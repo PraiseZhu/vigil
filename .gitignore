@@ -1,0 +1,54 @@
+# === Sensitive ===
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.token.json
+.auth.json
+credentials/
+secrets/
+
+# === macOS / iCloud ===
+.DS_Store
+._*
+*.icloud
+*.swp
+
+# === ECC session data ===
+history/checkpoints/
+history/daily/
+.claude/
+
+# === Logs ===
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# === IDE ===
+.idea/
+.vscode/
+
+# === Node ===
+node_modules/
+dist/
+build/
+.next/
+.nuxt/
+out/
+.cache/
+.parcel-cache/
+coverage/
+.turbo/
+
+# === Agent / Cindy 工作树与本地备份（不入库） ===
+.cindy-worktrees/
+.xdt-worktrees/
+.worktrees/
+_backup/
+_tmp/
+
+# === Tip: 大数据目录建议加 .nosync 后缀 ===
