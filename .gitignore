@@ -52,3 +52,11 @@ _backup/
 _tmp/
 
 # === Tip: 大数据目录建议加 .nosync 后缀 ===
+
+# === Project Vigil: watcher 运行态产物（不入库） ===
+**/state/
+**/deployments/
+**/config/profile.json
+
+# === Project Vigil: 本地私有词清单（贡献者自己维护,绝不提交） ===
+config/sanitize-denylist.local

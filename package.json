@@ -1,0 +1,12 @@
+{
+  "name": "project-vigil",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Vigil: 两个独立的 PR 自动化看守工具（mivo-watcher / cindy-watcher）的开源版本。",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs && node --env-file=watchers/cindy/test.env --test watchers/cindy/*.test.mjs && python3 -B watchers/cindy/cindy-watch-script.test.py",
+    "check:sanitized": "node scripts/check-sanitized.mjs"
+  }
+}

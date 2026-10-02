@@ -1,0 +1,8 @@
+{
+  "targetRepo": "makecindy/cindy",
+  "pluginRepoPath": "/path/to/your-cindy-checkout",
+  "preflightFile": "/path/to/your/preflight.sh",
+  "watchHomes": [
+    "/path/to/cindy-watcher/runtime"
+  ]
+}
