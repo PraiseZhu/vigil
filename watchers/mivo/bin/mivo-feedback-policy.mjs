@@ -1,5 +1,6 @@
 // Local repair authority. Comment bodies are evidence, never standing permission.
 // Pure and bounded: callers provide an already-collected feedback item and HEAD.
+import {verifiedLifelineFeedback} from './mivo-lifeline-source.mjs';
 export const FEEDBACK_POLICY_VERSION = 1;
 const INFRA = new Set(['INCOMPLETE', 'CI-NOT-GREEN', 'SKIP-LLM', 'SKIP-LOCAL', 'REFUSE', 'WINDOW-CLOSED', 'PARSE-FAILED', 'HELPERS-MISSING', 'UNHEALTHY']);
 const aliases = { P0: 'P0', CRITICAL: 'P0', P1: 'P1', HIGH: 'P1', P2: 'P2', MEDIUM: 'P2', P3: 'P3', LOW: 'P3' };
@@ -39,6 +40,9 @@ export function feedbackRepairPolicy(item = {}, { headSha } = {}) {
   if (!item || typeof item !== 'object') return result('needs-triage', [], 'invalid-feedback');
   if (item.actionable === false) return result('ignore-infra', [], 'non-actionable-or-resolved');
   if (headSha && item.sha && item.sha !== headSha) return result('needs-triage', [], 'stale-head');
+  if (item.source === 'lifeline-doctor') return verifiedLifelineFeedback(item,{headSha})
+    ? result('code-fix',[item.doctor.severity],'verified-local-doctor-classification')
+    : result('needs-triage',[],'doctor-handoff-not-verified');
   if (item.source === 'ci' || item.source === 'conflict') {
     if (!headSha || item.sha !== headSha) return result('needs-triage', [], 'unbound-head');
     if (item.source === 'conflict') return result('conflict-fix', [], 'current-merge-conflict');
