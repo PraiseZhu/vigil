@@ -135,6 +135,18 @@ test('unchanged fingerprint writes heartbeat and skips collect', (t) => {
   assert.equal(entry.heartbeatAt, now);
 });
 
+test('a repair result written after the last poll is read even when the PR fingerprint is unchanged', (t) => {
+  const { paths } = homeOf(t);
+  seedInFlight(paths);
+  fs.mkdirSync(path.join(paths.stateDir, 'results'), { recursive: true });
+  fs.writeFileSync(path.join(paths.stateDir, 'results', 'live-790-old.json'), JSON.stringify({
+    schemaVersion: 2, dispatchId: 'live-790-old', nodeId, sessionId: 'sess-790', status: 'complete', head: HEAD,
+    receiptId: 'r-new', ci: { requiredGreen: true, head: HEAD }, verification: { status: 'not-required-no-change' }, scs: [],
+  }));
+  const { collected } = poll(paths, { snapshot: snap(), collect: () => { throw new Error('forced collect'); } });
+  assert.equal(collected, 1);
+});
+
 test('dispatch-conflict still polls owner and alerts only once', (t) => {
   const { paths } = homeOf(t);
   seed(paths, {

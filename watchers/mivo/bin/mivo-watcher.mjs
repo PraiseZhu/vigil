@@ -14,7 +14,7 @@ import { collectPrSnapshot, collectPrOwnership } from './mivo-pr-snapshot.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './mivo-state.mjs';
 import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor } from './mivo-feedback-policy.mjs';
 import {lifelineFeedback} from './mivo-lifeline-source.mjs';
-import { partitionAutoClose, autoCloseThreads } from './mivo-review-resolve.mjs';
+import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads } from './mivo-review-resolve.mjs';
 import { autoCleanupWatch, command as gitDefaultFn } from './mivo-repair.mjs';
 import { requireConfig } from './profile.mjs';
 
@@ -766,6 +766,21 @@ function resultFor(previous, paths) {
   return result;
 }
 
+// The repair task this result answers; unreadable tasks simply skip refuted closure.
+function readActiveTask(previous, paths) {
+  const dispatchId = previous.activeTask?.dispatchId;
+  if (!dispatchId || !/^[A-Za-z0-9._:-]+$/.test(dispatchId)) return null;
+  try { return JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), 'utf8')); }
+  catch { return null; }
+}
+// A result the session wrote after the last poll must be read even when the PR itself
+// has not changed; otherwise the task stays "accepted" and its threads are never closed.
+function hasUnconsumedResult(previous, paths) {
+  try {
+    const result = resultFor(previous, paths);
+    return Boolean(result) && (result.receiptId ?? digest(result)) !== previous.activeTask?.receiptId;
+  } catch { return true; }
+}
 function consumeResult(previous, result, now) {
   if (!result) return previous;
   // A result written before the author reclaimed the PR must not revive the superseded task.
@@ -936,6 +951,15 @@ export function* processPr({
     const outcome = yield* autoCloseThreads({ eligible: autoCloseEligible, previous, ghFn, now });
     previous = outcome.previous;
     autoClosedThisRound = outcome.closed;
+  }
+  if (previous.activeTask?.status === 'complete' && !dryRun && !resultError) {
+    let refuted = [];
+    try { refuted = refutedThreads(resultFor(previous, paths), readActiveTask(previous, paths)); } catch { refuted = []; }
+    if (refuted.length > 0) {
+      const outcome = yield* closeRefutedThreads({ items: refuted, dispatchId: previous.activeTask.dispatchId, previous, ghFn, now });
+      previous = outcome.previous;
+      autoClosedThisRound = [...autoClosedThisRound, ...outcome.closed];
+    }
   }
   const admitted = previous.admissionVerified === true || collected.admissionVerified === true;
   const admissionBlocked = collected.admissionVerified === false && previous.admissionVerified !== true;
@@ -1315,7 +1339,8 @@ export function* pollWorkflow({
   });
   const pendingRetry = previous.pendingDispatch?.status === 'retryable';
   const recoveryDue = Boolean(readTaskForRecovery(previous, paths, now));
-  if (previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry && !normalized.overflow) {
+  if (previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry && !normalized.overflow
+    && !hasUnconsumedResult(previous, paths)) {
     save(previous);
     return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, dispatch: { attempted: false, reason: 'fingerprint-unchanged' } }] };
   }

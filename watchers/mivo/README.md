@@ -89,6 +89,7 @@ node bin/mivo-ownership.mjs --repo your-org/your-plugin-repo --pr 123 --home "$M
 但它们只是**可替换的配置**，不是协议的一部分：
 
 - 审查反馈严重度 `P0`/`P1`/`P2`/`P3`:P0/P1 视为必须改代码才能回复;P2/P3 只需回复不改代码。
+- 修复会话核实某条 P0/P1 讨论不成立(已验证完成的结果里该 key 为 `no-change` 且附证据)时,watcher 带证据回复并关闭该讨论;没有证据的不关。会话结果晚于上一次轮询写入时,即使 PR 指纹未变也会重新读取,避免任务停在 accepted、讨论永远挡住合并。
 - 本轮通过的标签名 `review:merge-ready`。
 - 可信审查来源(自动触发修复的评论来源)在 `mivo-pr-policy.mjs` / `mivo-feedback-policy.mjs`
   里按来源名单判断,按需改成你自己团队的 Bot/Reviewer 名单。
