@@ -781,6 +781,8 @@ function hasUnconsumedResult(previous, paths) {
     return Boolean(result) && (result.receiptId ?? digest(result)) !== previous.activeTask?.receiptId;
   } catch { return true; }
 }
+const RECHECK_MIN_BUDGET_MS = 40000;
+const RECHECK_TIMEOUT_MS = 60000;
 function consumeResult(previous, result, now) {
   if (!result) return previous;
   // A result written before the author reclaimed the PR must not revive the superseded task.
@@ -978,9 +980,16 @@ export function* processPr({
     || (active?.status === 'blocked' && ['required-ci', 'optional-ci', 'ci-transport'].includes(active.blockedKind));
   if (waiting && active.evidenceVersion === 2 && !dryRun && !resultError) {
     try {
-      if (remaining()<1000) throw Error('scan-budget-exhausted');
-      yield () => recheckFn({ paths, previous, pr, timeoutMs:Math.max(1,Math.min(30000,remaining())) });
-      previous = consumeResult(previous, resultFor(previous, paths), now);
+      // A recheck queries GitHub for CI and takes ~15-20s. Starting it on a nearly spent
+      // scan budget only gets it killed, and a PR late in the scan order then fails the
+      // same way every cycle (#846/#847, 2026-10-04). Resume the next scan at this PR.
+      if (remaining() < RECHECK_MIN_BUDGET_MS) {
+        state.scan = { ...state.scan, cursor: resumeCursor, deferredNumber: pr.number };
+        previous = { ...previous, recheckDeferredAt: now };
+      } else {
+        yield () => recheckFn({ paths, previous, pr, timeoutMs: Math.max(1, Math.min(RECHECK_TIMEOUT_MS, remaining())) });
+        previous = consumeResult(previous, resultFor(previous, paths), now);
+      }
     } catch (error) {
       // A transport failure is not a new agent task or proof of completion.
       previous = { ...previous, lastRecheckError: { at: now, message: String(error.message).slice(0, 400) } };
@@ -1266,6 +1275,8 @@ function* scanWorkflow({
       remaining, deadline, clock, resumeCursor,
       resetPrDeadline: () => { prDeadline = deadline; },
     });
+    // A PR deferred for budget keeps its resume cursor only if no later PR advances it.
+    if (state.scan?.deferredNumber === pr.number) { partial = true; break; }
   }
   state.scan={...state.scan,partial,visited,listed:listed.length,finishedAt:now,elapsedMs:clock()-started};
   state.updatedAt = now;

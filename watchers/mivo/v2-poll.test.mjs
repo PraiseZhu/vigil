@@ -45,7 +45,7 @@ function fakeGit(t, { status = '' } = {}) {
   return { plugin, calls, gitFn, env: { MIVO_PLUGIN_REPO: plugin } };
 }
 
-function poll(paths, { snapshot, collect, dispatchFn, enabled = true, recheckFn, git } = {}) {
+function poll(paths, { snapshot, collect, dispatchFn, enabled = true, recheckFn, git, budgetMs } = {}) {
   let collected = 0;
   const result = scanOnce({
     mode: 'poll', enabled, allowDispatch: true, paths, now, nodeId, prNumber: 790,
@@ -57,6 +57,7 @@ function poll(paths, { snapshot, collect, dispatchFn, enabled = true, recheckFn,
       throw new Error('collect should not run');
     },
     dispatchFn, recheckFn,
+    ...(budgetMs ? { budgetMs } : {}),
     ...(git ? { gitFn: git.gitFn, env: git.env } : {}),
     ownershipSnapshot: function* () {
       return { pr: { state: 'OPEN', isDraft: false, sameRepository: true, author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' } };
@@ -324,6 +325,31 @@ test('recheck failure does not commit fingerprint', (t) => {
   assert.equal(entry.pollFingerprint, oldFp);
   assert.equal(entry.collectRetry, true);
   assert.equal(entry.lastRecheckError.at, now);
+});
+
+const waitingCollect = () => ({
+  pr: { id: nodeId, number: 790, state: 'OPEN', isDraft: false, sameRepository: true, author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' },
+  admissionVerified: true, checks: [], comments: [], reviews: [], threads: [], labels: [], mergeReady: false,
+  ci: { status: 'green', required: [] }, policy: { status: 'verified', required: [] },
+});
+test('a recheck is not started on a budget too small to finish; it is deferred without an error', (t) => {
+  const { paths } = homeOf(t);
+  seed(paths, { pollFingerprint: 'old', activeTask: { status: 'waiting-ci', evidenceVersion: 2, dispatchId: 'd1', head: HEAD }, lastDispatch: { dispatchId: 'd1' } });
+  const calls = [];
+  const { entry } = poll(paths, { snapshot: snap(), collect: waitingCollect, budgetMs: 30000,
+    dispatchFn: () => ({ target_session_id: 'sess-790' }), recheckFn: (args) => { calls.push(args); return {}; } });
+  assert.equal(calls.length, 0);
+  assert.equal(entry.recheckDeferredAt, now);
+  assert.equal(entry.lastRecheckError, undefined);
+});
+test('a recheck with enough budget runs with room beyond the old 30s cap', (t) => {
+  const { paths } = homeOf(t);
+  seed(paths, { pollFingerprint: 'old', activeTask: { status: 'waiting-ci', evidenceVersion: 2, dispatchId: 'd1', head: HEAD }, lastDispatch: { dispatchId: 'd1' } });
+  const calls = [];
+  poll(paths, { snapshot: snap(), collect: waitingCollect,
+    dispatchFn: () => ({ target_session_id: 'sess-790' }), recheckFn: (args) => { calls.push(args); return {}; } });
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].timeoutMs > 30000 && calls[0].timeoutMs <= 60000);
 });
 
 test('collect failure does not commit fingerprint and retries next round', (t) => {
