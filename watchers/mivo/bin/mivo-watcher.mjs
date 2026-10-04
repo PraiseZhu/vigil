@@ -13,6 +13,7 @@ import { collectPublicReview } from './public-review.mjs';
 import { collectPrSnapshot, collectPrOwnership } from './mivo-pr-snapshot.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './mivo-state.mjs';
 import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor } from './mivo-feedback-policy.mjs';
+import {lifelineFeedback} from './mivo-lifeline-source.mjs';
 import { partitionAutoClose, autoCloseThreads } from './mivo-review-resolve.mjs';
 import { autoCleanupWatch, command as gitDefaultFn } from './mivo-repair.mjs';
 import { requireConfig } from './profile.mjs';
@@ -916,7 +917,16 @@ export function* processPr({
   const sameEpoch = !collected.pr || (previous.admissionEpoch === collected.pr.releaseEpoch && previous.wasDraft !== true);
   if (!sameEpoch) previous = {...previous, admissionVerified:false};
   const cursorBase = previous.wasDraft === true ? {} : (previous.feedbackCursor || {});
-  const { fresh: rawFresh, cursor } = newFeedback(cursorBase, feedbackItems({ pr, ...collected, receiptActor: viewer }));
+  const doctor = lifelineFeedback({...pr,...collected.pr,repo:REPO});
+  if (doctor.error) events.push({kind:'doctor-source-blocked',number:pr.number,code:doctor.error});
+  const { fresh: rawFresh, cursor } = newFeedback(cursorBase, [
+    ...feedbackItems({ pr, ...collected, receiptActor: viewer }),
+    ...doctor.items.map(item=>withCategory(item,{headSha:pr.headRefOid})),
+  ]);
+  // Green CI/review does not finish a newly confirmed local product failure.
+  // Keep the existing owner's recovery alive until its repair result completes.
+  if (rawFresh.some(item=>item.source==='lifeline-doctor' && item.repairPolicy.canChangeCode)
+    || (doctor.items.length && !['complete','legacy-complete'].includes(previous.activeTask?.status))) collected.mergeReady=false;
   // Autonomous P2/P3 review-thread closure happens here, before any dispatch
   // accounting below sees these items — closed items never reach a session,
   // never need a human, and are never counted as pending feedback.

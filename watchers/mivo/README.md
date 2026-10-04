@@ -50,10 +50,20 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | profile 字段 | 环境变量 | 默认值 |
 |---|---|---|
 | `watchHomes` | `MIVO_WATCHER_WATCH_HOMES`（逗号分隔） | `[]`（不内置任何路径） |
+| `lifelineConfigPath` | `MIVO_WATCHER_LIFELINE_CONFIG` | 未配置时不接收本地 Doctor 任务 |
 
 拷一份 [`config/examples/mivo.profile.example.json`](../../config/examples/mivo.profile.example.json)
 到你的 watcher home 下的 `config/profile.json`，把占位值换成真实路径即可。`config/profile.json`
 已在 `.gitignore` 里排除，不会被提交。
+
+`lifelineConfigPath` 可连接同一目标仓的本地生命线 Doctor。配置必须由操作者提供绝对路径；
+配置中的 `repo` 要与 `targetRepo` 相同，授权须为确认 P0/P1 的修复并允许 push。
+接收器读取该配置的 `stateRoot/lifeline-state.json` 和 `evidenceRoot`，只接收实际 Ready PR
+对应的已确认修复或调查中保留的未交付修复，核对 owner 世代、具体失败观察与失败证据文件 hash。
+同一证据幂等去重并续交该 PR 的既有会话；修复 helper 在使用任务时再次读取来源和字节，
+过期世代、已降级的记录、变更证据与调用者自填的权限标记均不能授权写代码。
+普通作者评论仍按原来的调查权限处理；本地接入不改变 GitHub CI、审查或单写者要求，
+不把队列接收或分支修复当作正式业务部署完成。
 
 ## CLI
 
