@@ -24,8 +24,13 @@ cron 的无状态脚本,而是专门为 Cindy 桌面端的调度器("script 模�
 根目录 [`README.md`](../../README.md#安装与部署)。
 
 Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为已处理,不再据此派发修复
-(混合优先级评论不会被这套工具自动 resolve,所以 resolve 只可能来自人工操作);
-`resolved → unresolved` 的高优先级 thread 会重新进入待处理队列。
+(混合优先级评论不会被这套工具自动 resolve);`resolved → unresolved` 的高优先级 thread
+会重新进入待处理队列。工具自己只在两种情况下 resolve:整条 thread 都是可信 Bot 的 P3;或修复会话
+核实某条必修意见不成立(已验证完成的结果里该 key 为 `no-change` 且附证据),此时带证据回复后关闭,
+没有证据的不关,权限不足时只降级报告、不重复回复。
+
+等 CI 的复查需要约 15–20 秒;剩余扫描预算不足 40 秒时不硬跑(硬跑会被超时杀掉、排在后面的 PR
+每轮同样失败),而是结束本轮并从该 PR 续扫,复查超时上限 60 秒。
 
 ## 配置:profile.mjs 的 fail-closed 机制
 

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { feedbackItems } from './bin/cindy-watcher.mjs';
-import { isAutoCloseEligible, isThreadAutoCloseEligible, partitionAutoClose, autoCloseThreads, autoCloseReplyText } from './bin/cindy-review-resolve.mjs';
+import { isAutoCloseEligible, isThreadAutoCloseEligible, partitionAutoClose, autoCloseThreads, autoCloseReplyText, closeRefutedThreads, refutedReplyText, refutedThreads } from './bin/cindy-review-resolve.mjs';
 import { dispatchParams, newFeedback, scanOnce, watcherPaths } from './bin/cindy-watcher.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -382,4 +382,74 @@ test('live unresolved thread from an older head keeps code authority through tas
   const staleReview = feedbackRepairPolicy({ source: 'greptile', nativeId: 'r1', sha: SHA_A, body: 'P1: crash', author: GREPTILE_AUTHOR, __typename: 'Bot' }, { headSha: HEAD });
   assert.equal(staleReview.reason, 'stale-head');
   assert.equal(staleReview.canChangeCode, false);
+});
+
+const refutedTask = { dispatchId: 'live-851', repairPolicy: { items: [
+  { key: 'thread:PRRT_p1:PRRC_a', action: 'code-fix' },
+  { key: 'greptile:PRRT_g1:PRRC_b', action: 'code-fix' },
+  { key: 'thread:PRRT_p3:PRRC_c', action: 'reply-only' },
+  { key: 'thread:PRRT_fixed:PRRC_d', action: 'code-fix' },
+  { key: 'thread:PRRT_noevidence:PRRC_e', action: 'code-fix' },
+  { key: 'comment:9', action: 'code-fix' },
+] } };
+const refutedResult = (extra = {}) => ({
+  schemaVersion: 2, status: 'complete', dispatchId: 'live-851',
+  scs: [
+    { id: 'SC-1', status: 'no-change', feedbackKeys: ['thread:PRRT_p1:PRRC_a', 'comment:9'], evidence: ['git show origin/main:x.mjs -> flag consumed; source /home/ci/repo/x.mjs'] },
+    { id: 'SC-2', status: 'no-change', feedbackKeys: ['greptile:PRRT_g1:PRRC_b', 'thread:PRRT_p3:PRRC_c'], evidence: ['existing guard covers it'] },
+    { id: 'SC-3', status: 'pass', feedbackKeys: ['thread:PRRT_fixed:PRRC_d'], evidence: ['fixed'] },
+    { id: 'SC-4', status: 'no-change', feedbackKeys: ['thread:PRRT_noevidence:PRRC_e'], evidence: [' '] },
+  ],
+  feedbackCoverage: { dispositions: [
+    { key: 'thread:PRRT_p1:PRRC_a', disposition: 'no-change' }, { key: 'greptile:PRRT_g1:PRRC_b', disposition: 'no-change' },
+    { key: 'thread:PRRT_p3:PRRC_c', disposition: 'no-change' }, { key: 'thread:PRRT_fixed:PRRC_d', disposition: 'fixed' },
+    { key: 'thread:PRRT_noevidence:PRRC_e', disposition: 'no-change' }, { key: 'comment:9', disposition: 'no-change' },
+  ] }, ...extra,
+});
+const runClosure = (items, previous, ghFn) => {
+  const gen = closeRefutedThreads({ items, dispatchId: 'live-851', previous, ghFn, now: 't' });
+  let step = gen.next();
+  while (!step.done) { step = gen.next(step.value()); }
+  return step.value;
+};
+
+test('only verified no-change authorized review threads with evidence are closed as refuted', () => {
+  assert.deepEqual(refutedThreads(refutedResult(), refutedTask).map((item) => item.threadId), ['PRRT_p1', 'PRRT_g1']);
+  for (const extra of [{ status: 'waiting-ci' }, { schemaVersion: 1 }, { dispatchId: 'other' }]) {
+    assert.deepEqual(refutedThreads(refutedResult(extra), refutedTask), []);
+  }
+});
+
+test('refuted reply shows the evidence without local paths and carries the self-trigger receipt', () => {
+  const text = refutedReplyText(['see /home/ci/repo/x.mjs line 3'], 'live-851');
+  assert.match(text, /要不要改代码/);
+  assert.match(text, /<本机路径>/);
+  assert.doesNotMatch(text, /\/home\//);
+  assert.match(text, /cindy-watcher-receipt task=live-851/);
+});
+
+test('refuted closure replies then resolves once per thread and is idempotent', () => {
+  const calls = [];
+  const items = refutedThreads(refutedResult(), refutedTask);
+  const first = runClosure(items, {}, (args) => { calls.push(args); return '{}'; });
+  assert.equal(calls.length, 4);
+  assert.ok(calls[0].some((arg) => arg.includes('addPullRequestReviewThreadReply')) && calls[1].some((arg) => arg.includes('resolveReviewThread')));
+  assert.deepEqual(first.closed.map((item) => item.threadId), ['PRRT_p1', 'PRRT_g1']);
+  calls.length = 0;
+  assert.deepEqual(runClosure(items, first.previous, (args) => { calls.push(args); return '{}'; }).closed, []);
+  assert.equal(calls.length, 0);
+});
+
+test('refuted closure degrades on permission errors and never replies twice', () => {
+  const items = refutedThreads(refutedResult(), refutedTask).slice(0, 1);
+  const denied = () => { const error = new Error('Resource not accessible by integration'); error.status = 403; throw error; };
+  const noReply = runClosure(items, {}, denied);
+  assert.equal(noReply.closed[0].degraded, true);
+  assert.equal(noReply.previous.autoClosedThreads.PRRT_p1, undefined);
+  const calls = [];
+  const replied = runClosure(items, {}, (args) => { calls.push(args); if (calls.length === 2) denied(); return '{}'; });
+  assert.equal(replied.previous.autoClosedThreads.PRRT_p1.resolveDegraded, true);
+  calls.length = 0;
+  runClosure(items, replied.previous, (args) => { calls.push(args); return '{}'; });
+  assert.equal(calls.length, 0);
 });
