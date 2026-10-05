@@ -252,9 +252,11 @@ export function keelLedgerRoot(env = process.env) {
 
 // Keel keeps each pstack run at runs/<run_id>/decisions.jsonl. The repair session binds its
 // run to this task by logging a row containing task=<dispatchId>; without a configured
-// ledger root the gate reports disabled instead of passing silently.
+// ledger root, or for a pre-Keel task, the gate reports why it did not apply.
 export function verifyKeelRun({ task, runId, root = keelLedgerRoot() }) {
   if (!root) return { status: 'disabled' };
+  // Tasks dispatched before the Keel prompt existed keep their original contract.
+  if (task.keelFlow !== true) return { status: 'not-required-legacy-task' };
   if (typeof runId !== 'string' || !KEEL_RUN_ID.test(runId)) fail('[KEEL_RUN_REQUIRED] finalize needs --keel-run <run_id> from Keel pstack_start');
   const file = path.join(requireAbs(root, 'keelLedgerRoot'), 'runs', runId, 'decisions.jsonl');
   let rows;

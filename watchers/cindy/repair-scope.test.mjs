@@ -271,6 +271,8 @@ test('finalize with a Keel ledger root refuses to push without a bound Keel run'
   const f = fixture(t);
   assert.equal(f.validate().status, 'pass');
   f.report([f.sc('pass', ['thread:P1'])]);
+  f.task.keelFlow = true;
+  f.saveTask(f.task.feedback);
   const keelRoot = keelLedger(t, 'run-1', [{ at: '2026-10-06T00:00:00Z', kind: 'step', summary: 'unrelated run' }]);
   assert.throws(() => finalize({ ...f.options, keelRoot }), /KEEL_RUN_REQUIRED.*--keel-run/);
   assert.throws(() => finalize({ ...f.options, keelRoot, keelRun: 'run-1' }), /KEEL_RUN_REQUIRED.*task=scope-dispatch/);
@@ -282,6 +284,8 @@ test('finalize pushes once the Keel run carries this task binding and reports it
   const f = fixture(t);
   assert.equal(f.validate().status, 'pass');
   f.report([f.sc('pass', ['thread:P1'])]);
+  f.task.keelFlow = true;
+  f.saveTask(f.task.feedback);
   const keelRoot = keelLedger(t, 'run-2', [
     { at: '2026-10-06T00:00:00Z', kind: 'decision', summary: 'J2 depth' },
     { at: '2026-10-06T00:00:01Z', kind: 'step', summary: 'vigil task=scope-dispatch' },
@@ -290,4 +294,14 @@ test('finalize pushes once the Keel run carries this task binding and reports it
   assert.equal(result.status, 'complete');
   assert.deepEqual(result.keel, { status: 'verified', runId: 'run-2', rows: 2, decisions: 1 });
   assert.equal(f.remoteHead(), f.head);
+});
+
+test('finalize keeps closing tasks dispatched before the Keel prompt', (t) => {
+  const f = fixture(t);
+  assert.equal(f.validate().status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  const keelRoot = keelLedger(t, 'run-3', []);
+  const result = finalize({ ...f.options, keelRoot });
+  assert.equal(result.status, 'complete');
+  assert.deepEqual(result.keel, { status: 'not-required-legacy-task' });
 });

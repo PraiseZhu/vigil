@@ -17,10 +17,15 @@ function ledger(t, runId, rows) {
   return root;
 }
 
-const task = { dispatchId: 'live-7-x', createdAt: '2026-10-06T01:00:00.000Z', repo: REPO };
+const task = { dispatchId: 'live-7-x', keelFlow: true, createdAt: '2026-10-06T01:00:00.000Z', repo: REPO };
 
 test('Keel gate reports disabled when no ledger root is configured', () => {
   assert.deepEqual(verifyKeelRun({ task, runId: undefined, root: null }), { status: 'disabled' });
+});
+
+test('Keel gate does not apply to tasks dispatched before the Keel prompt', (t) => {
+  const root = ledger(t, 'run-x', []);
+  assert.deepEqual(verifyKeelRun({ task: { ...task, keelFlow: undefined }, runId: undefined, root }), { status: 'not-required-legacy-task' });
 });
 
 test('Keel gate rejects a binding row written before the task existed', (t) => {

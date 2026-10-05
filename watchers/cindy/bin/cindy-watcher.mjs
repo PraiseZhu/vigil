@@ -666,7 +666,7 @@ function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix 
   const pending = { dispatchId, params: dispatchParams({ pr: headPr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix }), at: now, taskPath };
   if (!dryRun) {
     fs.mkdirSync(path.dirname(taskPath), { recursive: true });
-    atomic(taskPath, JSON.stringify({ dispatchId, nodeId: headPr.id, number: headPr.number, repo: REPO, headRefOid: headPr.headRefOid, headRefName: headPr.headRefName, headRepo: headRepoOf(headPr), headOwner: headOwnerOf(headPr), feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: headPr.headRefOid, feedback: fresh }), prSnapshot: compactPrSnapshot(collected, now), params: pending.params, createdAt: now }));
+    atomic(taskPath, JSON.stringify({ dispatchId, keelFlow: true, nodeId: headPr.id, number: headPr.number, repo: REPO, headRefOid: headPr.headRefOid, headRefName: headPr.headRefName, headRepo: headRepoOf(headPr), headOwner: headOwnerOf(headPr), feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: headPr.headRefOid, feedback: fresh }), prSnapshot: compactPrSnapshot(collected, now), params: pending.params, createdAt: now }));
   }
   return pending;
 }
