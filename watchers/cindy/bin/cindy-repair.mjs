@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { collectCindyCiSync } from './cindy-ci.mjs';
 import { taskRepairPolicy } from './cindy-feedback-policy.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, clearOrphanGuard, DEPLOY_LOCK_NAME, helperLockName, inspectLocks, lockStatus, readPr, writePr } from './cindy-state.mjs';
-import { requireConfig } from './profile.mjs';
+import { optionalConfig, requireConfig } from './profile.mjs';
 
 // 这是一个真实可公开的仓库，默认值保留；可用 CINDY_WATCHER_TARGET_REPO / profile.json 的
 // targetRepo 覆盖成你自己要盯梢的仓库。
@@ -366,6 +366,44 @@ export function assertTaskRepairScope(task, head) {
   return repairPolicy;
 }
 
+const KEEL_RUN_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
+export function keelLedgerRoot(env = process.env) {
+  return optionalConfig('keelLedgerRoot', { envVar: 'CINDY_KEEL_LEDGER_ROOT', env }) ?? null;
+}
+
+// Keel keeps each pstack run at runs/<run_id>/decisions.jsonl. The repair session binds its
+// run to this task by logging a row containing task=<dispatchId>; without a configured
+// ledger root the gate reports disabled instead of passing silently.
+export function verifyKeelRun({ task, runId, root = keelLedgerRoot() }) {
+  if (!root) return { status: 'disabled' };
+  if (typeof runId !== 'string' || !KEEL_RUN_ID.test(runId)) fail('[KEEL_RUN_REQUIRED] finalize needs --keel-run <run_id> from Keel pstack_start');
+  const file = path.join(requireAbs(root, 'keelLedgerRoot'), 'runs', runId, 'decisions.jsonl');
+  let rows;
+  try { rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)); }
+  catch (error) { fail(`[KEEL_RUN_REQUIRED] Keel run ${runId} ledger is unreadable: ${error.message}`); }
+  const since = Date.parse(task.createdAt ?? '');
+  const marker = `task=${task.dispatchId}`;
+  const bound = rows.some((row) => {
+    const at = Date.parse(row?.at ?? '');
+    return typeof row?.summary === 'string' && row.summary.includes(marker) && Number.isFinite(at) && !(at < since);
+  });
+  if (!bound) fail(`[KEEL_RUN_REQUIRED] Keel run ${runId} has no ledger row with ${marker} written after the task was created`);
+  return { status: 'verified', runId, rows: rows.length, decisions: rows.filter((row) => row?.kind === 'decision').length };
+}
+
+const CI_ERROR_LINES = 20;
+export function ciErrorExcerpts(task, ghFn = command) {
+  const runIds = [...new Set((task.prSnapshot?.failingChecks ?? []).map((check) => workflowRunId(check?.link ?? '', task.repo)).filter(Boolean))];
+  return runIds.map((runId) => {
+    try {
+      const log = String(ghFn(GH, ['run', 'view', runId, '--repo', task.repo, '--log-failed']));
+      return { runId, errors: log.split('\n').filter((line) => line.includes('##[error]')).slice(0, CI_ERROR_LINES).map((line) => line.slice(0, 400)) };
+    } catch (error) {
+      return { runId, error: String(error?.message ?? error).slice(0, 200) };
+    }
+  });
+}
+
 export function prepare({ home, taskPath, ghFn = command, gitFn = command, cloneUrl, originUrl, viewer } = {}) {
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   const { paths, task } = taskFrom(home, taskPath);
@@ -382,7 +420,7 @@ export function prepare({ home, taskPath, ghFn = command, gitFn = command, clone
   const needsSync = checkout.head !== pr.headRefOid || task.headRefOid !== pr.headRefOid;
   return { ...identity(task, sessionId), repairPolicy, status: needsSync ? 'needs-sync' : 'prepared', needsSync,
     worktree: checkout.worktree, head: checkout.head, remoteHead: pr.headRefOid, sourceHead: task.headRefOid,
-    origin: forkUrl, headRepo, created: checkout.created };
+    origin: forkUrl, headRepo, created: checkout.created, ciErrors: ciErrorExcerpts(task, ghFn) };
   });
 }
 
@@ -654,7 +692,7 @@ export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, o
   return { pushed: true };
 }
 
-export function finalize({ home, taskPath, scReport, validatedHead, validationReceipt, ghFn = command, gitFn = command, env = process.env, originUrl } = {}) {
+export function finalize({ home, taskPath, scReport, validatedHead, validationReceipt, keelRun, keelRoot = keelLedgerRoot(), ghFn = command, gitFn = command, env = process.env, originUrl } = {}) {
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
@@ -672,6 +710,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
   const { scs, feedbackCoverage } = loadScs(scReport, task);
+  const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot });
   if (validatedHead !== task.headRefOid && scs.every((sc) => sc.status === 'no-change')) {
     fail('[REPAIR_SCOPE_NO_CODE] Changed HEAD requires an SC bound to an authorized fix; no-change cannot cover commits');
   }
@@ -684,9 +723,9 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   try { ci = checkStatus(task, validatedHead, ghFn); }
   catch (error) {
     return saveResult(paths, task, sessionId, { status: 'blocked', blockedKind: 'ci-transport', reason: error.message,
-      head: validatedHead, scs, feedbackCoverage, verification, checks: [], pushed: push.pushed });
+      head: validatedHead, scs, feedbackCoverage, keel, verification, checks: [], pushed: push.pushed });
   }
-  return saveResult(paths, task, sessionId, { ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, verification, ci, checks: ci.requiredChecks, pushed: push.pushed });
+  return saveResult(paths, task, sessionId, { ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed: push.pushed });
   });
 }
 
@@ -914,7 +953,7 @@ function cli(argv) {
     const task = value('--task');
     if (mode === 'prepare') result = prepare({ home, taskPath: task });
     else if (mode === 'validate') result = validate({ home, taskPath: task, validatedHead: value('--validated-head') });
-    else if (mode === 'finalize') result = finalize({ home, taskPath: task, scReport: value('--sc-report'), validatedHead: value('--validated-head'), validationReceipt: value('--validation-receipt', false) });
+    else if (mode === 'finalize') result = finalize({ home, taskPath: task, scReport: value('--sc-report'), validatedHead: value('--validated-head'), validationReceipt: value('--validation-receipt', false), keelRun: value('--keel-run', false) });
     else if (mode === 'recheck') result = recheck({ home, taskPath: task, validatedHead: value('--validated-head', false) });
     else if (mode === 'blocked') result = blocked({ home, taskPath: task, reason: value('--reason') });
     else fail('mode must be prepare, validate, finalize, recheck, blocked, cleanup, clear-owner-unknown, or lock-doctor');
