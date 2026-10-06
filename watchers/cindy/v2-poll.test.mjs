@@ -45,7 +45,7 @@ function fakeGit(t, { status = '' } = {}) {
   return { plugin, calls, gitFn, env: { CINDY_WATCHER_REPO: plugin } };
 }
 
-function poll(paths, { snapshot, collect, dispatchFn, enabled = true, recheckFn, git, budgetMs } = {}) {
+function poll(paths, { snapshot, collect, dispatchFn, enabled = true, recheckFn, git, budgetMs, clock, ownershipSnapshot } = {}) {
   let collected = 0;
   const result = scanOnce({
     mode: 'poll', enabled, allowDispatch: true, paths, now, nodeId, prNumber: 790,
@@ -56,10 +56,10 @@ function poll(paths, { snapshot, collect, dispatchFn, enabled = true, recheckFn,
       if (typeof collect === 'function') return collect(...args);
       throw new Error('collect should not run');
     },
-    dispatchFn, recheckFn,
+    dispatchFn, recheckFn, clock,
     ...(budgetMs ? { budgetMs } : {}),
     ...(git ? { gitFn: git.gitFn, env: git.env } : {}),
-    ownershipSnapshot: function* () {
+    ownershipSnapshot: ownershipSnapshot ?? function* () {
       return { pr: { state: 'OPEN', isDraft: false, sameRepository: false, isCrossRepository: true, author: { login: 'owner' }, headRepositoryOwner: { login: 'owner' }, headRepository: { name: 'cindy-fork' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' } };
     },
   });
@@ -366,6 +366,63 @@ test('collect failure does not commit fingerprint and retries next round', (t) =
   assert.equal(collected, 1);
   assert.equal(second.entry.pollFingerprint, oldFp);
 });
+
+for (const gate of [
+  { name: '65s collection reserve', collectMs: 56000, ownershipMs: 0, ownershipCalls: 0 },
+  { name: '61s ownership reserve', collectMs: 20000, ownershipMs: 40000, ownershipCalls: 1 },
+]) {
+  for (const retryAlreadyPending of [false, true]) {
+    test(`budget-deferred poll at ${gate.name} retries unchanged feedback${retryAlreadyPending ? ' with an existing retry marker' : ''}`, (t) => {
+      const { paths } = homeOf(t);
+      const snapshot = snap({ commentCount: 9, commentUpdatedAt: '2026-09-28T04:00:00Z' });
+      const previousFingerprint = retryAlreadyPending ? pollFingerprint(snapshot) : pollFingerprint(snap());
+      const feedbackCursor = { prior: 'observed' };
+      seed(paths, { pollFingerprint: previousFingerprint, collectRetry: retryAlreadyPending, feedbackCursor, repairRounds: 2 });
+      const calls = [];
+      let elapsed = 0;
+      let slow = true;
+      let ownershipCalls = 0;
+      const options = {
+        snapshot, budgetMs: 120000, clock: () => elapsed,
+        collect: () => { elapsed += slow ? gate.collectMs : 0; return collectFailedCi(); },
+        ownershipSnapshot: function* () {
+          ownershipCalls += 1;
+          elapsed += slow ? gate.ownershipMs : 0;
+          return { pr: collectFailedCi().pr };
+        },
+        dispatchFn: (params) => { calls.push(params); return { target_session_id: 'sess-790' }; },
+      };
+      // An already pending retry must survive consecutive rounds with too little time.
+      for (let round = 0; round < (retryAlreadyPending ? 2 : 1); round += 1) {
+        const deferred = poll(paths, options);
+        assert.equal(deferred.result.prs[0].dispatch.reason, 'dispatch-budget-deferred');
+        assert.equal(deferred.collected, 1);
+        assert.equal(ownershipCalls, gate.ownershipCalls * (round + 1));
+        assert.equal(calls.length, 0);
+        assert.deepEqual(deferred.entry.feedbackCursor, feedbackCursor);
+        assert.equal(deferred.entry.repairRounds, 2);
+        assert.equal(deferred.entry.activeTask.status, 'complete');
+        assert.equal(deferred.entry.pollFingerprint, previousFingerprint);
+        assert.equal(deferred.entry.collectRetry, true);
+      }
+      slow = false;
+      const delivered = poll(paths, options);
+      assert.equal(delivered.collected, 1);
+      assert.equal(delivered.result.prs[0].dispatch.attempted, true);
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].target_session_id, 'sess-790');
+      assert.equal(delivered.entry.repairRounds, 3);
+      assert.notDeepEqual(delivered.entry.feedbackCursor, feedbackCursor);
+      assert.equal(delivered.entry.pollFingerprint, pollFingerprint(snapshot));
+      assert.equal(delivered.entry.collectRetry, false);
+      const unchanged = poll(paths, options);
+      assert.equal(unchanged.collected, 0);
+      assert.equal(unchanged.result.prs[0].dispatch.reason, 'fingerprint-unchanged');
+      assert.equal(unchanged.entry.repairRounds, 3);
+      assert.equal(calls.length, 1);
+    });
+  }
+}
 
 test('missing sessionId records needsOwner and does not create', (t) => {
   const { paths } = homeOf(t);
