@@ -50,7 +50,7 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 |---|---|---|
 | `targetRepo` | `CINDY_WATCHER_TARGET_REPO` | `makecindy/cindy`(公开仓库,可直接用,也可覆盖成别的仓) |
 | `watchHomes` | `CINDY_WATCHER_WATCH_HOMES`(逗号分隔) | `[]`(不内置任何路径) |
-| `keelLedgerRoot` | `CINDY_KEEL_LEDGER_ROOT` | 未配置时 finalize 的 Keel 台账检查记为 `disabled`，不拦截 |
+
 
 拷一份 [`config/examples/cindy.profile.example.json`](../../config/examples/cindy.profile.example.json)
 到 watcher home 下的 `config/profile.json`,把占位值换成真实路径即可。
@@ -59,14 +59,24 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 `CINDY_WATCHER_ENABLED`/`CINDY_WATCHER_DISPATCH`/`CINDY_WATCHER_BRIDGE`)是运行时/调度相关
 的开关,不经过 profile 机制,直接读 `process.env`,具体含义见对应源码文件头部注释。
 
+### 新版任务必需的 Keel 配置
+
+| profile 字段 | 环境变量 | 要求 |
+|---|---|---|
+| `keelLedgerRoot` | `CINDY_KEEL_LEDGER_ROOT` | Keel 插件数据目录（包含 `runs/` 的那一层）；新派发的 `keelFlowVersion=2` 任务缺少此配置时，`finalize` 报 `KEEL_RUN_REQUIRED`，拒绝收口和推送 |
+
 ## 修复 session 的 Keel 流程
 
 派给修复 session 的消息要求全程用 Cindy 的 Keel 插件（`ghost_id=keel`），不再用 goal skill：
 
-- prepare 之后先 `pstack_start`，再用 `pstack_ledger` 记一行含 `task=<dispatchId>` 的 step，把这次 Keel run 绑定到当前任务。
+- `prepare` 之后先 `pstack_start`，读取它返回的流程手册，再用 `pstack_ledger` 写入 `kind:"step"`、`summary:"vigil task=<dispatchId>"`，精确绑定当前任务。可改代码的任务使用 `bug-fix`，调查任务使用 `investigation`。
 - 只允许 `jev`、`pstack_start`、`pstack_decide`、`pstack_ledger`、`pr_threads` 和手册；`pr_reply` 每次弹确认框、`pr_wait` 长轮询、`pr_status` 会读到作者转 Ready 时写的交接记录而停手，所以都禁止。GitHub 写操作仍只走 helper 与 `gh`。
 - Jev 只在固定判断点给参考（严重度未知、CI 抖动还是真失败、P0/P1 不成立的证据、修法选择），不能单独授权改代码。
-- `finalize` 需要 `--keel-run <run_id>`。配置了 `keelLedgerRoot`（Keel 插件数据目录，即含 `runs/` 的那一层）时，helper 读 `runs/<run_id>/decisions.jsonl`，找不到任务创建之后写入的绑定行就拒绝收口和推送，结果里的 `keel` 字段记录核对结论。
+- 新版任务的适用判断点使用 `pstack_decide`，绑定同一个 `run_id`；仅有启动判断 J1/J2 或手写 `decision` 行不足以收口。
+- `finalize --keel-run <run_id>` 在推送前读取 `runs/<run_id>/decisions.jsonl`。新版任务必须具有任务创建后的启动记录、精确绑定、实际处置判断，以及绑定当前 `validated-head` 的 `vigil-flow` 证据。缺配置、缺记录、任务或提交不匹配均报 `KEEL_RUN_REQUIRED`；结果的 `keel.contractVersion=2` 表示通过新版契约。
+- 收口证据通过 `pstack_ledger` 的 `kind:"evidence"` 写入：`evidence` 包含 `kind:"vigil-flow"`、`version:2`、`taskId`、`head`、`playbook`、`manualPath`、`decisionRowIds` 和 `steps`。`decisionRowIds` 引用同一 run 中真实 `pstack_decide` 的台账行；`steps.reproduce`、`steps.repair` 写明实际复现/调查与处置证据；`steps.verify` 的 `head`、`receiptSha256` 必须匹配 helper `validate` 返回的验证收据。完整调用格式见派工消息。
+- 全部 SC 为 `no-change` 且提交未变时，`steps.verify` 改为 `{status:"not-run",reason:"具体原因"}`，仍需调查证据和实际判断。后续同提交的 `recheck` 保留已验证的 `keel` 结果。
+- 在途旧任务不改写：`keelFlow=true` 且没有 `keelFlowVersion` 的任务沿用 v1 绑定检查，缺台账配置时仍为 `disabled`；配置存在且任务没有 `keelFlow=true` 时为 `not-required-legacy-task`。这些旧契约结果不代表通过 v2。
 - `prepare` 返回 `ciErrors`：失败必需检查所在 workflow run 的 `##[error]` 行（每个 run 最多 20 行），取不到时给出错误原因。
 
 ## CLI
