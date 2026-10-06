@@ -258,3 +258,50 @@ test('validate refuses immediately when deploy.lock is live and writes no receip
   const dir = path.join(f.paths.validations, f.task.dispatchId);
   assert.equal(fs.existsSync(dir), false);
 });
+
+function keelLedger(t, runId, rows) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-keel-ledger-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'runs', runId), { recursive: true });
+  fs.writeFileSync(path.join(root, 'runs', runId, 'decisions.jsonl'), rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+  return root;
+}
+
+test('finalize with a Keel ledger root refuses to push without a bound Keel run', (t) => {
+  const f = fixture(t);
+  assert.equal(f.validate().status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  f.task.keelFlow = true;
+  f.saveTask(f.task.feedback);
+  const keelRoot = keelLedger(t, 'run-1', [{ at: '2026-10-06T00:00:00Z', kind: 'step', summary: 'unrelated run' }]);
+  assert.throws(() => finalize({ ...f.options, keelRoot }), /KEEL_RUN_REQUIRED.*--keel-run/);
+  assert.throws(() => finalize({ ...f.options, keelRoot, keelRun: 'run-1' }), /KEEL_RUN_REQUIRED.*task=scope-dispatch/);
+  assert.equal(f.pushCalls.length, 0);
+  assert.equal(f.remoteHead(), f.sourceHead);
+});
+
+test('finalize pushes once the Keel run carries this task binding and reports it', (t) => {
+  const f = fixture(t);
+  assert.equal(f.validate().status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  f.task.keelFlow = true;
+  f.saveTask(f.task.feedback);
+  const keelRoot = keelLedger(t, 'run-2', [
+    { at: '2026-10-06T00:00:00Z', kind: 'decision', summary: 'J2 depth' },
+    { at: '2026-10-06T00:00:01Z', kind: 'step', summary: 'vigil task=scope-dispatch' },
+  ]);
+  const result = finalize({ ...f.options, keelRoot, keelRun: 'run-2' });
+  assert.equal(result.status, 'complete');
+  assert.deepEqual(result.keel, { status: 'verified', runId: 'run-2', rows: 2, decisions: 1 });
+  assert.equal(f.remoteHead(), f.head);
+});
+
+test('finalize keeps closing tasks dispatched before the Keel prompt', (t) => {
+  const f = fixture(t);
+  assert.equal(f.validate().status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  const keelRoot = keelLedger(t, 'run-3', []);
+  const result = finalize({ ...f.options, keelRoot });
+  assert.equal(result.status, 'complete');
+  assert.deepEqual(result.keel, { status: 'not-required-legacy-task' });
+});

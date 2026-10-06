@@ -531,6 +531,7 @@ test('P1 next to P2 still dispatches and persists the frozen per-item authority'
   const taskFiles=fs.readdirSync(path.join(paths.stateDir,'tasks')).filter(n=>n.endsWith('.json'));
   assert.equal(taskFiles.length,1);
   const task=JSON.parse(fs.readFileSync(path.join(paths.stateDir,'tasks',taskFiles[0]),'utf8'));
+  assert.equal(task.keelFlow,true);
   assert.equal(task.repairPolicy.canChangeCode,true);
   assert.deepEqual(task.feedback.map(i=>i.repairPolicy.action).sort(),['code-fix','reply-only']);
   assert.ok(task.prSnapshot && 'unresolvedThreads' in task.prSnapshot);

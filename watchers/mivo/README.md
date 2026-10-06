@@ -50,6 +50,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | profile 字段 | 环境变量 | 默认值 |
 |---|---|---|
 | `watchHomes` | `MIVO_WATCHER_WATCH_HOMES`（逗号分隔） | `[]`（不内置任何路径） |
+| `keelLedgerRoot` | `MIVO_KEEL_LEDGER_ROOT` | 未配置时 finalize 的 Keel 台账检查记为 `disabled`，不拦截 |
 | `lifelineConfigPath` | `MIVO_WATCHER_LIFELINE_CONFIG` | 未配置时不接收本地 Doctor 任务 |
 
 拷一份 [`config/examples/mivo.profile.example.json`](../../config/examples/mivo.profile.example.json)
@@ -64,6 +65,16 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 过期世代、已降级的记录、变更证据与调用者自填的权限标记均不能授权写代码。
 普通作者评论仍按原来的调查权限处理；本地接入不改变 GitHub CI、审查或单写者要求，
 不把队列接收或分支修复当作正式业务部署完成。
+
+## 修复 session 的 Keel 流程
+
+派给修复 session 的消息要求全程用 Cindy 的 Keel 插件（`ghost_id=keel`），不再用 goal skill：
+
+- prepare 之后先 `pstack_start`，再用 `pstack_ledger` 记一行含 `task=<dispatchId>` 的 step，把这次 Keel run 绑定到当前任务。
+- 只允许 `jev`、`pstack_start`、`pstack_decide`、`pstack_ledger`、`pr_threads` 和手册；`pr_reply` 每次弹确认框、`pr_wait` 长轮询、`pr_status` 会读到作者转 Ready 时写的交接记录而停手，所以都禁止。GitHub 写操作仍只走 helper 与 `gh`。
+- Jev 只在固定判断点给参考（严重度未知、CI 抖动还是真失败、P0/P1 不成立的证据、修法选择），不能单独授权改代码。
+- `finalize` 需要 `--keel-run <run_id>`。配置了 `keelLedgerRoot`（Keel 插件数据目录，即含 `runs/` 的那一层）时，helper 读 `runs/<run_id>/decisions.jsonl`，找不到任务创建之后写入的绑定行就拒绝收口和推送，结果里的 `keel` 字段记录核对结论。
+- `prepare` 返回 `ciErrors`：失败必需检查所在 workflow run 的 `##[error]` 行（每个 run 最多 20 行），取不到时给出错误原因。
 
 ## CLI
 

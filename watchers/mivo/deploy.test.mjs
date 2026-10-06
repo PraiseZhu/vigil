@@ -75,9 +75,11 @@ test('manifest missing a dependency imported by an entry point is rejected', t =
 });
 test('validatePlan (used by apply) also enforces manifest completeness, not just verify()', t => {
  const f = fixture(t);
- const realFile = fileURLToPath(new URL('./bin/mivo-watcher.mjs', import.meta.url));
- const original = fs.readFileSync(realFile, 'utf8');
- t.after(() => fs.writeFileSync(realFile, original));
- fs.writeFileSync(realFile, original + "\nimport { y } from './not-in-manifest-either.mjs';\n");
- assert.throws(() => validatePlan(f.plan), /not-in-manifest-either\.mjs/);
+ // Mutate a copy: rewriting the real source races with test files that import it in parallel.
+ const source = fs.mkdtempSync(path.join(os.tmpdir(), 'watcher-plan-source-'));
+ t.after(() => fs.rmSync(source, { recursive: true, force: true }));
+ fs.cpSync(fileURLToPath(new URL('./bin/', import.meta.url)), source, { recursive: true });
+ fs.appendFileSync(path.join(source, 'mivo-watcher.mjs'), "\nimport { y } from './not-in-manifest-either.mjs';\n");
+ assert.doesNotThrow(() => validatePlan(f.plan));
+ assert.throws(() => validatePlan(f.plan, source), /not-in-manifest-either\.mjs/);
 });

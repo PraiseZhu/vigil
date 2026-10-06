@@ -97,7 +97,7 @@ Project Vigil/
      命中就直接返回，否则才落到 `requireConfig`——这条路径上 `profile.mjs` 的报错文案只会
      提示 profile 字段名/hint，不会提示环境变量名，和 `targetRepo`/`watchHomes` 的报错路径
      不同。
-- **验证基线**：`npm test` 应为 271(mivo) + 333(cindy) = 604 个 node 测试全绿，加 cindy 的
+- **验证基线**：`npm test` 应为 292(mivo) + 350(cindy) = 642 个 node 测试全绿，加 cindy 的
   2 个 python 测试；`node scripts/check-sanitized.mjs` 应退出 0（本机如果配置了私有词清单
   `config/sanitize-denylist.local`，该脚本会一并扫描；该文件本身绝不提交，CI 里不存在也是
   预期行为，脚本会打印提示并仅跑内置通用模式）。真正的私有组织名/仓库名/主机名**不要**

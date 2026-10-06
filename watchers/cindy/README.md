@@ -50,6 +50,7 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 |---|---|---|
 | `targetRepo` | `CINDY_WATCHER_TARGET_REPO` | `makecindy/cindy`(公开仓库,可直接用,也可覆盖成别的仓) |
 | `watchHomes` | `CINDY_WATCHER_WATCH_HOMES`(逗号分隔) | `[]`(不内置任何路径) |
+| `keelLedgerRoot` | `CINDY_KEEL_LEDGER_ROOT` | 未配置时 finalize 的 Keel 台账检查记为 `disabled`，不拦截 |
 
 拷一份 [`config/examples/cindy.profile.example.json`](../../config/examples/cindy.profile.example.json)
 到 watcher home 下的 `config/profile.json`,把占位值换成真实路径即可。
@@ -57,6 +58,16 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 其余环境变量(`CINDY_WATCHER_MODE`/`CINDY_WATCHER_PR`/`CINDY_WATCHER_NODE_ID`/
 `CINDY_WATCHER_ENABLED`/`CINDY_WATCHER_DISPATCH`/`CINDY_WATCHER_BRIDGE`)是运行时/调度相关
 的开关,不经过 profile 机制,直接读 `process.env`,具体含义见对应源码文件头部注释。
+
+## 修复 session 的 Keel 流程
+
+派给修复 session 的消息要求全程用 Cindy 的 Keel 插件（`ghost_id=keel`），不再用 goal skill：
+
+- prepare 之后先 `pstack_start`，再用 `pstack_ledger` 记一行含 `task=<dispatchId>` 的 step，把这次 Keel run 绑定到当前任务。
+- 只允许 `jev`、`pstack_start`、`pstack_decide`、`pstack_ledger`、`pr_threads` 和手册；`pr_reply` 每次弹确认框、`pr_wait` 长轮询、`pr_status` 会读到作者转 Ready 时写的交接记录而停手，所以都禁止。GitHub 写操作仍只走 helper 与 `gh`。
+- Jev 只在固定判断点给参考（严重度未知、CI 抖动还是真失败、P0/P1 不成立的证据、修法选择），不能单独授权改代码。
+- `finalize` 需要 `--keel-run <run_id>`。配置了 `keelLedgerRoot`（Keel 插件数据目录，即含 `runs/` 的那一层）时，helper 读 `runs/<run_id>/decisions.jsonl`，找不到任务创建之后写入的绑定行就拒绝收口和推送，结果里的 `keel` 字段记录核对结论。
+- `prepare` 返回 `ciErrors`：失败必需检查所在 workflow run 的 `##[error]` 行（每个 run 最多 20 行），取不到时给出错误原因。
 
 ## CLI
 

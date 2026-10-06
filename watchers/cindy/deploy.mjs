@@ -95,8 +95,8 @@ function idle(database,ids){
  const rows=JSON.parse(execFileSync('sqlite3',['-readonly','-json',database,`select id,active_turn_pid from sessions where id in (${ids.map(v=>`'${v}'`).join(',')})`],{encoding:'utf8'}));
  requireValue(rows.length===ids.length&&rows.every(r=>r.active_turn_pid===null),'Host session active or missing');
 }
-export function validatePlan(plan){
- checkManifestCompleteness();
+export function validatePlan(plan,sourceDir=path.join(here,'bin')){
+ checkManifestCompleteness(sourceDir);
  requireValue(plan?.version===1&&path.isAbsolute(plan.home)&&path.isAbsolute(plan.database)&&plan.database.endsWith('.db'),'invalid runtime/database');
  requireValue(/^[a-z0-9][a-z0-9-]{1,80}$/.test(plan.id),'invalid release id');
  requireValue(Array.isArray(plan.files)&&plan.files.length===FILES.length&&new Set(plan.files.map(f=>f.name)).size===FILES.length&&plan.files.every(f=>FILES.includes(f.name)&&/^[a-f0-9]{64}$/.test(f.source)&&(f.runtime===null||/^[a-f0-9]{64}$/.test(f.runtime))),'invalid artifact manifest');
