@@ -19,6 +19,56 @@ function ledger(t, runId, rows) {
 
 const task = { dispatchId: 'live-7-x', keelFlow: true, createdAt: '2026-10-06T01:00:00.000Z', repo: REPO };
 
+const V2_TASK = { ...task, keelFlowVersion: 2, headRefOid: HEAD, feedback: [] };
+const V2_VERIFICATION = { status: 'not-required-no-change', head: HEAD };
+function flowRows() {
+  const common = { run_id: 'run-flow', at: '2026-10-06T01:00:01.000Z' };
+  return [
+    { ...common, kind: 'step', summary: 'start investigation（user）depth=1' },
+    { ...common, kind: 'step', summary: 'vigil task=live-7-x' },
+    { ...common, row_id: 'run-flow#3', kind: 'decision', template: 'J4', state_sha256: 'b'.repeat(64), answer: 'no-change', policy: 'act' },
+    { ...common, kind: 'evidence', evidence: { kind: 'vigil-flow', version: 2, taskId: 'live-7-x', head: HEAD,
+      playbook: 'investigation', manualPath: 'pstack/skills/poteto-mode/playbooks/investigation.md',
+      decisionRowIds: ['run-flow#3'], steps: { reproduce: 'Investigated the reported behavior', repair: 'No change required',
+        verify: { status: 'not-run', reason: 'No code changed' } } } },
+  ];
+}
+test('v2 rejects missing ledger root and marker-only runs', t => {
+  assert.throws(() => verifyKeelRun({ task: V2_TASK, root: null }), /KEEL_RUN_REQUIRED/);
+  const root = ledger(t, 'run-flow', flowRows().slice(0, 2));
+  assert.throws(() => verifyKeelRun({ task: V2_TASK, root, runId: 'run-flow', validatedHead: HEAD, verification: V2_VERIFICATION }), /KEEL_RUN_REQUIRED/);
+});
+test('v2 accepts actual task decisions and no-change evidence', t => {
+  const root = ledger(t, 'run-flow', flowRows());
+  assert.equal(verifyKeelRun({ task: V2_TASK, root, runId: 'run-flow', validatedHead: HEAD, verification: V2_VERIFICATION }).contractVersion, 2);
+});
+for (const [name, mutate] of [
+  ['wrong task marker', r => { r[1].summary += '-other'; }],
+  ['wrong HEAD', r => { r[3].evidence.head = 'c'.repeat(40); }],
+  ['only startup decision', r => { r[2].template = 'J2'; }],
+  ['handwritten decision', r => { delete r[2].state_sha256; }],
+  ['wrong run', r => { r[2].run_id = 'run-other'; }],
+  ['empty investigation', r => { r[3].evidence.steps.reproduce = ''; }],
+  ['no reason for skipped tests', r => { delete r[3].evidence.steps.verify.reason; }],
+]) test('v2 rejects ' + name, t => {
+  const rows = flowRows(); mutate(rows);
+  const root = ledger(t, 'run-flow', rows);
+  assert.throws(() => verifyKeelRun({ task: V2_TASK, root, runId: 'run-flow', validatedHead: HEAD, verification: V2_VERIFICATION }), /KEEL_RUN_REQUIRED/);
+});
+test('v2 code repair binds the helper validation receipt', t => {
+  const codeTask = { ...V2_TASK, feedback: [{ key: 'r1', source: 'greptile', user: { login: 'greptile-apps', __typename: 'Bot' }, body: 'P1: broken', category: 'actionable-fix' }] };
+  const rows = flowRows();
+  rows[0].summary = 'start bug-fix（user）depth=1';
+  Object.assign(rows[3].evidence, { playbook: 'bug-fix', manualPath: 'pstack/skills/poteto-mode/playbooks/bug-fix.md' });
+  rows[3].evidence.steps.verify = { head: HEAD, receiptSha256: 'd'.repeat(64) };
+  const root = ledger(t, 'run-flow', rows);
+  const args = { task: codeTask, root, runId: 'run-flow', validatedHead: HEAD,
+    verification: { status: 'pass', head: HEAD, receiptSha256: 'd'.repeat(64) } };
+  assert.equal(verifyKeelRun(args).status, 'verified');
+  assert.throws(() => verifyKeelRun({ ...args, verification: { ...args.verification, receiptSha256: 'e'.repeat(64) } }), /KEEL_RUN_REQUIRED/);
+});
+
+
 test('Keel gate reports disabled when no ledger root is configured', () => {
   assert.deepEqual(verifyKeelRun({ task, runId: undefined, root: null }), { status: 'disabled' });
 });
@@ -43,7 +93,7 @@ test('Keel gate accepts a run bound to this task and counts its decisions', (t) 
     { at: '2026-10-06T01:00:01.000Z', kind: 'decision', summary: 'J4 severity' },
     { at: '2026-10-06T01:00:02.000Z', kind: 'step', summary: 'vigil task=live-7-x' },
   ]);
-  assert.deepEqual(verifyKeelRun({ task, runId: 'run-ok', root }), { status: 'verified', runId: 'run-ok', rows: 2, decisions: 1 });
+  assert.deepEqual(verifyKeelRun({ task, runId: 'run-ok', root }), { status: 'verified', runId: 'run-ok', rows: 2, decisions: 1, contractVersion: 1 });
 });
 
 test('prepare CI excerpts keep only ##[error] lines, once per workflow run', () => {

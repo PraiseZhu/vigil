@@ -259,7 +259,24 @@ test('validate refuses immediately when deploy.lock is live and writes no receip
   assert.equal(fs.existsSync(dir), false);
 });
 
+test('v2 finalize never pushes with missing config or only a task registration', t => {
+  const f = fixture(t);
+  assert.equal(f.validate().status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  f.task.keelFlow = true;
+  f.task.keelFlowVersion = 2;
+  f.task.createdAt = '2026-10-06T00:00:00Z';
+  f.saveTask(f.task.feedback);
+  assert.throws(() => finalize({ ...f.options, keelRoot: null }), /KEEL_RUN_REQUIRED/);
+  const keelRoot = keelLedger(t, 'run-v2', [{run_id:'run-v2',at:'2026-10-06T00:00:01Z',kind:'step',summary:'vigil task=scope-dispatch'}]);
+  assert.throws(() => finalize({ ...f.options, keelRoot, keelRun:'run-v2' }), /KEEL_RUN_REQUIRED/);
+  assert.equal(f.pushCalls.length, 0);
+  assert.equal(f.remoteHead(), f.sourceHead);
+});
+
 function keelLedger(t, runId, rows) {
+
+
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-keel-ledger-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(path.join(root, 'runs', runId), { recursive: true });
@@ -292,7 +309,7 @@ test('finalize pushes once the Keel run carries this task binding and reports it
   ]);
   const result = finalize({ ...f.options, keelRoot, keelRun: 'run-2' });
   assert.equal(result.status, 'complete');
-  assert.deepEqual(result.keel, { status: 'verified', runId: 'run-2', rows: 2, decisions: 1 });
+  assert.deepEqual(result.keel, { status: 'verified', runId: 'run-2', rows: 2, decisions: 1, contractVersion: 1 });
   assert.equal(f.remoteHead(), f.head);
 });
 
