@@ -425,6 +425,40 @@ test('discover still defers dispatch when global remaining is under 65s', (t) =>
   assert.equal(result.prs[0].dispatch.reason, 'dispatch-budget-deferred');
 });
 
+test('budget-deferred discover retries a bound PR on the next unchanged snapshot only once', (t) => {
+  const { paths } = homeOf(t);
+  const feedbackCursor = { prior: 'observed' };
+  seedBound(paths, { pollFingerprint: 'old', feedbackCursor, repairRounds: 2 });
+  const calls = [];
+  let elapsed = 0;
+  const dispatchFn = (params) => { calls.push(params); return { target_session_id: 'sess-790' }; };
+  const deferred = discover(paths, {
+    budgetMs: 84000, perPrBudgetMs: 75000, clock: () => elapsed,
+    collect: (pr) => { elapsed += 20000; return collectFor(pr); }, dispatchFn,
+  });
+  assert.equal(deferred.collected, 1);
+  assert.equal(deferred.result.prs[0].dispatch.reason, 'dispatch-budget-deferred');
+  assert.equal(calls.length, 0);
+  assert.deepEqual(deferred.entry.feedbackCursor, feedbackCursor);
+  assert.equal(deferred.entry.repairRounds, 2);
+  assert.equal(deferred.entry.pollFingerprint, 'old');
+  assert.equal(deferred.entry.collectRetry, true);
+  const delivered = discover(paths, { clock: () => elapsed, collect: collectFor, dispatchFn });
+  assert.equal(delivered.collected, 1);
+  assert.equal(delivered.result.prs[0].dispatch.attempted, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].target_session_id, 'sess-790');
+  assert.equal(delivered.entry.repairRounds, 3);
+  assert.notDeepEqual(delivered.entry.feedbackCursor, feedbackCursor);
+  assert.equal(delivered.entry.pollFingerprint, SNAP_FINGERPRINT);
+  assert.equal(delivered.entry.collectRetry, false);
+  const unchanged = discover(paths, { clock: () => elapsed, collect: collectFor, dispatchFn });
+  assert.equal(unchanged.collected, 0);
+  assert.equal(unchanged.result.prs[0].dispatch.reason, 'fingerprint-unchanged');
+  assert.equal(unchanged.entry.repairRounds, 3);
+  assert.equal(calls.length, 1);
+});
+
 test('discover defers later PRs after the first dispatch exhausts global remaining', (t) => {
   const { paths } = homeOf(t);
   const second = { number: 791, id: 'PR_791', headRefOid: HEAD, headRefName: 'fix/y', title: 'fix', isDraft: false, labels: [] };
