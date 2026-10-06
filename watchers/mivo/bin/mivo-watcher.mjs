@@ -1394,7 +1394,8 @@ export function* pollWorkflow({
   if (state._persistBlocked) return { mode: 'poll', dispatch: !dryRun, prs: report, events };
   const collectFailed = report.some((item) => item.dispatch?.reason === 'collection-failed');
   const recheckFailed = latest.lastRecheckError?.at === now;
-  if (collectFailed || recheckFailed) {
+  const dispatchDeferred = report.some((item) => item.dispatch?.reason === 'dispatch-budget-deferred');
+  if (collectFailed || recheckFailed || dispatchDeferred) {
     save({ ...latest, pollFingerprint: previous.pollFingerprint, collectRetry: true });
   } else {
     save({ ...latest, pollFingerprint: fingerprint, collectRetry: false, needsOwner: false, optOut: latest.optOut === true });
