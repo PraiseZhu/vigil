@@ -253,23 +253,57 @@ export function keelLedgerRoot(env = process.env) {
 // Keel keeps each pstack run at runs/<run_id>/decisions.jsonl. The repair session binds its
 // run to this task by logging a row containing task=<dispatchId>; without a configured
 // ledger root, or for a pre-Keel task, the gate reports why it did not apply.
-export function verifyKeelRun({ task, runId, root = keelLedgerRoot() }) {
-  if (!root) return { status: 'disabled' };
-  // Tasks dispatched before the Keel prompt existed keep their original contract.
+export function verifyKeelRun({ task, runId, root = keelLedgerRoot(), validatedHead, verification }) {
+  const version = task.keelFlowVersion ?? 1;
+  if (!root && version !== 2) return { status: 'disabled' };
   if (task.keelFlow !== true) return { status: 'not-required-legacy-task' };
-  if (typeof runId !== 'string' || !KEEL_RUN_ID.test(runId)) fail('[KEEL_RUN_REQUIRED] finalize needs --keel-run <run_id> from Keel pstack_start');
+  const reject = message => fail('[KEEL_RUN_REQUIRED] ' + message);
+  if (version !== 1 && version !== 2) reject('unsupported Keel flow version');
+  if (!root) reject('new Keel task requires keelLedgerRoot');
+  if (typeof runId !== 'string' || !KEEL_RUN_ID.test(runId)) reject('finalize needs --keel-run <run_id> from Keel pstack_start');
   const file = path.join(requireAbs(root, 'keelLedgerRoot'), 'runs', runId, 'decisions.jsonl');
   let rows;
-  try { rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)); }
-  catch (error) { fail(`[KEEL_RUN_REQUIRED] Keel run ${runId} ledger is unreadable: ${error.message}`); }
+  try { rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)); }
+  catch (error) { reject('Keel ledger is unreadable: ' + error.message); }
   const since = Date.parse(task.createdAt ?? '');
-  const marker = `task=${task.dispatchId}`;
-  const bound = rows.some((row) => {
-    const at = Date.parse(row?.at ?? '');
-    return typeof row?.summary === 'string' && row.summary.includes(marker) && Number.isFinite(at) && !(at < since);
-  });
-  if (!bound) fail(`[KEEL_RUN_REQUIRED] Keel run ${runId} has no ledger row with ${marker} written after the task was created`);
-  return { status: 'verified', runId, rows: rows.length, decisions: rows.filter((row) => row?.kind === 'decision').length };
+  const marker = 'task=' + task.dispatchId;
+  const current = row => Number.isFinite(Date.parse(row?.at ?? '')) && Date.parse(row.at) >= since;
+  if (version === 1) {
+    if (!rows.some(row => typeof row?.summary === 'string' && row.summary.includes(marker)
+      && Number.isFinite(Date.parse(row.at)) && !(Date.parse(row.at) < since))) reject('run has no binding for ' + marker + ' written after the task was created');
+    return { status: 'verified', runId, rows: rows.length, decisions: rows.filter(row => row?.kind === 'decision').length, contractVersion: 1 };
+  }
+  if (!Number.isFinite(since) || !isSha(validatedHead)) reject('task time and validated HEAD are required');
+  const boundRows = rows.filter(row => row?.run_id === runId && current(row));
+  const playbook = taskRepairPolicy(task).canChangeCode ? 'bug-fix' : 'investigation';
+  const manualPath = 'pstack/skills/poteto-mode/playbooks/' + playbook + '.md';
+  const start = boundRows.find(row => row.kind === 'step' && typeof row.summary === 'string'
+    && row.summary.startsWith('start ' + playbook + '（'));
+  const binding = boundRows.find(row => row.kind === 'step' && row.summary === 'vigil ' + marker);
+  if (!start || !binding || Date.parse(start.at) > Date.parse(binding.at)) reject('pstack start and exact task binding are required');
+  const flowRow = [...boundRows].reverse().find(row => row.kind === 'evidence'
+    && row.evidence?.kind === 'vigil-flow' && row.evidence.taskId === task.dispatchId && row.evidence.head === validatedHead);
+  const flow = flowRow?.evidence;
+  if (!flow || flow.version !== 2 || flow.playbook !== playbook || flow.manualPath !== manualPath) reject('current HEAD flow evidence and playbook are required');
+  if (Date.parse(flowRow.at) < Date.parse(binding.at)) reject('flow evidence predates task binding');
+  const refs = flow.decisionRowIds;
+  if (!Array.isArray(refs) || !refs.length || new Set(refs).size !== refs.length) reject('flow must reference actual pstack decisions');
+  for (const id of refs) {
+    const decision = boundRows.find(row => row.row_id === id && row.kind === 'decision');
+    if (!decision || !/^J(?:[3-9]|1[0-2])$/.test(decision.template ?? '')
+      || !/^[a-f0-9]{64}$/.test(decision.state_sha256 ?? '') || decision.answer == null || decision.policy == null
+      || Date.parse(decision.at) < Date.parse(binding.at) || Date.parse(decision.at) > Date.parse(flowRow.at)) reject('referenced task decision is missing or incomplete');
+  }
+  const steps = flow.steps;
+  if (!steps || typeof steps.reproduce !== 'string' || !steps.reproduce.trim()
+    || typeof steps.repair !== 'string' || !steps.repair.trim()) reject('reproduction/investigation and disposition evidence are required');
+  if (verification?.head !== validatedHead) reject('local verification HEAD does not match');
+  if (verification.status === 'not-required-no-change') {
+    if (steps.verify?.status !== 'not-run' || typeof steps.verify.reason !== 'string' || !steps.verify.reason.trim()) reject('no-change flow must explain why local tests were not run');
+  } else if (!['pass', 'approved-exception'].includes(verification.status)
+    || steps.verify?.head !== validatedHead || !/^[a-f0-9]{64}$/.test(verification.receiptSha256 ?? '')
+    || steps.verify?.receiptSha256 !== verification.receiptSha256) reject('flow must reference the current local validation receipt');
+  return { status: 'verified', runId, rows: rows.length, decisions: refs.length, contractVersion: 2 };
 }
 
 const CI_ERROR_LINES = 20;
@@ -543,7 +577,6 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
   const { scs, feedbackCoverage } = loadScs(scReport, task);
-  const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot });
   if (validatedHead !== task.headRefOid && scs.every((sc) => sc.status === 'no-change')) {
     fail('[REPAIR_SCOPE_NO_CODE] Changed HEAD requires an SC bound to an authorized fix; no-change cannot cover commits');
   }
@@ -551,6 +584,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   const verification = noChange
     ? { status: 'not-required-no-change', head: validatedHead, localTests: 'not-run', reason: 'all SCs are no-change and task, checkout and remote HEAD match' }
     : verifiedLocal(paths, task, sessionId, validatedHead, worktree, gitFn, validationReceipt);
+  const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot, validatedHead, verification });
   const push = pushIfNeeded(worktree, task, validatedHead, branchHead, gitFn, originUrl);
   let ci;
   try { ci = checkStatus(task, validatedHead, ghFn); }
@@ -585,7 +619,7 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn =
   const remoteHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (!isSha(remoteHead)) fail('remote branch head is unavailable during recheck');
   const observedPrHead = ghPr(task, ghFn, false).headRefOid;
-  const common = { head, scs, feedbackCoverage, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
+  const common = { head, scs, feedbackCoverage, keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
   if (remoteHead !== observedPrHead) {
     return saveResult(paths, task, sessionId, { ...common, status: 'waiting-ci', reason: 'GitHub PR and remote branch views differ', checks: [],
       ci: { head, requiredGreen: false, requiredChecks: [], optionalFailures: [], pending: [], missing: ['github-remote-head-mismatch'] } });

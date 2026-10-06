@@ -412,7 +412,7 @@ export function constrainRetryDispatch(params, task) {
     policy.canChangeCode ? 'OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY' : 'OWNER_STANDING_AUTH: NO_CODE_NO_PUSH_NO_EXTERNAL_REPLY',
     '仅 allowedFeedbackKeys 可修改代码；其余项不得改代码或 SC=pass。',
     'P3/建议/未定级只在当前会话说明不修，用 no-change helper 收口；自动回复+resolve 只作用于可信来源且已定级为 P3 的 thread。未知或混合项在会话内核实或 blocked。无代码授权时不启动修复流程、不索取 push/外发权限。不得合并或扩大范围。',
-    ...(typeof task?.dispatchId === 'string' ? keelRules({ dispatchId: task.dispatchId, canChangeCode: policy.canChangeCode }) : []),
+    ...(typeof task?.dispatchId === 'string' ? keelRules({ dispatchId: task.dispatchId, canChangeCode: policy.canChangeCode, version: task.keelFlowVersion ?? 1 }) : []),
   ].join('\n') };
 }
 
@@ -461,11 +461,15 @@ export function compactPrSnapshot(collected, now) {
 }
 
 // Repair sessions run Keel's pstack flow; finalize refuses to close a task whose Keel run is not bound to it.
-export function keelRules({ dispatchId, canChangeCode }) {
+export function keelRules({ dispatchId, canChangeCode, version = 2 }) {
   return [
     `KEEL_FLOW：全程用 Keel 插件（ghost_id=keel）跑流程，不用 goal skill。prepare 之后先 pstack_start({task:"PR 修复 task=${dispatchId}", repo_dir:<prepare 返回的 worktree>, playbook:"${canChangeCode ? 'bug-fix' : 'investigation'}"})，再 pstack_ledger({op:"log", run_id, kind:"step", summary:"vigil task=${dispatchId}"}) 绑定本任务；finalize 必须带 --keel-run <run_id>，helper 核对台账后才收口。`,
     'Keel 只用 jev、pstack_start、pstack_decide、pstack_ledger、pr_threads（只读分级）和 ghost_manual；禁止 pr_status、pr_wait、pr_reply、pr_ready、pr_open、pr_board、worktree、fanout_plan、fanout_ingest（会弹确认框、长轮询或因交接记录停手）。GitHub 写操作只走本 helper 与 gh。',
     'Jev 固定判断点（pstack_decide 或 jev，结论用 pstack_ledger 记 decision）：严重度未知或混合的反馈；必需 CI 失败是基础设施抖动还是真失败；判定 P0/P1 不成立时证据是否充分；修法与连带文件。Jev 结论只作参考，不能单独授权改代码或升级严重度。Jev 不可用时记 JEV_UNAVAILABLE，未知严重度一律 blocked。Keel 本身不可用时用 helper blocked --reason keel-unavailable。',
+    ...(version === 2 ? [
+      'KEEL_FLOW_VERSION=2：读取 pstack_start 返回的 playbook 手册，按复现/调查、修法/无需改动判断、验证的固定流程执行。适用判断点用 pstack_decide 并绑定本 run；只有启动 J2 或手写 decision 不能收口。',
+      `收口前用 pstack_ledger({op:"log",run_id,kind:"evidence",summary:"vigil flow task=${dispatchId}",evidence:{kind:"vigil-flow",version:2,taskId:"${dispatchId}",head:<validated-head>,playbook:"${canChangeCode ? 'bug-fix' : 'investigation'}",manualPath:"pstack/skills/poteto-mode/playbooks/${canChangeCode ? 'bug-fix' : 'investigation'}.md",decisionRowIds:[<本run中pstack_decide返回的row_id>],steps:{reproduce:<实际复现或调查证据>,repair:<修法和处置证据>,verify:{head:<validated-head>,receiptSha256:<helper validate返回值>}}}})；全SC=no-change时verify改为{status:"not-run",reason:<无需代码验证的具体原因>}。缺证据用 blocked 保存原因，不伪造完成。`,
+    ] : []),
   ];
 }
 
@@ -666,7 +670,7 @@ function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix 
   const pending = { dispatchId, params: dispatchParams({ pr: headPr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix }), at: now, taskPath };
   if (!dryRun) {
     fs.mkdirSync(path.dirname(taskPath), { recursive: true });
-    atomic(taskPath, JSON.stringify({ dispatchId, keelFlow: true, nodeId: headPr.id, number: headPr.number, repo: REPO, headRefOid: headPr.headRefOid, headRefName: headPr.headRefName, headRepo: headRepoOf(headPr), headOwner: headOwnerOf(headPr), feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: headPr.headRefOid, feedback: fresh }), prSnapshot: compactPrSnapshot(collected, now), params: pending.params, createdAt: now }));
+    atomic(taskPath, JSON.stringify({ dispatchId, keelFlow: true, keelFlowVersion: 2, nodeId: headPr.id, number: headPr.number, repo: REPO, headRefOid: headPr.headRefOid, headRefName: headPr.headRefName, headRepo: headRepoOf(headPr), headOwner: headOwnerOf(headPr), feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: headPr.headRefOid, feedback: fresh }), prSnapshot: compactPrSnapshot(collected, now), params: pending.params, createdAt: now }));
   }
   return pending;
 }
@@ -819,13 +823,16 @@ function needsCiRecheck(active) {
     || (active?.status === 'blocked' && ['required-ci', 'optional-ci', 'ci-transport'].includes(active.blockedKind));
 }
 
-function recheckResult({ paths, previous, timeoutMs = 30000 }) {
+export function recheckResult({ paths, previous, timeoutMs = 30000, prLockToken = null }) {
+  const childEnv = { ...process.env };
+  delete childEnv[PR_LOCK_TOKEN_ENV];
+  if (prLockToken) childEnv[PR_LOCK_TOKEN_ENV] = prLockToken;
   const helper = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cindy-repair.mjs');
   return JSON.parse(execFileSync(process.execPath, [
     helper, '--home', paths.home,
     '--task', path.join(paths.stateDir, 'tasks', `${previous.activeTask.dispatchId}.json`),
     'recheck', '--validated-head', previous.activeTask.head,
-  ], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+  ], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] }));
 }
 
 function markException(previous, now, events) {
@@ -866,7 +873,7 @@ export function* processPr({
   pr, previous: previousArg, state, paths, now, events, report, viewer, dryRun,
   dispatchFn, collect, ghFn, recheckFn, ownershipSnapshot, maintenanceSessionId,
   remaining, deadline, clock, resumeCursor, resetPrDeadline, allowCreate = true, messagePrefix = '', forceCreate = false,
-  unlockForDispatch = null, relockForDispatch = null,
+  unlockForDispatch = null, relockForDispatch = null, getPrLockToken = () => null,
 } = {}) {
   const key = String(pr.id);
   let persistBlocked = false;
@@ -996,7 +1003,7 @@ export function* processPr({
         state.scan = { ...state.scan, cursor: resumeCursor, deferredNumber: pr.number };
         previous = { ...previous, recheckDeferredAt: now };
       } else {
-        yield () => recheckFn({ paths, previous, pr, timeoutMs: Math.max(1, Math.min(RECHECK_TIMEOUT_MS, remaining())) });
+        yield () => recheckFn({ paths, previous, pr, prLockToken: getPrLockToken(), timeoutMs: Math.max(1, Math.min(RECHECK_TIMEOUT_MS, remaining())) });
         previous = consumeResult(previous, resultFor(previous, paths), now);
       }
     } catch (error) {
@@ -1324,7 +1331,7 @@ export function* pollWorkflow({
   // Set when discover polls a bound PR inline: collection is capped per PR,
   // dispatch may use the rest of the round, and the PR lock is released while
   // the dispatch RPC is in flight (same rules as the create path).
-  perPrBudgetMs = null, unlockForDispatch = null, relockForDispatch = null,
+  perPrBudgetMs = null, unlockForDispatch = null, relockForDispatch = null, getPrLockToken = () => null,
 } = {}) {
   const started = clock();
   const deadline = started + Math.min(120000, Math.max(1, budgetMs));
@@ -1398,7 +1405,7 @@ export function* pollWorkflow({
   yield* processPr({
     pr, previous, state, paths, now, events, report, viewer, dryRun, dispatchFn, collect, ghFn,
     recheckFn, ownershipSnapshot, remaining, deadline, clock, allowCreate: false,
-    resetPrDeadline: () => { prDeadline = deadline; }, unlockForDispatch, relockForDispatch,
+    resetPrDeadline: () => { prDeadline = deadline; }, unlockForDispatch, relockForDispatch, getPrLockToken,
   });
   const latest = state.prs[String(nodeId)] || previous;
   // Another writer took the PR lock while the dispatch was in flight; its state wins.
@@ -1506,6 +1513,7 @@ export function* discoverWorkflow({
     }
     const unlockForDispatch = () => { prLock.release(); prLock = { release() {} }; };
     const relockForDispatch = () => { prLock = acquireLock(paths.home, `pr-${key}`); return prLock; };
+    const getPrLockToken = () => prLock.token ?? null;
     try {
     let previous = readPr(paths.home, key) || { nodeId: key, number: pr.number };
     const guide = watchGuideMessage({ prNumber: pr.number });
@@ -1533,7 +1541,7 @@ export function* discoverWorkflow({
       const polled = yield* pollWorkflow({
         now, enabled, allowDispatch, ghFn, collect, dispatchFn, paths, recheckFn, ownershipSnapshot,
         clock, budgetMs: Math.max(1, deadline - clock()), perPrBudgetMs, nodeId: key, prNumber: pr.number, gitFn, env,
-        unlockForDispatch, relockForDispatch,
+        unlockForDispatch, relockForDispatch, getPrLockToken,
       });
       const item = polled.prs?.[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'poll-empty' } };
       const text = String(item.dispatch?.error ?? '');
@@ -1569,7 +1577,7 @@ export function* discoverWorkflow({
           pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
           recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, forceCreate: true,
           messagePrefix: `${watchSuccessorMessage({ prNumber: pr.number, predecessorId, reason: text.slice(0, 120), summary })}\n${guide}`,
-          unlockForDispatch, relockForDispatch,
+          unlockForDispatch, relockForDispatch, getPrLockToken,
         });
         report.push(inner[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: true, reason: 'successor' }, predecessors: previous.predecessors });
       } else {
@@ -1653,7 +1661,7 @@ export function* discoverWorkflow({
         yield* processPr({
           pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
           recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, messagePrefix: guide,
-          unlockForDispatch, relockForDispatch,
+          unlockForDispatch, relockForDispatch, getPrLockToken,
         });
         let entry = state.prs[key] || previous;
         if (!prLock.held && !state._persistBlocked) {
@@ -1693,7 +1701,7 @@ export function* discoverWorkflow({
     yield* processPr({
       pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
       recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, messagePrefix: guide,
-      unlockForDispatch, relockForDispatch,
+      unlockForDispatch, relockForDispatch, getPrLockToken,
     });
     let entry = state.prs[key] || previous;
     if (!prLock.held && !state._persistBlocked) {
@@ -1850,7 +1858,7 @@ if (fileURLToPath(import.meta.url) === process.argv[1]) {
       let dispatchFn;
       try {
         dispatchFn = process.env.CINDY_WATCHER_BRIDGE === '1' ? createCindyStdinDispatch() : null;
-        const result = await scanOnceAsync({ paths, dispatchFn, mode, nodeId, prNumber: process.env.CINDY_WATCHER_PR });
+        const result = await scanOnceAsync({ paths, dispatchFn, mode, nodeId, getPrLockToken: () => mode === 'poll' ? lock.token : null, prNumber: process.env.CINDY_WATCHER_PR });
         process.stdout.write(`${JSON.stringify(result)}\n`);
       } catch (error) {
         process.stderr.write(`${error.stderr?.toString() || error.message}\n`);

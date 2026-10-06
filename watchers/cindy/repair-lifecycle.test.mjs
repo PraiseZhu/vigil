@@ -109,7 +109,20 @@ test('discover → bind → prepare → failing preflight → repair → DCO →
   const scReport = path.join(root, 'sc.json');
   fs.writeFileSync(scReport, JSON.stringify({ scs: [{ id: 'SC-add', status: 'pass',
     feedbackKeys: task.feedback.map(f => f.key), evidence: ['Actual node check.mjs fails before fix and passes after fix'] }] }));
-  const finalOptions = { ...options, env: validationEnv, scReport, validatedHead: head };
+  const keelRoot = path.join(root, 'keel'), keelRun = 'run-lifecycle';
+  const commonRow = { run_id: keelRun, at: new Date().toISOString() };
+  const rows = [
+    { ...commonRow, kind: 'step', summary: 'start bug-fix（user）depth=1' },
+    { ...commonRow, kind: 'step', summary: 'vigil task=' + task.dispatchId },
+    { ...commonRow, kind: 'decision', row_id: 'run-lifecycle#3', template: 'J4', state_sha256: 'b'.repeat(64), answer: 'fix', policy: 'act' },
+    { ...commonRow, kind: 'evidence', evidence: { kind: 'vigil-flow', version: 2, taskId: task.dispatchId, head,
+      playbook: 'bug-fix', manualPath: 'pstack/skills/poteto-mode/playbooks/bug-fix.md', decisionRowIds: ['run-lifecycle#3'],
+      steps: { reproduce: 'Actual check.mjs fails before repair', repair: 'Addition fixed and DCO commit created',
+        verify: { head, receiptSha256: local.receiptSha256 } } } },
+  ];
+  fs.mkdirSync(path.join(keelRoot, 'runs', keelRun), { recursive: true });
+  fs.writeFileSync(path.join(keelRoot, 'runs', keelRun, 'decisions.jsonl'), rows.map(row => JSON.stringify(row)).join('\n'));
+  const finalOptions = { ...options, env: validationEnv, scReport, validatedHead: head, keelRoot, keelRun };
   const waiting = finalize(finalOptions);
   assert.equal(waiting.status, 'waiting-ci');
   assert.equal(waiting.pushed, true);
