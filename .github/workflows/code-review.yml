@@ -1,0 +1,12 @@
+name: Isolated watcher review probe
+run-name: "Code Review [pr:${{ github.event.pull_request.number }}]"
+on:
+  pull_request_target:
+    branches: [test/watcher-live-base-20261006]
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Isolated test review entry only; no review approval is issued by this workflow.'

@@ -1,0 +1,3 @@
+#!/bin/bash
+set -eu
+node scripts/watcher-live-probe/check.mjs
