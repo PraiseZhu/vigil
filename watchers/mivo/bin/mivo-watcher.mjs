@@ -971,7 +971,7 @@ export function* processPr({
   const sameHandoffEpoch = isCurrentHandoff(previous.handoff, ownerPr, { allowHeadChange: true });
   // A controlled push becomes visible before finalize can publish its result.
   // An unconfirmed HEAD blocks work; only an ownership change revokes the task.
-  if (!freshHandoff && sameHandoffEpoch && previous.handoff.head !== ownerPr.headRefOid && !controlledHead) {
+  if (sameHandoffEpoch && previous.handoff.head !== ownerPr.headRefOid && !controlledHead) {
     state.prs[key] = { ...base, mergeReady: false, admissionReason: 'head-change-unconfirmed' };
     persistState(state, paths);
     report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'head-change-unconfirmed' } });
@@ -979,9 +979,9 @@ export function* processPr({
   }
   const retainedHandoff = sameHandoffEpoch
     && (previous.handoff.head === ownerPr.headRefOid || controlledHead) ? previous.handoff : null;
-  const handoff = freshHandoff ?? retainedHandoff;
+  const handoff = retainedHandoff ?? freshHandoff;
   if ((!retainedHandoff && (previous.activeTask?.dispatchId || previous.pendingDispatch?.dispatchId))
-    || (freshHandoff && previous.handoff && freshHandoff.id !== previous.handoff.id)) {
+    || (freshHandoff && previous.handoff && freshHandoff.id !== previous.handoff.id && !sameHandoffEpoch)) {
     previous = supersedeOnRedraft(previous, now);
     base = { ...base, ...previous };
   }
@@ -993,7 +993,7 @@ export function* processPr({
     return;
   }
   collected = { ...collected, pr: ownerPr, handoff,
-    comments: (collected.comments ?? []).filter(c => String(c.id) !== handoff.id) };
+    comments: (collected.comments ?? []).filter(c => !selectHandoff([c], ownerPr, { allowHeadChange: true })) };
   previous = { ...previous, handoff };
   base = { ...base, handoff };
   if (hasWatchOff(collected.labels)) {
@@ -1409,7 +1409,8 @@ export function* pollWorkflow({
     return { mode: 'poll', dispatch: dispatch.attempted, prs: [{ number, nodeId, dispatch }] };
   }
   if (normalized.isDraft === true) {
-    save(supersedeOnRedraft(previous, now));
+    const next = supersedeOnRedraft({ ...previous, headRefOid: normalized.headRefOid }, now);
+    if (JSON.stringify(next) !== JSON.stringify(previous)) save(next);
     return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, dispatch: { attempted: false, reason: 'draft' } }], events };
   }
   if (previous.closedHandled === true) {
@@ -1569,7 +1570,8 @@ export function* discoverWorkflow({
     let previous = readPr(paths.home, key) || { nodeId: key, number: pr.number };
     const guide = watchGuideMessage({ prNumber: pr.number });
     if (pr.isDraft === true) {
-      writePr(paths.home, key, { ...supersedeOnRedraft(previous, now), lastSeenAt: now });
+      const next = supersedeOnRedraft({ ...previous, headRefOid: pr.headRefOid, headRefName: pr.headRefName }, now);
+      if (JSON.stringify(next) !== JSON.stringify(previous)) writePr(paths.home, key, { ...next, lastSeenAt: now });
       report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'draft-author-owned' } });
       continue;
     }

@@ -73,10 +73,11 @@ test('pushIfNeeded pushes HEAD:refs/heads/<headRef>', (t) => {
     if (args.includes('rev-parse') && args.includes('HEAD')) return HEAD;
     if (args.includes('ls-remote')) return pushed ? HEAD : REMOTE;
     if (args.includes('merge-base')) return '';
+    if (args.includes('--git-path')) return path.join(worktree, '.git', 'hooks');
     if (args.includes('push')) { pushed = true; return ''; }
     return '';
   };
-  pushIfNeeded(worktree, task, HEAD, REMOTE, gitFn);
+  pushIfNeeded(worktree, task, HEAD, REMOTE, gitFn, undefined, { home: worktree, taskPath: path.join(worktree, 'task.json') });
   assert.ok(calls.some((args) => args.includes('push') && args.includes('origin') && args.includes('HEAD:refs/heads/fix/x')));
 });
 

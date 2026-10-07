@@ -6,6 +6,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { assertOwner, finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/mivo-repair.mjs';
 import { writePr } from './bin/mivo-state.mjs';
+import { ownershipGh } from './ownership-gh.fixture.mjs';
 
 const REPO = 'example-org/example-plugin';
 const finding = (priority, key = `thread:${priority}`) => ({
@@ -26,10 +27,13 @@ function fixture(t, { changed = true } = {}) {
     env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
   }).trim();
   const previousPlugin = process.env.MIVO_PLUGIN_REPO;
+  const previousGh = process.env.GH_BIN;
   process.env.MIVO_PLUGIN_REPO = plugin;
   t.after(() => {
     if (previousPlugin === undefined) delete process.env.MIVO_PLUGIN_REPO;
     else process.env.MIVO_PLUGIN_REPO = previousPlugin;
+    if (previousGh === undefined) delete process.env.GH_BIN;
+    else process.env.GH_BIN = previousGh;
     fs.rmSync(root, { recursive: true, force: true });
   });
   fs.mkdirSync(worktree, { recursive: true });
@@ -66,6 +70,7 @@ function fixture(t, { changed = true } = {}) {
     fs.writeFileSync(taskPath, JSON.stringify(task));
   };
   saveTask(task.feedback);
+  process.env.GH_BIN = ownershipGh(root, taskPath, originUrl);
   writePr(home, task.nodeId, { number: task.number, nodeId: task.nodeId, sessionId: task.sessionId,
     handoff: task.handoff, activeTask: { dispatchId: task.dispatchId } });
   let remoteHead = sourceHead;
