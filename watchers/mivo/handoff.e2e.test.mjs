@@ -47,6 +47,7 @@ import { execFileSync } from 'node:child_process';
 import { scanOnce, watcherPaths } from ${JSON.stringify(new URL('./bin/mivo-watcher.mjs', import.meta.url).href)};
 const result = scanOnce({ mode: 'discover', enabled: true, allowDispatch: true,
   paths: watcherPaths(process.env.MIVO_WATCHER_HOME), now: ${JSON.stringify(now)},
+  budgetMs: Number(process.env.E2E_BUDGET_MS ?? 120000),
   ghFn: args => execFileSync(process.env.GH_BIN, args, { encoding: 'utf8', stdio: ['ignore','pipe','pipe'] }),
   dispatchFn: params => { fs.appendFileSync(process.env.E2E_DELIVERIES, JSON.stringify(params) + '\\n');
     return { target_session_id: 'example-session' }; },
@@ -74,7 +75,8 @@ process.stdout.write(JSON.stringify(result));
     read, update: mutate => { const value = read(); mutate(value); fs.writeFileSync(serviceFile, JSON.stringify(value)); },
     entry: () => fs.existsSync(prFile) ? JSON.parse(fs.readFileSync(prFile)) : null,
     seed: value => { fs.mkdirSync(path.dirname(prFile), { recursive: true }); fs.writeFileSync(prFile, JSON.stringify(value)); },
-    scan: () => run(driver), deliveries: () => lines(deliveriesFile), calls: () => lines(callsFile),
+    scan: (budgetMs = 120000) => { env.E2E_BUDGET_MS = String(budgetMs); return run(driver); },
+    advanceHead: () => { git(['-c', 'user.name=Example User', '-c', 'user.email=example@example.invalid', 'commit', '--allow-empty', '-m', 'repair']); return git(['rev-parse', 'HEAD']); }, deliveries: () => lines(deliveriesFile), calls: () => lines(callsFile),
     handoff: (success = true) => run(path.join(bin, 'mivo-handoff.mjs'), ['handoff', '--repo', repo, '--pr', '17'], success),
     reclaim: () => run(path.join(bin, 'mivo-handoff.mjs'), ['reclaim', '--repo', repo, '--pr', '17']),
     owner: (task, success = true) => run(path.join(bin, 'mivo-repair.mjs'), ['--home', home, '--task', task, 'assert-owner'], success),
@@ -105,9 +107,9 @@ function fakeGhMain() {
   if (args[0] === 'pr' && args[1] === 'checks') return send([{ name: 'unit', state: 'SUCCESS', bucket: 'pass' }]);
   if (args[1] === 'graphql') {
     const query = args.find(a => a.startsWith('query='));
-    if (query.includes('timelineItems')) return send({ data: { node: { timelineItems: page(state.timeline) } } });
+    if (query.includes('timelineItems(first:')) return send({ data: { node: { timelineItems: page(state.timeline) } } });
     // Same transport answers both the one-query poll snapshot and full collector.
-    return send({ data: { node: { ...state.pr, labels: page([]), comments: { ...page(state.comments), totalCount: state.comments.length },
+    return send({ data: { node: { ...state.pr, timelineItems: page(state.timeline), labels: page([]), comments: { ...page(state.comments), totalCount: state.comments.length },
       reviews: { ...page([]), totalCount: 0 }, reviewThreads: page([]), commits: page([]) } } });
   }
   const endpoint = args[1] ?? '';
@@ -206,4 +208,69 @@ test('unobserved Ready → Draft → Ready at the same HEAD cannot reuse an old 
   assert.equal(f.deliveries().length, 1);
   assert.equal(f.entry().activeTask.blockedKind, 'author-reclaimed');
   assert.equal(f.entry().handoff, null);
+});
+
+function pushedResult(f, taskFile, head) {
+  const task = JSON.parse(fs.readFileSync(taskFile));
+  const file = path.join(f.home, 'state', 'results', `${task.dispatchId}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const result = { schemaVersion: 2, kind: 'mivo-repair-result', dispatchId: task.dispatchId,
+    nodeId: task.nodeId, number: task.number, repo: task.repo, sessionId: f.entry().sessionId,
+    status: 'waiting-ci', head, sourceHead: task.headRefOid, pushed: true,
+    verification: { status: 'pass', head }, ci: { head, requiredGreen: false, pending: ['unit'] },
+    receiptId: 'example-pushed-receipt', observedAt: now };
+  // Simulate the delayed helper result, not an actual preflight/validation receipt.
+  fs.writeFileSync(file, JSON.stringify(result));
+  return result;
+}
+
+function pushWindow(f) {
+  const handoff = f.handoff().receipt;
+  f.scan();
+  const task = f.task();
+  const head = f.advanceHead();
+  f.update(s => { s.pr.headRefOid = head; });
+  const pending = f.scan();
+  assert.equal(pending.prs[0].dispatch.reason, 'head-change-unconfirmed', JSON.stringify(pending));
+  assert.equal(f.deliveries().length, 1);
+  assert.notEqual(f.entry().activeTask.blockedKind, 'author-reclaimed');
+  assert.deepEqual(f.entry().handoff, handoff);
+  assert.match(f.owner(task, false), /task head is stale/);
+  return { handoff, task, head };
+}
+
+test('pushed HEAD before helper receipt pauses safely, then consumes the late result without a second writer', t => {
+  const f = fixture(t);
+  const { handoff, task, head } = pushWindow(f);
+  const fingerprint = f.entry().pollFingerprint;
+  const result = pushedResult(f, task, head);
+  // The scan has enough budget to consume the result, but intentionally defers
+  // the separate CI recheck. No fabricated local validation receipt is needed.
+  const resumed = f.scan(35000);
+  assert.equal(resumed.prs[0].dispatch.reason, 'waiting-ci', JSON.stringify(resumed));
+  assert.equal(f.entry().pollFingerprint, fingerprint, 'GitHub poll snapshot did not change');
+  assert.equal(f.entry().activeTask.receiptId, result.receiptId, 'late result bypassed the unchanged-fingerprint shortcut');
+  assert.equal(f.entry().activeTask.head, head);
+  assert.equal(f.entry().activeTask.status, 'waiting-ci');
+  assert.equal(f.entry().activeTask.blockedKind, null);
+  assert.equal(f.entry().recheckDeferredAt, now);
+  assert.equal(f.entry().lastRecheckError, undefined);
+  assert.deepEqual(f.entry().handoff, handoff);
+  assert.equal(f.deliveries().length, 1);
+});
+
+test('a genuine Draft still permanently revokes ownership while a pushed HEAD awaits its receipt', t => {
+  const f = fixture(t);
+  const { task, head } = pushWindow(f);
+  f.reclaim();
+  f.scan();
+  assert.equal(f.entry().activeTask.blockedKind, 'author-reclaimed');
+  assert.equal(f.entry().handoff, null);
+  pushedResult(f, task, head);
+  readyAgain(f);
+  f.scan();
+  assert.equal(f.entry().activeTask.blockedKind, 'author-reclaimed');
+  assert.equal(f.entry().handoff, null);
+  assert.match(f.owner(task, false), /superseded/);
+  assert.equal(f.deliveries().length, 1);
 });

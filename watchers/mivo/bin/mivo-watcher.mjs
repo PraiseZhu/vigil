@@ -968,7 +968,16 @@ export function* processPr({
   const controlledHead = previous.activeTask?.evidenceVersion === 2
     && previous.activeTask.head === ownerPr.headRefOid
     && ['waiting-ci', 'complete', 'blocked'].includes(previous.activeTask.status);
-  const retainedHandoff = isCurrentHandoff(previous.handoff, ownerPr, { allowHeadChange: true })
+  const sameHandoffEpoch = isCurrentHandoff(previous.handoff, ownerPr, { allowHeadChange: true });
+  // A controlled push becomes visible before finalize can publish its result.
+  // An unconfirmed HEAD blocks work; only an ownership change revokes the task.
+  if (!freshHandoff && sameHandoffEpoch && previous.handoff.head !== ownerPr.headRefOid && !controlledHead) {
+    state.prs[key] = { ...base, mergeReady: false, admissionReason: 'head-change-unconfirmed' };
+    persistState(state, paths);
+    report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'head-change-unconfirmed' } });
+    return;
+  }
+  const retainedHandoff = sameHandoffEpoch
     && (previous.handoff.head === ownerPr.headRefOid || controlledHead) ? previous.handoff : null;
   const handoff = freshHandoff ?? retainedHandoff;
   if ((!retainedHandoff && (previous.activeTask?.dispatchId || previous.pendingDispatch?.dispatchId))

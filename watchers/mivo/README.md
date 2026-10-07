@@ -93,6 +93,8 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 
 修复会话每次改文件、提交或外发回复前执行 `mivo-repair.mjs assert-owner --home <home> --task <task>`。`prepare`、`validate` 前后、`finalize` 推送前和 CI 复查也执行同一归属检查。网络失败不放行，旧任务没有交接回执也不放行。已确认受控 push 的回执只允许同一任务继续验证/收口，不允许旧任务继续修改已推进的 HEAD。
 
+受控 push 可能先于结果回执可见。同一 Ready 代次内，新 HEAD 尚无可信结果时，watcher 以 `head-change-unconfirmed` 暂停处理并保留原任务；晚到的有效结果会重新触发消费，即使 PR 指纹没有再次变化。未知来源的新 HEAD 不获得修复权限，真正的 Draft 或代次变化仍会永久撤销旧任务。
+
 升级保留旧任务与工作树，但不会把旧 `admissionVerified` 自动升级成交接授权。既有 Ready PR 需作者确认工作已结束后执行 `handoff`。运行中的命令不能保证被立即打断；这些检查是协作式边界检查，不是宿主对任意文件写入的强制拦截。
 
 `handoff.e2e.test.mjs` 在隔离子进程中运行真实 CLI、Git 和状态机，GitHub/Host 传输使用替身。它验证交接、投递、取回、遗漏 Draft 的代次检查与查询失败路径，不代表真实 Host 会话已被中断。
