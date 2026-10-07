@@ -43,6 +43,28 @@ function graphqlNode(extra = {}) {
 }
 const SNAP_FINGERPRINT = pollFingerprint(normalizePollSnapshot({ data: { node: graphqlNode() } }));
 
+test('Draft revokes an already dispatched repair before discovery skips it', (t) => {
+  const { paths } = homeOf(t);
+  seedBound(paths, { activeTask: { dispatchId: 'live-test-task', status: 'accepted' },
+    pendingDispatch: { dispatchId: 'live-test-task', status: 'retryable' } });
+  const { entry, collected } = discover(paths, {
+    prs: [{ ...listed, isDraft: true }],
+    dispatchFn: () => { throw new Error('author owns the Draft'); },
+  });
+  assert.equal(collected, 0);
+  assert.equal(entry.activeTask.blockedKind, 'author-reclaimed');
+  assert.equal(entry.wasDraft, true);
+  assert.equal(entry.admissionVerified, false);
+  assert.equal(entry.pendingDispatch, null);
+});
+
+test('Ready without an author handoff never starts a repair session', (t) => {
+  const { paths } = homeOf(t);
+  let sends = 0;
+  discover(paths, { collect: collectFail, dispatchFn: () => { sends++; return { target_session_id: 'new-session' }; } });
+  assert.equal(sends, 0);
+});
+
 function discover(paths, { now = '2026-09-28T00:00:00Z', prs = [listed], collect, dispatchFn, maxPrs, clock, budgetMs, perPrBudgetMs, ghExtra, node = graphqlNode(), git } = {}) {
   let collected = 0;
   // Closedown runs git cleanup; never let a test reach the real plugin repo.
