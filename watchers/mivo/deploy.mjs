@@ -7,13 +7,13 @@ import {execFileSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 const here=path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_RUNTIME='/path/to/your/runtime/mivo-watcher';
-export const FILES=['mivo-lifeline-source.mjs','mivo-feedback-policy.mjs','mivo-ci.mjs','mivo-pr-policy.mjs','mivo-pr-snapshot.mjs','mivo-repair.mjs','mivo-review-resolve.mjs','mivo-state.mjs','mivo-ownership.mjs','mivo-watcher.mjs','public-review.mjs','session-title.mjs','profile.mjs','mivo-watch-script.py','protocol.py','session-title-maintenance.py'];
+export const FILES=['mivo-handoff.mjs','mivo-lifeline-source.mjs','mivo-feedback-policy.mjs','mivo-ci.mjs','mivo-pr-policy.mjs','mivo-pr-snapshot.mjs','mivo-repair.mjs','mivo-review-resolve.mjs','mivo-state.mjs','mivo-ownership.mjs','mivo-watcher.mjs','public-review.mjs','session-title.mjs','profile.mjs','mivo-watch-script.py','protocol.py','session-title-maintenance.py'];
 // Entry points actually spawned/imported directly by the runtime. Any relative import reachable
 // from these (transitively) must be listed in FILES, or the runtime will 500 on `import()` with
 // a healthy-looking manifest (2026-09-29 incident: mivo-review-resolve.mjs was imported by
 // mivo-watcher.mjs but missing from FILES; verify() still reported all-green because it only
 // hashes what's in FILES, never what the entry points actually require).
-const ENTRY_POINTS=['mivo-watcher.mjs','mivo-repair.mjs'];
+const ENTRY_POINTS=['mivo-watcher.mjs','mivo-repair.mjs','mivo-handoff.mjs'];
 const sha=file=>fs.existsSync(file)?createHash('sha256').update(fs.readFileSync(file)).digest('hex'):null;
 const requireValue=(v,m)=>{if(!v)throw Error(m);};
 function relativeImportNames(file){

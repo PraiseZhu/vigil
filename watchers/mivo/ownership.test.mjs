@@ -1,17 +1,18 @@
+import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {scanOnce,watcherPaths,REPO} from './bin/mivo-watcher.mjs';
-const pr={id:'PR_test',number:1,headRefOid:'a'.repeat(40),baseRefOid:'b'.repeat(40),headRefName:'fix/test',title:'修复测试',isDraft:false,state:'OPEN',sameRepository:true,author:{login:'owner'},releaseEpoch:'epoch-new'};
-function probe(t,{collectedPr=pr,livePr=pr,priorEpoch='epoch-new',admission=false}={}){
+const pr=handoffPr({id:'PR_test',number:1,headRefOid:'a'.repeat(40),baseRefOid:'b'.repeat(40),headRefName:'fix/test',title:'修复测试',isDraft:false,state:'OPEN',sameRepository:true,author:{login:'owner'},releaseEpoch:'epoch-new'});
+function probe(t,{collectedPr=pr,livePr=pr,priorEpoch=pr.releaseEpoch,admission=false}={}){
  const home=fs.mkdtempSync(path.join(os.tmpdir(),'watch-owner-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
  const paths=watcherPaths(home);fs.mkdirSync(paths.stateDir,{recursive:true});
- fs.writeFileSync(paths.statePath,JSON.stringify({version:2,repo:REPO,prs:{[pr.id]:{number:1,nodeId:pr.id,sessionId:'original-session',eligibilityInitialized:true,eligibility:'active',admissionVerified:true,admissionEpoch:priorEpoch,activeTask:{status:'complete'}}}}));
+ fs.writeFileSync(paths.statePath,JSON.stringify({version:2,repo:REPO,prs:{[pr.id]:{number:1,nodeId:pr.id,sessionId:'original-session',eligibilityInitialized:true,eligibility:'active',admissionVerified:true,admissionEpoch:handoffPr({...pr,releaseEpoch:priorEpoch}).releaseEpoch,handoff:handoffReceipt(pr),activeTask:{status:'complete'}}}}));
  let calls=0;
  const result=scanOnce({enabled:true,allowDispatch:true,paths,now:'2026-09-10T00:00:00Z',ghFn:args=>args[0]==='api'?'owner':JSON.stringify([pr]),
- collect:()=>({pr:collectedPr,admissionVerified:admission,checks:[{name:'unit',state:'FAILURE',bucket:'fail'}],ci:{status:'failed',required:[{context:'unit',status:'failed',evidence:{id:1,runId:2,attempt:1}}]},policy:{status:'verified',required:[{context:'unit'}]},comments:[],reviews:[],threads:[],labels:[],mergeReady:false}),
+ collect:()=>withAuthorHandoff({pr:collectedPr,admissionVerified:admission,checks:[{name:'unit',state:'FAILURE',bucket:'fail'}],ci:{status:'failed',required:[{context:'unit',status:'failed',evidence:{id:1,runId:2,attempt:1}}]},policy:{status:'verified',required:[{context:'unit'}]},comments:[],reviews:[],threads:[],labels:[],mergeReady:false},pr),
  ownershipSnapshot:function*(){return {pr:livePr};},dispatchFn:params=>{calls++;assert.equal(params.target_session_id,'original-session');return {target_session_id:'original-session'};}});
  return {calls,result};
 }

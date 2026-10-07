@@ -114,7 +114,10 @@ function writeTask(home, extra = {}) {
   fs.mkdirSync(paths.tasks, { recursive: true });
   const task = {
     dispatchId: 'live-790', nodeId: 'PR_790', number: 790, repo: 'example-org/example-plugin',
-    sessionId: 'sess-a', headRefOid: HEAD, headRefName: 'fix/x', ...extra,
+    sessionId: 'sess-a', headRefOid: HEAD, headRefName: 'fix/x',
+    releaseEpoch: 'opened:PR_790:2026-10-01T00:00:00Z',
+    handoff: { version: 1, id: 'handoff-fixture', repo: 'example-org/example-plugin', number: 790,
+      nodeId: 'PR_790', head: HEAD, releaseEpoch: 'opened:PR_790:2026-10-01T00:00:00Z', author: 'ExampleUser' }, ...extra,
   };
   const taskPath = path.join(paths.tasks, 'live-790.json');
   fs.writeFileSync(taskPath, JSON.stringify(task));
@@ -122,7 +125,11 @@ function writeTask(home, extra = {}) {
 }
 
 function prepareFns(plugin, worktree) {
-  const ghFn = () => JSON.stringify({
+  const ghFn = (_bin, args) => args[1] === 'graphql'
+    ? JSON.stringify({ data: { node: { timelineItems: { nodes: [], pageInfo: { hasNextPage: false } } } } })
+    : JSON.stringify({ id: 'PR_790', number: 790, createdAt: '2026-10-01T00:00:00Z',
+    author: { login: 'ExampleUser' }, isCrossRepository: false, baseRefName: 'main',
+    headRepositoryOwner: { login: 'example-org' }, headRepository: { name: 'example-plugin' },
     state: 'OPEN', isDraft: false, headRefOid: HEAD, headRefName: 'fix/x', baseRefOid: REMOTE,
   });
   const gitFn = (_bin, args) => {
@@ -142,8 +149,8 @@ test('prepare reads v2 per-PR state without ReferenceError', (t) => {
   const home = homeOf(t);
   const plugin = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-'));
   t.after(() => fs.rmSync(plugin, { recursive: true, force: true }));
-  const { taskPath } = writeTask(home);
-  writePr(home, 'PR_790', { number: 790, nodeId: 'PR_790', sessionId: 'sess-a', activeTask: { dispatchId: 'live-790' } });
+  const { taskPath, task } = writeTask(home);
+  writePr(home, 'PR_790', { number: 790, nodeId: 'PR_790', sessionId: 'sess-a', handoff: task.handoff, activeTask: { dispatchId: 'live-790' } });
   const worktree = watchWorktreePath(plugin, 790);
   const { ghFn, gitFn, env } = prepareFns(plugin, worktree);
   const original = process.env.MIVO_PLUGIN_REPO;
@@ -159,10 +166,10 @@ test('prepare reads legacy state.json without ReferenceError', (t) => {
   const home = homeOf(t);
   const plugin = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-'));
   t.after(() => fs.rmSync(plugin, { recursive: true, force: true }));
-  const { paths, taskPath } = writeTask(home);
+  const { paths, taskPath, task } = writeTask(home);
   fs.mkdirSync(path.dirname(paths.state), { recursive: true });
   fs.writeFileSync(paths.state, JSON.stringify({
-    prs: { PR_790: { number: 790, nodeId: 'PR_790', sessionId: 'sess-a', activeTask: { dispatchId: 'live-790' } } },
+    prs: { PR_790: { number: 790, nodeId: 'PR_790', sessionId: 'sess-a', handoff: task.handoff, activeTask: { dispatchId: 'live-790' } } },
   }));
   const worktree = watchWorktreePath(plugin, 790);
   const { ghFn, gitFn } = prepareFns(plugin, worktree);
@@ -178,7 +185,7 @@ test('prepare refuses a task superseded by the author reclaiming the PR', (t) =>
   const home = homeOf(t);
   const plugin = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-'));
   t.after(() => fs.rmSync(plugin, { recursive: true, force: true }));
-  const { taskPath } = writeTask(home);
+  const { taskPath, task } = writeTask(home);
   writePr(home, 'PR_790', { number: 790, nodeId: 'PR_790', sessionId: 'sess-a',
     activeTask: { dispatchId: 'live-790', status: 'blocked', blockedKind: 'author-reclaimed' } });
   const { ghFn, gitFn } = prepareFns(plugin, watchWorktreePath(plugin, 790));

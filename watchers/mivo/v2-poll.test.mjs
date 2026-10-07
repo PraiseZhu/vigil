@@ -6,6 +6,7 @@ import path from 'node:path';
 import { normalizePollSnapshot, pollFingerprint, scanOnce, watcherPaths, watchDispatchConflictMessage } from './bin/mivo-watcher.mjs';
 import { planSessionTitle, repairSessionTitle } from './bin/session-title.mjs';
 import { readPr, writePr as writePrState } from './bin/mivo-state.mjs';
+import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -29,9 +30,10 @@ function snap(extra = {}) {
 }
 
 function seed(paths, extra = {}) {
+  const handoff = handoffReceipt({ id: nodeId, number: 790, headRefOid: HEAD, releaseEpoch: 'e' });
   writePrState(paths.home, nodeId, {
     number: 790, nodeId, sessionId: 'sess-790', eligibilityInitialized: true, eligibility: 'active',
-    admissionVerified: true, admissionEpoch: 'e', activeTask: { status: 'complete' },
+    admissionVerified: true, admissionEpoch: handoff.releaseEpoch, handoff, activeTask: { status: 'complete' },
     headRefName: 'fix/x', title: 'fix', ...extra,
   });
 }
@@ -53,14 +55,14 @@ function poll(paths, { snapshot, collect, dispatchFn, enabled = true, recheckFn,
     ghFn: (args) => args[0] === 'api' ? 'owner' : '[]',
     collect: (...args) => {
       collected += 1;
-      if (typeof collect === 'function') return collect(...args);
+      if (typeof collect === 'function') return withAuthorHandoff(collect(...args), args[0]);
       throw new Error('collect should not run');
     },
     dispatchFn, recheckFn, clock,
     ...(budgetMs ? { budgetMs } : {}),
     ...(git ? { gitFn: git.gitFn, env: git.env } : {}),
     ownershipSnapshot: ownershipSnapshot ?? function* () {
-      return { pr: { state: 'OPEN', isDraft: false, sameRepository: true, author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' } };
+      return { pr: handoffPr({ id: nodeId, number: 790, state: 'OPEN', isDraft: false, sameRepository: true, author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' }) };
     },
   });
   return { result, collected, entry: readPr(paths.home, nodeId) };
@@ -399,7 +401,7 @@ for (const gate of [
         ownershipSnapshot: function* () {
           ownershipCalls += 1;
           elapsed += slow ? gate.ownershipMs : 0;
-          return { pr: collectFailedCi().pr };
+          return { pr: handoffPr({ id: nodeId, number: 790, ...collectFailedCi().pr }) };
         },
         dispatchFn: (params) => { calls.push(params); return { target_session_id: 'sess-790' }; },
       };

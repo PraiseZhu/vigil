@@ -1,3 +1,4 @@
+import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -10,8 +11,8 @@ test('discover passes its actual PR lock into the recheck child', t => {
   const home=fs.mkdtempSync(path.join(os.tmpdir(),'mivo-discover-lock-'));
   t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
   const head='a'.repeat(40),nodeId='PR_lockscan',now='2026-10-06T02:00:00.000Z';
-  const pr={id:nodeId,number:7,state:'OPEN',isDraft:false,headRefOid:head,baseRefOid:'b'.repeat(40),headRefName:'fix/sample',baseRefName:'main',title:'sample',labels:[],url:'https://example.invalid/pr/7'};
-  writePr(home,nodeId,{number:7,nodeId,sessionId:'sample-session',headRefOid:head,headRefName:pr.headRefName,eligibility:'active',eligibilityInitialized:true,lastDispatch:{dispatchId:'sample-task'},activeTask:{dispatchId:'sample-task',head,status:'waiting-ci',evidenceVersion:2}});
+  const pr=handoffPr({id:nodeId,number:7,state:'OPEN',isDraft:false,headRefOid:head,baseRefOid:'b'.repeat(40),headRefName:'fix/sample',baseRefName:'main',title:'sample',labels:[],url:'https://example.invalid/pr/7',author:{login:'ExampleUser'}});
+  writePr(home,nodeId,{number:7,nodeId,sessionId:'sample-session',headRefOid:head,headRefName:pr.headRefName,eligibility:'active',eligibilityInitialized:true,handoff:handoffReceipt(pr),admissionEpoch:pr.releaseEpoch,lastDispatch:{dispatchId:'sample-task'},activeTask:{dispatchId:'sample-task',head,status:'waiting-ci',evidenceVersion:2}});
   fs.mkdirSync(path.join(home,'state','results'),{recursive:true});
   const result={schemaVersion:2,kind:'mivo-repair-result',dispatchId:'sample-task',nodeId,number:7,repo:'example-org/example-plugin',sessionId:'sample-session',head,status:'waiting-ci',observedAt:now,receiptId:'sample-receipt'};
   fs.writeFileSync(path.join(home,'state','results','sample-task.json'),JSON.stringify(result));
@@ -21,7 +22,7 @@ test('discover passes its actual PR lock into the recheck child', t => {
   let rechecks=0;
   const report=scanOnce({mode:'discover',now,enabled:true,allowDispatch:true,paths:watcherPaths(home),dispatchFn:()=>{assert.fail('must reuse existing session without a new delivery')},
     ghFn:a=>{if(a[0]==='pr'&&a[1]==='list')return JSON.stringify([pr]);if(a[1]==='user')return 'ExampleUser';if(a[1]==='graphql')return JSON.stringify({data:{node:{...pr,comments:{totalCount:0,nodes:[]},reviews:{totalCount:0,nodes:[]},reviewThreads:{nodes:[],pageInfo:{hasNextPage:false}},commits:{nodes:[]},labels:{nodes:[],pageInfo:{hasNextPage:false}}}}});throw Error('unexpected fixture API')},
-    collect:()=>({pr:{...pr,sameRepository:true,isCrossRepository:true,headRepositoryOwner:{login:'ExampleUser'},headRepository:{name:'cindy-fork'},author:{login:'ExampleUser'},releaseEpoch:'e'},comments:[],reviews:[],threads:[],checks:[],labels:[],mergeable:'MERGEABLE',admissionVerified:true,mergeReady:false,ci:{status:'pending',required:[]}}),
+    collect:()=>withAuthorHandoff({pr:{...pr,sameRepository:true,isCrossRepository:false,headRepositoryOwner:{login:'example-org'},headRepository:{name:'example-plugin'}},comments:[],reviews:[],threads:[],checks:[],labels:[],mergeable:'MERGEABLE',admissionVerified:true,mergeReady:false,ci:{status:'pending',required:[]}},pr),
     recheckFn:({prLockToken})=>{rechecks++;assert.ok(prLockToken);assert.notEqual(prLockToken,discover.token);
       const file=path.join(home,'state','locks','pr-'+nodeId+'.lock');assert.equal(fs.readFileSync(file,'utf8').trim().split(/\s+/)[2],prLockToken);return result;},
   });
@@ -43,13 +44,14 @@ test('real recheck child writes under the PR lock without releasing parent owner
  git('-C',worktree,'remote','add','origin','https://github.com/'+headRepo+'.git');
  git('-C',worktree,'update-ref','refs/remotes/origin/fix/sample',head);git('-C',worktree,'branch','--set-upstream-to=origin/fix/sample');
  const paths=repairPaths(home);fs.mkdirSync(paths.tasks,{recursive:true});
- const task={dispatchId:'sample-task',nodeId:'PR_sample',number:7,repo,headRefOid:head,headRefName:'fix/sample',feedback:[],};
+ const task={dispatchId:'sample-task',nodeId:'PR_sample',number:7,repo,headRefOid:head,headRefName:'fix/sample',feedback:[],releaseEpoch:'opened:PR_sample:2026-10-01T00:00:00Z'};
+ task.handoff={version:1,id:'handoff-fixture',repo,number:7,nodeId:task.nodeId,head,releaseEpoch:task.releaseEpoch,author:'ExampleUser'};
  fs.writeFileSync(path.join(paths.tasks,'sample-task.json'),JSON.stringify(task));
- const previous={activeTask:{dispatchId:task.dispatchId,head}};writePr(home,task.nodeId,{...previous,nodeId:task.nodeId,number:7,sessionId:'sample-session'});
+ const previous={handoff:task.handoff,activeTask:{dispatchId:task.dispatchId,head}};writePr(home,task.nodeId,{...previous,nodeId:task.nodeId,number:7,sessionId:'sample-session'});
  fs.mkdirSync(paths.results,{recursive:true});
  fs.writeFileSync(path.join(paths.results,'sample-task.json'),JSON.stringify({schemaVersion:2,kind:'mivo-repair-result',...task,sessionId:'sample-session',head,status:'waiting-ci',scs:[{id:'scope',status:'no-change',feedbackKeys:[],evidence:['No code repair requested']}],keel:{status:'not-required-legacy-task'},verification:{status:'not-required-no-change',head}}));
  const gh=path.join(root,'fake-gh'),gitBin=path.join(root,'fake-git');
- const ghCode="const a=process.argv.slice(2),h=process.env.FIXTURE_HEAD;if(a[0]==='pr'&&a[1]==='view')console.log(JSON.stringify({id:'PR_sample',number:7,state:'OPEN',isDraft:false,headRefOid:h,headRefName:'fix/sample',baseRefOid:h,baseRefName:'main'}));else{console.error('fixture CI unavailable');process.exit(1)}";
+ const ghCode="const a=process.argv.slice(2),h=process.env.FIXTURE_HEAD;if(a[0]==='pr'&&a[1]==='view')console.log(JSON.stringify({id:'PR_sample',number:7,state:'OPEN',isDraft:false,headRefOid:h,headRefName:'fix/sample',baseRefOid:h,baseRefName:'main',createdAt:'2026-10-01T00:00:00Z',author:{login:'ExampleUser'},isCrossRepository:false,headRepositoryOwner:{login:'example-org'},headRepository:{name:'example-plugin'}}));else if(a[1]==='graphql')console.log(JSON.stringify({data:{node:{timelineItems:{nodes:[],pageInfo:{hasNextPage:false}}}}}));else{console.error('fixture CI unavailable');process.exit(1)}";
  const gitCode="const a=process.argv.slice(2);if(a[0]==='ls-remote')console.log(process.env.FIXTURE_HEAD+'\\trefs/heads/fix/sample');else{const r=require('node:child_process').spawnSync('git',a,{env:process.env,encoding:'utf8'});process.stdout.write(r.stdout||'');process.stderr.write(r.stderr||'');process.exit(r.status??1)}";
  fs.writeFileSync(gh,'#!'+process.execPath+'\n'+ghCode,{mode:0o700});fs.writeFileSync(gitBin,'#!'+process.execPath+'\n'+gitCode,{mode:0o700});
  const vars={GH_BIN:gh,GIT_BIN:gitBin,FIXTURE_HEAD:head,MIVO_WATCHER_HOME:home,MIVO_PLUGIN_REPO:plugin,MIVO_PR_LOCK_TOKEN:''};

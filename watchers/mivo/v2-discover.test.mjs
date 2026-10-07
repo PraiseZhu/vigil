@@ -4,10 +4,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { END_TURN_RULE, pollFingerprint, normalizePollSnapshot, scanOnce, watcherPaths, watchGuideMessage, watchSuccessorMessage } from './bin/mivo-watcher.mjs';
+import { END_TURN_RULE, applyDispatchReceipt, pollFingerprint, normalizePollSnapshot, scanOnce, watcherPaths, watchGuideMessage, watchSuccessorMessage } from './bin/mivo-watcher.mjs';
 import { clearOwnerUnknown } from './bin/mivo-repair.mjs';
 import { repairSessionTitle } from './bin/session-title.mjs';
 import { acquireLock, readPr, statePaths, writePr } from './bin/mivo-state.mjs';
+import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -61,11 +62,11 @@ test('Draft revokes an already dispatched repair before discovery skips it', (t)
 test('Ready without an author handoff never starts a repair session', (t) => {
   const { paths } = homeOf(t);
   let sends = 0;
-  discover(paths, { collect: collectFail, dispatchFn: () => { sends++; return { target_session_id: 'new-session' }; } });
+  discover(paths, { authorHandoff: false, collect: collectFail, dispatchFn: () => { sends++; return { target_session_id: 'new-session' }; } });
   assert.equal(sends, 0);
 });
 
-function discover(paths, { now = '2026-09-28T00:00:00Z', prs = [listed], collect, dispatchFn, maxPrs, clock, budgetMs, perPrBudgetMs, ghExtra, node = graphqlNode(), git } = {}) {
+function discover(paths, { now = '2026-09-28T00:00:00Z', prs = [listed], collect, dispatchFn, maxPrs, clock, budgetMs, perPrBudgetMs, ghExtra, node = graphqlNode(), git, authorHandoff = true } = {}) {
   let collected = 0;
   // Closedown runs git cleanup; never let a test reach the real plugin repo.
   const plugin = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-discover-plugin-'));
@@ -86,12 +87,15 @@ function discover(paths, { now = '2026-09-28T00:00:00Z', prs = [listed], collect
     },
     collect: (...args) => {
       collected += 1;
-      if (typeof collect === 'function') return collect(...args);
+      if (typeof collect === 'function') {
+        const value = collect(...args);
+        return authorHandoff ? withAuthorHandoff(value, args[0]) : value;
+      }
       throw new Error('collect should not run');
     },
     dispatchFn, maxPrs, clock, budgetMs, perPrBudgetMs,
     ownershipSnapshot: function* () {
-      return { pr: { state: 'OPEN', isDraft: false, sameRepository: true, author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' } };
+      return { pr: handoffPr({ id: nodeId, number: 790, state: 'OPEN', isDraft: false, sameRepository: true, author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' }) };
     },
   });
   fs.rmSync(plugin, { recursive: true, force: true });
@@ -99,9 +103,10 @@ function discover(paths, { now = '2026-09-28T00:00:00Z', prs = [listed], collect
 }
 
 function seedBound(paths, extra = {}) {
+  const handoff = handoffReceipt({ ...listed, releaseEpoch: 'e' });
   writePr(paths.home, nodeId, {
     number: 790, nodeId, sessionId: 'sess-790', claimedAt: '2026-09-27T00:00:00Z',
-    eligibilityInitialized: true, eligibility: 'active', admissionVerified: true, admissionEpoch: 'e',
+    eligibilityInitialized: true, eligibility: 'active', admissionVerified: true, admissionEpoch: handoff.releaseEpoch, handoff,
     activeTask: { status: 'complete' }, headRefName: 'fix/x', title: 'fix', ...extra,
   });
 }
@@ -593,10 +598,19 @@ test('discover does not closedown still-open PR missing from list', (t) => {
   assert.equal(result.prs.find((item) => item.nodeId === nodeId).dispatch.reason, 'stale-still-open');
 });
 
+function claimHandoff(paths) {
+  const handoff = handoffReceipt(listed);
+  const task = { dispatchId: 'live-790-old', repo: handoff.repo, nodeId, number: 790,
+    headRefOid: HEAD, headRefName: listed.headRefName, handoff, releaseEpoch: handoff.releaseEpoch, feedback: [] };
+  fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
+  fs.writeFileSync(path.join(paths.stateDir, 'tasks', 'live-790-old.json'), JSON.stringify(task));
+  return handoff;
+}
+
 test('claim timeout with known session wakes it once', (t) => {
   const { paths } = homeOf(t);
   writePr(paths.home, nodeId, {
-    number: 790, nodeId,
+    number: 790, nodeId, handoff: claimHandoff(paths),
     pendingDispatch: {
       status: 'awaiting-claim',
       dispatchId: 'live-790-old',
@@ -622,7 +636,7 @@ test('claim timeout with known session wakes it once', (t) => {
 test('claim-retry-wakeup without cached params falls back to repairSessionTitle', (t) => {
   const { paths } = homeOf(t);
   writePr(paths.home, nodeId, {
-    number: 790, nodeId,
+    number: 790, nodeId, handoff: claimHandoff(paths),
     pendingDispatch: {
       status: 'awaiting-claim',
       dispatchId: 'live-790-old',
@@ -655,4 +669,24 @@ test('bound Draft PR with stale heartbeat is left to the author, not woken', (t)
   assert.equal(collected, 0);
   assert.equal(result.prs[0].dispatch.reason, 'draft-author-owned');
   assert.equal(entry.lastLostReminderAt, undefined);
+});
+
+test('a late dispatch receipt cannot revive a task reclaimed by the author', (t) => {
+  const { paths } = homeOf(t);
+  const previous = { number: 790, nodeId, sessionId: 'original-session', wasDraft: true, handoff: null,
+    activeTask: { dispatchId: 'late-task', status: 'blocked', blockedKind: 'author-reclaimed' },
+    authorReclaimed: { dispatchId: 'late-task', at: '2026-09-28T00:00:00Z' } };
+  writePr(paths.home, nodeId, previous);
+  const state = { prs: { [nodeId]: previous } };
+  const result = applyDispatchReceipt({ state, pr: listed, mapping: {},
+    receipt: { target_session_id: 'late-session', dispatch_id: 'late-task' }, paths,
+    now: '2026-09-28T00:01:00Z' });
+  assert.equal(result.bound, false);
+  assert.equal(readPr(paths.home, nodeId).activeTask.blockedKind, 'author-reclaimed');
+  assert.equal(readPr(paths.home, nodeId).sessionId, 'original-session');
+});
+
+test('same HEAD and comments with a new Ready event changes the poll fingerprint', () => {
+  assert.notEqual(pollFingerprint(graphqlNode({ timelineItems: { nodes: [{ id: 'ready-one' }] } })),
+    pollFingerprint(graphqlNode({ timelineItems: { nodes: [{ id: 'ready-two' }] } })));
 });

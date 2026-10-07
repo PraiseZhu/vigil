@@ -1,3 +1,4 @@
+import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -359,12 +360,12 @@ function scanHome(t) {
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const paths = watcherPaths(home);
   fs.mkdirSync(paths.stateDir, { recursive: true });
-  const listed = { number: 1, id: 'PR_1', headRefOid: HEAD, headRefName: 'fix/x', title: 't', isDraft: false };
+  const listed = handoffPr({ number: 1, id: 'PR_1', headRefOid: HEAD, headRefName: 'fix/x', title: 't', isDraft: false });
   fs.writeFileSync(paths.statePath, JSON.stringify({
     version: 2, repo: REPO, prs: {
       PR_1: {
         number: 1, nodeId: 'PR_1', sessionId: 's1', eligibilityInitialized: true, eligibility: 'active',
-        admissionVerified: true, admissionEpoch: 'e', activeTask: { status: 'complete' },
+        admissionVerified: true, admissionEpoch: listed.releaseEpoch, handoff: handoffReceipt(listed), activeTask: { status: 'complete' },
       },
     },
   }));
@@ -375,7 +376,8 @@ function runScan(paths, listed, collect, dispatchFn, now = '2026-09-10T00:00:00Z
   return scanOnce({
     enabled: true, allowDispatch: true, paths, now,
     ghFn: (args) => args[0] === 'api' ? 'owner' : JSON.stringify([listed]),
-    collect, dispatchFn,
+    collect: (...args) => withAuthorHandoff(collect(...args), listed),
+    ownershipSnapshot: function* () { return { pr: handoffPr(listed) }; }, dispatchFn,
   });
 }
 
@@ -551,7 +553,9 @@ test('cached pre-upgrade retry gets recomputed no-code authority and keeps its o
 
 function saveLowTask(paths, dispatchId) {
   const dir=path.join(paths.stateDir,'tasks');fs.mkdirSync(dir,{recursive:true});
-  fs.writeFileSync(path.join(dir,`${dispatchId}.json`),JSON.stringify({dispatchId,headRefOid:HEAD,
+  fs.writeFileSync(path.join(dir,`${dispatchId}.json`),JSON.stringify({dispatchId,headRefOid:HEAD,nodeId:'PR_1',number:1,repo:REPO,headRefName:'fix/x',
+    handoff: handoffReceipt({ id:'PR_1', number:1, headRefOid:HEAD }),
+    releaseEpoch: handoffPr({ id:'PR_1' }).releaseEpoch,
     feedback:[{...botItem('**P2** naming nit'),key:'comment:low',sha:HEAD}],
     params:{message:'old prompt\nOWNER_STANDING_AUTH: PR_PUSH_AND_REPLY',target_session_id:'s1'}}));
 }
@@ -578,21 +582,35 @@ test('missing-result recovery rebuilds low-only task without broad grant', t=>{
   assert.equal(out.prs[0].dispatch.reason,'missing-result-recovery');assertNoExternalAuthority(sent.message);
 });
 
-for (const withTask of [true,false]) test(`discover claim-retry strips old P2 grant (task exists=${withTask})`,t=>{
+for (const withTask of [true,false,'legacy']) test(`discover claim-retry requires bound task and strips old P2 grant (task=${withTask})`,t=>{
   const home=fs.mkdtempSync(path.join(os.tmpdir(),'claim-policy-'));
   t.after(()=>fs.rmSync(home,{recursive:true,force:true}));const paths=watcherPaths(home);
   fs.mkdirSync(paths.stateDir,{recursive:true});const id='live-1-legacy-claim';
   if(withTask) saveLowTask(paths,id);
-  writePr(home,'PR_1',{number:1,nodeId:'PR_1',headRefOid:HEAD,headRefName:'fix/x',pendingDispatch:{
+  if(withTask === 'legacy') {
+    const taskPath=path.join(paths.stateDir,'tasks',`${id}.json`);
+    const legacyTask=JSON.parse(fs.readFileSync(taskPath));
+    delete legacyTask.handoff;
+    fs.writeFileSync(taskPath,JSON.stringify(legacyTask));
+  }
+  const currentPr=handoffPr({id:'PR_1',number:1,headRefOid:HEAD,headRefName:'fix/x',labels:[]});
+  writePr(home,'PR_1',{number:1,nodeId:'PR_1',headRefOid:HEAD,headRefName:'fix/x',handoff:handoffReceipt(currentPr),pendingDispatch:{
     status:'awaiting-claim',dispatchId:id,claimDeadline:'2026-09-10T00:00:00Z',createdSessionId:'s1',
     params:{title:'t',message:'schedule-prefix\nOWNER_STANDING_AUTH: PR_PUSH_AND_REPLY',target_session_id:'s1'},
   }});
   let sent;const out=scanOnce({mode:'discover',enabled:true,allowDispatch:true,paths,now:'2026-09-10T01:00:00Z',
     ghFn:args=>args[0]==='api'&&args[1]==='user'?'owner':args[0]==='pr'&&args[1]==='list'?JSON.stringify([{id:'PR_1',number:1,headRefOid:HEAD,isDraft:false,labels:[]}]):'[]',
+    ownershipSnapshot:function*(){return {pr:currentPr};},
     collect:()=>{throw Error('must not collect');},dispatchFn:p=>{sent=p;return {target_session_id:'s1',dispatch_id:id};},
   });
-  assert.equal(out.prs[0].dispatch.reason,'claim-retry-wakeup');assertNoExternalAuthority(sent.message);
-  assert.ok(sent.message.startsWith('schedule-prefix'));
+  if (withTask === true) {
+    assert.equal(out.prs[0].dispatch.reason,'claim-retry-wakeup');assertNoExternalAuthority(sent.message);
+    assert.ok(sent.message.startsWith('schedule-prefix'));
+  } else {
+    assert.equal(out.prs[0].dispatch.reason,'recovery-handoff-invalid');
+    assert.equal(out.prs[0].dispatch.attempted,false);
+    assert.equal(sent,undefined);
+  }
 });
 test('retry high finding retains the exact goal standing authorization marker once',()=>{
   const out=constrainRetryDispatch({message:'prefix\nOWNER_STANDING_AUTH: PR_PUSH_AND_REPLY\nOWNER_STANDING_AUTH: OLD'},
