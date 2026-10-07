@@ -111,3 +111,19 @@ test('schema 2 without controlEpoch blocks the source; config schema stays 1',t=
   f.state.controlEpoch='epoch-1';f.write();f.config.schemaVersion=2;save(f.configPath,f.config);
   assert.equal(lifelineFeedback(f.pr).error,'doctor-source-not-authorized');
 });
+test('migration and epoch rotation preserve delivered feedback identity without accepting stale authority',t=>{
+  const f=fixture(t),v1=lifelineFeedback(f.pr).items[0],sent=newFeedback({},[v1]);
+  asV2(f);const legacy=lifelineFeedback(f.pr).items[0];
+  assert.equal(newFeedback(sent.cursor,[legacy]).fresh.length,0);
+  assert.equal(verifiedLifelineFeedback(v1,{headSha:f.pr.headRefOid}),false);
+  assert.equal(verifiedLifelineFeedback(legacy,{headSha:f.pr.headRefOid}),true);
+  asV2(f,{mode:'work-item',workId:'work-1'});const work=lifelineFeedback(f.pr).items[0];
+  assert.equal(newFeedback(sent.cursor,[work]).fresh.length,0);
+  assert.equal(verifiedLifelineFeedback(legacy,{headSha:f.pr.headRefOid}),false);
+  asV2(f,{epoch:'epoch-2',mode:'work-item',workId:'work-1'});const rotated=lifelineFeedback(f.pr).items[0];
+  assert.equal(newFeedback(sent.cursor,[rotated]).fresh.length,0);
+  assert.equal(verifiedLifelineFeedback(work,{headSha:f.pr.headRefOid}),false);
+  assert.equal(verifiedLifelineFeedback(rotated,{headSha:f.pr.headRefOid}),true);
+  f.d.classificationReason.at++;f.write();
+  assert.equal(newFeedback(sent.cursor,lifelineFeedback(f.pr).items).fresh.length,1);
+});

@@ -63,6 +63,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 配置 `schemaVersion` 仍为 1。台账可读 schema 1 或 2；schema 2 必须有非空 `controlEpoch`，
 缺陷须显式 `ownershipMode=legacy|work-item`，并把 epoch、归属与 `workId` 写入 proof。
 缺字段不当成 legacy。使用前再次读真源，拒旧 epoch、错 workItem、换 owner 与调用者自填权限。
+投递去重沿用确认失败的身份，不把 schema 迁移或 epoch/workId 变化当新证据；完整 proof 仍绑定当前归属，旧 proof 不能因去重键相同而继续获权。
 同一证据幂等去重并续交该 PR 的既有会话；修复 helper 在使用任务时再次读取来源和字节，
 过期世代、已降级的记录、变更证据与调用者自填的权限标记均不能授权写代码。
 普通作者评论仍按原来的调查权限处理；本地接入不改变 GitHub CI、审查或单写者要求，

@@ -64,6 +64,13 @@ function statement(d,ctx) {
     observationId:o.id,sourceSha:o.sourceSha,evidenceSha256:o.evidence.sha256,classifiedAt:reason.at,severity:progress.severity,
     caseId:d.caseId,outcomeCode:d.outcomeCode,...ownership};
 }
+// Delivery identity follows the confirmed failure, not a storage migration.
+// Authority still includes the full current proof and is re-read on every use.
+function feedbackIdentity(proof) {
+  const stable = {...proof};
+  delete stable.controlEpoch;delete stable.ownershipMode;delete stable.workId;
+  return hash(JSON.stringify(stable));
+}
 export function lifelineFeedback(pr) {
   try {
     const ctx = context(pr.repo);
@@ -74,7 +81,7 @@ export function lifelineFeedback(pr) {
         || d.github?.number !== pr.number || d.github.state !== 'OPEN' || d.github.isDraft !== false || d.github.headSha !== pr.headRefOid) continue;
       const proof = statement(d,ctx);
       if (!proof) continue;
-      const stamp = hash(JSON.stringify(proof)), reason = (d.phase === 'repair' ? d : d.resumeProgress).classificationReason;
+      const stamp = feedbackIdentity(proof), reason = (d.phase === 'repair' ? d : d.resumeProgress).classificationReason;
       items.push({source:'lifeline-doctor',nativeId:stamp,revision:stamp,contentHash:stamp,sha:pr.headRefOid,
         doctor:proof,body:`${proof.severity}: Confirmed local lifeline failure\nCase: ${proof.caseId}\nTrigger: ${reason.trigger}\nImpact: ${reason.impact}\nEvidence SHA-256: ${proof.evidenceSha256}\nFailed source: ${proof.sourceSha}\nReason: ${reason.reason}`});
     }
@@ -92,6 +99,6 @@ export function verifiedLifelineFeedback(item,{headSha}={}) {
     if (!d || d.repo !== item.doctor.repo || d.pr?.repo !== d.repo || d.pr?.number !== item.doctor.number) return false;
     const current = statement(d,ctx);
     return Boolean(current && JSON.stringify(current) === JSON.stringify(item.doctor)
-      && hash(JSON.stringify(current)) === item.nativeId && item.contentHash === item.nativeId);
+      && feedbackIdentity(current) === item.nativeId && item.contentHash === item.nativeId);
   } catch { return false; }
 }
