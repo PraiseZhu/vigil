@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/mivo-repair.mjs';
+import { assertOwner, finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/mivo-repair.mjs';
 import { writePr } from './bin/mivo-state.mjs';
 
 const REPO = 'example-org/example-plugin';
@@ -55,7 +55,10 @@ function fixture(t, { changed = true } = {}) {
   fs.mkdirSync(paths.tasks, { recursive: true });
   const taskPath = path.join(paths.tasks, 'scope-dispatch.json');
   const task = { dispatchId: 'scope-dispatch', nodeId: 'PR_790', number: 790, repo: REPO,
-    sessionId: 'scope-session', headRefOid: sourceHead, headRefName: 'fix/scope', feedback: [finding('P1')] };
+    sessionId: 'scope-session', headRefOid: sourceHead, headRefName: 'fix/scope', feedback: [finding('P1')],
+    releaseEpoch: 'opened:PR_790:2026-10-01T00:00:00Z' };
+  task.handoff = { version: 1, id: 'handoff-fixture', repo: REPO, number: 790, nodeId: task.nodeId,
+    head: sourceHead, releaseEpoch: task.releaseEpoch, author: 'ExampleUser' };
   const saveTask = (feedback) => {
     task.feedback = feedback;
     // A stale or forged cached policy must not override the underlying feedback.
@@ -64,7 +67,7 @@ function fixture(t, { changed = true } = {}) {
   };
   saveTask(task.feedback);
   writePr(home, task.nodeId, { number: task.number, nodeId: task.nodeId, sessionId: task.sessionId,
-    activeTask: { dispatchId: task.dispatchId } });
+    handoff: task.handoff, activeTask: { dispatchId: task.dispatchId } });
   let remoteHead = sourceHead;
   const pushCalls = [];
   const ghCalls = [];
@@ -79,11 +82,14 @@ function fixture(t, { changed = true } = {}) {
     return out;
   };
   const pr = () => ({ id: task.nodeId, number: task.number, state: 'OPEN', isDraft: false,
-    headRefOid: remoteHead, headRefName: task.headRefName, baseRefOid: sourceHead, baseRefName: 'main' });
+    headRefOid: remoteHead, headRefName: task.headRefName, baseRefOid: sourceHead, baseRefName: 'main',
+    createdAt: '2026-10-01T00:00:00Z', author: { login: 'ExampleUser' }, isCrossRepository: false,
+    headRepositoryOwner: { login: 'example-org' }, headRepository: { name: 'example-plugin' } });
   const ghFn = (_binary, args) => {
     ghCalls.push(args);
     if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify(pr());
     const endpoint = args[1];
+    if (endpoint === 'graphql') return JSON.stringify({ data: { node: { timelineItems: { nodes: [], pageInfo: { hasNextPage: false } } } } });
     if (endpoint === `repos/${REPO}/branches/main`) return JSON.stringify({ protected: true });
     if (endpoint === `repos/${REPO}/branches/main/protection`) return JSON.stringify({ required_status_checks: {
       contexts: ['verify'], checks: [{ context: 'verify', app_id: 123 }],
@@ -279,4 +285,92 @@ test('finalize keeps closing tasks dispatched before the Keel prompt', (t) => {
   const result = finalize({ ...f.options, keelRoot });
   assert.equal(result.status, 'complete');
   assert.deepEqual(result.keel, { status: 'not-required-legacy-task' });
+});
+
+
+test('assert-owner refuses tasks without explicit handoff and stale GitHub heads', t => {
+  const f = fixture(t);
+  assert.equal(assertOwner(f.options).status, 'owned');
+  assert.throws(() => assertOwner({ ...f.options, ownershipFn: () => { throw Error('network unavailable'); } }), /network unavailable/);
+  const { handoff } = f.task;
+  delete f.task.handoff;
+  f.saveTask(f.task.feedback);
+  assert.throws(() => assertOwner(f.options), /handoff/i);
+  f.task.handoff = handoff;
+  f.saveTask(f.task.feedback);
+  assert.throws(() => assertOwner({ ...f.options, ownershipFn: () => ({ repo: REPO, number: 790,
+    id: f.task.nodeId, state: 'OPEN', isDraft: false, sameRepository: true, identityVerified: true,
+    createdAt: '2026-10-01T00:00:00Z', author: { login: 'ExampleUser' }, headRefName: f.task.headRefName, headRefOid: 'f'.repeat(40),
+    releaseEpoch: f.task.releaseEpoch }) }), /head/i);
+});
+
+for (const loss of ['draft', 'epoch', 'reclaimed', 'network']) {
+  test(`validate refuses a pass receipt when ownership changes during preflight: ${loss}`, t => {
+    const f = fixture(t);
+    let after = false;
+    const ghFn = (binary, args) => {
+      if (after && loss === 'network') throw Error('network unavailable');
+      const value = JSON.parse(f.options.ghFn(binary, args));
+      if (after && loss === 'draft' && args[0] === 'pr') value.isDraft = true;
+      if (after && loss === 'epoch' && args[1] === 'graphql') value.data.node.timelineItems.nodes = [
+        { __typename: 'ReadyForReviewEvent', id: 'new-release', createdAt: '2026-10-02T00:00:00Z' },
+      ];
+      return JSON.stringify(value);
+    };
+    const result = validate({ ...f.options, ghFn, runFn: () => {
+      after = true;
+      if (loss === 'reclaimed') writePr(f.options.home, f.task.nodeId, { sessionId: f.task.sessionId,
+        handoff: null, activeTask: { dispatchId: f.task.dispatchId } });
+      return 'checks passed';
+    } });
+    assert.equal(result.status, 'fail');
+    assert.match(JSON.parse(fs.readFileSync(result.receiptPath)).reason, /handoff|OPEN|draft|epoch|network/i);
+    assert.equal(f.pushCalls.length, 0);
+  });
+}
+
+test('finalize rechecks ownership immediately before any push', t => {
+  const f = fixture(t);
+  assert.equal(f.validate().status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  let checks = 0;
+  const ghFn = (binary, args) => {
+    const value = JSON.parse(f.options.ghFn(binary, args));
+    if (args[0] === 'pr' && args[1] === 'view') {
+      checks++;
+      if (checks >= 3) value.isDraft = true;
+    }
+    return JSON.stringify(value);
+  };
+  assert.throws(() => finalize({ ...f.options, ghFn }), /OPEN|draft|handoff/i);
+  assert.equal(f.pushCalls.length, 0);
+});
+
+
+test('only recorded controlled pushes let finalize and recheck retain the task ownership', t => {
+  const f = fixture(t);
+  assert.equal(f.validate().status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  assert.equal(f.finalize().pushed, true);
+  // A bare write checkpoint never opts in to the validated-head recovery path.
+  assert.throws(() => assertOwner(f.options), /head is stale/);
+  assert.equal(recheck(f.options).status, 'complete');
+  assert.equal(f.finalize().pushed, true);
+  assert.equal(recheck(f.options).status, 'complete');
+  assert.equal(f.pushCalls.length, 1);
+});
+
+test('assert-owner refuses superseded tasks and changed handoff binding at the same head', t => {
+  const f = fixture(t);
+  const base = { sessionId: f.task.sessionId, handoff: f.task.handoff,
+    activeTask: { dispatchId: f.task.dispatchId } };
+  for (const entry of [
+    { ...base, activeTask: null },
+    { ...base, activeTask: { dispatchId: 'new-task' } },
+    { ...base, handoff: { ...f.task.handoff, id: 'replacement' } },
+    { ...base, handoff: { ...f.task.handoff, releaseEpoch: 'another-release' } },
+  ]) {
+    writePr(f.options.home, f.task.nodeId, entry);
+    assert.throws(() => assertOwner(f.options), /handoff|dispatch/);
+  }
 });

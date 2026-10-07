@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { planSessionTitle, repairSessionTitle } from './session-title.mjs';
 import { collectPublicReview } from './public-review.mjs';
 import { collectPrSnapshot, collectPrOwnership } from './mivo-pr-snapshot.mjs';
+import { selectHandoff, isCurrentHandoff } from './mivo-handoff.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './mivo-state.mjs';
 import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor } from './mivo-feedback-policy.mjs';
 import {lifelineFeedback} from './mivo-lifeline-source.mjs';
@@ -373,13 +374,15 @@ const MAX_RECOVERIES = 3;
 // watcher task is superseded: no recovery re-delivery, no in-flight lock on
 // the next Ready, and the repair helper refuses to finalize it.
 export function supersedeOnRedraft(entry, now) {
-  const active = entry.activeTask;
-  if (entry.wasDraft === true || !active?.dispatchId) return entry;
-  if (['blocked', 'complete', 'legacy-complete'].includes(active.status)) return entry;
+  const revoked = { ...entry, wasDraft: true, admissionVerified: false, admissionEpoch: null,
+    handoff: null, mergeReady: false, pendingDispatch: null, dispatchError: null };
+  const active = entry.activeTask?.dispatchId ? entry.activeTask : entry.pendingDispatch;
+  if (!active?.dispatchId || ['complete', 'legacy-complete'].includes(active.status)
+    || active.blockedKind === AUTHOR_RECLAIMED) return revoked;
   return {
-    ...entry,
+    ...revoked,
     activeTask: { ...active, status: 'blocked', blockedKind: AUTHOR_RECLAIMED, at: now,
-      reason: 'PR returned to Draft; the author session reclaimed it and this watcher task is superseded.' },
+      reason: 'Author ownership changed; this watcher task is superseded and cannot resume.' },
     authorReclaimed: { at: now, dispatchId: active.dispatchId },
   };
 }
@@ -410,6 +413,9 @@ function readTaskForRecovery(previous, paths, now = new Date().toISOString()) {
   let task;
   try { task = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
   if (!task || typeof task.params !== 'object' || !task.params) return null;
+  if (!task.handoff || task.handoff.id !== previous.handoff?.id
+    || task.handoff.releaseEpoch !== previous.handoff?.releaseEpoch
+    || previous.activeTask?.blockedKind === AUTHOR_RECLAIMED) return null;
   const resultFile = path.join(paths.stateDir, 'results', `${dispatchId}.json`);
   if (fs.existsSync(resultFile)) return null;
   return { dispatchId, params: task.params, task, recoveryCount: count + 1 };
@@ -419,6 +425,12 @@ function readDispatchTask(paths, dispatchId) {
   if (typeof dispatchId !== 'string' || !dispatchId || path.basename(dispatchId) !== dispatchId) return {};
   try { return JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), 'utf8')); }
   catch { return {}; } // Missing task cannot grant authority.
+}
+
+function taskOwnsPr(task, entry, pr) {
+  return task.nodeId === pr.id && task.number === pr.number && task.repo === REPO
+    && task.headRefOid === pr.headRefOid && task.handoff?.id === entry.handoff?.id
+    && isCurrentHandoff(task.handoff, { ...pr, repo: REPO }, { allowHeadChange: true });
 }
 
 // Retried delivery may contain a prompt generated before the policy upgrade.
@@ -521,6 +533,7 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
         ...keelRules({ dispatchId: path.basename(taskPath, '.json'), canChangeCode: repairPolicy.canChangeCode }),
         'prepare 返回的 ciErrors 是失败必需 job 的 ##[error] 摘录，先据此分类，不够再读完整 job 日志。',
         `第一步：node ${shellQuote(path.join(home, 'bin', 'mivo-repair.mjs'))} --home ${shellQuote(home)} --task ${shellQuote(taskPath)} prepare。等待 watcher 的真实 session 绑定；只在返回的独立 worktree 改代码，禁止在 automation 根目录改产品。`,
+        '每次改文件、commit 或 GitHub 回复/resolve 前，先运行同一 helper assert-owner；它重新核对作者交接回执、当前 HEAD 和 Ready 代次。查询失败、回 Draft 或任务已失效就立即停止，不按旧快照继续。validate 前后和 finalize 推送前也会复核归属。',
         '允许路径：当前 PR 代码及解决反馈必需的直接调用/测试/文档；新增产品范围、CI配置、模型路由、密钥、生产数据不在授权内。外部服务失败写 blocked；禁止无依据反复 rerun。',
         '验证：该 worktree 仓库规定的 preflight 和受影响测试；每个 SC 记录真实命令/结果/HEAD，不伪造 PASS。',
         '验证收据：commit 后先运行同一 helper validate --validated-head <完整SHA>，由 helper 执行仓库 preflight；禁止 PREFLIGHT_SKIP 或自行写验证 PASS。无改动必须全部 SC=no-change 并保留未运行本地验证的事实。',
@@ -626,6 +639,7 @@ export function normalizePollSnapshot(payload) {
     || (suiteNodes?.nodes ?? []).some((suite) => suite.checkRuns?.pageInfo?.hasNextPage));
   return {
     state: node.state, isDraft: node.isDraft, headRefOid: node.headRefOid, baseRefOid: node.baseRefOid,
+    releaseEventId: node.timelineItems?.nodes?.at(-1)?.id ?? node.releaseEventId ?? null,
     mergeable: node.mergeable, labels,
     checks: normalizeChecks(checks),
     commentCount: comments?.totalCount ?? comments?.length ?? node.commentCount ?? 0,
@@ -641,6 +655,7 @@ export function pollFingerprint(snapshot) {
   const normalized = snapshot.checks ? snapshot : normalizePollSnapshot(snapshot);
   return digest({
     state: normalized.state, isDraft: normalized.isDraft, headRefOid: normalized.headRefOid,
+    releaseEventId: normalized.releaseEventId ?? null,
     baseRefOid: normalized.baseRefOid, mergeable: normalized.mergeable,
     labels: [...(normalized.labels ?? [])].map((item) => typeof item === 'string' ? item : item?.name).filter(Boolean).sort(),
     checks: normalizeChecks(normalized.checks),
@@ -652,7 +667,7 @@ export function pollFingerprint(snapshot) {
   });
 }
 function* fetchPollSnapshot({ nodeId, ghFn }) {
-  const query = 'query($id:ID!){node(id:$id){... on PullRequest{state isDraft headRefOid baseRefOid mergeable labels(first:50){pageInfo{hasNextPage} nodes{name}} comments(last:1){totalCount nodes{updatedAt}} reviews(last:1){totalCount nodes{updatedAt}} reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved comments(last:1){nodes{updatedAt}}}} commits(last:1){nodes{commit{checkSuites(first:30){pageInfo{hasNextPage} nodes{checkRuns(first:40){pageInfo{hasNextPage} nodes{name status conclusion databaseId detailsUrl}}}}}}}}}}';
+  const query = 'query($id:ID!){node(id:$id){... on PullRequest{state isDraft headRefOid baseRefOid mergeable timelineItems(last:1,itemTypes:[READY_FOR_REVIEW_EVENT,CONVERT_TO_DRAFT_EVENT]){nodes{... on ReadyForReviewEvent{id} ... on ConvertToDraftEvent{id}}} labels(first:50){pageInfo{hasNextPage} nodes{name}} comments(last:1){totalCount nodes{updatedAt}} reviews(last:1){totalCount nodes{updatedAt}} reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved comments(last:1){nodes{updatedAt}}}} commits(last:1){nodes{commit{checkSuites(first:30){pageInfo{hasNextPage} nodes{checkRuns(first:40){pageInfo{hasNextPage} nodes{name status conclusion databaseId detailsUrl}}}}}}}}}}';
   const raw = yield () => ghFn(['api', 'graphql', '-f', `query=${query}`, '-F', `id=${nodeId}`]);
   return normalizePollSnapshot(JSON.parse(raw));
 }
@@ -666,7 +681,7 @@ function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix 
   const pending = { dispatchId, params: dispatchParams({ pr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix }), at: now, taskPath };
   if (!dryRun) {
     fs.mkdirSync(path.dirname(taskPath), { recursive: true });
-    atomic(taskPath, JSON.stringify({ dispatchId, keelFlow: true, keelFlowVersion: 2, nodeId: pr.id, number: pr.number, repo: REPO, headRefOid: pr.headRefOid, headRefName: pr.headRefName, feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }), prSnapshot: compactPrSnapshot(collected, now), params: pending.params, createdAt: now }));
+    atomic(taskPath, JSON.stringify({ dispatchId, keelFlow: true, keelFlowVersion: 2, nodeId: pr.id, number: pr.number, repo: REPO, headRefOid: pr.headRefOid, headRefName: pr.headRefName, handoff: collected?.handoff, releaseEpoch: collected?.pr?.releaseEpoch, feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }), prSnapshot: compactPrSnapshot(collected, now), params: pending.params, createdAt: now }));
   }
   return pending;
 }
@@ -697,6 +712,11 @@ export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor,
   const key = String(pr.id);
   const previous = readPr(paths.home, key) || state.prs[key] || {};
   const thisId = receipt.dispatch_id ?? previous.pendingDispatch?.dispatchId;
+  if (previous.wasDraft === true || (thisId && previous.authorReclaimed?.dispatchId === thisId)) {
+    state.prs[key] = { ...previous, lateDispatchReceipt: { dispatchId: thisId, sessionId, at: now } };
+    persistState(state, paths);
+    return { bound: false, reason: 'author-reclaimed' };
+  }
   const expected = previous.pendingDispatch?.dispatchId;
   if (expected && thisId && expected !== thisId) {
     throw new Error('dispatch receipt does not match pending dispatch');
@@ -906,7 +926,7 @@ export function* processPr({
     } };
   }
   const mapping = planSession({ pr, existing: previous, date: now });
-  const base = {
+  let base = {
     ...previous, headRefOid: pr.headRefOid, headRefName: pr.headRefName, url: pr.url,
     title: mapping.title, titleDate: mapping.titleDate, taskName: mapping.taskName, lastSeenAt: now,
     ...(previous.activeTask ? {activeTask:{...previous.activeTask,resultHeadCurrent:previous.activeTask.head===pr.headRefOid}} : {}),
@@ -938,10 +958,44 @@ export function* processPr({
     return;
   }
   if (collected.pr && (collected.pr.state !== 'OPEN' || collected.pr.isDraft || !collected.pr.sameRepository || collected.pr.author?.login !== viewer)) {
-    state.prs[key] = { ...base, admissionVerified: false, admissionEpoch: null };
+    state.prs[key] = supersedeOnRedraft(base, now);
+    persistState(state, paths);
     report.push({ number: pr.number, dispatch: {attempted:false,reason:'ownership-no-longer-released'} });
     return;
   }
+  const ownerPr = { ...pr, ...collected.pr, repo: REPO };
+  const freshHandoff = selectHandoff(collected.comments, ownerPr);
+  const controlledHead = previous.activeTask?.evidenceVersion === 2
+    && previous.activeTask.head === ownerPr.headRefOid
+    && ['waiting-ci', 'complete', 'blocked'].includes(previous.activeTask.status);
+  const sameHandoffEpoch = isCurrentHandoff(previous.handoff, ownerPr, { allowHeadChange: true });
+  // A controlled push becomes visible before finalize can publish its result.
+  // An unconfirmed HEAD blocks work; only an ownership change revokes the task.
+  if (!freshHandoff && sameHandoffEpoch && previous.handoff.head !== ownerPr.headRefOid && !controlledHead) {
+    state.prs[key] = { ...base, mergeReady: false, admissionReason: 'head-change-unconfirmed' };
+    persistState(state, paths);
+    report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'head-change-unconfirmed' } });
+    return;
+  }
+  const retainedHandoff = sameHandoffEpoch
+    && (previous.handoff.head === ownerPr.headRefOid || controlledHead) ? previous.handoff : null;
+  const handoff = freshHandoff ?? retainedHandoff;
+  if ((!retainedHandoff && (previous.activeTask?.dispatchId || previous.pendingDispatch?.dispatchId))
+    || (freshHandoff && previous.handoff && freshHandoff.id !== previous.handoff.id)) {
+    previous = supersedeOnRedraft(previous, now);
+    base = { ...base, ...previous };
+  }
+  if (!handoff) {
+    state.prs[key] = { ...base, handoff: null, admissionVerified: false, admissionEpoch: null,
+      admissionReason: 'author-handoff-required', mergeReady: false };
+    persistState(state, paths);
+    report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'author-handoff-required' } });
+    return;
+  }
+  collected = { ...collected, pr: ownerPr, handoff,
+    comments: (collected.comments ?? []).filter(c => String(c.id) !== handoff.id) };
+  previous = { ...previous, handoff };
+  base = { ...base, handoff };
   if (hasWatchOff(collected.labels)) {
     previous = { ...base, labels: collected.labels ?? [], optOut: true };
     state.prs[key] = previous;
@@ -1089,6 +1143,12 @@ export function* processPr({
     && Number(previous.pendingDispatch.attempts ?? 1) < 3
     && Date.parse(previous.pendingDispatch.retryAt) <= Date.parse(now)) {
     const retryTask = readDispatchTask(paths, previous.pendingDispatch.dispatchId);
+    if (!taskOwnsPr(retryTask, previous, ownerPr)) {
+      state.prs[key] = supersedeOnRedraft(previous, now);
+      persistState(state, paths);
+      report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'recovery-handoff-invalid' } });
+      return;
+    }
     const pending = { ...previous.pendingDispatch, attempts: Number(previous.pendingDispatch.attempts ?? 1) + 1,
       params: constrainRetryDispatch({ ...previous.pendingDispatch.params, title: mapping.title }, retryTask) };
     state.prs[key] = { ...previous, pendingDispatch: pending };
@@ -1348,6 +1408,10 @@ export function* pollWorkflow({
     });
     return { mode: 'poll', dispatch: dispatch.attempted, prs: [{ number, nodeId, dispatch }] };
   }
+  if (normalized.isDraft === true) {
+    save(supersedeOnRedraft(previous, now));
+    return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, dispatch: { attempted: false, reason: 'draft' } }], events };
+  }
   if (previous.closedHandled === true) {
     const lock = acquireLock(paths.home, `pr-${nodeId}`);
     if (!lock.held) {
@@ -1504,6 +1568,11 @@ export function* discoverWorkflow({
     try {
     let previous = readPr(paths.home, key) || { nodeId: key, number: pr.number };
     const guide = watchGuideMessage({ prNumber: pr.number });
+    if (pr.isDraft === true) {
+      writePr(paths.home, key, { ...supersedeOnRedraft(previous, now), lastSeenAt: now });
+      report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'draft-author-owned' } });
+      continue;
+    }
     if (previous.closedHandled === true) {
       previous = { ...previous, closedHandled: false, reopenedAt: now };
       writePr(paths.home, key, previous);
@@ -1513,11 +1582,6 @@ export function* discoverWorkflow({
     });
     if (previous.needsHuman) {
       report.push({ number: pr.number, nodeId: key, needsHuman: previous.needsHuman, dispatch: { attempted: false, reason: 'needs-human' } });
-      continue;
-    }
-    if (previous.sessionId && pr.isDraft === true) {
-      // Draft belongs to the author session; never wake the watcher session for it.
-      report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'draft-author-owned' } });
       continue;
     }
     if (previous.sessionId) {
@@ -1584,10 +1648,21 @@ export function* discoverWorkflow({
         ?? null;
       if (retries < CLAIM_RETRY_LIMIT && !dryRun && remaining() >= 1000) {
         if (targetSessionId && typeof dispatchFn === 'function') {
+          const retryTask = readDispatchTask(paths, previous.pendingDispatch.dispatchId);
+          let live;
+          try { live = yield* ownershipSnapshot({ pr: { number: pr.number, repo: REPO }, ghFn }); }
+          catch { /* A missing ownership response never authorizes another input. */ }
+          const current = live?.pr && { ...pr, ...live.pr, repo: REPO };
+          if (!current || current.author?.login !== viewer || !taskOwnsPr(retryTask, previous, current)) {
+            if (current) writePr(paths.home, key, supersedeOnRedraft(previous, now));
+            report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false,
+              reason: current ? 'recovery-handoff-invalid' : 'ownership-query-unavailable' } });
+            continue;
+          }
           const retryParams = constrainRetryDispatch({
             ...(previous.pendingDispatch.params ?? { title: previous.title || repairSessionTitle({ task: pr.title, prNumber: pr.number, createdAt: now }), message: guide }),
             target_session_id: targetSessionId,
-          }, readDispatchTask(paths, previous.pendingDispatch.dispatchId));
+          }, retryTask);
           try {
             const receipt = yield () => dispatchFn(retryParams, { timeoutMs: Math.max(1, remaining()) });
             if (receipt?.target_session_id) {

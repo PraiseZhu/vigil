@@ -1,3 +1,4 @@
+import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -25,7 +26,7 @@ function fixture(t) {
   const state={schemaVersion:1,revision:1,defects:{[key]:d}};save(configPath,config);save(statePath,state);
   const previous=process.env.MIVO_WATCHER_LIFELINE_CONFIG;process.env.MIVO_WATCHER_LIFELINE_CONFIG=configPath;
   t.after(()=>{if(previous===undefined)delete process.env.MIVO_WATCHER_LIFELINE_CONFIG;else process.env.MIVO_WATCHER_LIFELINE_CONFIG=previous;fs.rmSync(root,{recursive:true,force:true});});
-  const pr={repo:REPO,id:'PR_fixture',number:900,title:'Fixture Ready repair',url:`https://github.com/${REPO}/pull/900`,headRefOid:sha,baseRefOid:'d'.repeat(40),headRefName:'fix/fixture',state:'OPEN',isDraft:false,author:{login:'ExampleUser'},sameRepository:true,releaseEpoch:'fixture'};
+  const pr=handoffPr({repo:REPO,id:'PR_fixture',number:900,title:'Fixture Ready repair',url:`https://github.com/${REPO}/pull/900`,headRefOid:sha,baseRefOid:'d'.repeat(40),headRefName:'fix/fixture',state:'OPEN',isDraft:false,author:{login:'ExampleUser'},sameRepository:true,releaseEpoch:'fixture'});
   return {root,configPath,statePath,evidencePath,key,d,state,config,pr,write:()=>save(statePath,state)};
 }
 test('confirmed Doctor failure reaches the existing mini owner with repair permission and no duplicate delivery',t=>{
@@ -34,15 +35,15 @@ test('confirmed Doctor failure reaches the existing mini owner with repair permi
   assert.equal(assertTaskRepairScope({headRefOid:f.pr.headRefOid,feedback:[item]},'e'.repeat(40)).canChangeCode,true);
   const first=newFeedback({},entry.items);assert.equal(first.fresh.length,1);assert.equal(newFeedback(first.cursor,lifelineFeedback(f.pr).items).fresh.length,0);
   const home=path.join(f.root,'shadow'),paths=watcherPaths(home);fs.mkdirSync(path.join(home,'config'),{recursive:true});
-  const now=new Date().toISOString(),watchState={version:2,repo:REPO,prs:{[f.pr.id]:{nodeId:f.pr.id,number:900,sessionId:'existing-mini-session',claimedAt:now,headRefOid:f.pr.headRefOid,eligibility:'active',eligibilityInitialized:true,admissionVerified:true,admissionEpoch:'fixture',wasDraft:false,feedbackCursor:{},repairRounds:0,activeTask:{status:'complete',head:f.pr.headRefOid,resultHeadCurrent:true}}}};
-  const snapshot={pr:f.pr,checks:[],requiredChecks:[],ci:{status:'green',required:[]},comments:[],reviews:[],threads:[],labels:[],mergeable:'MERGEABLE',admissionVerified:true,requiredChecksGreen:true,mergeReady:true,policy:{status:'verified'}};
+  const now=new Date().toISOString(),watchState={version:2,repo:REPO,prs:{[f.pr.id]:{nodeId:f.pr.id,number:900,sessionId:'existing-mini-session',claimedAt:now,headRefOid:f.pr.headRefOid,eligibility:'active',eligibilityInitialized:true,admissionVerified:true,admissionEpoch:f.pr.releaseEpoch,handoff:handoffReceipt(f.pr),wasDraft:false,feedbackCursor:{},repairRounds:0,activeTask:{status:'complete',head:f.pr.headRefOid,resultHeadCurrent:true}}}};
+  const snapshot=withAuthorHandoff({pr:f.pr,checks:[],requiredChecks:[],ci:{status:'green',required:[]},comments:[],reviews:[],threads:[],labels:[],mergeable:'MERGEABLE',admissionVerified:true,requiredChecksGreen:true,mergeReady:true,policy:{status:'verified'}}, f.pr);
   const report=[],events=[],forbidden=()=>{throw Error('external operation must not run in a fixture');};
   const listed={...f.pr};delete listed.state;delete listed.author;
   const run=processPr({pr:listed,state:watchState,paths,now,events,report,viewer:'ExampleUser',dryRun:true,dispatchFn:forbidden,collect:()=>snapshot,ghFn:forbidden,recheckFn:forbidden,ownershipSnapshot:forbidden,maintenanceSessionId:null,remaining:()=>120000,deadline:Date.now()+120000,clock:Date.now,resumeCursor:0,allowCreate:false,forceCreate:false});
   let next=run.next();while(!next.done)next=run.next(next.value());
   assert.equal(report[0].fresh,1);assert.equal(report[0].dispatch.reason,'dry-run');assert.equal(report[0].dispatch.pending.params.target_session_id,'existing-mini-session');
   assert.match(report[0].dispatch.pending.params.message,/OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY/);
-  assert.equal(snapshot.mergeReady,false);
+  assert.equal(report[0].mergeReady,false);
 });
 test('repair helper rejects a cached permission after evidence, owner generation or classification changes',t=>{
   const f=fixture(t),item=lifelineFeedback(f.pr).items[0],task={headRefOid:f.pr.headRefOid,feedback:[item],repairPolicy:{canChangeCode:true}};

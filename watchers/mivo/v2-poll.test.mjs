@@ -6,6 +6,7 @@ import path from 'node:path';
 import { normalizePollSnapshot, pollFingerprint, scanOnce, watcherPaths, watchDispatchConflictMessage } from './bin/mivo-watcher.mjs';
 import { planSessionTitle, repairSessionTitle } from './bin/session-title.mjs';
 import { readPr, writePr as writePrState } from './bin/mivo-state.mjs';
+import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -29,9 +30,10 @@ function snap(extra = {}) {
 }
 
 function seed(paths, extra = {}) {
+  const handoff = handoffReceipt({ id: nodeId, number: 790, headRefOid: HEAD, releaseEpoch: 'e' });
   writePrState(paths.home, nodeId, {
     number: 790, nodeId, sessionId: 'sess-790', eligibilityInitialized: true, eligibility: 'active',
-    admissionVerified: true, admissionEpoch: 'e', activeTask: { status: 'complete' },
+    admissionVerified: true, admissionEpoch: handoff.releaseEpoch, handoff, activeTask: { status: 'complete' },
     headRefName: 'fix/x', title: 'fix', ...extra,
   });
 }
@@ -45,7 +47,7 @@ function fakeGit(t, { status = '' } = {}) {
   return { plugin, calls, gitFn, env: { MIVO_PLUGIN_REPO: plugin } };
 }
 
-function poll(paths, { snapshot, collect, dispatchFn, enabled = true, recheckFn, git, budgetMs, clock, ownershipSnapshot } = {}) {
+function poll(paths, { snapshot, collect, dispatchFn, enabled = true, recheckFn, git, budgetMs, clock, ownershipSnapshot, authorHandoff = true } = {}) {
   let collected = 0;
   const result = scanOnce({
     mode: 'poll', enabled, allowDispatch: true, paths, now, nodeId, prNumber: 790,
@@ -53,14 +55,17 @@ function poll(paths, { snapshot, collect, dispatchFn, enabled = true, recheckFn,
     ghFn: (args) => args[0] === 'api' ? 'owner' : '[]',
     collect: (...args) => {
       collected += 1;
-      if (typeof collect === 'function') return collect(...args);
+      if (typeof collect === 'function') {
+        const value = collect(...args);
+        return authorHandoff ? withAuthorHandoff(value, args[0]) : value;
+      }
       throw new Error('collect should not run');
     },
     dispatchFn, recheckFn, clock,
     ...(budgetMs ? { budgetMs } : {}),
     ...(git ? { gitFn: git.gitFn, env: git.env } : {}),
     ownershipSnapshot: ownershipSnapshot ?? function* () {
-      return { pr: { state: 'OPEN', isDraft: false, sameRepository: true, author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' } };
+      return { pr: handoffPr({ id: nodeId, number: 790, state: 'OPEN', isDraft: false, sameRepository: true, author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' }) };
     },
   });
   return { result, collected, entry: readPr(paths.home, nodeId) };
@@ -399,7 +404,7 @@ for (const gate of [
         ownershipSnapshot: function* () {
           ownershipCalls += 1;
           elapsed += slow ? gate.ownershipMs : 0;
-          return { pr: collectFailedCi().pr };
+          return { pr: handoffPr({ id: nodeId, number: 790, ...collectFailedCi().pr }) };
         },
         dispatchFn: (params) => { calls.push(params); return { target_session_id: 'sess-790' }; },
       };
@@ -571,4 +576,39 @@ test('re-Ready after reclaim dispatches fresh work with the reset note, not a re
   });
   assert.ok(later);
   for (const p of calls.slice(1)) assert.doesNotMatch(p.message, /作者收回过本 PR/);
+});
+
+test('a pushed HEAD waits for its late result without revoking the author handoff', (t) => {
+  const { paths } = homeOf(t);
+  seedInFlight(paths);
+  const nextHead = 'c'.repeat(40);
+  const original = withAuthorHandoff(collectFailedCi(), { id: nodeId, number: 790, headRefOid: HEAD });
+  const collected = { ...original, pr: { ...original.pr, headRefOid: nextHead }, checks: [],
+    ci: { status: 'pending', required: [] } };
+  const snapshot = snap({ headRefOid: nextHead });
+  const options = { snapshot, authorHandoff: false, collect: () => collected,
+    dispatchFn: () => { throw new Error('unconfirmed HEAD must not create another writer'); } };
+  const first = poll(paths, options);
+  assert.equal(first.result.prs[0].dispatch.reason, 'head-change-unconfirmed');
+  assert.equal(first.entry.activeTask.status, 'accepted');
+  assert.equal(first.entry.handoff.head, HEAD);
+  assert.equal(first.entry.authorReclaimed, undefined);
+  assert.equal(poll(paths, options).collected, 0);
+
+  const late = { schemaVersion: 2, kind: 'mivo-repair-result', dispatchId: 'live-790-old',
+    nodeId, number: 790, repo: original.pr.repo, sessionId: 'sess-790', head: nextHead,
+    status: 'waiting-ci', pushed: true, verification: { status: 'pass', head: nextHead }, receiptId: 'late-push-result' };
+  fs.mkdirSync(path.join(paths.stateDir, 'results'), { recursive: true });
+  fs.writeFileSync(path.join(paths.stateDir, 'results', 'live-790-old.json'), JSON.stringify(late));
+  const resumed = poll(paths, { ...options, recheckFn: () => late });
+  assert.equal(resumed.collected, 1, 'a result must be consumed even without a new PR fingerprint');
+  assert.equal(resumed.entry.activeTask.status, 'waiting-ci');
+  assert.equal(resumed.entry.activeTask.head, nextHead);
+  assert.equal(resumed.entry.handoff.id, first.entry.handoff.id);
+  assert.equal(resumed.entry.authorReclaimed, undefined);
+
+  const draft = poll(paths, { snapshot: snap({ headRefOid: nextHead, isDraft: true }),
+    dispatchFn: options.dispatchFn });
+  assert.equal(draft.entry.activeTask.blockedKind, 'author-reclaimed');
+  assert.equal(draft.entry.handoff, null);
 });

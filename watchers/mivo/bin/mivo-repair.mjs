@@ -8,6 +8,8 @@ import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { collectMivoCiSync } from './mivo-ci.mjs';
+import { collectPrOwnershipSync } from './mivo-pr-snapshot.mjs';
+import { isCurrentHandoff } from './mivo-handoff.mjs';
 import { taskRepairPolicy } from './mivo-feedback-policy.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, readPr, writePr } from './mivo-state.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
@@ -180,7 +182,44 @@ function boundSession(paths, task) {
   if (entry.activeTask?.blockedKind === AUTHOR_RECLAIMED && entry.activeTask.dispatchId === task.dispatchId) {
     fail('task superseded: the author reclaimed this PR (Ready -> Draft); wait for the next watcher dispatch');
   }
-  return { sessionId: entry.sessionId };
+  return { sessionId: entry.sessionId, entry };
+}
+
+// This gate is also the repair session's explicit checkpoint before editing or
+// committing. A task file, Ready state, or an old validation receipt alone is not
+// ownership. Always query GitHub again; transport errors must stop the operation.
+export function assertOwner({ home, taskPath, ghFn = command, ownershipFn = collectPrOwnershipSync,
+  validatedHead, allowValidatedHead = false } = {}) {
+  const { paths, task } = taskFrom(home, taskPath);
+  const { sessionId, entry } = boundSession(paths, task);
+  if (entry.activeTask?.dispatchId !== task.dispatchId) fail('task dispatchId is not the active watcher dispatch');
+  const receipt = task.handoff;
+  const keys = ['version', 'id', 'repo', 'number', 'nodeId', 'head', 'releaseEpoch', 'author'];
+  if (!receipt || !entry.handoff || keys.some(key => receipt[key] !== entry.handoff[key])
+    || receipt.releaseEpoch !== task.releaseEpoch) fail('handoff missing, revoked, or replaced; author must hand off again');
+  const pr = ownershipFn({ pr: { repo: task.repo, number: task.number }, ghFn: args => ghFn(GH, args) });
+  if (!isCurrentHandoff(receipt, pr, { allowHeadChange: true })) fail('handoff no longer matches OPEN non-draft PR identity, author, or release epoch');
+  if (pr.id !== task.nodeId || pr.headRefName !== task.headRefName) fail('handoff PR or branch does not match task');
+  if (pr.headRefOid !== task.headRefOid) {
+    let controlled = false;
+    if (allowValidatedHead && isSha(validatedHead) && pr.headRefOid === validatedHead) {
+      const file = path.join(paths.results, `${task.dispatchId}.json`);
+      if (fs.existsSync(file)) {
+        const result = readJson(file, 'repair result');
+        assertIdentity(result, task, sessionId, 'repair result');
+        controlled = result.schemaVersion === 2 && result.kind === 'mivo-repair-result'
+          && result.head === validatedHead && result.pushed === true
+          && ['pass', 'approved-exception'].includes(result.verification?.status)
+          && result.verification.head === validatedHead;
+      }
+    }
+    if (!controlled) fail(`task head is stale: ${task.headRefOid} != ${pr.headRefOid}; no bound controlled-push result`);
+  }
+  // A reclaim can be written while the GitHub calls are in flight.
+  const latest = boundSession(paths, task);
+  if (latest.sessionId !== sessionId || latest.entry.activeTask?.dispatchId !== task.dispatchId || !latest.entry.handoff
+    || keys.some(key => receipt[key] !== latest.entry.handoff[key])) fail('handoff revoked or replaced during ownership check');
+  return { status: 'owned', ...identity(task, sessionId), handoffId: receipt.id, releaseEpoch: receipt.releaseEpoch, pr };
 }
 
 function ghPr(task, ghFn, requireHead = true) {
@@ -319,10 +358,9 @@ export function ciErrorExcerpts(task, ghFn = command) {
   });
 }
 
-export function prepare({ home, taskPath, ghFn = command, gitFn = command, cloneUrl, originUrl = remoteUrl(REPO) } = {}) {
+export function prepare({ home, taskPath, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, cloneUrl, originUrl = remoteUrl(REPO) } = {}) {
   const { paths, task } = taskFrom(home, taskPath);
-  const { sessionId } = boundSession(paths, task);
-  const pr = ghPr(task, ghFn, false);
+  const { sessionId, pr } = assertOwner({ home, taskPath, ghFn, ownershipFn });
   const checkout = cloneWorktree(paths, task, gitFn, cloneUrl ?? originUrl, originUrl, pr.headRefOid);
   const repairPolicy = assertTaskRepairScope(task, checkout.head);
   const needsSync = checkout.head !== pr.headRefOid || task.headRefOid !== pr.headRefOid;
@@ -406,10 +444,10 @@ function validationException(paths, task, sessionId, head, worktree, gitFn) {
   return { approvalPath: file, approvalSha256: binding.approvalSha256, approvalRef: approval.approvalRef, reason: approval.reason };
 }
 
-export function validate({ home, taskPath, validatedHead, gitFn = command, runFn = command, env = process.env, originUrl = remoteUrl(REPO) } = {}) {
+export function validate({ home, taskPath, validatedHead, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, runFn = command, env = process.env, originUrl = remoteUrl(REPO) } = {}) {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
-  const { sessionId } = boundSession(paths, task);
+  const { sessionId } = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
   assertTaskRepairScope(task, validatedHead);
   const worktree = taskWorktree(task);
@@ -437,6 +475,7 @@ export function validate({ home, taskPath, validatedHead, gitFn = command, runFn
   }
   let reason;
   try {
+    assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
     const after = assertWorktree(worktree, task, gitFn, originUrl);
     if (!after || after.head !== validatedHead) fail('HEAD changed during local validation');
     if (policy && validationPolicy(worktree, task, gitFn).sha256 !== policy.sha256) fail('preflight policy changed during validation');
@@ -563,13 +602,12 @@ export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, o
   return { pushed: true };
 }
 
-export function finalize({ home, taskPath, scReport, validatedHead, validationReceipt, keelRun, keelRoot = keelLedgerRoot(), ghFn = command, gitFn = command, env = process.env, originUrl = remoteUrl(REPO) } = {}) {
+export function finalize({ home, taskPath, scReport, validatedHead, validationReceipt, keelRun, keelRoot = keelLedgerRoot(), ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, env = process.env, originUrl = remoteUrl(REPO) } = {}) {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
-  const { sessionId } = boundSession(paths, task);
+  const { sessionId, pr } = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
   assertTaskRepairScope(task, validatedHead);
-  const pr = ghPr(task, ghFn, false);
   const worktree = taskWorktree(task);
   const checkout = assertWorktree(worktree, { ...task, headRefOid: validatedHead }, gitFn, originUrl);
   if (!checkout || checkout.head !== validatedHead) fail('worktree HEAD does not match validated-head');
@@ -585,17 +623,21 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
     ? { status: 'not-required-no-change', head: validatedHead, localTests: 'not-run', reason: 'all SCs are no-change and task, checkout and remote HEAD match' }
     : verifiedLocal(paths, task, sessionId, validatedHead, worktree, gitFn, validationReceipt);
   const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot, validatedHead, verification });
+  const beforePush = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
+  if (beforePush.pr.headRefOid !== branchHead) fail('remote branch changed before push');
   const push = pushIfNeeded(worktree, task, validatedHead, branchHead, gitFn, originUrl);
+  // Retrying finalize after a recorded push must preserve its ownership proof.
+  const pushed = push.pushed || (branchHead === validatedHead && validatedHead !== task.headRefOid);
   let ci;
   try { ci = checkStatus(task, validatedHead, ghFn); }
   catch (error) {
     return saveResult(paths, task, sessionId, { status: 'blocked', blockedKind: 'ci-transport', reason: error.message,
-      head: validatedHead, scs, feedbackCoverage, keel, verification, checks: [], pushed: push.pushed });
+      head: validatedHead, scs, feedbackCoverage, keel, verification, checks: [], pushed });
   }
-  return saveResult(paths, task, sessionId, { ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed: push.pushed });
+  return saveResult(paths, task, sessionId, { ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed });
 }
 
-export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn = command, originUrl = remoteUrl(REPO) } = {}) {
+export function recheck({ home, taskPath, validatedHead, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, originUrl = remoteUrl(REPO) } = {}) {
   const { paths, task } = taskFrom(home, taskPath);
   const { sessionId } = boundSession(paths, task);
   const previous = readJson(path.join(paths.results, `${task.dispatchId}.json`), 'repair result');
@@ -603,6 +645,7 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn =
   assertIdentity(previous, task, sessionId, 'repair result');
   const head = validatedHead ?? previous.head;
   if (!isSha(head) || previous.head !== head) fail('recheck HEAD does not match the result');
+  const ownership = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead: head, allowValidatedHead: true });
   assertTaskRepairScope(task, head);
   const { scs, feedbackCoverage } = validateScs(previous.scs, task);
   const worktree = taskWorktree(task);
@@ -618,7 +661,7 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn =
   }
   const remoteHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (!isSha(remoteHead)) fail('remote branch head is unavailable during recheck');
-  const observedPrHead = ghPr(task, ghFn, false).headRefOid;
+  const observedPrHead = ownership.pr.headRefOid;
   const common = { head, scs, feedbackCoverage, keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
   if (remoteHead !== observedPrHead) {
     return saveResult(paths, task, sessionId, { ...common, status: 'waiting-ci', reason: 'GitHub PR and remote branch views differ', checks: [],
@@ -630,6 +673,7 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn =
       drift: { validatedHead: head, remoteHead, githubHead: observedPrHead, sourceHead: task.headRefOid } });
   }
   const ci = checkStatus(task, head, ghFn);
+  assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead: head, allowValidatedHead: true });
   return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks });
 }
 
@@ -740,7 +784,7 @@ export function autoCleanupWatch({
 
 function cli(argv) {
   const args = [...argv];
-  const modes = new Set(['prepare', 'validate', 'finalize', 'recheck', 'blocked', 'cleanup', 'clear-owner-unknown']);
+  const modes = new Set(['assert-owner', 'prepare', 'validate', 'finalize', 'recheck', 'blocked', 'cleanup', 'clear-owner-unknown']);
   const modeIndex = args.findIndex((item) => modes.has(item));
   const mode = modeIndex >= 0 ? args.splice(modeIndex, 1)[0] : undefined;
   const value = (name, required = true) => {
@@ -756,12 +800,13 @@ function cli(argv) {
   else if (mode === 'clear-owner-unknown') result = clearOwnerUnknown({ home, pr: value('--pr'), nodeId: value('--node-id') });
   else {
     const task = value('--task');
-    if (mode === 'prepare') result = prepare({ home, taskPath: task });
+    if (mode === 'assert-owner') result = assertOwner({ home, taskPath: task });
+    else if (mode === 'prepare') result = prepare({ home, taskPath: task });
     else if (mode === 'validate') result = validate({ home, taskPath: task, validatedHead: value('--validated-head') });
     else if (mode === 'finalize') result = finalize({ home, taskPath: task, scReport: value('--sc-report'), validatedHead: value('--validated-head'), validationReceipt: value('--validation-receipt', false), keelRun: value('--keel-run', false) });
     else if (mode === 'recheck') result = recheck({ home, taskPath: task, validatedHead: value('--validated-head', false) });
     else if (mode === 'blocked') result = blocked({ home, taskPath: task, reason: value('--reason') });
-    else fail('mode must be prepare, validate, finalize, recheck, blocked, cleanup, or clear-owner-unknown');
+    else fail('mode must be assert-owner, prepare, validate, finalize, recheck, blocked, cleanup, or clear-owner-unknown');
   }
   process.stdout.write(`${JSON.stringify(result)}\n`);
   if (mode === 'validate' && result.status === 'fail') process.exitCode = 1;
