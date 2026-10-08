@@ -27,14 +27,34 @@ function context(repo) {
     || config.authorization.repair !== 'confirmed P0/P1 only') throw Error('doctor-source-not-authorized');
   if (!path.isAbsolute(config.stateRoot ?? '') || fs.realpathSync(config.stateRoot) !== path.resolve(config.stateRoot)) throw Error('doctor-state-root-invalid');
   const state = JSON.parse(fs.readFileSync(plainFile(path.join(config.stateRoot,'lifeline-state.json')),'utf8'));
-  if (state.schemaVersion !== 1 || !Number.isSafeInteger(state.revision) || !state.defects) throw Error('doctor-state-invalid');
+  if (!Number.isSafeInteger(state.revision) || !state.defects) throw Error('doctor-state-invalid');
+  if (state.schemaVersion === 2) {
+    if (typeof state.controlEpoch !== 'string' || !state.controlEpoch) throw Error('doctor-state-invalid');
+  } else if (state.schemaVersion !== 1) throw Error('doctor-state-invalid');
   return {config,state};
 }
-function statement(d,config) {
+function ownershipFields(d,state) {
+  if (state.schemaVersion !== 2) return {};
+  const controlEpoch = state.controlEpoch;
+  if (d.ownershipMode === 'legacy') {
+    if (d.workId != null) return null;
+    return {controlEpoch,ownershipMode:'legacy',workId:null};
+  }
+  if (d.ownershipMode !== 'work-item' || typeof d.workId !== 'string' || !d.workId) return null;
+  const item = state.workItems?.[d.workId];
+  if (!item || item.id !== d.workId || item.defectKey !== d.key || item.controlEpoch !== controlEpoch
+    || item.ownerSessionId !== d.ownerSessionId || item.generation !== d.generation
+    || typeof item.status !== 'string' || !item.status) return null;
+  return {controlEpoch,ownershipMode:'work-item',workId:d.workId};
+}
+function statement(d,ctx) {
+  const {config,state} = ctx;
   const progress = d.phase === 'repair' ? d : d.phase === 'investigation' && d.resumeProgress?.phase === 'repair' ? d.resumeProgress : null;
   const reason = progress?.classificationReason;
   if (!high(progress?.severity) || !reason || !Number.isFinite(reason.at) || reason.at > Date.now()+60000
     || !/^[a-zA-Z0-9-]{1,100}$/.test(d.ownerSessionId ?? '') || !Number.isSafeInteger(d.generation) || d.generation < 1) return null;
+  const ownership = ownershipFields(d,state);
+  if (!ownership) return null;
   const o = d.observations?.find(o => o.id === reason.observationId && o.sourceSha === reason.sourceSha && o.evidence?.sha256 === reason.evidence);
   if (!o || o.status !== 'PRODUCT_FAIL' || o.repo !== config.repo || !validSha(o.sourceSha)
     || !/^[a-f0-9]{64}$/.test(o.evidence.sha256 ?? '') || o.caseId !== d.caseId) throw Error('doctor-classification-not-bound');
@@ -42,7 +62,14 @@ function statement(d,config) {
   if (hash(fs.readFileSync(evidenceFile(config.evidenceRoot,o.evidence.path))) !== o.evidence.sha256) throw Error('doctor-evidence-changed');
   return {key:d.key,repo:d.repo,number:d.pr.number,ownerSessionId:d.ownerSessionId,generation:d.generation,
     observationId:o.id,sourceSha:o.sourceSha,evidenceSha256:o.evidence.sha256,classifiedAt:reason.at,severity:progress.severity,
-    caseId:d.caseId,outcomeCode:d.outcomeCode};
+    caseId:d.caseId,outcomeCode:d.outcomeCode,...ownership};
+}
+// Delivery identity follows the confirmed failure, not a storage migration.
+// Authority still includes the full current proof and is re-read on every use.
+function feedbackIdentity(proof) {
+  const stable = {...proof};
+  delete stable.controlEpoch;delete stable.ownershipMode;delete stable.workId;
+  return hash(JSON.stringify(stable));
 }
 export function lifelineFeedback(pr) {
   try {
@@ -52,9 +79,9 @@ export function lifelineFeedback(pr) {
     for (const [key,d] of Object.entries(ctx.state.defects)) {
       if (!/^[a-f0-9]{24}$/.test(key) || d.key !== key || d.repo !== pr.repo || d.pr?.repo !== pr.repo || d.pr?.number !== pr.number
         || d.github?.number !== pr.number || d.github.state !== 'OPEN' || d.github.isDraft !== false || d.github.headSha !== pr.headRefOid) continue;
-      const proof = statement(d,ctx.config);
+      const proof = statement(d,ctx);
       if (!proof) continue;
-      const stamp = hash(JSON.stringify(proof)), reason = (d.phase === 'repair' ? d : d.resumeProgress).classificationReason;
+      const stamp = feedbackIdentity(proof), reason = (d.phase === 'repair' ? d : d.resumeProgress).classificationReason;
       items.push({source:'lifeline-doctor',nativeId:stamp,revision:stamp,contentHash:stamp,sha:pr.headRefOid,
         doctor:proof,body:`${proof.severity}: Confirmed local lifeline failure\nCase: ${proof.caseId}\nTrigger: ${reason.trigger}\nImpact: ${reason.impact}\nEvidence SHA-256: ${proof.evidenceSha256}\nFailed source: ${proof.sourceSha}\nReason: ${reason.reason}`});
     }
@@ -70,8 +97,8 @@ export function verifiedLifelineFeedback(item,{headSha}={}) {
     if (!ctx) return false;
     const d = ctx.state.defects[item.doctor.key];
     if (!d || d.repo !== item.doctor.repo || d.pr?.repo !== d.repo || d.pr?.number !== item.doctor.number) return false;
-    const current = statement(d,ctx.config);
+    const current = statement(d,ctx);
     return Boolean(current && JSON.stringify(current) === JSON.stringify(item.doctor)
-      && hash(JSON.stringify(current)) === item.nativeId && item.contentHash === item.nativeId);
+      && feedbackIdentity(current) === item.nativeId && item.contentHash === item.nativeId);
   } catch { return false; }
 }

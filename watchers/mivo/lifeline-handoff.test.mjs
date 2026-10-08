@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import {createHash} from 'node:crypto';
-import {lifelineFeedback} from './bin/mivo-lifeline-source.mjs';
+import {lifelineFeedback,verifiedLifelineFeedback} from './bin/mivo-lifeline-source.mjs';
 import {feedbackRepairPolicy} from './bin/mivo-feedback-policy.mjs';
 import {assertTaskRepairScope} from './bin/mivo-repair.mjs';
 import {feedbackItems,newFeedback,processPr,watcherPaths,REPO} from './bin/mivo-watcher.mjs';
@@ -66,4 +66,65 @@ test('unfinished confirmed repair remains receivable while another version is in
   const items=feedbackItems({pr:f.pr,comments:[{id:1,body:'P1: normal author handoff text',user:{login:'ExampleUser',type:'User'}}]});
   assert.equal(items[0].repairPolicy.canChangeCode,false);
   assert.equal(items[0].repairPolicy.reason,'unverified-review-source');
+});
+function asV2(f,{epoch='epoch-1',mode='legacy',workId=null,workItems}={}) {
+  f.state.schemaVersion=2;f.state.controlEpoch=epoch;f.d.ownershipMode=mode;f.d.workId=workId;
+  if (workItems!==undefined) f.state.workItems=workItems;
+  else if (mode==='work-item') f.state.workItems={[workId]:{id:workId,defectKey:f.key,controlEpoch:epoch,ownerSessionId:f.d.ownerSessionId,generation:f.d.generation,status:'repair'}};
+  else f.state.workItems={};
+  f.write();return f;
+}
+test('schema 2 legacy Ready PR still grants the original P0/P1 evidence hash and head gates',t=>{
+  const f=asV2(fixture(t)),entry=lifelineFeedback(f.pr);assert.equal(entry.error,null);assert.equal(entry.items.length,1);
+  const item=entry.items[0];assert.equal(item.doctor.controlEpoch,'epoch-1');assert.equal(item.doctor.ownershipMode,'legacy');assert.equal(item.doctor.workId,null);
+  assert.equal(item.doctor.ownerSessionId,'original-owner');assert.equal(item.doctor.generation,1);
+  assert.equal(feedbackRepairPolicy(item,{headSha:f.pr.headRefOid}).canChangeCode,true);
+  f.d.github={...f.d.github,headSha:'f'.repeat(40)};f.write();assert.equal(lifelineFeedback(f.pr).items.length,0);
+});
+test('schema 2 work-item proof binds controlEpoch, workId and owner generation',t=>{
+  const f=asV2(fixture(t),{mode:'work-item',workId:'work-1'}),item=lifelineFeedback(f.pr).items[0];
+  assert.equal(item.doctor.ownershipMode,'work-item');assert.equal(item.doctor.workId,'work-1');
+  assert.equal(item.doctor.controlEpoch,'epoch-1');assert.equal(verifiedLifelineFeedback(item,{headSha:f.pr.headRefOid}),true);
+  assert.equal(feedbackRepairPolicy(item,{headSha:f.pr.headRefOid}).canChangeCode,true);
+});
+test('schema 2 rejects missing ownershipMode, unowned work-items, mismatched workItems and forged proofs',t=>{
+  const f=asV2(fixture(t));delete f.d.ownershipMode;f.write();assert.equal(lifelineFeedback(f.pr).items.length,0);
+  asV2(f,{mode:'work-item',workId:'work-1'});f.d.ownerSessionId=undefined;f.write();assert.equal(lifelineFeedback(f.pr).items.length,0);
+  f.d.ownerSessionId='original-owner';asV2(f,{mode:'work-item',workId:'work-1'});f.state.workItems['work-1'].defectKey='b'.repeat(24);f.write();assert.equal(lifelineFeedback(f.pr).items.length,0);
+  asV2(f,{mode:'work-item',workId:'work-1'});
+  const forged={source:'lifeline-doctor',sha:f.pr.headRefOid,verified:true,doctor:{...lifelineFeedback(f.pr).items[0].doctor,ownerSessionId:'other-owner'}};
+  assert.equal(verifiedLifelineFeedback(forged,{headSha:f.pr.headRefOid}),false);
+  assert.equal(feedbackRepairPolicy(forged,{headSha:f.pr.headRefOid}).canChangeCode,false);
+});
+test('schema 2 re-reads authority and rejects a cached proof after epoch or owner changes',t=>{
+  const f=asV2(fixture(t),{mode:'work-item',workId:'work-1'}),item=lifelineFeedback(f.pr).items[0];
+  assert.equal(assertTaskRepairScope({headRefOid:f.pr.headRefOid,feedback:[item]},'e'.repeat(40)).canChangeCode,true);
+  f.state.controlEpoch='epoch-2';f.state.workItems['work-1'].controlEpoch='epoch-2';f.write();
+  assert.equal(verifiedLifelineFeedback(item,{headSha:f.pr.headRefOid}),false);
+  assert.throws(()=>assertTaskRepairScope({headRefOid:f.pr.headRefOid,feedback:[item],repairPolicy:{canChangeCode:true}},'e'.repeat(40)),/REPAIR_SCOPE_NO_CODE/);
+  asV2(f,{mode:'work-item',workId:'work-1'});const current=lifelineFeedback(f.pr).items[0];
+  f.d.ownerSessionId='other-owner';f.d.generation=2;f.state.workItems['work-1'].ownerSessionId='other-owner';f.state.workItems['work-1'].generation=2;f.write();
+  assert.equal(verifiedLifelineFeedback(current,{headSha:f.pr.headRefOid}),false);
+});
+test('schema 2 without controlEpoch blocks the source; config schema stays 1',t=>{
+  const f=asV2(fixture(t));delete f.state.controlEpoch;f.write();
+  assert.equal(lifelineFeedback(f.pr).error,'doctor-state-invalid');assert.equal(lifelineFeedback(f.pr).items.length,0);
+  f.state.controlEpoch='epoch-1';f.write();f.config.schemaVersion=2;save(f.configPath,f.config);
+  assert.equal(lifelineFeedback(f.pr).error,'doctor-source-not-authorized');
+});
+test('migration and epoch rotation preserve delivered feedback identity without accepting stale authority',t=>{
+  const f=fixture(t),v1=lifelineFeedback(f.pr).items[0],sent=newFeedback({},[v1]);
+  asV2(f);const legacy=lifelineFeedback(f.pr).items[0];
+  assert.equal(newFeedback(sent.cursor,[legacy]).fresh.length,0);
+  assert.equal(verifiedLifelineFeedback(v1,{headSha:f.pr.headRefOid}),false);
+  assert.equal(verifiedLifelineFeedback(legacy,{headSha:f.pr.headRefOid}),true);
+  asV2(f,{mode:'work-item',workId:'work-1'});const work=lifelineFeedback(f.pr).items[0];
+  assert.equal(newFeedback(sent.cursor,[work]).fresh.length,0);
+  assert.equal(verifiedLifelineFeedback(legacy,{headSha:f.pr.headRefOid}),false);
+  asV2(f,{epoch:'epoch-2',mode:'work-item',workId:'work-1'});const rotated=lifelineFeedback(f.pr).items[0];
+  assert.equal(newFeedback(sent.cursor,[rotated]).fresh.length,0);
+  assert.equal(verifiedLifelineFeedback(work,{headSha:f.pr.headRefOid}),false);
+  assert.equal(verifiedLifelineFeedback(rotated,{headSha:f.pr.headRefOid}),true);
+  f.d.classificationReason.at++;f.write();
+  assert.equal(newFeedback(sent.cursor,lifelineFeedback(f.pr).items).fresh.length,1);
 });
