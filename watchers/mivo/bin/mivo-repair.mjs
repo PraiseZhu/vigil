@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { collectMivoCiSync } from './mivo-ci.mjs';
 import { collectPrOwnershipSync } from './mivo-pr-snapshot.mjs';
 import { isCurrentHandoff } from './mivo-handoff.mjs';
+import { createPushHooks } from './mivo-pre-push.mjs';
 import { taskRepairPolicy } from './mivo-feedback-policy.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, readPr, writePr } from './mivo-state.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
@@ -150,7 +151,7 @@ function ghJson(args, ghFn = command) {
   catch (error) { fail(`gh returned invalid JSON: ${error.message}`); }
 }
 
-function gitOutput(args, gitFn = command) { return String(gitFn(GIT, args)); }
+function gitOutput(args, gitFn = command, options) { return String(gitFn(GIT, args, options)); }
 
 function taskFrom(home, taskPath) {
   const paths = repairPaths(home);
@@ -585,8 +586,9 @@ export function ciResult(ci) {
   return { status: 'complete' };
 }
 
-export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, originUrl = remoteUrl(task.repo)) {
+export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, originUrl = remoteUrl(task.repo), guard) {
   if (remoteHead === validatedHead) return { pushed: false };
+  if (!guard?.home || !guard.taskPath) fail('push ownership guard required');
   const checkout = assertWorktree(worktree, task, gitFn, originUrl);
   if (!checkout || checkout.head !== validatedHead) fail('local HEAD changed before push');
   const latest = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
@@ -596,7 +598,14 @@ export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, o
     catch { return false; }
   })();
   if (!ancestor) fail('remote branch advanced independently; refusing non-fast-forward push');
-  gitOutput(['-C', worktree, 'push', 'origin', `HEAD:refs/heads/${task.headRefName}`], gitFn);
+  const hookPath = gitOutput(['-C', worktree, 'rev-parse', '--git-path', 'hooks'], gitFn).trim();
+  if (!hookPath) fail('effective Git hook directory unavailable');
+  const hooks = createPushHooks({ worktree, originalHooks: path.resolve(worktree, hookPath),
+    home: guard.home, taskPath: guard.taskPath, head: validatedHead, ref: `refs/heads/${task.headRefName}`, gitBinary: GIT });
+  try {
+    gitOutput(['-C', worktree, '-c', `core.hooksPath=${hooks.dir}`, 'push', 'origin', `HEAD:refs/heads/${task.headRefName}`],
+      gitFn, { env: guard.env ?? process.env });
+  } finally { hooks.cleanup(); }
   const after = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (after !== validatedHead) fail('remote branch changed after push; pushed commit requires reconciliation');
   return { pushed: true };
@@ -625,7 +634,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot, validatedHead, verification });
   const beforePush = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
   if (beforePush.pr.headRefOid !== branchHead) fail('remote branch changed before push');
-  const push = pushIfNeeded(worktree, task, validatedHead, branchHead, gitFn, originUrl);
+  const push = pushIfNeeded(worktree, task, validatedHead, branchHead, gitFn, originUrl, { home, taskPath, env });
   // Retrying finalize after a recorded push must preserve its ownership proof.
   const pushed = push.pushed || (branchHead === validatedHead && validatedHead !== task.headRefOid);
   let ci;

@@ -690,3 +690,17 @@ test('same HEAD and comments with a new Ready event changes the poll fingerprint
   assert.notEqual(pollFingerprint(graphqlNode({ timelineItems: { nodes: [{ id: 'ready-one' }] } })),
     pollFingerprint(graphqlNode({ timelineItems: { nodes: [{ id: 'ready-two' }] } })));
 });
+
+test('unchanged Draft discovery does not rewrite per-PR state, but a new head is recorded', t => {
+  const { paths } = homeOf(t);
+  seedBound(paths, { activeTask: { dispatchId: 'draft-task', status: 'accepted' } });
+  discover(paths, { prs: [{ ...listed, isDraft: true }] });
+  const file = path.join(statePaths(paths.home).prsDir, `${nodeId}.json`);
+  fs.utimesSync(file, new Date(1000), new Date(1000));
+  const before = fs.readFileSync(file, 'utf8'), mtime = fs.statSync(file, { bigint: true }).mtimeNs;
+  discover(paths, { now: '2026-09-29T00:00:00Z', prs: [{ ...listed, isDraft: true }] });
+  assert.equal(fs.readFileSync(file, 'utf8'), before);
+  assert.equal(fs.statSync(file, { bigint: true }).mtimeNs, mtime);
+  discover(paths, { now: '2026-09-29T00:01:00Z', prs: [{ ...listed, isDraft: true, headRefOid: 'c'.repeat(40) }] });
+  assert.equal(readPr(paths.home, nodeId).headRefOid, 'c'.repeat(40));
+});

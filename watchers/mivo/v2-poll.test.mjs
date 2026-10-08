@@ -612,3 +612,31 @@ test('a pushed HEAD waits for its late result without revoking the author handof
   assert.equal(draft.entry.activeTask.blockedKind, 'author-reclaimed');
   assert.equal(draft.entry.handoff, null);
 });
+
+test('unchanged Draft polling leaves the per-PR state bytes and mtime unchanged', t => {
+  const { paths } = homeOf(t); seedInFlight(paths);
+  poll(paths, { snapshot: snap({ isDraft: true }) });
+  const file = path.join(paths.home, 'state', 'prs', `${nodeId}.json`);
+  fs.utimesSync(file, new Date(1000), new Date(1000));
+  const bytes = fs.readFileSync(file, 'utf8'), mtime = fs.statSync(file, { bigint: true }).mtimeNs;
+  poll(paths, { snapshot: snap({ isDraft: true }) });
+  assert.equal(fs.readFileSync(file, 'utf8'), bytes);
+  assert.equal(fs.statSync(file, { bigint: true }).mtimeNs, mtime);
+});
+
+test('a same-epoch duplicate receipt cannot replace or revoke an acknowledged repair owner', t => {
+  const { paths } = homeOf(t), nextHead = 'c'.repeat(40);
+  seed(paths, { activeTask: { dispatchId: 'held-task', status: 'waiting-ci', head: nextHead, evidenceVersion: 2 } });
+  const adopted = readPr(paths.home, nodeId).handoff;
+  const original = withAuthorHandoff(collectFailedCi(), { id: nodeId, number: 790, headRefOid: HEAD });
+  const next = withAuthorHandoff({ ...collectFailedCi(), pr: { ...collectFailedCi().pr, headRefOid: nextHead } },
+    { id: nodeId, number: 790, headRefOid: nextHead });
+  const duplicate = { ...next.comments[0], id: 'manual-second-receipt' };
+  const collected = { ...next, comments: [...original.comments, duplicate], checks: [], ci: { status: 'pending', required: [] } };
+  const result = poll(paths, { snapshot: snap({ headRefOid: nextHead, commentCount: 2 }), budgetMs: 35000,
+    authorHandoff: false, collect: () => collected, dispatchFn: () => { throw Error('receipt is not repair feedback'); } });
+  assert.deepEqual(result.entry.handoff, adopted);
+  assert.equal(result.entry.activeTask.status, 'waiting-ci');
+  assert.equal(result.entry.authorReclaimed, undefined);
+  assert.equal(result.entry.pendingFeedback, 0);
+});

@@ -36,7 +36,7 @@ export function isCurrentHandoff(receipt, pr, { allowHeadChange = false } = {}) 
     && sha(receipt.head) && (allowHeadChange || same(receipt.head, pr.headRefOid)));
 }
 
-export function selectHandoff(comments, pr) {
+export function selectHandoff(comments, pr, options = {}) {
   if (!eligible(pr) || !Array.isArray(comments)) return null;
   const candidates = [];
   for (const comment of comments) {
@@ -52,7 +52,7 @@ export function selectHandoff(comments, pr) {
     const receipt = { version: payload.version, id: String(comment.id), repo: payload.repo,
       number: payload.number, nodeId: payload.nodeId, head: payload.head,
       releaseEpoch: payload.releaseEpoch, author: author.login };
-    if (isCurrentHandoff(receipt, pr)) candidates.push({ receipt, created });
+    if (isCurrentHandoff(receipt, pr, options)) candidates.push({ receipt, created });
   }
   candidates.sort((a, b) => a.created - b.created || a.receipt.id.localeCompare(b.receipt.id));
   return candidates[0]?.receipt ?? null;
@@ -68,25 +68,44 @@ function sameOwnership(before, after) {
     && before.headRefOid === after.headRefOid && before.releaseEpoch === after.releaseEpoch;
 }
 
-export function runHandoff({ command, repo, number, ghFn = gh }) {
-  requireValue(['handoff', 'reclaim'].includes(command), 'command must be handoff or reclaim');
+export function runHandoff({ command, repo, number, expectedHead, ghFn = gh }) {
+  requireValue(['inspect', 'handoff', 'reclaim'].includes(command), 'command must be inspect, handoff or reclaim');
   requireValue(typeof repo === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)
     && Number.isSafeInteger(number) && number > 0, 'valid --repo and --pr are required');
   const account = parse(ghFn(['api', 'user']));
   const read = () => collectPrOwnershipSync({ pr: { repo, number }, ghFn });
   const before = read();
-  requireValue(human(account) && same(account.login, before.author.login), 'authenticated account must be the PR author');
-  requireValue(eligible(before), 'PR must be OPEN, non-Draft and from the same repository');
+  const authorAuthorized = human(account) && same(account.login, before.author.login);
+  if (expectedHead !== undefined) {
+    requireValue(sha(expectedHead), 'expected head must be a full SHA');
+    requireValue(same(expectedHead, before.headRefOid), 'PR head changed since the caller checked its gate');
+  }
+  const comments = () => {
+    const pages = parse(ghFn(['api', `repos/${repo}/issues/${number}/comments?per_page=100`, '--paginate', '--slurp']));
+    requireValue(Array.isArray(pages) && pages.every(Array.isArray), 'incomplete comments response');
+    return pages.flat();
+  };
+  if (command === 'inspect') {
+    const receipt = eligible(before) ? selectHandoff(comments(), before, { allowHeadChange: true }) : null;
+    const after = read();
+    requireValue(before.id === after.id && before.state === after.state && before.isDraft === after.isDraft
+      && before.headRefOid === after.headRefOid && before.releaseEpoch === after.releaseEpoch
+      && same(before.author.login, after.author.login), 'PR ownership changed while inspecting handoff');
+    const status = before.state !== 'OPEN' || !before.sameRepository ? 'inactive'
+      : before.isDraft ? 'author-owned' : receipt ? 'handed-off' : 'ready-unclaimed';
+    return { status, pr: after, receipt, authorAuthorized };
+  }
+  requireValue(authorAuthorized, 'authenticated account must be the PR author');
+  requireValue(before.state === 'OPEN' && before.sameRepository, 'PR must be OPEN and from the same repository');
   if (command === 'reclaim') {
-    ghFn(['pr', 'ready', String(number), '--repo', repo, '--undo']);
+    if (!before.isDraft) ghFn(['pr', 'ready', String(number), '--repo', repo, '--undo']);
     const after = read();
     requireValue(after.id === before.id && after.state === 'OPEN' && after.isDraft === true
       && after.sameRepository === true && same(after.author.login, account.login), 'reclaim was not confirmed as Draft');
     return { status: 'author-owned', repo, number, head: after.headRefOid, releaseEpoch: after.releaseEpoch };
   }
-  const pages = parse(ghFn(['api', `repos/${repo}/issues/${number}/comments?per_page=100`, '--paginate', '--slurp']));
-  requireValue(Array.isArray(pages) && pages.every(Array.isArray), 'incomplete comments response');
-  const existing = selectHandoff(pages.flat(), before);
+  requireValue(eligible(before), 'PR must be OPEN, non-Draft and from the same repository');
+  const existing = selectHandoff(comments(), before, { allowHeadChange: true });
   if (existing) {
     requireValue(sameOwnership(before, read()), 'PR ownership changed while reading handoff');
     return { status: 'already-handed-off', receipt: existing };
@@ -106,8 +125,8 @@ function cli(argv) {
   const [command, ...rest] = argv;
   const options = { command };
   for (let i = 0; i < rest.length; i += 2) {
-    requireValue(['--repo', '--pr'].includes(rest[i]) && rest[i + 1] && !rest[i + 1].startsWith('--'), 'usage: handoff|reclaim --repo owner/repo --pr NUMBER');
-    const key = rest[i] === '--pr' ? 'number' : 'repo';
+    requireValue(['--repo', '--pr', '--expected-head'].includes(rest[i]) && rest[i + 1] && !rest[i + 1].startsWith('--'), 'usage: inspect|handoff|reclaim --repo owner/repo --pr NUMBER [--expected-head SHA]');
+    const key = rest[i] === '--pr' ? 'number' : rest[i] === '--expected-head' ? 'expectedHead' : 'repo';
     requireValue(options[key] === undefined, `duplicate ${rest[i]}`);
     options[key] = key === 'number' ? Number(rest[i + 1]) : rest[i + 1];
   }

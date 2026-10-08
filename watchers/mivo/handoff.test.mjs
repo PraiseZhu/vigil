@@ -49,12 +49,12 @@ test('draft, closed, forks, missing identity and new Ready epochs invalidate rec
   assert.equal(isCurrentHandoff({ ...receipt, head: '' }, next, { allowHeadChange: true }), false);
 });
 
-function fixture({ existing = [], login = 'ExampleUser', drift = false, epochDrift = false, postFailure = false, reclaimFailure = false } = {}) {
+function fixture({ existing = [], login = 'ExampleUser', head = basic.headRefOid, drift = false, epochDrift = false, postFailure = false, reclaimFailure = false } = {}) {
   const calls = []; let posted = false; let draft = false;
   const ghFn = args => {
     calls.push(args);
     if (args[0] === 'api' && args[1] === 'user') return JSON.stringify({ login, type: 'User' });
-    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ ...basic,
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ ...basic, headRefOid: head,
       isDraft: draft, ...(posted && drift ? { headRefOid: 'c'.repeat(40) } : {}) });
     if (args[1] === 'graphql') return JSON.stringify({ data: { node: { timelineItems: {
       nodes: [{ __typename: draft ? 'ConvertToDraftEvent' : 'ReadyForReviewEvent', id: draft ? 'DRAFT_1' : posted && epochDrift ? 'READY_2' : 'READY_1', createdAt: readyAt }],
@@ -113,4 +113,54 @@ test('opened-ready PRs use their opened epoch and no incomplete epoch is accepte
   const opened = { ...basic, releaseEpoch: `opened:${basic.id}:${createdAt}` };
   assert.ok(selectHandoff([comment({}, { releaseEpoch: opened.releaseEpoch })], opened));
   assert.equal(selectHandoff([comment({}, { releaseEpoch: 'ready:PR_1' })], { ...basic, releaseEpoch: 'ready:PR_1' }), null);
+});
+
+test('inspect reports authoritative ownership without writing or requiring the caller to be the author', () => {
+  const empty = fixture();
+  assert.equal(runHandoff({ ...empty.options, command: 'inspect' }).status, 'ready-unclaimed');
+  assert.equal(empty.calls.some(a => a.includes('POST') || a[1] === 'ready'), false);
+  const held = fixture({ existing: [comment()], login: 'OtherUser', head: 'c'.repeat(40) });
+  const state = runHandoff({ ...held.options, command: 'inspect' });
+  assert.equal(state.status, 'handed-off');
+  assert.equal(state.authorAuthorized, false);
+  assert.equal(state.pr.headRefOid, 'c'.repeat(40));
+  assert.equal(state.receipt.head, basic.headRefOid);
+  assert.equal(held.calls.some(a => a.includes('POST') || a[1] === 'ready'), false);
+});
+
+test('handoff keeps the adopted receipt across a same-epoch HEAD advance', () => {
+  const f = fixture({ existing: [comment()], head: 'c'.repeat(40) });
+  const result = runHandoff(f.options);
+  assert.equal(result.status, 'already-handed-off');
+  assert.equal(result.receipt.head, basic.headRefOid);
+  assert.equal(f.calls.filter(a => a.includes('POST')).length, 0);
+});
+
+test('caller expected-head drift prevents handoff before any write', () => {
+  const f = fixture();
+  assert.throws(() => runHandoff({ ...f.options, expectedHead: 'c'.repeat(40) }), /head changed/);
+  assert.equal(f.calls.some(a => a.includes('POST') || a[1] === 'ready'), false);
+});
+
+test('reclaim is idempotent and inspect sees the author-owned Draft', () => {
+  const f = fixture({ existing: [comment()] });
+  runHandoff({ ...f.options, command: 'reclaim' });
+  assert.equal(runHandoff({ ...f.options, command: 'reclaim' }).status, 'author-owned');
+  const state = runHandoff({ ...f.options, command: 'inspect' });
+  assert.equal(state.status, 'author-owned');
+  assert.equal(state.receipt, null);
+  assert.equal(f.calls.filter(a => a[1] === 'ready').length, 1);
+});
+
+test('inspect rejects an epoch change during its read without mutating the PR', () => {
+  const f = fixture({ existing: [comment()] });
+  let changed = false;
+  const ghFn = args => {
+    if (args.includes('--paginate')) changed = true;
+    const result = JSON.parse(f.ghFn(args));
+    if (changed && args[1] === 'graphql') result.data.node.timelineItems.nodes[0].id = 'READY_NEW';
+    return JSON.stringify(result);
+  };
+  assert.throws(() => runHandoff({ ...f.options, command: 'inspect', ghFn }), /ownership changed/);
+  assert.equal(f.calls.some(a => a.includes('POST') || a[1] === 'ready'), false);
 });
