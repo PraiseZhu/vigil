@@ -186,23 +186,26 @@ test('v3 rejects a missing ledger root and a run id other than the task fixed on
   assert.throws(() => verifyKeelRun(v3Args(root, { runId: 'run-other' })), /KEEL_RUN_REQUIRED.*run_id must be/);
 });
 
-for (const [name, mutate] of [
-  ['a missing task binding', r => { r.splice(1, 1); }],
-  ['a binding for another task', r => { r[1].summary += '-other'; }],
-  ['a hand-written decision (no state hash)', r => { delete r[0].state_sha256; }],
-  ['a decision without an answer (Jev failed)', r => { r[0].answer = null; }],
-  ['only a startup decision (J2)', r => { r[0].template = 'J2'; }],
-  ['evidence for another HEAD', r => { r[2].evidence.head = 'c'.repeat(40); }],
-  ['v2 evidence on a v3 task', r => { r[2].evidence.version = 2; }],
-  ['evidence that predates the binding', r => { r[2].at = '2026-10-06T01:00:01.500Z'; }],
-  ['a decision written after the evidence', r => { r[0].at = '2026-10-06T01:00:09.000Z'; }],
-  ['a decision row that is not in this run', r => { r[0].run_id = 'run-other'; }],
-  ['rows written before the task existed', r => { for (const row of r) row.at = '2026-10-06T00:59:00.000Z'; }],
-  ['empty investigation evidence', r => { r[2].evidence.steps.reproduce = ''; }],
-  ['skipped tests without a reason', r => { delete r[2].evidence.steps.verify.reason; }],
+const NO_BINDING = /KEEL_RUN_REQUIRED.*exact task binding row is required/;
+const BAD_DECISION = /KEEL_RUN_REQUIRED.*referenced task decision is missing or incomplete/;
+const BAD_EVIDENCE = /KEEL_RUN_REQUIRED.*current HEAD flow evidence and playbook are required/;
+for (const [name, mutate, reason] of [
+  ['a missing task binding', r => { r.splice(1, 1); }, NO_BINDING],
+  ['a binding for another task', r => { r[1].summary += '-other'; }, NO_BINDING],
+  ['a hand-written decision (no state hash)', r => { delete r[0].state_sha256; }, BAD_DECISION],
+  ['a decision without an answer (Jev failed)', r => { r[0].answer = null; }, BAD_DECISION],
+  ['only a startup decision (J2)', r => { r[0].template = 'J2'; }, BAD_DECISION],
+  ['evidence for another HEAD', r => { r[2].evidence.head = 'c'.repeat(40); }, BAD_EVIDENCE],
+  ['v2 evidence on a v3 task', r => { r[2].evidence.version = 2; }, BAD_EVIDENCE],
+  ['evidence that predates the binding', r => { r[2].at = '2026-10-06T01:00:01.500Z'; }, /KEEL_RUN_REQUIRED.*flow evidence predates task binding/],
+  ['a decision written after the evidence', r => { r[0].at = '2026-10-06T01:00:09.000Z'; }, BAD_DECISION],
+  ['a decision row that is not in this run', r => { r[0].run_id = 'run-other'; }, BAD_DECISION],
+  ['rows written before the task existed', r => { for (const row of r) row.at = '2026-10-06T00:59:00.000Z'; }, NO_BINDING],
+  ['empty investigation evidence', r => { r[2].evidence.steps.reproduce = ''; }, /KEEL_RUN_REQUIRED.*reproduction\/investigation and disposition evidence are required/],
+  ['skipped tests without a reason', r => { delete r[2].evidence.steps.verify.reason; }, /KEEL_RUN_REQUIRED.*no-change flow must explain why local tests were not run/],
 ]) test('v3 rejects ' + name, t => {
   const rows = v3Rows(); mutate(rows);
-  assert.throws(() => verifyKeelRun(v3Args(ledger(t, V3_RUN, rows))), /KEEL_RUN_REQUIRED/);
+  assert.throws(() => verifyKeelRun(v3Args(ledger(t, V3_RUN, rows))), reason);
 });
 
 test('v3 code repair binds the helper validation receipt', t => {

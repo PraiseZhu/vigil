@@ -889,13 +889,17 @@ export function reopenKeelBlocked({ previous, paths, now }) {
   };
   consider(active.dispatchId, active.reason);
   if (!candidates.length) return previous;
-  // Earlier rounds of this PR that the same incompatibility swallowed.
+  // Earlier rounds of this PR that the same incompatibility swallowed, walking back from the newest
+  // and stopping at the first round that ended any other way: a round that completed or blocked on
+  // something real already handled whatever came before it.
   let names = [];
   try { names = fs.readdirSync(path.join(paths.stateDir, 'tasks')); } catch { names = []; }
-  for (const name of names.filter(item => item.startsWith(`live-${previous.number}-`) && item.endsWith('.json')).sort().slice(-REOPEN_SCAN_LIMIT)) {
-    const dispatchId = name.slice(0, -'.json'.length);
+  const earlier = names.filter(item => item.startsWith(`live-${previous.number}-`) && item.endsWith('.json')
+    && item.slice(0, -'.json'.length) !== active.dispatchId).sort().slice(-REOPEN_SCAN_LIMIT).reverse();
+  for (const name of earlier) {
     const result = readJsonOrNull(path.join(paths.stateDir, 'results', name));
-    if (result?.status === 'blocked') consider(dispatchId, result.reason);
+    if (result?.status !== 'blocked' || !KEEL_BLOCK_REASON.test(String(result.reason ?? ''))) break;
+    consider(name.slice(0, -'.json'.length), result.reason);
   }
   const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
   for (const { keys } of candidates) for (const key of keys) delete feedbackCursor[key];
@@ -1497,8 +1501,11 @@ export function* pollWorkflow({
   });
   const pendingRetry = previous.pendingDispatch?.status === 'retryable';
   const recoveryDue = Boolean(readTaskForRecovery(previous, paths, now));
+  // A PR the Keel incompatibility froze has nothing new on GitHub, so its fingerprint never changes;
+  // without this it would never reach processPr, where reopenKeelBlocked hands its feedback back.
+  const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous;
   if (previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry && !normalized.overflow
-    && !hasUnconsumedResult(previous, paths)) {
+    && !hasUnconsumedResult(previous, paths) && !keelReopenDue) {
     save(previous);
     return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, dispatch: { attempted: false, reason: 'fingerprint-unchanged' } }] };
   }
