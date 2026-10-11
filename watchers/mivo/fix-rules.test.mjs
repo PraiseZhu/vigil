@@ -618,3 +618,25 @@ test('retry high finding retains the exact goal standing authorization marker on
   assert.equal(out.message.split('\n').filter(l=>l==='OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY').length,1);
   assert.doesNotMatch(out.message,/OWNER_STANDING_AUTH: OLD/);
 });
+
+test('review-pr flow: reviewer findings review and its threads carry code authority; clean report is not feedback', () => {
+  const reviewer = { login: 'ExampleReviewer' };
+  const header = `> Mivo 自动审查 · [PR](https://example.invalid/pull/1) · head \`${HEAD.slice(0, 12)}\` · base \`${'b'.repeat(12)}\` · diffHash \`0123456789ab\` · 档位 standard`;
+  const clean = { id: 'R_clean', author: reviewer, state: 'APPROVED', submittedAt: '2026-09-10T00:00:00Z', commit: { oid: HEAD },
+    body: `${header}\n## Findings\n无。\n\n## Overall\npass —— 没有 P0/P1。` };
+  const findings = { id: 'R_find', author: reviewer, state: 'COMMENTED', submittedAt: '2026-09-10T00:01:00Z', commit: { oid: 'e'.repeat(40) },
+    body: `${header}\n## Findings\n- [P1] src/a.ts:3 — 事实：……\n\n## Overall\nchanges-requested —— 1 条 P0/P1。\n\n<!-- review-pr:findings head=${'e'.repeat(40)} digest=${'c'.repeat(64)} -->` };
+  const thread = (id, author, reviewId) => ({ id, isResolved: false, isOutdated: false, path: 'src/a.ts',
+    comments: [{ id: `C_${id}`, body: '[P1] 事实：空指针', author, createdAt: '2026-09-10T00:01:00Z', pullRequestReview: { id: reviewId } }] });
+  const items = feedbackItems({ pr, reviews: [clean, findings],
+    threads: [thread('T1', reviewer, 'R_find'), thread('T2', { login: 'someone-else' }, 'R_find'), thread('T3', reviewer, 'R_clean')] });
+  assert.equal(items.some(item => item.nativeId === 'R_clean'), false);
+  const byId = id => items.find(item => item.nativeId === id || item.threadId === id);
+  assert.equal(byId('R_find').source, 'mivo-review');
+  // Earlier-head finding threads stay trusted: an open thread blocks the next review until fixed.
+  assert.equal(byId('T1').source, 'mivo-review');
+  assert.equal(byId('T1').repairPolicy.canChangeCode, true);
+  assert.equal(byId('T2').source, 'thread');
+  assert.equal(byId('T2').repairPolicy.canChangeCode, false);
+  assert.equal(byId('T3').source, 'thread');
+});

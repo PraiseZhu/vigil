@@ -43,6 +43,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | profile 字段 | 环境变量 | 用途 |
 |---|---|---|
 | `targetRepo` | `MIVO_WATCHER_TARGET_REPO` | 要盯梢的 `owner/repo` |
+| `reviewerLogin` | `MIVO_WATCHER_REVIEWER_LOGIN` | 审查流程提交 review 的 GitHub 账号（它的报告、发现问题的 review 与行内线程才被当作审查信号） |
 | `pluginRepoPath` | `MIVO_PLUGIN_REPO`（函数内手动预检，不经过 `profile.mjs` 的 fail-closed 报错路径） | 本地插件/项目工作仓的绝对路径，`mivo-repair.mjs` 建 worktree 要用 |
 
 ### 可选项（有安全默认值）
@@ -147,8 +148,10 @@ node bin/mivo-ownership.mjs --repo your-org/your-plugin-repo --pr 123 --home "$M
 - 审查反馈严重度 `P0`/`P1`/`P2`/`P3`:P0/P1 视为必须改代码才能回复;P2/P3 只需回复不改代码。
 - 修复会话核实某条 P0/P1 讨论不成立(已验证完成的结果里该 key 为 `no-change` 且附证据)时,watcher 带证据回复并关闭该讨论;没有证据的不关。会话结果晚于上一次轮询写入时,即使 PR 指纹未变也会重新读取,避免任务停在 accepted、讨论永远挡住合并。等 CI 的复查需要约 15–20 秒;剩余扫描预算不足 40 秒时不硬跑(硬跑会被超时杀掉、排在后面的 PR 每轮同样失败),而是结束本轮并从该 PR 续扫,复查超时上限 60 秒。
 - 本轮通过的标签名 `review:merge-ready`。
+- 审查信号（`public-review.mjs`）：审查流程由前置协调器派发 `review-pr.yml`。判「可合并」要同时满足：当前 head 上最新一条 `review-pr` check（GitHub Actions 写入、关联到本仓 `review-pr.yml` 的 workflow_dispatch run）成功；`reviewerLogin` 在同一 head/base 上提交了干净报告（Approve，或带 `<!-- mivo-review:report head=… -->` 的 COMMENT）且晚于本次 Ready；其余条件同前（必需 CI、可合并、讨论已解决、无否决、无新反馈）。
+- 审查入场：`review-pr.yml` 为 active 且仓库变量 `MIVO_REVIEW_MODE=live` 时，每个 Ready PR 都由协调器接管；读不到按未入场处理。`review-pr` check 是审查结论，不计入产品必需 CI（`mivo-pr-policy.mjs`），否则发现问题的 PR 会因「CI 不绿」永远不进修复。
 - 可信审查来源(自动触发修复的评论来源)在 `mivo-pr-policy.mjs` / `mivo-feedback-policy.mjs`
-  里按来源名单判断,按需改成你自己团队的 Bot/Reviewer 名单。
+  里按来源名单判断,按需改成你自己团队的 Bot/Reviewer 名单。`reviewerLogin` 带 `<!-- review-pr:findings … -->` 的 review 及其行内线程记为 `mivo-review` 来源（不按 head 过滤：上一版留下的未解决线程同样挡住下一次审查）；它的干净报告是结论，不进反馈流。
 
 如果你的团队用不同的分级或标签名,直接改这几个文件里的常量即可,不影响其余逻辑。
 

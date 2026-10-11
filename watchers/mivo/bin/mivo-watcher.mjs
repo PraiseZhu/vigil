@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { planSessionTitle, repairSessionTitle } from './session-title.mjs';
-import { collectPublicReview } from './public-review.mjs';
+import { collectPublicReview, REVIEWER, reviewerFindingReviewIds, isReviewerCleanReport } from './public-review.mjs';
 import { collectPrSnapshot, collectPrOwnership } from './mivo-pr-snapshot.mjs';
 import { selectHandoff, isCurrentHandoff } from './mivo-handoff.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './mivo-state.mjs';
@@ -148,11 +148,15 @@ function withPublisher(item, comment) {
 export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci, reviews = [], comments = [], threads = [], mergeable, receiptActor }) {
   const items = [];
   for (const item of failedRequiredCiItems({ pr, ci })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
+  // Reviewer reviews that carry findings (and their inline threads) are trusted review feedback.
+  // Not filtered by head: an unresolved finding thread from an earlier head still blocks the next review.
+  const findingReviews = reviewerFindingReviewIds(reviews);
   for (const review of reviews) {
     if (ownReceipt(review, receiptActor)) continue;
+    if (isReviewerCleanReport(review)) continue; // the clean report is the verdict, not feedback
     if (!review.body?.trim() && review.state !== 'CHANGES_REQUESTED') continue;
     items.push(withCategory(withPublisher({
-      source: isGreptileAuthor(review.author) ? 'greptile' : 'review',
+      source: isGreptileAuthor(review.author) ? 'greptile' : findingReviews.has(review.id) ? 'mivo-review' : 'review',
       nativeId: String(review.id || review.node_id || `${review.author?.login}:${review.submittedAt}`),
       revision: review.submittedAt ?? review.commit?.oid ?? '',
       sha: review.commit?.oid ?? pr.headRefOid ?? null,
@@ -176,8 +180,9 @@ export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci
     const external = threadComments.filter((comment) => !ownReceipt(comment, receiptActor));
     for (const comment of external) {
       const author = comment.author?.login ?? comment.user?.login;
+      const reviewerFinding = author === REVIEWER && findingReviews.has(comment.pullRequestReview?.id);
       items.push(withCategory(withPublisher({
-        source: isGreptileAuthor(author) ? 'greptile' : 'thread',
+        source: isGreptileAuthor(author) ? 'greptile' : reviewerFinding ? 'mivo-review' : 'thread',
         actionable: thread.isResolved !== true,
         threadId: thread.id,
         nativeId: `${thread.id}:${comment.id ?? author ?? 'comment'}`,

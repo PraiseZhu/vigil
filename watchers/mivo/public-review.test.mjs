@@ -1,23 +1,43 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {evaluatePublicReview, verdictComment} from './bin/public-review.mjs';
-const h='a'.repeat(40),b='b'.repeat(40);
-function fixture(verdict='APPROVE') {
-  const comment={id:12,user:{id:41898282,login:'github-actions[bot]',type:'Bot'},created_at:'2026-09-10T00:10:00Z',updated_at:'2026-09-10T00:10:00Z',
-    body:`## 🤖 自动 Review 结论：${verdict}\n三席聚合：CRITICAL 0 · HIGH 0 · MEDIUM 0\n<!-- review-complete head_sha=${h} base_sha=${b} -->`};
-  return {snapshot:{pr:{state:'OPEN',isDraft:false,sameRepository:true,number:10,headRefOid:h,baseRefOid:b,releaseEpoch:'ready:2026-09-10T00:00:00Z',author:{login:'owner'}},comments:[comment],requiredChecksGreen:true,mergeable:'MERGEABLE',threads:[],reviews:[],labels:[]},
-    runs:[{id:3,run_attempt:1,display_title:'Code Review [pr:10]',event:'pull_request_target',path:'.github/workflows/code-review.yml',repository:{full_name:'example-org/example-plugin'},head_sha:h,pull_requests:[{number:10,head:{sha:h},base:{sha:b}}],status:'completed',conclusion:'success',run_started_at:'2026-09-10T00:05:00Z',updated_at:'2026-09-10T00:11:00Z'}],
-    jobs:{3:['gate','seat1','seat2','seat3','publish'].map(name=>({name,run_id:3,run_attempt:1,status:'completed',conclusion:'success'}))}};
+import {evaluatePublicReview, reviewerReport, isReviewerCleanReport, reviewerFindingReviewIds} from './bin/public-review.mjs';
+const h='a'.repeat(40),b='b'.repeat(40),reviewer='ExampleReviewer';
+const header=(head=h,base=b)=>`> Mivo 自动审查 · [PR](https://example.invalid/pull/10) · head \`${head.slice(0,12)}\` · base \`${base.slice(0,12)}\` · diffHash \`0123456789ab\` · 档位 standard`;
+const cleanBody=(extra='')=>`${header()}\n## Findings\n无。\n\n## Overall\npass —— 没有 P0/P1。${extra}`;
+const findingsBody=()=>`${header()}\n## Findings\n- [P1] src/a.ts:3 — 事实：……\n\n## Overall\nchanges-requested —— 1 条 P0/P1，已在对应位置开 review thread。\n\n<!-- review-pr:findings head=${h} digest=${'c'.repeat(64)} -->`;
+function fixture({state='APPROVED',body=cleanBody()}={}) {
+  const report={id:'R1',author:{login:reviewer},state,submittedAt:'2026-09-10T00:10:00Z',commit:{oid:h},body};
+  return {snapshot:{pr:{state:'OPEN',isDraft:false,sameRepository:true,number:10,headRefOid:h,baseRefOid:b,releaseEpoch:'ready:2026-09-10T00:00:00Z',author:{login:'owner'}},
+      comments:[],requiredChecksGreen:true,mergeable:'MERGEABLE',threads:[],reviews:[report],labels:[]},
+    checks:[{id:5,name:'review-pr',app:{id:15368,slug:'github-actions'},head_sha:h,status:'completed',conclusion:'success',started_at:'2026-09-10T00:05:00Z',
+      details_url:'https://github.com/example-org/example-plugin/actions/runs/3'}],
+    runs:{3:{id:3,path:'.github/workflows/review-pr.yml',event:'workflow_dispatch',repository:{full_name:'example-org/example-plugin'}}}};
 }
-test('current APPROVE uses production PR-head run binding without native bundle',()=>assert.equal(evaluatePublicReview(fixture()).ready,true));
-for (const verdict of ['COMMENT','REQUEST_CHANGES','REFUSE','INCOMPLETE','PARSE-FAILED','CI-NOT-GREEN']) test(`${verdict} is not passed`,()=>assert.equal(evaluatePublicReview(fixture(verdict)).ready,false));
-for (const verdict of ['SKIP-LLM','SKIP-LOCAL']) test(`classified ${verdict} needs gate but no paid seats`,()=>{const f=fixture(verdict);f.jobs[3]=f.jobs[3].slice(0,1);assert.equal(evaluatePublicReview(f).ready,true);});
-for (const change of ['head','base','bot','edited','epoch','ci','conflict','thread','veto','draft','closed','jobs','newer','count']) test(`reject ${change}`,()=>{
-  const f=fixture(),s=f.snapshot,c=s.comments[0];
-  if(change==='head')s.pr.headRefOid='c'.repeat(40);
-  if(change==='base')s.pr.baseRefOid='c'.repeat(40);
-  if(change==='bot')c.user.id=1;
-  if(change==='edited')c.updated_at='2026-09-10T00:12:00Z';
+test('APPROVE report plus a successful review-pr check from the dispatch workflow is merge-ready',()=>{
+  const v=evaluatePublicReview(fixture());assert.equal(v.ready,true,v.reason);assert.equal(v.reason,'current-approve');
+});
+test('own PR: COMMENT sealed with the report marker is merge-ready',()=>{
+  const v=evaluatePublicReview(fixture({state:'COMMENTED',body:cleanBody(`\n\n<!-- mivo-review:report head=${h} -->`)}));
+  assert.equal(v.ready,true,v.reason);assert.equal(v.reason,'current-report');
+});
+test('COMMENT without the report marker is not a pass',()=>assert.equal(evaluatePublicReview(fixture({state:'COMMENTED'})).reason,'review-report-missing'));
+test('a later reuse round keeps the head merge-ready',()=>{
+  const f=fixture();f.checks.push({...f.checks[0],id:6,started_at:'2026-09-10T00:20:00Z',details_url:'https://github.com/example-org/example-plugin/actions/runs/4'});
+  f.runs[4]={...f.runs[3],id:4};assert.equal(evaluatePublicReview(f).ready,true);
+});
+test('findings review is not a pass',()=>assert.equal(evaluatePublicReview(fixture({state:'COMMENTED',body:findingsBody()})).reason,'review-findings'));
+for (const change of ['head','base','reviewer','check-missing','check-running','check-failed','check-app','run-path','run-event','run-repo','epoch','ci','conflict','thread','veto','draft','closed','later-findings','hold','new-feedback','overall','report-commit']) test(`reject ${change}`,()=>{
+  const f=fixture(),s=f.snapshot,r=s.reviews[0],c=f.checks[0];
+  if(change==='head'){s.pr.headRefOid='d'.repeat(40);}
+  if(change==='base')s.pr.baseRefOid='d'.repeat(40);
+  if(change==='reviewer')r.author.login='someone-else';
+  if(change==='check-missing')f.checks=[];
+  if(change==='check-running'){c.status='in_progress';c.conclusion=null;}
+  if(change==='check-failed')c.conclusion='failure';
+  if(change==='check-app')c.app.id=999;
+  if(change==='run-path')f.runs[3].path='.github/workflows/ci.yml';
+  if(change==='run-event')f.runs[3].event='pull_request_target';
+  if(change==='run-repo')f.runs[3].repository.full_name='example-org/fork';
   if(change==='epoch')s.pr.releaseEpoch='ready:2026-09-10T00:20:00Z';
   if(change==='ci')s.requiredChecksGreen=false;
   if(change==='conflict')s.mergeable='CONFLICTING';
@@ -25,11 +45,18 @@ for (const change of ['head','base','bot','edited','epoch','ci','conflict','thre
   if(change==='veto')s.reviewDecision='CHANGES_REQUESTED';
   if(change==='draft')s.pr.isDraft=true;
   if(change==='closed')s.pr.state='CLOSED';
-  if(change==='jobs')f.jobs[3][1].conclusion='skipped';
-  if(change==='newer')f.runs.push({...f.runs[0],id:4,status:'in_progress',conclusion:null,run_started_at:'2026-09-10T00:12:00Z'});
-  if(change==='count')c.body=c.body.replace('MEDIUM 0','MEDIUM 1');
+  if(change==='later-findings')s.reviews.push({id:'R2',author:{login:reviewer},state:'COMMENTED',submittedAt:'2026-09-10T00:12:00Z',commit:{oid:h},body:findingsBody()});
+  if(change==='hold')s.labels=['awaiting-discussion'];
+  if(change==='new-feedback')s.comments.push({id:14,user:{login:'greptile-apps[bot]'},created_at:'2026-09-10T00:12:00Z',body:'regression'});
+  if(change==='overall')r.body=r.body.replace('pass —— 没有 P0/P1。','changes-requested —— 1 条 P0/P1。');
+  if(change==='report-commit')r.commit.oid='d'.repeat(40);
   assert.equal(evaluatePublicReview(f).ready,false);
 });
-test('later unsealed infrastructure failure invalidates old pass',()=>{const f=fixture();f.snapshot.comments.push({...f.snapshot.comments[0],id:13,created_at:'2026-09-10T00:12:00Z',updated_at:'2026-09-10T00:12:00Z',body:`mivo-code-review depth=INCOMPLETE head_sha=${h}\n## 🤖 自动 Review 结论：INCOMPLETE`});assert.equal(evaluatePublicReview(f).ready,false);});
-test('new external comment invalidates old pass',()=>{const f=fixture();f.snapshot.comments.push({id:14,user:{login:'reviewer'},created_at:'2026-09-10T00:12:00Z',body:'regression'});assert.equal(evaluatePublicReview(f).ready,false);});
-test('P0/P1/P2 summary accepted after publisher display-only migration',()=>{const f=fixture();f.snapshot.comments[0].body=f.snapshot.comments[0].body.replace('CRITICAL','P0').replace('HIGH','P1').replace('MEDIUM','P2');assert.equal(evaluatePublicReview(f).ready,true);});
+test('reviewer report helpers: only the configured reviewer counts',()=>{
+  const clean={id:'R1',author:{login:reviewer},state:'APPROVED',submittedAt:'2026-09-10T00:10:00Z',commit:{oid:h},body:cleanBody()};
+  const findings={id:'R2',author:{login:reviewer},state:'COMMENTED',submittedAt:'2026-09-10T00:12:00Z',commit:{oid:h},body:findingsBody()};
+  const forged={...findings,id:'R3',author:{login:'someone-else'}};
+  assert.equal(isReviewerCleanReport(clean),true);assert.equal(isReviewerCleanReport(findings),false);
+  assert.equal(reviewerReport(forged),null);
+  assert.deepEqual([...reviewerFindingReviewIds([clean,findings,forged])],['R2']);
+});
