@@ -10,7 +10,7 @@ function fixture({state='APPROVED',body=cleanBody()}={}) {
   return {snapshot:{pr:{state:'OPEN',isDraft:false,sameRepository:true,number:10,headRefOid:h,baseRefOid:b,releaseEpoch:'ready:2026-09-10T00:00:00Z',author:{login:'owner'}},
       comments:[],requiredChecksGreen:true,mergeable:'MERGEABLE',threads:[],reviews:[report],labels:[]},
     checks:[{id:5,name:'review-pr',app:{id:15368,slug:'github-actions'},head_sha:h,status:'completed',conclusion:'success',started_at:'2026-09-10T00:05:00Z',
-      details_url:'https://github.com/example-org/example-plugin/actions/runs/3'}],
+      external_id:'https://github.com/example-org/example-plugin/actions/runs/3',details_url:'https://github.com/example-org/example-plugin/runs/5'}],
     runs:{3:{id:3,path:'.github/workflows/review-pr.yml',event:'workflow_dispatch',repository:{full_name:'example-org/example-plugin'}}}};
 }
 test('APPROVE report plus a successful review-pr check from the dispatch workflow is merge-ready',()=>{
@@ -22,11 +22,11 @@ test('own PR: COMMENT sealed with the report marker is merge-ready',()=>{
 });
 test('COMMENT without the report marker is not a pass',()=>assert.equal(evaluatePublicReview(fixture({state:'COMMENTED'})).reason,'review-report-missing'));
 test('a later reuse round keeps the head merge-ready',()=>{
-  const f=fixture();f.checks.push({...f.checks[0],id:6,started_at:'2026-09-10T00:20:00Z',details_url:'https://github.com/example-org/example-plugin/actions/runs/4'});
+  const f=fixture();f.checks.push({...f.checks[0],id:6,started_at:'2026-09-10T00:20:00Z',external_id:'https://github.com/example-org/example-plugin/actions/runs/4',details_url:'https://github.com/example-org/example-plugin/runs/6'});
   f.runs[4]={...f.runs[3],id:4};assert.equal(evaluatePublicReview(f).ready,true);
 });
 test('findings review is not a pass',()=>assert.equal(evaluatePublicReview(fixture({state:'COMMENTED',body:findingsBody()})).reason,'review-findings'));
-for (const change of ['head','base','reviewer','check-missing','check-running','check-failed','check-app','run-path','run-event','run-repo','epoch','ci','conflict','thread','veto','draft','closed','later-findings','hold','new-feedback','overall','report-commit']) test(`reject ${change}`,()=>{
+for (const change of ['head','base','reviewer','check-missing','check-running','check-failed','check-app','external-id-missing','external-id-other-repo','external-id-job','run-path','run-event','run-repo','epoch','ci','conflict','thread','veto','draft','closed','later-findings','hold','new-feedback','overall','report-commit']) test(`reject ${change}`,()=>{
   const f=fixture(),s=f.snapshot,r=s.reviews[0],c=f.checks[0];
   if(change==='head'){s.pr.headRefOid='d'.repeat(40);}
   if(change==='base')s.pr.baseRefOid='d'.repeat(40);
@@ -35,6 +35,10 @@ for (const change of ['head','base','reviewer','check-missing','check-running','
   if(change==='check-running'){c.status='in_progress';c.conclusion=null;}
   if(change==='check-failed')c.conclusion='failure';
   if(change==='check-app')c.app.id=999;
+  // GitHub ignores details_url for Actions-authored checks, so a run URL there must not bind the producer.
+  if(change==='external-id-missing'){delete c.external_id;c.details_url='https://github.com/example-org/example-plugin/actions/runs/3';}
+  if(change==='external-id-other-repo')c.external_id='https://github.com/example-org/fork/actions/runs/3';
+  if(change==='external-id-job')c.external_id='https://github.com/example-org/example-plugin/actions/runs/3/job/9';
   if(change==='run-path')f.runs[3].path='.github/workflows/ci.yml';
   if(change==='run-event')f.runs[3].event='pull_request_target';
   if(change==='run-repo')f.runs[3].repository.full_name='example-org/fork';

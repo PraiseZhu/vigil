@@ -61,9 +61,15 @@ export function isReviewerCleanReport(review) {
 
 const reviewChecks = (checks = [], head) => checks.filter(c => c?.name === REVIEW_CHECK && c.app?.id === ACTIONS_APP_ID && c.head_sha === head)
   .sort((a, b) => Date.parse(b.started_at ?? b.created_at) - Date.parse(a.started_at ?? a.created_at) || b.id - a.id);
+// GitHub rewrites details_url of API-created Actions checks to the check page; only external_id survives.
+// review-pr.yml writes its own run URL there, so the producing run is read from external_id and must be in REPO.
+const RUN_PATH_RE = new RegExp(`^/${REPO.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/actions/runs/(\\d+)/?$`);
 function runIdOf(check) {
-  try { return /\/actions\/runs\/(\d+)(?:\/job\/\d+)?\/?$/.exec(new URL(check.details_url).pathname)?.[1] ?? null; }
-  catch { return null; }
+  try {
+    const url = new URL(check.external_id);
+    if (url.protocol !== 'https:' || url.hostname !== 'github.com' || url.username || url.password) return null;
+    return RUN_PATH_RE.exec(url.pathname)?.[1] ?? null;
+  } catch { return null; }
 }
 
 export function evaluatePublicReview({ snapshot: s, comments = s.comments, checks = [], runs = {} }) {
