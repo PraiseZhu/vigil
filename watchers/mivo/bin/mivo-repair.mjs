@@ -286,6 +286,21 @@ export function assertTaskRepairScope(task, head) {
 }
 
 const KEEL_RUN_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+// Keel flow contract of newly dispatched tasks. 1 = a row naming the task; 2 = pstack_start row plus
+// flow evidence; 3 = a fixed run id whose ledger is created by the first pstack_decide(op:"decide").
+// A task is verified against the version it was dispatched with, so raising this never breaks one in flight.
+export const KEEL_FLOW_VERSION = 3;
+
+// The Keel run id of a v3 task. Derived from the dispatch id so the prompt can hand it out and the
+// gate can recompute it; shaped like Keel's own ids (run-<14 digits>-<hex>) so name-sorted ledger
+// listings stay in order.
+export function keelRunIdFor(dispatchId) {
+  const id = String(dispatchId);
+  const parts = /(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/.exec(id);
+  return `run-${parts ? parts.slice(1, 7).join('') : 'vigil'}-${createHash('sha256').update(id).digest('hex').slice(0, 6)}`;
+}
+
 export function keelLedgerRoot(env = process.env) {
   return optionalConfig('keelLedgerRoot', { envVar: 'MIVO_KEEL_LEDGER_ROOT', env }) ?? null;
 }
@@ -293,14 +308,17 @@ export function keelLedgerRoot(env = process.env) {
 // Keel keeps each pstack run at runs/<run_id>/decisions.jsonl. The repair session binds its
 // run to this task by logging a row containing task=<dispatchId>; without a configured
 // ledger root, or for a pre-Keel task, the gate reports why it did not apply.
+// A v3 run id is fixed per task. Current Keel only creates the ledger file in pstack_decide(op:"decide"),
+// so the first decision necessarily precedes the binding row and no start row exists to check.
 export function verifyKeelRun({ task, runId, root = keelLedgerRoot(), validatedHead, verification }) {
   const version = task.keelFlowVersion ?? 1;
-  if (!root && version !== 2) return { status: 'disabled' };
+  if (!root && version < 2) return { status: 'disabled' };
   if (task.keelFlow !== true) return { status: 'not-required-legacy-task' };
   const reject = message => fail('[KEEL_RUN_REQUIRED] ' + message);
-  if (version !== 1 && version !== 2) reject('unsupported Keel flow version');
+  if (![1, 2, 3].includes(version)) reject('unsupported Keel flow version');
   if (!root) reject('new Keel task requires keelLedgerRoot');
-  if (typeof runId !== 'string' || !KEEL_RUN_ID.test(runId)) reject('finalize needs --keel-run <run_id> from Keel pstack_start');
+  if (typeof runId !== 'string' || !KEEL_RUN_ID.test(runId)) reject('finalize needs --keel-run <run_id>');
+  if (version === 3 && runId !== keelRunIdFor(task.dispatchId)) reject('v3 run_id must be ' + keelRunIdFor(task.dispatchId));
   const file = path.join(requireAbs(root, 'keelLedgerRoot'), 'runs', runId, 'decisions.jsonl');
   let rows;
   try { rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)); }
@@ -317,14 +335,16 @@ export function verifyKeelRun({ task, runId, root = keelLedgerRoot(), validatedH
   const boundRows = rows.filter(row => row?.run_id === runId && current(row));
   const playbook = taskRepairPolicy(task).canChangeCode ? 'bug-fix' : 'investigation';
   const manualPath = 'pstack/skills/poteto-mode/playbooks/' + playbook + '.md';
-  const start = boundRows.find(row => row.kind === 'step' && typeof row.summary === 'string'
-    && row.summary.startsWith('start ' + playbook + '（'));
   const binding = boundRows.find(row => row.kind === 'step' && row.summary === 'vigil ' + marker);
-  if (!start || !binding || Date.parse(start.at) > Date.parse(binding.at)) reject('pstack start and exact task binding are required');
+  if (version === 2) {
+    const start = boundRows.find(row => row.kind === 'step' && typeof row.summary === 'string'
+      && row.summary.startsWith('start ' + playbook + '（'));
+    if (!start || !binding || Date.parse(start.at) > Date.parse(binding.at)) reject('pstack start and exact task binding are required');
+  } else if (!binding) reject('exact task binding row is required (pstack_decide op:"log" kind:"step" summary:"vigil ' + marker + '")');
   const flowRow = [...boundRows].reverse().find(row => row.kind === 'evidence'
     && row.evidence?.kind === 'vigil-flow' && row.evidence.taskId === task.dispatchId && row.evidence.head === validatedHead);
   const flow = flowRow?.evidence;
-  if (!flow || flow.version !== 2 || flow.playbook !== playbook || flow.manualPath !== manualPath) reject('current HEAD flow evidence and playbook are required');
+  if (!flow || flow.version !== version || flow.playbook !== playbook || flow.manualPath !== manualPath) reject('current HEAD flow evidence and playbook are required');
   if (Date.parse(flowRow.at) < Date.parse(binding.at)) reject('flow evidence predates task binding');
   const refs = flow.decisionRowIds;
   if (!Array.isArray(refs) || !refs.length || new Set(refs).size !== refs.length) reject('flow must reference actual pstack decisions');
@@ -332,7 +352,7 @@ export function verifyKeelRun({ task, runId, root = keelLedgerRoot(), validatedH
     const decision = boundRows.find(row => row.row_id === id && row.kind === 'decision');
     if (!decision || !/^J(?:[3-9]|1[0-2])$/.test(decision.template ?? '')
       || !/^[a-f0-9]{64}$/.test(decision.state_sha256 ?? '') || decision.answer == null || decision.policy == null
-      || Date.parse(decision.at) < Date.parse(binding.at) || Date.parse(decision.at) > Date.parse(flowRow.at)) reject('referenced task decision is missing or incomplete');
+      || (version === 2 && Date.parse(decision.at) < Date.parse(binding.at)) || Date.parse(decision.at) > Date.parse(flowRow.at)) reject('referenced task decision is missing or incomplete');
   }
   const steps = flow.steps;
   if (!steps || typeof steps.reproduce !== 'string' || !steps.reproduce.trim()
@@ -343,7 +363,7 @@ export function verifyKeelRun({ task, runId, root = keelLedgerRoot(), validatedH
   } else if (!['pass', 'approved-exception'].includes(verification.status)
     || steps.verify?.head !== validatedHead || !/^[a-f0-9]{64}$/.test(verification.receiptSha256 ?? '')
     || steps.verify?.receiptSha256 !== verification.receiptSha256) reject('flow must reference the current local validation receipt');
-  return { status: 'verified', runId, rows: rows.length, decisions: refs.length, contractVersion: 2 };
+  return { status: 'verified', runId, rows: rows.length, decisions: refs.length, contractVersion: version };
 }
 
 const CI_ERROR_LINES = 20;
