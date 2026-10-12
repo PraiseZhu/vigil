@@ -8,7 +8,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { scanOnce, watcherPaths } from './bin/cindy-watcher.mjs';
 import { evaluateCindyReview } from './bin/cindy-review-status.mjs';
-import { prepare, validate, finalize, recheck, cleanupWatch } from './bin/cindy-repair.mjs';
+import { prepare, validate, finalize, recheck, cleanupWatch, keelRunIdFor } from './bin/cindy-repair.mjs';
 import { readPr } from './bin/cindy-state.mjs';
 
 const REPO = 'makecindy/cindy', ID = 'PR_lifecycle', NUMBER = 790, SESSION = 'lifecycle-owner';
@@ -109,14 +109,18 @@ test('discover → bind → prepare → failing preflight → repair → DCO →
   const scReport = path.join(root, 'sc.json');
   fs.writeFileSync(scReport, JSON.stringify({ scs: [{ id: 'SC-add', status: 'pass',
     feedbackKeys: task.feedback.map(f => f.key), evidence: ['Actual node check.mjs fails before fix and passes after fix'] }] }));
-  const keelRoot = path.join(root, 'keel'), keelRun = 'run-lifecycle';
-  const commonRow = { run_id: keelRun, at: new Date().toISOString() };
+  // Ledger in the shape current Keel writes for a v3 task: fixed run id, the first decide creates it,
+  // then the binding row and the flow evidence via op:"log".
+  const keelRoot = path.join(root, 'keel'), keelRun = keelRunIdFor(task.dispatchId);
+  assert.equal(task.keelFlowVersion, 3);
+  assert.equal(task.keelRunId, keelRun);
+  const base = Date.now();
+  const commonRow = offset => ({ run_id: keelRun, at: new Date(base + offset).toISOString() });
   const rows = [
-    { ...commonRow, kind: 'step', summary: 'start bug-fix（user）depth=1' },
-    { ...commonRow, kind: 'step', summary: 'vigil task=' + task.dispatchId },
-    { ...commonRow, kind: 'decision', row_id: 'run-lifecycle#3', template: 'J4', state_sha256: 'b'.repeat(64), answer: 'fix', policy: 'act' },
-    { ...commonRow, kind: 'evidence', evidence: { kind: 'vigil-flow', version: 2, taskId: task.dispatchId, head,
-      playbook: 'bug-fix', manualPath: 'pstack/skills/poteto-mode/playbooks/bug-fix.md', decisionRowIds: ['run-lifecycle#3'],
+    { ...commonRow(0), kind: 'decision', row_id: `${keelRun}#1`, template: 'J4', state_sha256: 'b'.repeat(64), answer: 'fix', policy: 'act' },
+    { ...commonRow(1), row_id: `${keelRun}#2`, kind: 'step', summary: 'vigil task=' + task.dispatchId },
+    { ...commonRow(2), row_id: `${keelRun}#3`, kind: 'evidence', evidence: { kind: 'vigil-flow', version: 3, taskId: task.dispatchId, head,
+      playbook: 'bug-fix', manualPath: 'pstack/skills/poteto-mode/playbooks/bug-fix.md', decisionRowIds: [`${keelRun}#1`],
       steps: { reproduce: 'Actual check.mjs fails before repair', repair: 'Addition fixed and DCO commit created',
         verify: { head, receiptSha256: local.receiptSha256 } } } },
   ];
