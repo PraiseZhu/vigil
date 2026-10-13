@@ -15,8 +15,9 @@ export function isGreptileAuthor(author) {
 function trustedReviewer(item) {
   const author = item.user ?? item.author;
   const login = typeof author === 'string' ? author : author?.login;
-  // source=greptile is also the historic collector's normalized provenance.
-  return item.source === 'greptile' || isGreptileAuthor(author)
+  // source=greptile is also the historic collector's normalized provenance; source=mivo-review is set by
+  // the collector only for the configured reviewer's findings reviews and their inline threads.
+  return item.source === 'greptile' || item.source === 'mivo-review' || isGreptileAuthor(author)
     || ['github-actions', 'github-actions[bot]'].includes(login);
 }
 function visibleLines(body) {

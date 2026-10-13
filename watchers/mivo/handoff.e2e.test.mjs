@@ -129,8 +129,9 @@ function fakeGhMain() {
     content: Buffer.from(JSON.stringify({ on_main: ['unit'], pr_only: [] })).toString('base64') });
   if (endpoint.includes('/check-runs?')) return send([{ check_runs: [] }]);
   if (endpoint.includes('/statuses?')) return send([[{ id: 501, context: 'unit', state: 'success', created_at: '2026-09-02T01:00:00Z', creator: { id: 1 } }]]);
-  if (endpoint.includes('/actions/workflows/code-review.yml/runs?')) return send([{ workflow_runs: [{ id: 201,
-    display_title: 'Code Review [pr:17]', event: 'pull_request_target', head_sha: state.pr.headRefOid }] }]);
+  // Review ingress: the review-pr flow is live (dispatch workflow active, mode variable live).
+  if (endpoint.endsWith('/actions/workflows/review-pr.yml')) return send({ id: 201, path: '.github/workflows/review-pr.yml', state: 'active' });
+  if (endpoint.endsWith('/actions/variables/MIVO_REVIEW_MODE')) return send({ name: 'MIVO_REVIEW_MODE', value: 'live' });
   process.stderr.write('unexpected fake gh request: ' + JSON.stringify(args)); process.exit(2);
 }
 
