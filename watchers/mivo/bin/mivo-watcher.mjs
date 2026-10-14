@@ -211,6 +211,22 @@ export function newFeedback(previousCursor = {}, items = []) {
   return { fresh, cursor: next };
 }
 
+// A new reply must recheck the whole open thread: the previous task is replaced,
+// and closing a thread requires evidence for every external comment in the current task.
+function includeOpenThreadFeedback(fresh, observed) {
+  const threadIds = new Set(fresh.map((item) => item.threadId).filter(Boolean));
+  const keys = new Set(fresh.map((item) => item.key));
+  const feedback = [...fresh];
+  for (const item of observed) {
+    if (!threadIds.has(item.threadId) || item.actionable === false || item.deferred === true) continue;
+    const key = `${item.source}:${item.nativeId}`;
+    if (keys.has(key)) continue;
+    keys.add(key);
+    feedback.push({ ...item, key });
+  }
+  return feedback;
+}
+
 export function planSession({ pr, existing, date, task }) {
   const nodeId = pr.id;
   if (!nodeId) throw new Error('PR nodeid required');
@@ -1166,6 +1182,7 @@ export function* processPr({
       reason: 'No result after three bounded recovery deliveries; inspect the existing session before resuming.',
     } };
   }
+  fresh = includeOpenThreadFeedback(fresh, observed);
   const terminal = ['blocked', 'complete', 'legacy-complete'].includes(previous.activeTask?.status);
   const inFlight = Boolean(previous.lastDispatch?.dispatchId) && !terminal;
   const recovery = admitted && !collected.mergeReady && !resultError

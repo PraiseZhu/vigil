@@ -4,11 +4,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { pollWorkflow, watcherPaths, feedbackItems, newFeedback } from './bin/mivo-watcher.mjs';
+import { validateScs } from './bin/mivo-repair.mjs';
 import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 
 const ROOT = '/virtual/vigil-thread-close';
 
-function fixture({ kind = 'fixed', waiting = false, human = false, outdated = false, badCi = false, replyError = false } = {}) {
+function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = false, outdated = false, badCi = false, replyError = false } = {}) {
   const original = Object.fromEntries(['existsSync', 'readFileSync', 'mkdirSync', 'writeFileSync', 'renameSync', 'unlinkSync'].map((k) => [k, fs[k]]));
   const files = new Map();
   const dirs = new Set([ROOT, ROOT + '/state', ROOT + '/state/prs']);
@@ -35,7 +36,13 @@ function fixture({ kind = 'fixed', waiting = false, human = false, outdated = fa
   const review = { id: 'PRR_sample', author: { login: 'ExampleReviewer' }, body: `<!-- review-pr:findings head=${head} -->`, state: 'COMMENTED', commit: { oid: head }, submittedAt: now };
   const bot = { id: 'PRRC_bot', author: { login: 'ExampleReviewer' }, body: '**P1** concrete failure', pullRequestReview: { id: review.id }, createdAt: now };
   const thread = { id: 'PRRT_sample', isResolved: false, isOutdated: false, path: 'src/example.mjs', comments: { nodes: [bot] } };
-  const feedback = newFeedback({}, feedbackItems({ pr, reviews: [review], threads: [thread], receiptActor: 'owner' }));
+  const threads = [thread];
+  if (unrelated) {
+    threads.push({ ...thread, id: 'PRRT_other', comments: { nodes: [{ ...bot, id: 'PRRC_other' }] } });
+    threads.push({ ...thread, id: 'PRRT_resolved', isResolved: true, comments: { nodes: [{ ...bot, id: 'PRRC_resolved' }] } });
+    thread.comments.nodes.push({ id: 'PRRC_receipt', author: { login: 'owner' }, body: '<!-- mivo-watcher-receipt task=prior-task -->', createdAt: now });
+  }
+  const feedback = newFeedback({}, feedbackItems({ pr, reviews: [review], threads, receiptActor: 'owner' }));
   const item = feedback.fresh.find((x) => x.threadId === thread.id);
   assert.equal(item.repairPolicy.action, 'code-fix');
   const task = { dispatchId: 'sample-task', headRefOid: head, feedback: [item], repairPolicy: { items: [{ key: item.key, action: 'code-fix' }] } };
@@ -65,7 +72,7 @@ function fixture({ kind = 'fixed', waiting = false, human = false, outdated = fa
   const dispatches = [];
   let rechecks = 0;
   const snapshot = { state: 'OPEN', isDraft: false, headRefOid: head, baseRefOid: pr.baseRefOid, updatedAt: now, mergeable: 'MERGEABLE', labels: [], checkState: 'SUCCESS', commentCount: 1, reviewCount: 1, unresolvedThreads: 1 };
-  const collectedValue = withAuthorHandoff({ pr, checks: [], requiredChecks: [], ci: { status: 'green', required: [] }, policy: { status: 'verified', required: [] }, reviews: [review], threads: [thread], labels: [], comments: [], mergeReady: false, admissionVerified: true }, pr);
+  const collectedValue = withAuthorHandoff({ pr, checks: [], requiredChecks: [], ci: { status: 'green', required: [] }, policy: { status: 'verified', required: [] }, reviews: [review], threads, labels: [], comments: [], mergeReady: false, admissionVerified: true }, pr);
   function run() {
     const gen = pollWorkflow({
       paths, now, nodeId: pr.id, prNumber: pr.number, enabled: true, allowDispatch: true, budgetMs: 120000, clock: () => 0, snapshotFn: () => snapshot,
@@ -76,7 +83,7 @@ function fixture({ kind = 'fixed', waiting = false, human = false, outdated = fa
         return '{}';
       },
       collect: () => collectedValue,
-      dispatchFn: (params) => { dispatches.push(params); return { target_session_id: 'sample-session', dispatch_id: 'new-sample-task' }; },
+      dispatchFn: (params) => { dispatches.push(params); return { target_session_id: 'sample-session' }; },
       ownershipSnapshot: function* () { return { pr }; },
       recheckFn: () => { rechecks++; files.set(resultPath, JSON.stringify(complete)); return complete; },
     });
@@ -87,7 +94,20 @@ function fixture({ kind = 'fixed', waiting = false, human = false, outdated = fa
     return step.value;
   }
   const resolves = () => calls.filter((args) => args.some((a) => String(a).includes('resolveReviewThread'))).length;
-  return { run, restore, calls, dispatches, head, snapshot, resolves, rechecks: () => rechecks, entry: () => JSON.parse(files.get(entryPath)) };
+  const entry = () => JSON.parse(files.get(entryPath));
+  const activeTask = () => JSON.parse(files.get(ROOT + '/state/tasks/' + entry().activeTask.dispatchId + '.json'));
+  function completeActiveTask() {
+    const next = activeTask();
+    const evidence = validateScs(next.feedback.map((item, index) => ({
+      id: 'SC-' + index, status: item.repairPolicy.canChangeCode ? 'pass' : 'no-change',
+      feedbackKeys: [item.key], evidence: ['verified concrete trigger with focused tests'],
+    })), next);
+    files.set(ROOT + '/state/results/' + next.dispatchId + '.json', JSON.stringify({
+      ...complete, ...evidence, dispatchId: next.dispatchId, receiptId: 'second-complete-receipt',
+    }));
+    snapshot.commentCount++;
+  }
+  return { run, restore, calls, dispatches, head, snapshot, resolves, activeTask, completeActiveTask, rechecks: () => rechecks, entry };
 }
 
 for (const kind of ['fixed', 'refuted']) {
@@ -133,6 +153,31 @@ test('new unhandled human reply keeps the whole thread open and goes to dispatch
     f.run();
     assert.equal(f.resolves(), 0, 'human feedback outside the completed task must stay unresolved');
     assert.equal(f.entry().autoClosedThreads?.PRRT_sample, undefined);
+    assert.equal(f.dispatches.length, 1);
+  } finally { f.restore(); }
+});
+
+test('a later repair round covers the whole open thread and closes it once', () => {
+  const f = fixture({ human: true, unrelated: true });
+  try {
+    f.run();
+    assert.equal(f.resolves(), 0, 'the first result cannot close the new reply');
+    assert.equal(f.dispatches.length, 1);
+    const task = f.activeTask();
+    assert.deepEqual(task.feedback.map((item) => item.nativeId).sort(), [
+      'PRRT_sample:PRRC_bot', 'PRRT_sample:PRRC_human',
+    ], 'carry the consumed finding alongside its new reply, excluding other threads and watcher receipts');
+    assert.deepEqual(task.repairPolicy.items.map((item) => item.key).sort(), task.feedback.map((item) => item.key).sort());
+    assert.match(f.dispatches[0].message, /PRRT_sample:PRRC_bot/);
+    assert.match(f.dispatches[0].message, /PRRT_sample:PRRC_human/);
+    f.completeActiveTask();
+    f.run();
+    assert.equal(f.resolves(), 1, 'the second complete result closes all verified comments');
+    assert.equal(f.calls.length, 2, 'reply and resolve exactly once');
+    assert.equal(f.dispatches.length, 1, 'completed comments do not cause a third repair');
+    f.snapshot.commentCount++;
+    f.run();
+    assert.equal(f.calls.length, 2);
     assert.equal(f.dispatches.length, 1);
   } finally { f.restore(); }
 });
