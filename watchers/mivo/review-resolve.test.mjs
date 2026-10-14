@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { feedbackItems } from './bin/mivo-watcher.mjs';
-import { isAutoCloseEligible, partitionAutoClose, autoCloseThreads, autoCloseReplyText, closeRefutedThreads, refutedReplyText, refutedThreads } from './bin/mivo-review-resolve.mjs';
+import { isAutoCloseEligible, partitionAutoClose, autoCloseThreads, autoCloseReplyText, closeRefutedThreads, refutedReplyText, refutedThreads, fixedReplyText, fixedThreads } from './bin/mivo-review-resolve.mjs';
 
 const HEAD = 'a'.repeat(40);
 const PR = { headRefOid: HEAD };
@@ -148,6 +148,94 @@ test('refuted reply shows the evidence without local paths and carries the self-
   assert.match(text, /<本机路径>/);
   assert.doesNotMatch(text, /\/home\//);
   assert.match(text, /mivo-watcher-receipt task=live-851/);
+});
+
+test('refutedThreads recognizes mivo-review keys from the new review machine', () => {
+  const task = { dispatchId: 'live-851', repairPolicy: { items: [
+    { key: 'mivo-review:PRRT_new:PRRC_z', action: 'code-fix' },
+  ] } };
+  const result = {
+    schemaVersion: 2, status: 'complete', dispatchId: 'live-851',
+    scs: [
+      { id: 'SC-1', status: 'no-change', feedbackKeys: ['mivo-review:PRRT_new:PRRC_z'], evidence: ['current head already guards null'] },
+    ],
+    feedbackCoverage: { dispositions: [
+      { key: 'mivo-review:PRRT_new:PRRC_z', disposition: 'no-change' },
+    ] },
+  };
+  assert.deepEqual(refutedThreads(result, task).map((item) => item.threadId), ['PRRT_new']);
+});
+
+test('fixedThreads recognizes verified fixed P0/P1 review threads with pass evidence', () => {
+  const task = { dispatchId: 'live-851', repairPolicy: { items: [
+    { key: 'mivo-review:PRRT_fix:PRRC_a', action: 'code-fix' },
+    { key: 'thread:PRRT_legacy:PRRC_b', action: 'code-fix' },
+    { key: 'thread:PRRT_noevidence:PRRC_c', action: 'code-fix' },
+    { key: 'thread:PRRT_reply:PRRC_d', action: 'reply-only' },
+    { key: 'comment:9', action: 'code-fix' },
+  ] } };
+  const result = {
+    schemaVersion: 2, status: 'complete', dispatchId: 'live-851', head: 'c'.repeat(40),
+    scs: [
+      { id: 'SC-1', status: 'pass', feedbackKeys: ['mivo-review:PRRT_fix:PRRC_a'], evidence: ['git show abcdef123456:src/a.ts covers the null path'] },
+      { id: 'SC-2', status: 'pass', feedbackKeys: ['thread:PRRT_legacy:PRRC_b'], evidence: ['added guard'] },
+      { id: 'SC-3', status: 'pass', feedbackKeys: ['thread:PRRT_noevidence:PRRC_c'], evidence: [' '] },
+      { id: 'SC-4', status: 'pass', feedbackKeys: ['thread:PRRT_reply:PRRC_d'], evidence: ['should not close reply-only'] },
+      { id: 'SC-5', status: 'pass', feedbackKeys: ['comment:9'], evidence: ['not a thread'] },
+    ],
+    feedbackCoverage: { dispositions: [
+      { key: 'mivo-review:PRRT_fix:PRRC_a', disposition: 'fixed' },
+      { key: 'thread:PRRT_legacy:PRRC_b', disposition: 'fixed' },
+      { key: 'thread:PRRT_noevidence:PRRC_c', disposition: 'fixed' },
+      { key: 'thread:PRRT_reply:PRRC_d', disposition: 'fixed' },
+      { key: 'comment:9', disposition: 'fixed' },
+    ] },
+  };
+  assert.deepEqual(fixedThreads(result, task).map((item) => item.threadId), ['PRRT_fix', 'PRRT_legacy']);
+  for (const extra of [{ status: 'waiting-ci' }, { schemaVersion: 1 }, { dispatchId: 'other' }]) {
+    assert.deepEqual(fixedThreads({ ...result, ...extra }, task), []);
+  }
+});
+
+test('fixed reply names the repair head, sanitizes paths, and carries the receipt', () => {
+  const text = fixedReplyText(['see /home/ci/repo/x.mjs line 3'], 'abcdef1234567890', 'live-851');
+  assert.match(text, /发生了什么/);
+  assert.match(text, /abcdef123456/);
+  assert.match(text, /要不要改代码/);
+  assert.match(text, /已改/);
+  assert.match(text, /<本机路径>/);
+  assert.doesNotMatch(text, /\/home\//);
+  assert.match(text, /mivo-watcher-receipt task=live-851/);
+});
+
+test('closeRefutedThreads replies once per thread using kind-specific text and receipts', () => {
+  const calls = [];
+  const items = [
+    { key: 'mivo-review:PRRT_fix:PRRC_a', threadId: 'PRRT_fix', evidence: ['guard added'], kind: 'fixed' },
+    { key: 'mivo-review:PRRT_no:PRRC_b', threadId: 'PRRT_no', evidence: ['already guarded'], kind: 'refuted' },
+  ];
+  const run = (previous) => {
+    const gen = closeRefutedThreads({
+      items, dispatchId: 'live-851', previous, head: 'abcdef1234567890',
+      ghFn: (args) => { calls.push(args); return '{}'; }, now: 't',
+    });
+    let step = gen.next();
+    while (!step.done) { step.value(); step = gen.next(); }
+    return step.value;
+  };
+  const first = run({});
+  assert.equal(calls.length, 4);
+  const fixedBody = calls[0].find((arg) => arg.startsWith('body='));
+  const refutedBody = calls[2].find((arg) => arg.startsWith('body='));
+  assert.match(fixedBody, /已改/);
+  assert.match(fixedBody, /abcdef123456/);
+  assert.match(refutedBody, /不改/);
+  assert.equal(first.previous.autoClosedThreads.PRRT_fix.reason, 'fixed-p0-p1');
+  assert.equal(first.previous.autoClosedThreads.PRRT_no.reason, 'refuted-p0-p1');
+  assert.deepEqual(first.closed.map((item) => item.threadId), ['PRRT_fix', 'PRRT_no']);
+  calls.length = 0;
+  assert.deepEqual(run(first.previous).closed, []);
+  assert.equal(calls.length, 0);
 });
 
 test('refuted closure replies then resolves once per thread and is idempotent', () => {
