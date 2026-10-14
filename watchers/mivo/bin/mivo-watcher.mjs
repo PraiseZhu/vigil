@@ -15,7 +15,7 @@ import { selectHandoff, isCurrentHandoff } from './mivo-handoff.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './mivo-state.mjs';
 import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor } from './mivo-feedback-policy.mjs';
 import {lifelineFeedback} from './mivo-lifeline-source.mjs';
-import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads } from './mivo-review-resolve.mjs';
+import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems } from './mivo-review-resolve.mjs';
 import { autoCleanupWatch, command as gitDefaultFn, KEEL_FLOW_VERSION, keelRunIdFor } from './mivo-repair.mjs';
 import { requireConfig } from './profile.mjs';
 
@@ -1081,8 +1081,9 @@ export function* processPr({
   const cursorBase = previous.wasDraft === true ? {} : (previous.feedbackCursor || {});
   const doctor = lifelineFeedback({...pr,...collected.pr,repo:REPO});
   if (doctor.error) events.push({kind:'doctor-source-blocked',number:pr.number,code:doctor.error});
+  const observed = feedbackItems({ pr, ...collected, receiptActor: viewer });
   const { fresh: rawFresh, cursor } = newFeedback(cursorBase, [
-    ...feedbackItems({ pr, ...collected, receiptActor: viewer }),
+    ...observed,
     ...doctor.items.map(item=>withCategory(item,{headSha:pr.headRefOid})),
   ]);
   // Green CI/review does not finish a newly confirmed local product failure.
@@ -1092,29 +1093,14 @@ export function* processPr({
   // Autonomous P2/P3 review-thread closure happens here, before any dispatch
   // accounting below sees these items — closed items never reach a session,
   // never need a human, and are never counted as pending feedback.
-  const { eligible: autoCloseEligible, remaining: fresh } = partitionAutoClose(rawFresh);
+  const autoClose = partitionAutoClose(rawFresh);
+  const autoCloseEligible = autoClose.eligible;
+  let fresh = autoClose.remaining;
   let autoClosedThisRound = [];
   if (autoCloseEligible.length > 0 && !dryRun) {
     const outcome = yield* autoCloseThreads({ eligible: autoCloseEligible, previous, ghFn, now });
     previous = outcome.previous;
     autoClosedThisRound = outcome.closed;
-  }
-  if (previous.activeTask?.status === 'complete' && !dryRun && !resultError) {
-    let closable = [];
-    let resultHead;
-    try {
-      const result = resultFor(previous, paths);
-      const task = readActiveTask(previous, paths);
-      closable = [...fixedThreads(result, task), ...refutedThreads(result, task)];
-      resultHead = result?.head;
-    } catch { closable = []; }
-    if (closable.length > 0) {
-      const outcome = yield* closeRefutedThreads({
-        items: closable, dispatchId: previous.activeTask.dispatchId, previous, ghFn, now, head: resultHead,
-      });
-      previous = outcome.previous;
-      autoClosedThisRound = [...autoClosedThisRound, ...outcome.closed];
-    }
   }
   const admitted = previous.admissionVerified === true || collected.admissionVerified === true;
   const admissionBlocked = collected.admissionVerified === false && previous.admissionVerified !== true;
@@ -1147,6 +1133,28 @@ export function* processPr({
       // A transport failure is not a new agent task or proof of completion.
       previous = { ...previous, lastRecheckError: { at: now, message: String(error.message).slice(0, 400) } };
       if (deadline-clock()<1000) state.scan={...state.scan,cursor:resumeCursor,deferredNumber:pr.number};
+    }
+  }
+  // After the recheck: a fix normally reaches `complete` only when CI turns green here, and the
+  // next poll is skipped while the fingerprint stays stable, so closing earlier never happens.
+  if (previous.activeTask?.status === 'complete' && !dryRun && !resultError) {
+    let closable = [];
+    let resultHead;
+    try {
+      const result = resultFor(previous, paths);
+      const task = readActiveTask(previous, paths);
+      closable = coveredThreadItems([...fixedThreads(result, task), ...refutedThreads(result, task)], observed, task);
+      resultHead = result?.head;
+    } catch { closable = []; }
+    if (closable.length > 0) {
+      const outcome = yield* closeRefutedThreads({
+        items: closable, dispatchId: previous.activeTask.dispatchId, previous, ghFn, now, head: resultHead,
+      });
+      previous = outcome.previous;
+      autoClosedThisRound = [...autoClosedThisRound, ...outcome.closed];
+      // A pushed fix can turn the thread outdated, re-surfacing its comment; once closed it is not new work.
+      const closedIds = new Set(outcome.closed.map((item) => item.threadId));
+      fresh = fresh.filter((item) => !closedIds.has(item.threadId));
     }
   }
   if (!resultError && !['blocked', 'complete', 'legacy-complete', 'waiting-ci'].includes(previous.activeTask?.status)

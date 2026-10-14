@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { feedbackItems } from './bin/mivo-watcher.mjs';
-import { isAutoCloseEligible, partitionAutoClose, autoCloseThreads, autoCloseReplyText, closeRefutedThreads, refutedReplyText, refutedThreads, fixedReplyText, fixedThreads } from './bin/mivo-review-resolve.mjs';
+import { isAutoCloseEligible, partitionAutoClose, autoCloseThreads, autoCloseReplyText, closeRefutedThreads, refutedReplyText, refutedThreads, fixedReplyText, fixedThreads, coveredThreadItems } from './bin/mivo-review-resolve.mjs';
 
 const HEAD = 'a'.repeat(40);
 const PR = { headRefOid: HEAD };
@@ -195,6 +195,19 @@ test('fixedThreads recognizes verified fixed P0/P1 review threads with pass evid
   for (const extra of [{ status: 'waiting-ci' }, { schemaVersion: 1 }, { dispatchId: 'other' }]) {
     assert.deepEqual(fixedThreads({ ...result, ...extra }, task), []);
   }
+});
+
+test('coveredThreadItems keeps a thread open when it carries a reply outside the completed task', () => {
+  const task = { feedback: [{ key: 'mivo-review:PRRT_a:PRRC_bot' }, { key: 'mivo-review:PRRT_b:PRRC_bot' }] };
+  const items = [{ key: 'mivo-review:PRRT_a:PRRC_bot', threadId: 'PRRT_a' }, { key: 'mivo-review:PRRT_b:PRRC_bot', threadId: 'PRRT_b' }];
+  const observed = [
+    { source: 'mivo-review', nativeId: 'PRRT_a:PRRC_bot', threadId: 'PRRT_a' },
+    { source: 'mivo-review', nativeId: 'PRRT_b:PRRC_bot', threadId: 'PRRT_b' },
+    { source: 'thread', nativeId: 'PRRT_b:PRRC_human', threadId: 'PRRT_b' },
+    { source: 'thread', nativeId: 'PRRT_a:PRRC_old', threadId: 'PRRT_a', actionable: false },
+  ];
+  assert.deepEqual(coveredThreadItems(items, observed, task).map((item) => item.threadId), ['PRRT_a']);
+  assert.deepEqual(coveredThreadItems(items, [], task).map((item) => item.threadId), ['PRRT_a', 'PRRT_b']);
 });
 
 test('fixed reply names the repair head, sanitizes paths, and carries the receipt', () => {

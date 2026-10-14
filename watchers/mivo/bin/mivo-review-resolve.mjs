@@ -77,6 +77,15 @@ export function refutedThreads(result, task) {
 export function fixedThreads(result, task) {
   return completeCodeFixThreads(result, task, { disposition: 'fixed', scStatus: 'pass', kind: 'fixed' });
 }
+// Resolving closes the whole thread, so every open external comment observed on it now must
+// belong to the completed task. A reply added while the repair ran keeps the thread open and
+// goes through normal dispatch instead of being resolved on another comment's evidence.
+export function coveredThreadItems(items = [], observed = [], task = {}) {
+  const taskKeys = new Set((task?.feedback ?? []).map((item) => item?.key).filter((key) => typeof key === 'string'));
+  return items.filter((item) => observed
+    .filter((other) => other?.threadId === item.threadId && other.actionable !== false)
+    .every((other) => taskKeys.has(`${other.source}:${other.nativeId}`)));
+}
 function sanitizeEvidence(evidence) {
   return evidence.slice(0, 5).map((line) => '- ' + line.replace(/\/(?:Users|home)\/[^\s'"`]+/g, '<本机路径>').replace(/\s+/g, ' ').slice(0, 300));
 }
