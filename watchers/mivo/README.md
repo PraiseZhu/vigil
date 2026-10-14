@@ -146,7 +146,7 @@ node bin/mivo-ownership.mjs --repo your-org/your-plugin-repo --pr 123 --home "$M
 但它们只是**可替换的配置**，不是协议的一部分：
 
 - 审查反馈严重度 `P0`/`P1`/`P2`/`P3`:P0/P1 视为必须改代码才能回复;P2/P3 只需回复不改代码。
-- 修复会话核实某条 P0/P1 讨论不成立(已验证完成的结果里该 key 为 `no-change` 且附证据)时,watcher 带证据回复并关闭该讨论;没有证据的不关。会话结果晚于上一次轮询写入时,即使 PR 指纹未变也会重新读取,避免任务停在 accepted、讨论永远挡住合并。等 CI 的复查需要约 15–20 秒;剩余扫描预算不足 40 秒时不硬跑(硬跑会被超时杀掉、排在后面的 PR 每轮同样失败),而是结束本轮并从该 PR 续扫,复查超时上限 60 秒。
+- 修复会话核实某条 P0/P1 讨论不成立(已验证完成的结果里该 key 为 `no-change` 且附证据)或确认已修复(`fixed` 且 SC=`pass` 附证据)时,watcher 带证据回复并关闭该讨论;没有证据的不关。新审查机(`mivo-review:` 前缀)的行内线程同样走这条路径。收口在等 CI 的复查之后执行，CI 在本轮变绿就在本轮收口；线程里只要还有一条不属于已完成任务的外部意见(例如修复期间新加的回复)就不关，交给正常派工。本轮刚关闭的线程，其评论即使因修复推送变成 outdated 而重新出现，也不再当作新反馈派工。会话不要自己回复或 resolve thread。会话结果晚于上一次轮询写入时,即使 PR 指纹未变也会重新读取,避免任务停在 accepted、讨论永远挡住合并。等 CI 的复查需要约 15–20 秒;剩余扫描预算不足 40 秒时不硬跑(硬跑会被超时杀掉、排在后面的 PR 每轮同样失败),而是结束本轮并从该 PR 续扫,复查超时上限 60 秒。
 - 本轮通过的标签名 `review:merge-ready`。
 - 审查信号（`public-review.mjs`）：审查流程由前置协调器派发 `review-pr.yml`。判「可合并」要同时满足：当前 head 上最新一条 `review-pr` check（GitHub Actions 写入、关联到本仓 `review-pr.yml` 的 workflow_dispatch run）成功；`reviewerLogin` 在同一 head/base 上提交了干净报告（Approve，或带 `<!-- mivo-review:report head=… -->` 的 COMMENT）且晚于本次 Ready；其余条件同前（必需 CI、可合并、讨论已解决、无否决、无新反馈）。
 - 审查入场：`review-pr.yml` 为 active 且仓库变量 `MIVO_REVIEW_MODE=live` 时，每个 Ready PR 都由协调器接管；读不到按未入场处理。`review-pr` check 是审查结论，不计入产品必需 CI（`mivo-pr-policy.mjs`），否则发现问题的 PR 会因「CI 不绿」永远不进修复。
