@@ -54,42 +54,68 @@ export function* autoCloseThreads({ eligible = [], previous = {}, ghFn, now }) {
 // PR fingerprint stays unchanged (2026-10-04 #851), so the watcher closes it with the
 // session's evidence visible in the reply. Only verified complete results qualify, and
 // a code-fix item without evidence stays open.
-const THREAD_KEY = /^(?:thread|greptile):(PRRT_[A-Za-z0-9_-]+):/;
-export function refutedThreads(result, task) {
+const THREAD_KEY = /^(?:thread|greptile|mivo-review):(PRRT_[A-Za-z0-9_-]+):/;
+function evidenceLines(result, key, status) {
+  return (result.scs ?? []).filter((sc) => sc.status === status && sc.feedbackKeys?.includes(key))
+    .flatMap((sc) => sc.evidence ?? []).filter((line) => typeof line === 'string' && line.trim());
+}
+function completeCodeFixThreads(result, task, { disposition, scStatus, kind }) {
   if (result?.schemaVersion !== 2 || result.status !== 'complete' || result.dispatchId !== task?.dispatchId) return [];
   const policy = new Map((task.repairPolicy?.items ?? []).map((item) => [item.key, item]));
   const items = [];
-  for (const { key, disposition } of result.feedbackCoverage?.dispositions ?? []) {
+  for (const { key, disposition: itemDisposition } of result.feedbackCoverage?.dispositions ?? []) {
     const threadId = THREAD_KEY.exec(key ?? '')?.[1];
-    if (disposition !== 'no-change' || !threadId || policy.get(key)?.action !== 'code-fix') continue;
-    const evidence = (result.scs ?? []).filter((sc) => sc.status === 'no-change' && sc.feedbackKeys?.includes(key))
-      .flatMap((sc) => sc.evidence ?? []).filter((line) => typeof line === 'string' && line.trim());
-    if (evidence.length) items.push({ key, threadId, evidence });
+    if (itemDisposition !== disposition || !threadId || policy.get(key)?.action !== 'code-fix') continue;
+    const evidence = evidenceLines(result, key, scStatus);
+    if (evidence.length) items.push({ key, threadId, evidence, kind });
   }
   return items;
 }
+export function refutedThreads(result, task) {
+  return completeCodeFixThreads(result, task, { disposition: 'no-change', scStatus: 'no-change', kind: 'refuted' });
+}
+export function fixedThreads(result, task) {
+  return completeCodeFixThreads(result, task, { disposition: 'fixed', scStatus: 'pass', kind: 'fixed' });
+}
+function sanitizeEvidence(evidence) {
+  return evidence.slice(0, 5).map((line) => '- ' + line.replace(/\/(?:Users|home)\/[^\s'"`]+/g, '<本机路径>').replace(/\s+/g, ' ').slice(0, 300));
+}
 export function refutedReplyText(evidence, dispatchId) {
-  const lines = evidence.slice(0, 5).map((line) => '- ' + line.replace(/\/(?:Users|home)\/[^\s'"`]+/g, '<本机路径>').replace(/\s+/g, ' ').slice(0, 300));
   return [
     '**发生了什么**：盯梢修复轮核实了这条 P0/P1 意见，结论是它在当前 head 上不成立，不需要改代码。',
     '**对本 PR 意味着什么**：这条意见不再阻塞合并；核实依据如下，若之后的提交让问题重新成立，服务器审查会在新 head 上再次提出。',
     '**要不要改代码**：不改。',
     '',
     '核实证据：',
-    ...lines,
+    ...sanitizeEvidence(evidence),
+    '',
+    `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
+  ].join('\n');
+}
+export function fixedReplyText(evidence, head, dispatchId) {
+  const shortHead = typeof head === 'string' && head.length ? head.slice(0, 12) : '';
+  return [
+    `**发生了什么**：盯梢修复轮确认此意见成立并已修复，修复提交 \`${shortHead}\`。`,
+    '**对本 PR 意味着什么**：这条意见已处理，不再阻塞，服务器审查会在新 head 上复核。',
+    '**要不要改代码**：已改。',
+    '',
+    '修复证据：',
+    ...sanitizeEvidence(evidence),
     '',
     `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
   ].join('\n');
 }
 // Same durable receipt as the P2/P3 closure: `previous.autoClosedThreads[threadId]`.
-export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, ghFn, now }) {
+export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, ghFn, now, head }) {
   const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
   const results = [];
   for (const item of items) {
     if (closedThreads[item.threadId]) continue;
-    yield () => ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${refutedReplyText(item.evidence, dispatchId)}`]);
+    const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, dispatchId) : refutedReplyText(item.evidence, dispatchId);
+    const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : 'refuted-p0-p1';
+    yield () => ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${body}`]);
     yield () => ghFn(['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${item.threadId}`]);
-    closedThreads[item.threadId] = { at: now, key: item.key, reason: 'refuted-p0-p1', dispatchId };
+    closedThreads[item.threadId] = { at: now, key: item.key, reason, dispatchId };
     results.push({ threadId: item.threadId, key: item.key });
   }
   return { previous: { ...previous, autoClosedThreads: closedThreads }, closed: results };
