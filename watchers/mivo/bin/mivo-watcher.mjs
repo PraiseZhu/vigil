@@ -1049,15 +1049,15 @@ export function blockedNoticeText({ event, author, maintainers = [] }) {
       ? `**对本 PR 意味着什么**：自动修复暂停，PR 已挂上 \`${INTENT_LABEL}\` 标签。这件事定下来之前不要合并。`
       : '**对本 PR 意味着什么**：自动修复已停，还没处理的反馈仍然挂着，PR 暂时不会自己往前走。',
     intent
-      ? `**需要谁做什么**：${mention} 请在对应讨论里回复决定：保留现在写明的设计，还是按反馈改。有人回复后，盯梢会按回复重新处理。`
+      ? `**需要谁做什么**：${mention} 请在对应讨论里回复决定：保留现在写明的设计，还是按反馈改。有人回复后，盯梢会按回复重新处理，处理完自动摘掉 \`${INTENT_LABEL}\`；决定不在那些讨论里给出时，请定下来后手动摘掉这个标签。`
       : `**需要谁做什么**：${mention} 请按上面的原因处理（补权限或环境、自己接手修改，或回复说明怎么做）。之后有新回复、新推送或重新转 Ready，盯梢会继续。`,
     '',
     `<!-- mivo-watcher-receipt task=blocked-notice kind=${String(event.blockedKind ?? 'unknown').replace(/[^\w-]/g, '')} -->`,
   ].join('\n');
 }
 // Posts once per blocked state (lastException fingerprint). A failed post is retried on later polls.
-export function* announceBlocked({ previous: start, pr, author, ghFn, now, maintainers = intentMaintainers() }) {
-  const previous = yield* releaseIntentLabel({ previous: start, pr, ghFn, now });
+export function* announceBlocked({ previous: start, pr, author, ghFn, now, maintainers = intentMaintainers(), readTaskKeys = () => null }) {
+  const previous = yield* releaseIntentLabel({ previous: start, pr, ghFn, now, readTaskKeys });
   const exception = previous.lastException;
   const stillBlocked = previous.activeTask?.status === 'blocked' || previous.dispatchError;
   if (!exception?.fingerprint || !stillBlocked || QUIET_BLOCKED_KINDS.has(exception.event?.blockedKind)) return previous;
@@ -1067,6 +1067,7 @@ export function* announceBlocked({ previous: start, pr, author, ghFn, now, maint
   if ((record.commentAt && (!intent || record.labelAt)) || Number(record.attempts ?? 0) >= NOTICE_ATTEMPTS) return previous;
   const keep = (next) => Object.fromEntries(Object.entries(next).slice(-NOTICE_HISTORY));
   const next = { ...record, attempts: Number(record.attempts ?? 0) + 1, kind: exception.event?.blockedKind ?? null, dispatchId: exception.event?.dispatchId ?? null };
+  if (intent && !next.feedbackKeys) next.feedbackKeys = readTaskKeys(next.dispatchId);
   try {
     if (!next.commentAt) {
       const body = blockedNoticeText({ event: exception.event, author, maintainers });
@@ -1084,15 +1085,24 @@ export function* announceBlocked({ previous: start, pr, author, ghFn, now, maint
   return { ...previous, blockedNotices: keep({ ...notices, [exception.fingerprint]: next }) };
 }
 
-// The hold label is the watcher's own; once a later repair round (dispatched after someone answered)
-// completes, the decision has been acted on and the label would otherwise block merge-ready forever.
-// Only a label this watcher added is removed, once; a 404 means someone already removed it.
-function* releaseIntentLabel({ previous, pr, ghFn, now }) {
+// The hold label is the watcher's own. It comes off only when a later repair round completed with every
+// feedback item of the blocked round in it: someone answered in those threads (a reply re-delivers the whole
+// thread) and that answer was acted on. An unrelated round finishing does not lift it (GPT review 2026-10-15).
+// Otherwise the people deciding remove it by hand, as the notice asks. A 404 means it is already gone.
+function readTaskFeedbackKeys(paths, dispatchId) {
+  if (!dispatchId || !/^[A-Za-z0-9._:-]+$/.test(dispatchId)) return null;
+  const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`));
+  const keys = (task?.feedback ?? []).map((item) => item?.key).filter((key) => typeof key === 'string');
+  return keys.length ? keys : null;
+}
+function* releaseIntentLabel({ previous, pr, ghFn, now, readTaskKeys }) {
   const active = previous.activeTask;
   if (active?.status !== 'complete') return previous;
   const notices = previous.blockedNotices ?? {};
+  const answered = new Set(readTaskKeys(active.dispatchId) ?? []);
   const held = Object.entries(notices).filter(([, notice]) => notice?.kind === 'product-intent' && notice.labelAt && !notice.labelReleasedAt
-    && notice.dispatchId && notice.dispatchId !== active.dispatchId);
+    && notice.dispatchId && notice.dispatchId !== active.dispatchId
+    && Array.isArray(notice.feedbackKeys) && notice.feedbackKeys.length > 0 && notice.feedbackKeys.every((key) => answered.has(key)));
   if (!held.length) return previous;
   try {
     yield () => ghFn(['api', '--method', 'DELETE', `repos/${REPO}/issues/${pr.number}/labels/${encodeURIComponent(INTENT_LABEL)}`]);
@@ -1566,7 +1576,8 @@ export function* processPr({
   }
   if (!persistBlocked) {
   previous = markException({ ...previous, lastPolicyStatus: collected.policy?.status ?? previous.lastPolicyStatus ?? null }, now, events);
-  if (!dryRun) previous = yield* announceBlocked({ previous, pr, author: collected.pr?.author?.login ?? pr.author?.login ?? null, ghFn, now });
+  if (!dryRun) previous = yield* announceBlocked({ previous, pr, author: collected.pr?.author?.login ?? pr.author?.login ?? null, ghFn, now,
+    readTaskKeys: (dispatchId) => readTaskFeedbackKeys(paths, dispatchId) });
   state.prs[key] = previous;
   }
   report.push({

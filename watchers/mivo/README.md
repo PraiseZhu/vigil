@@ -116,7 +116,7 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 - Greptile、审查账号的 P2/P3：watcher 直接回复说明并 resolve，不开会话。
 - 仓库成员（OWNER/MEMBER/COLLABORATOR，含作者本人）留的 review thread：交修复会话按统一分级判定（`member-thread-triage`），确认 P0/P1 才改代码；其余由 watcher 贴出会话写的结论。PR 作者自己的 thread 随后 resolve；其他成员的 thread 只回复不 resolve（可能是产品要求，留给他们自己关；任务里没记作者时也按这条处理）。仓外人员的 thread 仍只做说明。
 - 产品意图门：watcher 抓 PR 正文，优先取标题含「产品意图 / 设计意图 / Product intent」的一节（没有就取正文开头，最多 2000 字），写进任务的 `prSnapshot.prIntent` 和派工消息。反馈要求的改法会推翻 PR 正文、规格或维护者裁定里写明的界面、交互或流程时，会话不改代码，用 `mivo-repair.mjs blocked --kind product-intent --reason "<人话>"` 收口。
-- 卡住要让人看见：修复任务 blocked（产品意图、外部阻塞、6 轮上限、补投三次无结果、结果无效、派发失败）时，watcher 在 PR 上发一条评论，按「发生了什么 / 对本 PR 意味着什么 / 需要谁做什么」写明原因并 @作者；`product-intent` 还会 @`maintainers` 并挂 `awaiting-discussion` 标签（有人回复后的下一轮修复完成时，watcher 摘掉它自己挂的这个标签）。同一 blocked 状态只发一次，发送失败下一轮重试（最多 3 次）。必需 CI 红、HEAD 漂移这类 watcher 自己会接着处理的状态不发。
+- 卡住要让人看见：修复任务 blocked（产品意图、外部阻塞、6 轮上限、补投三次无结果、结果无效、派发失败）时，watcher 在 PR 上发一条评论，按「发生了什么 / 对本 PR 意味着什么 / 需要谁做什么」写明原因并 @作者；`product-intent` 还会 @`maintainers` 并挂 `awaiting-discussion` 标签（之后某一轮修复完成、且那一轮包含了当初卡住的全部反馈——有人在那些讨论里回复后会整条重新投递——watcher 才摘掉它自己挂的这个标签；无关的修复完成不摘。决定不在那些讨论里给出时，由做决定的人手动摘）。同一 blocked 状态只发一次，发送失败下一轮重试（最多 3 次）。必需 CI 红、HEAD 漂移这类 watcher 自己会接着处理的状态不发。
 - Greptile 汇总评论没有自己的 P0/P1 时不单独开会话（它的发现另以行内 thread 出现）。
 - 策略读不出（`required-policy-unknown`）和可合并（`merge-ready`）各在状态转换时出一条事件。
 

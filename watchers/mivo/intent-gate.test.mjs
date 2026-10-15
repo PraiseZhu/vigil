@@ -87,29 +87,38 @@ test('the repair helper accepts product-intent and rejects unknown kinds before 
   assert.throws(() => blocked({ home: '/nonexistent', taskPath: '/nonexistent/t.json', reason: 'r', kind: 'arch' }), /blocked --kind must be one of external, product-intent/);
 });
 
-test('the hold label is removed once a later repair round completes, and only once', () => {
+test('the hold label comes off only after a later round covered the blocked feedback, and only once', () => {
   const calls = [];
   const ghFn = (args) => { calls.push(args); return '{}'; };
-  const notice = { kind: 'product-intent', commentAt: 'a', labelAt: 'a', dispatchId: 'task-1' };
-  const base = { blockedNotices: { f1: notice }, lastException: { fingerprint: 'f1', event: { blockedKind: 'product-intent', dispatchId: 'task-1' } } };
-  // Still blocked on the same task: keep the hold.
-  drive(announceBlocked({ previous: { ...base, activeTask: { status: 'blocked', dispatchId: 'task-1' } }, pr: { number: 3 }, author: 'a', ghFn, now: 'n', maintainers: [] }));
-  // A later round is running: keep the hold until it finishes.
-  drive(announceBlocked({ previous: { ...base, activeTask: { status: 'running', dispatchId: 'task-2' } }, pr: { number: 3 }, author: 'a', ghFn, now: 'n', maintainers: [] }));
-  assert.equal(calls.length, 0);
-  const done = drive(announceBlocked({ previous: { ...base, activeTask: { status: 'complete', dispatchId: 'task-2' } }, pr: { number: 3 }, author: 'a', ghFn, now: 'n2', maintainers: [] }));
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].slice(0, 3), ['api', '--method', 'DELETE']);
-  assert.match(calls[0][3], /\/issues\/3\/labels\/awaiting-discussion$/);
+  const tasks = { 'task-1': ['thread:T1:c1', 'thread:T1:c2'], 'task-2': ['greptile:T9:x'], 'task-3': ['thread:T1:c1', 'thread:T1:c2', 'thread:T1:c3'] };
+  const readTaskKeys = (id) => tasks[id] ?? null;
+  const run = (previous, extra = {}) => drive(announceBlocked({ previous, pr: { number: 3 }, author: 'a', ghFn, now: 'n', maintainers: [], readTaskKeys, ...extra }));
+  // Blocked: the notice records which feedback the owner has to decide on.
+  const blocked = run({ activeTask: { status: 'blocked', dispatchId: 'task-1' },
+    lastException: { fingerprint: 'f1', event: { kind: 'repair-blocked', blockedKind: 'product-intent', dispatchId: 'task-1', reason: 'r' } } });
+  assert.deepEqual(blocked.blockedNotices.f1.feedbackKeys, tasks['task-1']);
+  assert.equal(calls.length, 2, 'comment and label');
+  // An unrelated round finishing does not lift the hold.
+  run({ ...blocked, activeTask: { status: 'complete', dispatchId: 'task-2' } });
+  // A later round still running does not either.
+  run({ ...blocked, activeTask: { status: 'running', dispatchId: 'task-3' } });
+  assert.equal(calls.length, 2);
+  const done = run({ ...blocked, activeTask: { status: 'complete', dispatchId: 'task-3' } }, { now: 'n2' });
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[2].slice(0, 3), ['api', '--method', 'DELETE']);
+  assert.match(calls[2][3], /\/issues\/3\/labels\/awaiting-discussion$/);
   assert.equal(done.blockedNotices.f1.labelReleasedAt, 'n2');
-  drive(announceBlocked({ previous: done, pr: { number: 3 }, author: 'a', ghFn, now: 'n3', maintainers: [] }));
-  assert.equal(calls.length, 1, 'released once');
+  run(done);
+  assert.equal(calls.length, 3, 'released once');
   // Someone already removed it: a 404 counts as released; other failures retry next poll.
-  const gone = drive(announceBlocked({ previous: { ...base, activeTask: { status: 'complete', dispatchId: 'task-2' } }, pr: { number: 3 }, author: 'a',
-    ghFn: () => { throw new Error('HTTP 404: Label does not exist'); }, now: 'n4', maintainers: [] }));
-  assert.equal(gone.blockedNotices.f1.labelReleasedAt, 'n4');
-  const flaky = drive(announceBlocked({ previous: { ...base, activeTask: { status: 'complete', dispatchId: 'task-2' } }, pr: { number: 3 }, author: 'a',
-    ghFn: () => { throw new Error('HTTP 502'); }, now: 'n5', maintainers: [] }));
+  const covering = { ...blocked, activeTask: { status: 'complete', dispatchId: 'task-3' } };
+  assert.ok(run(covering, { ghFn: () => { throw new Error('HTTP 404: Label does not exist'); } }).blockedNotices.f1.labelReleasedAt);
+  const flaky = run(covering, { ghFn: () => { throw new Error('HTTP 502'); } });
   assert.equal(flaky.blockedNotices.f1.labelReleasedAt, undefined);
   assert.match(flaky.blockedNotices.f1.releaseError, /502/);
+  // Without the blocked round's feedback keys the watcher never lifts the hold by itself.
+  const unknown = { ...covering, blockedNotices: { f1: { ...blocked.blockedNotices.f1, feedbackKeys: null } } };
+  const before = calls.length;
+  run(unknown);
+  assert.equal(calls.length, before);
 });
