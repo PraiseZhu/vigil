@@ -80,13 +80,15 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 
 ### 作者交接与取回
 
-Ready 是交接的必要条件。作者会话完成本轮工作、当前 CI 和审查进场条件满足后，在已有交接授权范围内自动运行下列命令，作为本轮最后一个写操作，然后停止修改该 PR：
+**转 Ready 就是交接**（2026-10-15 起）。作者自己的 PR 不管是网页按钮、`gh pr ready` 还是 Keel `pr_ready` 转的 Ready，watcher 下一轮（≤5 分钟）就接手：没有评论回执时，按本次 Ready 代次和当前 HEAD 合成一份隐式回执（`implicit: true`），下游归属检查照常核对仓库、PR、作者和 Ready 代次。准入不再要求 CI 先全绿，必需检查失败和冲突直接成为修复反馈；审查流程不在线（`review-ingress-missing`）时才不接手。
+
+下面的命令仍可用，作用变成「显式留一条交接记录」：
 
 ```sh
 node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" handoff --repo your-org/your-plugin-repo --pr 123
 ```
 
-命令核对当前 GitHub 账号为 PR 作者，并发布绑定仓库、PR、HEAD、本次 Ready 代次的结构化评论回执；重复调用复用同代次已有回执，包括受控 push 已推进 HEAD 的情况。它不会转 Ready、等待 CI 或管理调度。Keel 交接车道配置 `handoffHelperPath` 指向已部署的本 helper 后，`pr_ready` 会在转 Ready 后自动调用 `handoff --expected-head <已验收 SHA>`，取得回执才确认交接完成，无须增加一次人工确认。未接入 Keel 的作者流程仍需显式调用上述命令。只有 Ready、作者回执与原有 CI/审查进场条件同时满足，watcher 才能接管；单纯 Ready 或会话空闲不代表交接。
+命令核对当前 GitHub 账号为 PR 作者，并发布绑定仓库、PR、HEAD、本次 Ready 代次的结构化评论回执；重复调用复用同代次已有回执。Keel 交接车道配置 `handoffHelperPath` 后，`pr_ready` 会在转 Ready 后自动调用它。watcher 已按隐式回执接手的同代次 PR，后来发的回执不会换任务。
 
 `inspect --repo <repo> --pr <number>` 只读返回当前 PR、Ready/Draft 代次、作者身份匹配情况及有效回执。`handoff --expected-head <SHA>` 在写回执前拒绝 HEAD 漂移。同代次手工重复回执不会替换 watcher 已采用的回执或撤销其任务。
 
@@ -96,15 +98,23 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" handoff --repo your-org/your-plug
 node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plugin-repo --pr 123
 ```
 
-`reclaim` 将 PR 转回 Draft 并确认结果。watcher 在 discover、poll 和 scan 入口观察到 Draft 时作废活动任务；修复 helper 每次读取 GitHub 的 Ready/Draft 代次，即使巡检错过中间的 Draft、HEAD 也未变化，旧任务仍会被拒绝。重新交接必须生成新代次的回执。
+`reclaim` 将 PR 转回 Draft 并确认结果。watcher 在 discover、poll 和 scan 入口观察到 Draft 时作废活动任务；修复 helper 每次读取 GitHub 的 Ready/Draft 代次，即使巡检错过中间的 Draft、HEAD 也未变化，旧任务仍会被拒绝。再次转 Ready 是新的交接：新代次、新任务，旧任务永远不能续用；修复轮次上限（6 轮）也按新代次重新计数。
 
 修复会话每次改文件、提交或外发回复前执行 `mivo-repair.mjs assert-owner --home <home> --task <task>`。`prepare`、`validate` 前后、`finalize` 推送前和 CI 复查也执行同一归属检查。网络失败不放行，旧任务没有交接回执也不放行。已确认受控 push 的回执只允许同一任务继续验证/收口，不允许旧任务继续修改已推进的 HEAD。
 
 受控 push 使用一次性 hooks 目录：先按 Git 原语执行原有 `pre-push`，再核验实际推送的 SHA/ref 和实时归属。作者在耗时预检期间转 Draft 时，Git 拒绝发布。原 hook 的参数、标准输入、失败退出码及其他 hooks 保留；结束后清除临时目录，不改持久 Git 配置。此入口需要支持 `git hook run --to-stdin` 的 Git；不支持时拒绝推送。GitHub 核验与远端 Git 接收不是原子事务，核验后瞬间取回的极短窗口仍无法靠客户端完全消除。
 
-受控 push 可能先于结果回执可见。同一 Ready 代次内，新 HEAD 尚无可信结果时，watcher 以 `head-change-unconfirmed` 暂停处理并保留原任务；晚到的有效结果会重新触发消费，即使 PR 指纹没有再次变化。未知来源的新 HEAD 不获得修复权限，真正的 Draft 或代次变化仍会永久撤销旧任务。
+受控 push 可能先于结果回执可见。判断「HEAD 变了」的基准是本次交接认可过的最新 HEAD（`trustedHead`：Ready 时的 HEAD，之后每轮修复任务到达的 HEAD，以及任务派发时的 HEAD），所以第二轮及以后的修复不会被当成作者推送。同一 Ready 代次内，修复会话还在跑时出现的新 HEAD 先按 `head-change-unconfirmed` 等它自己的结果（最多 60 分钟），晚到的有效结果会重新触发消费，即使 PR 指纹没有再次变化。没有会话在跑、或等满 60 分钟，新 HEAD 就算作者自己的推送：没做完的任务作废、它负责的反馈重新投递；已经处理过的反馈不重投，也不额外消耗修复轮次；watcher 以新 HEAD 的隐式回执继续处理，不再永久暂停（事件 `author-push-superseded`）。真正的 Draft 或代次变化仍会永久撤销旧任务。
 
-升级保留旧任务与工作树，但不会把旧 `admissionVerified` 自动升级成交接授权。既有 Ready PR 需作者确认工作已结束后执行 `handoff`。运行中的命令不能保证被立即打断；这些检查是协作式边界检查，不是宿主对任意文件写入的强制拦截。
+运行中的命令不能保证被立即打断；这些检查是协作式边界检查，不是宿主对任意文件写入的强制拦截。
+
+### 反馈出口
+
+- Greptile、审查账号的 P0/P1：修复会话修，修完 watcher 带证据回复并 resolve；不成立也带证据回复并 resolve。
+- Greptile、审查账号的 P2/P3：watcher 直接回复说明并 resolve，不开会话。
+- 仓库成员（OWNER/MEMBER/COLLABORATOR，含作者本人）留的 review thread：交修复会话按统一分级判定（`member-thread-triage`），确认 P0/P1 才改代码；其余由 watcher 贴出会话写的结论并 resolve。仓外人员的 thread 仍只做说明。
+- Greptile 汇总评论没有自己的 P0/P1 时不单独开会话（它的发现另以行内 thread 出现）。
+- 策略读不出（`required-policy-unknown`）和可合并（`merge-ready`）各在状态转换时出一条事件。
 
 `handoff.e2e.test.mjs` 在隔离子进程中运行真实 CLI、Git 和状态机，GitHub/Host 传输使用替身。它验证交接、投递、取回、遗漏 Draft 的代次检查与查询失败路径，不代表真实 Host 会话已被中断。
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { collectPrOwnershipSync } from './mivo-pr-snapshot.mjs';
@@ -56,6 +57,18 @@ export function selectHandoff(comments, pr, options = {}) {
   }
   candidates.sort((a, b) => a.created - b.created || a.receipt.id.localeCompare(b.receipt.id));
   return candidates[0]?.receipt ?? null;
+}
+
+// Marking the PR Ready is itself the handoff (web button, gh pr ready or a helper). Without a comment
+// receipt the watcher synthesizes one from the Ready epoch and the current head, so every ownership check
+// downstream (isCurrentHandoff, assertOwner) still binds the same repo, node, author and release epoch.
+// A later author push yields a different id for the new head; the watcher treats that as a new handoff.
+export function implicitHandoff(pr) {
+  if (!eligible(pr)) return null;
+  const id = `ready_${createHash('sha256').update(`${pr.releaseEpoch}\n${pr.headRefOid}`).digest('hex').slice(0, 24)}`;
+  const receipt = { version: 1, id, repo: pr.repo, number: pr.number, nodeId: pr.id,
+    head: pr.headRefOid, releaseEpoch: pr.releaseEpoch, author: pr.author.login, implicit: true };
+  return isCurrentHandoff(receipt, pr) ? receipt : null;
 }
 
 function gh(args) {

@@ -70,10 +70,11 @@ test('git clone gets a 15-minute timeout; other git commands keep the default', 
   assert.equal(seen.status, 120_000);
 });
 
-test('a clean 5/5 Greptile summary is not a finding; lower scores still go to triage', () => {
+test('a Greptile summary is not a finding unless it carries its own must-fix item', () => {
   const summary = (score) => ({ source: 'greptile', user: GREPTILE, body: `<!-- greptile_summary -->\n<h2>Confidence Score: ${score}/5</h2>\n**[Low risk]** Updates the changelog.`, sha: HEAD });
   assert.equal(feedbackRepairPolicy(summary(5), { headSha: HEAD }).action, 'ignore-infra');
-  assert.equal(feedbackRepairPolicy(summary(4), { headSha: HEAD }).action, 'needs-triage');
+  // 2026-10-15 #6120: a lower-scored overview opened a session with no authority; findings come as inline threads.
+  assert.equal(feedbackRepairPolicy(summary(4), { headSha: HEAD }).action, 'ignore-infra');
   const withFinding = { ...summary(5), body: `${summary(5).body}\n**P1** real bug` };
   assert.equal(feedbackRepairPolicy(withFinding, { headSha: HEAD }).action, 'code-fix');
 });

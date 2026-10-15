@@ -20,6 +20,18 @@ function trustedReviewer(item) {
   return item.source === 'greptile' || item.source === 'mivo-review' || isGreptileAuthor(author)
     || ['github-actions', 'github-actions[bot]'].includes(login);
 }
+// A review thread left by a person with standing in the repository (owner, member, collaborator; the PR
+// author included). Its body still grants nothing: the repair session grades it on the unified severity
+// scale, only a confirmed P0/P1 changes code, anything else is answered with evidence and resolved.
+const MEMBER_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+export function isMemberThread(item) {
+  const author = item?.user ?? item?.author;
+  const login = typeof author === 'string' ? author : author?.login;
+  const bot = /\[bot\]$/i.test(String(login ?? '')) || author?.__typename === 'Bot' || author?.type === 'Bot';
+  return typeof item?.threadId === 'string' && item.threadId.length > 0 && !bot && typeof login === 'string'
+    && MEMBER_ASSOCIATIONS.has(String(item.authorAssociation ?? '').toUpperCase());
+}
+const isGreptileSummary = body => /<!--\s*greptile_summary\s*-->/i.test(body);
 function visibleLines(body) {
   const lines = body.replace(/<!--[^]*?-->/g, '').split(/\r?\n|\\n/);
   let fence = null;
@@ -37,7 +49,17 @@ function visibleLines(body) {
 const result = (action, severities, reason) => ({ policyVersion: FEEDBACK_POLICY_VERSION, action,
   canChangeCode: ['code-fix', 'required-ci-fix', 'conflict-fix'].includes(action), severities, reason });
 
-export function feedbackRepairPolicy(item = {}, { headSha } = {}) {
+// Greptile's overview restates findings that arrive as their own graded inline threads. Unless it carries an
+// explicit P0/P1 finding of its own, it only opened a session with no authority (2026-10-15 #989, #993).
+export function feedbackRepairPolicy(item = {}, options = {}) {
+  const policy = itemRepairPolicy(item, options);
+  if (!['code-fix', 'ignore-infra'].includes(policy.action) && trustedReviewer(item) && isGreptileSummary(String(item.body ?? ''))) {
+    return result('ignore-infra', policy.severities, 'greptile-summary-inline-threads');
+  }
+  return policy;
+}
+
+function itemRepairPolicy(item = {}, { headSha } = {}) {
   if (!item || typeof item !== 'object') return result('needs-triage', [], 'invalid-feedback');
   if (item.actionable === false) return result('ignore-infra', [], 'non-actionable-or-resolved');
   if (headSha && item.sha && item.sha !== headSha) return result('needs-triage', [], 'stale-head');
@@ -55,7 +77,9 @@ export function feedbackRepairPolicy(item = {}, { headSha } = {}) {
     // infer CI authority from a comment mentioning checks or from optional checks.
     return result('required-ci-fix', [], proof ? 'verified-required-ci-failure' : 'legacy-required-ci-failure');
   }
-  if (!trustedReviewer(item)) return result('needs-triage', [], 'unverified-review-source');
+  if (!trustedReviewer(item)) {
+    return isMemberThread(item) ? result('code-fix', [], 'member-thread-triage') : result('needs-triage', [], 'unverified-review-source');
+  }
   const body = String(item.body ?? '');
   if (body.length > 256 * 1024) return result('needs-triage', [], 'feedback-too-large');
   const lines = visibleLines(body);

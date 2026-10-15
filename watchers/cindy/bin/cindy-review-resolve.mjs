@@ -111,9 +111,23 @@ export function refutedThreads(result, task) {
     if (disposition !== 'no-change' || !threadId || policy.get(key)?.action !== 'code-fix') continue;
     const evidence = (result.scs ?? []).filter((sc) => sc.status === 'no-change' && sc.feedbackKeys?.includes(key))
       .flatMap((sc) => sc.evidence ?? []).filter((line) => typeof line === 'string' && line.trim());
-    if (evidence.length) items.push({ key, threadId, evidence });
+    if (evidence.length) items.push({ key, threadId, evidence, triage: policy.get(key)?.reason === 'review-thread-triage' });
   }
   return items;
+}
+// A thread from a maintainer, the author or a review app that the session graded as not needing code.
+export function triagedReplyText(evidence, dispatchId) {
+  const lines = evidence.slice(0, 5).map((line) => '- ' + line.replace(/\/(?:Users|home)\/[^\s'"`]+/g, '<本机路径>').replace(/\s+/g, ' ').slice(0, 300));
+  return [
+    '**发生了什么**：盯梢修复轮按仓库统一分级核实了这条意见，结论是本轮不需要改代码（不成立、或属于建议）。',
+    '**对本 PR 意味着什么**：这条讨论不再阻塞合并；核实依据如下。如果你认为判断有误，直接在这里回复，盯梢会重新处理。',
+    '**要不要改代码**：本轮不改。',
+    '',
+    '核实依据：',
+    ...lines,
+    '',
+    `<!-- cindy-watcher-receipt task=${dispatchId} -->`,
+  ].join('\n');
 }
 export function refutedReplyText(evidence, dispatchId) {
   const lines = evidence.slice(0, 5).map((line) => '- ' + line.replace(/\/(?:Users|home)\/[^\s'"`]+/g, '<本机路径>').replace(/\s+/g, ' ').slice(0, 300));
@@ -139,13 +153,13 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
   };
   for (const item of items) {
     if (closedThreads[item.threadId]) continue;
-    const reply = yield attempt(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${refutedReplyText(item.evidence, dispatchId)}`]);
+    const reply = yield attempt(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${item.triage ? triagedReplyText(item.evidence, dispatchId) : refutedReplyText(item.evidence, dispatchId)}`]);
     if (reply?.__degraded) {
       results.push({ threadId: item.threadId, key: item.key, degraded: true, reason: 'permission-denied' });
       continue;
     }
     const resolved = yield attempt(['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${item.threadId}`]);
-    closedThreads[item.threadId] = { at: now, key: item.key, reason: 'refuted-authorized-finding', dispatchId,
+    closedThreads[item.threadId] = { at: now, key: item.key, reason: item.triage ? 'review-thread-no-change' : 'refuted-authorized-finding', dispatchId,
       ...(resolved?.__degraded ? { resolveDegraded: true } : {}) };
     results.push({ threadId: item.threadId, key: item.key, ...(resolved?.__degraded ? { degraded: true, reason: 'permission-denied' } : {}) });
   }

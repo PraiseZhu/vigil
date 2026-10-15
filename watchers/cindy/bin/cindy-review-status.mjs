@@ -60,12 +60,16 @@ export function* collectCindyReview(pr, ghFn) {
     || latest.author?.login !== snapshot.pr.author.login) {
     throw Error('PR changed during review collection');
   }
-  const admissionVerified = snapshot.pr.state === 'OPEN' && snapshot.pr.isDraft !== true && snapshot.requiredChecksGreen === true;
+  // A Ready PR is taken in at once; a red required check is repair feedback, not a reason to wait (it used to
+  // stay "admission-not-verified" forever when CI was already red at Ready). The reason still tells a real red
+  // apart from pending CI and from a policy the watcher could not read.
+  const admissionVerified = snapshot.pr.state === 'OPEN' && snapshot.pr.isDraft !== true;
+  const ciReason = { green: 'required-ci-green', failed: 'required-ci-failed', pending: 'required-ci-pending' }[ci.status] ?? 'required-policy-unknown';
   return {
     ...snapshot,
     ci,
     admissionVerified,
-    admissionReason: admissionVerified ? 'required-ci-green' : (snapshot.requiredChecksGreen ? 'inactive' : 'required-ci-not-green'),
+    admissionReason: admissionVerified ? ciReason : 'inactive',
     mergeReady: verdict.ready === true,
     reviewReason: verdict.reason,
     reviewEvidence: verdict,

@@ -29,6 +29,18 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 核实某条必修意见不成立(已验证完成的结果里该 key 为 `no-change` 且附证据),此时带证据回复后关闭,
 没有证据的不关,权限不足时只降级报告、不重复回复。
 
+接手与出口(2026-10-15 起):
+
+- 作者自己的 PR 转 Ready 后下一轮就接手,不要求必需检查先绿:CI 失败和冲突直接成为修复反馈。
+- 维护者(OWNER/MEMBER/COLLABORATOR)、作者本人和已知代码审查应用(`REVIEW_APPS`)留的 review thread
+  交修复会话按 REVIEW.md 分级(`review-thread-triage`):必修才改,其余由 watcher 贴出会话的结论并 resolve。
+  其它应用的状态评论、没有自己必修项的 Greptile 汇总不再单独开会话。
+- 修复会话 `prepare` 先对齐 watch 树:落后 fork 就快进,与 fork 分叉就把旧分支打 bundle 存进
+  `_backup/` 后按 fork 重建。
+- 因环境原因 blocked(预检跑不起来、watch 树分叉、子代理路由被拒等,见 `INFRA_BLOCK_REASON`)的轮次退还轮次、
+  把反馈放回队列重投,每个 Ready 代次最多 3 次;新的 Ready 代次重新计修复轮次。
+- 终点仍是 `awaiting-maintainer-approval`:仓库要求有写权限的维护者批准并经合并队列合入,watcher 不代替审批。
+
 等 CI 的复查需要约 15–20 秒;剩余扫描预算不足 40 秒时不硬跑(硬跑会被超时杀掉、排在后面的 PR
 每轮同样失败),而是结束本轮并从该 PR 续扫,复查超时上限 60 秒。
 
