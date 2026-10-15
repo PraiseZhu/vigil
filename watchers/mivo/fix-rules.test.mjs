@@ -423,7 +423,7 @@ test('dispatchParams message contains repair rules and old bans', () => {
     taskPath: '/tmp/task.json',
     home: '/tmp/home',
   }).message;
-  for (const needle of ['subagent', '禁止 create_worker', 'gh run rerun', '--failed', '发生了什么', 'resolve', '6 轮', 'git merge origin/main', 'CodeQL', 'Windows']) {
+  for (const needle of ['subagent', '禁止 create_worker', 'gh run rerun', '--failed', '发生了什么', 'resolve', '不设轮次上限', 'git merge origin/main', 'CodeQL', 'Windows']) {
     assert.match(message, new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
   assert.match(message, /^OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY$/m);
@@ -454,32 +454,49 @@ test('P2-only dispatch still forbids GitHub replies while code-fix dispatch leav
   assert.doesNotMatch(codeFix, /获准修复项的 PR 回复末尾加 <!-- mivo-watcher-receipt/);
 });
 
-test('repairRounds blocks the 7th dispatch as round-limit', (t) => {
+test('repairRounds has no cap: the 7th round is dispatched', (t) => {
   const { paths, listed } = scanHome(t);
   let sent = 0;
-  for (let round = 1; round <= 6; round += 1) {
+  for (let round = 1; round <= 7; round += 1) {
     const now = `2026-09-10T00:0${round}:00Z`;
-    runScan(paths, listed, () => ({
+    const report = runScan(paths, listed, () => ({
       comments: [{ id: round, body: verdict('REQUEST_CHANGES', `**P1** \`f.ts:${round}\``), updatedAt: now }],
       mergeReady: false,
     }), () => { sent += 1; return { target_session_id: 's1' }; }, now);
+    assert.equal(report.prs[0].dispatch.attempted, true);
     const state = JSON.parse(fs.readFileSync(paths.statePath, 'utf8'));
     assert.equal(state.prs.PR_1.repairRounds, round);
+    assert.notEqual(state.prs.PR_1.eligibility, 'blocked');
     state.prs.PR_1.activeTask = { ...state.prs.PR_1.activeTask, status: 'complete' };
     fs.writeFileSync(paths.statePath, JSON.stringify(state));
   }
-  assert.equal(sent, 6);
-  const seventh = runScan(paths, listed, () => ({
-    comments: [{ id: 7, body: verdict('REQUEST_CHANGES', '**P1** `f.ts:7`'), updatedAt: '2026-09-10T00:07:00Z' }],
+  assert.equal(sent, 7);
+});
+
+test('a PR an older build stopped on round-limit is delivered again', (t) => {
+  const { paths, listed } = scanHome(t);
+  let sent = 0;
+  runScan(paths, listed, () => ({
+    comments: [{ id: 1, body: verdict('REQUEST_CHANGES', '**P1** `f.ts:1`'), updatedAt: '2026-09-10T00:01:00Z' }],
     mergeReady: false,
-  }), () => { sent += 1; return { target_session_id: 's1' }; }, '2026-09-10T00:07:00Z');
-  assert.equal(sent, 6);
-  assert.equal(seventh.prs[0].dispatch.attempted, false);
-  assert.equal(seventh.prs[0].dispatch.reason, 'round-limit');
-  const blocked = JSON.parse(fs.readFileSync(paths.statePath, 'utf8')).prs.PR_1;
-  assert.equal(blocked.repairRounds, 6);
-  assert.equal(blocked.activeTask.status, 'blocked');
-  assert.equal(blocked.activeTask.blockedKind, 'round-limit');
+  }), () => { sent += 1; return { target_session_id: 's1' }; }, '2026-09-10T00:01:00Z');
+  assert.equal(sent, 1);
+  // Simulate the old cap: the next feedback was held back undelivered and the PR blocked.
+  const state = JSON.parse(fs.readFileSync(paths.statePath, 'utf8'));
+  state.prs.PR_1.repairRounds = 6;
+  state.prs.PR_1.eligibility = 'blocked';
+  state.prs.PR_1.activeTask = { ...state.prs.PR_1.activeTask, status: 'blocked', blockedKind: 'round-limit',
+    reason: 'Same PR reached the 6-round repair limit.' };
+  fs.writeFileSync(paths.statePath, JSON.stringify(state));
+  const report = runScan(paths, listed, () => ({
+    comments: [{ id: 2, body: verdict('REQUEST_CHANGES', '**P1** `f.ts:2`'), updatedAt: '2026-09-10T00:02:00Z' }],
+    mergeReady: false,
+  }), () => { sent += 1; return { target_session_id: 's1' }; }, '2026-09-10T00:02:00Z');
+  assert.equal(report.prs[0].dispatch.attempted, true);
+  assert.equal(sent, 2);
+  const after = JSON.parse(fs.readFileSync(paths.statePath, 'utf8')).prs.PR_1;
+  assert.notEqual(after.eligibility, 'blocked');
+  assert.equal(after.repairRounds, 7);
 });
 
 test('ciResult optional failures do not block', () => {

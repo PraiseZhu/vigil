@@ -98,7 +98,9 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" handoff --repo your-org/your-plug
 node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plugin-repo --pr 123
 ```
 
-`reclaim` 将 PR 转回 Draft 并确认结果。watcher 在 discover、poll 和 scan 入口观察到 Draft 时作废活动任务；修复 helper 每次读取 GitHub 的 Ready/Draft 代次，即使巡检错过中间的 Draft、HEAD 也未变化，旧任务仍会被拒绝。再次转 Ready 是新的交接：新代次、新任务，旧任务永远不能续用；修复轮次上限（6 轮）也按新代次重新计数。
+`reclaim` 将 PR 转回 Draft 并确认结果。watcher 在 discover、poll 和 scan 入口观察到 Draft 时作废活动任务；修复 helper 每次读取 GitHub 的 Ready/Draft 代次，即使巡检错过中间的 Draft、HEAD 也未变化，旧任务仍会被拒绝。再次转 Ready 是新的交接：新代次、新任务，旧任务永远不能续用；修复轮次计数（`repairRounds`，只作记录）也按新代次重新计数。
+
+修复不设轮次上限：同一 PR 只要还有新反馈、还没到可合并，watcher 就继续派修复轮次。旧版本按 6 轮上限停下的 PR（`blockedKind: round-limit`），下一次扫描会转回 active（`round-limit-reset`，不发评论），压住没投的反馈照常投递。
 
 修复会话每次改文件、提交或外发回复前执行 `mivo-repair.mjs assert-owner --home <home> --task <task>`。`prepare`、`validate` 前后、`finalize` 推送前和 CI 复查也执行同一归属检查。网络失败不放行，旧任务没有交接回执也不放行。已确认受控 push 的回执只允许同一任务继续验证/收口，不允许旧任务继续修改已推进的 HEAD。
 
@@ -116,7 +118,7 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 - 仓库成员（OWNER/MEMBER/COLLABORATOR，含作者本人）留的 review thread（`member-thread-triage`），以及严重度读不出、来源未核验的其他未解决 thread（`thread-triage`，含仓外人员和其他机器人）：交修复会话按统一分级判定，确认 P0/P1 才改代码；其余由 watcher 贴出会话写的结论并 resolve。目标是 PR 不因为一条没人处理的讨论卡在合并前。
 - 产品意图：watcher 抓 PR 正文，优先取标题含「产品意图 / 设计意图 / Product intent」的一节（没有就取正文开头，最多 2000 字），写进任务的 `prSnapshot.prIntent` 和派工消息。反馈要求的改法会推翻 PR 正文、规格或维护者裁定里写明的界面、交互或流程时，它不算缺陷：会话不改代码，记 SC=no-change 并引用正文，watcher 回复后 resolve，继续推进。
 - 全自动推进到可合并（不合并）：严重度拿不准时会话自己复现核实，确认不了 P0/P1 就按不成立回复并 resolve；Jev 不可用也不因此 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用、作者收回才 blocked。
-- 卡住要让人看见：修复任务 blocked（外部阻塞、6 轮上限、补投三次无结果、结果无效、派发失败）时，watcher 在 PR 上发一条评论，按「发生了什么 / 对本 PR 意味着什么 / 需要谁做什么」写明原因并 @作者。同一 blocked 状态只发一次，发送失败下一轮重试（最多 3 次）。必需 CI 红、HEAD 漂移这类 watcher 自己会接着处理的状态不发。
+- 卡住要让人看见：修复任务 blocked（外部阻塞、补投三次无结果、结果无效、派发失败）时，watcher 在 PR 上发一条评论，按「发生了什么 / 对本 PR 意味着什么 / 需要谁做什么」写明原因并 @作者。同一 blocked 状态只发一次，发送失败下一轮重试（最多 3 次）。必需 CI 红、HEAD 漂移这类 watcher 自己会接着处理的状态不发。
 - Greptile 汇总评论没有自己的 P0/P1 时不单独开会话（它的发现另以行内 thread 出现）。
 - 策略读不出（`required-policy-unknown`）和可合并（`merge-ready`）各在状态转换时出一条事件。
 

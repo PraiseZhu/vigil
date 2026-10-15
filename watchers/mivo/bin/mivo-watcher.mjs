@@ -90,7 +90,6 @@ function ownReceipt(comment, actor) {
     && (!actor || author === actor);
 }
 
-export const REPAIR_ROUND_LIMIT = 6;
 // How long a new HEAD seen while a repair session works waits for that session's own result.
 export const HEAD_CHANGE_WAIT_MS = 60 * 60 * 1000;
 
@@ -602,7 +601,7 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       '整体目标是按逐项权限处理本批反馈；获准修复才提交并 push，P2/P3 只说明暂不修，未知严重度在会话里核实，不以回复冒充修复。required CI 通过或记录外部阻塞；不自行合并。',
       '必须项红先读 job 日志 ##[error] 分类：pr-format-gate 的 Windows 证据/竞态、pr-size-gate 的 freshness(verify fail/pending) → 先修真正红的上游 job，上游全绿后对该门 gh run rerun <run-id> --failed 一次；只有日志明确是格式/行数问题才改 PR。Windows 偶发：同 head 首次失败且日志命中基础设施特征（下载失败/runner 取消/超时/磁盘/网络）重跑一次，仍红当真实失败。可选 check（Greptile Review check、Windows trace A/B diagnostic、stale branch reminder 等非 required）不当必修。CodeQL 记外部阻塞。',
       '要先复核再决定改不改的 thread（repairPolicy 里 reason=member-thread-triage：仓库成员含作者本人留的；greptile-p1-triage：Greptile 按它自己的标准打的 P0/P1；thread-triage：严重度读不出或来源未核验的）：先按统一分级重新判定，拿不准用 Jev 并自己复现核实。确认成立的 P0/P1 才改代码并记 SC=pass；P2/P3、提问或不成立记 SC=no-change。两种情况 evidence 第一条都写一句给评论人看的人话结论（发生了什么 / 对本 PR 意味着什么 / 要不要改代码），watcher 会把它贴到该 thread 并 resolve；不要以「严重度未知」blocked 这类项。',
-      '三审/Greptile：只修复核成立的 P0/P1；reply-resolve 类别现仅表示 reply-only：用「发生了什么 / 对本 PR 意味着什么 / 要不要改代码」在当前会话说明，不改代码、不主动 GitHub 回复、不自动 resolve。混合/未知严重度 needs-triage 不授整条修复，在会话里核实。ignore-infra 不处理。与写明产品意图冲突的按上面「产品意图」处理。同一 PR 修复轮次上限 6 轮；获准冲突修复用 git merge origin/main，不 rebase/force push。',
+      '三审/Greptile：只修复核成立的 P0/P1；reply-resolve 类别现仅表示 reply-only：用「发生了什么 / 对本 PR 意味着什么 / 要不要改代码」在当前会话说明，不改代码、不主动 GitHub 回复、不自动 resolve。混合/未知严重度 needs-triage 不授整条修复，在会话里核实。ignore-infra 不处理。与写明产品意图冲突的按上面「产品意图」处理。修复不设轮次上限，一直推进到可合并；获准冲突修复用 git merge origin/main，不 rebase/force push。',
       ...(taskPath ? [
         `task=${taskPath}`,
         ...keelRules({ dispatchId: path.basename(taskPath, '.json'), canChangeCode: repairPolicy.canChangeCode, version: keelVersion }),
@@ -989,6 +988,15 @@ export function reopenKeelBlocked({ previous, paths, now }) {
   };
 }
 
+// Repair rounds have no cap any more (2026-10-15: a PR keeps being repaired until it is mergeable). Versions
+// before this change stopped a PR after 6 rounds in one Ready and kept its feedback undelivered, so such a PR
+// goes back to active and that feedback is delivered on the next scan.
+export function reopenRoundLimitBlocked({ previous }) {
+  const active = previous?.activeTask;
+  if (active?.status !== 'blocked' || active.blockedKind !== 'round-limit') return previous;
+  return { ...previous, eligibility: 'active', activeTask: { ...active, blockedKind: 'round-limit-reset' } };
+}
+
 // Versions deployed 2026-10-15 between 65f6f28 and this change stopped on a product-intent conflict and
 // waited for a person. Product questions are now answered in the session, so such a task's feedback is handed
 // back once (cursor cleared, round refunded) and goes to a new round under the current rules.
@@ -1075,7 +1083,6 @@ const NOTICE_HISTORY = 20;
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const BLOCKED_KIND_TEXT = {
   external: '修复会话遇到它自己解决不了的问题（缺权限、缺环境、外部服务故障或需要人裁决）',
-  'round-limit': '同一次 Ready 内已经修了 6 轮，盯梢按上限停手',
   'missing-result-limit': '修复会话三次补投都没有交回结果',
   'invalid-result': '修复会话交回的结果对不上本 PR 或缺少验证证据',
   'dispatch-retry-limit': '宿主多次拒绝创建修复会话',
@@ -1169,6 +1176,7 @@ export function* processPr({
   catch (error) { resultError = error.message; }
   if (!resultError) previous = reopenKeelBlocked({ previous, paths, now });
   if (!resultError) previous = reopenProductIntentBlocked({ previous, paths, now });
+  if (!resultError) previous = reopenRoundLimitBlocked({ previous });
   if (resultError) {
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.activeTask?.dispatchId ?? previous.lastDispatch?.dispatchId,
@@ -1284,14 +1292,11 @@ export function* processPr({
   }
   const sameEpoch = !collected.pr || (previous.admissionEpoch === collected.pr.releaseEpoch && previous.wasDraft !== true);
   if (!sameEpoch) previous = {...previous, admissionVerified:false};
-  // A new Ready is a new handoff with a fresh round budget; the cap only stops loops inside one Ready
-  // (2026-10-15: #819 and #884 stayed blocked on round-limit even after being made Ready again).
+  // repairRounds is a per-Ready count for the record only; it no longer stops repairs.
   // Entries written before this field count their rounds in the epoch they were admitted in.
   const countedEpoch = previous.roundsEpoch ?? previous.admissionEpoch ?? collected.pr?.releaseEpoch;
   if (collected.pr?.releaseEpoch && countedEpoch !== collected.pr.releaseEpoch) {
-    const roundLimited = previous.eligibility === 'blocked' && previous.activeTask?.blockedKind === 'round-limit';
-    const reset = { repairRounds: 0, roundsEpoch: collected.pr.releaseEpoch,
-      ...(roundLimited ? { eligibility: 'active', activeTask: { ...previous.activeTask, blockedKind: 'round-limit-reset' } } : {}) };
+    const reset = { repairRounds: 0, roundsEpoch: collected.pr.releaseEpoch };
     previous = { ...previous, ...reset };
     base = { ...base, ...reset };
   } else if (collected.pr?.releaseEpoch && !previous.roundsEpoch) {
@@ -1400,13 +1405,11 @@ export function* processPr({
   const recovery = admitted && !collected.mergeReady && !resultError
     && previous.activeTask?.status !== 'waiting-ci' && !terminal
     ? readTaskForRecovery(previous, paths, now) : null;
-  const repairRounds = Number(previous.repairRounds ?? 0);
-  const hitRoundLimit = repairRounds >= REPAIR_ROUND_LIMIT;
   const canResume = !resultError && (canRepair(previous) || (
     fresh.length > 0 && previous.activeTask?.status === 'blocked'
-    && !['invalid-result', 'missing-result-limit', 'round-limit'].includes(previous.activeTask?.blockedKind)
+    && !['invalid-result', 'missing-result-limit'].includes(previous.activeTask?.blockedKind)
   ));
-  const shouldDispatch = forceCreate || (fresh.length > 0 && !collected.mergeReady && canResume && !admissionBlocked && !inFlight && !hitRoundLimit);
+  const shouldDispatch = forceCreate || (fresh.length > 0 && !collected.mergeReady && canResume && !admissionBlocked && !inFlight);
   let dispatch = { attempted: false, bound: false, reason: 'no-new-feedback' };
   // Advance only non-actionable observations until a delivery is acknowledged.
   const retainedCursor = { ...cursor };
@@ -1418,20 +1421,6 @@ export function* processPr({
     ...previous, feedbackCursor: retainedCursor, pendingFeedback: fresh.length,
     sessionId: mapping.sessionId ?? previous.sessionId ?? null,
   };
-  if (hitRoundLimit && fresh.length > 0 && !collected.mergeReady && !admissionBlocked && !resultError && !inFlight) {
-    previous = {
-      ...previous,
-      eligibility: 'blocked',
-      activeTask: {
-        ...previous.activeTask,
-        dispatchId: previous.activeTask?.dispatchId ?? previous.lastDispatch?.dispatchId,
-        sessionId: previous.sessionId,
-        status: 'blocked',
-        blockedKind: 'round-limit',
-        reason: 'Same PR reached the 6-round repair limit.',
-      },
-    };
-  }
   const wantsDelivery=shouldDispatch || recovery || previous.pendingDispatch?.status==='retryable';
   // Per-PR budget caps collection only. Dispatch reserve (65s/61s) uses the global deadline.
   if (wantsDelivery) resetPrDeadline?.();
@@ -1567,8 +1556,6 @@ export function* processPr({
         }
       }
     }
-  } else if (hitRoundLimit && fresh.length > 0) {
-    dispatch.reason = 'round-limit';
   } else if (inFlight) {
     dispatch.reason = previous.activeTask?.status === 'waiting-ci' ? 'waiting-ci' : 'task-in-flight';
   } else if (!canResume) {
@@ -1757,7 +1744,8 @@ export function* pollWorkflow({
   const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous;
   // The same holds for a PR an older build stopped on a product-intent conflict, or whose awaiting-discussion
   // label the watcher still has to take off (including after a failed DELETE): nothing changes on GitHub.
-  const intentMigrationDue = reopenProductIntentBlocked({ previous, paths, now }) !== previous || legacyIntentLabelDue(previous);
+  const intentMigrationDue = reopenProductIntentBlocked({ previous, paths, now }) !== previous || legacyIntentLabelDue(previous)
+    || reopenRoundLimitBlocked({ previous }) !== previous;
   if (previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry && !normalized.overflow
     && !hasUnconsumedResult(previous, paths) && !keelReopenDue && !intentMigrationDue) {
     save(previous);
