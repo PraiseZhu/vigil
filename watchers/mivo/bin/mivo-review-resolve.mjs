@@ -106,7 +106,7 @@ export function refutedReplyText(evidence, dispatchId) {
 export function triagedReplyText(evidence, dispatchId) {
   return [
     '**发生了什么**：盯梢修复轮按仓库统一分级核实了这条意见，结论是本轮不需要改代码（不成立、或属于 P2/P3 建议）。',
-    '**对本 PR 意味着什么**：这条讨论不再阻塞合并；核实依据如下。如果你认为判断有误，直接在这里回复，盯梢会重新处理。',
+    '**对本 PR 意味着什么**：这条讨论不再阻塞合并；核实依据如下。如果你认为判断有误，请点「Unresolve」重新打开这条讨论（只回复不会被处理）；盯梢会重新评估，之后不再自动关闭它。',
     '**要不要改代码**：本轮不改。',
     '',
     '核实依据：',

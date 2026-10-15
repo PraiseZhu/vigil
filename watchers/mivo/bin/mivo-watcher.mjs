@@ -1728,7 +1728,12 @@ export function* discoverWorkflow({
   let index = JSON.parse(fs.readFileSync(v2.indexPath, 'utf8'));
   const sorted = [...listed].sort((a, b) => a.number - b.number);
   const previousCursor = Number(index.cursor ?? 0);
-  const ordered = [...sorted.filter((pr) => pr.number > previousCursor), ...sorted.filter((pr) => pr.number <= previousCursor)];
+  const rotated = [...sorted.filter((pr) => pr.number > previousCursor), ...sorted.filter((pr) => pr.number <= previousCursor)];
+  // A PR whose delivery was deferred because earlier PRs used this run's time goes first next run. The cursor
+  // only rotates when a run stops early, so with every PR visited the last one was deferred every run
+  // (2026-10-15: #993 waited behind #989 and #990).
+  const deferredFirst = new Set(index.deferredNumbers ?? []);
+  const ordered = [...rotated.filter((pr) => deferredFirst.has(pr.number)), ...rotated.filter((pr) => !deferredFirst.has(pr.number))];
   for (const pr of ordered) {
     if (deadline - clock() < 1000 || report.length >= maxPrs) break;
     prDeadline = Math.min(deadline, clock() + perPrBudgetMs);
@@ -2007,7 +2012,8 @@ export function* discoverWorkflow({
       report.push({ number: live.number, nodeId: staleKey, dispatch });
     } finally { staleLock.release(); }
   }
-  index = { ...index, finishedAt: now, elapsedMs: clock() - started };
+  const deferredNumbers = report.filter((item) => item.dispatch?.reason === 'dispatch-budget-deferred').map((item) => item.number);
+  index = { ...index, finishedAt: now, elapsedMs: clock() - started, deferredNumbers };
   fs.writeFileSync(v2.indexPath, `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
   const closedownManual = listPrs(paths.home)
     .filter((entry) => entry?.closedownManual)
