@@ -686,6 +686,42 @@ test('a late dispatch receipt cannot revive a task reclaimed by the author', (t)
   assert.equal(readPr(paths.home, nodeId).sessionId, 'original-session');
 });
 
+// R60:宿主在没给目标会话的派发里返回了另一个 PR 正在用的会话(一次继任派发拿回了别的 PR 的修复会话)。
+// 绑上去就成了一个会话对应两个 PR:deploy.mjs 的会话身份检查从此拒绝部署,按会话找归属也会认错。
+test('a dispatch receipt naming a session already bound to another PR is not bound', (t) => {
+  const { paths } = homeOf(t);
+  const otherId = 'PR_791';
+  writePr(paths.home, otherId, { number: 791, nodeId: otherId, sessionId: 'shared-session', claimedAt: '2026-10-11T06:45:00Z',
+    activeTask: { dispatchId: 'live-791-a', sessionId: 'shared-session', status: 'complete' } });
+  const otherFile = path.join(statePaths(paths.home).prsDir, `${otherId}.json`);
+  const otherBefore = fs.readFileSync(otherFile, 'utf8');
+  const previous = { number: 790, nodeId, sessionId: null, claimedAt: null,
+    predecessors: [{ sessionId: 'archived-session', at: '2026-10-11T11:35:00Z', reason: 'ARCHIVED' }],
+    pendingDispatch: { dispatchId: 'live-790-successor', status: 'awaiting-claim' } };
+  writePr(paths.home, nodeId, previous);
+  const state = { version: 2, prs: { [nodeId]: previous } };
+  const result = applyDispatchReceipt({ state, pr: listed, mapping: {},
+    receipt: { target_session_id: 'shared-session', dispatch_id: 'live-790-successor', wake_kind: 'queued' }, paths,
+    now: '2026-10-11T11:45:51Z' });
+  assert.deepEqual(result, { bound: false, reason: 'session-owned-by-other-pr', otherPr: 791 });
+  const entry = readPr(paths.home, nodeId);
+  assert.equal(entry.sessionId, null, '不绑定别的 PR 的会话');
+  assert.equal(entry.claimedAt, null);
+  assert.equal(entry.pendingDispatch, null);
+  assert.deepEqual(entry.needsHuman, { reason: 'session-owned-by-other-pr', at: '2026-10-11T11:45:51Z',
+    sessionId: 'shared-session', otherPr: 791, dispatchId: 'live-790-successor' });
+  assert.equal(fs.readFileSync(otherFile, 'utf8'), otherBefore, '另一个 PR 的记录一个字节都不动');
+  const ids = fs.readdirSync(statePaths(paths.home).prsDir).filter((f) => f.endsWith('.json'))
+    .map((f) => JSON.parse(fs.readFileSync(path.join(statePaths(paths.home).prsDir, f), 'utf8')).sessionId).filter(Boolean);
+  assert.equal(new Set(ids).size, ids.length, '会话身份仍然唯一,部署检查不会被卡住');
+  // 本 PR 自己的会话回来(正常复用)照常绑定
+  writePr(paths.home, otherId, { number: 791, nodeId: otherId, sessionId: 'other-session' });
+  const again = applyDispatchReceipt({ state: { version: 2, prs: { [nodeId]: { ...previous, needsHuman: undefined } } }, pr: listed, mapping: {},
+    receipt: { target_session_id: 'fresh-session', dispatch_id: 'live-790-successor' }, paths, now: '2026-10-11T12:00:00Z' });
+  assert.equal(again.bound, true);
+  assert.equal(readPr(paths.home, nodeId).sessionId, 'fresh-session');
+});
+
 test('same HEAD and comments with a new Ready event changes the poll fingerprint', () => {
   assert.notEqual(pollFingerprint(graphqlNode({ timelineItems: { nodes: [{ id: 'ready-one' }] } })),
     pollFingerprint(graphqlNode({ timelineItems: { nodes: [{ id: 'ready-two' }] } })));

@@ -743,6 +743,13 @@ export function isExcludedHead(headRefName) {
   return EXCLUDED_HEAD_PREFIXES.some((prefix) => String(headRefName ?? '').startsWith(prefix));
 }
 
+// 一个修复会话只归一个 PR:deploy.mjs 的会话身份检查和 mivo-ownership 都按 sessionId 找归属。
+function sessionOwnerOf({ state, paths, sessionId, exceptKey }) {
+  const entries = [...Object.entries(state.prs ?? {}),
+    ...listPrs(paths.home).filter(Boolean).map((entry) => [String(entry.nodeId ?? ''), entry])];
+  return entries.find(([key, entry]) => key !== exceptKey && entry?.sessionId === sessionId)?.[1] ?? null;
+}
+
 export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor, collected, fresh, paths = watcherPaths(), recovery = false }) {
   const sessionId = receipt?.target_session_id;
   if (!sessionId) throw new Error('dispatch receipt missing target_session_id');
@@ -775,6 +782,21 @@ export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor,
     };
     persistState(state, paths);
     return { bound: true, sessionId: previous.sessionId, conflict: true, reused: true };
+  }
+  // 宿主在没给目标会话的派发里可能返回别的 PR 正在用的会话(R60:一次继任派发拿回了另一个 PR 的修复会话)。
+  // 绑上去会让一个会话对应两个 PR,部署检查从此拒绝、按会话找归属也会认错:不绑定,交人工核实。
+  if (!previous.sessionId) {
+    const owner = sessionOwnerOf({ state, paths, sessionId, exceptKey: key });
+    if (owner) {
+      state.prs[key] = {
+        ...previous,
+        pendingDispatch: null,
+        dispatchError: null,
+        needsHuman: { reason: 'session-owned-by-other-pr', at: now, sessionId, otherPr: owner.number ?? null, dispatchId: thisId ?? null },
+      };
+      persistState(state, paths);
+      return { bound: false, reason: 'session-owned-by-other-pr', otherPr: owner.number ?? null };
+    }
   }
   state.prs[key] = {
     ...previous,
@@ -1778,7 +1800,7 @@ export function* discoverWorkflow({
             const receipt = yield () => dispatchFn(retryParams, { timeoutMs: Math.max(1, remaining()) });
             if (receipt?.target_session_id) {
               const state = { version: 2, repo: REPO, prs: { [key]: previous } };
-              applyDispatchReceipt({
+              const claimed = applyDispatchReceipt({
                 state,
                 pr: { id: key, number: pr.number, headRefOid: previous.headRefOid, headRefName: previous.headRefName, url: previous.url },
                 mapping: { sessionId: previous.sessionId, title: previous.title, titleDate: previous.titleDate, taskName: previous.taskName },
@@ -1787,7 +1809,7 @@ export function* discoverWorkflow({
               });
               previous = state.prs[key];
               writePr(paths.home, key, previous);
-              report.push({ number: pr.number, nodeId: key, dispatch: { attempted: true, bound: true, reason: 'claim-retry-wakeup' } });
+              report.push({ number: pr.number, nodeId: key, dispatch: { attempted: true, ...claimed, reason: claimed.bound ? 'claim-retry-wakeup' : claimed.reason } });
               continue;
             }
             previous = {
