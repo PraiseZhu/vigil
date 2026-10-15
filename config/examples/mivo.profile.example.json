@@ -3,5 +3,8 @@
   "pluginRepoPath": "/path/to/your-plugin-checkout",
   "watchHomes": [
     "/path/to/mivo-watcher/runtime"
+  ],
+  "maintainers": [
+    "your-maintainer-login"
   ]
 }

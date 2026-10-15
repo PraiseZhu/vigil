@@ -1,3 +1,5 @@
+import { TRIAGE_REASONS } from './mivo-feedback-policy.mjs';
+
 // Autonomous P2/P3 review-thread closure. No human notification, no session dispatch.
 // Eligibility is entirely derived from the existing policy layer:
 //   category === 'reply-resolve'  (== feedbackRepairPolicy action 'reply-only')
@@ -68,7 +70,11 @@ function completeCodeFixThreads(result, task, { disposition, scStatus, kind }) {
     const threadId = THREAD_KEY.exec(key ?? '')?.[1];
     if (itemDisposition !== disposition || !threadId || policy.get(key)?.action !== 'code-fix') continue;
     const evidence = evidenceLines(result, key, scStatus);
-    if (evidence.length) items.push({ key, threadId, evidence, kind, triage: policy.get(key)?.reason === 'member-thread-triage' });
+    const reason = policy.get(key)?.reason;
+    // A maintainer's own thread graded no-change may still be a product requirement: answer it, leave it open for them.
+    const commenter = (task.feedback ?? []).find((item) => item?.key === key)?.author;
+    const replyOnly = kind === 'refuted' && reason === 'member-thread-triage' && (!task.prAuthor || commenter !== task.prAuthor);
+    if (evidence.length) items.push({ key, threadId, evidence, kind, triage: TRIAGE_REASONS.has(reason), replyOnly });
   }
   return items;
 }
@@ -115,6 +121,19 @@ export function triagedReplyText(evidence, dispatchId) {
     `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
   ].join('\n');
 }
+// A non-author member's thread graded no-change: the watcher answers but leaves the thread to them.
+export function memberReplyText(evidence, dispatchId) {
+  return [
+    '**发生了什么**：盯梢修复轮按仓库统一分级核实了这条意见，结论是本轮不需要改代码（不成立、或属于 P2/P3 建议）。',
+    '**对本 PR 意味着什么**：这条讨论是仓库成员提的，可能是产品要求，所以盯梢不替你关闭它。讨论没关之前，PR 不能合并。',
+    '**要不要改代码**：本轮不改。认同这个结论就点「Resolve」；不认同请直接回复，盯梢会按你的回复重新处理。',
+    '',
+    '核实依据：',
+    ...sanitizeEvidence(evidence),
+    '',
+    `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
+  ].join('\n');
+}
 export function fixedReplyText(evidence, head, dispatchId) {
   const shortHead = typeof head === 'string' && head.length ? head.slice(0, 12) : '';
   return [
@@ -129,11 +148,22 @@ export function fixedReplyText(evidence, head, dispatchId) {
   ].join('\n');
 }
 // Same durable receipt as the P2/P3 closure: `previous.autoClosedThreads[threadId]`.
+// Reply-only answers are recorded per task in `previous.repliedThreads` and leave the thread open.
 export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, ghFn, now, head }) {
   const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
+  const repliedThreads = { ...(previous.repliedThreads ?? {}) };
   const results = [];
+  const replied = [];
   for (const item of items) {
     if (closedThreads[item.threadId]) continue;
+    if (item.replyOnly) {
+      const receipt = `${item.threadId}:${dispatchId}`;
+      if (repliedThreads[receipt]) continue;
+      yield () => ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${memberReplyText(item.evidence, dispatchId)}`]);
+      repliedThreads[receipt] = { at: now, key: item.key, reason: 'member-thread-replied' };
+      replied.push({ threadId: item.threadId, key: item.key });
+      continue;
+    }
     const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, dispatchId)
       : item.triage ? triagedReplyText(item.evidence, dispatchId) : refutedReplyText(item.evidence, dispatchId);
     const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : 'refuted-p0-p1';
@@ -142,5 +172,5 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
     closedThreads[item.threadId] = { at: now, key: item.key, reason, dispatchId };
     results.push({ threadId: item.threadId, key: item.key });
   }
-  return { previous: { ...previous, autoClosedThreads: closedThreads }, closed: results };
+  return { previous: { ...previous, autoClosedThreads: closedThreads, ...(replied.length || previous.repliedThreads ? { repliedThreads } : {}) }, closed: results, replied };
 }
