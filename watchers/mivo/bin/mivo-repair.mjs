@@ -706,11 +706,14 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
   return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks });
 }
 
-export function blocked({ home, taskPath, reason, ghFn = command } = {}) {
+// product-intent: a requested fix would overturn UI or flow the PR body, a spec or a maintainer ruling wrote down.
+export const BLOCKED_KINDS = new Set(['external', 'product-intent']);
+export function blocked({ home, taskPath, reason, kind = 'external', ghFn = command } = {}) {
+  if (!BLOCKED_KINDS.has(kind)) fail(`blocked --kind must be one of ${[...BLOCKED_KINDS].join(', ')}, got ${JSON.stringify(kind)}`);
   const { paths, task } = taskFrom(home, taskPath);
   const { sessionId } = boundSession(paths, task);
   if (typeof reason !== 'string' || !reason.trim()) fail('blocked reason is required');
-  return saveResult(paths, task, sessionId, { status: 'blocked', blockedKind: 'external', reason: reason.trim(), worktree: taskWorktree(task) });
+  return saveResult(paths, task, sessionId, { status: 'blocked', blockedKind: kind, reason: reason.trim(), worktree: taskWorktree(task) });
 }
 
 export function shellQuote(value) {
@@ -834,7 +837,7 @@ function cli(argv) {
     else if (mode === 'validate') result = validate({ home, taskPath: task, validatedHead: value('--validated-head') });
     else if (mode === 'finalize') result = finalize({ home, taskPath: task, scReport: value('--sc-report'), validatedHead: value('--validated-head'), validationReceipt: value('--validation-receipt', false), keelRun: value('--keel-run', false) });
     else if (mode === 'recheck') result = recheck({ home, taskPath: task, validatedHead: value('--validated-head', false) });
-    else if (mode === 'blocked') result = blocked({ home, taskPath: task, reason: value('--reason') });
+    else if (mode === 'blocked') result = blocked({ home, taskPath: task, reason: value('--reason'), kind: value('--kind', false) ?? 'external' });
     else fail('mode must be assert-owner, prepare, validate, finalize, recheck, blocked, cleanup, or clear-owner-unknown');
   }
   process.stdout.write(`${JSON.stringify(result)}\n`);

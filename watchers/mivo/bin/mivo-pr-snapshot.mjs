@@ -5,7 +5,7 @@ const DEFAULT_REPO = requireConfig('targetRepo', {
   envVar: 'MIVO_WATCHER_TARGET_REPO',
   hint: '示例："your-org/your-repo"。',
 });
-const FIELDS = 'id,number,title,url,state,isDraft,headRefOid,headRefName,baseRefOid,baseRefName,createdAt,author,isCrossRepository,headRepository,headRepositoryOwner,mergeable,reviewDecision';
+const FIELDS = 'id,number,title,body,url,state,isDraft,headRefOid,headRefName,baseRefOid,baseRefName,createdAt,author,isCrossRepository,headRepository,headRepositoryOwner,mergeable,reviewDecision';
 const parse = (raw) => typeof raw === 'string' ? JSON.parse(raw) : raw;
 const requireValue = (ok, reason) => { if (!ok) throw new Error(`PR snapshot: ${reason}`); };
 const quote = (value) => JSON.stringify(value);

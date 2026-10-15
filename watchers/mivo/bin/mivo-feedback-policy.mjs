@@ -56,8 +56,19 @@ export function feedbackRepairPolicy(item = {}, options = {}) {
   if (!['code-fix', 'ignore-infra'].includes(policy.action) && trustedReviewer(item) && isGreptileSummary(String(item.body ?? ''))) {
     return result('ignore-infra', policy.severities, 'greptile-summary-inline-threads');
   }
+  // Greptile grades P1 on its own scale (2026-10-15: #925's "handwritten text lost on reload" was a false alarm).
+  // Its P0/P1 gets the same unified re-grading as a member thread before any code changes.
+  if (policy.action === 'code-fix' && GREPTILE_GRADED.has(policy.reason) && isGreptileItem(item)) {
+    return result('code-fix', policy.severities, 'greptile-p1-triage');
+  }
   return policy;
 }
+const GREPTILE_GRADED = new Set(['explicit-p0-p1-finding', 'mixed-severity-high-authorized-low-no-change']);
+function isGreptileItem(item) {
+  return item.source === 'greptile' || isGreptileAuthor(item.user ?? item.author);
+}
+// Feedback whose severity the repair session re-grades on the unified scale before changing code.
+export const TRIAGE_REASONS = new Set(['member-thread-triage', 'greptile-p1-triage']);
 
 function itemRepairPolicy(item = {}, { headSha } = {}) {
   if (!item || typeof item !== 'object') return result('needs-triage', [], 'invalid-feedback');
