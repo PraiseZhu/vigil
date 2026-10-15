@@ -50,7 +50,12 @@ function* loadBranchRequired({ gh, repo, baseRefName, branchPath, isProtected, i
     else throw error;
   }
   assert(protection && typeof protection === 'object', 'unknown classic protection');
-  const classic = protection.required_status_checks;
+  // GitHub omits the key entirely once classic required checks are removed in favor of rulesets.
+  // Treat that like an explicit null only for a real protection object; an error body stays unknown.
+  if (!Object.hasOwn(protection, 'required_status_checks')) {
+    assert(typeof protection.url === 'string' || Object.hasOwn(protection, 'enforce_admins'), 'unknown classic protection');
+  }
+  const classic = protection.required_status_checks ?? null;
   if (classic !== null) {
     assert(classic && Array.isArray(classic.contexts) && Array.isArray(classic.checks), 'unknown classic checks');
     for (const check of classic.checks) addRequired(into, check.context, check.app_id === -1 ? null : check.app_id ?? null, 'classic');

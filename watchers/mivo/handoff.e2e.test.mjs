@@ -46,7 +46,7 @@ import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { scanOnce, watcherPaths } from ${JSON.stringify(new URL('./bin/mivo-watcher.mjs', import.meta.url).href)};
 const result = scanOnce({ mode: 'discover', enabled: true, allowDispatch: true,
-  paths: watcherPaths(process.env.MIVO_WATCHER_HOME), now: ${JSON.stringify(now)},
+  paths: watcherPaths(process.env.MIVO_WATCHER_HOME), now: process.env.E2E_NOW || ${JSON.stringify(now)},
   budgetMs: Number(process.env.E2E_BUDGET_MS ?? 120000),
   ghFn: args => execFileSync(process.env.GH_BIN, args, { encoding: 'utf8', stdio: ['ignore','pipe','pipe'] }),
   dispatchFn: params => { fs.appendFileSync(process.env.E2E_DELIVERIES, JSON.stringify(params) + '\\n');
@@ -76,6 +76,8 @@ process.stdout.write(JSON.stringify(result));
     entry: () => fs.existsSync(prFile) ? JSON.parse(fs.readFileSync(prFile)) : null,
     seed: value => { fs.mkdirSync(path.dirname(prFile), { recursive: true }); fs.writeFileSync(prFile, JSON.stringify(value)); },
     scan: (budgetMs = 120000) => { env.E2E_BUDGET_MS = String(budgetMs); return run(driver); },
+    // A later tick: task ids carry the tick time, so a second task needs a later clock.
+    later: (at = '2026-09-03T03:00:00Z') => { env.E2E_NOW = at; },
     advanceHead: () => { git(['-c', 'user.name=Example User', '-c', 'user.email=example@example.invalid', 'commit', '--allow-empty', '-m', 'repair']); return git(['rev-parse', 'HEAD']); }, deliveries: () => lines(deliveriesFile), calls: () => lines(callsFile),
     handoff: (success = true) => run(path.join(bin, 'mivo-handoff.mjs'), ['handoff', '--repo', repo, '--pr', '17'], success),
     reclaim: () => run(path.join(bin, 'mivo-handoff.mjs'), ['reclaim', '--repo', repo, '--pr', '17']),
@@ -139,44 +141,54 @@ function readyAgain(f) {
   f.update(s => { s.pr.isDraft = false; s.timeline.push({ __typename: 'ReadyForReviewEvent', id: 'READY_2', createdAt: '2026-09-03T02:00:00Z' }); });
 }
 
-test('CLI handoff → real watcher dispatch → helper ownership → reclaim revokes task and same-head Ready epoch', t => {
+// 2026-10-15: Ready itself is the handoff. A PR made Ready from the web (no comment receipt) is taken in at once;
+// the Draft reclaim still revokes the running task for good, and Ready again starts a new task.
+test('Ready is the handoff: no receipt needed, a later receipt keeps the task, reclaim revokes, Ready again hands off anew', t => {
   const f = fixture(t);
-  assert.equal(f.scan().prs[0].dispatch.reason, 'author-handoff-required');
-  assert.equal(f.deliveries().length, 0);
-  const handoff = f.handoff();
-  assert.equal(handoff.status, 'handed-off');
-  assert.equal(handoff.receipt.head, f.head);
-  assert.equal(f.read().comments.length, 2);
-  const dispatched = f.scan();
-  assert.equal(dispatched.prs[0].dispatch.attempted, true, JSON.stringify(dispatched));
+  const first = f.scan();
+  assert.equal(first.prs[0].dispatch.attempted, true, JSON.stringify(first));
   assert.equal(f.deliveries().length, 1);
+  const implicit = f.entry().handoff;
+  assert.equal(implicit.implicit, true);
+  assert.equal(implicit.head, f.head);
   const task = f.task();
-  assert.deepEqual(JSON.parse(fs.readFileSync(task)).handoff, handoff.receipt);
+  assert.deepEqual(JSON.parse(fs.readFileSync(task)).handoff, implicit);
+  assert.equal(f.owner(task).status, 'owned');
+  assert.equal(f.handoff().status, 'handed-off');
+  f.scan();
+  assert.equal(f.deliveries().length, 1, 'a receipt posted later does not start a second writer');
   assert.equal(f.owner(task).status, 'owned');
   assert.equal(f.reclaim().status, 'author-owned');
-  assert.equal(f.read().pr.isDraft, true);
   assert.match(f.owner(task, false), /handoff|superseded/);
   assert.equal(f.scan().prs[0].dispatch.reason, 'draft-author-owned');
   assert.equal(f.entry().activeTask.blockedKind, 'author-reclaimed');
   assert.equal(f.entry().handoff, null);
   readyAgain(f);
-  assert.equal(f.read().pr.headRefOid, f.head);
   assert.match(f.owner(task, false), /superseded|handoff/);
+  f.later();
   f.scan();
-  assert.equal(f.deliveries().length, 1);
-  assert.equal(f.entry().handoff, null);
+  assert.equal(f.deliveries().length, 2, 'Ready again is a new handoff with a new task');
+  assert.equal(f.entry().handoff.releaseEpoch, `ready:${nodeId}:READY_2:2026-09-03T02:00:00Z`);
+  assert.notEqual(f.task(), task);
+  assert.notEqual(f.owner(f.task()).status, undefined);
+  assert.match(f.owner(task, false), /superseded|handoff|dispatchId/);
 });
 
-test('Ready legacy admission without author receipt cannot reuse a bound session', t => {
+test('a legacy bound task without a receipt is superseded by the Ready handoff, never reused', t => {
   const f = fixture(t);
   f.seed({ nodeId, number: 17, sessionId: 'example-legacy-session', admissionVerified: true,
     admissionEpoch: `ready:${nodeId}:READY_1:2026-09-02T00:00:00Z`, wasDraft: false,
     activeTask: { status: 'accepted', dispatchId: 'example-legacy-task' },
     heartbeatAt: '2026-09-01T00:00:00Z', headRefOid: f.head, headRefName: 'feature' });
-  f.scan();
-  assert.equal(f.deliveries().length, 0);
-  assert.equal(f.entry().admissionVerified, false);
-  assert.equal(f.entry().handoff, null);
+  const scanned = f.scan();
+  const entry = f.entry();
+  assert.equal(entry.handoff.implicit, true);
+  // The legacy task is revoked for good; new work gets its own task id (the fixture host answers with another
+  // session, so this delivery stays unconfirmed, which is the safe outcome here).
+  assert.equal(entry.activeTask.dispatchId, 'example-legacy-task');
+  assert.equal(entry.activeTask.blockedKind, 'author-reclaimed');
+  assert.equal(scanned.prs[0].dispatch.attempted, true);
+  assert.notEqual(entry.pendingDispatch.dispatchId, 'example-legacy-task');
 });
 
 test('GitHub failures block handoff and helper ownership before local work can continue', t => {
@@ -196,7 +208,7 @@ test('GitHub failures block handoff and helper ownership before local work can c
   assert.equal(f.calls().filter(args => args.includes('POST')).length, 1);
 });
 
-test('unobserved Ready → Draft → Ready at the same HEAD cannot reuse an old task', t => {
+test('unobserved Ready → Draft → Ready at the same HEAD revokes the old task and hands off anew', t => {
   const f = fixture(t);
   f.handoff(); f.scan();
   const task = f.task();
@@ -205,10 +217,12 @@ test('unobserved Ready → Draft → Ready at the same HEAD cannot reuse an old 
   readyAgain(f); // No watcher tick occurs during Draft.
   assert.equal(f.read().pr.headRefOid, f.head);
   assert.match(f.owner(task, false), /handoff.*release epoch/);
+  f.later();
   f.scan();
-  assert.equal(f.deliveries().length, 1);
-  assert.equal(f.entry().activeTask.blockedKind, 'author-reclaimed');
-  assert.equal(f.entry().handoff, null);
+  assert.equal(f.deliveries().length, 2);
+  assert.notEqual(f.task(), task);
+  assert.equal(f.entry().handoff.releaseEpoch, `ready:${nodeId}:READY_2:2026-09-03T02:00:00Z`);
+  assert.match(f.owner(task, false), /superseded|handoff|dispatchId/);
 });
 
 function pushedResult(f, taskFile, head) {
@@ -260,7 +274,7 @@ test('pushed HEAD before helper receipt pauses safely, then consumes the late re
   assert.equal(f.deliveries().length, 1);
 });
 
-test('a genuine Draft still permanently revokes ownership while a pushed HEAD awaits its receipt', t => {
+test('a genuine Draft still permanently revokes the task while a pushed HEAD awaits its receipt', t => {
   const f = fixture(t);
   const { task, head } = pushWindow(f);
   f.reclaim();
@@ -269,9 +283,36 @@ test('a genuine Draft still permanently revokes ownership while a pushed HEAD aw
   assert.equal(f.entry().handoff, null);
   pushedResult(f, task, head);
   readyAgain(f);
+  f.later();
   f.scan();
-  assert.equal(f.entry().activeTask.blockedKind, 'author-reclaimed');
-  assert.equal(f.entry().handoff, null);
-  assert.match(f.owner(task, false), /superseded/);
-  assert.equal(f.deliveries().length, 1);
+  assert.match(f.owner(task, false), /superseded|dispatchId|handoff/);
+  assert.equal(f.entry().handoff.releaseEpoch, `ready:${nodeId}:READY_2:2026-09-03T02:00:00Z`);
+  assert.notEqual(f.task(), task, 'the late result of the revoked task is never resumed');
+});
+
+// 2026-10-15: an author push after Ready used to pause the PR for good (head-change-unconfirmed).
+test('an author push after Ready, with no repair running, continues on the new head', t => {
+  const f = fixture(t);
+  f.scan();
+  const entry = f.entry();
+  f.seed({ ...entry, activeTask: { ...entry.activeTask, status: 'complete' }, pendingDispatch: null });
+  const head = f.advanceHead();
+  f.update(s => { s.pr.headRefOid = head; });
+  f.later();
+  const next = f.scan();
+  assert.notEqual(next.prs[0].dispatch.reason, 'head-change-unconfirmed', JSON.stringify(next.prs[0]));
+  assert.equal(f.entry().handoff.head, head);
+  assert.equal(f.entry().handoff.implicit, true);
+});
+
+test('a HEAD change seen while a repair runs waits for its result, but not forever', t => {
+  const f = fixture(t);
+  const { task } = pushWindow(f);
+  f.later('2026-09-03T00:30:00Z');
+  assert.equal(f.scan().prs[0].dispatch.reason, 'head-change-unconfirmed');
+  f.later('2026-09-03T01:30:00Z');
+  const next = f.scan();
+  assert.notEqual(next.prs[0].dispatch.reason, 'head-change-unconfirmed', JSON.stringify(next.prs[0]));
+  assert.equal(f.entry().handoff.head, f.read().pr.headRefOid);
+  assert.match(f.owner(task, false), /superseded|dispatchId|handoff|stale/);
 });

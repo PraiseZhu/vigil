@@ -6,8 +6,9 @@
 // GraphQL review-thread items), never via `item.source === 'thread'` — Greptile-authored
 // thread comments carry `source: 'greptile'`, so gating on `source` would silently skip them.
 
+// The receipt marker keeps this reply out of the watcher's own feedback if the thread is ever reopened.
 const REPLY_TEXT = '这是一条 P2 级（建议类）反馈，不是阻塞性问题。按项目当前规则，这类建议本轮不安排修复；'
-  + '如后续需要可另行处理。讨论到此关闭，不影响本 PR 合并。';
+  + '如后续需要可另行处理。讨论到此关闭，不影响本 PR 合并。\n\n<!-- mivo-watcher-receipt task=auto-close -->';
 
 export function autoCloseReplyText() {
   return REPLY_TEXT;
@@ -67,7 +68,7 @@ function completeCodeFixThreads(result, task, { disposition, scStatus, kind }) {
     const threadId = THREAD_KEY.exec(key ?? '')?.[1];
     if (itemDisposition !== disposition || !threadId || policy.get(key)?.action !== 'code-fix') continue;
     const evidence = evidenceLines(result, key, scStatus);
-    if (evidence.length) items.push({ key, threadId, evidence, kind });
+    if (evidence.length) items.push({ key, threadId, evidence, kind, triage: policy.get(key)?.reason === 'member-thread-triage' });
   }
   return items;
 }
@@ -101,6 +102,19 @@ export function refutedReplyText(evidence, dispatchId) {
     `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
   ].join('\n');
 }
+// A member's thread the session graded as not needing code (P2/P3, a question, or not reproducible).
+export function triagedReplyText(evidence, dispatchId) {
+  return [
+    '**发生了什么**：盯梢修复轮按仓库统一分级核实了这条意见，结论是本轮不需要改代码（不成立、或属于 P2/P3 建议）。',
+    '**对本 PR 意味着什么**：这条讨论不再阻塞合并；核实依据如下。如果你认为判断有误，直接在这里回复，盯梢会重新处理。',
+    '**要不要改代码**：本轮不改。',
+    '',
+    '核实依据：',
+    ...sanitizeEvidence(evidence),
+    '',
+    `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
+  ].join('\n');
+}
 export function fixedReplyText(evidence, head, dispatchId) {
   const shortHead = typeof head === 'string' && head.length ? head.slice(0, 12) : '';
   return [
@@ -120,8 +134,9 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
   const results = [];
   for (const item of items) {
     if (closedThreads[item.threadId]) continue;
-    const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, dispatchId) : refutedReplyText(item.evidence, dispatchId);
-    const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : 'refuted-p0-p1';
+    const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, dispatchId)
+      : item.triage ? triagedReplyText(item.evidence, dispatchId) : refutedReplyText(item.evidence, dispatchId);
+    const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : 'refuted-p0-p1';
     yield () => ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${body}`]);
     yield () => ghFn(['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${item.threadId}`]);
     closedThreads[item.threadId] = { at: now, key: item.key, reason, dispatchId };

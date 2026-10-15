@@ -79,7 +79,7 @@ export function* collectPrSnapshot({ pr, ghFn }) {
   const releaseEpoch = yield* epoch({ pr: before, ghFn });
   const checks = list(yield () => ghFn(['pr', 'checks', String(number), '--repo', repo, '--json', 'name,state,bucket,link']), 'checks');
   const requiredChecks = list(yield () => ghFn(['pr', 'checks', String(number), '--repo', repo, '--required', '--json', 'name,state,bucket,link']), 'required checks');
-  const commentSelection = 'id body createdAt updatedAt author{login __typename} pullRequestReview{id}';
+  const commentSelection = 'id body createdAt updatedAt authorAssociation author{login __typename} pullRequestReview{id}';
   const threads = yield* connection({ id: before.id, field: 'reviewThreads', selection: `id isResolved isOutdated path comments(first:100){nodes{${commentSelection}} pageInfo{hasNextPage endCursor}}`, ghFn });
   const threadIds = new Set();
   for (const thread of threads) {
@@ -101,7 +101,7 @@ export function* collectPrSnapshot({ pr, ghFn }) {
     requireValue(comment && comment.id && typeof comment.body === 'string', 'invalid issue comment');
     return { ...comment, author: comment.author ?? comment.user, createdAt: comment.createdAt ?? comment.created_at, updatedAt: comment.updatedAt ?? comment.updated_at };
   });
-  const reviews = yield* connection({ id: before.id, field: 'reviews', selection: 'id body state submittedAt author{login} commit{oid}', ghFn });
+  const reviews = yield* connection({ id: before.id, field: 'reviews', selection: 'id body state submittedAt authorAssociation author{login} commit{oid}', ghFn });
   const labelNodes = yield* connection({ id: before.id, field: 'labels', selection: 'name', ghFn });
   requireValue(labelNodes.every((label) => typeof label.name === 'string'), 'invalid labels');
   const after = basic(yield () => ghFn(viewArgs), repo, number);

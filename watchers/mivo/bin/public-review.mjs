@@ -128,10 +128,15 @@ export function* collectPublicReview(pr, ghFn) {
   const reviewIngress = yield* reviewSystemLive(ghFn);
   const latest = parse(yield () => ghFn(['pr','view',String(pr.number),'--repo',REPO,'--json','id,state,isDraft,headRefOid,baseRefOid,author']));
   if (['id','state','isDraft','headRefOid','baseRefOid'].some(k=>latest[k] !== snapshot.pr[k]) || latest.author?.login !== snapshot.pr.author.login) throw Error('PR changed during review collection');
+  // Admission no longer waits for green CI: a Ready PR is taken in as soon as the review flow is live, and a
+  // red required check becomes repair feedback (failedRequiredCiItems). Pending CI only delays CI repairs.
+  // The reason tells a real red apart from a policy the watcher could not read (2026-10-15: both showed as
+  // "required-ci-not-green" while CI was green).
+  const ciReason = { green: 'required-ci-and-review-ingress', failed: 'required-ci-failed', pending: 'required-ci-pending' }[ci.status] ?? 'required-policy-unknown';
   return {...snapshot,
     checks: snapshot.checks.filter(c => !REVIEW_INFRA_CHECKS.includes(c.name)),
     ci,
-    admissionVerified: snapshot.requiredChecksGreen && reviewIngress,
-    admissionReason: snapshot.requiredChecksGreen ? (reviewIngress ? 'required-ci-and-review-ingress' : 'review-ingress-missing') : 'required-ci-not-green',
+    admissionVerified: reviewIngress,
+    admissionReason: reviewIngress ? ciReason : 'review-ingress-missing',
     mergeReady: verdict.ready, reviewReason: verdict.reason, reviewEvidence: verdict};
 }

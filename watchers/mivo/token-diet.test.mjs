@@ -61,10 +61,13 @@ test('script no-change only when every item is reply-only or ignore-infra', () =
   assert.equal(scriptNoChangePolicy(pr, []), null);
 });
 
-test('a clean 5/5 Greptile summary is not a finding; lower scores still go to triage', () => {
+test('a Greptile summary is not a finding unless it carries its own P0/P1', () => {
   const summary = (score) => ({ source: 'greptile', user: GREPTILE, body: `<!-- greptile_summary -->\n<h2>Confidence Score: ${score}/5</h2>\n**[Low risk]** Updates the changelog.`, sha: HEAD });
   assert.equal(feedbackRepairPolicy(summary(5), { headSha: HEAD }).action, 'ignore-infra');
-  assert.equal(feedbackRepairPolicy(summary(4), { headSha: HEAD }).action, 'needs-triage');
+  // 2026-10-15 #989: a 4/5 overview opened a session with no authority; its findings come as inline threads.
+  assert.equal(feedbackRepairPolicy(summary(4), { headSha: HEAD }).action, 'ignore-infra');
+  const table = { ...summary(3), body: `${summary(3).body}\n| P1 lost update | P2 naming |` };
+  assert.equal(feedbackRepairPolicy(table, { headSha: HEAD }).action, 'ignore-infra', 'mixed overview table');
   const withFinding = { ...summary(5), body: `${summary(5).body}\n**P1** real bug` };
   assert.equal(feedbackRepairPolicy(withFinding, { headSha: HEAD }).action, 'code-fix');
 });
