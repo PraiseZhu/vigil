@@ -104,7 +104,7 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 
 受控 push 使用一次性 hooks 目录：先按 Git 原语执行原有 `pre-push`，再核验实际推送的 SHA/ref 和实时归属。作者在耗时预检期间转 Draft 时，Git 拒绝发布。原 hook 的参数、标准输入、失败退出码及其他 hooks 保留；结束后清除临时目录，不改持久 Git 配置。此入口需要支持 `git hook run --to-stdin` 的 Git；不支持时拒绝推送。GitHub 核验与远端 Git 接收不是原子事务，核验后瞬间取回的极短窗口仍无法靠客户端完全消除。
 
-受控 push 可能先于结果回执可见。同一 Ready 代次内，修复会话还在跑时出现的新 HEAD 先按 `head-change-unconfirmed` 等它自己的结果（最多 60 分钟），晚到的有效结果会重新触发消费，即使 PR 指纹没有再次变化。没有会话在跑、或等满 60 分钟，新 HEAD 就算作者自己的推送：旧任务作废，watcher 以新 HEAD 的隐式回执继续处理，不再永久暂停（事件 `author-push-superseded`）。真正的 Draft 或代次变化仍会永久撤销旧任务。
+受控 push 可能先于结果回执可见。判断「HEAD 变了」的基准是本次交接认可过的最新 HEAD（`trustedHead`：Ready 时的 HEAD，之后每轮修复任务到达的 HEAD，以及任务派发时的 HEAD），所以第二轮及以后的修复不会被当成作者推送。同一 Ready 代次内，修复会话还在跑时出现的新 HEAD 先按 `head-change-unconfirmed` 等它自己的结果（最多 60 分钟），晚到的有效结果会重新触发消费，即使 PR 指纹没有再次变化。没有会话在跑、或等满 60 分钟，新 HEAD 就算作者自己的推送：没做完的任务作废、它负责的反馈重新投递；已经处理过的反馈不重投，也不额外消耗修复轮次；watcher 以新 HEAD 的隐式回执继续处理，不再永久暂停（事件 `author-push-superseded`）。真正的 Draft 或代次变化仍会永久撤销旧任务。
 
 运行中的命令不能保证被立即打断；这些检查是协作式边界检查，不是宿主对任意文件写入的强制拦截。
 

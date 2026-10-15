@@ -1090,7 +1090,14 @@ export function* processPr({
   // still working a new HEAD waits for that result (bounded). With no session working, or past the bound,
   // the new HEAD is the author's own push: it wins, any stale task is superseded below and work continues on
   // the new head. It used to pause the PR for good as head-change-unconfirmed.
-  const headChanged = sameHandoffEpoch && previous.handoff.head !== ownerPr.headRefOid && !controlledHead;
+  // The baseline is the last head this handoff accepted (the Ready head, then each head a repair task reached);
+  // against the Ready head alone every later round looked like an author push.
+  const trusted = previous.trustedHead && previous.trustedHead.handoffId === previous.handoff?.id
+    ? previous.trustedHead.head : previous.handoff?.head;
+  // A task is dispatched on the head the watcher accepted at that moment (this also covers entries saved
+  // before trustedHead existed).
+  const dispatchedHead = ['accepted', 'queued'].includes(previous.activeTask?.status) && previous.activeTask.head === ownerPr.headRefOid;
+  const headChanged = sameHandoffEpoch && trusted !== ownerPr.headRefOid && !controlledHead && !dispatchedHead;
   const taskInFlight = Boolean(previous.pendingDispatch?.dispatchId) || (Boolean(previous.activeTask?.dispatchId)
     && !['complete', 'legacy-complete', 'blocked', 'waiting-ci'].includes(previous.activeTask?.status));
   const headChangeSince = headChanged ? previous.headChangeSince ?? now : null;
@@ -1105,7 +1112,16 @@ export function* processPr({
   if (authorPushed) events.push({ kind: 'author-push-superseded', number: pr.number, head: ownerPr.headRefOid });
   const retainedHandoff = sameHandoffEpoch && !authorPushed ? previous.handoff : null;
   const handoff = retainedHandoff ?? freshHandoff;
-  if ((!retainedHandoff && (previous.activeTask?.dispatchId || previous.pendingDispatch?.dispatchId))
+  if (authorPushed) {
+    // An author push inside one Ready is not a reclaim: feedback already handled stays handled and the round
+    // budget goes on. Only a task that had not finished is revoked, and its feedback is delivered again.
+    const unfinished = previous.activeTask?.dispatchId
+      && !['complete', 'legacy-complete', 'waiting-ci'].includes(previous.activeTask.status) ? readActiveTask(previous, paths) : null;
+    const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
+    for (const item of unfinished?.feedback ?? []) if (typeof item?.key === 'string') delete feedbackCursor[item.key];
+    previous = { ...supersedeOnRedraft(previous, now), feedbackCursor };
+    base = { ...base, ...previous };
+  } else if ((!retainedHandoff && (previous.activeTask?.dispatchId || previous.pendingDispatch?.dispatchId))
     || (freshHandoff && previous.handoff && freshHandoff.id !== previous.handoff.id && !sameHandoffEpoch)) {
     previous = supersedeOnRedraft(previous, now);
     base = { ...base, ...previous };
@@ -1119,8 +1135,11 @@ export function* processPr({
   }
   collected = { ...collected, pr: ownerPr, handoff,
     comments: (collected.comments ?? []).filter(c => !selectHandoff([c], ownerPr, { allowHeadChange: true })) };
-  previous = { ...previous, handoff };
-  base = { ...base, handoff };
+  // Every path that reaches here stands on the current head: either it is the trusted one, a repair task reached
+  // it (controlledHead), or it was just taken over as the author's push or a new handoff.
+  const trustedHead = { handoffId: handoff.id, head: ownerPr.headRefOid };
+  previous = { ...previous, handoff, trustedHead };
+  base = { ...base, handoff, trustedHead };
   if (hasWatchOff(collected.labels)) {
     previous = { ...base, labels: collected.labels ?? [], optOut: true };
     state.prs[key] = previous;
@@ -1144,7 +1163,7 @@ export function* processPr({
     previous = { ...previous, roundsEpoch: collected.pr.releaseEpoch };
     base = { ...base, roundsEpoch: collected.pr.releaseEpoch };
   }
-  const cursorBase = previous.wasDraft === true ? {} : (previous.feedbackCursor || {});
+  const cursorBase = previous.wasDraft === true && !authorPushed ? {} : (previous.feedbackCursor || {});
   const doctor = lifelineFeedback({...pr,...collected.pr,repo:REPO});
   if (doctor.error) events.push({kind:'doctor-source-blocked',number:pr.number,code:doctor.error});
   const observed = feedbackItems({ pr, ...collected, receiptActor: viewer });

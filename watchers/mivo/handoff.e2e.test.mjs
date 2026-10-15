@@ -315,4 +315,67 @@ test('a HEAD change seen while a repair runs waits for its result, but not forev
   assert.notEqual(next.prs[0].dispatch.reason, 'head-change-unconfirmed', JSON.stringify(next.prs[0]));
   assert.equal(f.entry().handoff.head, f.read().pr.headRefOid);
   assert.match(f.owner(task, false), /superseded|dispatchId|handoff|stale/);
+  // The revoked task never finished, so its feedback goes to the new task.
+  assert.equal(f.deliveries().length, 2);
+  assert.match(f.deliveries().at(-1).message, /Example core failure/);
+});
+
+function completedResult(f, head) {
+  const task = JSON.parse(fs.readFileSync(f.task()));
+  const file = path.join(f.home, 'state', 'results', `${task.dispatchId}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 2, kind: 'mivo-repair-result', dispatchId: task.dispatchId,
+    nodeId: task.nodeId, number: task.number, repo: task.repo, sessionId: f.entry().sessionId,
+    status: 'complete', head, sourceHead: task.headRefOid, pushed: true,
+    verification: { status: 'pass', head }, ci: { head, requiredGreen: true, pending: [] },
+    receiptId: `example-complete-${head.slice(0, 7)}`, observedAt: now }));
+}
+
+function firstRoundPushed(f) {
+  f.scan();
+  const head = f.advanceHead();
+  f.update(s => { s.pr.headRefOid = head; });
+  completedResult(f, head);
+  f.later('2026-09-03T00:10:00Z');
+  f.scan();
+  assert.equal(f.entry().activeTask.status, 'complete');
+  return head;
+}
+
+// 2026-10-15 review: the baseline stayed at the Ready head, so from round 2 on a running repair looked like an
+// author push and was revoked after the wait bound.
+test('a later repair round is never taken for an author push, however long it runs', t => {
+  const f = fixture(t);
+  const head = firstRoundPushed(f);
+  assert.equal(f.entry().trustedHead.head, head);
+  f.update(s => { s.comments.push({ id: 602, body: 'P1 **Second core failure**\nA supported operation fails before completion.',
+    user: { login: 'greptile[bot]', type: 'Bot' }, created_at: '2026-09-03T00:11:00Z', updated_at: '2026-09-03T00:11:00Z' }); });
+  f.later('2026-09-03T00:20:00Z');
+  f.scan();
+  assert.equal(f.deliveries().length, 2);
+  const task = f.task();
+  for (const at of ['2026-09-03T01:30:00Z', '2026-09-03T02:40:00Z']) {
+    f.later(at);
+    const next = f.scan();
+    assert.notEqual(next.prs[0].dispatch.reason, 'head-change-unconfirmed', JSON.stringify(next.prs[0]));
+    // Missing-result nudges go to the same task; the task itself is never revoked or replaced.
+    assert.equal(f.task(), task);
+    assert.notEqual(f.entry().activeTask.blockedKind, 'author-reclaimed');
+  }
+  assert.equal(f.owner(task).status, 'owned');
+});
+
+test('an author push keeps feedback already handled and spends no round', t => {
+  const f = fixture(t);
+  firstRoundPushed(f);
+  const rounds = f.entry().repairRounds;
+  const before = f.entry().handoff;
+  const head = f.advanceHead();
+  f.update(s => { s.pr.headRefOid = head; });
+  f.later('2026-09-03T00:20:00Z');
+  f.scan();
+  assert.notEqual(f.entry().handoff.id, before.id, 'the author push is taken over as a new handoff');
+  assert.equal(f.entry().handoff.head, head);
+  assert.equal(f.deliveries().length, 1, 'the handled P1 is not delivered again');
+  assert.equal(f.entry().repairRounds, rounds);
 });
