@@ -485,6 +485,24 @@ test('discover defers later PRs after the first dispatch exhausts global remaini
   assert.equal(result.prs[1].dispatch.reason, 'dispatch-budget-deferred');
 });
 
+// 2026-10-15: with every PR visited the cursor never rotated, so the last PR was deferred every run.
+test('a PR deferred for budget goes first in the next discover run', (t) => {
+  const { paths } = homeOf(t);
+  const second = { number: 791, id: 'PR_791', headRefOid: HEAD, headRefName: 'fix/y', title: 'fix', isDraft: false, labels: [] };
+  let clock = 0;
+  const calls = [];
+  const options = {
+    prs: [listed, second], budgetMs: 120000, perPrBudgetMs: 75000, clock: () => clock,
+    collect: (pr) => { clock += 20000; return collectFor(pr); },
+    dispatchFn: (p) => { calls.push(p); clock += 40000; return { target_session_id: `sess-${calls.length}` }; },
+  };
+  assert.equal(discover(paths, options).result.prs[1].dispatch.reason, 'dispatch-budget-deferred');
+  const { result } = discover(paths, options);
+  assert.equal(result.prs[0].number, 791);
+  assert.equal(result.prs[0].dispatch.attempted, true);
+  assert.equal(calls.length, 2);
+});
+
 const BAN = /不要创建、恢复、修改或查询任何调度（包括名为 Cindy watcher 的共享调度）/;
 
 test('guide and successor messages forbid every schedule operation', () => {
