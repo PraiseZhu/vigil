@@ -80,7 +80,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 
 ### 作者交接与取回
 
-**转 Ready 就是交接**（2026-10-15 起）。作者自己的 PR 不管是网页按钮、`gh pr ready` 还是 Keel `pr_ready` 转的 Ready，watcher 下一轮（≤5 分钟）就接手：没有评论回执时，按本次 Ready 代次和当前 HEAD 合成一份隐式回执（`implicit: true`），下游归属检查照常核对仓库、PR、作者和 Ready 代次。准入不再要求 CI 先全绿，必需检查失败和冲突直接成为修复反馈；审查流程不在线（`review-ingress-missing`）时才不接手。
+**转 Ready 就是交接**（2026-10-15 起）。作者自己的 PR 不管是网页按钮、`gh pr ready` 还是 Keel `pr_ready` 转的 Ready，watcher 约 45 秒内就接手（见下文「并行与跟进」）：没有评论回执时，按本次 Ready 代次和当前 HEAD 合成一份隐式回执（`implicit: true`），下游归属检查照常核对仓库、PR、作者和 Ready 代次。准入不再要求 CI 先全绿，必需检查失败和冲突直接成为修复反馈；审查流程不在线（`review-ingress-missing`）时才不接手。
 
 下面的命令仍可用，作用变成「显式留一条交接记录」：
 
@@ -137,6 +137,17 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 - v3 依赖已安装的 Keel 提供 `pstack_decide` 的 `op`（`decide` / `log` / `read`）参数，即 `pstack_ledger` 已并入之后的版本。部署 v3 前先确认各机 Keel 版本；旧版 Keel 会把 `op:"log"` 当成 decide，会话会以 `keel-` 开头的原因 blocked，而 v3 任务不会自动重投。
 - 在途旧任务不改写，各按自己的契约核对。v1（`keelFlow=true` 且没有 `keelFlowVersion`）沿用绑定检查，缺台账配置时仍为 `disabled`；配置存在且任务没有 `keelFlow=true` 时为 `not-required-legacy-task`。v2（`keelFlowVersion=2`）仍要求 `pstack_start` 写入的 `start <playbook>（` 行；当前 Keel 不再自动写这一行，v2 任务只能靠会话手写才能通过，这是升级 v3 的原因。这些旧契约结果不代表通过 v3。
 - `prepare` 返回 `ciErrors`：失败必需检查所在 workflow run 的 `##[error]` 行（每个 run 最多 20 行），取不到时给出错误原因。
+
+## 并行与跟进
+
+发现器由 Cindy 脚本模式定时任务每分钟触发一次（超时 180 秒）；上一轮还在跑时，新的触发拿不到 `discover` 锁就直接返回 `lock-held`。
+
+- **不设并发上限**：一轮里所有 open PR 同时采集、同时派发，一轮耗时约等于最慢的那个 PR，不再随 PR 数量线性增长；某个 PR 出错不影响其他 PR，错误在所有 PR 结束后再抛出。`gh` 和复查 helper 走异步子进程，不阻塞其他 PR。
+- **同一轮共享仓库级查询**：分支规则、仓库变量、审查 workflow、钉住的 required-checks 文件和当前账号，每轮只查一次。
+- **45 秒跟进**：每分钟一轮全量扫描；两轮之间，在启动后第 45 秒再跑一次 `gh pr list`，PR 转 Ready、有新推送、标签或更新时间变了，就立刻对这些 PR 再跑一遍。跟进以启动后 120 秒为限，剩余不足 70 秒（一次采集加一次派发）就不再开新的跟进，所以一轮通常在下一分钟触发前结束。CI 状态变化不改 `gh pr list` 的字段，由下一分钟的全量扫描发现。
+- **派发并发**：Python 包装同时转发多个 `sessions.dispatch`；宿主同时最多接 16 个调用，包装自己最多同时发 12 个，多出来的排队，不报错。
+
+环境变量 `MIVO_WATCHER_FOLLOW_MS` 可改跟进间隔，设为 `0` 只跑全量一轮。
 
 ## CLI
 

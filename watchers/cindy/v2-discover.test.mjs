@@ -96,7 +96,7 @@ test('unbound admitted PR creates a session without any schedule step', (t) => {
   assert.equal(result.prs[0].dispatch.attempted, true);
   assert.equal(params.target_session_id, undefined);
   assert.doesNotMatch(params.message, /schedule-params|bind-schedule|schedule_create|继续轮询/);
-  assert.match(params.message, /watcher 脚本每 5 分钟检查本 PR/);
+  assert.match(params.message, /watcher 每分钟检查本 PR/);
   assert.ok(params.message.includes(END_TURN_RULE));
   assert.equal(entry.sessionId, 'sess-new');
   assert.equal(entry.claimedAt, '2026-09-28T00:00:00Z');

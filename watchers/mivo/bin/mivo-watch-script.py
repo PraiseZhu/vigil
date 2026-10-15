@@ -8,7 +8,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import importlib.util
+import itertools
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -90,6 +92,71 @@ def _summary(scan: dict) -> dict:
     return complete
 
 
+class ConcurrentCalls:
+    """Lets several host calls be in flight at once.
+
+    protocol.DuplexClient waits for each call_result before the next call; discover now dispatches every PR of a
+    pass at once. One reader thread routes call_result frames by id. The host accepts at most 16 in-flight calls,
+    so calls above that wait here instead of failing with TOO_MANY_REQUESTS.
+    """
+
+    def __init__(self, client, limit: int = 12):
+        self._client = client
+        self._write_lock = threading.Lock()
+        self._waiters: dict[str, list] = {}
+        self._waiters_lock = threading.Lock()
+        self._ids = itertools.count(1)
+        self._slots = threading.BoundedSemaphore(limit)
+        self._closed: Exception | None = None
+        threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def _read_loop(self) -> None:
+        try:
+            while True:
+                frame = self._client._read_frame()
+                if frame.get("type") != "call_result":
+                    raise RuntimeError("unexpected host frame while calls are in flight")
+                with self._waiters_lock:
+                    waiter = self._waiters.pop(str(frame.get("id")), None)
+                if waiter is None:
+                    raise RuntimeError("host answered an unknown call id")
+                waiter[1] = frame
+                waiter[0].set()
+        except Exception as error:  # fail every pending and later call instead of hanging
+            with self._waiters_lock:
+                self._closed = error
+                pending = list(self._waiters.values())
+                self._waiters.clear()
+            for waiter in pending:
+                waiter[2] = error
+                waiter[0].set()
+
+    def write(self, frame: dict) -> None:
+        with self._write_lock:
+            self._client._write_frame(frame)
+
+    def call(self, method: str, params: dict):
+        with self._slots:
+            request_id = f"pyc-{next(self._ids)}"
+            waiter = [threading.Event(), None, None]
+            with self._waiters_lock:
+                if self._closed is not None:
+                    raise RuntimeError(f"host channel closed: {self._closed}")
+                self._waiters[request_id] = waiter
+            self.write({"type": "call", "id": request_id, "method": method, "params": params})
+            waiter[0].wait()
+        if waiter[2] is not None:
+            raise RuntimeError(f"host channel closed: {waiter[2]}")
+        response = waiter[1]
+        if response.get("ok") is True:
+            return response.get("result")
+        error = response.get("error") if isinstance(response.get("error"), dict) else {}
+        raise RuntimeError(f"{error.get('code', 'INTERNAL')}: {error.get('message', 'host call failed')}")
+
+    def emit_complete(self, result_text: str) -> None:
+        self.write({"type": "complete", "resultText": result_text, "primarySessionId": None})
+
+
 def _drain(stream, sink):
     try:
         for chunk in iter(stream.readline, ""):
@@ -99,6 +166,7 @@ def _drain(stream, sink):
 
 
 def _run_watcher(env: dict[str, str], watcher: Path, node: str, client, live: bool) -> dict:
+    """client must offer call(method, params); dispatch frames are answered on worker threads."""
     process = subprocess.Popen(
         [node, str(watcher)],
         env=env,
@@ -113,6 +181,22 @@ def _run_watcher(env: dict[str, str], watcher: Path, node: str, client, live: bo
     stderr_thread = threading.Thread(target=_drain, args=(process.stderr, stderr_chunks), daemon=True)
     stderr_thread.start()
     scan = None
+    stdin_lock = threading.Lock()
+    workers: list[threading.Thread] = []
+
+    def answer(frame: dict) -> None:
+        try:
+            receipt = client.call("sessions.dispatch", frame["params"])
+            response = {"type": "receipt", "id": frame.get("id"), "receipt": receipt}
+        except Exception as error:  # unblock Node with an explicit rejection
+            response = {"type": "receipt", "id": frame.get("id"), "error": str(error)}
+        with stdin_lock:
+            try:
+                process.stdin.write(json.dumps(response, ensure_ascii=False) + "\n")
+                process.stdin.flush()
+            except (OSError, ValueError):
+                pass  # Node already finished; its own timeout keeps the dispatch pending
+
     try:
         for line in process.stdout:
             if not line.strip():
@@ -130,21 +214,21 @@ def _run_watcher(env: dict[str, str], watcher: Path, node: str, client, live: bo
                     raise RuntimeError("watcher dispatch frame missing id")
                 if not isinstance(frame.get("params"), dict):
                     raise RuntimeError("watcher dispatch frame missing params")
-                try:
-                    receipt = client.call("sessions.dispatch", frame["params"])
-                    response = {"type": "receipt", "id": frame.get("id"), "receipt": receipt}
-                except Exception as error:  # unblock Node with an explicit rejection
-                    response = {"type": "receipt", "id": frame.get("id"), "error": str(error)}
-                process.stdin.write(json.dumps(response, ensure_ascii=False) + "\n")
-                process.stdin.flush()
+                worker = threading.Thread(target=answer, args=(frame,), daemon=True)
+                worker.start()
+                workers.append(worker)
             elif "mode" in frame and "prs" in frame:
                 scan = frame
                 break
             else:
                 raise RuntimeError("watcher protocol frame missing scan result")
     finally:
+        join_until = time.monotonic() + 70
+        for worker in workers:
+            worker.join(timeout=max(0, join_until - time.monotonic()))
         try:
-            process.stdin.close()
+            with stdin_lock:
+                process.stdin.close()
         except OSError:
             pass
         process.stdout.close()
@@ -221,11 +305,12 @@ def main() -> None:
     env["MIVO_WATCHER_DISPATCH"] = "1" if live else "0"
     if live:
         env["MIVO_CINDY_BRIDGE"] = "1"
-    scan = _run_watcher(env, watcher, node, client, live)
+    calls = ConcurrentCalls(client)
+    scan = _run_watcher(env, watcher, node, calls, live)
     summary = _summary(scan)
     if pending:
         summary["maintenance"] = pending
-    client.emit_complete(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
+    calls.emit_complete(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
 
 
 if __name__ == "__main__":

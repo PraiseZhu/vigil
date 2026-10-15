@@ -64,6 +64,16 @@ export function partitionAutoClose(fresh = [], { allItems = fresh, threads = [] 
 const replyMutation = 'mutation($tid:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$tid, body:$body}){comment{id}}}';
 const resolveMutation = 'mutation($tid:ID!){resolveReviewThread(input:{threadId:$tid}){thread{id isResolved}}}';
 
+// A denied reply or resolve degrades to a report instead of failing the poll. gh may answer synchronously
+// (tests, legacy driver) or with a promise (async driver), so both kinds of failure are mapped.
+const permissionGuarded = (ghFn, args) => () => {
+  const degrade = (error) => { if (isPermissionError(error)) return { __degraded: true, error }; throw error; };
+  try {
+    const value = ghFn(args);
+    return typeof value?.then === 'function' ? value.catch(degrade) : value;
+  } catch (error) { return degrade(error); }
+};
+
 export function* autoCloseThreads({ eligible = [], previous = {}, ghFn, now }) {
   const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
   const results = [];
@@ -72,19 +82,13 @@ export function* autoCloseThreads({ eligible = [], previous = {}, ghFn, now }) {
     const threadId = item.threadId;
     if (seen.has(threadId) || closedThreads[threadId]) { seen.add(threadId); continue; }
     seen.add(threadId);
-    const reply = yield () => {
-      try { return ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${threadId}`, '-f', `body=${autoCloseReplyText()}`]); }
-      catch (error) { if (isPermissionError(error)) return { __degraded: true, error }; throw error; }
-    };
+    const reply = yield permissionGuarded(ghFn, ['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${threadId}`, '-f', `body=${autoCloseReplyText()}`]);
     if (reply?.__degraded) {
       results.push({ threadId, key: item.key ?? null, degraded: true, reason: 'permission-denied',
         report: 'GitHub 拒绝回复或 resolve（权限不足）。仅在本会话报告，不视为本轮 poll 失败。' });
       continue;
     }
-    const resolved = yield () => {
-      try { return ghFn(['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${threadId}`]); }
-      catch (error) { if (isPermissionError(error)) return { __degraded: true, error }; throw error; }
-    };
+    const resolved = yield permissionGuarded(ghFn, ['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${threadId}`]);
     if (resolved?.__degraded) {
       results.push({ threadId, key: item.key ?? null, degraded: true, reason: 'permission-denied',
         report: 'GitHub 拒绝回复或 resolve（权限不足）。仅在本会话报告，不视为本轮 poll 失败。' });
@@ -147,10 +151,7 @@ export function refutedReplyText(evidence, dispatchId) {
 export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, ghFn, now }) {
   const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
   const results = [];
-  const attempt = (args) => () => {
-    try { return ghFn(args); }
-    catch (error) { if (isPermissionError(error)) return { __degraded: true }; throw error; }
-  };
+  const attempt = (args) => permissionGuarded(ghFn, args);
   for (const item of items) {
     if (closedThreads[item.threadId]) continue;
     const reply = yield attempt(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${item.triage ? triagedReplyText(item.evidence, dispatchId) : refutedReplyText(item.evidence, dispatchId)}`]);
