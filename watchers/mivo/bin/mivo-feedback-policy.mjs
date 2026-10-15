@@ -61,14 +61,22 @@ export function feedbackRepairPolicy(item = {}, options = {}) {
   if (policy.action === 'code-fix' && GREPTILE_GRADED.has(policy.reason) && isGreptileItem(item)) {
     return result('code-fix', policy.severities, 'greptile-p1-triage');
   }
+  // An open review thread nobody can grade by reading its text would block the merge until a person answered it.
+  // The session grades it like a member thread: only a reproduced P0/P1 changes code, anything else is answered and
+  // resolved (2026-10-15: the owner wants PRs pushed to mergeable without a person in the loop).
+  if (policy.action === 'needs-triage' && THREAD_TRIAGEABLE.has(policy.reason) && typeof item.threadId === 'string' && item.threadId.length > 0) {
+    return result('code-fix', policy.severities, 'thread-triage');
+  }
   return policy;
 }
+const THREAD_TRIAGEABLE = new Set(['unverified-review-source', 'severity-unconfirmed', 'mixed-severity-inseparable',
+  'approve-conflicts-with-high-finding', 'high-summary-without-finding']);
 const GREPTILE_GRADED = new Set(['explicit-p0-p1-finding', 'mixed-severity-high-authorized-low-no-change']);
 function isGreptileItem(item) {
   return item.source === 'greptile' || isGreptileAuthor(item.user ?? item.author);
 }
 // Feedback whose severity the repair session re-grades on the unified scale before changing code.
-export const TRIAGE_REASONS = new Set(['member-thread-triage', 'greptile-p1-triage']);
+export const TRIAGE_REASONS = new Set(['member-thread-triage', 'greptile-p1-triage', 'thread-triage']);
 
 function itemRepairPolicy(item = {}, { headSha } = {}) {
   if (!item || typeof item !== 'object') return result('needs-triage', [], 'invalid-feedback');

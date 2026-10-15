@@ -9,14 +9,15 @@ const thread = (extra) => ({ source: 'thread', threadId: 'PRRT_example', nativeI
   body: '这里会丢数据吗？', user: { login: 'ExampleMember' }, ...extra });
 
 // A member's review thread blocks the merge and the pre-review until resolved; it used to stay open forever.
-test('a member review thread goes to the session for grading; outsiders and bots do not', () => {
+test('a member review thread goes to the session for grading; other open threads are graded too', () => {
   for (const association of ['OWNER', 'MEMBER', 'COLLABORATOR']) {
     const policy = feedbackRepairPolicy(thread({ authorAssociation: association }), { headSha: HEAD });
     assert.equal(policy.action, 'code-fix', association);
     assert.equal(policy.reason, 'member-thread-triage');
   }
-  assert.equal(feedbackRepairPolicy(thread({ authorAssociation: 'NONE' }), { headSha: HEAD }).action, 'needs-triage');
-  assert.equal(feedbackRepairPolicy(thread({ authorAssociation: 'MEMBER', user: { login: 'helper[bot]' } }), { headSha: HEAD }).action, 'needs-triage');
+  // An outsider's or a bot's open thread also blocks the merge; the session grades it rather than a person.
+  assert.equal(feedbackRepairPolicy(thread({ authorAssociation: 'NONE' }), { headSha: HEAD }).reason, 'thread-triage');
+  assert.equal(feedbackRepairPolicy(thread({ authorAssociation: 'MEMBER', user: { login: 'helper[bot]' } }), { headSha: HEAD }).reason, 'thread-triage');
   assert.equal(feedbackRepairPolicy(thread({ authorAssociation: 'MEMBER', threadId: undefined }), { headSha: HEAD }).action, 'needs-triage', 'an issue comment does not block the merge');
   assert.equal(isMemberThread(thread({ authorAssociation: 'member' })), true);
 });
@@ -31,7 +32,6 @@ test('a member thread the session graded as no-change is answered as a triage, n
   const items = refutedThreads(result, task);
   assert.equal(items.length, 1);
   assert.equal(items[0].triage, true);
-  assert.equal(items[0].replyOnly, false, 'the PR author\'s own thread is still resolved');
   const calls = [];
   const run = closeRefutedThreads({ items, dispatchId: 'task-1', previous: {}, ghFn: args => { calls.push(args); return '{}'; }, now: 'n', head: HEAD });
   let next = run.next(); while (!next.done) next = run.next(next.value());
@@ -53,33 +53,6 @@ test('the implicit handoff binds the Ready epoch and head and passes the ownersh
   assert.equal(implicitHandoff({ ...pr, author: { login: 'helper[bot]' } }), null);
 });
 
-// A maintainer's thread may carry a product requirement; the watcher answers it but never closes it for them.
-test('another member\'s no-change thread is answered and left open, once per task', () => {
-  const key = 'thread:PRRT_example:1';
-  const task = { dispatchId: 'task-2', prAuthor: 'ExampleAuthor', feedback: [{ key, author: 'ExampleMaintainer' }],
-    repairPolicy: { items: [{ key, action: 'code-fix', reason: 'member-thread-triage' }] } };
-  const result = { schemaVersion: 2, status: 'complete', dispatchId: 'task-2',
-    feedbackCoverage: { dispositions: [{ key, disposition: 'no-change' }] },
-    scs: [{ status: 'no-change', feedbackKeys: [key], evidence: ['按现有设计这是有意行为，不改。'] }] };
-  const items = refutedThreads(result, task);
-  assert.equal(items[0].replyOnly, true);
-  const calls = [];
-  const drive = (previous) => {
-    const run = closeRefutedThreads({ items, dispatchId: 'task-2', previous, ghFn: args => { calls.push(args); return '{}'; }, now: 'n', head: HEAD });
-    let next = run.next(); while (!next.done) next = run.next(next.value());
-    return next.value;
-  };
-  const first = drive({});
-  assert.equal(calls.length, 1, 'reply only');
-  assert.ok(!calls.flat().some(arg => String(arg).includes('resolveReviewThread')));
-  assert.match(calls[0].find(arg => arg.startsWith('body=')), /不替你关闭/);
-  assert.equal(first.closed.length, 0);
-  assert.equal(first.previous.autoClosedThreads.PRRT_example, undefined);
-  drive(first.previous);
-  assert.equal(calls.length, 1, 'the same task does not reply twice');
-  // Without a recorded PR author the watcher cannot tell, so it leaves the thread open.
-  assert.equal(refutedThreads(result, { ...task, prAuthor: undefined })[0].replyOnly, true);
-});
 
 test('a Greptile P1 is re-graded before code changes; the reviewer account\'s P1 is not', () => {
   const body = '**P1** reload loses handwritten text';
@@ -97,27 +70,25 @@ test('a Greptile P1 is re-graded before code changes; the reviewer account\'s P1
     scs: [{ status: 'no-change', feedbackKeys: [key], evidence: ['只在隐藏的 server 模式下触发，按统一分级是 P3。'] }] };
   const [item] = refutedThreads(result, task);
   assert.equal(item.triage, true);
-  assert.equal(item.replyOnly, false, 'a bot thread is answered and resolved');
 });
 
-// One thread, a maintainer's comment and the author's reply both graded no-change: the thread stays open.
-test('a thread holding a member comment is not resolved because another comment on it could be', () => {
+
+// The owner wants PRs pushed to mergeable without a person in the loop (2026-10-15): a member's thread graded
+// no-change is answered and resolved like any other, even with the author's reply on the same thread.
+test('a member thread graded no-change is answered and resolved, together with the author reply on it', () => {
   const memberKey = 'thread:PRRT_mixed:1';
   const authorKey = 'thread:PRRT_mixed:2';
   const task = { dispatchId: 'task-4', prAuthor: 'ExampleAuthor',
     feedback: [{ key: memberKey, author: 'ExampleMaintainer' }, { key: authorKey, author: 'ExampleAuthor' }],
     repairPolicy: { items: [memberKey, authorKey].map((key) => ({ key, action: 'code-fix', reason: 'member-thread-triage' })) } };
   const result = { schemaVersion: 2, status: 'complete', dispatchId: 'task-4',
-    feedbackCoverage: { dispositions: [{ key: authorKey, disposition: 'no-change' }, { key: memberKey, disposition: 'no-change' }] },
-    scs: [{ status: 'no-change', feedbackKeys: [authorKey, memberKey], evidence: ['按现有设计这是有意行为，不改。'] }] };
-  const items = refutedThreads(result, task);
-  assert.deepEqual(items.map((item) => [item.key, item.replyOnly]).sort(), [[memberKey, true], [authorKey, false]].sort());
+    feedbackCoverage: { dispositions: [{ key: memberKey, disposition: 'no-change' }, { key: authorKey, disposition: 'no-change' }] },
+    scs: [{ status: 'no-change', feedbackKeys: [memberKey, authorKey], evidence: ['PR 正文「产品意图」写明保留这个菜单，按设计不改。'] }] };
   const calls = [];
-  const run = closeRefutedThreads({ items, dispatchId: 'task-4', previous: {}, ghFn: args => { calls.push(args); return '{}'; }, now: 'n', head: HEAD });
+  const run = closeRefutedThreads({ items: refutedThreads(result, task), dispatchId: 'task-4', previous: {}, ghFn: args => { calls.push(args); return '{}'; }, now: 'n', head: HEAD });
   let next = run.next(); while (!next.done) next = run.next(next.value());
-  assert.ok(!calls.flat().some(arg => String(arg).includes('resolveReviewThread')), 'the thread must stay open');
-  assert.equal(calls.length, 1, 'one answer for the thread');
-  assert.match(calls[0].find(arg => arg.startsWith('body=')), /不替你关闭/);
-  assert.equal(next.value.closed.length, 0);
-  assert.equal(next.value.previous.autoClosedThreads.PRRT_mixed, undefined);
+  assert.equal(calls.filter(args => args.some(arg => String(arg).includes('resolveReviewThread'))).length, 1, 'resolved once');
+  assert.equal(calls.filter(args => args.some(arg => String(arg).includes('addPullRequestReviewThreadReply'))).length, 1, 'answered once');
+  assert.match(calls[0].find(arg => arg.startsWith('body=')), /产品意图/);
+  assert.equal(next.value.previous.autoClosedThreads.PRRT_mixed.reason, 'member-thread-no-change');
 });

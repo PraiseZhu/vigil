@@ -32,19 +32,19 @@ test('P0/P1 thread item is never auto-close eligible', () => {
 
 test('severity-unconfirmed thread item is not auto-close eligible', () => {
   const [item] = threadItems({ body: 'thanks for the update, looks fine to me' });
-  assert.equal(item.repairPolicy.reason, 'severity-unconfirmed');
+  assert.equal(item.repairPolicy.reason, 'thread-triage', 'graded by the session, not left open');
   assert.equal(isAutoCloseEligible(item), false);
 });
 
 test('untrusted-source P2-looking thread item is not auto-close eligible', () => {
   const [item] = threadItems({ body: 'P2: naming nit', author: HUMAN_AUTHOR });
-  assert.equal(item.repairPolicy.reason, 'unverified-review-source');
+  assert.equal(item.repairPolicy.reason, 'thread-triage', 'graded by the session, not left open');
   assert.equal(isAutoCloseEligible(item), false);
 });
 
 test('mixed P0+P2 on same line is not auto-close eligible (needs-triage)', () => {
   const [item] = threadItems({ body: 'P0 crash here, also P2 naming nit on the same line' });
-  assert.equal(item.repairPolicy.action, 'needs-triage');
+  assert.equal(item.repairPolicy.reason, 'thread-triage');
   assert.equal(isAutoCloseEligible(item), false);
 });
 

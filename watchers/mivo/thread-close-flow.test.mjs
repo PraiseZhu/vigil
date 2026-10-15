@@ -3,15 +3,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { pollWorkflow, watcherPaths, feedbackItems, newFeedback } from './bin/mivo-watcher.mjs';
+import { pollWorkflow, watcherPaths, feedbackItems, newFeedback, pollFingerprint, normalizePollSnapshot } from './bin/mivo-watcher.mjs';
 import { validateScs } from './bin/mivo-repair.mjs';
 import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 
 const ROOT = '/virtual/vigil-thread-close';
-// Built at runtime so the sanitize check does not read it as a real home path.
-const LOCAL_LOG = ['', 'Users', 'someone', 'x.log'].join('/');
 
-function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = false, outdated = false, badCi = false, replyError = false, intent = false, labelError = false } = {}) {
+function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = false, outdated = false, badCi = false, replyError = false, legacyIntent = false, frozen = null, deleteErrors = 0 } = {}) {
   const original = Object.fromEntries(['existsSync', 'readFileSync', 'mkdirSync', 'writeFileSync', 'renameSync', 'unlinkSync'].map((k) => [k, fs[k]]));
   const files = new Map();
   const dirs = new Set([ROOT, ROOT + '/state', ROOT + '/state/prs']);
@@ -54,9 +52,9 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
     scs: [{ id: 'SC-1', status: kind === 'fixed' ? 'pass' : 'no-change', feedbackKeys: [item.key], evidence: ['verified concrete trigger with focused tests'] }],
     feedbackCoverage: { dispositions: [{ key: item.key, disposition: kind === 'fixed' ? 'fixed' : 'no-change' }] },
   };
-  const intentBlocked = { schemaVersion: 2, dispatchId: task.dispatchId, nodeId: pr.id, sessionId: 'sample-session', status: 'blocked', head, receiptId: 'intent-receipt',
-    blockedKind: 'product-intent', reason: '反馈要求去掉侧边「+」弹出的菜单，但 PR 正文「产品意图」写明保留该菜单；需要 @owner 决定。日志在 ' + LOCAL_LOG };
-  const initial = intent ? intentBlocked : waiting ? { ...complete, status: 'waiting-ci', receiptId: 'waiting-receipt', ci: { requiredGreen: false, head } } : complete;
+  const legacyBlocked = { schemaVersion: 2, dispatchId: task.dispatchId, nodeId: pr.id, sessionId: 'sample-session', status: 'blocked', head,
+    receiptId: 'legacy-intent-receipt', blockedKind: 'product-intent', reason: '旧版本：等维护者拍板' };
+  const initial = legacyIntent && frozen !== 'complete' ? legacyBlocked : waiting ? { ...complete, status: 'waiting-ci', receiptId: 'waiting-receipt', ci: { requiredGreen: false, head } } : complete;
   const paths = watcherPaths(ROOT);
   const entryPath = ROOT + '/state/prs/' + pr.id + '.json';
   const resultPath = ROOT + '/state/results/sample-task.json';
@@ -68,6 +66,7 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
     eligibilityInitialized: true, eligibility: 'active', admissionVerified: true, admissionEpoch: pr.releaseEpoch, handoff: handoffReceipt(pr),
     feedbackCursor: feedback.cursor, pollFingerprint: 'old',
     activeTask: { dispatchId: task.dispatchId, head, status: waiting ? 'waiting-ci' : 'accepted', evidenceVersion: 2 },
+    ...(legacyIntent ? { blockedNotices: { legacy: { kind: 'product-intent', commentAt: now, labelAt: now, dispatchId: task.dispatchId, attempts: 1 } } } : {}),
   }));
   // Pushing the fix can move the commented line: the thread turns outdated and its comment re-surfaces as fresh.
   if (outdated) thread.isOutdated = true;
@@ -76,6 +75,15 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
   const dispatches = [];
   let rechecks = 0;
   const snapshot = { state: 'OPEN', isDraft: false, headRefOid: head, baseRefOid: pr.baseRefOid, updatedAt: now, mergeable: 'MERGEABLE', labels: [], checkState: 'SUCCESS', commentCount: 1, reviewCount: 1, unresolvedThreads: 1 };
+  // Frozen: the older build's result was already consumed and nothing on GitHub changed since.
+  if (frozen) {
+    const entry = JSON.parse(files.get(entryPath));
+    entry.pollFingerprint = pollFingerprint(normalizePollSnapshot(snapshot));
+    entry.activeTask = frozen === 'blocked'
+      ? { dispatchId: task.dispatchId, head, status: 'blocked', blockedKind: 'product-intent', receiptId: 'legacy-intent-receipt', evidenceVersion: 2 }
+      : { dispatchId: task.dispatchId, head, status: 'complete', receiptId: 'complete-receipt', evidenceVersion: 2 };
+    files.set(entryPath, JSON.stringify(entry));
+  }
   const collectedValue = withAuthorHandoff({ pr, checks: [], requiredChecks: [], ci: { status: 'green', required: [] }, policy: { status: 'verified', required: [] }, reviews: [review], threads, labels: [], comments: [], mergeReady: false, admissionVerified: true }, pr);
   function run() {
     const gen = pollWorkflow({
@@ -84,7 +92,7 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
         if (args[0] === 'api' && args[1] === 'user') return 'owner';
         calls.push(args);
         if (replyError && args.some((a) => String(a).includes('addPullRequestReviewThreadReply'))) throw new Error('simulated reply transport failure');
-        if (labelError && /\/labels$/.test(String(args[1]))) { labelError = false; throw new Error('simulated label failure'); }
+        if (deleteErrors > 0 && args.includes('DELETE')) { deleteErrors--; throw new Error('HTTP 502: Bad Gateway'); }
         return '{}';
       },
       collect: () => collectedValue,
@@ -213,41 +221,72 @@ test('failed reply never resolves or records a closed receipt', () => {
   } finally { f.restore(); }
 });
 
-test('product-intent block: thread stays open, PR gets one human notice to author and maintainers plus the label', () => {
-  process.env.MIVO_WATCHER_MAINTAINERS = 'ExampleMaintainer, @owner, not a login';
-  const f = fixture({ intent: true });
+// A finding that asks to undo the PR's written intent is answered with that intent and resolved; nothing waits
+// for a person and no hold label appears (2026-10-15).
+test('intent conflict: the finding is refuted with the PR intent, answered and resolved, no block or label', () => {
+  const f = fixture({ kind: 'refuted' });
   try {
     f.run();
-    assert.equal(f.entry().activeTask.status, 'blocked');
-    assert.equal(f.entry().activeTask.blockedKind, 'product-intent');
-    assert.equal(f.resolves(), 0, 'nothing is resolved while the owner decides');
-    assert.equal(f.dispatches.length, 0);
-    const comments = f.calls.filter((args) => /\/issues\/7\/comments$/.test(String(args[1])));
-    assert.equal(comments.length, 1);
-    const body = comments[0].find((a) => a.startsWith('body='));
-    assert.match(body, /会改变本 PR 写明的产品设计/);
-    assert.match(body, /@owner @ExampleMaintainer 请在对应讨论里回复决定/);
-    assert.match(body, /awaiting-discussion/);
-    assert.ok(!body.includes(LOCAL_LOG), 'local paths are not published');
-    assert.ok(!/@owner 决定/.test(body), 'mentions inside the session reason are defused');
-    const labels = f.calls.filter((args) => /\/issues\/7\/labels$/.test(String(args[1])));
-    assert.deepEqual(labels.map((args) => args.at(-1)), ['labels[]=awaiting-discussion']);
-    f.snapshot.commentCount++;
-    f.run();
-    assert.equal(f.calls.filter((args) => /\/issues\/7\//.test(String(args[1]))).length, 2, 'announced once');
-  } finally { f.restore(); delete process.env.MIVO_WATCHER_MAINTAINERS; }
+    assert.equal(f.resolves(), 1);
+    assert.equal(f.entry().activeTask.status, 'complete');
+    assert.ok(!f.calls.some((args) => /\/issues\/7\/(?:comments|labels)/.test(String(args[1]))), 'no notice, no label');
+  } finally { f.restore(); }
 });
 
-test('a failed label is retried on the next poll without repeating the comment', () => {
-  const f = fixture({ intent: true, labelError: true });
+// Upgrade from the 2026-10-15 builds that held a PR on a product-intent conflict: the round is handed back
+// once and redelivered, the watcher removes the awaiting-discussion label it put there, and no "stuck" notice goes out.
+test('legacy product-intent hold: feedback is redelivered once, the watcher\'s own label comes off, no notice', () => {
+  const f = fixture({ legacyIntent: true });
   try {
     f.run();
-    assert.equal(f.calls.filter((args) => /\/issues\/7\/comments$/.test(String(args[1]))).length, 1);
+    const labelDeletes = () => f.calls.filter((args) => args.includes('DELETE') && /\/issues\/7\/labels\/awaiting-discussion$/.test(String(args.at(-1)))).length;
+    assert.equal(f.dispatches.length, 1, 'the held feedback goes to a new round');
+    assert.equal(labelDeletes(), 1);
+    assert.ok(!f.calls.some((args) => /\/issues\/7\/comments$/.test(String(args[1]))), 'no stuck notice for a reopened hold');
+    assert.ok(Object.values(f.entry().blockedNotices).every((notice) => notice.labelReleasedAt));
+    assert.equal(f.entry().intentReopened.length, 1);
     f.snapshot.commentCount++;
     f.run();
-    assert.equal(f.calls.filter((args) => /\/issues\/7\/comments$/.test(String(args[1]))).length, 1);
-    assert.equal(f.calls.filter((args) => /\/issues\/7\/labels$/.test(String(args[1]))).length, 2);
-    const record = Object.values(f.entry().blockedNotices)[0];
-    assert.ok(record.commentAt && record.labelAt && !record.lastError);
+    assert.equal(f.dispatches.length, 1, 'reopened once');
+    assert.equal(labelDeletes(), 1, 'label removed once');
+  } finally { f.restore(); }
+});
+
+// The same upgrade with nothing changed on GitHub since the older build: the fingerprint fast path must not hide it.
+const labelDeleteCount = (f) => f.calls.filter((args) => args.includes('DELETE') && /\/issues\/7\/labels\/awaiting-discussion$/.test(String(args.at(-1)))).length;
+test('legacy product-intent hold with an unchanged fingerprint is still reopened and its label removed', () => {
+  const f = fixture({ legacyIntent: true, frozen: 'blocked' });
+  try {
+    const first = f.run();
+    assert.notEqual(first.prs?.[0]?.dispatch?.reason, 'fingerprint-unchanged');
+    assert.equal(f.dispatches.length, 1);
+    assert.equal(labelDeleteCount(f), 1);
+    assert.deepEqual(f.entry().intentReopened, ['sample-task']);
+  } finally { f.restore(); }
+});
+
+test('a completed PR still holding the legacy label gets it removed although its fingerprint is unchanged', () => {
+  const f = fixture({ kind: 'refuted', legacyIntent: true, frozen: 'complete' });
+  try {
+    f.run();
+    assert.equal(labelDeleteCount(f), 1);
+    assert.ok(f.entry().blockedNotices.legacy.labelReleasedAt);
+    const before = f.calls.length;
+    const again = f.run();
+    assert.equal(again.prs?.[0]?.dispatch?.reason, 'fingerprint-unchanged', 'done once, then quiet');
+    assert.equal(f.calls.length, before);
+  } finally { f.restore(); }
+});
+
+test('a failed label removal is retried on the next poll even when nothing changed on GitHub', () => {
+  const f = fixture({ kind: 'refuted', legacyIntent: true, frozen: 'complete', deleteErrors: 1 });
+  try {
+    f.run();
+    assert.equal(labelDeleteCount(f), 1);
+    assert.match(f.entry().blockedNotices.legacy.releaseError, /502/);
+    assert.equal(f.entry().blockedNotices.legacy.labelReleasedAt, undefined);
+    f.run();
+    assert.equal(labelDeleteCount(f), 2, 'retried without any GitHub change');
+    assert.ok(f.entry().blockedNotices.legacy.labelReleasedAt);
   } finally { f.restore(); }
 });

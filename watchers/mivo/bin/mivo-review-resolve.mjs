@@ -70,11 +70,7 @@ function completeCodeFixThreads(result, task, { disposition, scStatus, kind }) {
     const threadId = THREAD_KEY.exec(key ?? '')?.[1];
     if (itemDisposition !== disposition || !threadId || policy.get(key)?.action !== 'code-fix') continue;
     const evidence = evidenceLines(result, key, scStatus);
-    const reason = policy.get(key)?.reason;
-    // A maintainer's own thread graded no-change may still be a product requirement: answer it, leave it open for them.
-    const commenter = (task.feedback ?? []).find((item) => item?.key === key)?.author;
-    const replyOnly = kind === 'refuted' && reason === 'member-thread-triage' && (!task.prAuthor || commenter !== task.prAuthor);
-    if (evidence.length) items.push({ key, threadId, evidence, kind, triage: TRIAGE_REASONS.has(reason), replyOnly });
+    if (evidence.length) items.push({ key, threadId, evidence, kind, triage: TRIAGE_REASONS.has(policy.get(key)?.reason) });
   }
   return items;
 }
@@ -112,21 +108,8 @@ export function refutedReplyText(evidence, dispatchId) {
 export function triagedReplyText(evidence, dispatchId) {
   return [
     '**发生了什么**：盯梢修复轮按仓库统一分级核实了这条意见，结论是本轮不需要改代码（不成立、或属于 P2/P3 建议）。',
-    '**对本 PR 意味着什么**：这条讨论不再阻塞合并；核实依据如下。如果你认为判断有误，请点「Unresolve」重新打开这条讨论（只回复不会被处理）；盯梢会重新评估，之后不再自动关闭它。',
+    '**对本 PR 意味着什么**：这条讨论不再阻塞合并；核实依据如下。如果你认为判断有误，请点「Unresolve」重新打开这条讨论（只回复不会被处理），盯梢会重新评估。',
     '**要不要改代码**：本轮不改。',
-    '',
-    '核实依据：',
-    ...sanitizeEvidence(evidence),
-    '',
-    `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
-  ].join('\n');
-}
-// A non-author member's thread graded no-change: the watcher answers but leaves the thread to them.
-export function memberReplyText(evidence, dispatchId) {
-  return [
-    '**发生了什么**：盯梢修复轮按仓库统一分级核实了这条意见，结论是本轮不需要改代码（不成立、或属于 P2/P3 建议）。',
-    '**对本 PR 意味着什么**：这条讨论是仓库成员提的，可能是产品要求，所以盯梢不替你关闭它。讨论没关之前，PR 不能合并。',
-    '**要不要改代码**：本轮不改。认同这个结论就点「Resolve」；不认同请直接回复，盯梢会按你的回复重新处理。',
     '',
     '核实依据：',
     ...sanitizeEvidence(evidence),
@@ -148,27 +131,11 @@ export function fixedReplyText(evidence, head, dispatchId) {
   ].join('\n');
 }
 // Same durable receipt as the P2/P3 closure: `previous.autoClosedThreads[threadId]`.
-// Reply-only answers are recorded per task in `previous.repliedThreads` and leave the thread open.
 export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, ghFn, now, head }) {
   const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
-  const repliedThreads = { ...(previous.repliedThreads ?? {}) };
   const results = [];
-  const replied = [];
-  // Resolving closes the whole thread: one comment that must stay with its member keeps the thread open for
-  // every other item on it too (GPT review 2026-10-15: an author reply graded no-change closed a member's thread).
-  // The thread gets one answer per task, carrying the member item's evidence.
-  const held = new Set(items.filter((item) => item.replyOnly).map((item) => item.threadId));
-  const ordered = [...items.filter((item) => item.replyOnly), ...items.filter((item) => !item.replyOnly)];
-  for (const item of ordered) {
+  for (const item of items) {
     if (closedThreads[item.threadId]) continue;
-    if (held.has(item.threadId)) {
-      const receipt = `${item.threadId}:${dispatchId}`;
-      if (repliedThreads[receipt]) continue;
-      yield () => ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${memberReplyText(item.evidence, dispatchId)}`]);
-      repliedThreads[receipt] = { at: now, key: item.key, reason: 'member-thread-replied' };
-      replied.push({ threadId: item.threadId, key: item.key });
-      continue;
-    }
     const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, dispatchId)
       : item.triage ? triagedReplyText(item.evidence, dispatchId) : refutedReplyText(item.evidence, dispatchId);
     const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : 'refuted-p0-p1';
@@ -177,5 +144,5 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
     closedThreads[item.threadId] = { at: now, key: item.key, reason, dispatchId };
     results.push({ threadId: item.threadId, key: item.key });
   }
-  return { previous: { ...previous, autoClosedThreads: closedThreads, ...(replied.length || previous.repliedThreads ? { repliedThreads } : {}) }, closed: results, replied };
+  return { previous: { ...previous, autoClosedThreads: closedThreads }, closed: results };
 }
