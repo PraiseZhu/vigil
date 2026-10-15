@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { memoRepoReads, REPO, runGhAsync, scanOnce, scanOnceAsync, watcherPaths } from './bin/cindy-watcher.mjs';
-import { readPr } from './bin/cindy-state.mjs';
+import { readPr, writePr } from './bin/cindy-state.mjs';
+import { autoCloseThreads, closeRefutedThreads } from './bin/cindy-review-resolve.mjs';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -146,4 +147,61 @@ test('runGhAsync keeps the JSON gh prints with a failing or pending check', asyn
   };
   assert.equal(await runGhAsync(['pr', 'checks', '5', '--json', 'name'], 1000, runner('[{"name":"unit"}]', 8)), '[{"name":"unit"}]');
   await assert.rejects(runGhAsync(['pr', 'view', '5'], 1000, runner('', 1)), /exit 1/);
+});
+
+const graphqlNode = (extra = {}) => ({
+  state: 'OPEN', isDraft: false, headRefOid: HEAD, baseRefOid: BASE, mergeable: 'MERGEABLE',
+  labels: { nodes: [] }, comments: { totalCount: 0, nodes: [] }, reviews: { totalCount: 0, nodes: [] },
+  reviewThreads: { nodes: [] }, commits: { nodes: [] }, ...extra,
+});
+
+test('a PR dispatched again in the follow pass gets its own task, not the first task id', (t) => {
+  const paths = homeOf(t);
+  let now = 0;
+  let round = 1;
+  const sent = [];
+  scanOnce(options(t, paths, {
+    clock: () => now, followMs: 45000,
+    sleepFn: (ms) => {
+      now += ms;
+      // The first repair finished while CI stayed red; a new CI run failed before the follow listing.
+      const entry = readPr(paths.home, 'PR_841');
+      writePr(paths.home, 'PR_841', { ...entry, activeTask: { ...entry.activeTask, status: 'complete' } });
+      round = 2;
+    },
+    ghFn: (args) => {
+      if (args[0] === 'api' && args[1] === 'user') return 'owner';
+      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([listedPr(841, { updatedAt: `2026-10-15T00:00:0${round}Z` })]);
+      if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { node: graphqlNode({ comments: { totalCount: round, nodes: [] } }) } });
+      return '[]';
+    },
+    collect: (pr) => {
+      const value = failing(pr);
+      return { ...value, ci: { ...value.ci, required: [{ context: 'unit', status: 'failed', evidence: { id: round, runId: 10 + round, attempt: 1 } }] } };
+    },
+    dispatchFn: (params) => { sent.push(params.target_session_id ?? 'create'); return { target_session_id: 'sess-841' }; },
+  }));
+  assert.deepEqual(sent, ['create', 'sess-841']);
+  const tasks = fs.readdirSync(path.join(paths.stateDir, 'tasks')).filter((name) => name.endsWith('.json')).sort();
+  assert.deepEqual(tasks, ['live-841-2026-10-15T00:00:00Z.json', 'live-841-2026-10-15T00:00:45.000Z.json']);
+  assert.equal(readPr(paths.home, 'PR_841').lastDispatch.dispatchId, 'live-841-2026-10-15T00:00:45.000Z');
+});
+
+async function driveAsync(iterator) {
+  let step = iterator.next();
+  while (!step.done) {
+    let value;
+    try { value = await step.value(); } catch (error) { step = iterator.throw(error); continue; }
+    step = iterator.next(value);
+  }
+  return step.value;
+}
+
+test('a denied reply or resolve still degrades when gh answers with a promise', async () => {
+  const denied = async () => { throw Object.assign(new Error('Resource not accessible by integration (HTTP 403)'), { status: 1, stderr: 'HTTP 403' }); };
+  const auto = await driveAsync(autoCloseThreads({ eligible: [{ threadId: 'T1', key: 'k1' }], ghFn: denied, now: 'n' }));
+  assert.deepEqual(auto.closed.map((item) => [item.threadId, item.degraded, item.reason]), [['T1', true, 'permission-denied']]);
+  const refuted = await driveAsync(closeRefutedThreads({ items: [{ threadId: 'T2', key: 'k2', evidence: ['不成立'] }], dispatchId: 'd', ghFn: denied, now: 'n' }));
+  assert.deepEqual(refuted.closed.map((item) => [item.threadId, item.degraded, item.reason]), [['T2', true, 'permission-denied']]);
+  await assert.rejects(driveAsync(autoCloseThreads({ eligible: [{ threadId: 'T3' }], ghFn: async () => { throw new Error('HTTP 502'); }, now: 'n' })), /502/);
 });

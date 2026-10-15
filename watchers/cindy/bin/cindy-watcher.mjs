@@ -1999,7 +1999,10 @@ export function* discoverWorkflow({
       known = new Map(relisted.map((pr) => [String(pr.id), listingSignature(pr)]));
       if (changed.length === 0) continue;
       const passDeadline = Math.min(hardDeadline, clock() + 120000);
-      yield* discoverPass(changed, { ...ctx, ghFn, deadline: passDeadline }, report, events);
+      // Task ids are built from the PR number and `now`; a follow pass that dispatched the same PR again under
+      // the round's start time would reuse the first task's id, overwrite its task file and take its result.
+      const passNow = new Date(nowMs + (clock() - started)).toISOString();
+      yield* discoverPass(changed, { ...ctx, ghFn, deadline: passDeadline, now: passNow, nowMs: Date.parse(passNow) }, report, events);
     }
   }
   const lastByPr = new Map(report.map((item) => [item.number, item]));

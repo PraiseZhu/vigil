@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { memoRepoReads, REPO, runGhAsync, scanOnce, scanOnceAsync, watcherPaths } from './bin/mivo-watcher.mjs';
-import { readPr } from './bin/mivo-state.mjs';
+import { readPr, writePr } from './bin/mivo-state.mjs';
 import { handoffPr, withAuthorHandoff } from './handoff.fixture.mjs';
 
 const HEAD = 'a'.repeat(40);
@@ -198,4 +198,48 @@ test('runGhAsync keeps the JSON gh prints with a failing or pending check', asyn
   await assert.rejects(runGhAsync(['pr', 'view', '5'], 1000, runner('', 1)), /exit 1/);
   const ok = (_bin, _args, _options, callback) => { setImmediate(() => callback(null, 'fine', '')); return {}; };
   assert.equal(await runGhAsync(['api', 'user'], 1000, ok), 'fine');
+});
+
+// One-query poll snapshot a bound PR gets inside discover.
+const graphqlNode = (extra = {}) => ({
+  state: 'OPEN', isDraft: false, headRefOid: HEAD, baseRefOid: BASE, mergeable: 'MERGEABLE',
+  labels: { nodes: [] }, comments: { totalCount: 0, nodes: [] }, reviews: { totalCount: 0, nodes: [] },
+  reviewThreads: { nodes: [] }, commits: { nodes: [] }, ...extra,
+});
+
+test('a PR dispatched again in the follow pass gets its own task, not the first task id', (t) => {
+  const paths = homeOf(t);
+  let now = 0;
+  let round = 1;
+  const sent = [];
+  const plugin = fs.mkdtempSync(path.join(os.tmpdir(), 'parallel-follow-plugin-'));
+  t.after(() => fs.rmSync(plugin, { recursive: true, force: true }));
+  scanOnce({
+    mode: 'discover', enabled: true, allowDispatch: true, paths, now: '2026-10-15T00:00:00Z',
+    gitFn: () => '', env: { MIVO_PLUGIN_REPO: plugin },
+    clock: () => now, followMs: 45000,
+    sleepFn: (ms) => {
+      now += ms;
+      // The first repair finished while CI stayed red; a new CI run failed before the follow listing.
+      const entry = readPr(paths.home, 'PR_841');
+      writePr(paths.home, 'PR_841', { ...entry, activeTask: { ...entry.activeTask, status: 'complete' } });
+      round = 2;
+    },
+    ghFn: (args) => {
+      if (args[0] === 'api' && args[1] === 'user') return 'owner';
+      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([listedPr(841, { updatedAt: `2026-10-15T00:00:0${round}Z` })]);
+      if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { node: graphqlNode({ comments: { totalCount: round, nodes: [] } }) } });
+      return '[]';
+    },
+    collect: (pr) => {
+      const value = failing(pr);
+      return { ...value, ci: { ...value.ci, required: [{ context: 'unit', status: 'failed', evidence: { id: round, runId: 10 + round, attempt: 1 } }] } };
+    },
+    dispatchFn: (params) => { sent.push(params.target_session_id ?? 'create'); return { target_session_id: 'sess-841' }; },
+    ownershipSnapshot: ownership,
+  });
+  assert.deepEqual(sent, ['create', 'sess-841']);
+  const tasks = fs.readdirSync(path.join(paths.stateDir, 'tasks')).filter((name) => name.endsWith('.json')).sort();
+  assert.deepEqual(tasks, ['live-841-2026-10-15T00:00:00Z.json', 'live-841-2026-10-15T00:00:45.000Z.json']);
+  assert.equal(readPr(paths.home, 'PR_841').lastDispatch.dispatchId, 'live-841-2026-10-15T00:00:45.000Z');
 });
