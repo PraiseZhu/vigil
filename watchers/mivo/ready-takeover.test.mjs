@@ -99,3 +99,25 @@ test('a Greptile P1 is re-graded before code changes; the reviewer account\'s P1
   assert.equal(item.triage, true);
   assert.equal(item.replyOnly, false, 'a bot thread is answered and resolved');
 });
+
+// One thread, a maintainer's comment and the author's reply both graded no-change: the thread stays open.
+test('a thread holding a member comment is not resolved because another comment on it could be', () => {
+  const memberKey = 'thread:PRRT_mixed:1';
+  const authorKey = 'thread:PRRT_mixed:2';
+  const task = { dispatchId: 'task-4', prAuthor: 'ExampleAuthor',
+    feedback: [{ key: memberKey, author: 'ExampleMaintainer' }, { key: authorKey, author: 'ExampleAuthor' }],
+    repairPolicy: { items: [memberKey, authorKey].map((key) => ({ key, action: 'code-fix', reason: 'member-thread-triage' })) } };
+  const result = { schemaVersion: 2, status: 'complete', dispatchId: 'task-4',
+    feedbackCoverage: { dispositions: [{ key: authorKey, disposition: 'no-change' }, { key: memberKey, disposition: 'no-change' }] },
+    scs: [{ status: 'no-change', feedbackKeys: [authorKey, memberKey], evidence: ['按现有设计这是有意行为，不改。'] }] };
+  const items = refutedThreads(result, task);
+  assert.deepEqual(items.map((item) => [item.key, item.replyOnly]).sort(), [[memberKey, true], [authorKey, false]].sort());
+  const calls = [];
+  const run = closeRefutedThreads({ items, dispatchId: 'task-4', previous: {}, ghFn: args => { calls.push(args); return '{}'; }, now: 'n', head: HEAD });
+  let next = run.next(); while (!next.done) next = run.next(next.value());
+  assert.ok(!calls.flat().some(arg => String(arg).includes('resolveReviewThread')), 'the thread must stay open');
+  assert.equal(calls.length, 1, 'one answer for the thread');
+  assert.match(calls[0].find(arg => arg.startsWith('body=')), /不替你关闭/);
+  assert.equal(next.value.closed.length, 0);
+  assert.equal(next.value.previous.autoClosedThreads.PRRT_mixed, undefined);
+});
