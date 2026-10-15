@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { planSessionTitle, repairSessionTitle } from './session-title.mjs';
@@ -58,6 +58,51 @@ export function runGh(args, runner = execFileSync, timeoutMs = 12000) {
   }
 }
 const gh = runGh;
+
+// Same exit-code handling as runGh, without blocking the event loop: discover collects all PRs at once.
+export function runGhAsync(args, timeoutMs = 12000, runner = execFile) {
+  return new Promise((resolve, reject) => {
+    const child = runner(GH, args, { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (!error) { resolve(stdout); return; }
+      error.stdout = stdout;
+      error.stderr = stderr;
+      if (typeof error.code === 'number') error.status = error.code;
+      try { resolve(runGh(args, () => { throw error; })); } catch (failure) { reject(failure); }
+    });
+    child?.stdin?.end();
+  });
+}
+
+const REPO_READ = new RegExp(`^repos/${REPO.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/(?:rules/branches/|branches/[^/?]+(?:/protection)?$|actions/variables/[^/?]+$|actions/workflows/[^/?]+$|contents/[^?]+\\?ref=[0-9a-f]{40}$)`);
+const WRITE_FLAG = /^(?:-X|--method|-f|-F|--field|--raw-field|--input)$/;
+
+// Within one discover pass every PR reads the same branch rules, repository variables, review workflow and
+// pinned required-checks file. Those reads are shared per pass; anything PR-specific or writing is not.
+export function memoRepoReads(ghFn) {
+  const cache = new Map();
+  return (args) => {
+    const target = String(args[1] ?? '');
+    if (args[0] !== 'api' || !(target === 'user' || REPO_READ.test(target)) || args.some((arg) => WRITE_FLAG.test(arg))) return ghFn(args);
+    const key = JSON.stringify(args);
+    if (cache.has(key)) return cache.get(key);
+    let value = ghFn(args);
+    if (typeof value?.then === 'function') value = value.catch((error) => { cache.delete(key); throw error; });
+    cache.set(key, value);
+    return value;
+  };
+}
+
+// A generator yields parallel(workflows) to run several sub-workflows at once; it gets back one
+// { status, value | reason } per workflow, in order. The sync driver runs them one after another.
+const PARALLEL = Symbol('mivo.parallel');
+export function parallel(workflows) { return { [PARALLEL]: workflows }; }
+export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+// The discover schedule fires every minute (180 s timeout). Between two full rounds a run lists open PRs once
+// more at +45 s and handles the ones that changed; a follow pass starts only while 70 s are left before the
+// 120 s cut-off for a collection plus a dispatch, so a run normally ends before the next minute's round.
+export const FOLLOW_INTERVAL_MS = 45000;
+export const FOLLOW_UNTIL_MS = 120000;
+const FOLLOW_MIN_PASS_MS = 70000;
 
 function hasReviewIngress(view) {
   const reviews = view.latestReviews ?? view.reviews ?? [];
@@ -570,7 +615,7 @@ export function keelRules({ dispatchId, canChangeCode, version = KEEL_FLOW_VERSI
   ];
 }
 
-export const END_TURN_RULE = '本轮收口（finalize 返回 complete 或 waiting-ci、blocked、no-change）后立即结束回合：不要自己轮询、sleep 或等待，不要查询 PR、CI 或任何调度。watcher 脚本每 5 分钟检查一次，出现新反馈、CI 变化或冲突会再投递给你。goal 的完成条件只覆盖本批反馈，不包含等待审查结论或合并。';
+export const END_TURN_RULE = '本轮收口（finalize 返回 complete 或 waiting-ci、blocked、no-change）后立即结束回合：不要自己轮询、sleep 或等待，不要查询 PR、CI 或任何调度。watcher 每分钟检查一次（新转 Ready 和新推送约 45 秒内跟进），出现新反馈、CI 变化或冲突会再投递给你。goal 的完成条件只覆盖本批反馈，不包含等待审查结论或合并。';
 export const SNAPSHOT_RULE = 'PR 状态、required checks、失败 check 和未解决 thread 已由 watcher 采集，见 task 文件 prSnapshot 字段，反馈全文见 feedback[].body。先读 task 文件；只有回复/resolve thread、推送后确认 CI 或核实 task 之后的新变化时，才调用 gh 或 GitHub 插件。';
 
 // Feedback that asks to undo a design the PR body wrote down is not a defect: answer it with the body and move on.
@@ -636,7 +681,7 @@ function watchScheduleConstraint() {
   return '不要创建、恢复、修改或查询任何调度（包括名为 Mivo watcher 的共享调度）；轮询、合并后的清理都由 watcher 脚本完成。';
 }
 export function watchGuideMessage({ prNumber } = {}) {
-  return `你是 PR #${prNumber} 的专属修复 session。watcher 脚本每 5 分钟检查本 PR，出现新反馈、CI 变化或冲突时直接投递到这里；PR 合并或关闭后由脚本清理 worktree。${watchScheduleConstraint()}`;
+  return `你是 PR #${prNumber} 的专属修复 session。watcher 每分钟检查本 PR（转 Ready 和新推送约 45 秒内跟进），出现新反馈、CI 变化或冲突时直接投递到这里；PR 合并或关闭后由脚本清理 worktree。${watchScheduleConstraint()}`;
 }
 export function watchSuccessorMessage({ prNumber, predecessorId, reason, summary }) {
   return `你是 PR #${prNumber} 的接班修复 session，前任 ${predecessorId} 已不可用（${reason}）；先读本 PR 状态摘要 ${summary ?? '…'}。若状态为 merge-ready，等待人工合并，不要改代码。${watchScheduleConstraint()}`;
@@ -1055,6 +1100,24 @@ export function recheckResult({ paths, previous, timeoutMs = 30000, prLockToken 
     '--task', path.join(paths.stateDir, 'tasks', `${previous.activeTask.dispatchId}.json`),
     'recheck', '--validated-head', previous.activeTask.head,
   ], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] }));
+}
+
+export function recheckResultAsync({ paths, previous, timeoutMs = 30000, prLockToken = null }) {
+  const childEnv = { ...process.env };
+  delete childEnv[PR_LOCK_TOKEN_ENV];
+  if (prLockToken) childEnv[PR_LOCK_TOKEN_ENV] = prLockToken;
+  const helper = path.join(path.dirname(fileURLToPath(import.meta.url)), 'mivo-repair.mjs');
+  return new Promise((resolve, reject) => {
+    const child = execFile(process.execPath, [
+      helper, '--home', paths.home,
+      '--task', path.join(paths.stateDir, 'tasks', `${previous.activeTask.dispatchId}.json`),
+      'recheck', '--validated-head', previous.activeTask.head,
+    ], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: childEnv }, (error, stdout, stderr) => {
+      if (error) { error.stdout = stdout; error.stderr = stderr; reject(error); return; }
+      try { resolve(JSON.parse(stdout)); } catch (failure) { reject(failure); }
+    });
+    child.stdin?.end();
+  });
 }
 
 function markException(previous, now, events) {
@@ -1822,31 +1885,301 @@ function* deliverClosedown({
   return { previous, dispatch: { attempted: false, bound: false, reason: 'closedown-script', autoCleanup } };
 }
 
+// One PR of a discover pass. Every PR of a pass runs at the same time (see parallel()), so each keeps its own
+// collection budget, report and events; the caller merges them in listing order.
+function* discoverOnePr(pr, ctx) {
+  const {
+    now, nowMs, enabled, allowDispatch, viewer, dryRun, dispatchFn, collect, ghFn, recheckFn, ownershipSnapshot,
+    paths, clock, deadline, perPrBudgetMs, gitFn, env, markCursor,
+  } = ctx;
+  const report = [];
+  const events = [];
+  const done = () => ({ report, events });
+  if (deadline - clock() < 1000) return done();
+  let prDeadline = Math.min(deadline, clock() + perPrBudgetMs);
+  const remaining = () => Math.max(0, Math.min(deadline, prDeadline) - clock());
+  const resetPrDeadline = () => { prDeadline = deadline; };
+  markCursor(pr.number);
+  const key = String(pr.id);
+  const labels = (pr.labels ?? []).map((item) => typeof item === 'string' ? item : item?.name);
+  if (hasWatchOff(labels)) {
+    report.push({ number: pr.number, nodeId: pr.id, dispatch: { attempted: false, reason: 'opt-out' } });
+    return done();
+  }
+  if (isExcludedHead(pr.headRefName)) {
+    report.push({ number: pr.number, nodeId: pr.id, dispatch: { attempted: false, reason: 'excluded-head' } });
+    return done();
+  }
+  let prLock = acquireLock(paths.home, `pr-${key}`);
+  if (prLock.held) {
+    report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'pr-lock-held' } });
+    return done();
+  }
+  const unlockForDispatch = () => { prLock.release(); prLock = { release() {} }; };
+  const relockForDispatch = () => { prLock = acquireLock(paths.home, `pr-${key}`); return prLock; };
+  const getPrLockToken = () => prLock.token ?? null;
+  try {
+  let previous = readPr(paths.home, key) || { nodeId: key, number: pr.number };
+  const guide = watchGuideMessage({ prNumber: pr.number });
+  if (pr.isDraft === true) {
+    const next = supersedeOnRedraft({ ...previous, headRefOid: pr.headRefOid, headRefName: pr.headRefName }, now);
+    if (JSON.stringify(next) !== JSON.stringify(previous)) writePr(paths.home, key, { ...next, lastSeenAt: now });
+    report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'draft-author-owned' } });
+    return done();
+  }
+  if (previous.closedHandled === true) {
+    previous = { ...previous, closedHandled: false, reopenedAt: now };
+    writePr(paths.home, key, previous);
+  }
+  previous = yield* notifyDispatchConflictOnce({
+    previous, key, paths, now, dryRun, dispatchFn, remaining, pr,
+  });
+  if (previous.needsHuman) {
+    report.push({ number: pr.number, nodeId: key, needsHuman: previous.needsHuman, dispatch: { attempted: false, reason: 'needs-human' } });
+    return done();
+  }
+  if (previous.sessionId) {
+    // Bound PRs are polled here, inline: one fingerprint query per PR, and a
+    // full collection plus dispatch only when something changed. No per-PR
+    // schedule exists, so the session never creates, binds or deletes one.
+    if (deadline - clock() < 1000) return done();
+    const polled = yield* pollWorkflow({
+      now, enabled, allowDispatch, ghFn, collect, dispatchFn, paths, recheckFn, ownershipSnapshot,
+      clock, budgetMs: Math.max(1, deadline - clock()), perPrBudgetMs, nodeId: key, prNumber: pr.number, gitFn, env,
+      unlockForDispatch, relockForDispatch, getPrLockToken,
+    });
+    const item = polled.prs?.[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'poll-empty' } };
+    const text = String(item.dispatch?.error ?? '');
+    if (!dryRun && item.dispatch?.attempted && /ARCHIVED|NOT_FOUND|DELETED/.test(text)) {
+      // The bound session is gone: hand the PR to a successor session.
+      previous = readPr(paths.home, key) || previous;
+      const predecessorId = previous.sessionId;
+      const summary = JSON.stringify({
+        activeTask: previous.activeTask ?? null,
+        pendingDispatch: previous.pendingDispatch ?? null,
+        lastDispatch: previous.lastDispatch ?? null,
+      });
+      previous = {
+        ...previous,
+        sessionId: null,
+        claimedAt: null,
+        activeTask: null,
+        pendingDispatch: null,
+        lastDispatch: null,
+        // Re-collect on the successor's behalf even if nothing else changed.
+        pollFingerprint: null,
+        predecessors: [...(previous.predecessors ?? []), {
+          sessionId: predecessorId, at: now, reason: text.slice(0, 120),
+          activeTask: previous.activeTask ?? null,
+          pendingDispatch: previous.pendingDispatch ?? null,
+          lastDispatch: previous.lastDispatch ?? null,
+        }],
+      };
+      writePr(paths.home, key, previous);
+      const state = { version: 2, repo: REPO, prs: { [key]: previous } };
+      const inner = [];
+      yield* processPr({
+        pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
+        recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, forceCreate: true,
+        messagePrefix: `${watchSuccessorMessage({ prNumber: pr.number, predecessorId, reason: text.slice(0, 120), summary })}\n${guide}`,
+        unlockForDispatch, relockForDispatch, getPrLockToken,
+      });
+      report.push(inner[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: true, reason: 'successor' }, predecessors: previous.predecessors });
+    } else {
+      report.push(item);
+    }
+    return done();
+  }
+  if (previous.pendingDispatch?.status === 'awaiting-claim') {
+    const until = Date.parse(previous.pendingDispatch.claimDeadline ?? '');
+    if (Number.isFinite(until) && nowMs < until) {
+      report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'awaiting-claim' } });
+      return done();
+    }
+    const retries = Number(previous.pendingDispatch.claimRetries ?? 0);
+    const targetSessionId = previous.pendingDispatch.createdSessionId
+      ?? previous.pendingDispatch.params?.target_session_id
+      ?? null;
+    if (retries < CLAIM_RETRY_LIMIT && !dryRun && remaining() >= 1000) {
+      if (targetSessionId && typeof dispatchFn === 'function') {
+        const retryTask = readDispatchTask(paths, previous.pendingDispatch.dispatchId);
+        let live;
+        try { live = yield* ownershipSnapshot({ pr: { number: pr.number, repo: REPO }, ghFn }); }
+        catch { /* A missing ownership response never authorizes another input. */ }
+        const current = live?.pr && { ...pr, ...live.pr, repo: REPO };
+        if (!current || current.author?.login !== viewer || !taskOwnsPr(retryTask, previous, current)) {
+          if (current) writePr(paths.home, key, supersedeOnRedraft(previous, now));
+          report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false,
+            reason: current ? 'recovery-handoff-invalid' : 'ownership-query-unavailable' } });
+          return done();
+        }
+        const retryParams = constrainRetryDispatch({
+          ...(previous.pendingDispatch.params ?? { title: previous.title || repairSessionTitle({ task: pr.title, prNumber: pr.number, createdAt: now }), message: guide }),
+          target_session_id: targetSessionId,
+        }, retryTask);
+        try {
+          const receipt = yield () => dispatchFn(retryParams, { timeoutMs: Math.max(1, remaining()) });
+          if (receipt?.target_session_id) {
+            const state = { version: 2, repo: REPO, prs: { [key]: previous } };
+            const claimed = applyDispatchReceipt({
+              state,
+              pr: { id: key, number: pr.number, headRefOid: previous.headRefOid, headRefName: previous.headRefName, url: previous.url },
+              mapping: { sessionId: previous.sessionId, title: previous.title, titleDate: previous.titleDate, taskName: previous.taskName },
+              receipt: { ...receipt, dispatch_id: receipt.dispatch_id ?? previous.pendingDispatch.dispatchId },
+              now, paths,
+            });
+            previous = state.prs[key];
+            writePr(paths.home, key, previous);
+            report.push({ number: pr.number, nodeId: key, dispatch: { attempted: true, ...claimed, reason: claimed.bound ? 'claim-retry-wakeup' : claimed.reason } });
+            return done();
+          }
+          previous = {
+            ...previous,
+            pendingDispatch: {
+              ...previous.pendingDispatch,
+              status: 'awaiting-claim',
+              claimDeadline: new Date(nowMs + CLAIM_MS).toISOString(),
+              claimRetries: retries + 1,
+              createdSessionId: targetSessionId,
+              lastClaimRetryAt: now,
+            },
+          };
+          writePr(paths.home, key, previous);
+          report.push({ number: pr.number, nodeId: key, dispatch: { attempted: true, reason: 'claim-retry-wakeup' } });
+        } catch (error) {
+          const text = String(error.message);
+          previous = {
+            ...previous,
+            pendingDispatch: {
+              ...previous.pendingDispatch,
+              claimRetries: retries + 1,
+              lastClaimRetryAt: now,
+              lastClaimRetryError: text.slice(0, 400),
+              claimDeadline: new Date(nowMs + CLAIM_MS).toISOString(),
+            },
+          };
+          writePr(paths.home, key, previous);
+          report.push({
+            number: pr.number, nodeId: key,
+            dispatch: { attempted: true, reason: 'claim-retry-unconfirmed', error: text.slice(0, 400) },
+          });
+        }
+        return done();
+      }
+      previous = {
+        ...previous,
+        abandonedDispatches: [...(previous.abandonedDispatches ?? []), previous.pendingDispatch.dispatchId].filter(Boolean),
+        pendingDispatch: null, dispatchError: null, claimRetries: retries + 1,
+      };
+      writePr(paths.home, key, previous);
+      const state = { version: 2, repo: REPO, prs: { [key]: previous } };
+      const inner = [];
+      yield* processPr({
+        pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
+        recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, messagePrefix: guide,
+        unlockForDispatch, relockForDispatch, getPrLockToken,
+      });
+      let entry = state.prs[key] || previous;
+      if (!prLock.held && !state._persistBlocked) {
+        if (!entry.sessionId && entry.pendingDispatch && entry.pendingDispatch.status !== 'retryable'
+          && !String(entry.pendingDispatch.dispatchId ?? '').startsWith('dry-')) {
+          entry = {
+            ...entry, dispatchError: null,
+            pendingDispatch: {
+              ...entry.pendingDispatch,
+              status: 'awaiting-claim',
+              claimDeadline: new Date(nowMs + CLAIM_MS).toISOString(),
+              claimRetries: retries + 1,
+            },
+          };
+        }
+        writePr(paths.home, key, entry);
+      }
+      const created = inner[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: false } };
+      report.push({
+        ...created,
+        dispatch: { ...(created.dispatch ?? {}), reason: created.dispatch?.attempted ? 'claim-retry-recreate' : (created.dispatch?.reason ?? 'claim-retry-recreate') },
+      });
+      return done();
+    }
+    previous = {
+      ...previous,
+      abandonedDispatches: [...(previous.abandonedDispatches ?? []), previous.pendingDispatch.dispatchId].filter(Boolean),
+      pendingDispatch: null, dispatchError: null,
+      needsHuman: { reason: 'owner-unknown', at: now, abandonedDispatchId: previous.pendingDispatch.dispatchId },
+    };
+    writePr(paths.home, key, previous);
+    report.push({ number: pr.number, nodeId: key, needsHuman: previous.needsHuman, dispatch: { attempted: false, reason: 'needs-human' } });
+    return done();
+  }
+  const state = { version: 2, repo: REPO, prs: { [key]: previous } };
+  const inner = [];
+  yield* processPr({
+    pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
+    recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, messagePrefix: guide,
+    unlockForDispatch, relockForDispatch, getPrLockToken,
+  });
+  let entry = state.prs[key] || previous;
+  if (!prLock.held && !state._persistBlocked) {
+  if (!entry.sessionId && entry.pendingDispatch && entry.pendingDispatch.status !== 'retryable'
+    && !String(entry.pendingDispatch.dispatchId ?? '').startsWith('dry-')) {
+    entry = {
+      ...entry, dispatchError: null,
+      pendingDispatch: { ...entry.pendingDispatch, status: 'awaiting-claim', claimDeadline: new Date(nowMs + CLAIM_MS).toISOString() },
+    };
+  }
+  writePr(paths.home, key, entry);
+  }
+  report.push(inner[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: false } });
+  } finally { prLock.release(); }
+  return done();
+}
+
+// Runs every PR of a pass at once and merges their reports in listing order. A PR that throws does not stop
+// the others; the first error is raised after all of them have finished and released their locks.
+function* discoverPass(prs, ctx, report, events) {
+  const settled = yield parallel(prs.map((pr) => discoverOnePr(pr, ctx)));
+  let failure = null;
+  for (const item of settled) {
+    if (item.status === 'rejected') { failure ??= item.reason; continue; }
+    report.push(...item.value.report);
+    events.push(...item.value.events);
+  }
+  if (failure) throw failure;
+}
+
+const listingSignature = (pr) => JSON.stringify([pr.isDraft === true, pr.headRefOid, pr.updatedAt,
+  (pr.labels ?? []).map((item) => typeof item === 'string' ? item : item?.name).sort()]);
+
 export function* discoverWorkflow({
   now = new Date().toISOString(),
   enabled = process.env.MIVO_WATCHER_ENABLED === '1',
   allowDispatch = process.env.MIVO_WATCHER_DISPATCH === '1',
-  ghFn = gh, collect = collectPr, dispatchFn = null, paths = watcherPaths(),
+  ghFn: baseGh = gh, collect = collectPr, dispatchFn = null, paths = watcherPaths(),
   recheckFn = recheckResult, ownershipSnapshot = collectPrOwnership,
   clock = Date.now, budgetMs = 120000, maxPrs = 1000, perPrBudgetMs = 75000,
   gitFn = gitDefaultFn, env = process.env,
+  // After the full pass, keep listing open PRs every followMs until followUntilMs after the start and handle a PR
+  // as soon as it turns Ready, gets a push or otherwise changes. 0 = one pass only.
+  followMs = 0, followUntilMs = FOLLOW_UNTIL_MS, sleepFn = sleep,
 } = {}) {
   const started = clock();
   const deadline = started + Math.min(120000, Math.max(1, budgetMs));
-  let prDeadline = deadline;
-  const remaining = () => Math.max(0, Math.min(deadline, prDeadline) - clock());
-  const resetPrDeadline = () => { prDeadline = deadline; };
   const dryRun = !(enabled && allowDispatch && typeof dispatchFn === 'function');
   const v2 = v2StatePaths(paths.home);
   fs.mkdirSync(v2.prsDir, { recursive: true, mode: 0o700 });
   if (!fs.existsSync(v2.indexPath)) {
     fs.writeFileSync(v2.indexPath, `${JSON.stringify({ version: 2, migratedAt: now }, null, 2)}\n`, { mode: 0o600 });
   }
+  // Repository-wide reads (branch rules, variables, workflow, required-checks file) are the same for every PR.
+  let ghFn = memoRepoReads(baseGh);
   const viewer = String(yield () => ghFn(['api', 'user', '-q', '.login'])).trim();
-  const listed = JSON.parse(yield () => ghFn([
+  const listArgs = [
     'pr', 'list', '--repo', REPO, '--author', viewer, '--state', 'open', '--limit', '1000',
     '--json', 'number,id,headRefOid,headRefName,isDraft,labels,url,updatedAt,title',
-  ]));
+  ];
+  let listedAt = clock();
+  const listed = JSON.parse(yield () => ghFn(listArgs));
   if (!Array.isArray(listed)) throw new Error('Open PR listing is not an array');
   migrateLegacy(paths.home, listed.map((pr) => pr.id));
   const report = [];
@@ -1856,249 +2189,20 @@ export function* discoverWorkflow({
   const sorted = [...listed].sort((a, b) => a.number - b.number);
   const previousCursor = Number(index.cursor ?? 0);
   const rotated = [...sorted.filter((pr) => pr.number > previousCursor), ...sorted.filter((pr) => pr.number <= previousCursor)];
-  // A PR whose delivery was deferred because earlier PRs used this run's time goes first next run. The cursor
-  // only rotates when a run stops early, so with every PR visited the last one was deferred every run
-  // (2026-10-15: #993 waited behind #989 and #990).
+  // A PR whose delivery was deferred last run goes first. PRs now run in parallel, so this only matters when a
+  // single PR's collection used up the round (2026-10-15: #993 waited behind #989 and #990 when PRs ran in turn).
   const deferredFirst = new Set(index.deferredNumbers ?? []);
-  const ordered = [...rotated.filter((pr) => deferredFirst.has(pr.number)), ...rotated.filter((pr) => !deferredFirst.has(pr.number))];
-  for (const pr of ordered) {
-    if (deadline - clock() < 1000 || report.length >= maxPrs) break;
-    prDeadline = Math.min(deadline, clock() + perPrBudgetMs);
-    index = { ...index, version: 2, cursor: pr.number, startedAt: now };
+  const ordered = [...rotated.filter((pr) => deferredFirst.has(pr.number)), ...rotated.filter((pr) => !deferredFirst.has(pr.number))]
+    .slice(0, maxPrs);
+  const markCursor = (number) => {
+    index = { ...index, version: 2, cursor: number, startedAt: now };
     fs.writeFileSync(v2.indexPath, `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
-    const key = String(pr.id);
-    const labels = (pr.labels ?? []).map((item) => typeof item === 'string' ? item : item?.name);
-    if (hasWatchOff(labels)) {
-      report.push({ number: pr.number, nodeId: pr.id, dispatch: { attempted: false, reason: 'opt-out' } });
-      continue;
-    }
-    if (isExcludedHead(pr.headRefName)) {
-      report.push({ number: pr.number, nodeId: pr.id, dispatch: { attempted: false, reason: 'excluded-head' } });
-      continue;
-    }
-    let prLock = acquireLock(paths.home, `pr-${key}`);
-    if (prLock.held) {
-      report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'pr-lock-held' } });
-      continue;
-    }
-    const unlockForDispatch = () => { prLock.release(); prLock = { release() {} }; };
-    const relockForDispatch = () => { prLock = acquireLock(paths.home, `pr-${key}`); return prLock; };
-    const getPrLockToken = () => prLock.token ?? null;
-    try {
-    let previous = readPr(paths.home, key) || { nodeId: key, number: pr.number };
-    const guide = watchGuideMessage({ prNumber: pr.number });
-    if (pr.isDraft === true) {
-      const next = supersedeOnRedraft({ ...previous, headRefOid: pr.headRefOid, headRefName: pr.headRefName }, now);
-      if (JSON.stringify(next) !== JSON.stringify(previous)) writePr(paths.home, key, { ...next, lastSeenAt: now });
-      report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'draft-author-owned' } });
-      continue;
-    }
-    if (previous.closedHandled === true) {
-      previous = { ...previous, closedHandled: false, reopenedAt: now };
-      writePr(paths.home, key, previous);
-    }
-    previous = yield* notifyDispatchConflictOnce({
-      previous, key, paths, now, dryRun, dispatchFn, remaining, pr,
-    });
-    if (previous.needsHuman) {
-      report.push({ number: pr.number, nodeId: key, needsHuman: previous.needsHuman, dispatch: { attempted: false, reason: 'needs-human' } });
-      continue;
-    }
-    if (previous.sessionId) {
-      // Bound PRs are polled here, inline: one fingerprint query per PR, and a
-      // full collection plus dispatch only when something changed. No per-PR
-      // schedule exists, so the session never creates, binds or deletes one.
-      if (deadline - clock() < 1000) break;
-      const polled = yield* pollWorkflow({
-        now, enabled, allowDispatch, ghFn, collect, dispatchFn, paths, recheckFn, ownershipSnapshot,
-        clock, budgetMs: Math.max(1, deadline - clock()), perPrBudgetMs, nodeId: key, prNumber: pr.number, gitFn, env,
-        unlockForDispatch, relockForDispatch, getPrLockToken,
-      });
-      const item = polled.prs?.[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'poll-empty' } };
-      const text = String(item.dispatch?.error ?? '');
-      if (!dryRun && item.dispatch?.attempted && /ARCHIVED|NOT_FOUND|DELETED/.test(text)) {
-        // The bound session is gone: hand the PR to a successor session.
-        previous = readPr(paths.home, key) || previous;
-        const predecessorId = previous.sessionId;
-        const summary = JSON.stringify({
-          activeTask: previous.activeTask ?? null,
-          pendingDispatch: previous.pendingDispatch ?? null,
-          lastDispatch: previous.lastDispatch ?? null,
-        });
-        previous = {
-          ...previous,
-          sessionId: null,
-          claimedAt: null,
-          activeTask: null,
-          pendingDispatch: null,
-          lastDispatch: null,
-          // Re-collect on the successor's behalf even if nothing else changed.
-          pollFingerprint: null,
-          predecessors: [...(previous.predecessors ?? []), {
-            sessionId: predecessorId, at: now, reason: text.slice(0, 120),
-            activeTask: previous.activeTask ?? null,
-            pendingDispatch: previous.pendingDispatch ?? null,
-            lastDispatch: previous.lastDispatch ?? null,
-          }],
-        };
-        writePr(paths.home, key, previous);
-        const state = { version: 2, repo: REPO, prs: { [key]: previous } };
-        const inner = [];
-        yield* processPr({
-          pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
-          recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, forceCreate: true,
-          messagePrefix: `${watchSuccessorMessage({ prNumber: pr.number, predecessorId, reason: text.slice(0, 120), summary })}\n${guide}`,
-          unlockForDispatch, relockForDispatch, getPrLockToken,
-        });
-        report.push(inner[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: true, reason: 'successor' }, predecessors: previous.predecessors });
-      } else {
-        report.push(item);
-      }
-      continue;
-    }
-    if (previous.pendingDispatch?.status === 'awaiting-claim') {
-      const until = Date.parse(previous.pendingDispatch.claimDeadline ?? '');
-      if (Number.isFinite(until) && nowMs < until) {
-        report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'awaiting-claim' } });
-        continue;
-      }
-      const retries = Number(previous.pendingDispatch.claimRetries ?? 0);
-      const targetSessionId = previous.pendingDispatch.createdSessionId
-        ?? previous.pendingDispatch.params?.target_session_id
-        ?? null;
-      if (retries < CLAIM_RETRY_LIMIT && !dryRun && remaining() >= 1000) {
-        if (targetSessionId && typeof dispatchFn === 'function') {
-          const retryTask = readDispatchTask(paths, previous.pendingDispatch.dispatchId);
-          let live;
-          try { live = yield* ownershipSnapshot({ pr: { number: pr.number, repo: REPO }, ghFn }); }
-          catch { /* A missing ownership response never authorizes another input. */ }
-          const current = live?.pr && { ...pr, ...live.pr, repo: REPO };
-          if (!current || current.author?.login !== viewer || !taskOwnsPr(retryTask, previous, current)) {
-            if (current) writePr(paths.home, key, supersedeOnRedraft(previous, now));
-            report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false,
-              reason: current ? 'recovery-handoff-invalid' : 'ownership-query-unavailable' } });
-            continue;
-          }
-          const retryParams = constrainRetryDispatch({
-            ...(previous.pendingDispatch.params ?? { title: previous.title || repairSessionTitle({ task: pr.title, prNumber: pr.number, createdAt: now }), message: guide }),
-            target_session_id: targetSessionId,
-          }, retryTask);
-          try {
-            const receipt = yield () => dispatchFn(retryParams, { timeoutMs: Math.max(1, remaining()) });
-            if (receipt?.target_session_id) {
-              const state = { version: 2, repo: REPO, prs: { [key]: previous } };
-              const claimed = applyDispatchReceipt({
-                state,
-                pr: { id: key, number: pr.number, headRefOid: previous.headRefOid, headRefName: previous.headRefName, url: previous.url },
-                mapping: { sessionId: previous.sessionId, title: previous.title, titleDate: previous.titleDate, taskName: previous.taskName },
-                receipt: { ...receipt, dispatch_id: receipt.dispatch_id ?? previous.pendingDispatch.dispatchId },
-                now, paths,
-              });
-              previous = state.prs[key];
-              writePr(paths.home, key, previous);
-              report.push({ number: pr.number, nodeId: key, dispatch: { attempted: true, ...claimed, reason: claimed.bound ? 'claim-retry-wakeup' : claimed.reason } });
-              continue;
-            }
-            previous = {
-              ...previous,
-              pendingDispatch: {
-                ...previous.pendingDispatch,
-                status: 'awaiting-claim',
-                claimDeadline: new Date(nowMs + CLAIM_MS).toISOString(),
-                claimRetries: retries + 1,
-                createdSessionId: targetSessionId,
-                lastClaimRetryAt: now,
-              },
-            };
-            writePr(paths.home, key, previous);
-            report.push({ number: pr.number, nodeId: key, dispatch: { attempted: true, reason: 'claim-retry-wakeup' } });
-          } catch (error) {
-            const text = String(error.message);
-            previous = {
-              ...previous,
-              pendingDispatch: {
-                ...previous.pendingDispatch,
-                claimRetries: retries + 1,
-                lastClaimRetryAt: now,
-                lastClaimRetryError: text.slice(0, 400),
-                claimDeadline: new Date(nowMs + CLAIM_MS).toISOString(),
-              },
-            };
-            writePr(paths.home, key, previous);
-            report.push({
-              number: pr.number, nodeId: key,
-              dispatch: { attempted: true, reason: 'claim-retry-unconfirmed', error: text.slice(0, 400) },
-            });
-          }
-          continue;
-        }
-        previous = {
-          ...previous,
-          abandonedDispatches: [...(previous.abandonedDispatches ?? []), previous.pendingDispatch.dispatchId].filter(Boolean),
-          pendingDispatch: null, dispatchError: null, claimRetries: retries + 1,
-        };
-        writePr(paths.home, key, previous);
-        const state = { version: 2, repo: REPO, prs: { [key]: previous } };
-        const inner = [];
-        yield* processPr({
-          pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
-          recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, messagePrefix: guide,
-          unlockForDispatch, relockForDispatch, getPrLockToken,
-        });
-        let entry = state.prs[key] || previous;
-        if (!prLock.held && !state._persistBlocked) {
-          if (!entry.sessionId && entry.pendingDispatch && entry.pendingDispatch.status !== 'retryable'
-            && !String(entry.pendingDispatch.dispatchId ?? '').startsWith('dry-')) {
-            entry = {
-              ...entry, dispatchError: null,
-              pendingDispatch: {
-                ...entry.pendingDispatch,
-                status: 'awaiting-claim',
-                claimDeadline: new Date(nowMs + CLAIM_MS).toISOString(),
-                claimRetries: retries + 1,
-              },
-            };
-          }
-          writePr(paths.home, key, entry);
-        }
-        const created = inner[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: false } };
-        report.push({
-          ...created,
-          dispatch: { ...(created.dispatch ?? {}), reason: created.dispatch?.attempted ? 'claim-retry-recreate' : (created.dispatch?.reason ?? 'claim-retry-recreate') },
-        });
-        continue;
-      }
-      previous = {
-        ...previous,
-        abandonedDispatches: [...(previous.abandonedDispatches ?? []), previous.pendingDispatch.dispatchId].filter(Boolean),
-        pendingDispatch: null, dispatchError: null,
-        needsHuman: { reason: 'owner-unknown', at: now, abandonedDispatchId: previous.pendingDispatch.dispatchId },
-      };
-      writePr(paths.home, key, previous);
-      report.push({ number: pr.number, nodeId: key, needsHuman: previous.needsHuman, dispatch: { attempted: false, reason: 'needs-human' } });
-      continue;
-    }
-    const state = { version: 2, repo: REPO, prs: { [key]: previous } };
-    const inner = [];
-    yield* processPr({
-      pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
-      recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, messagePrefix: guide,
-      unlockForDispatch, relockForDispatch, getPrLockToken,
-    });
-    let entry = state.prs[key] || previous;
-    if (!prLock.held && !state._persistBlocked) {
-    if (!entry.sessionId && entry.pendingDispatch && entry.pendingDispatch.status !== 'retryable'
-      && !String(entry.pendingDispatch.dispatchId ?? '').startsWith('dry-')) {
-      entry = {
-        ...entry, dispatchError: null,
-        pendingDispatch: { ...entry.pendingDispatch, status: 'awaiting-claim', claimDeadline: new Date(nowMs + CLAIM_MS).toISOString() },
-      };
-    }
-    writePr(paths.home, key, entry);
-    }
-    report.push(inner[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: false } });
-    } finally { prLock.release(); }
-  }
+  };
+  const ctx = {
+    now, nowMs, enabled, allowDispatch, viewer, dryRun, dispatchFn, collect, ghFn, recheckFn, ownershipSnapshot,
+    paths, clock, deadline, perPrBudgetMs, gitFn, env, markCursor,
+  };
+  yield* discoverPass(ordered, ctx, report, events);
   const listedIds = new Set(listed.map((pr) => String(pr.id)));
   for (const stale of listPrs(paths.home)) {
     if (deadline - clock() < CLOSEDOWN_MIN_MS) break;
@@ -2139,7 +2243,27 @@ export function* discoverWorkflow({
       report.push({ number: live.number, nodeId: staleKey, dispatch });
     } finally { staleLock.release(); }
   }
-  const deferredNumbers = report.filter((item) => item.dispatch?.reason === 'dispatch-budget-deferred').map((item) => item.number);
+  if (followMs > 0) {
+    const hardDeadline = started + followUntilMs;
+    let known = new Map(listed.map((pr) => [String(pr.id), listingSignature(pr)]));
+    for (;;) {
+      const tickAt = Math.max(clock(), listedAt + followMs);
+      if (hardDeadline - tickAt < FOLLOW_MIN_PASS_MS) break;
+      if (tickAt > clock()) yield () => sleepFn(tickAt - clock());
+      ghFn = memoRepoReads(baseGh);
+      listedAt = clock();
+      const relisted = JSON.parse(yield () => ghFn(listArgs));
+      if (!Array.isArray(relisted)) throw new Error('Open PR listing is not an array');
+      const changed = relisted.filter((pr) => known.get(String(pr.id)) !== listingSignature(pr))
+        .sort((a, b) => a.number - b.number).slice(0, maxPrs);
+      known = new Map(relisted.map((pr) => [String(pr.id), listingSignature(pr)]));
+      if (changed.length === 0) continue;
+      const passDeadline = Math.min(hardDeadline, clock() + 120000);
+      yield* discoverPass(changed, { ...ctx, ghFn, deadline: passDeadline }, report, events);
+    }
+  }
+  const lastByPr = new Map(report.map((item) => [item.number, item]));
+  const deferredNumbers = [...lastByPr.values()].filter((item) => item.dispatch?.reason === 'dispatch-budget-deferred').map((item) => item.number);
   index = { ...index, finishedAt: now, elapsedMs: clock() - started, deferredNumbers };
   fs.writeFileSync(v2.indexPath, `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
   const closedownManual = listPrs(paths.home)
@@ -2148,13 +2272,18 @@ export function* discoverWorkflow({
   return { mode: 'discover', dispatch: !dryRun, viewer, repo: REPO, prs: report, events, closedownManual, scan: { cursor: index.cursor ?? 0, listed: listed.length } };
 }
 
-export function scanOnce(options = {}) {
-  const iterator = options.mode === 'poll' ? pollWorkflow(options)
-    : options.mode === 'discover' ? discoverWorkflow(options) : scanWorkflow(options);
+function driveSync(iterator) {
   let step = iterator.next();
   while (!step.done) {
     let value;
-    try { value = step.value(); }
+    try {
+      if (step.value?.[PARALLEL]) {
+        value = step.value[PARALLEL].map((workflow) => {
+          try { return { status: 'fulfilled', value: driveSync(workflow) }; }
+          catch (reason) { return { status: 'rejected', reason }; }
+        });
+      } else value = step.value();
+    }
     catch (error) { step = iterator.throw(error); continue; }
     if (value?.then) throw new Error('scanOnce cannot use asynchronous effects');
     step = iterator.next(value);
@@ -2162,18 +2291,33 @@ export function scanOnce(options = {}) {
   return step.value;
 }
 
-export async function scanOnceAsync(options = {}) {
-  const mode = options.mode ?? watcherMode();
-  const workflow = mode === 'poll' ? pollWorkflow : mode === 'discover' ? discoverWorkflow : scanWorkflow;
-  const iterator = workflow({ collect: collectPrAsync, ...options });
+async function driveAsync(iterator) {
   let step = iterator.next();
   while (!step.done) {
     let value;
-    try { value = await step.value(); }
+    try {
+      value = step.value?.[PARALLEL]
+        ? await Promise.allSettled(step.value[PARALLEL].map((workflow) => driveAsync(workflow)))
+        : await step.value();
+    }
     catch (error) { step = iterator.throw(error); continue; }
     step = iterator.next(value);
   }
   return step.value;
+}
+
+export function scanOnce(options = {}) {
+  const iterator = options.mode === 'poll' ? pollWorkflow(options)
+    : options.mode === 'discover' ? discoverWorkflow(options) : scanWorkflow(options);
+  return driveSync(iterator);
+}
+
+export async function scanOnceAsync(options = {}) {
+  const mode = options.mode ?? watcherMode();
+  const workflow = mode === 'poll' ? pollWorkflow : mode === 'discover' ? discoverWorkflow : scanWorkflow;
+  // discover/poll run PRs concurrently, so gh and the recheck helper must not block the event loop.
+  const transport = mode === 'poll' || mode === 'discover' ? { ghFn: runGhAsync, recheckFn: recheckResultAsync } : {};
+  return driveAsync(workflow({ collect: collectPrAsync, ...transport, ...options }));
 }
 
 export function createCindyStdinDispatch() {
@@ -2234,7 +2378,8 @@ if (fileURLToPath(import.meta.url) === process.argv[1]) {
       let dispatchFn;
       try {
         dispatchFn = process.env.MIVO_CINDY_BRIDGE === '1' ? createCindyStdinDispatch() : null;
-        const result = await scanOnceAsync({ paths, dispatchFn, mode, nodeId, getPrLockToken: () => mode === 'poll' ? lock.token : null, prNumber: process.env.MIVO_WATCHER_PR });
+        const followMs = mode === 'discover' ? Number(process.env.MIVO_WATCHER_FOLLOW_MS ?? FOLLOW_INTERVAL_MS) : 0;
+        const result = await scanOnceAsync({ paths, dispatchFn, mode, nodeId, followMs, getPrLockToken: () => mode === 'poll' ? lock.token : null, prNumber: process.env.MIVO_WATCHER_PR });
         process.stdout.write(`${JSON.stringify(result)}\n`);
       } catch (error) {
         process.stderr.write(`${error.stderr?.toString() || error.message}\n`);

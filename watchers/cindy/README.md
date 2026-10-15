@@ -93,6 +93,10 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 - 在途旧任务不改写，各按自己的契约核对。v1（`keelFlow=true` 且没有 `keelFlowVersion`）沿用绑定检查，缺台账配置时仍为 `disabled`；配置存在且任务没有 `keelFlow=true` 时为 `not-required-legacy-task`。v2（`keelFlowVersion=2`）仍要求 `pstack_start` 写入的 `start <playbook>（` 行；当前 Keel 不再自动写这一行，v2 任务只能靠会话手写才能通过，这是升级 v3 的原因。这些旧契约结果不代表通过 v3。
 - `prepare` 返回 `ciErrors`：失败必需检查所在 workflow run 的 `##[error]` 行（每个 run 最多 20 行），取不到时给出错误原因。
 
+## 并行与跟进
+
+与 Mivo watcher 相同（详见 `../mivo/README.md`「并行与跟进」）：发现器每分钟触发一次（超时 180 秒），一轮里所有 open PR 同时采集、同时派发，不设并发上限；分支规则、仓库变量等仓库级查询每轮只查一次；两轮之间在启动后第 45 秒再跑一次 `gh pr list`，转 Ready、有新推送或有更新的 PR 立刻处理；Python 包装同时转发多个 `sessions.dispatch`（最多 12 个同时在途，宿主上限 16）。环境变量 `CINDY_WATCHER_FOLLOW_MS` 可改跟进间隔，`0` 只跑全量一轮。
+
 ## CLI
 
 ```sh
