@@ -989,6 +989,47 @@ export function reopenKeelBlocked({ previous, paths, now }) {
   };
 }
 
+// Versions deployed 2026-10-15 between 65f6f28 and this change stopped on a product-intent conflict and
+// waited for a person. Product questions are now answered in the session, so such a task's feedback is handed
+// back once (cursor cleared, round refunded) and goes to a new round under the current rules.
+export function reopenProductIntentBlocked({ previous, paths, now }) {
+  const active = previous?.activeTask;
+  if (active?.status !== 'blocked' || active.blockedKind !== 'product-intent') return previous;
+  const reopened = new Set(previous.intentReopened ?? []);
+  if (!active.dispatchId || reopened.has(active.dispatchId)) return previous;
+  const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', `${active.dispatchId}.json`));
+  const keys = (task?.feedback ?? []).map((item) => item?.key).filter((key) => typeof key === 'string');
+  const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
+  for (const key of keys) delete feedbackCursor[key];
+  return {
+    ...previous, feedbackCursor, eligibility: 'active',
+    activeTask: { ...active, blockedKind: 'product-intent-reopened' },
+    repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) - 1),
+    intentReopened: [...reopened, active.dispatchId], intentReopenedAt: now,
+  };
+}
+
+// The same versions put `awaiting-discussion` on the PR and recorded it in blockedNotices. Nothing holds a PR
+// for a product question any more, so the watcher takes off the label it put there itself, once.
+// A label without such a record is someone else's and stays.
+const LEGACY_INTENT_LABEL = 'awaiting-discussion';
+export function* releaseLegacyIntentLabel({ previous, pr, ghFn, now }) {
+  const notices = previous.blockedNotices ?? {};
+  const held = Object.entries(notices).filter(([, notice]) => notice?.kind === 'product-intent' && notice.labelAt && !notice.labelReleasedAt);
+  if (!held.length) return previous;
+  try {
+    yield () => ghFn(['api', '--method', 'DELETE', `repos/${REPO}/issues/${pr.number}/labels/${encodeURIComponent(LEGACY_INTENT_LABEL)}`]);
+  } catch (error) {
+    if (!/404|Label does not exist/i.test(String(error.message))) {
+      return { ...previous, blockedNotices: { ...notices, ...Object.fromEntries(held.map(([key, notice]) => [key, { ...notice, releaseError: String(error.message).slice(0, 300) }])) } };
+    }
+  }
+  return { ...previous, blockedNotices: { ...notices, ...Object.fromEntries(held.map(([key, notice]) => {
+    const { releaseError, ...rest } = notice;
+    return [key, { ...rest, labelReleasedAt: now }];
+  })) } };
+}
+
 export function recheckResult({ paths, previous, timeoutMs = 30000, prLockToken = null }) {
   const childEnv = { ...process.env };
   delete childEnv[PR_LOCK_TOKEN_ENV];
@@ -1005,6 +1046,8 @@ function markException(previous, now, events) {
   if (previous.activeTask?.status !== 'blocked' && !previous.dispatchError) return previous;
   // Author reclaiming a PR is the normal handoff contract, not an incident.
   if (previous.activeTask?.blockedKind === AUTHOR_RECLAIMED && !previous.dispatchError) return previous;
+  // A reopened product-intent round is handed back to the watcher, not an incident.
+  if (previous.activeTask?.blockedKind === 'product-intent-reopened' && !previous.dispatchError) return previous;
   const event = {
     kind: previous.dispatchError ? 'dispatch-blocked' : 'repair-blocked', number: previous.number, nodeId: previous.nodeId,
     sessionId: previous.sessionId, dispatchId: previous.dispatchError?.dispatchId ?? previous.activeTask?.dispatchId,
@@ -1019,7 +1062,7 @@ function markException(previous, now, events) {
 
 // A stuck PR has to be visible where its author looks (2026-10-15: blocked rounds only reached the
 // Mini's run log). Kinds the watcher resolves by itself on a later poll are not announced.
-const QUIET_BLOCKED_KINDS = new Set(['required-ci', 'optional-ci', 'ci-transport', 'head-drift', 'round-limit-reset', AUTHOR_RECLAIMED]);
+const QUIET_BLOCKED_KINDS = new Set(['required-ci', 'optional-ci', 'ci-transport', 'head-drift', 'round-limit-reset', 'product-intent-reopened', AUTHOR_RECLAIMED]);
 const NOTICE_ATTEMPTS = 3;
 const NOTICE_HISTORY = 20;
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
@@ -1048,7 +1091,8 @@ export function blockedNoticeText({ event, author }) {
   ].join('\n');
 }
 // Posts once per blocked state (lastException fingerprint). A failed post is retried on later polls.
-export function* announceBlocked({ previous, pr, author, ghFn, now }) {
+export function* announceBlocked({ previous: start, pr, author, ghFn, now }) {
+  const previous = yield* releaseLegacyIntentLabel({ previous: start, pr, ghFn, now });
   const exception = previous.lastException;
   const stillBlocked = previous.activeTask?.status === 'blocked' || previous.dispatchError;
   if (!exception?.fingerprint || !stillBlocked || QUIET_BLOCKED_KINDS.has(exception.event?.blockedKind)) return previous;
@@ -1117,6 +1161,7 @@ export function* processPr({
   try { previous = consumeResult(previous, resultFor(previous, paths), now); }
   catch (error) { resultError = error.message; }
   if (!resultError) previous = reopenKeelBlocked({ previous, paths, now });
+  if (!resultError) previous = reopenProductIntentBlocked({ previous, paths, now });
   if (resultError) {
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.activeTask?.dispatchId ?? previous.lastDispatch?.dispatchId,

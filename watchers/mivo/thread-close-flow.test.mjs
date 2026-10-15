@@ -9,7 +9,7 @@ import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.
 
 const ROOT = '/virtual/vigil-thread-close';
 
-function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = false, outdated = false, badCi = false, replyError = false } = {}) {
+function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = false, outdated = false, badCi = false, replyError = false, legacyIntent = false } = {}) {
   const original = Object.fromEntries(['existsSync', 'readFileSync', 'mkdirSync', 'writeFileSync', 'renameSync', 'unlinkSync'].map((k) => [k, fs[k]]));
   const files = new Map();
   const dirs = new Set([ROOT, ROOT + '/state', ROOT + '/state/prs']);
@@ -52,7 +52,9 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
     scs: [{ id: 'SC-1', status: kind === 'fixed' ? 'pass' : 'no-change', feedbackKeys: [item.key], evidence: ['verified concrete trigger with focused tests'] }],
     feedbackCoverage: { dispositions: [{ key: item.key, disposition: kind === 'fixed' ? 'fixed' : 'no-change' }] },
   };
-  const initial = waiting ? { ...complete, status: 'waiting-ci', receiptId: 'waiting-receipt', ci: { requiredGreen: false, head } } : complete;
+  const legacyBlocked = { schemaVersion: 2, dispatchId: task.dispatchId, nodeId: pr.id, sessionId: 'sample-session', status: 'blocked', head,
+    receiptId: 'legacy-intent-receipt', blockedKind: 'product-intent', reason: '旧版本：等维护者拍板' };
+  const initial = legacyIntent ? legacyBlocked : waiting ? { ...complete, status: 'waiting-ci', receiptId: 'waiting-receipt', ci: { requiredGreen: false, head } } : complete;
   const paths = watcherPaths(ROOT);
   const entryPath = ROOT + '/state/prs/' + pr.id + '.json';
   const resultPath = ROOT + '/state/results/sample-task.json';
@@ -64,6 +66,7 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
     eligibilityInitialized: true, eligibility: 'active', admissionVerified: true, admissionEpoch: pr.releaseEpoch, handoff: handoffReceipt(pr),
     feedbackCursor: feedback.cursor, pollFingerprint: 'old',
     activeTask: { dispatchId: task.dispatchId, head, status: waiting ? 'waiting-ci' : 'accepted', evidenceVersion: 2 },
+    ...(legacyIntent ? { blockedNotices: { legacy: { kind: 'product-intent', commentAt: now, labelAt: now, dispatchId: task.dispatchId, attempts: 1 } } } : {}),
   }));
   // Pushing the fix can move the commented line: the thread turns outdated and its comment re-surfaces as fresh.
   if (outdated) thread.isOutdated = true;
@@ -217,5 +220,24 @@ test('intent conflict: the finding is refuted with the PR intent, answered and r
     assert.equal(f.resolves(), 1);
     assert.equal(f.entry().activeTask.status, 'complete');
     assert.ok(!f.calls.some((args) => /\/issues\/7\/(?:comments|labels)/.test(String(args[1]))), 'no notice, no label');
+  } finally { f.restore(); }
+});
+
+// Upgrade from the 2026-10-15 builds that held a PR on a product-intent conflict: the round is handed back
+// once and redelivered, the watcher removes the awaiting-discussion label it put there, and no "stuck" notice goes out.
+test('legacy product-intent hold: feedback is redelivered once, the watcher\'s own label comes off, no notice', () => {
+  const f = fixture({ legacyIntent: true });
+  try {
+    f.run();
+    const labelDeletes = () => f.calls.filter((args) => args.includes('DELETE') && /\/issues\/7\/labels\/awaiting-discussion$/.test(String(args.at(-1)))).length;
+    assert.equal(f.dispatches.length, 1, 'the held feedback goes to a new round');
+    assert.equal(labelDeletes(), 1);
+    assert.ok(!f.calls.some((args) => /\/issues\/7\/comments$/.test(String(args[1]))), 'no stuck notice for a reopened hold');
+    assert.ok(Object.values(f.entry().blockedNotices).every((notice) => notice.labelReleasedAt));
+    assert.equal(f.entry().intentReopened.length, 1);
+    f.snapshot.commentCount++;
+    f.run();
+    assert.equal(f.dispatches.length, 1, 'reopened once');
+    assert.equal(labelDeletes(), 1, 'label removed once');
   } finally { f.restore(); }
 });
