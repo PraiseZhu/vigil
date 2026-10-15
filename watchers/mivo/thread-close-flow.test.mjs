@@ -8,10 +8,8 @@ import { validateScs } from './bin/mivo-repair.mjs';
 import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 
 const ROOT = '/virtual/vigil-thread-close';
-// Built at runtime so the sanitize check does not read it as a real home path.
-const LOCAL_LOG = ['', 'Users', 'someone', 'x.log'].join('/');
 
-function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = false, outdated = false, badCi = false, replyError = false, intent = false, labelError = false } = {}) {
+function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = false, outdated = false, badCi = false, replyError = false } = {}) {
   const original = Object.fromEntries(['existsSync', 'readFileSync', 'mkdirSync', 'writeFileSync', 'renameSync', 'unlinkSync'].map((k) => [k, fs[k]]));
   const files = new Map();
   const dirs = new Set([ROOT, ROOT + '/state', ROOT + '/state/prs']);
@@ -54,9 +52,7 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
     scs: [{ id: 'SC-1', status: kind === 'fixed' ? 'pass' : 'no-change', feedbackKeys: [item.key], evidence: ['verified concrete trigger with focused tests'] }],
     feedbackCoverage: { dispositions: [{ key: item.key, disposition: kind === 'fixed' ? 'fixed' : 'no-change' }] },
   };
-  const intentBlocked = { schemaVersion: 2, dispatchId: task.dispatchId, nodeId: pr.id, sessionId: 'sample-session', status: 'blocked', head, receiptId: 'intent-receipt',
-    blockedKind: 'product-intent', reason: '反馈要求去掉侧边「+」弹出的菜单，但 PR 正文「产品意图」写明保留该菜单；需要 @owner 决定。日志在 ' + LOCAL_LOG };
-  const initial = intent ? intentBlocked : waiting ? { ...complete, status: 'waiting-ci', receiptId: 'waiting-receipt', ci: { requiredGreen: false, head } } : complete;
+  const initial = waiting ? { ...complete, status: 'waiting-ci', receiptId: 'waiting-receipt', ci: { requiredGreen: false, head } } : complete;
   const paths = watcherPaths(ROOT);
   const entryPath = ROOT + '/state/prs/' + pr.id + '.json';
   const resultPath = ROOT + '/state/results/sample-task.json';
@@ -84,7 +80,6 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
         if (args[0] === 'api' && args[1] === 'user') return 'owner';
         calls.push(args);
         if (replyError && args.some((a) => String(a).includes('addPullRequestReviewThreadReply'))) throw new Error('simulated reply transport failure');
-        if (labelError && /\/labels$/.test(String(args[1]))) { labelError = false; throw new Error('simulated label failure'); }
         return '{}';
       },
       collect: () => collectedValue,
@@ -213,41 +208,14 @@ test('failed reply never resolves or records a closed receipt', () => {
   } finally { f.restore(); }
 });
 
-test('product-intent block: thread stays open, PR gets one human notice to author and maintainers plus the label', () => {
-  process.env.MIVO_WATCHER_MAINTAINERS = 'ExampleMaintainer, @owner, not a login';
-  const f = fixture({ intent: true });
+// A finding that asks to undo the PR's written intent is answered with that intent and resolved; nothing waits
+// for a person and no hold label appears (2026-10-15).
+test('intent conflict: the finding is refuted with the PR intent, answered and resolved, no block or label', () => {
+  const f = fixture({ kind: 'refuted' });
   try {
     f.run();
-    assert.equal(f.entry().activeTask.status, 'blocked');
-    assert.equal(f.entry().activeTask.blockedKind, 'product-intent');
-    assert.equal(f.resolves(), 0, 'nothing is resolved while the owner decides');
-    assert.equal(f.dispatches.length, 0);
-    const comments = f.calls.filter((args) => /\/issues\/7\/comments$/.test(String(args[1])));
-    assert.equal(comments.length, 1);
-    const body = comments[0].find((a) => a.startsWith('body='));
-    assert.match(body, /会改变本 PR 写明的产品设计/);
-    assert.match(body, /@owner @ExampleMaintainer 请在对应讨论里回复决定/);
-    assert.match(body, /awaiting-discussion/);
-    assert.ok(!body.includes(LOCAL_LOG), 'local paths are not published');
-    assert.ok(!/@owner 决定/.test(body), 'mentions inside the session reason are defused');
-    const labels = f.calls.filter((args) => /\/issues\/7\/labels$/.test(String(args[1])));
-    assert.deepEqual(labels.map((args) => args.at(-1)), ['labels[]=awaiting-discussion']);
-    f.snapshot.commentCount++;
-    f.run();
-    assert.equal(f.calls.filter((args) => /\/issues\/7\//.test(String(args[1]))).length, 2, 'announced once');
-  } finally { f.restore(); delete process.env.MIVO_WATCHER_MAINTAINERS; }
-});
-
-test('a failed label is retried on the next poll without repeating the comment', () => {
-  const f = fixture({ intent: true, labelError: true });
-  try {
-    f.run();
-    assert.equal(f.calls.filter((args) => /\/issues\/7\/comments$/.test(String(args[1]))).length, 1);
-    f.snapshot.commentCount++;
-    f.run();
-    assert.equal(f.calls.filter((args) => /\/issues\/7\/comments$/.test(String(args[1]))).length, 1);
-    assert.equal(f.calls.filter((args) => /\/issues\/7\/labels$/.test(String(args[1]))).length, 2);
-    const record = Object.values(f.entry().blockedNotices)[0];
-    assert.ok(record.commentAt && record.labelAt && !record.lastError);
+    assert.equal(f.resolves(), 1);
+    assert.equal(f.entry().activeTask.status, 'complete');
+    assert.ok(!f.calls.some((args) => /\/issues\/7\/(?:comments|labels)/.test(String(args[1]))), 'no notice, no label');
   } finally { f.restore(); }
 });

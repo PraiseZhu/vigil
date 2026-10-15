@@ -706,8 +706,8 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
   return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks });
 }
 
-// product-intent: a requested fix would overturn UI or flow the PR body, a spec or a maintainer ruling wrote down.
-export const BLOCKED_KINDS = new Set(['external', 'product-intent']);
+// Only what a session cannot settle itself blocks; product questions and untrue feedback are answered in the session.
+export const BLOCKED_KINDS = new Set(['external']);
 export function blocked({ home, taskPath, reason, kind = 'external', ghFn = command } = {}) {
   if (!BLOCKED_KINDS.has(kind)) fail(`blocked --kind must be one of ${[...BLOCKED_KINDS].join(', ')}, got ${JSON.stringify(kind)}`);
   const { paths, task } = taskFrom(home, taskPath);
