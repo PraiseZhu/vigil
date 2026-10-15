@@ -154,9 +154,14 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
   const repliedThreads = { ...(previous.repliedThreads ?? {}) };
   const results = [];
   const replied = [];
-  for (const item of items) {
+  // Resolving closes the whole thread: one comment that must stay with its member keeps the thread open for
+  // every other item on it too (GPT review 2026-10-15: an author reply graded no-change closed a member's thread).
+  // The thread gets one answer per task, carrying the member item's evidence.
+  const held = new Set(items.filter((item) => item.replyOnly).map((item) => item.threadId));
+  const ordered = [...items.filter((item) => item.replyOnly), ...items.filter((item) => !item.replyOnly)];
+  for (const item of ordered) {
     if (closedThreads[item.threadId]) continue;
-    if (item.replyOnly) {
+    if (held.has(item.threadId)) {
       const receipt = `${item.threadId}:${dispatchId}`;
       if (repliedThreads[receipt]) continue;
       yield () => ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${memberReplyText(item.evidence, dispatchId)}`]);
