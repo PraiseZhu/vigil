@@ -1013,15 +1013,22 @@ export function reopenProductIntentBlocked({ previous, paths, now }) {
 // for a product question any more, so the watcher takes off the label it put there itself, once.
 // A label without such a record is someone else's and stays.
 const LEGACY_INTENT_LABEL = 'awaiting-discussion';
+const LEGACY_LABEL_ATTEMPTS = 10;
+const legacyLabelHolds = (previous) => Object.entries(previous?.blockedNotices ?? {}).filter(([, notice]) => notice?.kind === 'product-intent'
+  && notice.labelAt && !notice.labelReleasedAt && Number(notice.releaseAttempts ?? 0) < LEGACY_LABEL_ATTEMPTS);
+export function legacyIntentLabelDue(previous) {
+  return legacyLabelHolds(previous).length > 0;
+}
 export function* releaseLegacyIntentLabel({ previous, pr, ghFn, now }) {
   const notices = previous.blockedNotices ?? {};
-  const held = Object.entries(notices).filter(([, notice]) => notice?.kind === 'product-intent' && notice.labelAt && !notice.labelReleasedAt);
+  const held = legacyLabelHolds(previous);
   if (!held.length) return previous;
   try {
     yield () => ghFn(['api', '--method', 'DELETE', `repos/${REPO}/issues/${pr.number}/labels/${encodeURIComponent(LEGACY_INTENT_LABEL)}`]);
   } catch (error) {
     if (!/404|Label does not exist/i.test(String(error.message))) {
-      return { ...previous, blockedNotices: { ...notices, ...Object.fromEntries(held.map(([key, notice]) => [key, { ...notice, releaseError: String(error.message).slice(0, 300) }])) } };
+      return { ...previous, blockedNotices: { ...notices, ...Object.fromEntries(held.map(([key, notice]) => [key,
+        { ...notice, releaseError: String(error.message).slice(0, 300), releaseAttempts: Number(notice.releaseAttempts ?? 0) + 1 }])) } };
     }
   }
   return { ...previous, blockedNotices: { ...notices, ...Object.fromEntries(held.map(([key, notice]) => {
@@ -1748,8 +1755,11 @@ export function* pollWorkflow({
   // A PR the Keel incompatibility froze has nothing new on GitHub, so its fingerprint never changes;
   // without this it would never reach processPr, where reopenKeelBlocked hands its feedback back.
   const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous;
+  // The same holds for a PR an older build stopped on a product-intent conflict, or whose awaiting-discussion
+  // label the watcher still has to take off (including after a failed DELETE): nothing changes on GitHub.
+  const intentMigrationDue = reopenProductIntentBlocked({ previous, paths, now }) !== previous || legacyIntentLabelDue(previous);
   if (previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry && !normalized.overflow
-    && !hasUnconsumedResult(previous, paths) && !keelReopenDue) {
+    && !hasUnconsumedResult(previous, paths) && !keelReopenDue && !intentMigrationDue) {
     save(previous);
     return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, dispatch: { attempted: false, reason: 'fingerprint-unchanged' } }] };
   }

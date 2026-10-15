@@ -3,13 +3,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { pollWorkflow, watcherPaths, feedbackItems, newFeedback } from './bin/mivo-watcher.mjs';
+import { pollWorkflow, watcherPaths, feedbackItems, newFeedback, pollFingerprint, normalizePollSnapshot } from './bin/mivo-watcher.mjs';
 import { validateScs } from './bin/mivo-repair.mjs';
 import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 
 const ROOT = '/virtual/vigil-thread-close';
 
-function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = false, outdated = false, badCi = false, replyError = false, legacyIntent = false } = {}) {
+function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = false, outdated = false, badCi = false, replyError = false, legacyIntent = false, frozen = null, deleteErrors = 0 } = {}) {
   const original = Object.fromEntries(['existsSync', 'readFileSync', 'mkdirSync', 'writeFileSync', 'renameSync', 'unlinkSync'].map((k) => [k, fs[k]]));
   const files = new Map();
   const dirs = new Set([ROOT, ROOT + '/state', ROOT + '/state/prs']);
@@ -54,7 +54,7 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
   };
   const legacyBlocked = { schemaVersion: 2, dispatchId: task.dispatchId, nodeId: pr.id, sessionId: 'sample-session', status: 'blocked', head,
     receiptId: 'legacy-intent-receipt', blockedKind: 'product-intent', reason: '旧版本：等维护者拍板' };
-  const initial = legacyIntent ? legacyBlocked : waiting ? { ...complete, status: 'waiting-ci', receiptId: 'waiting-receipt', ci: { requiredGreen: false, head } } : complete;
+  const initial = legacyIntent && frozen !== 'complete' ? legacyBlocked : waiting ? { ...complete, status: 'waiting-ci', receiptId: 'waiting-receipt', ci: { requiredGreen: false, head } } : complete;
   const paths = watcherPaths(ROOT);
   const entryPath = ROOT + '/state/prs/' + pr.id + '.json';
   const resultPath = ROOT + '/state/results/sample-task.json';
@@ -75,6 +75,15 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
   const dispatches = [];
   let rechecks = 0;
   const snapshot = { state: 'OPEN', isDraft: false, headRefOid: head, baseRefOid: pr.baseRefOid, updatedAt: now, mergeable: 'MERGEABLE', labels: [], checkState: 'SUCCESS', commentCount: 1, reviewCount: 1, unresolvedThreads: 1 };
+  // Frozen: the older build's result was already consumed and nothing on GitHub changed since.
+  if (frozen) {
+    const entry = JSON.parse(files.get(entryPath));
+    entry.pollFingerprint = pollFingerprint(normalizePollSnapshot(snapshot));
+    entry.activeTask = frozen === 'blocked'
+      ? { dispatchId: task.dispatchId, head, status: 'blocked', blockedKind: 'product-intent', receiptId: 'legacy-intent-receipt', evidenceVersion: 2 }
+      : { dispatchId: task.dispatchId, head, status: 'complete', receiptId: 'complete-receipt', evidenceVersion: 2 };
+    files.set(entryPath, JSON.stringify(entry));
+  }
   const collectedValue = withAuthorHandoff({ pr, checks: [], requiredChecks: [], ci: { status: 'green', required: [] }, policy: { status: 'verified', required: [] }, reviews: [review], threads, labels: [], comments: [], mergeReady: false, admissionVerified: true }, pr);
   function run() {
     const gen = pollWorkflow({
@@ -83,6 +92,7 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
         if (args[0] === 'api' && args[1] === 'user') return 'owner';
         calls.push(args);
         if (replyError && args.some((a) => String(a).includes('addPullRequestReviewThreadReply'))) throw new Error('simulated reply transport failure');
+        if (deleteErrors > 0 && args.includes('DELETE')) { deleteErrors--; throw new Error('HTTP 502: Bad Gateway'); }
         return '{}';
       },
       collect: () => collectedValue,
@@ -239,5 +249,44 @@ test('legacy product-intent hold: feedback is redelivered once, the watcher\'s o
     f.run();
     assert.equal(f.dispatches.length, 1, 'reopened once');
     assert.equal(labelDeletes(), 1, 'label removed once');
+  } finally { f.restore(); }
+});
+
+// The same upgrade with nothing changed on GitHub since the older build: the fingerprint fast path must not hide it.
+const labelDeleteCount = (f) => f.calls.filter((args) => args.includes('DELETE') && /\/issues\/7\/labels\/awaiting-discussion$/.test(String(args.at(-1)))).length;
+test('legacy product-intent hold with an unchanged fingerprint is still reopened and its label removed', () => {
+  const f = fixture({ legacyIntent: true, frozen: 'blocked' });
+  try {
+    const first = f.run();
+    assert.notEqual(first.prs?.[0]?.dispatch?.reason, 'fingerprint-unchanged');
+    assert.equal(f.dispatches.length, 1);
+    assert.equal(labelDeleteCount(f), 1);
+    assert.deepEqual(f.entry().intentReopened, ['sample-task']);
+  } finally { f.restore(); }
+});
+
+test('a completed PR still holding the legacy label gets it removed although its fingerprint is unchanged', () => {
+  const f = fixture({ kind: 'refuted', legacyIntent: true, frozen: 'complete' });
+  try {
+    f.run();
+    assert.equal(labelDeleteCount(f), 1);
+    assert.ok(f.entry().blockedNotices.legacy.labelReleasedAt);
+    const before = f.calls.length;
+    const again = f.run();
+    assert.equal(again.prs?.[0]?.dispatch?.reason, 'fingerprint-unchanged', 'done once, then quiet');
+    assert.equal(f.calls.length, before);
+  } finally { f.restore(); }
+});
+
+test('a failed label removal is retried on the next poll even when nothing changed on GitHub', () => {
+  const f = fixture({ kind: 'refuted', legacyIntent: true, frozen: 'complete', deleteErrors: 1 });
+  try {
+    f.run();
+    assert.equal(labelDeleteCount(f), 1);
+    assert.match(f.entry().blockedNotices.legacy.releaseError, /502/);
+    assert.equal(f.entry().blockedNotices.legacy.labelReleasedAt, undefined);
+    f.run();
+    assert.equal(labelDeleteCount(f), 2, 'retried without any GitHub change');
+    assert.ok(f.entry().blockedNotices.legacy.labelReleasedAt);
   } finally { f.restore(); }
 });
