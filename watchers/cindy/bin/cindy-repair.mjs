@@ -460,6 +460,26 @@ export function ciErrorExcerpts(task, ghFn = command) {
   });
 }
 
+// An existing watch tree behind the fork is fast-forwarded; one that diverged from it (an earlier round's commits
+// that were never pushed, while the author pushed their own) is bundled into _backup and rebuilt from the fork.
+// Local commits on top of the fork head are this round's unpushed work and stay. Before this, 2026-10-15 #6077
+// blocked twice on "worktree HEAD does not match validated-head" with no way to recover.
+export function alignWatchWorktree({ task, checkout, remoteHead, gitFn = command, now = new Date().toISOString(), env = process.env }) {
+  if (checkout.created || checkout.head === remoteHead) return { ...checkout, realigned: null };
+  const worktree = checkout.worktree;
+  gitOutput(['-C', worktree, 'fetch', '--quiet', 'origin', task.headRefName], gitFn);
+  const isAncestor = (older, newer) => {
+    try { gitOutput(['-C', worktree, 'merge-base', '--is-ancestor', older, newer], gitFn); return true; } catch { return false; }
+  };
+  if (isAncestor(remoteHead, checkout.head)) return { ...checkout, realigned: null };
+  const backup = isAncestor(checkout.head, remoteHead) ? null
+    : backupWatchBranch({ plugin: pluginRepoPath(env), number: task.number, branch: watchBranchName(task.number), gitFn, now, worktree });
+  gitOutput(['-C', worktree, 'reset', '--hard', remoteHead], gitFn);
+  const head = gitOutput(['-C', worktree, 'rev-parse', 'HEAD'], gitFn);
+  if (head !== remoteHead) fail('watch tree realign did not reach the fork head');
+  return { ...checkout, head, realigned: { from: checkout.head, to: head, backup: backup?.bundlePath ?? null } };
+}
+
 export function prepare({ home, taskPath, ghFn = command, gitFn = command, cloneUrl, originUrl, viewer } = {}) {
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   const { paths, task } = taskFrom(home, taskPath);
@@ -471,12 +491,12 @@ export function prepare({ home, taskPath, ghFn = command, gitFn = command, clone
   const forkUrl = originUrl ?? cloneUrl ?? githubRepoUrl(headRepo);
   if (isBaseGithubUrl(forkUrl) || headRepo === REPO) fail(`refusing origin=${REPO}; push only to the PR fork`);
   const pr = ghPr(task, ghFn, false);
-  const checkout = cloneWorktree(paths, task, gitFn, forkUrl, forkUrl, pr.headRefOid);
+  const checkout = alignWatchWorktree({ task, checkout: cloneWorktree(paths, task, gitFn, forkUrl, forkUrl, pr.headRefOid), remoteHead: pr.headRefOid, gitFn });
   const repairPolicy = assertTaskRepairScope(task, checkout.head);
   const needsSync = checkout.head !== pr.headRefOid || task.headRefOid !== pr.headRefOid;
   return { ...identity(task, sessionId), repairPolicy, status: needsSync ? 'needs-sync' : 'prepared', needsSync,
     worktree: checkout.worktree, head: checkout.head, remoteHead: pr.headRefOid, sourceHead: task.headRefOid,
-    origin: forkUrl, headRepo, created: checkout.created, ciErrors: ciErrorExcerpts(task, ghFn) };
+    origin: forkUrl, headRepo, created: checkout.created, realigned: checkout.realigned, ciErrors: ciErrorExcerpts(task, ghFn) };
   });
 }
 

@@ -35,6 +35,21 @@ function trustedReviewer(item) {
   const login = normalizeActorLogin(author);
   return isGreptileAuthor(author) || login === 'github-actions' || login === 'github-actions[bot]';
 }
+// Review threads block the merge until resolved (required_review_thread_resolution), whoever wrote them. A thread
+// from a maintainer (owner, member, collaborator), the PR author, or a known code-review app goes to the repair
+// session for grading: its body grants nothing, only a confirmed must-fix finding changes code, anything else is
+// answered with the session's evidence and resolved. Other people's threads still only get a triage note.
+const MEMBER_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+export const REVIEW_APPS = new Set(['chatgpt-codex-connector[bot]', 'coderabbitai[bot]', 'copilot-pull-request-reviewer[bot]']);
+export function isTriageThread(item) {
+  if (typeof item?.threadId !== 'string' || !item.threadId) return false;
+  const author = item.user ?? item.author;
+  if (isBotActor(author)) return REVIEW_APPS.has(normalizeActorLogin(author));
+  const login = typeof author === 'string' ? author : author?.login;
+  return typeof login === 'string' && login.length > 0
+    && (item.fromPrAuthor === true || MEMBER_ASSOCIATIONS.has(String(item.authorAssociation ?? '').toUpperCase()));
+}
+const isGreptileSummary = (body) => /<!--\s*greptile_summary\s*-->/i.test(body);
 function visibleLines(body) {
   const lines = body.replace(/<!--[^]*?-->/g, '').split(/\r?\n|\\n/);
   let fence = null;
@@ -62,7 +77,17 @@ function stripBadge(line) {
     .replace(/^(?:severity|priority|严重度|优先级)\s*[:：]\s*/i, '');
 }
 
-export function feedbackRepairPolicy(item = {}, { headSha } = {}) {
+// Greptile's overview restates findings that arrive as their own graded inline threads. Unless it carries a
+// must-fix finding of its own, it only opened a session with no authority (2026-10-15 #6120).
+export function feedbackRepairPolicy(item = {}, options = {}) {
+  const policy = itemRepairPolicy(item, options);
+  if (!['code-fix', 'ignore-infra'].includes(policy.action) && trustedReviewer(item) && isGreptileSummary(String(item.body ?? ''))) {
+    return result('ignore-infra', policy.severities, 'greptile-summary-inline-threads');
+  }
+  return policy;
+}
+
+function itemRepairPolicy(item = {}, { headSha } = {}) {
   if (!item || typeof item !== 'object') return result('needs-triage', [], 'invalid-feedback');
   if (item.actionable === false) return result('ignore-infra', [], 'non-actionable-or-resolved');
   // An unresolved review thread in the current snapshot stays live across later pushes: its
@@ -78,7 +103,13 @@ export function feedbackRepairPolicy(item = {}, { headSha } = {}) {
     }
     return result('required-ci-fix', [], proof ? 'verified-required-ci-failure' : 'legacy-required-ci-failure');
   }
-  if (!trustedReviewer(item)) return result('needs-triage', [], 'unverified-review-source');
+  if (!trustedReviewer(item)) {
+    if (isTriageThread(item)) return result('code-fix', [], 'review-thread-triage');
+    // A status or summary comment from any other app (e.g. "Codex Review Summary: Failed") is not a review
+    // finding and does not block the merge; it used to open a session with no authority (2026-10-15 #6120).
+    if (isBotActor(item.user ?? item.author) && !item.threadId) return result('ignore-infra', [], 'untrusted-app-comment');
+    return result('needs-triage', [], 'unverified-review-source');
+  }
   const body = String(item.body ?? '');
   if (body.length > 256 * 1024) return result('needs-triage', [], 'feedback-too-large');
   const lines = visibleLines(body);
