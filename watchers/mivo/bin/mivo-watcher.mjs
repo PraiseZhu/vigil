@@ -1056,7 +1056,8 @@ export function blockedNoticeText({ event, author, maintainers = [] }) {
   ].join('\n');
 }
 // Posts once per blocked state (lastException fingerprint). A failed post is retried on later polls.
-export function* announceBlocked({ previous, pr, author, ghFn, now, maintainers = intentMaintainers() }) {
+export function* announceBlocked({ previous: start, pr, author, ghFn, now, maintainers = intentMaintainers() }) {
+  const previous = yield* releaseIntentLabel({ previous: start, pr, ghFn, now });
   const exception = previous.lastException;
   const stillBlocked = previous.activeTask?.status === 'blocked' || previous.dispatchError;
   if (!exception?.fingerprint || !stillBlocked || QUIET_BLOCKED_KINDS.has(exception.event?.blockedKind)) return previous;
@@ -1065,7 +1066,7 @@ export function* announceBlocked({ previous, pr, author, ghFn, now, maintainers 
   const intent = exception.event?.blockedKind === 'product-intent';
   if ((record.commentAt && (!intent || record.labelAt)) || Number(record.attempts ?? 0) >= NOTICE_ATTEMPTS) return previous;
   const keep = (next) => Object.fromEntries(Object.entries(next).slice(-NOTICE_HISTORY));
-  const next = { ...record, attempts: Number(record.attempts ?? 0) + 1, kind: exception.event?.blockedKind ?? null };
+  const next = { ...record, attempts: Number(record.attempts ?? 0) + 1, kind: exception.event?.blockedKind ?? null, dispatchId: exception.event?.dispatchId ?? null };
   try {
     if (!next.commentAt) {
       const body = blockedNoticeText({ event: exception.event, author, maintainers });
@@ -1081,6 +1082,29 @@ export function* announceBlocked({ previous, pr, author, ghFn, now, maintainers 
     next.lastError = String(error.message).slice(0, 300);
   }
   return { ...previous, blockedNotices: keep({ ...notices, [exception.fingerprint]: next }) };
+}
+
+// The hold label is the watcher's own; once a later repair round (dispatched after someone answered)
+// completes, the decision has been acted on and the label would otherwise block merge-ready forever.
+// Only a label this watcher added is removed, once; a 404 means someone already removed it.
+function* releaseIntentLabel({ previous, pr, ghFn, now }) {
+  const active = previous.activeTask;
+  if (active?.status !== 'complete') return previous;
+  const notices = previous.blockedNotices ?? {};
+  const held = Object.entries(notices).filter(([, notice]) => notice?.kind === 'product-intent' && notice.labelAt && !notice.labelReleasedAt
+    && notice.dispatchId && notice.dispatchId !== active.dispatchId);
+  if (!held.length) return previous;
+  try {
+    yield () => ghFn(['api', '--method', 'DELETE', `repos/${REPO}/issues/${pr.number}/labels/${encodeURIComponent(INTENT_LABEL)}`]);
+  } catch (error) {
+    if (!/404|Label does not exist/i.test(String(error.message))) {
+      return { ...previous, blockedNotices: { ...notices, ...Object.fromEntries(held.map(([key, notice]) => [key, { ...notice, releaseError: String(error.message).slice(0, 300) }])) } };
+    }
+  }
+  return { ...previous, blockedNotices: { ...notices, ...Object.fromEntries(held.map(([key, notice]) => {
+    const { releaseError, ...rest } = notice;
+    return [key, { ...rest, labelReleasedAt: now }];
+  })) } };
 }
 
 function rememberDispatchFailure(state, key, error, now, paths) {
