@@ -1100,10 +1100,11 @@ function* releaseIntentLabel({ previous, pr, ghFn, now, readTaskKeys }) {
   if (active?.status !== 'complete') return previous;
   const notices = previous.blockedNotices ?? {};
   const answered = new Set(readTaskKeys(active.dispatchId) ?? []);
-  const held = Object.entries(notices).filter(([, notice]) => notice?.kind === 'product-intent' && notice.labelAt && !notice.labelReleasedAt
-    && notice.dispatchId && notice.dispatchId !== active.dispatchId
-    && Array.isArray(notice.feedbackKeys) && notice.feedbackKeys.length > 0 && notice.feedbackKeys.every((key) => answered.has(key)));
-  if (!held.length) return previous;
+  const held = Object.entries(notices).filter(([, notice]) => notice?.kind === 'product-intent' && notice.labelAt && !notice.labelReleasedAt);
+  // One label stands for every open hold on the PR: lift it only when all of them were answered.
+  const covered = ([, notice]) => notice.dispatchId && notice.dispatchId !== active.dispatchId
+    && Array.isArray(notice.feedbackKeys) && notice.feedbackKeys.length > 0 && notice.feedbackKeys.every((key) => answered.has(key));
+  if (!held.length || !held.every(covered)) return previous;
   try {
     yield () => ghFn(['api', '--method', 'DELETE', `repos/${REPO}/issues/${pr.number}/labels/${encodeURIComponent(INTENT_LABEL)}`]);
   } catch (error) {

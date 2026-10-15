@@ -122,3 +122,18 @@ test('the hold label comes off only after a later round covered the blocked feed
   run(unknown);
   assert.equal(calls.length, before);
 });
+
+test('with two open holds the shared label stays until a round answered both', () => {
+  const calls = [];
+  const ghFn = (args) => { calls.push(args); return '{}'; };
+  const tasks = { 'task-1': ['thread:T1:c1'], 'task-2': ['thread:T2:c1'], 'task-3': ['thread:T1:c1'], 'task-4': ['thread:T1:c1', 'thread:T2:c1'] };
+  const notice = (dispatchId) => ({ kind: 'product-intent', commentAt: 'a', labelAt: 'a', dispatchId, feedbackKeys: tasks[dispatchId] });
+  const base = { blockedNotices: { f1: notice('task-1'), f2: notice('task-2') }, lastException: { fingerprint: 'f2', event: { blockedKind: 'product-intent', dispatchId: 'task-2' } } };
+  const run = (dispatchId) => drive(announceBlocked({ previous: { ...base, activeTask: { status: 'complete', dispatchId } }, pr: { number: 3 }, author: 'a', ghFn, now: 'n', maintainers: [], readTaskKeys: (id) => tasks[id] }));
+  const partial = run('task-3');
+  assert.equal(calls.length, 0, 'the second hold is still undecided');
+  assert.equal(partial.blockedNotices.f1.labelReleasedAt, undefined);
+  const both = run('task-4');
+  assert.equal(calls.length, 1);
+  assert.ok(both.blockedNotices.f1.labelReleasedAt && both.blockedNotices.f2.labelReleasedAt);
+});
