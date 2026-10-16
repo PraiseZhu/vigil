@@ -514,3 +514,30 @@ test('assert-owner refuses superseded tasks and changed handoff binding at the s
     assert.throws(() => assertOwner(f.options), /handoff|dispatch/);
   }
 });
+
+test('W-1 finalize keeps the workers the session reported', (t) => {
+  const f = fixture(t, { changed: false });
+  f.saveTask([finding('P2')]);
+  const workers = [
+    { purpose: 'review', agent: 'claude-code', model: 'review-model', effort: 'max', providerId: 'route-a', workerId: 'w-review', verdict: 'PASS' },
+    { purpose: 'consult', agent: 'codex', model: 'consult-model', effort: 'medium', providerId: 'route-b', workerId: 'w-consult', verdict: 'suggested fix' },
+  ];
+  fs.writeFileSync(f.options.scReport, JSON.stringify({ scs: [f.sc('no-change', ['thread:P2'])], workers }));
+  const result = f.finalize();
+  assert.equal(result.status, 'complete');
+  assert.deepEqual(result.workers, workers);
+});
+
+for (const [label, workers] of [
+  ['a third consult worker', [1, 2, 3].map((n) => ({ purpose: 'consult', agent: 'codex', model: `m${n}`, effort: 'medium' }))],
+  ['a consult worker at max effort', [{ purpose: 'consult', agent: 'codex', model: 'm', effort: 'max' }]],
+]) {
+  test(`W-2 finalize rejects ${label} before any push`, (t) => {
+    const f = fixture(t, { changed: false });
+    f.saveTask([finding('P2')]);
+    fs.writeFileSync(f.options.scReport, JSON.stringify({ scs: [f.sc('no-change', ['thread:P2'])], workers }));
+    assert.throws(f.finalize, /consult/);
+    assert.equal(f.pushCalls.length, 0);
+    assert.equal(fs.existsSync(path.join(f.paths.results, `${f.task.dispatchId}.json`)), false);
+  });
+}
