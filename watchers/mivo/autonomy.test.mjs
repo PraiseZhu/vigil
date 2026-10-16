@@ -6,8 +6,9 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { blocked, repairPaths } from './bin/mivo-repair.mjs';
-import { dispatchParams, pollFingerprint, normalizePollSnapshot, scanOnce, watcherPaths, rulesVersion } from './bin/mivo-watcher.mjs';
+import { dispatchParams, pollFingerprint, normalizePollSnapshot, scanOnce, watcherPaths, rulesVersion, feedbackItems, newFeedback } from './bin/mivo-watcher.mjs';
 import { acquireLock, readPr, writePr } from './bin/mivo-state.mjs';
+import { pendingEvents } from './bin/notify.mjs';
 import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 
 const HEAD = 'a'.repeat(40);
@@ -504,4 +505,131 @@ test('SC6 concurrent enqueue keeps both notice events', (t) => {
   assert.equal(b.status, 0, b.stderr);
   const pending = JSON.parse(fs.readFileSync(path.join(home, 'state', 'notices', 'pending.json'), 'utf8'));
   assert.equal(pending.events.length, 2);
+});
+
+function seedWaitingCi(t, { status = 'waiting-ci', blockedKind, reason, coverage = true, consumeCursor = false } = {}) {
+  const { home, paths } = homeOf(t);
+  const waitId = 'live-wait';
+  const oldKey = 'greptile:PRRT_old:c-old';
+  const cursor = consumeCursor
+    ? newFeedback({}, feedbackItems({ ...collectBase({ threads: [oldThread] }), receiptActor: 'owner' })).cursor
+    : undefined;
+  seedBound(paths, {
+    pollFingerprint: 'old', rulesVersion: rulesVersion(),
+    lastDispatch: { dispatchId: waitId, at: '2026-09-28T00:00:00Z' },
+    activeTask: {
+      status, evidenceVersion: 2, dispatchId: waitId, head: HEAD, sessionId: 'sess-790',
+      ...(blockedKind ? { blockedKind, reason } : {}),
+    },
+    ...(status === 'blocked' ? { eligibility: 'blocked' } : {}),
+    ...(cursor ? { feedbackCursor: cursor } : {}),
+  });
+  fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
+  fs.mkdirSync(path.join(paths.stateDir, 'results'), { recursive: true });
+  fs.writeFileSync(path.join(paths.stateDir, 'tasks', `${waitId}.json`), JSON.stringify({
+    dispatchId: waitId, nodeId, number: 790, repo: process.env.MIVO_WATCHER_TARGET_REPO, sessionId: 'sess-790',
+    headRefOid: HEAD, headRefName: 'fix/x', params: { message: 'old' },
+    handoff: handoffReceipt({ ...listed, releaseEpoch: 'e' }),
+    feedback: [{ key: oldKey, source: 'greptile', nativeId: 'PRRT_old:c-old', path: 'src/a.ts', body: '**P1** old leak' }],
+    repairPolicy: { items: [{ key: oldKey, action: 'code-fix' }] },
+  }));
+  fs.writeFileSync(path.join(paths.stateDir, 'results', `${waitId}.json`), JSON.stringify({
+    schemaVersion: 2, kind: 'mivo-repair-result', dispatchId: waitId, nodeId, sessionId: 'sess-790',
+    status, head: HEAD, receiptId: 'r-wait',
+    ...(blockedKind ? { blockedKind, reason } : {}),
+    ...(coverage ? {
+      feedbackCoverage: { dispositions: [{ key: oldKey, disposition: 'fixed' }] },
+      scs: [{ status: 'pass', feedbackKeys: [oldKey], evidence: ['fixed in src/a.ts'] }],
+    } : {}),
+  }));
+  return { home, paths, waitId, oldKey };
+}
+
+test('R1 waiting-ci body edit of the same comment key dispatches in the same round', (t) => {
+  const { paths } = seedWaitingCi(t);
+  const calls = [];
+  const edited = {
+    ...oldThread,
+    comments: [{ ...oldThread.comments[0], body: '**P1** correction: a second reachable failure remains', updatedAt: '2026-09-28T00:31:00Z' }],
+  };
+  const { result } = discover(paths, {
+    collect: () => collectBase({ threads: [edited], ci: { status: 'pending', required: [] } }),
+    dispatchFn: (params) => { calls.push(params); return { target_session_id: 'sess-790' }; },
+    recheckFn: () => ({}),
+  });
+  assert.equal(calls.length, 1, 'edited P1 body must dispatch even while waiting-ci');
+  assert.equal(result.prs[0].dispatch.attempted, true);
+  assert.match(calls[0].message, /second reachable failure/);
+});
+
+test('R2 new P1 reply on a pending-close thread stays open after later complete', (t) => {
+  const { home, paths } = seedWaitingCi(t);
+  const reply = {
+    ...oldThread,
+    comments: [
+      ...oldThread.comments,
+      { id: 'c-second', author: { login: 'greptile-apps[bot]' }, body: '**P1** correction: still broken', createdAt: '2026-09-28T00:31:00Z' },
+    ],
+  };
+  const calls = [];
+  discover(paths, {
+    collect: () => collectBase({ threads: [reply], ci: { status: 'pending', required: [] } }),
+    dispatchFn: (params) => { calls.push(params); return { target_session_id: 'sess-790' }; },
+    recheckFn: () => ({}),
+  });
+  assert.equal(calls.length, 1);
+  const afterDispatch = readPr(home, nodeId);
+  const nextId = afterDispatch.activeTask.dispatchId;
+  fs.writeFileSync(path.join(paths.stateDir, 'results', `${nextId}.json`), JSON.stringify({
+    schemaVersion: 2, kind: 'mivo-repair-result', dispatchId: nextId, nodeId, sessionId: 'sess-790',
+    status: 'complete', head: HEAD, receiptId: 'r-done', ci: { requiredGreen: true, head: HEAD },
+    verification: { status: 'pass' },
+    scs: [{ status: 'pass', feedbackKeys: ['greptile:PRRT_old:c-second'], evidence: ['fixed reply'] }],
+    feedbackCoverage: { dispositions: [{ key: 'greptile:PRRT_old:c-second', disposition: 'fixed' }] },
+  }));
+  discover(paths, {
+    collect: () => collectBase({ threads: [reply], mergeReady: true }),
+    dispatchFn: () => { throw new Error('should not dispatch after complete'); },
+    recheckFn: () => ({}),
+  });
+  assert.equal(Boolean(readPr(home, nodeId).autoClosedThreads?.PRRT_old), false,
+    'thread with an uncovered new P1 reply must stay open');
+});
+
+test('R3 consumed external blocked still queues escalate when GitHub is unchanged', (t) => {
+  const { home, paths } = seedWaitingCi(t, {
+    status: 'blocked', blockedKind: 'external', reason: 'credential missing', coverage: false, consumeCursor: true,
+  });
+  for (let i = 0; i < 3; i += 1) {
+    discover(paths, {
+      now: `2026-09-28T00:3${i}:00Z`,
+      collect: () => collectBase({ threads: [oldThread], ci: { status: 'pending', required: [] } }),
+      dispatchFn: () => { throw new Error('unexpected dispatch'); },
+      recheckFn: () => ({}),
+    });
+  }
+  assert.ok(pendingEvents(home).some((event) => event.kind === 'blocked-escalate'),
+    'external blocked must reach the notice queue without a GitHub fingerprint change');
+});
+
+test('SC9 history line includes the finding file from the prior task when evidence has none', (t) => {
+  const { home, paths } = homeOf(t);
+  seedBound(paths, { pollFingerprint: 'old', rulesVersion: rulesVersion() });
+  const prior = writeTask(home, {
+    dispatchId: 'old-complete',
+    feedback: [{ key: 'greptile:PRRT_past:c-past', source: 'greptile', nativeId: 'PRRT_past:c-past', path: 'src/leak.ts', body: '**P1** src/leak.ts leaks sockets' }],
+  });
+  fs.mkdirSync(prior.paths.results, { recursive: true });
+  fs.writeFileSync(path.join(prior.paths.results, 'old-complete.json'), JSON.stringify({
+    nodeId, dispatchId: 'old-complete', schemaVersion: 2, status: 'complete',
+    scs: [{ status: 'pass', feedbackKeys: ['greptile:PRRT_past:c-past'], evidence: ['npm test: all passed'] }],
+  }));
+  const calls = [];
+  discover(paths, {
+    collect: () => collectBase({ threads: [newThread] }),
+    dispatchFn: (params) => { calls.push(params); return { target_session_id: 'sess-790' }; },
+  });
+  assert.equal(calls.length, 1);
+  const history = calls[0].message.split('\n').find((line) => line.startsWith('此前各轮已处理 finding：'));
+  assert.match(history, /src\/leak\.ts/);
 });

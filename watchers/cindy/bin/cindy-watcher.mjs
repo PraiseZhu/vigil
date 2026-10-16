@@ -927,19 +927,57 @@ function handledFindingsFrom(paths, previous) {
   for (const name of names.filter((item) => item.endsWith('.json')).sort()) {
     const result = readJsonOrNull(path.join(paths.stateDir, 'results', name));
     if (!result || result.nodeId !== previous.nodeId) continue;
+    const task = result.dispatchId ? readDispatchTask(paths, result.dispatchId) : {};
+    const filesByKey = new Map();
+    for (const item of task.feedback ?? []) if (item?.key && item.path) filesByKey.set(item.key, item.path);
     for (const sc of result.scs ?? []) {
       const summary = String(sc.evidence?.[0] ?? sc.status ?? '').replace(/\s+/g, ' ').slice(0, 80);
-      const file = String(sc.evidence?.[0] ?? '').match(/([\w./-]+\.\w{1,8})/)?.[1] ?? '';
-      for (const key of sc.feedbackKeys ?? []) items.push({ key, file, summary });
+      const evidenceFile = String(sc.evidence?.[0] ?? '').match(/([\w./-]+\.\w{1,8})/)?.[1] ?? '';
+      for (const key of sc.feedbackKeys ?? []) items.push({ key, file: evidenceFile || filesByKey.get(key) || '', summary });
     }
   }
   return items.slice(-20);
 }
 function dropWaitingCiRevisionFlips(fresh, previous, paths) {
   if (previous.activeTask?.status !== 'waiting-ci') return fresh;
-  const keys = new Set((readDispatchTask(paths, previous.activeTask.dispatchId).feedback ?? []).map((item) => item?.key).filter(Boolean));
-  if (!keys.size) return fresh;
-  return fresh.filter((item) => !keys.has(item.key) || item.source === 'ci' || item.source === 'conflict');
+  const prior = new Map((readDispatchTask(paths, previous.activeTask.dispatchId).feedback ?? [])
+    .filter((item) => item?.key).map((item) => [item.key, item]));
+  if (!prior.size) return fresh;
+  return fresh.filter((item) => {
+    if (item.source === 'ci' || item.source === 'conflict') return true;
+    const original = prior.get(item.key);
+    if (!original) return true;
+    if (original.contentHash && item.contentHash && original.contentHash !== item.contentHash) return true;
+    if (typeof original.body === 'string' && typeof item.body === 'string' && original.body !== item.body) return true;
+    return false;
+  });
+}
+function coveredPendingClose(items, observed, paths) {
+  const grouped = new Map();
+  for (const item of items ?? []) {
+    const id = item?.dispatchId ?? '';
+    const list = grouped.get(id) ?? [];
+    list.push(item);
+    grouped.set(id, list);
+  }
+  const covered = [];
+  for (const [dispatchId, group] of grouped) {
+    covered.push(...coveredThreadItems(group, observed, dispatchId ? readDispatchTask(paths, dispatchId) : {}));
+  }
+  return covered;
+}
+function includeOpenThreadFeedback(fresh, observed) {
+  const threadIds = new Set(fresh.map((item) => item.threadId).filter(Boolean));
+  const keys = new Set(fresh.map((item) => item.key));
+  const feedback = [...fresh];
+  for (const item of observed) {
+    if (!threadIds.has(item.threadId) || item.actionable === false || item.deferred === true) continue;
+    const key = `${item.source}:${item.nativeId}`;
+    if (keys.has(key)) continue;
+    keys.add(key);
+    feedback.push({ ...item, key });
+  }
+  return feedback;
 }
 function consumeResult(previous, result, now) {
   if (!result) return previous;
@@ -1143,14 +1181,19 @@ function markException(previous, now, events, { home, dryRun } = {}) {
       kind: 'blocked-escalate', number: previous.number, url: previous.url, head: event.head,
       blockedKind: event.blockedKind, cause: blockedCause(event.blockedKind, event.reason),
     }, dryRun);
-    return previous;
+    return previous.lastException.escalated ? previous : { ...previous, lastException: { ...previous.lastException, escalated: true } };
   }
   events.push(event);
   if (['needs-human', 'missing-result-limit', 'invalid-result', 'pending-dispatch-unknown', 'unknown-dispatch-receipt'].includes(event.blockedKind)
     || event.kind === 'dispatch-blocked') {
     queueHumanNotice(home, { kind: event.blockedKind ?? event.kind, number: previous.number, url: previous.url, head: event.head }, dryRun);
+  } else if (event.blockedKind === 'external') {
+    queueHumanNotice(home, {
+      kind: 'blocked-escalate', number: previous.number, url: previous.url, head: event.head,
+      blockedKind: event.blockedKind, cause: blockedCause(event.blockedKind, event.reason),
+    }, dryRun);
   }
-  return { ...previous, lastException: { fingerprint, at: now, event } };
+  return { ...previous, lastException: { fingerprint, at: now, event, escalated: event.blockedKind === 'external' } };
 }
 
 function rememberDispatchFailure(state, key, error, now, paths) {
@@ -1325,7 +1368,7 @@ export function* processPr({
   }
   const currentHeadGreen = collected.ci?.status === 'green' || collected.mergeReady === true;
   if (!dryRun && !resultError && (previous.activeTask?.status === 'complete' || (currentHeadGreen && (previous.pendingThreadClose ?? []).length))) {
-    let closable = [...(previous.pendingThreadClose ?? [])];
+    let closable = coveredPendingClose(previous.pendingThreadClose, allItems, paths);
     let resultHead = previous.activeTask?.head;
     try {
       if (previous.activeTask?.status === 'complete') {
@@ -1341,10 +1384,15 @@ export function* processPr({
       const outcome = yield* closeRefutedThreads({
         items: closable, dispatchId: previous.activeTask?.dispatchId ?? closable[0].dispatchId, previous, ghFn, now, head: resultHead,
       });
-      previous = { ...outcome.previous, pendingThreadClose: [] };
+      const closedIds = new Set(outcome.closed.map((item) => item.threadId));
+      previous = {
+        ...outcome.previous,
+        pendingThreadClose: (previous.pendingThreadClose ?? []).filter((item) => !closedIds.has(item.threadId)),
+      };
       autoClosedThisRound = [...autoClosedThisRound, ...outcome.closed];
     }
   }
+  fresh = includeOpenThreadFeedback(fresh, allItems);
   // CI/threads can be ready while a trusted bot still has an unhandled finding
   // in an issue comment or COMMENTED review. Only fresh, authorized feedback
   // overrides readiness. An acknowledged dispatch consumes its cursor before
@@ -1733,9 +1781,13 @@ export function* pollWorkflow({
     || reopenInfraBlocked({ previous, paths, now }) !== previous
     || reopenRoundLimitBlocked({ previous }) !== previous
     || reopenExternalBlocked({ previous, paths, now, head: previous.headRefOid }) !== previous;
+  const escalateDue = previous.activeTask?.status === 'blocked'
+    && previous.activeTask?.blockedKind === 'external'
+    && previous.lastException != null
+    && previous.lastException.escalated !== true;
   if (previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry
     && !localResultPending && !needsCiRecheck(previous.activeTask) && !previous.recheckDeferredAt
-    && !normalized.overflow && !keelReopenDue) {
+    && !normalized.overflow && !keelReopenDue && !escalateDue) {
     save(previous);
     return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, dispatch: { attempted: false, reason: 'fingerprint-unchanged' } }] };
   }

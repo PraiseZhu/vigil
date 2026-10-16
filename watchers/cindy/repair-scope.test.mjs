@@ -237,6 +237,37 @@ test('SC7 no-change required-CI failure retriggers once with a signed empty comm
   assert.match(second.reason, /after one no-change empty-commit retrigger/);
 });
 
+test('R4 replacing a required-CI task on the same original head must not empty-commit again', (t) => {
+  const f = fixture(t, { changed: false });
+  const ci = (head) => ({
+    key: 'ci:verify', source: 'ci', nativeId: 'verify', sha: head,
+    requiredFailure: { verified: true, status: 'failed', headSha: head },
+  });
+  f.saveTask([ci(f.sourceHead)]);
+  f.report([f.sc('no-change', ['ci:verify'])]);
+  f.setCiConclusion('failure');
+  const first = f.finalize();
+  assert.equal(first.status, 'waiting-ci');
+  const nextHead = f.remoteHead();
+  const pushesAfterFirst = f.pushCalls.length;
+  const task = {
+    ...f.task, dispatchId: 'second-dispatch', headRefOid: nextHead,
+    feedback: [ci(nextHead), finding('P1', 'thread:new')],
+  };
+  const taskPath = path.join(f.paths.tasks, 'second-dispatch.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+  writePr(f.paths.home, task.nodeId, {
+    number: task.number, nodeId: task.nodeId, sessionId: task.sessionId,
+    activeTask: { dispatchId: task.dispatchId },
+  });
+  f.report([f.sc('no-change', ['ci:verify', 'thread:new'])]);
+  const second = finalize({ ...f.options, taskPath, validatedHead: nextHead });
+  assert.notEqual(second.status, 'waiting-ci');
+  assert.equal(second.status, 'blocked');
+  assert.equal(second.blockedKind, 'external');
+  assert.equal(f.pushCalls.length, pushesAfterFirst);
+});
+
 test('mixed task can fix P1 while explicitly leaving P3 unchanged', (t) => {
   const f = fixture(t);
   f.saveTask([finding('P1'), finding('P3')]);

@@ -247,6 +247,37 @@ test('SC7 no-change required-CI failure reruns failed jobs once, then escalates'
   assert.equal(f.ghCalls.filter((args) => args[0] === 'run' && args[1] === 'rerun').length, 1);
 });
 
+test('R4 replacing a required-CI task on the same head must not retrigger again', (t) => {
+  const f = fixture(t, { changed: false });
+  const ci = (head) => ({
+    key: 'ci:verify', source: 'ci', nativeId: 'verify', sha: head,
+    requiredFailure: { verified: true, status: 'failed', headSha: head },
+  });
+  f.saveTask([ci(f.sourceHead)]);
+  f.report([f.sc('no-change', ['ci:verify'])]);
+  f.setCiConclusion('failure');
+  const first = f.finalize();
+  assert.equal(first.status, 'waiting-ci');
+  const nextHead = f.remoteHead();
+  const task = {
+    ...f.task, dispatchId: 'second-dispatch', headRefOid: nextHead,
+    feedback: [ci(nextHead), finding('P1', 'thread:new')],
+  };
+  if (task.handoff) task.handoff = { ...task.handoff, head: nextHead };
+  const taskPath = path.join(f.paths.tasks, 'second-dispatch.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+  writePr(f.paths.home, task.nodeId, {
+    number: task.number, nodeId: task.nodeId, sessionId: task.sessionId,
+    handoff: task.handoff, activeTask: { dispatchId: task.dispatchId },
+  });
+  f.report([f.sc('no-change', ['ci:verify', 'thread:new'])]);
+  const second = finalize({ ...f.options, taskPath, validatedHead: nextHead });
+  assert.notEqual(second.status, 'waiting-ci');
+  assert.equal(second.status, 'blocked');
+  assert.equal(second.blockedKind, 'external');
+  assert.equal(f.ghCalls.filter((args) => args[0] === 'run' && args[1] === 'rerun').length, 1);
+});
+
 test('mixed task can fix P1 while explicitly leaving P2 unchanged', (t) => {
   const f = fixture(t);
   f.saveTask([finding('P1'), finding('P2')]);

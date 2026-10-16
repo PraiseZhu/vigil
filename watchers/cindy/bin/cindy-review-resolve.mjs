@@ -130,9 +130,13 @@ export function fixedThreads(result, task) {
 }
 export function coveredThreadItems(items = [], observed = [], task = {}) {
   const taskKeys = new Set((task?.feedback ?? []).map((item) => item?.key).filter((key) => typeof key === 'string'));
+  const closeKeys = new Set(items.map((item) => item?.key).filter(Boolean));
   return items.filter((item) => observed
     .filter((other) => other?.threadId === item.threadId && other.actionable !== false)
-    .every((other) => taskKeys.has(`${other.source}:${other.nativeId}`)));
+    .every((other) => {
+      const key = `${other.source}:${other.nativeId}`;
+      return taskKeys.has(key) && closeKeys.has(key);
+    }));
 }
 // A thread from a maintainer, the author or a review app that the session graded as not needing code.
 export function triagedReplyText(evidence, dispatchId) {

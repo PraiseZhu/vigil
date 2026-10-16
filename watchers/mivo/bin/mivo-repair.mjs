@@ -665,8 +665,25 @@ function allNoChange(scs) {
   return Array.isArray(scs) && scs.length > 0 && scs.every((sc) => sc.status === 'no-change');
 }
 
+function priorCiRetrigger(paths, task, extra = null) {
+  const matches = (record) => record && (record.sourceHead === task.headRefOid || record.head === task.headRefOid);
+  if (matches(extra?.ciRetrigger)) return extra.ciRetrigger;
+  let names = [];
+  try { names = fs.readdirSync(paths.results); } catch { return extra?.ciRetrigger ?? null; }
+  for (const name of names.filter((item) => item.endsWith('.json'))) {
+    let result;
+    try { result = JSON.parse(fs.readFileSync(path.join(paths.results, name), 'utf8')); } catch { continue; }
+    if (result?.nodeId !== task.nodeId) continue;
+    if (matches(result.ciRetrigger)) return result.ciRetrigger;
+  }
+  return extra?.ciRetrigger ?? null;
+}
+
 function retriggerRequiredCi({ task, ci, ghFn, previous, sourceHead }) {
-  if (previous?.ciRetrigger?.sourceHead === sourceHead) return { retried: false, already: true, ciRetrigger: previous.ciRetrigger };
+  const recorded = previous?.ciRetrigger;
+  if (recorded && (recorded.sourceHead === sourceHead || recorded.head === task.headRefOid || recorded.sourceHead === task.headRefOid)) {
+    return { retried: false, already: true, ciRetrigger: recorded };
+  }
   const runIds = failedRunIds(ci);
   if (!runIds.length) return { retried: false };
   const reruns = [];
@@ -742,7 +759,11 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   if (noChange && ciResult(ci).blockedKind === 'required-ci') {
     const prior = fs.existsSync(path.join(paths.results, `${task.dispatchId}.json`))
       ? readJson(path.join(paths.results, `${task.dispatchId}.json`), 'repair result') : null;
-    extra = retriggerRequiredCi({ task, ci, ghFn, previous: prior, sourceHead: task.headRefOid });
+    extra = retriggerRequiredCi({
+      task, ci, ghFn,
+      previous: { ciRetrigger: priorCiRetrigger(paths, task, prior) },
+      sourceHead: task.headRefOid,
+    });
     if (extra.retried) return saveResult(paths, task, sessionId, {
       status: 'waiting-ci', reason: 'retried required CI once after no-change',
       head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed, ciRetrigger: extra.ciRetrigger,
@@ -796,7 +817,11 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
   const ci = checkStatus(task, head, ghFn);
   assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead: head, allowValidatedHead: true });
   if (allNoChange(scs) && ciResult(ci).blockedKind === 'required-ci') {
-    const extra = retriggerRequiredCi({ task, ci, ghFn, previous, sourceHead: task.headRefOid });
+    const extra = retriggerRequiredCi({
+      task, ci, ghFn,
+      previous: { ciRetrigger: priorCiRetrigger(paths, task, previous) },
+      sourceHead: task.headRefOid,
+    });
     if (extra.retried) {
       return saveResult(paths, task, sessionId, {
         ...common, status: 'waiting-ci', reason: 'retried required CI once after no-change',

@@ -77,6 +77,30 @@ function stripBadge(line) {
     .replace(/^(?:severity|priority|严重度|优先级)\s*[:：]\s*/i, '');
 }
 
+function visibleSeverities(body) {
+  const lines = visibleLines(String(body ?? ''));
+  const heading = verdictHeading.exec(lines.join('\n'))?.[1]?.toUpperCase();
+  const substantive = lines.filter((line) => line && !verdictHeading.test(line)
+    && !/^(?:(?:cindy|mivo)-code-review depth=\S+ head_sha=[a-f0-9]{40}|review-complete head_sha=[a-f0-9]{40} base_sha=[a-f0-9]{40})$/.test(line));
+  const severities = [];
+  let summaryHigh = false;
+  for (const line of substantive) {
+    if (/三席聚合|(?:findings?|severity)\s*(?:counts?|summary)|汇总|统计/i.test(line)) {
+      if (/(?:P[012]|CRITICAL|HIGH|MEDIUM)\s*[:：]?\s*[1-9]\d*/i.test(line)) summaryHigh = true;
+      continue;
+    }
+    const findingLine = stripBadge(line);
+    const match = severityHeading.exec(findingLine);
+    if (!match) continue;
+    const remainder = match[2].replace(/^[:：\s—–-]+/, '');
+    if (/^(?:\d+(?:\s|$)|none\b|zero\b|no\b|无|没有|零)/i.test(remainder)) continue;
+    if (/^\s*[:：]?\s*0\s*(?:findings?|issues?|项|个)?\s*$/i.test(remainder)) continue;
+    const severity = aliases[match[1].toUpperCase()];
+    if (!severities.includes(severity)) severities.push(severity);
+  }
+  return { heading, substantive, severities, summaryHigh };
+}
+
 // Greptile's overview restates findings that arrive as their own graded inline threads. Unless it carries a
 // must-fix finding of its own, it only opened a session with no authority (2026-10-15 #6120).
 export function feedbackRepairPolicy(item = {}, options = {}) {
@@ -104,7 +128,13 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
     return result('required-ci-fix', [], proof ? 'verified-required-ci-failure' : 'legacy-required-ci-failure');
   }
   if (!trustedReviewer(item)) {
-    if (isTriageThread(item)) return result('code-fix', [], 'review-thread-triage');
+    if (isTriageThread(item)) {
+      const graded = visibleSeverities(String(item.body ?? ''));
+      if (graded.severities.some((s) => s === 'P2' || s === 'P3') && !graded.severities.some((s) => AUTHORIZED.has(s))) {
+        return result('reply-only', graded.severities, 'p2-p3-no-code-authority');
+      }
+      return result('code-fix', graded.severities, 'review-thread-triage');
+    }
     // A status or summary comment from any other app (e.g. "Codex Review Summary: Failed") is not a review
     // finding and does not block the merge; it used to open a session with no authority (2026-10-15 #6120).
     if (isBotActor(item.user ?? item.author) && !item.threadId) return result('ignore-infra', [], 'untrusted-app-comment');
@@ -112,28 +142,9 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
   }
   const body = String(item.body ?? '');
   if (body.length > 256 * 1024) return result('needs-triage', [], 'feedback-too-large');
-  const lines = visibleLines(body);
-  const heading = verdictHeading.exec(lines.join('\n'))?.[1]?.toUpperCase();
+  const { heading, substantive, severities, summaryHigh } = visibleSeverities(body);
   if (INFRA.has(heading)) return result('ignore-infra', [], 'review-infrastructure');
-  const substantive = lines.filter((line) => line && !verdictHeading.test(line)
-    && !/^(?:(?:cindy|mivo)-code-review depth=\S+ head_sha=[a-f0-9]{40}|review-complete head_sha=[a-f0-9]{40} base_sha=[a-f0-9]{40})$/.test(line));
   if (!substantive.length) return result('ignore-infra', [], 'review-marker-only');
-  const severities = [];
-  let summaryHigh = false;
-  for (const line of substantive) {
-    if (/三席聚合|(?:findings?|severity)\s*(?:counts?|summary)|汇总|统计/i.test(line)) {
-      if (/(?:P[012]|CRITICAL|HIGH|MEDIUM)\s*[:：]?\s*[1-9]\d*/i.test(line)) summaryHigh = true;
-      continue;
-    }
-    const findingLine = stripBadge(line);
-    const match = severityHeading.exec(findingLine);
-    if (!match) continue;
-    const remainder = match[2].replace(/^[:：\s—–-]+/, '');
-    if (/^(?:\d+(?:\s|$)|none\b|zero\b|no\b|无|没有|零)/i.test(remainder)) continue;
-    if (/^\s*[:：]?\s*0\s*(?:findings?|issues?|项|个)?\s*$/i.test(remainder)) continue;
-    const severity = aliases[match[1].toUpperCase()];
-    if (!severities.includes(severity)) severities.push(severity);
-  }
   const authorized = severities.some((s) => AUTHORIZED.has(s));
   const p3 = severities.includes('P3');
   if (authorized && heading === 'APPROVE') return result('needs-triage', severities, 'approve-conflicts-with-high-finding');

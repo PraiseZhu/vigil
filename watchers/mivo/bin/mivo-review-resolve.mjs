@@ -85,9 +85,13 @@ export function fixedThreads(result, task) {
 // goes through normal dispatch instead of being resolved on another comment's evidence.
 export function coveredThreadItems(items = [], observed = [], task = {}) {
   const taskKeys = new Set((task?.feedback ?? []).map((item) => item?.key).filter((key) => typeof key === 'string'));
+  const closeKeys = new Set(items.map((item) => item?.key).filter(Boolean));
   return items.filter((item) => observed
     .filter((other) => other?.threadId === item.threadId && other.actionable !== false)
-    .every((other) => taskKeys.has(`${other.source}:${other.nativeId}`)));
+    .every((other) => {
+      const key = `${other.source}:${other.nativeId}`;
+      return taskKeys.has(key) && closeKeys.has(key);
+    }));
 }
 function sanitizeEvidence(evidence) {
   return evidence.slice(0, 5).map((line) => '- ' + line.replace(/\/(?:Users|home)\/[^\s'"`]+/g, '<本机路径>').replace(/\s+/g, ' ').slice(0, 300));

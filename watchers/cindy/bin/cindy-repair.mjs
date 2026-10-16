@@ -798,6 +798,20 @@ function allNoChange(scs) {
   return Array.isArray(scs) && scs.length > 0 && scs.every((sc) => sc.status === 'no-change');
 }
 
+function priorCiRetrigger(paths, task, extra = null) {
+  const matches = (record) => record && (record.sourceHead === task.headRefOid || record.head === task.headRefOid);
+  if (matches(extra?.ciRetrigger)) return extra.ciRetrigger;
+  let names = [];
+  try { names = fs.readdirSync(paths.results); } catch { return extra?.ciRetrigger ?? null; }
+  for (const name of names.filter((item) => item.endsWith('.json'))) {
+    let result;
+    try { result = JSON.parse(fs.readFileSync(path.join(paths.results, name), 'utf8')); } catch { continue; }
+    if (result?.nodeId !== task.nodeId) continue;
+    if (matches(result.ciRetrigger)) return result.ciRetrigger;
+  }
+  return extra?.ciRetrigger ?? null;
+}
+
 export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, originUrl) {
   const forkUrl = originUrl ?? githubRepoUrl(resolveHeadRepo(task));
   if (isBaseGithubUrl(forkUrl)) fail(`refusing to push to base repo ${REPO}`);
@@ -857,13 +871,14 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   }
   const prior = fs.existsSync(path.join(paths.results, `${task.dispatchId}.json`))
     ? readJson(path.join(paths.results, `${task.dispatchId}.json`), 'repair result') : null;
+  const recorded = priorCiRetrigger(paths, task, prior);
   if (allNoChange(scs) && ciResult(ci).blockedKind === 'required-ci') {
-    if (prior?.ciRetrigger?.sourceHead === task.headRefOid) {
+    if (recorded) {
       return saveResult(paths, task, sessionId, {
         status: 'blocked', blockedKind: 'external',
         reason: 'required CI still failed after one no-change empty-commit retrigger',
         head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks,
-        pushed: push.pushed, ciRetrigger: prior.ciRetrigger,
+        pushed: push.pushed, ciRetrigger: recorded,
       });
     }
     if (!emptyRetrigger && validatedHead === task.headRefOid) {
@@ -924,11 +939,12 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn =
       drift: { validatedHead: head, remoteHead, githubHead: observedPrHead, sourceHead: task.headRefOid } }, { requirePrLock: true });
   }
   const ci = checkStatus(task, head, ghFn);
-  if (allNoChange(scs) && ciResult(ci).blockedKind === 'required-ci' && previous.ciRetrigger?.sourceHead === task.headRefOid) {
+  const recorded = priorCiRetrigger(paths, task, previous);
+  if (allNoChange(scs) && ciResult(ci).blockedKind === 'required-ci' && recorded) {
     return saveResult(paths, task, sessionId, {
       ...common, status: 'blocked', blockedKind: 'external',
       reason: 'required CI still failed after one no-change empty-commit retrigger',
-      ci, checks: ci.requiredChecks, ciRetrigger: previous.ciRetrigger,
+      ci, checks: ci.requiredChecks, ciRetrigger: recorded,
     }, { requirePrLock: true });
   }
   return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks, ...(previous.ciRetrigger ? { ciRetrigger: previous.ciRetrigger } : {}) }, { requirePrLock: true });
