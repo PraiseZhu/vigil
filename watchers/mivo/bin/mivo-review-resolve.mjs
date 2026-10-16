@@ -148,13 +148,17 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
   const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
   const results = [];
   for (const item of items) {
-    if (closedThreads[item.threadId]) continue;
-    const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, dispatchId)
-      : item.triage ? triagedReplyText(item.evidence, dispatchId) : refutedReplyText(item.evidence, dispatchId);
+    // The receipt covers one disposition. A thread reopened and handled again by a later task
+    // carries that task's dispatchId and is answered again; the same task never posts twice.
+    const itemDispatchId = item.dispatchId ?? dispatchId;
+    const receipt = closedThreads[item.threadId];
+    if (receipt && (!receipt.dispatchId || receipt.dispatchId === itemDispatchId)) continue;
+    const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, itemDispatchId)
+      : item.triage ? triagedReplyText(item.evidence, itemDispatchId) : refutedReplyText(item.evidence, itemDispatchId);
     const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : 'refuted-p0-p1';
     yield () => ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${body}`]);
     yield () => ghFn(['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${item.threadId}`]);
-    closedThreads[item.threadId] = { at: now, key: item.key, reason, dispatchId };
+    closedThreads[item.threadId] = { at: now, key: item.key, reason, dispatchId: itemDispatchId };
     results.push({ threadId: item.threadId, key: item.key });
   }
   return { previous: { ...previous, autoClosedThreads: closedThreads }, closed: results };

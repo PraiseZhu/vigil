@@ -210,16 +210,20 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
   const results = [];
   const attempt = (args) => permissionGuarded(ghFn, args);
   for (const item of items) {
-    if (closedThreads[item.threadId]) continue;
-    const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, dispatchId)
-      : item.triage ? triagedReplyText(item.evidence, dispatchId) : refutedReplyText(item.evidence, dispatchId);
+    // The receipt covers one disposition. A thread reopened and handled again by a later task
+    // carries that task's dispatchId and is answered again; the same task never posts twice.
+    const itemDispatchId = item.dispatchId ?? dispatchId;
+    const receipt = closedThreads[item.threadId];
+    if (receipt && (!receipt.dispatchId || receipt.dispatchId === itemDispatchId)) continue;
+    const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, itemDispatchId)
+      : item.triage ? triagedReplyText(item.evidence, itemDispatchId) : refutedReplyText(item.evidence, itemDispatchId);
     const reply = yield attempt(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${body}`]);
     if (reply?.__degraded) {
       results.push({ threadId: item.threadId, key: item.key, degraded: true, reason: 'permission-denied' });
       continue;
     }
     const resolved = yield attempt(['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${item.threadId}`]);
-    closedThreads[item.threadId] = { at: now, key: item.key, reason: item.kind === 'fixed' ? 'fixed-authorized-finding' : item.triage ? 'review-thread-no-change' : 'refuted-authorized-finding', dispatchId,
+    closedThreads[item.threadId] = { at: now, key: item.key, reason: item.kind === 'fixed' ? 'fixed-authorized-finding' : item.triage ? 'review-thread-no-change' : 'refuted-authorized-finding', dispatchId: itemDispatchId,
       ...(resolved?.__degraded ? { resolveDegraded: true } : {}) };
     results.push({ threadId: item.threadId, key: item.key, ...(resolved?.__degraded ? { degraded: true, reason: 'permission-denied' } : {}) });
   }

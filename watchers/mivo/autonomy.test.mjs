@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { blocked, repairPaths } from './bin/mivo-repair.mjs';
 import { dispatchParams, pollFingerprint, normalizePollSnapshot, scanOnce, watcherPaths, rulesVersion, feedbackItems, newFeedback } from './bin/mivo-watcher.mjs';
@@ -776,6 +776,70 @@ test('R4-3 a thread with a fixed P1 and an answered P2 closes after a complete g
   assert.ok(readPr(home, nodeId).autoClosedThreads?.PRRT_mix, 'a fully handled mixed thread must close');
 });
 
+test('R5-2 a reopened thread handled again by a later task is answered and resolved again', (t) => {
+  const { home, paths } = homeOf(t);
+  const dispatchId = 'live-second';
+  seedBound(paths, {
+    pollFingerprint: 'old', rulesVersion: rulesVersion(),
+    lastDispatch: { dispatchId, at: '2026-09-28T00:00:00Z' },
+    activeTask: { status: 'accepted', dispatchId, head: HEAD, sessionId: 'sess-790' },
+    autoClosedThreads: { PRRT_mix: { at: '2026-09-27T12:00:00Z', key: 'greptile:PRRT_mix:c-p1', reason: 'fixed', dispatchId: 'live-first' } },
+  });
+  const p1 = 'greptile:PRRT_mix:c-p1';
+  fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
+  fs.writeFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), JSON.stringify({
+    dispatchId, nodeId, number: 790, repo: process.env.MIVO_WATCHER_TARGET_REPO, sessionId: 'sess-790',
+    headRefOid: HEAD, headRefName: 'fix/x', params: { message: 'fix' },
+    handoff: handoffReceipt({ ...listed, releaseEpoch: 'e' }),
+    feedback: [
+      { key: p1, source: 'greptile', nativeId: 'PRRT_mix:c-p1', path: 'src/m.ts', body: mixedThread.comments[0].body },
+    ],
+    repairPolicy: { items: [{ key: p1, action: 'code-fix' }] },
+  }));
+  writeResult(paths, dispatchId, {
+    status: 'complete', ci: { requiredGreen: true, head: HEAD }, verification: { status: 'pass' },
+    feedbackCoverage: { dispositions: [{ key: p1, disposition: 'fixed' }] },
+    scs: [
+      { status: 'pass', feedbackKeys: [p1], evidence: ['guarded empty input in src/m.ts'] },
+    ],
+  });
+  discover(paths, { collect: () => collectBase({ threads: [{ ...mixedThread, comments: [mixedThread.comments[0]] }], mergeReady: true }), dispatchFn: () => { throw new Error('no dispatch after complete'); }, recheckFn: () => ({}) });
+  const receipt = readPr(home, nodeId).autoClosedThreads?.PRRT_mix;
+  assert.equal(receipt?.dispatchId, 'live-second', 'the second fix must close the reopened thread');
+});
+
+test('R5-2 the same task never answers a thread twice', (t) => {
+  const { home, paths } = homeOf(t);
+  const dispatchId = 'live-second';
+  seedBound(paths, {
+    pollFingerprint: 'old', rulesVersion: rulesVersion(),
+    lastDispatch: { dispatchId, at: '2026-09-28T00:00:00Z' },
+    activeTask: { status: 'accepted', dispatchId, head: HEAD, sessionId: 'sess-790' },
+    autoClosedThreads: { PRRT_mix: { at: '2026-09-27T12:00:00Z', key: 'greptile:PRRT_mix:c-p1', reason: 'fixed', dispatchId: dispatchId } },
+  });
+  const p1 = 'greptile:PRRT_mix:c-p1';
+  fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
+  fs.writeFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), JSON.stringify({
+    dispatchId, nodeId, number: 790, repo: process.env.MIVO_WATCHER_TARGET_REPO, sessionId: 'sess-790',
+    headRefOid: HEAD, headRefName: 'fix/x', params: { message: 'fix' },
+    handoff: handoffReceipt({ ...listed, releaseEpoch: 'e' }),
+    feedback: [
+      { key: p1, source: 'greptile', nativeId: 'PRRT_mix:c-p1', path: 'src/m.ts', body: mixedThread.comments[0].body },
+    ],
+    repairPolicy: { items: [{ key: p1, action: 'code-fix' }] },
+  }));
+  writeResult(paths, dispatchId, {
+    status: 'complete', ci: { requiredGreen: true, head: HEAD }, verification: { status: 'pass' },
+    feedbackCoverage: { dispositions: [{ key: p1, disposition: 'fixed' }] },
+    scs: [
+      { status: 'pass', feedbackKeys: [p1], evidence: ['guarded empty input in src/m.ts'] },
+    ],
+  });
+  discover(paths, { collect: () => collectBase({ threads: [{ ...mixedThread, comments: [mixedThread.comments[0]] }], mergeReady: true }), dispatchFn: () => { throw new Error('no dispatch after complete'); }, recheckFn: () => ({}) });
+  const receipt = readPr(home, nodeId).autoClosedThreads?.PRRT_mix;
+  assert.equal(receipt?.at, '2026-09-27T12:00:00Z', 'a thread this task already closed is left alone');
+});
+
 test('R4-4 a notice lock left by a killed process is reclaimed', (t) => {
   const { home } = homeOf(t);
   const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
@@ -790,4 +854,43 @@ test('R4-4 a notice lock left by a killed process is reclaimed', (t) => {
   assert.ok(Date.now() - started < 5000, 'a dead holder must not make writers wait out the timeout');
   assert.ok(pendingEvents(home).some((event) => event.number === 791));
   assert.equal(fs.existsSync(path.join(home, 'state', 'notices', 'pending.lock')), false);
+});
+
+test('R5-1 a reclaimer that saw a dead lock cannot delete a newer live lock', async (t) => {
+  const { home } = homeOf(t);
+  const notices = path.join(home, 'state', 'notices');
+  fs.mkdirSync(notices, { recursive: true });
+  const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+  fs.writeFileSync(path.join(notices, 'pending.lock'), String(Number(dead.stdout)));
+  fs.writeFileSync(path.join(notices, 'pending.json'), JSON.stringify({ events: [] }));
+  const bin = fileURLToPath(new URL('./bin/notify.mjs', import.meta.url));
+  const common = `import fs from 'node:fs'; import path from 'node:path'; import { enqueueNotice } from ${JSON.stringify(bin)};
+    const home = ${JSON.stringify(home)}; const read = fs.readFileSync;
+    const flag = (name) => path.join(home, name);
+    const wait = (name) => { const start = Date.now(); while (!fs.existsSync(flag(name))) { if (Date.now() - start > 6000) throw new Error('timeout ' + name); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); } };`;
+  const child = (source) => {
+    const proc = spawn(process.execPath, ['--input-type=module', '-e', source], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = '';
+    proc.stderr.on('data', (chunk) => { err += chunk; });
+    t.after(() => proc.kill('SIGKILL'));
+    return new Promise((resolve) => proc.once('exit', (code) => resolve({ code, err })));
+  };
+  const until = async (name) => { const start = Date.now(); while (!fs.existsSync(path.join(home, name))) { if (Date.now() - start > 6000) throw new Error(`timeout ${name}`); await new Promise((r) => setTimeout(r, 5)); } };
+  // A pauses right after its second look at the dead lock, the moment before it would remove it.
+  const a = child(common + `let reads = 0; fs.readFileSync = function (file, ...rest) { const value = read.call(this, file, ...rest);
+    if (String(file).endsWith('/pending.lock') && ++reads === 2) { fs.writeFileSync(flag('a-paused'), ''); wait('release-a'); } return value; };
+    enqueueNotice(home, { kind: 'merge-ready', number: 20, head: 'h' });`);
+  await until('a-paused');
+  // B pauses while holding the lock, after reading the queue.
+  const b = child(common + `fs.readFileSync = function (file, ...rest) { const value = read.call(this, file, ...rest);
+    if (String(file).endsWith('/pending.json')) { fs.readFileSync = read; fs.writeFileSync(flag('b-locked'), ''); wait('release-b'); } return value; };
+    enqueueNotice(home, { kind: 'merge-ready', number: 21, head: 'h' });`);
+  await new Promise((r) => setTimeout(r, 300));
+  fs.writeFileSync(path.join(home, 'release-a'), '');
+  const ar = await a;
+  fs.writeFileSync(path.join(home, 'release-b'), '');
+  const br = await b;
+  assert.equal(ar.code, 0, ar.err);
+  assert.equal(br.code, 0, br.err);
+  assert.deepEqual(pendingEvents(home).map((event) => event.number).sort(), [20, 21], 'both queued notices must survive');
 });

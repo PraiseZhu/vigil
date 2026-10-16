@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
+import { randomBytes } from 'node:crypto';
 
 const PROTOCOL = 'cindy-script/1';
 
@@ -38,30 +39,58 @@ function readJson(file, fallback) {
 }
 
 // A writer killed while holding the lock (timeout, SIGKILL, reboot) never reaches its finally.
-// Its pid is in the file; once that process is gone the lock is removed, unless another writer
-// replaced it in the meantime. An unreadable lock counts as dead after 30 seconds.
-function reclaimDeadNoticeLock(file) {
-  let holder, stat;
-  try { holder = fs.readFileSync(file, 'utf8'); stat = fs.statSync(file); } catch { return true; }
-  const pid = Number(holder);
-  let dead = false;
+// The lock holds "<pid> <token>"; once that pid is gone the lock is removed. Checking the
+// holder and unlinking it is not atomic, so it runs under a second, short-lived reclaim lock:
+// a reclaimer that saw the dead lock earlier cannot delete a newer live lock taken meanwhile.
+// An unreadable lock counts as dead after 30 seconds.
+function holderDead(content, stat) {
+  const pid = Number(String(content).split(' ')[0]);
   if (Number.isSafeInteger(pid) && pid > 0) {
-    try { process.kill(pid, 0); } catch (error) { dead = error.code === 'ESRCH'; }
-  } else dead = Date.now() - stat.mtimeMs > 30_000;
-  if (!dead) return false;
-  try { if (fs.readFileSync(file, 'utf8') === holder) fs.unlinkSync(file); } catch {}
-  return true;
+    try { process.kill(pid, 0); return false; } catch (error) { return error.code === 'ESRCH'; }
+  }
+  return Date.now() - stat.mtimeMs > 30_000;
+}
+function readHolder(file) {
+  try { return { content: fs.readFileSync(file, 'utf8'), stat: fs.statSync(file) }; } catch { return null; }
+}
+function reclaimDeadNoticeLock(file) {
+  const seen = readHolder(file);
+  if (!seen) return true;
+  if (!holderDead(seen.content, seen.stat)) return false;
+  const guard = `${file}.reclaim`;
+  try { fs.writeFileSync(guard, String(process.pid), { flag: 'wx', mode: 0o600 }); }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    // The reclaim section is a few syscalls; only a reclaimer killed inside it leaves this file.
+    const stale = readHolder(guard);
+    if (stale && holderDead(stale.content, stale.stat) && Date.now() - stale.stat.mtimeMs > 5_000) {
+      try { fs.unlinkSync(guard); } catch {}
+    }
+    return false;
+  }
+  try {
+    const current = readHolder(file);
+    if (!current) return true;
+    if (current.content !== seen.content || !holderDead(current.content, current.stat)) return false;
+    fs.unlinkSync(file);
+    return true;
+  } finally { try { fs.unlinkSync(guard); } catch {} }
+}
+
+function releaseNoticeLock(file, token) {
+  try { if (fs.readFileSync(file, 'utf8') === token) fs.unlinkSync(file); } catch {}
 }
 
 function withNoticeLock(home, fn) {
   const file = lockPath(home);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const token = `${process.pid} ${randomBytes(8).toString('hex')}`;
   const started = Date.now();
   while (true) {
     try {
-      fs.writeFileSync(file, String(process.pid), { flag: 'wx', mode: 0o600 });
+      fs.writeFileSync(file, token, { flag: 'wx', mode: 0o600 });
       try { return fn(); }
-      finally { try { fs.unlinkSync(file); } catch {} }
+      finally { releaseNoticeLock(file, token); }
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
       if (reclaimDeadNoticeLock(file)) continue;
