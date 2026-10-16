@@ -4,7 +4,7 @@
 // source of the session binding and Cindy is responsible for the session.
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { collectCindyCiSync } from './cindy-ci.mjs';
@@ -123,13 +123,54 @@ function assertIdentity(value, task, sessionId, label) {
   }
 }
 
-function saveResult(paths, task, sessionId, payload) {
+function activityFile(paths, dispatchId) {
+  return path.join(paths.home, 'state', 'activity', `${dispatchId}.json`);
+}
+export function recordActivity(paths, task, op, at = new Date().toISOString()) {
+  if (!task?.dispatchId) return;
+  atomicJson(activityFile(paths, task.dispatchId), { at, op, dispatchId: task.dispatchId });
+}
+export function readActivityAt(home, dispatchId) {
+  try {
+    const at = Date.parse(JSON.parse(fs.readFileSync(path.join(requireAbs(home, 'home'), 'state', 'activity', `${dispatchId}.json`), 'utf8'))?.at ?? '');
+    return Number.isFinite(at) ? at : null;
+  } catch { return null; }
+}
+function activityHeartbeatMs() {
+  return Math.max(1_000, Number(process.env.VIGIL_ACTIVITY_HEARTBEAT_MS) || 60_000);
+}
+// The heartbeat outlives a blocked event loop, but not the helper: it follows parentPid and
+// exits once that process is gone, so a killed helper cannot keep a dead task looking busy.
+export function startActivityHeartbeat(paths, task, op, { parentPid = process.pid } = {}) {
+  recordActivity(paths, task, op);
+  const file = activityFile(paths, task.dispatchId);
+  const child = spawn(process.execPath, ['-e', `
+    const fs = require('fs');
+    const path = ${JSON.stringify(file)};
+    const parentPid = ${JSON.stringify(parentPid)};
+    const rec = () => {
+      try { process.kill(parentPid, 0); } catch (error) { if (error.code === 'ESRCH') process.exit(0); }
+      try {
+        const tmp = path + '.tmp-' + process.pid + '-' + Date.now();
+        fs.mkdirSync(require('path').dirname(path), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(tmp, JSON.stringify({ at: new Date().toISOString(), op: ${JSON.stringify(op)}, dispatchId: ${JSON.stringify(task.dispatchId)} }) + '\\n', { mode: 0o600 });
+        fs.renameSync(tmp, path);
+      } catch {}
+    };
+    setInterval(rec, ${activityHeartbeatMs()});
+  `], { detached: true, stdio: 'ignore' });
+  child.unref();
+  return () => { try { process.kill(child.pid, 'SIGTERM'); } catch {} };
+}
+
+function saveResult(paths, task, sessionId, payload, { requirePrLock = false } = {}) {
+  refuseDeployLock(paths.home);
+  recordActivity(paths, task, payload?.status ?? 'result');
+  if (!requirePrLock) return saveResultLocked(paths, task, sessionId, payload);
   const lock = acquireLock(paths.home, `pr-${task.nodeId}`);
   if (lock.held) fail('PR 状态锁占用，请稍后重试写结果');
-  try {
-    refuseDeployLock(paths.home);
-    return saveResultLocked(paths, task, sessionId, payload);
-  } finally { lock.release(); }
+  try { return saveResultLocked(paths, task, sessionId, payload); }
+  finally { lock.release(); }
 }
 function saveResultLocked(paths, task, sessionId, payload) {
   const latest = path.join(paths.results, `${task.dispatchId}.json`);
@@ -357,10 +398,15 @@ export function cloneWorktree(paths, task, gitFn, cloneUrl, expectedUrl, remoteH
 
 // Recompute from the trusted task's feedback, including legacy tasks. A cached
 // category, an SC assertion, or a successful preflight is not repair authority.
-export function assertTaskRepairScope(task, head) {
+export function isEmptyCiRetrigger(worktree, fromSha, toSha, gitFn) {
+  if (!isSha(fromSha) || !isSha(toSha) || fromSha === toSha) return false;
+  return gitOutput(['-C', worktree, 'diff', '--name-only', fromSha, toSha], gitFn).trim() === '';
+}
+
+export function assertTaskRepairScope(task, head, { emptyRetrigger = false } = {}) {
   if (!isSha(task?.headRefOid) || !isSha(head)) fail('repair scope requires valid source and target HEAD');
   const repairPolicy = taskRepairPolicy(task);
-  if (head !== task.headRefOid && !repairPolicy.canChangeCode) {
+  if (head !== task.headRefOid && !repairPolicy.canChangeCode && !emptyRetrigger) {
     fail('[REPAIR_SCOPE_NO_CODE] This task has no P0/P1, required-CI or conflict repair authority; preserve local changes, do not push. P2/P3 and unknown findings are no-change only.');
   }
   return repairPolicy;
@@ -483,6 +529,7 @@ export function alignWatchWorktree({ task, checkout, remoteHead, gitFn = command
 export function prepare({ home, taskPath, ghFn = command, gitFn = command, cloneUrl, originUrl, viewer } = {}) {
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'prepare');
   const { sessionId } = boundSession(paths, task);
   const headRepo = resolveHeadRepo(task);
   const headOwner = headRepo.split('/')[0];
@@ -564,7 +611,7 @@ function validationPolicy(_worktree, _task, _gitFn, env = process.env) {
 
 export function commitsMissingDco(worktree, fromSha, toSha, gitFn) {
   if (!isSha(fromSha) || !isSha(toSha) || fromSha === toSha) return [];
-  const raw = gitOutput(['-C', worktree, 'log', `${fromSha}..${toSha}`, '--format=%H%n%B%x1e'], gitFn);
+  const raw = gitOutput(['-C', worktree, 'log', '--no-merges', `${fromSha}..${toSha}`, '--format=%H%n%B%x1e'], gitFn);
   const missing = [];
   for (const entry of raw.split('\x1e')) {
     const text = entry.trim();
@@ -608,6 +655,8 @@ export function validate({ home, taskPath, validatedHead, gitFn = command, runFn
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
+  const stopHeartbeat = startActivityHeartbeat(paths, task, 'validate');
+  try {
   const { sessionId } = boundSession(paths, task);
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
   assertTaskRepairScope(task, validatedHead);
@@ -652,6 +701,7 @@ export function validate({ home, taskPath, validatedHead, gitFn = command, runFn
   const verification = { status, head: validatedHead, receiptPath, receiptSha256: hash(fs.readFileSync(receiptPath)) };
   atomicJson(validationPointer(paths, task, validatedHead), verification);
   return verification;
+  } finally { stopHeartbeat(); }
   });
 }
 
@@ -731,7 +781,7 @@ function legacyCheckStatus(task, head, ghFn) {
 
 export function policyCiResult(ci, head) {
   return {head, requiredGreen:ci.status === 'green', policyHash:ci.policyHash,
-    requiredChecks:(ci.required??[]).map(r=>({name:r.context,bucket:r.status==='green'?'pass':r.status==='failed'?'fail':'pending',headSha:head,evidence:r.evidence})),
+    requiredChecks:(ci.required??[]).map(r=>({name:r.context,bucket:r.status==='green'?'pass':r.status==='failed'?'fail':'pending',headSha:head,runId:r.evidence?.runId ?? null,evidence:r.evidence})),
     optionalFailures:[],pending:(ci.required??[]).filter(r=>r.status==='pending').map(r=>r.context),
     missing:ci.status==='unknown'?[ci.reason??'required-policy-unknown']:[]};
 }
@@ -746,6 +796,38 @@ export function ciResult(ci) {
   if (failures.length) return { status: 'blocked', blockedKind: 'required-ci', reason: `required CI failed: ${failures.map((check) => check.name).join(', ')}` };
   if (!ci.requiredGreen) return { status: 'waiting-ci', reason: `waiting for current HEAD required CI: ${[...ci.missing, ...ci.pending].join(', ')}` };
   return { status: 'complete' };
+}
+
+function allNoChange(scs) {
+  return Array.isArray(scs) && scs.length > 0 && scs.every((sc) => sc.status === 'no-change');
+}
+
+// One CI retrigger per PR head. The quota lives in its own file, keyed by the head it was
+// spent on, and is claimed before the push: a lost or overwritten result file, or a later
+// task on the same head, cannot hand it out again.
+function retriggerLedgerFile(paths, nodeId) {
+  return path.join(paths.home, 'state', 'ci-retrigger', `${encodeURIComponent(nodeId)}.json`);
+}
+function readRetriggerLedger(paths, nodeId) {
+  try { return JSON.parse(fs.readFileSync(retriggerLedgerFile(paths, nodeId), 'utf8')) ?? {}; } catch { return {}; }
+}
+function claimRetrigger(paths, task, record) {
+  atomicJson(retriggerLedgerFile(paths, task.nodeId), { ...readRetriggerLedger(paths, task.nodeId), [record.sourceHead]: record });
+}
+function priorCiRetrigger(paths, task, extra = null) {
+  const matches = (record) => record && (record.sourceHead === task.headRefOid || record.head === task.headRefOid);
+  const ledger = Object.values(readRetriggerLedger(paths, task.nodeId)).find(matches);
+  if (ledger) return ledger;
+  if (matches(extra?.ciRetrigger)) return extra.ciRetrigger;
+  let names = [];
+  try { names = fs.readdirSync(paths.results); } catch { return extra?.ciRetrigger ?? null; }
+  for (const name of names.filter((item) => item.endsWith('.json'))) {
+    let result;
+    try { result = JSON.parse(fs.readFileSync(path.join(paths.results, name), 'utf8')); } catch { continue; }
+    if (result?.nodeId !== task.nodeId) continue;
+    if (matches(result.ciRetrigger)) return result.ciRetrigger;
+  }
+  return extra?.ciRetrigger ?? null;
 }
 
 export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, originUrl) {
@@ -772,42 +854,90 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'finalize');
   const { sessionId } = boundSession(paths, task);
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
-  assertTaskRepairScope(task, validatedHead);
   const pr = ghPr(task, ghFn, false);
   const worktree = taskWorktree(task);
   originUrl = originUrl ?? githubRepoUrl(resolveHeadRepo(task));
   if (isBaseGithubUrl(originUrl)) fail(`refusing to push to base repo ${REPO}`);
-  assertDco(worktree, task.headRefOid, validatedHead, gitFn);
   const checkout = assertWorktree(worktree, { ...task, headRefOid: validatedHead }, gitFn, originUrl);
   if (!checkout || checkout.head !== validatedHead) fail('worktree HEAD does not match validated-head');
   const branchHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
   const { scs, feedbackCoverage } = loadScs(scReport, task);
-  if (validatedHead !== task.headRefOid && scs.every((sc) => sc.status === 'no-change')) {
+  const emptyRetrigger = allNoChange(scs) && isEmptyCiRetrigger(worktree, task.headRefOid, validatedHead, gitFn);
+  assertTaskRepairScope(task, validatedHead, { emptyRetrigger });
+  assertDco(worktree, task.headRefOid, validatedHead, gitFn);
+  if (validatedHead !== task.headRefOid && scs.every((sc) => sc.status === 'no-change') && !emptyRetrigger) {
     fail('[REPAIR_SCOPE_NO_CODE] Changed HEAD requires an SC bound to an authorized fix; no-change cannot cover commits');
   }
   const noChange = validatedHead === task.headRefOid && branchHead === validatedHead && scs.every((sc) => sc.status === 'no-change');
-  const verification = noChange
-    ? { status: 'not-required-no-change', head: validatedHead, localTests: 'not-run', reason: 'all SCs are no-change and task, checkout and remote HEAD match' }
+  const verification = (noChange || emptyRetrigger)
+    ? { status: 'not-required-no-change', head: validatedHead, localTests: 'not-run', reason: emptyRetrigger
+      ? 'signed empty commit retriggered required CI once; local tests were not required'
+      : 'all SCs are no-change and task, checkout and remote HEAD match' }
     : verifiedLocal(paths, task, sessionId, validatedHead, worktree, gitFn, validationReceipt, env);
   const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot, validatedHead, verification });
+  const prior = fs.existsSync(path.join(paths.results, `${task.dispatchId}.json`))
+    ? readJson(path.join(paths.results, `${task.dispatchId}.json`), 'repair result') : null;
+  const recorded = priorCiRetrigger(paths, task, prior);
+  // A session-made empty commit spends the same one-per-head quota, and is checked before it is pushed.
+  if (emptyRetrigger && recorded && recorded.head !== validatedHead) {
+    return saveResult(paths, task, sessionId, {
+      status: 'blocked', blockedKind: 'external',
+      reason: 'required CI still failed after one no-change empty-commit retrigger; the extra empty commit was not pushed',
+      head: task.headRefOid, scs, feedbackCoverage, keel, verification, checks: [], pushed: false, ciRetrigger: recorded,
+    });
+  }
+  const sessionRetrigger = emptyRetrigger && !recorded
+    ? { sourceHead: task.headRefOid, method: 'empty-commit', head: validatedHead, at: new Date().toISOString() } : null;
+  if (sessionRetrigger) claimRetrigger(paths, task, sessionRetrigger);
   const push = pushIfNeeded(worktree, task, validatedHead, branchHead, gitFn, originUrl);
   let ci;
   try { ci = checkStatus(task, validatedHead, ghFn); }
   catch (error) {
     return saveResult(paths, task, sessionId, { status: 'blocked', blockedKind: 'ci-transport', reason: error.message,
-      head: validatedHead, scs, feedbackCoverage, keel, verification, checks: [], pushed: push.pushed });
+      head: validatedHead, scs, feedbackCoverage, keel, verification, checks: [], pushed: push.pushed,
+      ...(sessionRetrigger ?? recorded ? { ciRetrigger: sessionRetrigger ?? recorded } : {}) });
   }
-  return saveResult(paths, task, sessionId, { ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed: push.pushed });
+  if (allNoChange(scs) && ciResult(ci).blockedKind === 'required-ci') {
+    if (recorded) {
+      return saveResult(paths, task, sessionId, {
+        status: 'blocked', blockedKind: 'external',
+        reason: 'required CI still failed after one no-change empty-commit retrigger',
+        head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks,
+        pushed: push.pushed, ciRetrigger: recorded,
+      });
+    }
+    if (!emptyRetrigger && validatedHead === task.headRefOid) {
+      gitOutput(['-C', worktree, '-c', 'commit.gpgsign=false', 'commit', '-s', '--allow-empty', '-m', 'ci: retrigger required checks'], gitFn);
+      const retriggerHead = gitOutput(['-C', worktree, 'rev-parse', 'HEAD'], gitFn);
+      assertDco(worktree, task.headRefOid, retriggerHead, gitFn);
+      const ciRetrigger = { sourceHead: task.headRefOid, method: 'empty-commit', head: retriggerHead, at: new Date().toISOString() };
+      // Spent before the push: if the push fails midway, a second attempt would be a second retrigger.
+      claimRetrigger(paths, task, ciRetrigger);
+      const retriggerPush = pushIfNeeded(worktree, task, retriggerHead, validatedHead, gitFn, originUrl);
+      return saveResult(paths, task, sessionId, {
+        status: 'waiting-ci', reason: 'retried required CI once with a signed empty commit',
+        head: retriggerHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks,
+        pushed: retriggerPush.pushed, ciRetrigger,
+      });
+    }
+  }
+  const carried = sessionRetrigger ?? recorded;
+  return saveResult(paths, task, sessionId, {
+    ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed: push.pushed,
+    ...(carried ? { ciRetrigger: carried } : {}),
+  });
   });
 }
 
 export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn = command, originUrl, env = process.env } = {}) {
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'recheck');
   originUrl = originUrl ?? githubRepoUrl(resolveHeadRepo(task));
   const { sessionId } = boundSession(paths, task);
   const previous = readJson(path.join(paths.results, `${task.dispatchId}.json`), 'repair result');
@@ -815,14 +945,15 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn =
   assertIdentity(previous, task, sessionId, 'repair result');
   const head = validatedHead ?? previous.head;
   if (!isSha(head) || previous.head !== head) fail('recheck HEAD does not match the result');
-  assertTaskRepairScope(task, head);
   const { scs, feedbackCoverage } = validateScs(previous.scs, task);
   const worktree = taskWorktree(task);
+  const emptyRetrigger = previous.ciRetrigger?.method === 'empty-commit' && isEmptyCiRetrigger(worktree, task.headRefOid, head, gitFn);
+  assertTaskRepairScope(task, head, { emptyRetrigger });
   const checkout = assertWorktree(worktree, task, gitFn, originUrl);
   if (!checkout || checkout.head !== head) fail('recheck worktree HEAD changed');
   let verification;
   if (previous.verification?.status === 'not-required-no-change') {
-    if (head !== task.headRefOid || !previous.scs.every((sc) => sc.status === 'no-change')) fail('no-change verification cannot cover code changes');
+    if ((head !== task.headRefOid && !emptyRetrigger) || !previous.scs.every((sc) => sc.status === 'no-change')) fail('no-change verification cannot cover code changes');
     verification = previous.verification;
   } else {
     verification = verifiedLocal(paths, task, sessionId, head, worktree, gitFn, previous.verification?.receiptPath, env);
@@ -834,24 +965,36 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn =
   const common = { head, scs, feedbackCoverage, keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
   if (remoteHead !== observedPrHead) {
     return saveResult(paths, task, sessionId, { ...common, status: 'waiting-ci', reason: 'GitHub PR and remote branch views differ', checks: [],
-      ci: { head, requiredGreen: false, requiredChecks: [], optionalFailures: [], pending: [], missing: ['github-remote-head-mismatch'] } });
+      ci: { head, requiredGreen: false, requiredChecks: [], optionalFailures: [], pending: [], missing: ['github-remote-head-mismatch'] } }, { requirePrLock: true });
   }
   if (remoteHead !== head) {
     return saveResult(paths, task, sessionId, { ...common, status: 'blocked', blockedKind: 'head-drift',
       reason: 'remote HEAD advanced independently; preserve local work and reconcile before validation', checks: [],
-      drift: { validatedHead: head, remoteHead, githubHead: observedPrHead, sourceHead: task.headRefOid } });
+      drift: { validatedHead: head, remoteHead, githubHead: observedPrHead, sourceHead: task.headRefOid } }, { requirePrLock: true });
   }
   const ci = checkStatus(task, head, ghFn);
-  return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks });
+  const recorded = priorCiRetrigger(paths, task, previous);
+  if (allNoChange(scs) && ciResult(ci).blockedKind === 'required-ci' && recorded) {
+    return saveResult(paths, task, sessionId, {
+      ...common, status: 'blocked', blockedKind: 'external',
+      reason: 'required CI still failed after one no-change empty-commit retrigger',
+      ci, checks: ci.requiredChecks, ciRetrigger: recorded,
+    }, { requirePrLock: true });
+  }
+  return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks, ...(recorded ? { ciRetrigger: recorded } : {}) }, { requirePrLock: true });
   });
 }
 
 export function blocked({ home, taskPath, reason, ghFn = command } = {}) {
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'blocked');
   const { sessionId } = boundSession(paths, task);
   if (typeof reason !== 'string' || !reason.trim()) fail('blocked reason is required');
-  return saveResult(paths, task, sessionId, { status: 'blocked', blockedKind: 'external', reason: reason.trim(), worktree: taskWorktree(task) });
+  return saveResult(paths, task, sessionId, {
+    status: 'blocked', blockedKind: 'external', reason: reason.trim(),
+    head: task.headRefOid, worktree: taskWorktree(task),
+  });
   });
 }
 

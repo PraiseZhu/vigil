@@ -28,10 +28,10 @@ test('P3 greptile thread item is auto-close eligible', () => {
   assert.equal(isAutoCloseEligible(item), true);
 });
 
-test('P2 greptile thread item is authorized fix, not auto-close', () => {
+test('P2 greptile thread item is reply-only auto-close', () => {
   const [item] = threadItems({ body: 'P2: must-fix this PR' });
-  assert.equal(item.category, 'actionable-fix');
-  assert.equal(isAutoCloseEligible(item), false);
+  assert.equal(item.category, 'reply-resolve');
+  assert.equal(isAutoCloseEligible(item), true);
 });
 
 test('P0/P1 thread item is never auto-close eligible', () => {
@@ -415,7 +415,8 @@ const runClosure = (items, previous, ghFn) => {
 
 test('only verified no-change authorized review threads with evidence are closed as refuted', () => {
   assert.deepEqual(refutedThreads(refutedResult(), refutedTask).map((item) => item.threadId), ['PRRT_p1', 'PRRT_g1']);
-  for (const extra of [{ status: 'waiting-ci' }, { schemaVersion: 1 }, { dispatchId: 'other' }]) {
+  assert.deepEqual(refutedThreads(refutedResult({ status: 'waiting-ci' }), refutedTask).map((item) => item.threadId), ['PRRT_p1', 'PRRT_g1']);
+  for (const extra of [{ schemaVersion: 1 }, { dispatchId: 'other' }]) {
     assert.deepEqual(refutedThreads(refutedResult(extra), refutedTask), []);
   }
 });

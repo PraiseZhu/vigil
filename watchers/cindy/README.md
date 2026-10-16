@@ -25,7 +25,7 @@ cron 的无状态脚本,而是专门为 Cindy 桌面端的调度器("script 模�
 
 Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为已处理,不再据此派发修复
 (混合优先级评论不会被这套工具自动 resolve);`resolved → unresolved` 的高优先级 thread
-会重新进入待处理队列。工具自己只在两种情况下 resolve:整条 thread 都是可信 Bot 的 P3;或修复会话
+会重新进入待处理队列。工具自己只在两种情况下 resolve:整条 thread 都是可信 Bot 的 P2/P3;或修复会话
 核实某条必修意见不成立(已验证完成的结果里该 key 为 `no-change` 且附证据),此时带证据回复后关闭,
 没有证据的不关,权限不足时只降级报告、不重复回复。
 
@@ -33,8 +33,8 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 
 - 作者自己的 PR 转 Ready 后下一轮就接手,不要求必需检查先绿:CI 失败和冲突直接成为修复反馈。
 - 维护者(OWNER/MEMBER/COLLABORATOR)、作者本人和已知代码审查应用(`REVIEW_APPS`)留的 review thread
-  交修复会话按 REVIEW.md 分级(`review-thread-triage`):必修才改,其余由 watcher 贴出会话的结论并 resolve。
-  其它应用的状态评论、没有自己必修项的 Greptile 汇总不再单独开会话。
+  交修复会话按 REVIEW.md 分级(`review-thread-triage`):确认成立的 P0/P1 才改代码,P2/P3 由 watcher 回复分级说明后 resolve。
+  其它应用的状态评论、没有自己必修项的 Greptile 汇总不再单独开会话。严重度未知或 Jev 不可用时按不成立记 no-change,不 blocked。
 - 修复会话 `prepare` 先对齐 watch 树:落后 fork 就快进,与 fork 分叉就把旧分支打 bundle 存进
   `_backup/` 后按 fork 重建。
 - 因环境原因 blocked(预检跑不起来、watch 树分叉、子代理路由被拒等,见 `INFRA_BLOCK_REASON`)的轮次退还轮次、
@@ -42,7 +42,11 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 - 终点仍是 `awaiting-maintainer-approval`:仓库要求有写权限的维护者批准并经合并队列合入,watcher 不代替审批。
 
 等 CI 的复查需要约 15–20 秒;剩余扫描预算不足 40 秒时不硬跑(硬跑会被超时杀掉、排在后面的 PR
-每轮同样失败),而是结束本轮并从该 PR 续扫,复查超时上限 60 秒。
+每轮同样失败),而是结束本轮并从该 PR 续扫,复查超时上限 60 秒。`waiting-ci` 不算在途:当前 head 出现新的必需 CI 失败、冲突或审查意见时,同一轮就会派新任务。被预算推迟的复查(`recheckDeferredAt`)下一轮即使指纹没变也会再查。
+
+补投只在该 dispatch 没有结果文件、且距最近 helper 活动或派发已超过 30 分钟时发生,上限仍为 3 次。helper 的 prepare / validate / finalize / blocked / recheck 都会刷新活动时间;validate 心跳跑在独立子进程,长跑期间至少每 60 秒一次(可用 `VIGIL_ACTIVITY_HEARTBEAT_MS` 覆盖)。session 写结果不抢 PR 状态锁,下一轮由 watcher 消费。无代码改动且当前 head 必需 CI 仍红时,会做一次带 DCO 的空提交重触发;第二次仍红按同因升级,不再无限重跑。`waiting-ci` 任务被新反馈取代时,旧任务已有证据的 thread 会等到后续 complete 或当前 head CI 全绿再回复并 resolve。通知队列用 `pending.lock` 串行读写。
+
+同因 blocked 不再原样重投,改为写一条升级通知(每个 PR、每个原因、每个 head 一次)。规则版本变化、新 head 或新反馈时仍会重投。可合并、同因升级、needs-human 这类事件写进 `state/notices/`,用 `bin/notify.mjs` 配独立调度发出,见 [`docs/operations.md`](../../docs/operations.md)。
 
 ## 配置:profile.mjs 的 fail-closed 机制
 
@@ -116,6 +120,9 @@ CINDY_WATCHER_MODE=poll CINDY_WATCHER_PR=<N> node bin/cindy-watcher.mjs --node-i
 node bin/cindy-repair.mjs <子命令> --home "$CINDY_WATCHER_HOME"
 
 node bin/cindy-ownership.mjs --repo makecindy/cindy --pr 123 --home "$CINDY_WATCHER_HOME"
+
+node bin/notify.mjs check --home "$CINDY_WATCHER_HOME"   # 有未发事件 exit 0,否则 2
+node bin/notify.mjs emit --home "$CINDY_WATCHER_HOME"    # 按 cindy-script/1 发出并标记已发
 ```
 
 ## 运行锁与 lock-doctor
