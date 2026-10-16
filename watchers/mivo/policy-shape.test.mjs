@@ -75,3 +75,30 @@ test('a job claiming a later attempt than its workflow run is still rejected', (
   assert.equal(ci.status, 'unknown');
   assert.match(ci.reason, /attempt mismatch/);
 });
+
+// The real #1002 shape: the jobs a partial re-run skipped are copied into the new attempt with new check ids and the
+// same timestamps. Same-time checks from different runs stay ambiguous.
+function copiesGh(secondRun) {
+  const base = ciGh(1, 2);
+  const check = (id, job, run) => ({ id, name: 'verify', head_sha: HEAD, app: { id: 15368, slug: 'github-actions' }, status: 'completed',
+    conclusion: 'success', started_at: '2026-10-15T10:00:00Z', details_url: `https://github.com/${REPO}/actions/runs/${run}/job/${job}` });
+  const jobs = { 200: [100, 1], 201: [secondRun, secondRun === 100 ? 2 : 1] };
+  return (args) => {
+    const endpoint = args[1];
+    if (endpoint === `repos/${REPO}/commits/${HEAD}/check-runs?per_page=100&filter=all`) return JSON.stringify([{ check_runs: [check(11, 200, 100), check(12, 201, secondRun)] }]);
+    const job = /actions\/jobs\/(\d+)$/.exec(endpoint ?? '');
+    if (job) { const [run, attempt] = jobs[job[1]]; return JSON.stringify({ id: Number(job[1]), run_id: run, head_sha: HEAD, run_attempt: attempt,
+      check_run_url: `https://api.github.com/repos/${REPO}/check-runs/${job[1] === '200' ? 11 : 12}` }); }
+    const run = /actions\/runs\/(\d+)$/.exec(endpoint ?? '');
+    if (run) return JSON.stringify({ id: Number(run[1]), repository: { full_name: REPO }, head_sha: HEAD, run_attempt: run[1] === '100' ? 2 : 1 });
+    return base(args);
+  };
+}
+
+test('a re-run copy of a skipped job is the later attempt, not an ambiguous check', () => {
+  const ci = collectMivoCiSync({ pr, ghFn: copiesGh(100) });
+  assert.equal(ci.status, 'green', JSON.stringify(ci.required));
+  assert.equal(ci.required[0].evidence.attempt, 2);
+  const other = collectMivoCiSync({ pr, ghFn: copiesGh(101) });
+  assert.equal(other.required[0].reason, 'ambiguous-check-attempt');
+});
