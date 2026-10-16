@@ -34,8 +34,10 @@ export function* collectMivoCiSteps({ pr, ghFn }) {
       if (!runs.has(runId)) runs.set(runId, parse(yield () => ghFn(['api', `repos/${pr.repo}/actions/runs/${runId}`])));
       const run = runs.get(runId);
       check(run.id === Number(runId) && run.repository?.full_name === pr.repo && run.head_sha === pr.headRefOid
-        && job.run_attempt === run.run_attempt, 'Actions workflow/head/attempt mismatch');
-      Object.assign(item, { workflowHeadSha: run.head_sha, runId: run.id, runAttempt: run.run_attempt });
+        // A partial re-run (gh run rerun --failed) bumps the run's attempt, but jobs that were not re-run keep the
+        // attempt that produced their check, so the job's attempt may be lower (2026-10-16: #1002 stayed unknown for 17 h).
+        && Number.isSafeInteger(job.run_attempt) && job.run_attempt >= 1 && job.run_attempt <= run.run_attempt, 'Actions workflow/head/attempt mismatch');
+      Object.assign(item, { workflowHeadSha: run.head_sha, runId: run.id, runAttempt: job.run_attempt });
     }
     const statusPages = parse(yield () => ghFn(['api', `repos/${pr.repo}/commits/${pr.headRefOid}/statuses?per_page=100`, '--paginate', '--slurp']));
     check(Array.isArray(statusPages) && statusPages.every(Array.isArray), 'status pagination incomplete');

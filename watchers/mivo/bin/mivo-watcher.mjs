@@ -1085,6 +1085,18 @@ function hasUnconsumedResult(previous, paths) {
 }
 const RECHECK_MIN_BUDGET_MS = 40000;
 const RECHECK_TIMEOUT_MS = 60000;
+// A recheck that could not read CI (missing evidence, CI unknown) leaves the task waiting-ci, and once CI has finished nothing
+// on GitHub changes, so the fingerprint never moves and the task is never rechecked again. Recheck such a task on its own,
+// at most every 5 minutes; pending or failing CI already moves the fingerprint (2026-10-16: #1002 stuck for 17 h).
+export const CI_UNKNOWN_RECHECK_MS = 5 * 60 * 1000;
+export function ciUnknownRecheckDue(previous, paths, now) {
+  const active = previous?.activeTask;
+  if (active?.status !== 'waiting-ci' || active.evidenceVersion !== 2) return false;
+  let result;
+  try { result = resultFor(previous, paths); } catch { return false; }
+  if (!result?.ci?.missing?.length) return false;
+  return !(Date.parse(now) - Date.parse(active.observedAt ?? 0) < CI_UNKNOWN_RECHECK_MS);
+}
 function consumeResult(previous, result, now) {
   if (!result) return previous;
   // A result written before the author reclaimed the PR must not revive the superseded task.
@@ -2064,7 +2076,7 @@ export function* pollWorkflow({
     && previous.lastException.escalated !== true;
   if (previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry && !normalized.overflow
     && !hasUnconsumedResult(previous, paths) && !needsCiRecheck(previous.activeTask) && !previous.recheckDeferredAt
-    && !keelReopenDue && !intentMigrationDue && !escalateDue) {
+    && !keelReopenDue && !intentMigrationDue && !escalateDue && !ciUnknownRecheckDue(previous, paths, now)) {
     // A pushed HEAD is still waiting for its in-flight result. GitHub itself has
     // not changed, so skip collection, but keep reporting the wait until it expires.
     if (previous.headChangeSince && Date.parse(now) - Date.parse(previous.headChangeSince) < HEAD_CHANGE_WAIT_MS) {

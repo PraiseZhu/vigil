@@ -138,9 +138,13 @@ export function evaluateCindyCi({ policy, headSha, checks = [], statuses = [] })
     if (candidates.some((item) => !item.id || !Number.isFinite(Date.parse(item.time)))) return result('unknown', 'unorderable-check-evidence');
     const producers = new Set(candidates.map((item) => `${item.kind}:${item.producer ?? item.creator?.id ?? 'unknown'}`));
     if (producers.size !== 1) return result('unknown', 'ambiguous-check-producer');
-    candidates.sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
+    candidates.sort((a, b) => Date.parse(b.time) - Date.parse(a.time) || (b.runAttempt ?? 0) - (a.runAttempt ?? 0));
     const latest = candidates[0];
-    if (candidates[1] && Date.parse(latest.time) === Date.parse(candidates[1].time) && latest.id !== candidates[1].id) return result('unknown', 'ambiguous-check-attempt');
+    // A partial re-run copies the jobs it did not re-run into the new attempt: same run, same times, a new check id.
+    // That copy is not ambiguous; the later attempt is the evidence (2026-10-16: #1002 stayed unknown).
+    const tied = candidates[1] && Date.parse(latest.time) === Date.parse(candidates[1].time) && latest.id !== candidates[1].id;
+    const rerunCopy = tied && latest.runId != null && latest.runId === candidates[1].runId && latest.runAttempt > candidates[1].runAttempt;
+    if (tied && !rerunCopy) return result('unknown', 'ambiguous-check-attempt');
     if (latest.isActions && latest.workflowHead !== headSha) return result('unknown', 'workflow-head-unverified', latest);
     if (['QUEUED', 'IN_PROGRESS', 'PENDING', 'WAITING', 'REQUESTED'].includes(String(latest.status ?? latest.result).toUpperCase())) return result('pending', 'required-check-pending', latest);
     if (String(latest.result).toUpperCase() === 'SUCCESS' && (latest.kind === 'status' || String(latest.status).toUpperCase() === 'COMPLETED')) return result('green', 'required-check-success', latest);

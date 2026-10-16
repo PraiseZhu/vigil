@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 import { feedbackRepairPolicy, isMemberThread } from './bin/mivo-feedback-policy.mjs';
 import { refutedThreads, closeRefutedThreads } from './bin/mivo-review-resolve.mjs';
 import { implicitHandoff, isCurrentHandoff } from './bin/mivo-handoff.mjs';
+import { ciUnknownRecheckDue, watcherPaths } from './bin/mivo-watcher.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const HEAD = 'a'.repeat(40);
 const thread = (extra) => ({ source: 'thread', threadId: 'PRRT_example', nativeId: 'PRRT_example:1', sha: HEAD,
@@ -91,4 +95,24 @@ test('a member thread graded no-change is answered and resolved, together with t
   assert.equal(calls.filter(args => args.some(arg => String(arg).includes('addPullRequestReviewThreadReply'))).length, 1, 'answered once');
   assert.match(calls[0].find(arg => arg.startsWith('body=')), /产品意图/);
   assert.equal(next.value.previous.autoClosedThreads.PRRT_mixed.reason, 'member-thread-no-change');
+});
+
+// 2026-10-16: #1002 kept a recheck result that could not read CI; its CI had finished, nothing on GitHub changed again, and
+// the watcher never rechecked it, so the task stayed waiting-ci (and blocked new feedback) for 17 hours.
+test('a waiting-ci task whose last recheck could not read CI is rechecked on its own, at most every 5 minutes', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-ci-unknown-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const paths = watcherPaths(home);
+  fs.mkdirSync(path.join(paths.stateDir, 'results'), { recursive: true });
+  const write = (missing) => fs.writeFileSync(path.join(paths.stateDir, 'results', 'task-1.json'), JSON.stringify({
+    dispatchId: 'task-1', nodeId: 'PR_1', sessionId: 'session-1', status: 'waiting-ci', ci: { missing, pending: [] } }));
+  const entry = (observedAt, status = 'waiting-ci') => ({ nodeId: 'PR_1', sessionId: 'session-1',
+    activeTask: { dispatchId: 'task-1', status, evidenceVersion: 2, observedAt } });
+  const now = '2026-10-16T10:30:00Z';
+  write(['required-policy-unknown']);
+  assert.equal(ciUnknownRecheckDue(entry('2026-10-15T17:24:00Z'), paths, now), true);
+  assert.equal(ciUnknownRecheckDue(entry('2026-10-16T10:27:00Z'), paths, now), false, 'rechecked 3 minutes ago');
+  assert.equal(ciUnknownRecheckDue(entry('2026-10-15T17:24:00Z', 'complete'), paths, now), false);
+  write([]);
+  assert.equal(ciUnknownRecheckDue(entry('2026-10-15T17:24:00Z'), paths, now), false, 'pending or failing CI moves the fingerprint itself');
 });
