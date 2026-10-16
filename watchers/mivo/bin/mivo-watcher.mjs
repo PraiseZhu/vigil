@@ -15,7 +15,7 @@ import { selectHandoff, isCurrentHandoff, implicitHandoff } from './mivo-handoff
 import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './mivo-state.mjs';
 import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor } from './mivo-feedback-policy.mjs';
 import {lifelineFeedback} from './mivo-lifeline-source.mjs';
-import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems } from './mivo-review-resolve.mjs';
+import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent } from './mivo-review-resolve.mjs';
 import { autoCleanupWatch, command as gitDefaultFn, KEEL_FLOW_VERSION, keelRunIdFor, readActivityAt } from './mivo-repair.mjs';
 import { enqueueNotice } from './notify.mjs';
 import { requireConfig } from './profile.mjs';
@@ -1044,10 +1044,7 @@ function dropWaitingCiRevisionFlips(fresh, previous, paths) {
   return fresh.filter((item) => {
     if (item.source === 'ci' || item.source === 'conflict') return true;
     const original = prior.get(item.key);
-    if (!original) return true;
-    if (original.contentHash && item.contentHash && original.contentHash !== item.contentHash) return true;
-    if (typeof original.body === 'string' && typeof item.body === 'string' && original.body !== item.body) return true;
-    return false;
+    return !original || !sameFeedbackContent(original, item);
   });
 }
 function coveredPendingClose(items, observed, paths) {
@@ -1673,14 +1670,16 @@ export function* processPr({
     && previous.activeTask?.status !== 'waiting-ci' && !terminal
     ? readTaskForRecovery(previous, paths, now) : null;
   const blockedTask = readDispatchTask(paths, previous.activeTask?.dispatchId);
-  const blockedKeys = new Set((blockedTask.feedback ?? []).map((item) => item?.key).filter(Boolean));
+  const blockedItems = new Map((blockedTask.feedback ?? []).filter((item) => item?.key).map((item) => [item.key, item]));
+  // "Same batch" means the same comments with the same words; an edit is new feedback.
+  const inBlockedBatch = (item) => blockedItems.has(item.key) && sameFeedbackContent(blockedItems.get(item.key), item);
   const sameBlockedCause = previous.eligibility === 'blocked'
     && previous.activeTask?.status === 'blocked'
     && (previous.activeTask.head ?? previous.activeTask.sourceHead) === pr.headRefOid
     && previous.activeTask.blockedKind === 'external'
     && (previous.rulesVersion == null || previous.rulesVersion === rulesVersion())
     && fresh.length > 0
-    && fresh.every((item) => blockedKeys.has(item.key));
+    && fresh.every(inBlockedBatch);
   if (sameBlockedCause) {
     queueHumanNotice(paths.home, {
       kind: 'blocked-escalate', number: pr.number, url: pr.url, head: pr.headRefOid,
@@ -2224,6 +2223,8 @@ function* discoverOnePr(pr, ctx) {
     previous, key, paths, now, dryRun, dispatchFn, remaining, pr,
   });
   if (previous.needsHuman) {
+    // The resident discover loop stops here, so this is where the person has to hear about it.
+    queueHumanNotice(paths.home, { kind: previous.needsHuman.reason ?? 'needs-human', number: pr.number, url: pr.url, head: pr.headRefOid }, dryRun);
     report.push({ number: pr.number, nodeId: key, needsHuman: previous.needsHuman, dispatch: { attempted: false, reason: 'needs-human' } });
     return done();
   }
@@ -2400,6 +2401,7 @@ function* discoverOnePr(pr, ctx) {
       needsHuman: { reason: 'owner-unknown', at: now, abandonedDispatchId: previous.pendingDispatch.dispatchId },
     };
     writePr(paths.home, key, previous);
+    queueHumanNotice(paths.home, { kind: 'owner-unknown', number: pr.number, url: pr.url, head: pr.headRefOid }, dryRun);
     report.push({ number: pr.number, nodeId: key, needsHuman: previous.needsHuman, dispatch: { attempted: false, reason: 'needs-human' } });
     return done();
   }

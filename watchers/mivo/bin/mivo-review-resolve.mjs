@@ -80,17 +80,26 @@ export function refutedThreads(result, task) {
 export function fixedThreads(result, task) {
   return completeCodeFixThreads(result, task, { disposition: 'fixed', scStatus: 'pass', kind: 'fixed' });
 }
+// Same comment key, same wording: a reviewer can edit a comment in place, keeping its id.
+// Older task files carry no snapshot; they compare as unchanged, as before.
+export function sameFeedbackContent(original, current) {
+  if (!original || !current) return true;
+  if (original.contentHash && current.contentHash) return original.contentHash === current.contentHash;
+  if (typeof original.body === 'string' && typeof current.body === 'string') return original.body === current.body;
+  return true;
+}
 // Resolving closes the whole thread, so every open external comment observed on it now must
-// belong to the completed task. A reply added while the repair ran keeps the thread open and
-// goes through normal dispatch instead of being resolved on another comment's evidence.
+// belong to the completed task, unedited since the task saw it. A reply added or a comment
+// edited while the repair ran keeps the thread open and goes through normal dispatch instead
+// of being resolved on evidence written for different words.
 export function coveredThreadItems(items = [], observed = [], task = {}) {
-  const taskKeys = new Set((task?.feedback ?? []).map((item) => item?.key).filter((key) => typeof key === 'string'));
+  const taskItems = new Map((task?.feedback ?? []).filter((item) => typeof item?.key === 'string').map((item) => [item.key, item]));
   const closeKeys = new Set(items.map((item) => item?.key).filter(Boolean));
   return items.filter((item) => observed
     .filter((other) => other?.threadId === item.threadId && other.actionable !== false)
     .every((other) => {
       const key = `${other.source}:${other.nativeId}`;
-      return taskKeys.has(key) && closeKeys.has(key);
+      return taskItems.has(key) && closeKeys.has(key) && sameFeedbackContent(taskItems.get(key), other);
     }));
 }
 function sanitizeEvidence(evidence) {

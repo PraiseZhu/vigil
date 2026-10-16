@@ -13,7 +13,7 @@ import { collectCindyReview } from './cindy-review-status.mjs';
 import { collectPrSnapshot, collectPrOwnership } from './cindy-pr-snapshot.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, DEPLOY_LOCK_NAME, inspectLocks, listPrs, lockStatus, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './cindy-state.mjs';
 import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor, normalizeActorLogin } from './cindy-feedback-policy.mjs';
-import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems } from './cindy-review-resolve.mjs';
+import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent } from './cindy-review-resolve.mjs';
 import {
   autoCleanupWatch, command as gitDefaultFn, KEEL_FLOW_VERSION, keelRunIdFor, readActivityAt,
 } from './cindy-repair.mjs';
@@ -582,7 +582,7 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       '审查与 e2e 用子代理（subagent），不要用 Orca Worker，禁止 create_worker / create_workers。',
       '只改本 PR 必需代码+测试。不合并、不开 auto-merge、不删远端分支、不改 CI 配置、不请求/代替维护者审批。给人看的回复先说人话：发生了什么 / 对本 PR 意味着什么 / 改了什么。',
       '整体目标是按逐项权限处理本批反馈；获准修复才提交并 push fork，P2/P3 只说明暂不修，未知严重度在会话里核实，确认不了的按不成立记 no-change，不以回复冒充修复。required CI 通过或记录外部阻塞。',
-      '必须项红：不许 gh run rerun。先读 job 日志分类；与本 PR 相关则修代码；判定 flaky/外部则每个 head SHA 最多一次空提交（git commit -s --allow-empty）重触发，仍红则 blocked。可选 check 不当必修。',
+      '必须项红：不许 gh run rerun。先读 job 日志分类；与本 PR 相关则修代码；判定 flaky/外部时不要自己做空提交，记 SC=no-change 按 helper finalize 收口，helper 会对同一 head 只用一次签名空提交重触发，仍红由 watcher 升级通知。可选 check 不当必修。',
       '维护者、作者本人或代码审查应用留的 review thread（repairPolicy 里 reason=review-thread-triage）：先按仓库 REVIEW.md 的统一分级判定，拿不准用 Jev。确认必修（评论 P0/P1）才改代码，SC=pass，修完回复人话并 resolve；建议、提问或不成立记 SC=no-change，evidence 第一条写一句给评论人看的人话结论（发生了什么 / 对本 PR 意味着什么 / 要不要改代码），watcher 会贴到该 thread 并 resolve。不要以「严重度未知」blocked 这类项。',
       'Greptile / github-actions[bot]：只修复核成立的 P0/P1；P2/P3 reply-only。自动回复+resolve 作用于可信来源且已定级为 P2/P3 的 thread。回复/resolve 遇到 403 只在会话内报告，不让整轮失败。混合/未知严重度 needs-triage，在会话里核实后确认不了就 no-change。修复不设轮次上限，一直推进到可合并；冲突处理 = fetch upstream main 后 merge 进 PR 分支再 push fork，不 rebase/force push，绝不 push 到 makecindy/cindy。',
       ...(taskPath ? [
@@ -946,10 +946,7 @@ function dropWaitingCiRevisionFlips(fresh, previous, paths) {
   return fresh.filter((item) => {
     if (item.source === 'ci' || item.source === 'conflict') return true;
     const original = prior.get(item.key);
-    if (!original) return true;
-    if (original.contentHash && item.contentHash && original.contentHash !== item.contentHash) return true;
-    if (typeof original.body === 'string' && typeof item.body === 'string' && original.body !== item.body) return true;
-    return false;
+    return !original || !sameFeedbackContent(original, item);
   });
 }
 function coveredPendingClose(items, observed, paths) {
@@ -1423,14 +1420,16 @@ export function* processPr({
     && previous.activeTask?.status !== 'waiting-ci' && !terminal
     ? readTaskForRecovery(previous, paths, now) : null;
   const blockedTask = readDispatchTask(paths, previous.activeTask?.dispatchId);
-  const blockedKeys = new Set((blockedTask.feedback ?? []).map((item) => item?.key).filter(Boolean));
+  const blockedItems = new Map((blockedTask.feedback ?? []).filter((item) => item?.key).map((item) => [item.key, item]));
+  // "Same batch" means the same comments with the same words; an edit is new feedback.
+  const inBlockedBatch = (item) => blockedItems.has(item.key) && sameFeedbackContent(blockedItems.get(item.key), item);
   const sameBlockedCause = previous.eligibility === 'blocked'
     && previous.activeTask?.status === 'blocked'
     && (previous.activeTask.head ?? previous.activeTask.sourceHead) === pr.headRefOid
     && previous.activeTask.blockedKind === 'external'
     && (previous.rulesVersion == null || previous.rulesVersion === rulesVersion())
     && fresh.length > 0
-    && fresh.every((item) => blockedKeys.has(item.key));
+    && fresh.every(inBlockedBatch);
   if (sameBlockedCause) {
     queueHumanNotice(paths.home, {
       kind: 'blocked-escalate', number: pr.number, url: pr.url, head: pr.headRefOid,
@@ -1947,6 +1946,8 @@ function* discoverOnePr(pr, ctx) {
     previous, key, paths, now, dryRun, dispatchFn, remaining, pr,
   });
   if (previous.needsHuman) {
+    // The resident discover loop stops here, so this is where the person has to hear about it.
+    queueHumanNotice(paths.home, { kind: previous.needsHuman.reason ?? 'needs-human', number: pr.number, url: pr.url, head: pr.headRefOid }, dryRun);
     report.push({ number: pr.number, nodeId: key, needsHuman: previous.needsHuman, dispatch: { attempted: false, reason: 'needs-human' } });
     return done();
   }
@@ -2117,6 +2118,7 @@ function* discoverOnePr(pr, ctx) {
       needsHuman: { reason: 'owner-unknown', at: now, abandonedDispatchId: previous.pendingDispatch.dispatchId },
     };
     writePr(paths.home, key, previous);
+    queueHumanNotice(paths.home, { kind: 'owner-unknown', number: pr.number, url: pr.url, head: pr.headRefOid }, dryRun);
     report.push({ number: pr.number, nodeId: key, needsHuman: previous.needsHuman, dispatch: { attempted: false, reason: 'needs-human' } });
     return done();
   }

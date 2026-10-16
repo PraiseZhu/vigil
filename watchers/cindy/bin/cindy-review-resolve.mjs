@@ -128,14 +128,24 @@ export function refutedThreads(result, task) {
 export function fixedThreads(result, task) {
   return completeCodeFixThreads(result, task, { disposition: 'fixed', scStatus: 'pass', kind: 'fixed' });
 }
+// Same comment key, same wording: a reviewer can edit a comment in place, keeping its id.
+// Older task files carry no snapshot; they compare as unchanged, as before.
+export function sameFeedbackContent(original, current) {
+  if (!original || !current) return true;
+  if (original.contentHash && current.contentHash) return original.contentHash === current.contentHash;
+  if (typeof original.body === 'string' && typeof current.body === 'string') return original.body === current.body;
+  return true;
+}
+// Every open external comment on the thread must belong to the task, unedited since the task
+// saw it; otherwise evidence written for other words would resolve it.
 export function coveredThreadItems(items = [], observed = [], task = {}) {
-  const taskKeys = new Set((task?.feedback ?? []).map((item) => item?.key).filter((key) => typeof key === 'string'));
+  const taskItems = new Map((task?.feedback ?? []).filter((item) => typeof item?.key === 'string').map((item) => [item.key, item]));
   const closeKeys = new Set(items.map((item) => item?.key).filter(Boolean));
   return items.filter((item) => observed
     .filter((other) => other?.threadId === item.threadId && other.actionable !== false)
     .every((other) => {
       const key = `${other.source}:${other.nativeId}`;
-      return taskKeys.has(key) && closeKeys.has(key);
+      return taskItems.has(key) && closeKeys.has(key) && sameFeedbackContent(taskItems.get(key), other);
     }));
 }
 // A thread from a maintainer, the author or a review app that the session graded as not needing code.

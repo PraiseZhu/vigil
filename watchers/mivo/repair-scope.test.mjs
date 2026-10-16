@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { assertOwner, finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/mivo-repair.mjs';
 import { writePr } from './bin/mivo-state.mjs';
 import { ownershipGh } from './ownership-gh.fixture.mjs';
@@ -108,7 +108,8 @@ function fixture(t, { changed = true } = {}) {
     if (String(endpoint).startsWith(`repos/${REPO}/commits/${remoteHead}/check-runs`)) {
       const conclusion = ciConclusion();
       return JSON.stringify([{ check_runs: [{
-        id: 101, name: 'verify', head_sha: remoteHead, status: 'completed', conclusion,
+        id: 101, name: 'verify', head_sha: remoteHead,
+        status: conclusion === 'pending' ? 'in_progress' : 'completed', conclusion: conclusion === 'pending' ? null : conclusion,
         started_at: '2026-09-29T00:00:00Z', app: { id: 123, slug: 'github-actions' },
         details_url: `https://github.com/${REPO}/actions/runs/555/job/101`,
       }] }]);
@@ -276,6 +277,57 @@ test('R4 replacing a required-CI task on the same head must not retrigger again'
   assert.equal(second.status, 'blocked');
   assert.equal(second.blockedKind, 'external');
   assert.equal(f.ghCalls.filter((args) => args[0] === 'run' && args[1] === 'rerun').length, 1);
+});
+
+test('R3-4 a repeated finalize while the rerun is pending keeps the one-retry quota for the head', (t) => {
+  const f = fixture(t, { changed: false });
+  f.saveTask([finding('P2')]);
+  f.report([f.sc('no-change', ['thread:P2'])]);
+  const reruns = () => f.ghCalls.filter((args) => args[0] === 'run' && args[1] === 'rerun').length;
+  f.setCiConclusion('failure');
+  assert.equal(f.finalize().status, 'waiting-ci');
+  assert.equal(reruns(), 1);
+  f.setCiConclusion('pending');
+  const pending = f.finalize();
+  assert.equal(pending.status, 'waiting-ci');
+  assert.equal(pending.ciRetrigger?.method, 'gh-rerun', 'a later receipt must keep the recorded retrigger');
+  f.setCiConclusion('failure');
+  const again = f.finalize();
+  assert.equal(again.status, 'blocked');
+  assert.equal(again.blockedKind, 'external');
+  assert.equal(reruns(), 1, 'the same head must not be rerun twice');
+});
+
+test('R3-4 the retrigger quota survives a lost result file for the same head', (t) => {
+  const f = fixture(t, { changed: false });
+  f.saveTask([finding('P2')]);
+  f.report([f.sc('no-change', ['thread:P2'])]);
+  f.setCiConclusion('failure');
+  assert.equal(f.finalize().status, 'waiting-ci');
+  fs.rmSync(path.join(f.paths.results, `${f.task.dispatchId}.json`));
+  const again = f.finalize();
+  assert.equal(again.status, 'blocked');
+  assert.equal(f.ghCalls.filter((args) => args[0] === 'run' && args[1] === 'rerun').length, 1);
+});
+
+test('R3-2 the validate heartbeat stops once its helper process is gone', async (t) => {
+  const previous = process.env.VIGIL_ACTIVITY_HEARTBEAT_MS;
+  process.env.VIGIL_ACTIVITY_HEARTBEAT_MS = '1000';
+  t.after(() => {
+    if (previous === undefined) delete process.env.VIGIL_ACTIVITY_HEARTBEAT_MS;
+    else process.env.VIGIL_ACTIVITY_HEARTBEAT_MS = previous;
+  });
+  const { startActivityHeartbeat } = await import(`./bin/mivo-repair.mjs?orphan=${Date.now()}`);
+  const f = fixture(t);
+  const file = path.join(f.paths.home, 'state', 'activity', `${f.task.dispatchId}.json`);
+  // A helper that dies without running its cleanup: the heartbeat watches this pid instead of ours.
+  const helper = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+  const deadPid = Number(helper.stdout);
+  startActivityHeartbeat(f.paths, f.task, 'validate', { parentPid: deadPid });
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+  const first = fs.readFileSync(file, 'utf8');
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2500);
+  assert.equal(fs.readFileSync(file, 'utf8'), first, 'an orphaned heartbeat must not keep the task looking active');
 });
 
 test('mixed task can fix P1 while explicitly leaving P2 unchanged', (t) => {

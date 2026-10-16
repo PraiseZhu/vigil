@@ -633,3 +633,48 @@ test('SC9 history line includes the finding file from the prior task when eviden
   const history = calls[0].message.split('\n').find((line) => line.startsWith('此前各轮已处理 finding：'));
   assert.match(history, /src\/leak\.ts/);
 });
+
+const editedOldThread = {
+  ...oldThread,
+  comments: [{ ...oldThread.comments[0], body: '**P1** correction: the leak also happens on the retry path', updatedAt: '2026-09-28T00:31:00Z' }],
+};
+
+test('R3-1 old waiting-ci evidence does not close a comment edited before CI turns green', (t) => {
+  const { home, paths } = seedWaitingCi(t);
+  const calls = [];
+  discover(paths, {
+    collect: () => collectBase({ threads: [editedOldThread] }),
+    dispatchFn: (params) => { calls.push(params); return { target_session_id: 'sess-790' }; },
+    recheckFn: () => ({}),
+  });
+  assert.equal(Boolean(readPr(home, nodeId).autoClosedThreads?.PRRT_old), false,
+    'evidence for the old body must not resolve the edited P1');
+  assert.equal(calls.length, 1, 'the edited P1 must be dispatched');
+  assert.match(calls[0].message, /retry path/);
+});
+
+test('R3-3 editing the blocked feedback is new feedback, not the same blocked cause', (t) => {
+  const { paths } = seedWaitingCi(t, {
+    status: 'blocked', blockedKind: 'external', reason: 'credential missing', coverage: false, consumeCursor: true,
+  });
+  const calls = [];
+  discover(paths, {
+    collect: () => collectBase({ threads: [editedOldThread], ci: { status: 'pending', required: [] } }),
+    dispatchFn: (params) => { calls.push(params); return { target_session_id: 'sess-790' }; },
+    recheckFn: () => ({}),
+  });
+  assert.equal(calls.length, 1, 'an edited comment after an external block must wake the session');
+});
+
+test('R3-5 discover queues one notice for a PR that needs a person', (t) => {
+  const { home, paths } = homeOf(t);
+  seedBound(paths, { needsHuman: { reason: 'owner-unknown', at: now } });
+  for (let i = 0; i < 2; i += 1) {
+    discover(paths, {
+      collect: () => collectBase(),
+      dispatchFn: () => { throw new Error('needs-human PR must not dispatch'); },
+    });
+  }
+  const events = pendingEvents(home).filter((event) => event.kind === 'owner-unknown');
+  assert.equal(events.length, 1, 'one notice per PR and state');
+});

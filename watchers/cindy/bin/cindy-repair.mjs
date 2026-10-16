@@ -139,13 +139,17 @@ export function readActivityAt(home, dispatchId) {
 function activityHeartbeatMs() {
   return Math.max(1_000, Number(process.env.VIGIL_ACTIVITY_HEARTBEAT_MS) || 60_000);
 }
-function startActivityHeartbeat(paths, task, op) {
+// The heartbeat outlives a blocked event loop, but not the helper: it follows parentPid and
+// exits once that process is gone, so a killed helper cannot keep a dead task looking busy.
+export function startActivityHeartbeat(paths, task, op, { parentPid = process.pid } = {}) {
   recordActivity(paths, task, op);
   const file = activityFile(paths, task.dispatchId);
   const child = spawn(process.execPath, ['-e', `
     const fs = require('fs');
     const path = ${JSON.stringify(file)};
+    const parentPid = ${JSON.stringify(parentPid)};
     const rec = () => {
+      try { process.kill(parentPid, 0); } catch (error) { if (error.code === 'ESRCH') process.exit(0); }
       try {
         const tmp = path + '.tmp-' + process.pid + '-' + Date.now();
         fs.mkdirSync(require('path').dirname(path), { recursive: true, mode: 0o700 });
@@ -798,8 +802,22 @@ function allNoChange(scs) {
   return Array.isArray(scs) && scs.length > 0 && scs.every((sc) => sc.status === 'no-change');
 }
 
+// One CI retrigger per PR head. The quota lives in its own file, keyed by the head it was
+// spent on, and is claimed before the push: a lost or overwritten result file, or a later
+// task on the same head, cannot hand it out again.
+function retriggerLedgerFile(paths, nodeId) {
+  return path.join(paths.home, 'state', 'ci-retrigger', `${encodeURIComponent(nodeId)}.json`);
+}
+function readRetriggerLedger(paths, nodeId) {
+  try { return JSON.parse(fs.readFileSync(retriggerLedgerFile(paths, nodeId), 'utf8')) ?? {}; } catch { return {}; }
+}
+function claimRetrigger(paths, task, record) {
+  atomicJson(retriggerLedgerFile(paths, task.nodeId), { ...readRetriggerLedger(paths, task.nodeId), [record.sourceHead]: record });
+}
 function priorCiRetrigger(paths, task, extra = null) {
   const matches = (record) => record && (record.sourceHead === task.headRefOid || record.head === task.headRefOid);
+  const ledger = Object.values(readRetriggerLedger(paths, task.nodeId)).find(matches);
+  if (ledger) return ledger;
   if (matches(extra?.ciRetrigger)) return extra.ciRetrigger;
   let names = [];
   try { names = fs.readdirSync(paths.results); } catch { return extra?.ciRetrigger ?? null; }
@@ -862,16 +880,28 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
       : 'all SCs are no-change and task, checkout and remote HEAD match' }
     : verifiedLocal(paths, task, sessionId, validatedHead, worktree, gitFn, validationReceipt, env);
   const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot, validatedHead, verification });
+  const prior = fs.existsSync(path.join(paths.results, `${task.dispatchId}.json`))
+    ? readJson(path.join(paths.results, `${task.dispatchId}.json`), 'repair result') : null;
+  const recorded = priorCiRetrigger(paths, task, prior);
+  // A session-made empty commit spends the same one-per-head quota, and is checked before it is pushed.
+  if (emptyRetrigger && recorded && recorded.head !== validatedHead) {
+    return saveResult(paths, task, sessionId, {
+      status: 'blocked', blockedKind: 'external',
+      reason: 'required CI still failed after one no-change empty-commit retrigger; the extra empty commit was not pushed',
+      head: task.headRefOid, scs, feedbackCoverage, keel, verification, checks: [], pushed: false, ciRetrigger: recorded,
+    });
+  }
+  const sessionRetrigger = emptyRetrigger && !recorded
+    ? { sourceHead: task.headRefOid, method: 'empty-commit', head: validatedHead, at: new Date().toISOString() } : null;
+  if (sessionRetrigger) claimRetrigger(paths, task, sessionRetrigger);
   const push = pushIfNeeded(worktree, task, validatedHead, branchHead, gitFn, originUrl);
   let ci;
   try { ci = checkStatus(task, validatedHead, ghFn); }
   catch (error) {
     return saveResult(paths, task, sessionId, { status: 'blocked', blockedKind: 'ci-transport', reason: error.message,
-      head: validatedHead, scs, feedbackCoverage, keel, verification, checks: [], pushed: push.pushed });
+      head: validatedHead, scs, feedbackCoverage, keel, verification, checks: [], pushed: push.pushed,
+      ...(sessionRetrigger ?? recorded ? { ciRetrigger: sessionRetrigger ?? recorded } : {}) });
   }
-  const prior = fs.existsSync(path.join(paths.results, `${task.dispatchId}.json`))
-    ? readJson(path.join(paths.results, `${task.dispatchId}.json`), 'repair result') : null;
-  const recorded = priorCiRetrigger(paths, task, prior);
   if (allNoChange(scs) && ciResult(ci).blockedKind === 'required-ci') {
     if (recorded) {
       return saveResult(paths, task, sessionId, {
@@ -885,17 +915,21 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
       gitOutput(['-C', worktree, '-c', 'commit.gpgsign=false', 'commit', '-s', '--allow-empty', '-m', 'ci: retrigger required checks'], gitFn);
       const retriggerHead = gitOutput(['-C', worktree, 'rev-parse', 'HEAD'], gitFn);
       assertDco(worktree, task.headRefOid, retriggerHead, gitFn);
+      const ciRetrigger = { sourceHead: task.headRefOid, method: 'empty-commit', head: retriggerHead, at: new Date().toISOString() };
+      // Spent before the push: if the push fails midway, a second attempt would be a second retrigger.
+      claimRetrigger(paths, task, ciRetrigger);
       const retriggerPush = pushIfNeeded(worktree, task, retriggerHead, validatedHead, gitFn, originUrl);
       return saveResult(paths, task, sessionId, {
         status: 'waiting-ci', reason: 'retried required CI once with a signed empty commit',
         head: retriggerHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks,
-        pushed: retriggerPush.pushed, ciRetrigger: { sourceHead: task.headRefOid, method: 'empty-commit', head: retriggerHead },
+        pushed: retriggerPush.pushed, ciRetrigger,
       });
     }
   }
+  const carried = sessionRetrigger ?? recorded;
   return saveResult(paths, task, sessionId, {
     ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed: push.pushed,
-    ...(emptyRetrigger ? { ciRetrigger: { sourceHead: task.headRefOid, method: 'empty-commit', head: validatedHead } } : {}),
+    ...(carried ? { ciRetrigger: carried } : {}),
   });
   });
 }
@@ -947,7 +981,7 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn =
       ci, checks: ci.requiredChecks, ciRetrigger: recorded,
     }, { requirePrLock: true });
   }
-  return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks, ...(previous.ciRetrigger ? { ciRetrigger: previous.ciRetrigger } : {}) }, { requirePrLock: true });
+  return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks, ...(recorded ? { ciRetrigger: recorded } : {}) }, { requirePrLock: true });
   });
 }
 

@@ -114,13 +114,17 @@ export function readActivityAt(home, dispatchId) {
 function activityHeartbeatMs() {
   return Math.max(1_000, Number(process.env.VIGIL_ACTIVITY_HEARTBEAT_MS) || 60_000);
 }
-function startActivityHeartbeat(paths, task, op) {
+// The heartbeat outlives a blocked event loop, but not the helper: it follows parentPid and
+// exits once that process is gone, so a killed helper cannot keep a dead task looking busy.
+export function startActivityHeartbeat(paths, task, op, { parentPid = process.pid } = {}) {
   recordActivity(paths, task, op);
   const file = activityFile(paths, task.dispatchId);
   const child = spawn(process.execPath, ['-e', `
     const fs = require('fs');
     const path = ${JSON.stringify(file)};
+    const parentPid = ${JSON.stringify(parentPid)};
     const rec = () => {
+      try { process.kill(parentPid, 0); } catch (error) { if (error.code === 'ESRCH') process.exit(0); }
       try {
         const tmp = path + '.tmp-' + process.pid + '-' + Date.now();
         fs.mkdirSync(require('path').dirname(path), { recursive: true, mode: 0o700 });
@@ -665,8 +669,22 @@ function allNoChange(scs) {
   return Array.isArray(scs) && scs.length > 0 && scs.every((sc) => sc.status === 'no-change');
 }
 
+// One CI retrigger per PR head. The quota lives in its own file, keyed by the head it was
+// spent on, and is claimed before the cloud action: a lost or overwritten result file, or a
+// later task on the same head, cannot hand it out again.
+function retriggerLedgerFile(paths, nodeId) {
+  return path.join(paths.home, 'state', 'ci-retrigger', `${encodeURIComponent(nodeId)}.json`);
+}
+function readRetriggerLedger(paths, nodeId) {
+  try { return JSON.parse(fs.readFileSync(retriggerLedgerFile(paths, nodeId), 'utf8')) ?? {}; } catch { return {}; }
+}
+function claimRetrigger(paths, task, record) {
+  atomicJson(retriggerLedgerFile(paths, task.nodeId), { ...readRetriggerLedger(paths, task.nodeId), [record.sourceHead]: record });
+}
 function priorCiRetrigger(paths, task, extra = null) {
   const matches = (record) => record && (record.sourceHead === task.headRefOid || record.head === task.headRefOid);
+  const ledger = Object.values(readRetriggerLedger(paths, task.nodeId)).find(matches);
+  if (ledger) return ledger;
   if (matches(extra?.ciRetrigger)) return extra.ciRetrigger;
   let names = [];
   try { names = fs.readdirSync(paths.results); } catch { return extra?.ciRetrigger ?? null; }
@@ -679,19 +697,18 @@ function priorCiRetrigger(paths, task, extra = null) {
   return extra?.ciRetrigger ?? null;
 }
 
-function retriggerRequiredCi({ task, ci, ghFn, previous, sourceHead }) {
+function retriggerRequiredCi({ paths, task, ci, ghFn, previous, sourceHead }) {
   const recorded = previous?.ciRetrigger;
   if (recorded && (recorded.sourceHead === sourceHead || recorded.head === task.headRefOid || recorded.sourceHead === task.headRefOid)) {
     return { retried: false, already: true, ciRetrigger: recorded };
   }
   const runIds = failedRunIds(ci);
   if (!runIds.length) return { retried: false };
-  const reruns = [];
-  for (const runId of runIds) {
-    ghFn(GH, ['run', 'rerun', runId, '--repo', task.repo, '--failed']);
-    reruns.push(runId);
-  }
-  return { retried: true, ciRetrigger: { sourceHead, method: 'gh-rerun', runIds: reruns } };
+  const ciRetrigger = { sourceHead, method: 'gh-rerun', runIds, at: new Date().toISOString() };
+  // Spent even if the rerun call fails: a second attempt would be a second retrigger.
+  claimRetrigger(paths, task, ciRetrigger);
+  for (const runId of runIds) ghFn(GH, ['run', 'rerun', runId, '--repo', task.repo, '--failed']);
+  return { retried: true, ciRetrigger };
 }
 
 export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, originUrl = remoteUrl(task.repo), guard) {
@@ -756,12 +773,13 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
       head: validatedHead, scs, feedbackCoverage, keel, verification, checks: [], pushed });
   }
   let extra = {};
+  const prior = fs.existsSync(path.join(paths.results, `${task.dispatchId}.json`))
+    ? readJson(path.join(paths.results, `${task.dispatchId}.json`), 'repair result') : null;
+  const recorded = priorCiRetrigger(paths, task, prior);
   if (noChange && ciResult(ci).blockedKind === 'required-ci') {
-    const prior = fs.existsSync(path.join(paths.results, `${task.dispatchId}.json`))
-      ? readJson(path.join(paths.results, `${task.dispatchId}.json`), 'repair result') : null;
     extra = retriggerRequiredCi({
-      task, ci, ghFn,
-      previous: { ciRetrigger: priorCiRetrigger(paths, task, prior) },
+      paths, task, ci, ghFn,
+      previous: { ciRetrigger: recorded },
       sourceHead: task.headRefOid,
     });
     if (extra.retried) return saveResult(paths, task, sessionId, {
@@ -774,7 +792,8 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
       head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed, ciRetrigger: extra.ciRetrigger,
     });
   }
-  return saveResult(paths, task, sessionId, { ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed, ...(extra.ciRetrigger ? { ciRetrigger: extra.ciRetrigger } : {}) });
+  const carried = extra.ciRetrigger ?? recorded;
+  return saveResult(paths, task, sessionId, { ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed, ...(carried ? { ciRetrigger: carried } : {}) });
 }
 
 export function recheck({ home, taskPath, validatedHead, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, originUrl = remoteUrl(REPO) } = {}) {
@@ -818,7 +837,7 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
   assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead: head, allowValidatedHead: true });
   if (allNoChange(scs) && ciResult(ci).blockedKind === 'required-ci') {
     const extra = retriggerRequiredCi({
-      task, ci, ghFn,
+      paths, task, ci, ghFn,
       previous: { ciRetrigger: priorCiRetrigger(paths, task, previous) },
       sourceHead: task.headRefOid,
     });
@@ -836,7 +855,8 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
       }, { requirePrLock: true });
     }
   }
-  return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks, ...(previous.ciRetrigger ? { ciRetrigger: previous.ciRetrigger } : {}) }, { requirePrLock: true });
+  const carried = priorCiRetrigger(paths, task, previous);
+  return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks, ...(carried ? { ciRetrigger: carried } : {}) }, { requirePrLock: true });
 }
 
 // Only what a session cannot settle itself blocks; product questions and untrue feedback are answered in the session.

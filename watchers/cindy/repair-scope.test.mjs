@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { apply, FILES, stateFingerprint, verify } from './deploy.mjs';
 import { finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/cindy-repair.mjs';
 import { acquireLock, DEPLOY_LOCK_NAME, helperLockName, HELPER_LOCK_NAME, lockStatus, writePr } from './bin/cindy-state.mjs';
@@ -266,6 +266,71 @@ test('R4 replacing a required-CI task on the same original head must not empty-c
   assert.equal(second.status, 'blocked');
   assert.equal(second.blockedKind, 'external');
   assert.equal(f.pushCalls.length, pushesAfterFirst);
+});
+
+const fixtureGit = (...args) => execFileSync('git', args, {
+  encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'],
+  env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
+}).trim();
+
+test('R3-4 a session-made empty commit after the retrigger was spent is not pushed', (t) => {
+  const f = fixture(t, { changed: false });
+  const ci = (head) => ({
+    key: 'ci:verify', source: 'ci', nativeId: 'verify', sha: head,
+    requiredFailure: { verified: true, status: 'failed', headSha: head },
+  });
+  f.saveTask([ci(f.sourceHead)]);
+  f.report([f.sc('no-change', ['ci:verify'])]);
+  f.setCiConclusion('failure');
+  assert.equal(f.finalize().status, 'waiting-ci');
+  const retriggerHead = f.remoteHead();
+  const pushesAfterFirst = f.pushCalls.length;
+  const task = { ...f.task, dispatchId: 'third-dispatch', headRefOid: retriggerHead, feedback: [ci(retriggerHead)] };
+  const taskPath = path.join(f.paths.tasks, 'third-dispatch.json');
+  fs.writeFileSync(taskPath, JSON.stringify(task));
+  writePr(f.paths.home, task.nodeId, { number: task.number, nodeId: task.nodeId, sessionId: task.sessionId,
+    activeTask: { dispatchId: task.dispatchId } });
+  // The session follows old guidance and makes a second signed empty commit by hand.
+  fixtureGit('-C', f.worktree, '-c', 'commit.gpgsign=false', 'commit', '-s', '--allow-empty', '-m', 'manual retrigger');
+  const manualHead = fixtureGit('-C', f.worktree, 'rev-parse', 'HEAD');
+  f.report([f.sc('no-change', ['ci:verify'])]);
+  const second = finalize({ ...f.options, taskPath, validatedHead: manualHead });
+  assert.equal(second.status, 'blocked');
+  assert.equal(second.blockedKind, 'external');
+  assert.equal(f.pushCalls.length, pushesAfterFirst, 'the second empty commit must not reach the fork');
+  assert.equal(f.remoteHead(), retriggerHead);
+});
+
+test('R3-4 the retrigger quota survives a lost result file for the same head', (t) => {
+  const f = fixture(t, { changed: false });
+  f.saveTask([finding('P3')]);
+  f.report([f.sc('no-change', ['thread:P3'])]);
+  f.setCiConclusion('failure');
+  assert.equal(f.finalize().status, 'waiting-ci');
+  const pushesAfterFirst = f.pushCalls.length;
+  fs.rmSync(path.join(f.paths.results, `${f.task.dispatchId}.json`));
+  const again = finalize({ ...f.options, validatedHead: f.remoteHead() });
+  assert.equal(again.status, 'blocked');
+  assert.equal(again.blockedKind, 'external');
+  assert.equal(f.pushCalls.length, pushesAfterFirst);
+});
+
+test('R3-2 the validate heartbeat stops once its helper process is gone', async (t) => {
+  const previous = process.env.VIGIL_ACTIVITY_HEARTBEAT_MS;
+  process.env.VIGIL_ACTIVITY_HEARTBEAT_MS = '1000';
+  t.after(() => {
+    if (previous === undefined) delete process.env.VIGIL_ACTIVITY_HEARTBEAT_MS;
+    else process.env.VIGIL_ACTIVITY_HEARTBEAT_MS = previous;
+  });
+  const { startActivityHeartbeat } = await import(`./bin/cindy-repair.mjs?orphan=${Date.now()}`);
+  const f = fixture(t);
+  const file = path.join(f.paths.home, 'state', 'activity', `${f.task.dispatchId}.json`);
+  const helper = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+  startActivityHeartbeat(f.paths, f.task, 'validate', { parentPid: Number(helper.stdout) });
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+  const first = fs.readFileSync(file, 'utf8');
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2500);
+  assert.equal(fs.readFileSync(file, 'utf8'), first, 'an orphaned heartbeat must not keep the task looking active');
 });
 
 test('mixed task can fix P1 while explicitly leaving P3 unchanged', (t) => {
