@@ -123,13 +123,34 @@ function assertIdentity(value, task, sessionId, label) {
   }
 }
 
-function saveResult(paths, task, sessionId, payload) {
+function activityFile(paths, dispatchId) {
+  return path.join(paths.home, 'state', 'activity', `${dispatchId}.json`);
+}
+export function recordActivity(paths, task, op, at = new Date().toISOString()) {
+  if (!task?.dispatchId) return;
+  atomicJson(activityFile(paths, task.dispatchId), { at, op, dispatchId: task.dispatchId });
+}
+export function readActivityAt(home, dispatchId) {
+  try {
+    const at = Date.parse(JSON.parse(fs.readFileSync(path.join(requireAbs(home, 'home'), 'state', 'activity', `${dispatchId}.json`), 'utf8'))?.at ?? '');
+    return Number.isFinite(at) ? at : null;
+  } catch { return null; }
+}
+function startActivityHeartbeat(paths, task, op) {
+  recordActivity(paths, task, op);
+  const timer = setInterval(() => { try { recordActivity(paths, task, op); } catch {} }, 60_000);
+  if (typeof timer.unref === 'function') timer.unref();
+  return () => clearInterval(timer);
+}
+
+function saveResult(paths, task, sessionId, payload, { requirePrLock = false } = {}) {
+  refuseDeployLock(paths.home);
+  recordActivity(paths, task, payload?.status ?? 'result');
+  if (!requirePrLock) return saveResultLocked(paths, task, sessionId, payload);
   const lock = acquireLock(paths.home, `pr-${task.nodeId}`);
   if (lock.held) fail('PR 状态锁占用，请稍后重试写结果');
-  try {
-    refuseDeployLock(paths.home);
-    return saveResultLocked(paths, task, sessionId, payload);
-  } finally { lock.release(); }
+  try { return saveResultLocked(paths, task, sessionId, payload); }
+  finally { lock.release(); }
 }
 function saveResultLocked(paths, task, sessionId, payload) {
   const latest = path.join(paths.results, `${task.dispatchId}.json`);
@@ -483,6 +504,7 @@ export function alignWatchWorktree({ task, checkout, remoteHead, gitFn = command
 export function prepare({ home, taskPath, ghFn = command, gitFn = command, cloneUrl, originUrl, viewer } = {}) {
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'prepare');
   const { sessionId } = boundSession(paths, task);
   const headRepo = resolveHeadRepo(task);
   const headOwner = headRepo.split('/')[0];
@@ -564,7 +586,7 @@ function validationPolicy(_worktree, _task, _gitFn, env = process.env) {
 
 export function commitsMissingDco(worktree, fromSha, toSha, gitFn) {
   if (!isSha(fromSha) || !isSha(toSha) || fromSha === toSha) return [];
-  const raw = gitOutput(['-C', worktree, 'log', `${fromSha}..${toSha}`, '--format=%H%n%B%x1e'], gitFn);
+  const raw = gitOutput(['-C', worktree, 'log', '--no-merges', `${fromSha}..${toSha}`, '--format=%H%n%B%x1e'], gitFn);
   const missing = [];
   for (const entry of raw.split('\x1e')) {
     const text = entry.trim();
@@ -608,6 +630,8 @@ export function validate({ home, taskPath, validatedHead, gitFn = command, runFn
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
+  const stopHeartbeat = startActivityHeartbeat(paths, task, 'validate');
+  try {
   const { sessionId } = boundSession(paths, task);
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
   assertTaskRepairScope(task, validatedHead);
@@ -652,6 +676,7 @@ export function validate({ home, taskPath, validatedHead, gitFn = command, runFn
   const verification = { status, head: validatedHead, receiptPath, receiptSha256: hash(fs.readFileSync(receiptPath)) };
   atomicJson(validationPointer(paths, task, validatedHead), verification);
   return verification;
+  } finally { stopHeartbeat(); }
   });
 }
 
@@ -772,6 +797,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'finalize');
   const { sessionId } = boundSession(paths, task);
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
   assertTaskRepairScope(task, validatedHead);
@@ -808,6 +834,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
 export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn = command, originUrl, env = process.env } = {}) {
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'recheck');
   originUrl = originUrl ?? githubRepoUrl(resolveHeadRepo(task));
   const { sessionId } = boundSession(paths, task);
   const previous = readJson(path.join(paths.results, `${task.dispatchId}.json`), 'repair result');
@@ -834,21 +861,22 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn =
   const common = { head, scs, feedbackCoverage, keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
   if (remoteHead !== observedPrHead) {
     return saveResult(paths, task, sessionId, { ...common, status: 'waiting-ci', reason: 'GitHub PR and remote branch views differ', checks: [],
-      ci: { head, requiredGreen: false, requiredChecks: [], optionalFailures: [], pending: [], missing: ['github-remote-head-mismatch'] } });
+      ci: { head, requiredGreen: false, requiredChecks: [], optionalFailures: [], pending: [], missing: ['github-remote-head-mismatch'] } }, { requirePrLock: true });
   }
   if (remoteHead !== head) {
     return saveResult(paths, task, sessionId, { ...common, status: 'blocked', blockedKind: 'head-drift',
       reason: 'remote HEAD advanced independently; preserve local work and reconcile before validation', checks: [],
-      drift: { validatedHead: head, remoteHead, githubHead: observedPrHead, sourceHead: task.headRefOid } });
+      drift: { validatedHead: head, remoteHead, githubHead: observedPrHead, sourceHead: task.headRefOid } }, { requirePrLock: true });
   }
   const ci = checkStatus(task, head, ghFn);
-  return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks });
+  return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks }, { requirePrLock: true });
   });
 }
 
 export function blocked({ home, taskPath, reason, ghFn = command } = {}) {
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'blocked');
   const { sessionId } = boundSession(paths, task);
   if (typeof reason !== 'string' || !reason.trim()) fail('blocked reason is required');
   return saveResult(paths, task, sessionId, { status: 'blocked', blockedKind: 'external', reason: reason.trim(), worktree: taskWorktree(task) });

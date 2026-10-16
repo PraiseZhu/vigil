@@ -11,7 +11,7 @@ function orphanGuardsOf(home){
 }
 const here=path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_RUNTIME='/path/to/your/runtime/cindy-watcher';
-export const FILES=['cindy-feedback-policy.mjs','cindy-ci.mjs','cindy-pr-policy.mjs','cindy-pr-snapshot.mjs','cindy-repair.mjs','cindy-review-resolve.mjs','cindy-state.mjs','cindy-ownership.mjs','cindy-watcher.mjs','cindy-review-status.mjs','session-title.mjs','profile.mjs','cindy-watch-script.py','protocol.py','session-title-maintenance.py'];
+export const FILES=['cindy-feedback-policy.mjs','cindy-ci.mjs','cindy-pr-policy.mjs','cindy-pr-snapshot.mjs','cindy-repair.mjs','cindy-review-resolve.mjs','cindy-state.mjs','cindy-ownership.mjs','cindy-watcher.mjs','cindy-review-status.mjs','notify.mjs','session-title.mjs','profile.mjs','cindy-watch-script.py','protocol.py','session-title-maintenance.py'];
 // Entry points actually spawned/imported directly by the runtime. Any relative import reachable
 // from these (transitively) must be listed in FILES, or the runtime will 500 on `import()` with
 // a healthy-looking manifest (2026-09-29 incident: cindy-review-resolve.mjs was imported by

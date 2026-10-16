@@ -1,13 +1,13 @@
 // Local repair authority. Comment bodies are evidence, never standing permission.
-// Cindy REVIEW.md: comment P1 = repo P0, comment P2 = repo P1 — both authorize code-fix.
-// P3 / ungraded / suggestions are reply-only.
+// Code-fix is only confirmed P0/P1. Comment P2/P3 are reply-only; the watcher
+// replies with the grading note and resolves, without opening a repair session.
 export const FEEDBACK_POLICY_VERSION = 1;
 const INFRA = new Set(['INCOMPLETE', 'CI-NOT-GREEN', 'SKIP-LLM', 'SKIP-LOCAL', 'REFUSE', 'WINDOW-CLOSED', 'PARSE-FAILED', 'HELPERS-MISSING', 'UNHEALTHY']);
 const aliases = { P0: 'P0', CRITICAL: 'P0', P1: 'P1', HIGH: 'P1', P2: 'P2', MEDIUM: 'P2', P3: 'P3', LOW: 'P3' };
 const TOKEN = '(P[0-3]|CRITICAL|HIGH|MEDIUM|LOW)';
 const severityHeading = new RegExp('^(?:#{1,6}\\s+)?(?:[-*+]\\s+|\\d+[.)]\\s+)?(?:🤖 自动 Review\\s*·\\s*)?(?:\\*\\*|\\[)?' + TOKEN + '(?:\\*\\*|\\])?(?=\\s|:|：|[-—–]|$)(.*)$', 'i');
 const verdictHeading = /^## 🤖 自动 Review 结论[：:]\s*(\S+)\s*$/m;
-const AUTHORIZED = new Set(['P0', 'P1', 'P2']);
+const AUTHORIZED = new Set(['P0', 'P1']);
 
 export function isBotActor(author) {
   if (author == null) return false;
@@ -147,8 +147,8 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
   if (mixedOnSameLine) return result('needs-triage', severities, 'mixed-severity-inseparable');
   if (authorized && p3) return result('code-fix', severities, 'mixed-severity-authorized-p3-no-change');
   if (summaryHigh && !authorized) return result('needs-triage', severities, 'high-summary-without-finding');
-  if (authorized) return result('code-fix', severities, 'explicit-p0-p2-finding');
-  if (p3) return result('reply-only', severities, 'p3-no-code-authority');
+  if (authorized) return result('code-fix', severities, 'explicit-p0-p1-finding');
+  if (p3 || severities.includes('P2')) return result('reply-only', severities, 'p2-p3-no-code-authority');
   // A Greptile overview scored 5/5 with no severity finding is a clean bill, not
   // a finding; its inline findings arrive as separate, graded items.
   if (/<!--\s*greptile_summary\s*-->/i.test(body) && /Confidence Score:\s*5\s*\/\s*5/i.test(body)) {

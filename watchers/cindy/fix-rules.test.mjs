@@ -22,8 +22,8 @@ test('classifyReviewFeedback REQUEST_CHANGES+P0 is actionable-fix', () => {
 test('classifyReviewFeedback REQUEST_CHANGES+P1 is actionable-fix', () => {
   assert.equal(classifyReviewFeedback(botItem(verdict('REQUEST_CHANGES', '**P1** `src/a.ts:2`'), { source: 'review' })), 'actionable-fix');
 });
-test('classifyReviewFeedback COMMENT only P2 is actionable-fix', () => {
-  assert.equal(classifyReviewFeedback(botItem(verdict('COMMENT', '**P2** `src/a.ts:3`'))), 'actionable-fix');
+test('classifyReviewFeedback COMMENT only P2 is reply-resolve', () => {
+  assert.equal(classifyReviewFeedback(botItem(verdict('COMMENT', '**P2** `src/a.ts:3`'))), 'reply-resolve');
 });
 test('classifyReviewFeedback P3 inline is reply-resolve', () => {
   assert.equal(classifyReviewFeedback(botItem('🤖 自动 Review · P3 unused export', { source: 'thread' })), 'reply-resolve');
@@ -39,8 +39,8 @@ const GREPTILE_BOT = { login: 'greptile-apps', __typename: 'Bot' };
 test('classifyReviewFeedback Greptile P1 is actionable-fix', () => {
   assert.equal(classifyReviewFeedback({ source: 'greptile', author: GREPTILE_BOT, body: 'P1: missing null check' }), 'actionable-fix');
 });
-test('classifyReviewFeedback Greptile P2 is actionable-fix', () => {
-  assert.equal(classifyReviewFeedback({ source: 'greptile', author: GREPTILE_BOT, body: 'P2: naming nit' }), 'actionable-fix');
+test('classifyReviewFeedback Greptile P2 is reply-resolve', () => {
+  assert.equal(classifyReviewFeedback({ source: 'greptile', author: GREPTILE_BOT, body: 'P2: naming nit' }), 'reply-resolve');
 });
 test('classifyReviewFeedback Greptile P3 is reply-resolve', () => {
   assert.equal(classifyReviewFeedback({ source: 'greptile', author: GREPTILE_BOT, body: 'P3: naming nit' }), 'reply-resolve');
@@ -551,16 +551,13 @@ test('P3-only feedback is closed by the script: no session turn, no task, cursor
   assert.equal(sent,0);
   assert.equal(again.prs[0].dispatch.reason,'no-new-feedback');
 });
-test('P2 next to P3 still dispatches and persists the frozen per-item authority', t=>{
+test('P2 next to P3 is closed by the script: no session turn, no task', t=>{
   const {paths,listed}=scanHome(t);
-  runScan(paths,listed,()=>({comments:[{id:92,user:BOT_USER,body:'**P3** nit',updatedAt:'t92'},{id:93,user:BOT_USER,body:'**P2** bug',updatedAt:'t93'}],mergeReady:false}),()=>({target_session_id:'s1'}));
-  const taskFiles=fs.readdirSync(path.join(paths.stateDir,'tasks')).filter(n=>n.endsWith('.json'));
-  assert.equal(taskFiles.length,1);
-  const task=JSON.parse(fs.readFileSync(path.join(paths.stateDir,'tasks',taskFiles[0]),'utf8'));
-  assert.equal(task.keelFlow,true);
-  assert.equal(task.repairPolicy.canChangeCode,true);
-  assert.deepEqual(task.feedback.map(i=>i.repairPolicy.action).sort(),['code-fix','reply-only']);
-  assert.ok(task.prSnapshot && 'unresolvedThreads' in task.prSnapshot);
+  let sent=0;
+  const result=runScan(paths,listed,()=>({comments:[{id:92,user:BOT_USER,body:'**P3** nit',updatedAt:'t92'},{id:93,user:BOT_USER,body:'**P2** bug',updatedAt:'t93'}],mergeReady:false}),()=>{sent++;return {target_session_id:'s1'};});
+  assert.equal(sent,0);
+  assert.equal(result.prs[0].dispatch.reason,'script-no-change');
+  assert.equal(fs.existsSync(path.join(paths.stateDir,'tasks')),false);
 });
 
 

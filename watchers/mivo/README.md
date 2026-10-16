@@ -118,7 +118,7 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 - 仓库成员（OWNER/MEMBER/COLLABORATOR，含作者本人）留的 review thread（`member-thread-triage`），以及严重度读不出、来源未核验的其他未解决 thread（`thread-triage`，含仓外人员和其他机器人）：交修复会话按统一分级判定，确认 P0/P1 才改代码；其余由 watcher 贴出会话写的结论并 resolve。目标是 PR 不因为一条没人处理的讨论卡在合并前。
 - 产品意图：watcher 抓 PR 正文，优先取标题含「产品意图 / 设计意图 / Product intent」的一节（没有就取正文开头，最多 2000 字），写进任务的 `prSnapshot.prIntent` 和派工消息。反馈要求的改法会推翻 PR 正文、规格或维护者裁定里写明的界面、交互或流程时，它不算缺陷：会话不改代码，记 SC=no-change 并引用正文，watcher 回复后 resolve，继续推进。
 - 全自动推进到可合并（不合并）：严重度拿不准时会话自己复现核实，确认不了 P0/P1 就按不成立回复并 resolve；Jev 不可用也不因此 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用、作者收回才 blocked。
-- 卡住要让人看见：修复任务 blocked（外部阻塞、补投三次无结果、结果无效、派发失败）时，watcher 在 PR 上发一条评论，按「发生了什么 / 对本 PR 意味着什么 / 需要谁做什么」写明原因并 @作者。同一 blocked 状态只发一次，发送失败下一轮重试（最多 3 次）。必需 CI 红、HEAD 漂移这类 watcher 自己会接着处理的状态不发。
+- 卡住要让人看见：修复任务 blocked（外部阻塞、补投三次无结果、结果无效、派发失败）时，watcher 把事件写进 `state/notices/`，用独立的 `bin/notify.mjs` 调度发飞书（watcher 与作者是同一 GitHub 账号，@自己不会通知）。同一 blocked 原因每个 head 只升级一次，不再原样重投。规则版本变化、新 head 或新反馈时仍会重投。必需 CI 红、HEAD 漂移这类 watcher 自己会接着处理的状态不发。
 - Greptile 汇总评论没有自己的 P0/P1 时不单独开会话（它的发现另以行内 thread 出现）。
 - 策略读不出（`required-policy-unknown`）和可合并（`merge-ready`）各在状态转换时出一条事件。
 
@@ -149,6 +149,8 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 
 环境变量 `MIVO_WATCHER_FOLLOW_MS` 可改跟进间隔，设为 `0` 只跑全量一轮。
 
+`waiting-ci` 不算在途：当前 head 出现新的必需 CI 失败、冲突或审查意见时，同一轮就会派新任务。被预算推迟的复查（`recheckDeferredAt`）下一轮即使指纹没变也会再查。补投只在该 dispatch 没有结果文件、且距最近 helper 活动或派发已超过 30 分钟时发生，上限仍为 3 次。session 写结果不抢 PR 状态锁。可合并与无自动出口的事件用 `bin/notify.mjs` 配独立调度发出，见 [`docs/operations.md`](../../docs/operations.md)。
+
 ## 规则版本与已开会话
 
 修复会话是长期复用的，历史里留着旧版 watcher 投递的规则。每次投递的第一行都是 `盯梢规则版本 <12 位>`，并写明本条覆盖此前收到的规则；版本号是把当前全部规则文字渲染后取的摘要，规则一改版本就变。回执确认后，PR 状态记下这次实际投递的版本（`rulesVersion`，重投旧消息时记旧版本）。
@@ -167,6 +169,10 @@ node bin/mivo-repair.mjs <子命令> --home "$MIVO_WATCHER_HOME"
 
 # 查询某个 PR 当前归哪个任务/session 管
 node bin/mivo-ownership.mjs --repo your-org/your-plugin-repo --pr 123 --home "$MIVO_WATCHER_HOME"
+
+# 通知：有未发事件 exit 0 并打印 CINDY_PRECHECK_OK,否则 exit 2;emit 发出并标记已发
+node bin/notify.mjs check --home "$MIVO_WATCHER_HOME"
+node bin/notify.mjs emit --home "$MIVO_WATCHER_HOME"
 ```
 
 ## 停止盯梢某个 PR

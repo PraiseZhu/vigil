@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { blocked, repairPaths } from './bin/mivo-repair.mjs';
-import { dispatchParams, pollFingerprint, normalizePollSnapshot, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
+import { dispatchParams, pollFingerprint, normalizePollSnapshot, scanOnce, watcherPaths, rulesVersion } from './bin/mivo-watcher.mjs';
 import { acquireLock, readPr, writePr } from './bin/mivo-state.mjs';
 import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 
@@ -130,7 +130,7 @@ test('SC3 active helper heartbeat blocks recovery; existing result is consumed n
   const { paths, home } = homeOf(t);
   const dispatchId = 'live-790-run';
   seedBound(paths, {
-    pollFingerprint: 'old',
+    pollFingerprint: 'old', rulesVersion: rulesVersion(),
     lastDispatch: { dispatchId, at: '2026-09-28T00:00:00Z', recoveryCount: 0 },
     activeTask: { status: 'accepted', dispatchId, head: HEAD, sessionId: 'sess-790' },
   });
@@ -209,15 +209,16 @@ test('SC4 blocked writes the result while the PR lock is held and the next poll 
   const { taskPath } = writeTask(home, { handoff: handoffReceipt({ ...listed, releaseEpoch: 'e' }) });
   writePr(home, nodeId, { number: 790, nodeId, sessionId: 'sess-790', activeTask: { dispatchId: 'live-790' } });
   const lock = acquireLock(home, `pr-${nodeId}`);
-  t.after(() => lock.release());
+  t.after(() => { try { lock.release(); } catch {} });
   assert.equal(lock.held, false);
   const held = acquireLock(home, `pr-${nodeId}`);
-  t.after(() => held.release());
+  t.after(() => { try { held.release(); } catch {} });
   assert.equal(held.held, true);
   const result = blocked({ home, taskPath, reason: '缺权限：无法读上游 workflow' });
   assert.equal(result.status, 'blocked');
   assert.equal(fs.existsSync(path.join(paths.stateDir, 'results', 'live-790.json')), true);
   held.release();
+  lock.release();
 
   seedBound(paths, {
     pollFingerprint: 'old', sessionId: 'sess-790',
@@ -250,21 +251,21 @@ test('SC5 same blocked cause does not redispatch; it writes one escalate notice 
   const { paths, home } = homeOf(t);
   const dispatchId = 'live-790-ext';
   seedBound(paths, {
-    pollFingerprint: 'old', eligibility: 'blocked',
+    pollFingerprint: 'old', eligibility: 'blocked', rulesVersion: rulesVersion(),
     lastDispatch: { dispatchId, at: '2026-09-28T00:00:00Z' },
-    activeTask: { status: 'blocked', blockedKind: 'external', reason: 'keel-unavailable: missing', dispatchId, head: HEAD, sessionId: 'sess-790' },
+    activeTask: { status: 'blocked', blockedKind: 'external', reason: 'no-permission: missing secret', dispatchId, head: HEAD, sessionId: 'sess-790' },
   });
   const handoff = handoffReceipt({ ...listed, releaseEpoch: 'e' });
   fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
   fs.writeFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), JSON.stringify({
     dispatchId, nodeId, number: 790, repo: process.env.MIVO_WATCHER_TARGET_REPO, sessionId: 'sess-790',
     headRefOid: HEAD, headRefName: 'fix/x', params: { message: 'fix' }, handoff,
-    feedback: [{ key: 'thread:PRRT_1:c1', source: 'thread', nativeId: 'PRRT_1:c1', body: '**P1** x' }],
+    feedback: [{ key: 'greptile:PRRT_1:c1', source: 'greptile', nativeId: 'PRRT_1:c1', body: '**P1** x' }],
   }));
   fs.mkdirSync(path.join(paths.stateDir, 'results'), { recursive: true });
   fs.writeFileSync(path.join(paths.stateDir, 'results', `${dispatchId}.json`), JSON.stringify({
     schemaVersion: 2, kind: 'mivo-repair-result', dispatchId, nodeId, sessionId: 'sess-790',
-    status: 'blocked', blockedKind: 'external', reason: 'keel-unavailable: missing', receiptId: 'r-block', head: HEAD,
+    status: 'blocked', blockedKind: 'external', reason: 'no-permission: missing secret', receiptId: 'r-block', head: HEAD,
   }));
   const calls = [];
   discover(paths, {

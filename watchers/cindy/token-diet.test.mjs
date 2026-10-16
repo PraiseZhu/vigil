@@ -56,7 +56,7 @@ test('compact snapshot keeps only what a repair turn needs', () => {
 test('script no-change only when every item is reply-only or ignore-infra', () => {
   const item = (body) => ({ source: 'greptile', user: GREPTILE, body, sha: HEAD });
   assert.ok(scriptNoChangePolicy(pr, [item('**P3** nit'), item('**P3** style')]));
-  assert.equal(scriptNoChangePolicy(pr, [item('**P3** nit'), item('**P2** bug')]), null, 'P2 is code-fix on Cindy');
+  assert.ok(scriptNoChangePolicy(pr, [item('**P3** nit'), item('**P2** bug')]), 'P2 is reply-only on Cindy');
   assert.equal(scriptNoChangePolicy(pr, [item('**P1** bug')]), null);
   assert.equal(scriptNoChangePolicy(pr, [item('looks odd, please check')]), null, 'unknown severity still needs a session');
   assert.equal(scriptNoChangePolicy(pr, []), null);

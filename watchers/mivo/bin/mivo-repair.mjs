@@ -98,12 +98,33 @@ function assertIdentity(value, task, sessionId, label) {
   }
 }
 
-function saveResult(paths, task, sessionId, payload) {
+function activityFile(paths, dispatchId) {
+  return path.join(paths.home, 'state', 'activity', `${dispatchId}.json`);
+}
+export function recordActivity(paths, task, op, at = new Date().toISOString()) {
+  if (!task?.dispatchId) return;
+  atomicJson(activityFile(paths, task.dispatchId), { at, op, dispatchId: task.dispatchId });
+}
+export function readActivityAt(home, dispatchId) {
+  try {
+    const at = Date.parse(JSON.parse(fs.readFileSync(path.join(requireAbs(home, 'home'), 'state', 'activity', `${dispatchId}.json`), 'utf8'))?.at ?? '');
+    return Number.isFinite(at) ? at : null;
+  } catch { return null; }
+}
+function startActivityHeartbeat(paths, task, op) {
+  recordActivity(paths, task, op);
+  const timer = setInterval(() => { try { recordActivity(paths, task, op); } catch {} }, 60_000);
+  if (typeof timer.unref === 'function') timer.unref();
+  return () => clearInterval(timer);
+}
+
+function saveResult(paths, task, sessionId, payload, { requirePrLock = false } = {}) {
+  recordActivity(paths, task, payload?.status ?? 'result');
+  if (!requirePrLock) return saveResultLocked(paths, task, sessionId, payload);
   const lock = acquireLock(paths.home, `pr-${task.nodeId}`);
   if (lock.held) fail('PR 状态锁占用，请稍后重试写结果');
-  try {
-  return saveResultLocked(paths, task, sessionId, payload);
-  } finally { lock.release(); }
+  try { return saveResultLocked(paths, task, sessionId, payload); }
+  finally { lock.release(); }
 }
 function saveResultLocked(paths, task, sessionId, payload) {
   const latest = path.join(paths.results, `${task.dispatchId}.json`);
@@ -192,6 +213,7 @@ function boundSession(paths, task) {
 export function assertOwner({ home, taskPath, ghFn = command, ownershipFn = collectPrOwnershipSync,
   validatedHead, allowValidatedHead = false } = {}) {
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'assert-owner');
   const { sessionId, entry } = boundSession(paths, task);
   if (entry.activeTask?.dispatchId !== task.dispatchId) fail('task dispatchId is not the active watcher dispatch');
   const receipt = task.handoff;
@@ -381,6 +403,7 @@ export function ciErrorExcerpts(task, ghFn = command) {
 
 export function prepare({ home, taskPath, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, cloneUrl, originUrl = remoteUrl(REPO) } = {}) {
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'prepare');
   const { sessionId, pr } = assertOwner({ home, taskPath, ghFn, ownershipFn });
   const checkout = cloneWorktree(paths, task, gitFn, cloneUrl ?? originUrl, originUrl, pr.headRefOid);
   const repairPolicy = assertTaskRepairScope(task, checkout.head);
@@ -468,6 +491,8 @@ function validationException(paths, task, sessionId, head, worktree, gitFn) {
 export function validate({ home, taskPath, validatedHead, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, runFn = command, env = process.env, originUrl = remoteUrl(REPO) } = {}) {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
+  const stopHeartbeat = startActivityHeartbeat(paths, task, 'validate');
+  try {
   const { sessionId } = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
   assertTaskRepairScope(task, validatedHead);
@@ -511,6 +536,7 @@ export function validate({ home, taskPath, validatedHead, ghFn = command, owners
   const verification = { status, head: validatedHead, receiptPath, receiptSha256: hash(fs.readFileSync(receiptPath)) };
   atomicJson(validationPointer(paths, task, validatedHead), verification);
   return verification;
+  } finally { stopHeartbeat(); }
 }
 
 function verifiedLocal(paths, task, sessionId, head, worktree, gitFn, receiptPath = null) {
@@ -634,6 +660,7 @@ export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, o
 export function finalize({ home, taskPath, scReport, validatedHead, validationReceipt, keelRun, keelRoot = keelLedgerRoot(), ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, env = process.env, originUrl = remoteUrl(REPO) } = {}) {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'finalize');
   const { sessionId, pr } = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
   assertTaskRepairScope(task, validatedHead);
@@ -668,6 +695,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
 
 export function recheck({ home, taskPath, validatedHead, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, originUrl = remoteUrl(REPO) } = {}) {
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'recheck');
   const { sessionId } = boundSession(paths, task);
   const previous = readJson(path.join(paths.results, `${task.dispatchId}.json`), 'repair result');
   if (previous.schemaVersion !== 2 || previous.kind !== 'mivo-repair-result') fail('legacy result is unverified; a new finalize receipt is required');
@@ -694,16 +722,16 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
   const common = { head, scs, feedbackCoverage, keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
   if (remoteHead !== observedPrHead) {
     return saveResult(paths, task, sessionId, { ...common, status: 'waiting-ci', reason: 'GitHub PR and remote branch views differ', checks: [],
-      ci: { head, requiredGreen: false, requiredChecks: [], optionalFailures: [], pending: [], missing: ['github-remote-head-mismatch'] } });
+      ci: { head, requiredGreen: false, requiredChecks: [], optionalFailures: [], pending: [], missing: ['github-remote-head-mismatch'] } }, { requirePrLock: true });
   }
   if (remoteHead !== head) {
     return saveResult(paths, task, sessionId, { ...common, status: 'blocked', blockedKind: 'head-drift',
       reason: 'remote HEAD advanced independently; preserve local work and reconcile before validation', checks: [],
-      drift: { validatedHead: head, remoteHead, githubHead: observedPrHead, sourceHead: task.headRefOid } });
+      drift: { validatedHead: head, remoteHead, githubHead: observedPrHead, sourceHead: task.headRefOid } }, { requirePrLock: true });
   }
   const ci = checkStatus(task, head, ghFn);
   assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead: head, allowValidatedHead: true });
-  return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks });
+  return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks }, { requirePrLock: true });
 }
 
 // Only what a session cannot settle itself blocks; product questions and untrue feedback are answered in the session.
@@ -711,6 +739,7 @@ export const BLOCKED_KINDS = new Set(['external']);
 export function blocked({ home, taskPath, reason, kind = 'external', ghFn = command } = {}) {
   if (!BLOCKED_KINDS.has(kind)) fail(`blocked --kind must be one of ${[...BLOCKED_KINDS].join(', ')}, got ${JSON.stringify(kind)}`);
   const { paths, task } = taskFrom(home, taskPath);
+  recordActivity(paths, task, 'blocked');
   const { sessionId } = boundSession(paths, task);
   if (typeof reason !== 'string' || !reason.trim()) fail('blocked reason is required');
   return saveResult(paths, task, sessionId, { status: 'blocked', blockedKind: kind, reason: reason.trim(), worktree: taskWorktree(task) });

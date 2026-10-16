@@ -1,5 +1,5 @@
 // Autonomous P3 review-thread closure. Permission errors degrade; they must not fail the poll.
-const REPLY_TEXT = '这是一条 P3 级（建议类）反馈，不是阻塞性问题。按 Cindy 仓当前规则，这类建议本轮不安排修复；'
+const REPLY_TEXT = '这是一条 P2/P3 级（建议类）反馈，不是阻塞性问题。按 Cindy 仓当前规则，这类建议本轮不安排修复；'
   + '如后续需要可另行处理。讨论到此关闭，不影响本 PR 等待维护者审批。';
 
 export function autoCloseReplyText() {
@@ -17,8 +17,8 @@ export function isAutoCloseEligible(item) {
   const severities = item?.repairPolicy?.severities ?? [];
   return Boolean(item) && item.category === 'reply-resolve'
     && item.repairPolicy?.action === 'reply-only'
-    && severities.includes('P3')
-    && !severities.some((s) => s === 'P0' || s === 'P1' || s === 'P2')
+    && severities.some((s) => s === 'P2' || s === 'P3')
+    && !severities.some((s) => s === 'P0' || s === 'P1')
     && typeof item.threadId === 'string' && item.threadId.length > 0;
 }
 

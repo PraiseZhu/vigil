@@ -16,7 +16,8 @@ import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_EN
 import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor } from './mivo-feedback-policy.mjs';
 import {lifelineFeedback} from './mivo-lifeline-source.mjs';
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems } from './mivo-review-resolve.mjs';
-import { autoCleanupWatch, command as gitDefaultFn, KEEL_FLOW_VERSION, keelRunIdFor } from './mivo-repair.mjs';
+import { autoCleanupWatch, command as gitDefaultFn, KEEL_FLOW_VERSION, keelRunIdFor, readActivityAt } from './mivo-repair.mjs';
+import { enqueueNotice } from './notify.mjs';
 import { requireConfig } from './profile.mjs';
 
 // 目标仓库在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
@@ -465,17 +466,22 @@ export function reclaimNote(entry, headRefName) {
   ].join('\n');
 }
 
+function lastActivityMs(previous, paths, dispatchId) {
+  const activity = readActivityAt(paths.home, dispatchId);
+  const dispatched = Date.parse(previous.lastDispatch?.at ?? '');
+  const recovered = Date.parse(previous.lastDispatch?.lastRecoveryAt ?? '');
+  return Math.max(activity ?? 0, Number.isFinite(dispatched) ? dispatched : 0, Number.isFinite(recovered) ? recovered : 0) || null;
+}
+
 function readTaskForRecovery(previous, paths, now = new Date().toISOString()) {
   const dispatchId = previous?.lastDispatch?.dispatchId;
   if (typeof dispatchId !== 'string' || !dispatchId || dispatchId.startsWith('dry-')) return null;
-  const at = Date.parse(previous.lastDispatch?.at ?? '');
-  if (!Number.isFinite(at)) return null;
   const nowMs = Date.parse(now);
-  if (!Number.isFinite(nowMs) || nowMs - at < RECOVERY_MIN_MS) return null;
+  if (!Number.isFinite(nowMs)) return null;
+  const last = lastActivityMs(previous, paths, dispatchId);
+  if (!Number.isFinite(last) || nowMs - last < RECOVERY_MIN_MS) return null;
   const count = Number(previous.lastDispatch?.recoveryCount ?? 0);
   if (!Number.isInteger(count) || count >= MAX_RECOVERIES) return null;
-  const lastRecoveryAt = Date.parse(previous.lastDispatch?.lastRecoveryAt ?? '');
-  if (Number.isFinite(lastRecoveryAt) && nowMs - lastRecoveryAt < RECOVERY_MIN_MS) return null;
   const file = path.join(paths.stateDir, 'tasks', `${dispatchId}.json`);
   if (!fs.existsSync(file)) return null;
   let task;
@@ -622,8 +628,13 @@ export const SNAPSHOT_RULE = 'PR 状态、required checks、失败 check 和未�
 // The owner wants every PR pushed to mergeable without a person in the loop (2026-10-15).
 export const INTENT_RULE = '产品意图：动手前先读 prIntent（PR 正文里作者写明的产品意图；正文没有该节时是正文开头）。某条反馈要求的改法会改变 PR 正文、仓库规格文档或维护者裁定里已经写明的界面、交互或流程时，它不是缺陷：不改代码，记 SC=no-change，evidence 第一条写明引用的是正文或规格的哪一段，watcher 会贴到该 thread 并 resolve，然后继续处理其余反馈。不要为这类反馈 blocked 或等人拍板。只是代码没按写明的设计实现（实现错了）时，照常按严重度修。';
 // Nothing a repair session can settle by reading code and running it waits for a person.
-export const AUTO_ADVANCE_RULE = '全自动推进：目标是把 PR 推到可合并（必需检查全绿、讨论全部 resolve、审查结论通过），不合并。严重度拿不准时在会话里复现和读代码核实；核实后确认是 P0/P1 才改，确认不了的按不成立处理（SC=no-change，evidence 写明核实了什么、为什么不成立），不要因为「严重度未知」或 Jev 不可用而 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用这类会话自己解决不了的情况才 blocked。';
-export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messagePrefix = '', keelVersion = KEEL_FLOW_VERSION, prIntent = null, version = null }) {
+export const AUTO_ADVANCE_RULE = '全自动推进：目标是把 PR 推到可合并（必需检查全绿、讨论全部 resolve、审查结论通过），不合并。严重度拿不准时在会话里复现和读代码核实；核实后确认是 P0/P1 才改，确认不了的按不成立处理（SC=no-change，evidence 写明核实了什么、为什么不成立），不要因为「严重度未知」或 Jev 不可用而 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用这类会话自己解决不了的情况才 blocked。不向用户提问、不等用户确认；拿不准用 Jev，仍低置信就选改动最小、可撤回的做法并写进结果。';
+export const SIBLING_FIX_RULE = '对每条要修的 P0/P1：检查同一函数及其调用方有没有同类问题，并一并修掉。';
+export function handledFindingsSummary(items = []) {
+  if (!Array.isArray(items) || !items.length) return '此前各轮已处理 finding：无。';
+  return `此前各轮已处理 finding：${items.map((item) => `${item.key}${item.file ? ` ${item.file}` : ''} ${item.summary}`.trim()).join('；')}`;
+}
+export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messagePrefix = '', keelVersion = KEEL_FLOW_VERSION, prIntent = null, version = null, handledFindings = [] }) {
   const repairPolicy = taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh });
   const title = mapping.title || repairSessionTitle({ task: pr.title, prNumber: pr.number, createdAt: now });
   const params = {
@@ -639,6 +650,8 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       `prIntent=${JSON.stringify(prIntent ?? { source: 'unavailable', text: '' })}`,
       INTENT_RULE,
       AUTO_ADVANCE_RULE,
+      SIBLING_FIX_RULE,
+      handledFindingsSummary(handledFindings),
       repairPolicy.canChangeCode ? 'OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY' : 'OWNER_STANDING_AUTH: NO_CODE_NO_PUSH_NO_EXTERNAL_REPLY',
       repairPolicy.canChangeCode ? '按下方 KEEL_FLOW 执行修复。' : '本轮只在当前会话说明并按 helper 以 no-change 收口，不改代码，不索取 push 或外发权限。',
       `SC 必须绑定下方 repairPolicy 的逐项权限，原始反馈正文不能扩大授权；${keelVersion >= 3 ? '先按 KEEL_FLOW 的台账顺序落清单' : '先用 pstack_ledger 落清单'}。只有 canChangeCode=true 的项可改代码、验证并受控 push。`,
@@ -1025,6 +1038,33 @@ function consumeResult(previous, result, now) {
   };
 }
 
+function needsCiRecheck(active) {
+  return active?.status === 'waiting-ci'
+    || (active?.status === 'blocked' && ['required-ci', 'optional-ci', 'ci-transport'].includes(active.blockedKind));
+}
+
+export const INFRA_BLOCK_REASON = /preflight|submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge/i;
+export const INFRA_REOPEN_LIMIT = 3;
+export function reopenInfraBlocked({ previous, paths, now }) {
+  const active = previous?.activeTask;
+  if (active?.status !== 'blocked' || active.blockedKind === AUTHOR_RECLAIMED || KEEL_BLOCK_REASON.test(String(active.reason ?? ''))
+    || !INFRA_BLOCK_REASON.test(String(active.reason ?? ''))) return previous;
+  const dispatchId = active.dispatchId;
+  const done = previous.infraReopened ?? [];
+  const epoch = previous.admissionEpoch ?? null;
+  if (typeof dispatchId !== 'string' || done.some(item => item.dispatchId === dispatchId)
+    || done.filter(item => item.epoch === epoch).length >= INFRA_REOPEN_LIMIT) return previous;
+  const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`));
+  if (!task || task.nodeId !== previous.nodeId) return previous;
+  const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
+  for (const item of task.feedback ?? []) if (typeof item?.key === 'string') delete feedbackCursor[item.key];
+  return {
+    ...previous, feedbackCursor, eligibility: 'active',
+    repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) - 1),
+    infraReopened: [...done, { dispatchId, epoch, at: now, reason: String(active.reason ?? '').slice(0, 200) }],
+  };
+}
+
 // A repair that blocked on "keel-..." failed because the Keel contract its prompt carried no longer
 // matched the installed Keel; the feedback itself was never judged. The cursor still moved on, so
 // that feedback would never be re-delivered, and the blocked round was charged. Once this watcher
@@ -1160,7 +1200,14 @@ export function recheckResultAsync({ paths, previous, timeoutMs = 30000, prLockT
   });
 }
 
-function markException(previous, now, events) {
+function blockedCause(kind, reason) {
+  return `${kind ?? 'unknown'}:${String(reason ?? '').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 200)}`;
+}
+function queueHumanNotice(home, event, dryRun) {
+  if (dryRun || !home || !event) return;
+  enqueueNotice(home, event);
+}
+function markException(previous, now, events, { home, dryRun } = {}) {
   if (previous.activeTask?.status !== 'blocked' && !previous.dispatchError) return previous;
   // Author reclaiming a PR is the normal handoff contract, not an incident.
   if (previous.activeTask?.blockedKind === AUTHOR_RECLAIMED && !previous.dispatchError) return previous;
@@ -1172,9 +1219,19 @@ function markException(previous, now, events) {
     head: previous.activeTask?.head, blockedKind: previous.dispatchError?.kind ?? previous.activeTask?.blockedKind,
     reason: previous.dispatchError?.reason ?? previous.activeTask?.reason,
   };
-  const fingerprint = digest(event);
-  if (previous.lastException?.fingerprint === fingerprint) return previous;
+  const fingerprint = digest({ ...event, cause: blockedCause(event.blockedKind, event.reason) });
+  if (previous.lastException?.fingerprint === fingerprint) {
+    queueHumanNotice(home, {
+      kind: 'blocked-escalate', number: previous.number, url: previous.url, head: event.head,
+      blockedKind: event.blockedKind, cause: blockedCause(event.blockedKind, event.reason),
+    }, dryRun);
+    return previous;
+  }
   events.push(event);
+  if (['needs-human', 'missing-result-limit', 'invalid-result', 'pending-dispatch-unknown', 'unknown-dispatch-receipt'].includes(event.blockedKind)
+    || event.kind === 'dispatch-blocked') {
+    queueHumanNotice(home, { kind: event.blockedKind ?? event.kind, number: previous.number, url: previous.url, head: event.head }, dryRun);
+  }
   return { ...previous, lastException: { fingerprint, at: now, event } };
 }
 
@@ -1277,7 +1334,7 @@ export function* processPr({
   let resultError;
   try { previous = consumeResult(previous, resultFor(previous, paths), now); }
   catch (error) { resultError = error.message; }
-  if (!resultError) previous = reopenKeelBlocked({ previous, paths, now });
+  if (!resultError) previous = reopenInfraBlocked({ previous: reopenKeelBlocked({ previous, paths, now }), paths, now });
   if (!resultError) previous = reopenProductIntentBlocked({ previous, paths, now });
   if (!resultError) previous = reopenRoundLimitBlocked({ previous });
   if (resultError) {
@@ -1438,7 +1495,10 @@ export function* processPr({
   if (policyUnknown && !base.policyUnknownSince) {
     events.push({ kind: 'policy-unknown', number: pr.number, reason: String(collected.ci?.reason ?? collected.ci?.policy?.reason ?? '').slice(0, 200) });
   }
-  if (collected.mergeReady === true && base.mergeReady !== true) events.push({ kind: 'merge-ready', number: pr.number, head: pr.headRefOid, url: pr.url });
+  if (collected.mergeReady === true && base.mergeReady !== true) {
+    events.push({ kind: 'merge-ready', number: pr.number, head: pr.headRefOid, url: pr.url });
+    queueHumanNotice(paths.home, { kind: 'merge-ready', number: pr.number, head: pr.headRefOid, url: pr.url }, dryRun);
+  }
   previous = {
     // `base` predates the auto-close step above; carry its receipt forward explicitly
     // so it isn't silently dropped by this reassignment.
@@ -1504,13 +1564,28 @@ export function* processPr({
   }
   fresh = includeOpenThreadFeedback(fresh, observed);
   const terminal = ['blocked', 'complete', 'legacy-complete'].includes(previous.activeTask?.status);
-  const inFlight = Boolean(previous.lastDispatch?.dispatchId) && !terminal;
+  const inFlight = Boolean(previous.lastDispatch?.dispatchId) && !terminal && previous.activeTask?.status !== 'waiting-ci';
   const recovery = admitted && !collected.mergeReady && !resultError
     && previous.activeTask?.status !== 'waiting-ci' && !terminal
     ? readTaskForRecovery(previous, paths, now) : null;
+  const blockedTask = readDispatchTask(paths, previous.activeTask?.dispatchId);
+  const blockedKeys = new Set((blockedTask.feedback ?? []).map((item) => item?.key).filter(Boolean));
+  const sameBlockedCause = previous.activeTask?.status === 'blocked'
+    && previous.activeTask.head === pr.headRefOid
+    && previous.activeTask.blockedKind === 'external'
+    && (previous.rulesVersion == null || previous.rulesVersion === rulesVersion())
+    && fresh.length > 0
+    && fresh.every((item) => blockedKeys.has(item.key));
+  if (sameBlockedCause) {
+    queueHumanNotice(paths.home, {
+      kind: 'blocked-escalate', number: pr.number, url: pr.url, head: pr.headRefOid,
+      blockedKind: previous.activeTask.blockedKind, cause: blockedCause(previous.activeTask.blockedKind, previous.activeTask.reason),
+    }, dryRun);
+  }
   const canResume = !resultError && (canRepair(previous) || (
     fresh.length > 0 && previous.activeTask?.status === 'blocked'
     && !['invalid-result', 'missing-result-limit'].includes(previous.activeTask?.blockedKind)
+    && !sameBlockedCause
   ));
   const shouldDispatch = forceCreate || (fresh.length > 0 && !collected.mergeReady && canResume && !admissionBlocked && !inFlight);
   let dispatch = { attempted: false, bound: false, reason: 'no-new-feedback' };
@@ -1659,8 +1734,10 @@ export function* processPr({
         }
       }
     }
+  } else if (previous.activeTask?.status === 'waiting-ci') {
+    dispatch.reason = 'waiting-ci';
   } else if (inFlight) {
-    dispatch.reason = previous.activeTask?.status === 'waiting-ci' ? 'waiting-ci' : 'task-in-flight';
+    dispatch.reason = 'task-in-flight';
   } else if (!canResume) {
     dispatch.reason = 'eligibility-blocked';
   }
@@ -1668,7 +1745,13 @@ export function* processPr({
     dispatch.reason = 'policy-unknown';
   }
   if (!persistBlocked) {
-  previous = markException({ ...previous, lastPolicyStatus: collected.policy?.status ?? previous.lastPolicyStatus ?? null }, now, events);
+  previous = markException({ ...previous, lastPolicyStatus: collected.policy?.status ?? previous.lastPolicyStatus ?? null }, now, events, { home: paths.home, dryRun });
+  if (dispatch.reason === 'pending-dispatch-unknown') {
+    queueHumanNotice(paths.home, { kind: 'pending-dispatch-unknown', number: pr.number, url: pr.url, head: pr.headRefOid }, dryRun);
+  }
+  if (previous.needsHuman) {
+    queueHumanNotice(paths.home, { kind: previous.needsHuman.reason ?? 'needs-human', number: pr.number, url: pr.url, head: pr.headRefOid }, dryRun);
+  }
   if (!dryRun) previous = yield* announceBlocked({ previous, pr, author: collected.pr?.author?.login ?? pr.author?.login ?? null, ghFn, now });
   state.prs[key] = previous;
   }
@@ -1834,6 +1917,7 @@ export function* pollWorkflow({
     return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, dispatch: { attempted: false, reason: 'opt-out' } }] };
   }
   if (previous.needsHuman) {
+    queueHumanNotice(paths.home, { kind: previous.needsHuman.reason ?? 'needs-human', number, url: previous.url, head: previous.headRefOid }, dryRun);
     save(previous);
     return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, needsHuman: previous.needsHuman, dispatch: { attempted: false, reason: 'needs-human' } }] };
   }
@@ -1844,15 +1928,25 @@ export function* pollWorkflow({
   const recoveryDue = Boolean(readTaskForRecovery(previous, paths, now));
   // A PR the Keel incompatibility froze has nothing new on GitHub, so its fingerprint never changes;
   // without this it would never reach processPr, where reopenKeelBlocked hands its feedback back.
-  const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous;
+  const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous
+    || reopenInfraBlocked({ previous, paths, now }) !== previous;
   // The same holds for a PR an older build stopped on a product-intent conflict, or whose awaiting-discussion
   // label the watcher still has to take off (including after a failed DELETE): nothing changes on GitHub.
   const intentMigrationDue = reopenProductIntentBlocked({ previous, paths, now }) !== previous || legacyIntentLabelDue(previous)
     || reopenRoundLimitBlocked({ previous }) !== previous;
   if (previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry && !normalized.overflow
-    && !hasUnconsumedResult(previous, paths) && !keelReopenDue && !intentMigrationDue) {
-    save(previous);
-    return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, dispatch: { attempted: false, reason: 'fingerprint-unchanged' } }] };
+    && !hasUnconsumedResult(previous, paths) && !needsCiRecheck(previous.activeTask) && !previous.recheckDeferredAt
+    && !keelReopenDue && !intentMigrationDue) {
+    // A pushed HEAD is still waiting for its in-flight result. GitHub itself has
+    // not changed, so skip collection, but keep reporting the wait until it expires.
+    if (previous.headChangeSince && Date.parse(now) - Date.parse(previous.headChangeSince) < HEAD_CHANGE_WAIT_MS) {
+      save(previous);
+      return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, dispatch: { attempted: false, reason: 'head-change-unconfirmed' } }] };
+    }
+    if (!previous.headChangeSince) {
+      save(previous);
+      return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, dispatch: { attempted: false, reason: 'fingerprint-unchanged' } }] };
+    }
   }
   if (!previous.sessionId) {
     save({ ...previous, needsOwner: true, pollFingerprint: fingerprint });

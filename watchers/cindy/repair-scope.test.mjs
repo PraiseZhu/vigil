@@ -151,10 +151,10 @@ test('a P1 in the same task does not authorize an SC marking P3 fixed', (t) => {
   assert.equal(f.remoteHead(), f.sourceHead);
 });
 
-for (const kind of ['P1', 'P2', 'required-ci']) {
+for (const kind of ['P1', 'required-ci']) {
   test(`${kind} authorized repair can validate, push to fixture origin and close against current-head CI`, (t) => {
     const f = fixture(t);
-    const feedback = kind === 'P1' || kind === 'P2' ? finding(kind) : {
+    const feedback = kind === 'P1' ? finding(kind) : {
       key: 'ci:verify', source: 'ci', sha: f.sourceHead,
       requiredFailure: { verified: true, status: 'failed', headSha: f.sourceHead },
     };
@@ -171,13 +171,13 @@ for (const kind of ['P1', 'P2', 'required-ci']) {
   });
 }
 
-for (const kind of ['P3', 'unknown', 'empty']) {
+for (const kind of ['P2', 'P3', 'unknown', 'empty']) {
   test(`${kind} feedback cannot publish a changed HEAD through no-change SCs`, (t) => {
     const f = fixture(t);
     assert.equal(f.validate().status, 'pass');
     const feedback = kind === 'empty' ? [] : kind === 'unknown'
       ? [{ ...finding('P1'), key: 'thread:unknown', body: 'Please consider this improvement.' }]
-      : [finding('P3')];
+      : [finding(kind)];
     f.saveTask(feedback);
     f.report([f.sc('no-change', feedback.map(item => item.key))]);
     assert.throws(f.finalize, /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限/i);
