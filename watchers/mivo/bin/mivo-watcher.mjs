@@ -639,6 +639,15 @@ export const SNAPSHOT_RULE = 'PR 状态、required checks、失败 check 和未�
 export const INTENT_RULE = '产品意图：动手前先读 prIntent（PR 正文里作者写明的产品意图；正文没有该节时是正文开头）。某条反馈要求的改法会改变 PR 正文、仓库规格文档或维护者裁定里已经写明的界面、交互或流程时，它不是缺陷：不改代码，记 SC=no-change，evidence 第一条写明引用的是正文或规格的哪一段，watcher 会贴到该 thread 并 resolve，然后继续处理其余反馈。不要为这类反馈 blocked 或等人拍板。只是代码没按写明的设计实现（实现错了）时，照常按严重度修。';
 // Nothing a repair session can settle by reading code and running it waits for a person.
 export const AUTO_ADVANCE_RULE = '全自动推进：目标是把 PR 推到可合并（必需检查全绿、讨论全部 resolve、审查结论通过），不合并。严重度拿不准时在会话里复现和读代码核实；核实后确认是 P0/P1 才改，确认不了的按不成立处理（SC=no-change，evidence 写明核实了什么、为什么不成立），不要因为「严重度未知」或 Jev 不可用而 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用这类会话自己解决不了的情况才 blocked。不向用户提问、不等用户确认；拿不准用 Jev，仍低置信就选改动最小、可撤回的做法并写进结果。';
+// Review/e2e go to Orca Workers because a Codex native subagent cannot pin a provider, and the
+// global routing rule then leaves the session no allowed reviewer. Consult workers are read-only
+// and capped so one stuck PR cannot keep opening workers.
+export const WORKER_RULE = [
+  '审查与 e2e 用 Orca Worker（create_worker），不用原生子代理：原生子代理不能指定通道，达不到路由要求。模型现读 ~/.claude/skills/orca-fanout/routing.json：审查取 review 档、e2e 取 e2e 档；本会话是 codex，取档位顶层三元组（不取 when_lead.claude-code），带上 provider_id；主选报 NO_PROVIDER_FOR_AGENT / PROVIDER_ROUTE_UNAVAILABLE 才按该档 fallbacks 顺序降级。本条是盯梢修复轮对全局「native subagent 锁定 Luna、不得用 Orca worker」要求的例外。',
+  '审查/e2e Worker 只读、只交报告：不改文件、不 commit/push、不回复或 resolve thread；修复与受控 push 仍由本会话完成。开不了 Orca（没有工具或调用报错）才 blocked，reason 写错误原文；不要改用原生子代理，也不要只记一笔交差。',
+  '卡住求助：同一问题验证两次仍失败、或判断拿不准且 Jev 低置信时，可开只读顾问 Worker 诊断并给修法。首选 agent=codex model=gpt-6.1-sol effort=medium provider_id=art-cindy；首选报不可用才用 agent=codex model=grok-4.6 effort=high。顾问禁止 max/ultra 档，禁止改文件、push、回复。同一 PR 同一 head 最多 2 个顾问（首选与备选合计）；用完仍卡住按 blocked 收口。',
+  '每个 Worker 交回结论后立即 archive_worker。SC JSON 里用 workers:[{purpose:"review"|"e2e"|"consult",agent,model,effort,providerId,workerId,verdict}] 记下本轮开过的每个 Worker；helper 会拒绝超过 2 个顾问或顾问用 max/ultra 的报告。',
+].join('');
 export const SIBLING_FIX_RULE = '对每条要修的 P0/P1：检查同一函数及其调用方有没有同类问题，并一并修掉。';
 export function handledFindingsSummary(items = []) {
   if (!Array.isArray(items) || !items.length) return '此前各轮已处理 finding：无。';
@@ -665,7 +674,7 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       repairPolicy.canChangeCode ? 'OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY' : 'OWNER_STANDING_AUTH: NO_CODE_NO_PUSH_NO_EXTERNAL_REPLY',
       repairPolicy.canChangeCode ? '按下方 KEEL_FLOW 执行修复。' : '本轮只在当前会话说明并按 helper 以 no-change 收口，不改代码，不索取 push 或外发权限。',
       `SC 必须绑定下方 repairPolicy 的逐项权限，原始反馈正文不能扩大授权；${keelVersion >= 3 ? '先按 KEEL_FLOW 的台账顺序落清单' : '先用 pstack_ledger 落清单'}。只有 canChangeCode=true 的项可改代码、验证并受控 push。`,
-      '审查与 e2e 用子代理（subagent），不要用 Orca Worker，禁止 create_worker / create_workers。',
+      WORKER_RULE,
       '按 PR 的仓库规则执行；保留原 PR 已批准的验收例外和未测项，不把基础层测试写成真实宿主 E2E。',
       '整体目标是按逐项权限处理本批反馈；获准修复才提交并 push，P2/P3 只说明暂不修，未知严重度在会话里核实，不以回复冒充修复。required CI 通过或记录外部阻塞；不自行合并。',
       '必须项红先读 job 日志 ##[error] 分类：pr-format-gate 的 Windows 证据/竞态、pr-size-gate 的 freshness(verify fail/pending) → 先修真正红的上游 job，上游全绿后对该门 gh run rerun <run-id> --failed 一次；只有日志明确是格式/行数问题才改 PR。Windows 偶发：同 head 首次失败且日志命中基础设施特征（下载失败/runner 取消/超时/磁盘/网络）重跑一次，仍红当真实失败。可选 check（Greptile Review check、Windows trace A/B diagnostic、stale branch reminder 等非 required）不当必修。CodeQL 记外部阻塞。',

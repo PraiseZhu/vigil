@@ -438,6 +438,28 @@ export function prepare({ home, taskPath, ghFn = command, ownershipFn = collectP
     ciErrors: ciErrorExcerpts(task, ghFn) };
 }
 
+// Workers a repair round opened, as reported by the session. Consult workers are capped per head
+// and may not use max/ultra; a report breaking either limit is rejected so it is fixed before push.
+const WORKER_PURPOSES = new Set(['review', 'e2e', 'consult']);
+export const MAX_CONSULT_WORKERS = 2;
+export function validateWorkers(value) {
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value)) fail('SC report workers must be an array');
+  const workers = value.map((item, index) => {
+    if (!item || typeof item !== 'object') fail(`workers[${index}] must be an object`);
+    if (!WORKER_PURPOSES.has(item.purpose)) fail(`workers[${index}].purpose must be review, e2e or consult, got ${String(item.purpose).slice(0, 40)}`);
+    for (const field of ['agent', 'model', 'effort']) {
+      if (typeof item[field] !== 'string' || !item[field].trim()) fail(`workers[${index}].${field} is required`);
+    }
+    if (item.purpose === 'consult' && ['max', 'ultra'].includes(item.effort)) fail(`workers[${index}] consult effort ${item.effort} is above the allowed high`);
+    const text = (field, limit) => (typeof item[field] === 'string' && item[field].trim() ? { [field]: item[field].trim().slice(0, limit) } : {});
+    return { purpose: item.purpose, agent: item.agent.trim(), model: item.model.trim(), effort: item.effort.trim(), ...text('providerId', 80), ...text('workerId', 80), ...text('verdict', 500) };
+  });
+  const consults = workers.filter((item) => item.purpose === 'consult').length;
+  if (consults > MAX_CONSULT_WORKERS) fail(`workers lists ${consults} consult workers; at most ${MAX_CONSULT_WORKERS} per head`);
+  return workers;
+}
+
 export function validateScs(report, task) {
   const scs = Array.isArray(report) ? report : report?.scs;
   if (!Array.isArray(scs) || scs.length === 0) fail('SC report must contain a non-empty scs array');
@@ -472,7 +494,7 @@ export function validateScs(report, task) {
     key: item.key, disposition: checked.some((sc) => sc.feedbackKeys.includes(item.key) && sc.status === 'pass') ? 'fixed' : 'no-change',
     ...(item.source === 'thread' || item.key.startsWith('thread:') ? { resolved: null, resolutionEvidence: 'not-checked-by-helper' } : {}),
   }));
-  return { scs: checked, feedbackCoverage: { mode: expected.size ? 'task-feedback' : 'legacy-empty', requiredKeys: [...expected], coveredKeys: [...covered], dispositions, complete: true } };
+  return { scs: checked, feedbackCoverage: { mode: expected.size ? 'task-feedback' : 'legacy-empty', requiredKeys: [...expected], coveredKeys: [...covered], dispositions, complete: true }, workers: Array.isArray(report) ? null : validateWorkers(report?.workers) };
 }
 
 function loadScs(scReport, task) {
@@ -748,7 +770,8 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   const branchHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
-  const { scs, feedbackCoverage } = loadScs(scReport, task);
+  const { scs, feedbackCoverage, workers } = loadScs(scReport, task);
+  const workersField = workers ? { workers } : {};
   const emptyRetrigger = allNoChange(scs) && isEmptyCiRetrigger(worktree, task.headRefOid, validatedHead, gitFn);
   assertTaskRepairScope(task, validatedHead, { emptyRetrigger });
   if (validatedHead !== task.headRefOid && scs.every((sc) => sc.status === 'no-change') && !emptyRetrigger) {
@@ -770,7 +793,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   try { ci = checkStatus(task, validatedHead, ghFn); }
   catch (error) {
     return saveResult(paths, task, sessionId, { status: 'blocked', blockedKind: 'ci-transport', reason: error.message,
-      head: validatedHead, scs, feedbackCoverage, keel, verification, checks: [], pushed });
+      head: validatedHead, scs, feedbackCoverage, ...workersField, keel, verification, checks: [], pushed });
   }
   let extra = {};
   const prior = fs.existsSync(path.join(paths.results, `${task.dispatchId}.json`))
@@ -784,16 +807,16 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
     });
     if (extra.retried) return saveResult(paths, task, sessionId, {
       status: 'waiting-ci', reason: 'retried required CI once after no-change',
-      head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed, ciRetrigger: extra.ciRetrigger,
+      head: validatedHead, scs, feedbackCoverage, ...workersField, keel, verification, ci, checks: ci.requiredChecks, pushed, ciRetrigger: extra.ciRetrigger,
     });
     if (extra.already) return saveResult(paths, task, sessionId, {
       status: 'blocked', blockedKind: 'external',
       reason: 'required CI still failed after one no-change retrigger',
-      head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed, ciRetrigger: extra.ciRetrigger,
+      head: validatedHead, scs, feedbackCoverage, ...workersField, keel, verification, ci, checks: ci.requiredChecks, pushed, ciRetrigger: extra.ciRetrigger,
     });
   }
   const carried = extra.ciRetrigger ?? recorded;
-  return saveResult(paths, task, sessionId, { ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed, ...(carried ? { ciRetrigger: carried } : {}) });
+  return saveResult(paths, task, sessionId, { ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, ...workersField, keel, verification, ci, checks: ci.requiredChecks, pushed, ...(carried ? { ciRetrigger: carried } : {}) });
 }
 
 export function recheck({ home, taskPath, validatedHead, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, originUrl = remoteUrl(REPO) } = {}) {
@@ -823,7 +846,7 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
   const remoteHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (!isSha(remoteHead)) fail('remote branch head is unavailable during recheck');
   const observedPrHead = ownership.pr.headRefOid;
-  const common = { head, scs, feedbackCoverage, keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
+  const common = { head, scs, feedbackCoverage, ...(previous.workers ? { workers: previous.workers } : {}), keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
   if (remoteHead !== observedPrHead) {
     return saveResult(paths, task, sessionId, { ...common, status: 'waiting-ci', reason: 'GitHub PR and remote branch views differ', checks: [],
       ci: { head, requiredGreen: false, requiredChecks: [], optionalFailures: [], pending: [], missing: ['github-remote-head-mismatch'] } }, { requirePrLock: true });
