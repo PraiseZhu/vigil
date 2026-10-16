@@ -41,7 +41,7 @@ Vigil 的两个 watcher **不是**可以配进任意 cron 的无状态脚本—�
 | 字段 | 取值 | 说明 |
 |---|---|---|
 | `executionMode` | `"script"` | 零 token 模式:宿主不起 agent,直接执行 `scriptConfig.command` |
-| `cronExpr` | `"*/5 * * * *"` | 每 5 分钟触发一次;5 字段 cron(minute hour day-of-month month day-of-week) |
+| `cronExpr` | `"* * * * *"` | 每分钟触发一次;5 字段 cron(minute hour day-of-month month day-of-week)。两轮之间在启动后第 45 秒再跟进一次转 Ready / 新推送 |
 | `timezone` | 你所在时区的 IANA id,如 `"Asia/Shanghai"` | 必填 |
 | `recurring` | `true` | discover 是常驻轮询,不是一次性任务 |
 | `scriptConfig.command` | `python3 <watcher home>/bin/mivo-watch-script.py --mode discover`(cindy watcher 换成 `cindy-watch-script.py`) | 经系统 shell 执行,cwd 为 `workingDir`;该命令必须实现 `cindy-script/1` 协议(stdout 只能是协议帧,调试输出走 stderr) |
@@ -49,9 +49,25 @@ Vigil 的两个 watcher **不是**可以配进任意 cron 的无状态脚本—�
 | `scriptConfig.timeoutMs` | 按需,可省略 | 整轮脚本超时;超时会杀进程树,run 记 failed |
 | `workingDir` | `<watcher home>` 的绝对路径 | script 模式下作为 `scriptConfig.command` 的 cwd |
 | `useWorktree` | `false` | script 模式不支持 ephemeral worktree |
-| `notify` | `{"desktop": true, "feishu": false}` 或按你自己的通知偏好 | 必填对象,discover 本身建议静默(见下),失败轮仍会通知 |
+| `notify` | `{"desktop": false, "feishu": false}` | discover 建议静默;失败轮仍会记进调度日志 |
 
 discover 一次调用会扫描 `targetRepo` 下你自己的所有 open PR,不需要"每个 PR 一个调度项"。
+
+### 通知调度
+
+需要人处理的事件(首次可合并、同因 blocked 升级、needs-human / 三次补投无结果 / 结果无效 / 派发无回执)写进 watcher home 的 `state/notices/pending.json`。另建一条 script 调度,前置检查有未发事件才跑,并把通知发到飞书:
+
+| 字段 | 取值 |
+|---|---|
+| `executionMode` | `"script"` |
+| `cronExpr` | `"* * * * *"` |
+| `scriptConfig.command` | `node <watcher home>/bin/notify.mjs emit --home <watcher home>` |
+| `preRunHook` | `node <watcher home>/bin/notify.mjs check --home <watcher home>`（检查完整成功都打印 `CINDY_PRECHECK_OK`；有未发事件 exit 0，空队列 exit 2。宿主字段是 `preRunHook` / `schedule_set_pre_run_hook`，不是 `scriptConfig.precheck`） |
+| `scriptConfig.capabilities` | `[]` |
+| `notify` | `{"desktop": false, "feishu": true}` |
+| `workingDir` | `<watcher home>` |
+
+`emit` 按 `cindy-script/1` 输出一个 complete 帧,`resultText` 用简体中文写清 PR 号、链接、发生了什么、需要做什么(可合并就写可以点合并了),然后把这些事件标为已发,重复运行不重复发。
 
 ### poll 模式
 

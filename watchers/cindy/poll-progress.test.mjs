@@ -81,7 +81,7 @@ for (const surface of ['comments', 'reviews']) for (const severity of ['P0', 'P1
     writePr(f.home, ID, { ...f.entry, activeTask: { status: 'complete' }, lastDispatch: null, pollFingerprint: 'old' });
     f.collected[surface] = [{ id: 'finding-1', author: { login: 'greptile-apps', __typename: 'Bot' },
       body: `${severity}: example finding`, state: 'COMMENTED', commit: { oid: HEAD }, updatedAt: now, submittedAt: now }];
-    const authorized = ['P0', 'P1', 'P2'].includes(severity);
+    const authorized = ['P0', 'P1'].includes(severity);
     const out = f.poll();
     assert.equal(f.calls.length, authorized ? 1 : 0);
     if (!authorized) return;

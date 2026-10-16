@@ -63,7 +63,7 @@ function evidenceLines(result, key, status) {
     .flatMap((sc) => sc.evidence ?? []).filter((line) => typeof line === 'string' && line.trim());
 }
 function completeCodeFixThreads(result, task, { disposition, scStatus, kind }) {
-  if (result?.schemaVersion !== 2 || result.status !== 'complete' || result.dispatchId !== task?.dispatchId) return [];
+  if (result?.schemaVersion !== 2 || !['complete', 'waiting-ci'].includes(result.status) || result.dispatchId !== task?.dispatchId) return [];
   const policy = new Map((task.repairPolicy?.items ?? []).map((item) => [item.key, item]));
   const items = [];
   for (const { key, disposition: itemDisposition } of result.feedbackCoverage?.dispositions ?? []) {
@@ -80,14 +80,27 @@ export function refutedThreads(result, task) {
 export function fixedThreads(result, task) {
   return completeCodeFixThreads(result, task, { disposition: 'fixed', scStatus: 'pass', kind: 'fixed' });
 }
+// Same comment key, same wording: a reviewer can edit a comment in place, keeping its id.
+// Older task files carry no snapshot; they compare as unchanged, as before.
+export function sameFeedbackContent(original, current) {
+  if (!original || !current) return true;
+  if (original.contentHash && current.contentHash) return original.contentHash === current.contentHash;
+  if (typeof original.body === 'string' && typeof current.body === 'string') return original.body === current.body;
+  return true;
+}
 // Resolving closes the whole thread, so every open external comment observed on it now must
-// belong to the completed task. A reply added while the repair ran keeps the thread open and
-// goes through normal dispatch instead of being resolved on another comment's evidence.
+// belong to the completed task, unedited since the task saw it. A reply added or a comment
+// edited while the repair ran keeps the thread open and goes through normal dispatch instead
+// of being resolved on evidence written for different words.
 export function coveredThreadItems(items = [], observed = [], task = {}) {
-  const taskKeys = new Set((task?.feedback ?? []).map((item) => item?.key).filter((key) => typeof key === 'string'));
+  const taskItems = new Map((task?.feedback ?? []).filter((item) => typeof item?.key === 'string').map((item) => [item.key, item]));
+  const closeKeys = new Set(items.map((item) => item?.key).filter(Boolean));
   return items.filter((item) => observed
     .filter((other) => other?.threadId === item.threadId && other.actionable !== false)
-    .every((other) => taskKeys.has(`${other.source}:${other.nativeId}`)));
+    .every((other) => {
+      const key = `${other.source}:${other.nativeId}`;
+      return taskItems.has(key) && closeKeys.has(key) && sameFeedbackContent(taskItems.get(key), other);
+    }));
 }
 function sanitizeEvidence(evidence) {
   return evidence.slice(0, 5).map((line) => '- ' + line.replace(/\/(?:Users|home)\/[^\s'"`]+/g, '<本机路径>').replace(/\s+/g, ' ').slice(0, 300));
@@ -135,13 +148,17 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
   const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
   const results = [];
   for (const item of items) {
-    if (closedThreads[item.threadId]) continue;
-    const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, dispatchId)
-      : item.triage ? triagedReplyText(item.evidence, dispatchId) : refutedReplyText(item.evidence, dispatchId);
+    // The receipt covers one disposition. A thread reopened and handled again by a later task
+    // carries that task's dispatchId and is answered again; the same task never posts twice.
+    const itemDispatchId = item.dispatchId ?? dispatchId;
+    const receipt = closedThreads[item.threadId];
+    if (receipt && (!receipt.dispatchId || receipt.dispatchId === itemDispatchId)) continue;
+    const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, itemDispatchId)
+      : item.triage ? triagedReplyText(item.evidence, itemDispatchId) : refutedReplyText(item.evidence, itemDispatchId);
     const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : 'refuted-p0-p1';
     yield () => ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${body}`]);
     yield () => ghFn(['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${item.threadId}`]);
-    closedThreads[item.threadId] = { at: now, key: item.key, reason, dispatchId };
+    closedThreads[item.threadId] = { at: now, key: item.key, reason, dispatchId: itemDispatchId };
     results.push({ threadId: item.threadId, key: item.key });
   }
   return { previous: { ...previous, autoClosedThreads: closedThreads }, closed: results };

@@ -81,7 +81,7 @@ README:[`watchers/mivo/README.md`](watchers/mivo/README.md)、
    | 字段 | 取值 | 说明 |
    |---|---|---|
    | `executionMode` | `"script"` | 零 token 模式:宿主不起 agent,直接执行 `scriptConfig.command` |
-   | `cronExpr` | `"*/5 * * * *"` | 每 5 分钟触发一次 |
+   | `cronExpr` | `"* * * * *"` | 每分钟触发一次;两轮之间在启动后第 45 秒再跟进转 Ready / 新推送 |
    | `timezone` | 如 `"Asia/Shanghai"` | 必填,IANA 时区 id |
    | `recurring` | `true` | discover 是常驻轮询 |
    | `scriptConfig.command` | `python3 <watcher home>/bin/mivo-watch-script.py --mode discover` | cwd 为 `workingDir`;必须实现 `cindy-script/1` 协议(stdout 只能是协议帧,调试输出走 stderr) |
@@ -111,8 +111,8 @@ discover 发现需要处理的反馈后,通过 `sessions.dispatch` 唤醒一个*
 **SC 报告格式**:`finalize` 要求的 `--sc-report` 是 `{ scs: [{ id, status: "pass"|"no-change",
 evidence: [...], feedbackKeys: [...] }] }`。每一条 feedback 必须被某个 SC 的 `feedbackKeys`
 覆盖(覆盖不全直接 fail);`status: "pass"` 只允许用在"该反馈的权限允许改代码"的 key 上——
-Mivo 场景下只有 **P0/P1** 允许改代码判 `pass`,Cindy 场景下 **P0/P1/P2** 允许,其余(P3、混合
-优先级、未经确认的发现)只能判 `no-change`,否则 `finalize` 会报 `REPAIR_SCOPE_NO_CODE` 拒绝。
+两套 watcher 都只有 **P0/P1** 允许改代码判 `pass`,P2/P3、混合优先级、未经确认的发现只能判
+`no-change`,否则 `finalize` 会报 `REPAIR_SCOPE_NO_CODE` 拒绝。
 这个权限表来自各自的 `*-pr-policy.mjs`/`*-feedback-policy.mjs`,不是 `finalize` 自己硬编码的。
 
 ## 省 token 设计
