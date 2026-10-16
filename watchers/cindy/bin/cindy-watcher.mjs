@@ -167,7 +167,6 @@ function ownReceipt(comment, actor) {
     && (!actor || author === actor);
 }
 
-export const REPAIR_ROUND_LIMIT = 6;
 
 export function classifyReviewFeedback(item = {}) {
   const policy = feedbackRepairPolicy(item);
@@ -543,7 +542,7 @@ export function keelRules({ dispatchId, canChangeCode, version = KEEL_FLOW_VERSI
 export const END_TURN_RULE = '本轮收口（finalize 返回 complete 或 waiting-ci、blocked、no-change）后立即结束回合：不要自己轮询、sleep 或等待，不要查询 PR、CI、维护者审批或任何调度。watcher 每分钟检查一次（新转 Ready 和新推送约 45 秒内跟进），出现新反馈、CI 变化或冲突会再投递给你。goal 的完成条件只覆盖本批反馈，不包含等待维护者审批或合并。';
 export const SNAPSHOT_RULE = 'PR 状态、required checks、失败 check 和未解决 thread 已由 watcher 采集，见 task 文件 prSnapshot 字段，反馈全文见 feedback[].body。先读 task 文件；只有回复/resolve thread、推送后确认 CI 或核实 task 之后的新变化时，才调用 gh 或 GitHub 插件。';
 
-export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messagePrefix = '', keelVersion = KEEL_FLOW_VERSION }) {
+export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messagePrefix = '', keelVersion = KEEL_FLOW_VERSION, version = null }) {
   const repairPolicy = taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh });
   const title = mapping.title || repairSessionTitle({ task: pr.title, prNumber: pr.number, createdAt: now });
   const outdatedNotes = (fresh ?? [])
@@ -553,6 +552,7 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
   const params = {
     title,
     message: [
+      rulesHeader(version ?? rulesVersion()),
       ...(messagePrefix ? [messagePrefix] : []),
       `Cindy PR 修复：${REPO}#${pr.number}（fork 双远程，origin=PR head 仓，upstream=${REPO} 只 fetch）。`,
       `nodeid=${pr.id}`,
@@ -569,7 +569,7 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       '整体目标是按逐项权限处理本批反馈；P0/P1/P2 获准修复才提交并 push fork；P3/建议/未定级只说明暂不修。未知严重度需核实或 blocked，不以回复冒充修复。required CI 通过或记录外部阻塞。',
       '必须项红：不许 gh run rerun。先读 job 日志分类；与本 PR 相关则修代码；判定 flaky/外部则每个 head SHA 最多一次空提交（git commit -s --allow-empty）重触发，仍红则 blocked。可选 check 不当必修。',
       '维护者、作者本人或代码审查应用留的 review thread（repairPolicy 里 reason=review-thread-triage）：先按仓库 REVIEW.md 的统一分级判定，拿不准用 Jev。确认必修（评论 P0/P1/P2）才改代码，SC=pass，修完回复人话并 resolve；建议、提问或不成立记 SC=no-change，evidence 第一条写一句给评论人看的人话结论（发生了什么 / 对本 PR 意味着什么 / 要不要改代码），watcher 会贴到该 thread 并 resolve。不要以「严重度未知」blocked 这类项。',
-      'Greptile / github-actions[bot]：P0/P1/P2 授权自动修复；P3 reply-only。自动回复+resolve 只作用于可信来源且已定级为 P3 的 thread。回复/resolve 遇到 403 只在会话内报告，不让整轮失败。混合/未知严重度 needs-triage。同一 PR 修复轮次上限 6 轮；冲突处理 = fetch upstream main 后 merge 进 PR 分支再 push fork，不 rebase/force push，绝不 push 到 makecindy/cindy。',
+      'Greptile / github-actions[bot]：P0/P1/P2 授权自动修复；P3 reply-only。自动回复+resolve 只作用于可信来源且已定级为 P3 的 thread。回复/resolve 遇到 403 只在会话内报告，不让整轮失败。混合/未知严重度 needs-triage。修复不设轮次上限，一直推进到可合并；冲突处理 = fetch upstream main 后 merge 进 PR 分支再 push fork，不 rebase/force push，绝不 push 到 makecindy/cindy。',
       ...(taskPath ? [
         `task=${taskPath}`,
         ...keelRules({ dispatchId: path.basename(taskPath, '.json'), canChangeCode: repairPolicy.canChangeCode, version: keelVersion }),
@@ -607,6 +607,42 @@ export function prWithHeadRepo(pr, collected) {
     headRepository: src?.headRepository ?? pr?.headRepository ?? (name ? { name, owner: ownerLogin ? { login: ownerLogin } : undefined } : undefined),
     headRepositoryOwner: src?.headRepositoryOwner ?? pr?.headRepositoryOwner ?? (ownerLogin ? { login: ownerLogin } : undefined),
   };
+}
+
+// Every delivery states its rules version and that it overrides earlier ones: a long-lived repair session keeps
+// messages from older watcher versions (6-round cap, 5-minute polling) in its history. The version is a digest
+// of the rendered rules, so any change to them bumps it.
+const RULES_HEADER = '盯梢规则版本';
+export function rulesHeader(version) {
+  return `${RULES_HEADER} ${version}：本条消息里的规则是当前完整规则，覆盖本会话此前收到的任何规则（包括旧的修复轮次上限、检查频率等说法）。`;
+}
+// Only the first line counts: a successor's prefix can quote an older task that carries an older header.
+export function rulesVersionOf(message) {
+  return String(message ?? '').match(new RegExp(`^${RULES_HEADER} ([0-9a-f]{12})：`))?.[1] ?? null;
+}
+let currentRulesVersion = null;
+export function rulesVersion() {
+  if (currentRulesVersion) return currentRulesVersion;
+  const sample = (fresh) => dispatchParams({
+    pr: { number: 0, id: 'PR_rules', headRefOid: '0'.repeat(40), title: 'rules' }, mapping: { title: 'rules' }, fresh,
+    now: '1970-01-01T00:00:00Z', taskPath: '/rules/tasks/rules.json', home: '/rules', version: '-',
+  }).message;
+  const finding = { key: 'review:rules', source: 'review', nativeId: 'rules', revision: 'rules', sha: '0'.repeat(40),
+    body: '**P1** rules', user: { login: 'github-actions[bot]', type: 'Bot' }, category: 'actionable-fix' };
+  currentRulesVersion = createHash('sha256').update([sample([]), sample([finding]), rulesRefreshMessage('-'), watchGuideMessage({ prNumber: 0 })].join('\n'))
+    .digest('hex').slice(0, 12);
+  return currentRulesVersion;
+}
+// Sent once per rules version to a bound session that has no task running, so it drops rules from older
+// deliveries now instead of at its next task.
+export function rulesRefreshMessage(version) {
+  return [
+    rulesHeader(version),
+    '规则更新，这不是新任务：不要改代码、不要 push、不要回复或 resolve 评论、不要运行 helper、不要查询 PR、CI 或调度，读完立即结束回合。',
+    '从现在起，本会话此前收到的规则一律以本条及之后投递里的规则为准；旧消息里的「同一 PR 修复轮次上限 6 轮」「watcher 每 5 分钟检查一次」等说法已作废。下一次投递会附带任务文件、helper 路径和完整流程。',
+    '修复不设轮次上限：只要还有新反馈、PR 还没到可合并，就继续修。不合并、不开 auto-merge、不删远端分支，绝不 push 到上游仓。',
+    END_TURN_RULE,
+  ].join('\n');
 }
 
 function shellQuote(value) {
@@ -810,6 +846,7 @@ export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor,
     },
     lastSeenAt: now,
     pendingFeedback: 0,
+    rulesVersion: rulesVersionOf(previous.pendingDispatch?.params?.message) ?? previous.rulesVersion ?? null,
     pendingDispatch: null,
     dispatchError: null,
     wasDraft: false,
@@ -903,6 +940,15 @@ function readJsonOrNull(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { return null; }
 }
+// Repair rounds have no cap any more (2026-10-16, same as the Mivo watcher). Versions before this change stopped a
+// PR after 6 rounds in one Ready and kept its feedback undelivered, so such a PR goes back to active and that
+// feedback is delivered on the next scan.
+export function reopenRoundLimitBlocked({ previous }) {
+  const active = previous?.activeTask;
+  if (active?.status !== 'blocked' || active.blockedKind !== 'round-limit') return previous;
+  return { ...previous, eligibility: 'active', activeTask: { ...active, blockedKind: 'round-limit-reset' } };
+}
+
 export function reopenKeelBlocked({ previous, paths, now }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || !KEEL_BLOCK_REASON.test(String(active.reason ?? ''))) return previous;
@@ -1060,6 +1106,7 @@ export function* processPr({
   try { previous = consumeResult(previous, resultFor(previous, paths), now); }
   catch (error) { resultError = error.message; }
   if (!resultError) previous = reopenInfraBlocked({ previous: reopenKeelBlocked({ previous, paths, now }), paths, now });
+  if (!resultError) previous = reopenRoundLimitBlocked({ previous });
   if (resultError) {
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.activeTask?.dispatchId ?? previous.lastDispatch?.dispatchId,
@@ -1119,13 +1166,11 @@ export function* processPr({
   pr = prWithHeadRepo(pr, collected);
   const sameEpoch = !collected.pr || (previous.admissionEpoch === collected.pr.releaseEpoch && previous.wasDraft !== true);
   if (!sameEpoch) previous = {...previous, admissionVerified:false};
-  // A new Ready is a new handoff with a fresh round budget; the cap only stops loops inside one Ready.
+  // repairRounds is a per-Ready count for the record only; it no longer stops repairs.
   // Entries written before this field count their rounds in the epoch they were admitted in.
   const countedEpoch = previous.roundsEpoch ?? previous.admissionEpoch ?? collected.pr?.releaseEpoch;
   if (collected.pr?.releaseEpoch && countedEpoch !== collected.pr.releaseEpoch) {
-    const roundLimited = previous.eligibility === 'blocked' && previous.activeTask?.blockedKind === 'round-limit';
-    const reset = { repairRounds: 0, roundsEpoch: collected.pr.releaseEpoch,
-      ...(roundLimited ? { eligibility: 'active', activeTask: { ...previous.activeTask, blockedKind: 'round-limit-reset' } } : {}) };
+    const reset = { repairRounds: 0, roundsEpoch: collected.pr.releaseEpoch };
     previous = { ...previous, ...reset };
     base = { ...base, ...reset };
   } else if (collected.pr?.releaseEpoch && !previous.roundsEpoch) {
@@ -1215,13 +1260,11 @@ export function* processPr({
   const recovery = admitted && !collected.mergeReady && !resultError
     && previous.activeTask?.status !== 'waiting-ci' && !terminal
     ? readTaskForRecovery(previous, paths, now) : null;
-  const repairRounds = Number(previous.repairRounds ?? 0);
-  const hitRoundLimit = repairRounds >= REPAIR_ROUND_LIMIT;
   const canResume = !resultError && (canRepair(previous) || (
     fresh.length > 0 && previous.activeTask?.status === 'blocked'
-    && !['invalid-result', 'missing-result-limit', 'round-limit'].includes(previous.activeTask?.blockedKind)
+    && !['invalid-result', 'missing-result-limit'].includes(previous.activeTask?.blockedKind)
   ));
-  const shouldDispatch = forceCreate || (fresh.length > 0 && !collected.mergeReady && canResume && !admissionBlocked && !inFlight && !hitRoundLimit);
+  const shouldDispatch = forceCreate || (fresh.length > 0 && !collected.mergeReady && canResume && !admissionBlocked && !inFlight);
   let dispatch = { attempted: false, bound: false, reason: 'no-new-feedback' };
   // Advance only non-actionable observations until a delivery is acknowledged.
   const retainedCursor = { ...cursor };
@@ -1233,20 +1276,6 @@ export function* processPr({
     ...previous, feedbackCursor: retainedCursor, pendingFeedback: fresh.length,
     sessionId: mapping.sessionId ?? previous.sessionId ?? null,
   };
-  if (hitRoundLimit && fresh.length > 0 && !collected.mergeReady && !admissionBlocked && !resultError && !inFlight) {
-    previous = {
-      ...previous,
-      eligibility: 'blocked',
-      activeTask: {
-        ...previous.activeTask,
-        dispatchId: previous.activeTask?.dispatchId ?? previous.lastDispatch?.dispatchId,
-        sessionId: previous.sessionId,
-        status: 'blocked',
-        blockedKind: 'round-limit',
-        reason: 'Same PR reached the 6-round repair limit.',
-      },
-    };
-  }
   const wantsDelivery=shouldDispatch || recovery || previous.pendingDispatch?.status==='retryable';
   // Per-PR budget caps collection only. Dispatch reserve (65s/61s) uses the global deadline.
   if (wantsDelivery) resetPrDeadline?.();
@@ -1376,8 +1405,6 @@ export function* processPr({
         }
       }
     }
-  } else if (hitRoundLimit && fresh.length > 0) {
-    dispatch.reason = 'round-limit';
   } else if (inFlight) {
     dispatch.reason = previous.activeTask?.status === 'waiting-ci' ? 'waiting-ci' : 'task-in-flight';
   } else if (!canResume) {
@@ -1559,7 +1586,8 @@ export function* pollWorkflow({
   // A PR the Keel incompatibility froze has nothing new on GitHub, so its fingerprint never changes;
   // without this it would never reach processPr, where reopenKeelBlocked hands its feedback back.
   const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous
-    || reopenInfraBlocked({ previous, paths, now }) !== previous;
+    || reopenInfraBlocked({ previous, paths, now }) !== previous
+    || reopenRoundLimitBlocked({ previous }) !== previous;
   if (previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry
     && !localResultPending && !needsCiRecheck(previous.activeTask) && !normalized.overflow && !keelReopenDue) {
     save(previous);
@@ -1639,6 +1667,39 @@ function* deliverClosedown({
     : {};
   previous = save({ ...previous, closedHandled: true, closedownAt: now, autoCleanup, ...manual });
   return { previous, dispatch: { attempted: false, bound: false, reason: 'closedown-script', autoCleanup } };
+}
+
+const TASK_IN_FLIGHT = new Set(['queued', 'accepted', 'prepared', 'running']);
+const RULES_REFRESH_ATTEMPTS = 3;
+// A bound session with no task running whose last delivery carried older rules gets the current rules once.
+// It is not a task: it neither touches the feedback cursor nor counts as a repair round. A PR that is
+// merge-ready, or whose feedback is waiting for delivery (which carries the current rules), is left alone.
+function* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn, remaining, unlockForDispatch, relockForDispatch }) {
+  const version = rulesVersion();
+  const entry = readPr(paths.home, key);
+  if (dryRun || typeof dispatchFn !== 'function' || !entry?.sessionId || entry.rulesVersion === version) return null;
+  if (item?.dispatch?.attempted || item?.dispatch?.reason === 'dispatch-budget-deferred' || item?.dispatch?.reason === 'merge-ready'
+    || entry.mergeReady === true || entry.collectRetry || Number(entry.pendingFeedback ?? 0) > 0) return null;
+  if (entry.pendingDispatch || entry.needsHuman || entry.optOut || entry.closedHandled || entry.wasDraft === true
+    || TASK_IN_FLIGHT.has(entry.activeTask?.status) || entry.activeTask?.blockedKind === AUTHOR_RECLAIMED) return null;
+  const attempts = entry.rulesRefresh?.version === version ? Number(entry.rulesRefresh.attempts ?? 0) : 0;
+  if (attempts >= RULES_REFRESH_ATTEMPTS || remaining() < 15000) return null;
+  const params = { title: entry.title || repairSessionTitle({ task: entry.taskName ?? 'PR', prNumber: entry.number, createdAt: now }),
+    message: rulesRefreshMessage(version), target_session_id: entry.sessionId };
+  let outcome;
+  unlockForDispatch?.();
+  try {
+    const receipt = yield () => dispatchFn(params, { timeoutMs: Math.max(1, Math.min(60000, remaining())) });
+    outcome = receipt?.target_session_id === entry.sessionId
+      ? { rulesVersion: version, rulesRefresh: { version, at: now, attempts: attempts + 1 } }
+      : { rulesRefresh: { version, at: now, attempts: attempts + 1, error: 'receipt-session-mismatch' } };
+  } catch (error) {
+    outcome = { rulesRefresh: { version, at: now, attempts: attempts + 1, error: String(error.message).slice(0, 200) } };
+  }
+  if (relockForDispatch?.()?.held) return 'rules-refresh-unrecorded';
+  const latest = readPr(paths.home, key) ?? entry;
+  writePr(paths.home, key, { ...latest, ...outcome });
+  return outcome.rulesVersion ? 'rules-refreshed' : 'rules-refresh-failed';
 }
 
 // One PR of a discover pass. Every PR of a pass runs at the same time (see parallel()), so each keeps its own
@@ -1737,7 +1798,9 @@ function* discoverOnePr(pr, ctx) {
       });
       report.push(inner[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: true, reason: 'successor' }, predecessors: previous.predecessors });
     } else {
-      report.push(item);
+      const refreshed = yield* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn,
+        remaining: () => Math.max(0, deadline - clock()), unlockForDispatch, relockForDispatch });
+      report.push(refreshed ? { ...item, rulesRefresh: refreshed } : item);
     }
     return done();
   }

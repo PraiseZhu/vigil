@@ -149,6 +149,12 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 
 环境变量 `MIVO_WATCHER_FOLLOW_MS` 可改跟进间隔，设为 `0` 只跑全量一轮。
 
+## 规则版本与已开会话
+
+修复会话是长期复用的，历史里留着旧版 watcher 投递的规则。每次投递的第一行都是 `盯梢规则版本 <12 位>`，并写明本条覆盖此前收到的规则；版本号是把当前全部规则文字渲染后取的摘要，规则一改版本就变。回执确认后，PR 状态记下这次实际投递的版本（`rulesVersion`，重投旧消息时记旧版本）。
+
+已绑定会话的 PR 每轮检查一次：版本落后、手上没有任务在跑（不是 queued / accepted / prepared / running）、没有待投递的反馈、PR 不是可合并时，补发一条「规则更新，不是新任务」的消息，只带当前规则、不改代码不回评论；同一版本最多补发 3 次（`rulesRefresh` 记次数和错误）。有反馈要投递的会话不补发，因为那条投递本身就带当前规则。
+
 ## CLI
 
 ```sh
