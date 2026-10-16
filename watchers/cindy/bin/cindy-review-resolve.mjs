@@ -138,14 +138,28 @@ export function sameFeedbackContent(original, current) {
 }
 // Every open external comment on the thread must belong to the task, unedited since the task
 // saw it; otherwise evidence written for other words would resolve it.
-export function coveredThreadItems(items = [], observed = [], task = {}) {
+// Comments the task held as reply-only (P2/P3) need an answer, not a fix: a result that gave them
+// a no-change disposition with evidence covers them, so a thread mixing a fixed P1 and an
+// answered P2 can close. Without that result only fixed or refuted items count.
+function answeredReplyOnlyKeys(result, task) {
+  if (!result || result.dispatchId !== task?.dispatchId) return new Set();
+  const policy = new Map((task.repairPolicy?.items ?? []).map((item) => [item.key, item]));
+  const keys = new Set();
+  for (const { key, disposition } of result.feedbackCoverage?.dispositions ?? []) {
+    if (!key || disposition !== 'no-change' || !policy.has(key) || policy.get(key)?.action === 'code-fix') continue;
+    if (evidenceLines(result, key, 'no-change').length) keys.add(key);
+  }
+  return keys;
+}
+export function coveredThreadItems(items = [], observed = [], task = {}, result = null) {
   const taskItems = new Map((task?.feedback ?? []).filter((item) => typeof item?.key === 'string').map((item) => [item.key, item]));
   const closeKeys = new Set(items.map((item) => item?.key).filter(Boolean));
+  const answered = answeredReplyOnlyKeys(result, task);
   return items.filter((item) => observed
     .filter((other) => other?.threadId === item.threadId && other.actionable !== false)
     .every((other) => {
       const key = `${other.source}:${other.nativeId}`;
-      return taskItems.has(key) && closeKeys.has(key) && sameFeedbackContent(taskItems.get(key), other);
+      return taskItems.has(key) && (closeKeys.has(key) || answered.has(key)) && sameFeedbackContent(taskItems.get(key), other);
     }));
 }
 // A thread from a maintainer, the author or a review app that the session graded as not needing code.

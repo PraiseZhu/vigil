@@ -473,6 +473,16 @@ function lastActivityMs(previous, paths, dispatchId) {
   return Math.max(activity ?? 0, Number.isFinite(dispatched) ? dispatched : 0, Number.isFinite(recovered) ? recovered : 0) || null;
 }
 
+// All bounded deliveries are spent, no result arrived, and the session has been quiet for the
+// recovery interval: the task stops as missing-result-limit and the person is told.
+function recoveryLimitDue(previous, paths, now) {
+  if (['blocked', 'complete', 'legacy-complete', 'waiting-ci'].includes(previous.activeTask?.status)) return false;
+  if (!previous.lastDispatch?.dispatchId || Number(previous.lastDispatch?.recoveryCount ?? 0) < MAX_RECOVERIES) return false;
+  const last = lastActivityMs(previous, paths, previous.lastDispatch.dispatchId)
+    ?? Date.parse(previous.lastDispatch?.lastRecoveryAt ?? previous.lastDispatch?.at);
+  return Number.isFinite(last) && Date.parse(now) - last >= RECOVERY_MIN_MS;
+}
+
 function readTaskForRecovery(previous, paths, now = new Date().toISOString()) {
   const dispatchId = previous?.lastDispatch?.dispatchId;
   if (typeof dispatchId !== 'string' || !dispatchId || dispatchId.startsWith('dry-')) return null;
@@ -1012,10 +1022,14 @@ function rememberPendingClose(previous, paths) {
     const items = [...fixedThreads(result, task), ...refutedThreads(result, task)]
       .map((item) => ({ ...item, dispatchId: result.dispatchId, head: result.head }));
     if (!items.length) return previous;
+    // The newest task to handle a thread holds the evidence for its current words; an older
+    // entry for the same thread would be rejected by the content check and block the close.
     const existing = previous.pendingThreadClose ?? [];
-    const seen = new Set(existing.map((item) => item.threadId));
-    const extra = items.filter((item) => !seen.has(item.threadId));
-    return extra.length ? { ...previous, pendingThreadClose: [...existing, ...extra] } : previous;
+    const replaced = new Set(items.map((item) => item.threadId));
+    const kept = existing.filter((item) => !replaced.has(item.threadId) || item.dispatchId === result.dispatchId);
+    const seen = new Set(kept.map((item) => `${item.threadId}:${item.dispatchId}`));
+    const extra = items.filter((item) => !seen.has(`${item.threadId}:${item.dispatchId}`));
+    return extra.length || kept.length !== existing.length ? { ...previous, pendingThreadClose: [...kept, ...extra] } : previous;
   } catch { return previous; }
 }
 function handledFindingsFrom(paths, previous) {
@@ -1654,9 +1668,7 @@ export function* processPr({
       reviewEvidence: { ready: false, reason: 'pending-authorized-feedback', terminal: null } };
     previous = { ...previous, mergeReady: false, reviewReason: collected.reviewReason, reviewEvidence: collected.reviewEvidence };
   }
-  if (!resultError && !['blocked', 'complete', 'legacy-complete', 'waiting-ci'].includes(previous.activeTask?.status)
-    && Number(previous.lastDispatch?.recoveryCount ?? 0) >= MAX_RECOVERIES
-    && Date.parse(now) - (lastActivityMs(previous, paths, previous.lastDispatch?.dispatchId) ?? Date.parse(previous.lastDispatch?.lastRecoveryAt ?? previous.lastDispatch?.at)) >= RECOVERY_MIN_MS) {
+  if (!resultError && recoveryLimitDue(previous, paths, now)) {
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.lastDispatch.dispatchId,
       sessionId: previous.sessionId, status: 'blocked', blockedKind: 'missing-result-limit',
@@ -2034,7 +2046,9 @@ export function* pollWorkflow({
     previous, key: nodeId, paths, now, dryRun, dispatchFn, remaining, pr: { number },
   });
   const pendingRetry = previous.pendingDispatch?.status === 'retryable';
-  const recoveryDue = Boolean(readTaskForRecovery(previous, paths, now));
+  const recoveryDue = Boolean(readTaskForRecovery(previous, paths, now))
+    // Out of deliveries and still silent: nothing on GitHub changes, so this alone must reach processPr.
+    || recoveryLimitDue(previous, paths, now);
   // A PR the Keel incompatibility froze has nothing new on GitHub, so its fingerprint never changes;
   // without this it would never reach processPr, where reopenKeelBlocked hands its feedback back.
   const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous

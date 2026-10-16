@@ -678,3 +678,116 @@ test('R3-5 discover queues one notice for a PR that needs a person', (t) => {
   const events = pendingEvents(home).filter((event) => event.kind === 'owner-unknown');
   assert.equal(events.length, 1, 'one notice per PR and state');
 });
+
+function writeResult(paths, dispatchId, extra) {
+  fs.mkdirSync(path.join(paths.stateDir, 'results'), { recursive: true });
+  fs.writeFileSync(path.join(paths.stateDir, 'results', `${dispatchId}.json`), JSON.stringify({
+    schemaVersion: 2, kind: 'mivo-repair-result', dispatchId, nodeId, sessionId: 'sess-790', head: HEAD,
+    receiptId: `r-${dispatchId}-${extra.status}`, ...extra,
+  }));
+}
+
+test('R4-1 the newest evidence for a thread replaces older pending evidence and closes it once CI is green', (t) => {
+  const { home, paths, oldKey } = seedWaitingCi(t);
+  const calls = [];
+  const track = (params) => { calls.push(params); return { target_session_id: 'sess-790' }; };
+  // Round 1: the comment is edited while the first fix waits for CI; a second task picks up the new words.
+  discover(paths, { collect: () => collectBase({ threads: [editedOldThread], ci: { status: 'pending', required: [] } }), dispatchFn: track, recheckFn: () => ({}) });
+  assert.equal(calls.length, 1);
+  const second = readPr(home, nodeId).activeTask.dispatchId;
+  writeResult(paths, second, {
+    status: 'waiting-ci', feedbackCoverage: { dispositions: [{ key: oldKey, disposition: 'fixed' }] },
+    scs: [{ status: 'pass', feedbackKeys: [oldKey], evidence: ['fixed the retry path in src/a.ts'] }],
+  });
+  // Round 2: an unrelated thread arrives while the second fix waits for CI.
+  discover(paths, { now: '2026-09-28T00:40:00Z', collect: () => collectBase({ threads: [editedOldThread, newThread], ci: { status: 'pending', required: [] } }), dispatchFn: track, recheckFn: () => ({}) });
+  assert.equal(calls.length, 2);
+  const third = readPr(home, nodeId).activeTask.dispatchId;
+  writeResult(paths, third, {
+    status: 'complete', ci: { requiredGreen: true, head: HEAD }, verification: { status: 'pass' },
+    feedbackCoverage: { dispositions: [{ key: 'greptile:PRRT_new:c-new', disposition: 'fixed' }] },
+    scs: [{ status: 'pass', feedbackKeys: ['greptile:PRRT_new:c-new'], evidence: ['fixed new'] }],
+  });
+  // Round 3: CI is green; both threads were fixed for the words they now show.
+  discover(paths, { now: '2026-09-28T00:50:00Z', collect: () => collectBase({ threads: [editedOldThread, newThread], mergeReady: true }), dispatchFn: () => { throw new Error('no dispatch after complete'); }, recheckFn: () => ({}) });
+  const closed = readPr(home, nodeId).autoClosedThreads ?? {};
+  assert.ok(closed.PRRT_new, 'the third task closes its own thread');
+  assert.ok(closed.PRRT_old, 'the second task evidence for the edited comment must close it');
+});
+
+test('R4-2 exhausted recoveries with no result reach missing-result-limit even when GitHub is unchanged', (t) => {
+  const { home, paths } = homeOf(t);
+  const dispatchId = 'live-790-silent';
+  seedBound(paths, {
+    pollFingerprint: SNAP_FINGERPRINT, rulesVersion: rulesVersion(),
+    lastDispatch: { dispatchId, at: '2026-09-28T00:00:00Z', recoveryCount: 3, lastRecoveryAt: '2026-09-28T01:30:00Z' },
+    activeTask: { status: 'accepted', dispatchId, head: HEAD, sessionId: 'sess-790' },
+  });
+  fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
+  fs.writeFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), JSON.stringify({
+    dispatchId, nodeId, number: 790, repo: process.env.MIVO_WATCHER_TARGET_REPO, sessionId: 'sess-790',
+    headRefOid: HEAD, headRefName: 'fix/x', params: { message: 'fix' }, feedback: [],
+    handoff: handoffReceipt({ ...listed, releaseEpoch: 'e' }),
+  }));
+  discover(paths, { now: '2026-09-28T02:05:00Z', collect: () => collectBase(), dispatchFn: () => { throw new Error('no fourth delivery'); }, recheckFn: () => ({}) });
+  const entry = readPr(home, nodeId);
+  assert.equal(entry.activeTask.blockedKind, 'missing-result-limit');
+  assert.ok(pendingEvents(home).some((event) => event.kind === 'missing-result-limit'), 'the person must be told');
+});
+
+const mixedThread = {
+  id: 'PRRT_mix', isResolved: false, isOutdated: false, path: 'src/m.ts',
+  comments: [
+    { id: 'c-p1', author: { login: 'greptile-apps[bot]' }, body: '**P1** crash on empty input', createdAt: now },
+    { id: 'c-p2', author: { login: 'greptile-apps[bot]' }, body: '**P2** naming could be clearer', createdAt: now },
+  ],
+};
+
+test('R4-3 a thread with a fixed P1 and an answered P2 closes after a complete green result', (t) => {
+  const { home, paths } = homeOf(t);
+  const dispatchId = 'live-mixed';
+  seedBound(paths, {
+    pollFingerprint: 'old', rulesVersion: rulesVersion(),
+    lastDispatch: { dispatchId, at: '2026-09-28T00:00:00Z' },
+    activeTask: { status: 'accepted', dispatchId, head: HEAD, sessionId: 'sess-790' },
+  });
+  const p1 = 'greptile:PRRT_mix:c-p1';
+  const p2 = 'greptile:PRRT_mix:c-p2';
+  fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
+  fs.writeFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), JSON.stringify({
+    dispatchId, nodeId, number: 790, repo: process.env.MIVO_WATCHER_TARGET_REPO, sessionId: 'sess-790',
+    headRefOid: HEAD, headRefName: 'fix/x', params: { message: 'fix' },
+    handoff: handoffReceipt({ ...listed, releaseEpoch: 'e' }),
+    feedback: [
+      { key: p1, source: 'greptile', nativeId: 'PRRT_mix:c-p1', path: 'src/m.ts', body: mixedThread.comments[0].body },
+      { key: p2, source: 'greptile', nativeId: 'PRRT_mix:c-p2', path: 'src/m.ts', body: mixedThread.comments[1].body },
+    ],
+    repairPolicy: { items: [{ key: p1, action: 'code-fix' }, { key: p2, action: 'reply-only' }] },
+  }));
+  writeResult(paths, dispatchId, {
+    status: 'complete', ci: { requiredGreen: true, head: HEAD }, verification: { status: 'pass' },
+    feedbackCoverage: { dispositions: [{ key: p1, disposition: 'fixed' }, { key: p2, disposition: 'no-change' }] },
+    scs: [
+      { status: 'pass', feedbackKeys: [p1], evidence: ['guarded empty input in src/m.ts'] },
+      { status: 'no-change', feedbackKeys: [p2], evidence: ['P2 naming suggestion recorded, not changed'] },
+    ],
+  });
+  discover(paths, { collect: () => collectBase({ threads: [mixedThread], mergeReady: true }), dispatchFn: () => { throw new Error('no dispatch after complete'); }, recheckFn: () => ({}) });
+  assert.ok(readPr(home, nodeId).autoClosedThreads?.PRRT_mix, 'a fully handled mixed thread must close');
+});
+
+test('R4-4 a notice lock left by a killed process is reclaimed', (t) => {
+  const { home } = homeOf(t);
+  const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' });
+  fs.mkdirSync(path.join(home, 'state', 'notices'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'state', 'notices', 'pending.lock'), String(Number(dead.stdout)));
+  const bin = fileURLToPath(new URL('./bin/notify.mjs', import.meta.url));
+  const started = Date.now();
+  const run = spawnSync(process.execPath, ['--input-type=module', '-e', `import { enqueueNotice } from ${JSON.stringify(bin)}; enqueueNotice(process.env.NOTICE_HOME, { kind: 'merge-ready', number: 791, head: 'h' });`], {
+    encoding: 'utf8', env: { ...process.env, NOTICE_HOME: home },
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.ok(Date.now() - started < 5000, 'a dead holder must not make writers wait out the timeout');
+  assert.ok(pendingEvents(home).some((event) => event.number === 791));
+  assert.equal(fs.existsSync(path.join(home, 'state', 'notices', 'pending.lock')), false);
+});

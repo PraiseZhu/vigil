@@ -37,6 +37,22 @@ function readJson(file, fallback) {
   catch { return fallback; }
 }
 
+// A writer killed while holding the lock (timeout, SIGKILL, reboot) never reaches its finally.
+// Its pid is in the file; once that process is gone the lock is removed, unless another writer
+// replaced it in the meantime. An unreadable lock counts as dead after 30 seconds.
+function reclaimDeadNoticeLock(file) {
+  let holder, stat;
+  try { holder = fs.readFileSync(file, 'utf8'); stat = fs.statSync(file); } catch { return true; }
+  const pid = Number(holder);
+  let dead = false;
+  if (Number.isSafeInteger(pid) && pid > 0) {
+    try { process.kill(pid, 0); } catch (error) { dead = error.code === 'ESRCH'; }
+  } else dead = Date.now() - stat.mtimeMs > 30_000;
+  if (!dead) return false;
+  try { if (fs.readFileSync(file, 'utf8') === holder) fs.unlinkSync(file); } catch {}
+  return true;
+}
+
 function withNoticeLock(home, fn) {
   const file = lockPath(home);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -48,6 +64,7 @@ function withNoticeLock(home, fn) {
       finally { try { fs.unlinkSync(file); } catch {} }
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
+      if (reclaimDeadNoticeLock(file)) continue;
       if (Date.now() - started > 8000) throw error;
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
     }
