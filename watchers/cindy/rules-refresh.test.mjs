@@ -63,6 +63,15 @@ test('every delivery opens with the rules version and says it overrides earlier 
   assert.equal(rulesVersionOf('no header'), null);
 });
 
+test('a successor delivery still opens with the current version, not one quoted from an older task', () => {
+  const stale = rulesHeader('0123456789ab');
+  const { message } = dispatchParams({ pr: { number: 7, id: 'PR_7', headRefOid: HEAD, title: 't' }, mapping: { title: 't' }, fresh: [],
+    now: '2026-10-16T00:00:00Z', taskPath: '/h/state/tasks/x.json', home: '/h', messagePrefix: `接班说明，前任摘要：${stale}\nold task` });
+  assert.ok(message.startsWith(rulesHeader(rulesVersion())), message.split('\n')[0]);
+  assert.equal(rulesVersionOf(message), rulesVersion());
+  assert.equal(rulesVersionOf(`接班说明\n${stale}`), null);
+});
+
 test('a receipt records the rules version of the message that was actually delivered', (t) => {
   const paths = homeOf(t);
   const pr = { id: nodeId, number: 790, headRefOid: HEAD, headRefName: 'fix/x', url: 'u' };

@@ -629,8 +629,8 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
   const params = {
     title,
     message: [
-      ...(messagePrefix ? [messagePrefix] : []),
       rulesHeader(version ?? rulesVersion()),
+      ...(messagePrefix ? [messagePrefix] : []),
       `Mivo PR repair for ${REPO}#${pr.number}.`,
       `nodeid=${pr.id}`,
       `head=${pr.headRefOid}`,
@@ -682,8 +682,9 @@ const RULES_HEADER = '盯梢规则版本';
 export function rulesHeader(version) {
   return `${RULES_HEADER} ${version}：本条消息里的规则是当前完整规则，覆盖本会话此前收到的任何规则（包括旧的修复轮次上限、产品意图等人裁定、检查频率等说法）。`;
 }
+// Only the first line counts: a successor's prefix can quote an older task that carries an older header.
 export function rulesVersionOf(message) {
-  return String(message ?? '').match(new RegExp(`${RULES_HEADER} ([0-9a-f]{12})：`))?.[1] ?? null;
+  return String(message ?? '').match(new RegExp(`^${RULES_HEADER} ([0-9a-f]{12})：`))?.[1] ?? null;
 }
 let currentRulesVersion = null;
 export function rulesVersion() {
