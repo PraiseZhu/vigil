@@ -137,7 +137,8 @@ const refutedResult = (extra = {}) => ({
 
 test('only verified no-change P0/P1 review threads with evidence are closed as refuted', () => {
   assert.deepEqual(refutedThreads(refutedResult(), refutedTask).map((item) => item.threadId), ['PRRT_p1', 'PRRT_g1']);
-  for (const extra of [{ status: 'waiting-ci' }, { schemaVersion: 1 }, { dispatchId: 'other' }]) {
+  assert.deepEqual(refutedThreads(refutedResult({ status: 'waiting-ci' }), refutedTask).map((item) => item.threadId), ['PRRT_p1', 'PRRT_g1']);
+  for (const extra of [{ schemaVersion: 1 }, { dispatchId: 'other' }]) {
     assert.deepEqual(refutedThreads(refutedResult(extra), refutedTask), []);
   }
 });
@@ -192,7 +193,8 @@ test('fixedThreads recognizes verified fixed P0/P1 review threads with pass evid
     ] },
   };
   assert.deepEqual(fixedThreads(result, task).map((item) => item.threadId), ['PRRT_fix', 'PRRT_legacy']);
-  for (const extra of [{ status: 'waiting-ci' }, { schemaVersion: 1 }, { dispatchId: 'other' }]) {
+  assert.deepEqual(fixedThreads({ ...result, status: 'waiting-ci' }, task).map((item) => item.threadId), ['PRRT_fix', 'PRRT_legacy']);
+  for (const extra of [{ schemaVersion: 1 }, { dispatchId: 'other' }]) {
     assert.deepEqual(fixedThreads({ ...result, ...extra }, task), []);
   }
 });

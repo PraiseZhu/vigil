@@ -68,6 +68,8 @@ function fixture(t, { changed = true } = {}) {
   writePr(home, task.nodeId, { number: task.number, nodeId: task.nodeId, sessionId: task.sessionId,
     activeTask: { dispatchId: task.dispatchId } });
   let remoteHead = sourceHead;
+  let ciConclusionValue = 'success';
+  const ciConclusion = () => ciConclusionValue;
   const pushCalls = [];
   const ghCalls = [];
   const gitFn = (_binary, args) => {
@@ -94,12 +96,22 @@ function fixture(t, { changed = true } = {}) {
     if (endpoint === `repos/${REPO}/contents/docs/sync/required-checks.json?ref=${sourceHead}`) {
       assert.fail('cindy policy must not read docs/sync/required-checks.json');
     }
-    if (endpoint === `repos/${REPO}/commits/${remoteHead}/check-runs?per_page=100&filter=all`) return JSON.stringify([{ check_runs: [{
-      id: 101, name: 'verify', head_sha: remoteHead, status: 'completed', conclusion: 'success',
-      started_at: '2026-09-29T00:00:00Z', app: { id: 123, slug: 'fixture-ci' },
-      details_url: 'https://example.invalid/fixture-ci',
-    }] }]);
-    if (endpoint === `repos/${REPO}/commits/${remoteHead}/statuses?per_page=100`) return JSON.stringify([[]]);
+    if (String(endpoint).startsWith(`repos/${REPO}/commits/${remoteHead}/check-runs`)) {
+      const conclusion = ciConclusion();
+      return JSON.stringify([{ check_runs: [{
+        id: 101, name: 'verify', head_sha: remoteHead, status: 'completed', conclusion,
+        started_at: '2026-09-29T00:00:00Z', app: { id: 123, slug: 'github-actions' },
+        details_url: `https://github.com/${REPO}/actions/runs/555/job/101`,
+      }] }]);
+    }
+    if (endpoint === `repos/${REPO}/actions/jobs/101`) return JSON.stringify({
+      id: 101, run_id: 555, head_sha: remoteHead, run_attempt: 1,
+      check_run_url: `https://api.github.com/repos/${REPO}/check-runs/101`,
+    });
+    if (endpoint === `repos/${REPO}/actions/runs/555`) return JSON.stringify({
+      id: 555, repository: { full_name: REPO }, head_sha: remoteHead, run_attempt: 1,
+    });
+    if (String(endpoint).startsWith(`repos/${REPO}/commits/${remoteHead}/statuses`)) return JSON.stringify([[]]);
     assert.fail(`unexpected GitHub call: ${JSON.stringify(args)}`);
   };
   const scReport = path.join(root, 'sc-report.json');
@@ -108,7 +120,8 @@ function fixture(t, { changed = true } = {}) {
     feedbackKeys, evidence: ['synthetic fixture checked locally'] });
   const options = { home, taskPath, scReport, validatedHead: head, originUrl, gitFn, ghFn,
     env: { ...process.env, PREFLIGHT_SKIP: '0', CINDY_PREFLIGHT_BIN: path.join(worktree, '.githooks/pre-push') } };
-  return { task, paths, sourceHead, head, options, saveTask, report, sc, pushCalls, ghCalls,
+  return { task, paths, sourceHead, head, worktree, options, saveTask, report, sc, pushCalls, ghCalls,
+    setCiConclusion: (value) => { ciConclusionValue = value; },
     remoteHead: () => git('--git-dir', originUrl, 'rev-parse', 'refs/heads/fix/scope'),
     validate: () => validate(options), finalize: () => finalize(options) };
 }
@@ -185,6 +198,44 @@ for (const kind of ['P2', 'P3', 'unknown', 'empty']) {
     assert.equal(f.remoteHead(), f.sourceHead);
   });
 }
+
+test('SC3 validate heartbeat refreshes activity during a blocking preflight', async (t) => {
+  const previous = process.env.VIGIL_ACTIVITY_HEARTBEAT_MS;
+  process.env.VIGIL_ACTIVITY_HEARTBEAT_MS = '1000';
+  t.after(() => {
+    if (previous === undefined) delete process.env.VIGIL_ACTIVITY_HEARTBEAT_MS;
+    else process.env.VIGIL_ACTIVITY_HEARTBEAT_MS = previous;
+  });
+  const { validate } = await import(`./bin/cindy-repair.mjs?heartbeat=${Date.now()}`);
+  const f = fixture(t);
+  const file = path.join(f.paths.home, 'state', 'activity', `${f.task.dispatchId}.json`);
+  const result = validate({
+    ...f.options,
+    runFn: () => {
+      const first = JSON.parse(fs.readFileSync(file, 'utf8')).at;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2200);
+      assert.notEqual(JSON.parse(fs.readFileSync(file, 'utf8')).at, first);
+      return 'passed\n';
+    },
+  });
+  assert.equal(result.status, 'pass');
+});
+
+test('SC7 no-change required-CI failure retriggers once with a signed empty commit, then escalates', (t) => {
+  const f = fixture(t, { changed: false });
+  f.saveTask([finding('P3')]);
+  f.report([f.sc('no-change', ['thread:P3'])]);
+  f.setCiConclusion('failure');
+  const first = f.finalize();
+  assert.equal(first.status, 'waiting-ci');
+  assert.equal(first.ciRetrigger.method, 'empty-commit');
+  assert.equal(first.pushed, true);
+  assert.notEqual(f.remoteHead(), f.sourceHead);
+  const second = finalize({ ...f.options, validatedHead: f.remoteHead() });
+  assert.equal(second.status, 'blocked');
+  assert.equal(second.blockedKind, 'external');
+  assert.match(second.reason, /after one no-change empty-commit retrigger/);
+});
 
 test('mixed task can fix P1 while explicitly leaving P3 unchanged', (t) => {
   const f = fixture(t);

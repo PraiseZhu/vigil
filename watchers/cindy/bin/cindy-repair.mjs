@@ -4,7 +4,7 @@
 // source of the session binding and Cindy is responsible for the session.
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { collectCindyCiSync } from './cindy-ci.mjs';
@@ -136,11 +136,27 @@ export function readActivityAt(home, dispatchId) {
     return Number.isFinite(at) ? at : null;
   } catch { return null; }
 }
+function activityHeartbeatMs() {
+  return Math.max(1_000, Number(process.env.VIGIL_ACTIVITY_HEARTBEAT_MS) || 60_000);
+}
 function startActivityHeartbeat(paths, task, op) {
   recordActivity(paths, task, op);
-  const timer = setInterval(() => { try { recordActivity(paths, task, op); } catch {} }, 60_000);
-  if (typeof timer.unref === 'function') timer.unref();
-  return () => clearInterval(timer);
+  const file = activityFile(paths, task.dispatchId);
+  const child = spawn(process.execPath, ['-e', `
+    const fs = require('fs');
+    const path = ${JSON.stringify(file)};
+    const rec = () => {
+      try {
+        const tmp = path + '.tmp-' + process.pid + '-' + Date.now();
+        fs.mkdirSync(require('path').dirname(path), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(tmp, JSON.stringify({ at: new Date().toISOString(), op: ${JSON.stringify(op)}, dispatchId: ${JSON.stringify(task.dispatchId)} }) + '\\n', { mode: 0o600 });
+        fs.renameSync(tmp, path);
+      } catch {}
+    };
+    setInterval(rec, ${activityHeartbeatMs()});
+  `], { detached: true, stdio: 'ignore' });
+  child.unref();
+  return () => { try { process.kill(child.pid, 'SIGTERM'); } catch {} };
 }
 
 function saveResult(paths, task, sessionId, payload, { requirePrLock = false } = {}) {
@@ -378,10 +394,15 @@ export function cloneWorktree(paths, task, gitFn, cloneUrl, expectedUrl, remoteH
 
 // Recompute from the trusted task's feedback, including legacy tasks. A cached
 // category, an SC assertion, or a successful preflight is not repair authority.
-export function assertTaskRepairScope(task, head) {
+export function isEmptyCiRetrigger(worktree, fromSha, toSha, gitFn) {
+  if (!isSha(fromSha) || !isSha(toSha) || fromSha === toSha) return false;
+  return gitOutput(['-C', worktree, 'diff', '--name-only', fromSha, toSha], gitFn).trim() === '';
+}
+
+export function assertTaskRepairScope(task, head, { emptyRetrigger = false } = {}) {
   if (!isSha(task?.headRefOid) || !isSha(head)) fail('repair scope requires valid source and target HEAD');
   const repairPolicy = taskRepairPolicy(task);
-  if (head !== task.headRefOid && !repairPolicy.canChangeCode) {
+  if (head !== task.headRefOid && !repairPolicy.canChangeCode && !emptyRetrigger) {
     fail('[REPAIR_SCOPE_NO_CODE] This task has no P0/P1, required-CI or conflict repair authority; preserve local changes, do not push. P2/P3 and unknown findings are no-change only.');
   }
   return repairPolicy;
@@ -756,7 +777,7 @@ function legacyCheckStatus(task, head, ghFn) {
 
 export function policyCiResult(ci, head) {
   return {head, requiredGreen:ci.status === 'green', policyHash:ci.policyHash,
-    requiredChecks:(ci.required??[]).map(r=>({name:r.context,bucket:r.status==='green'?'pass':r.status==='failed'?'fail':'pending',headSha:head,evidence:r.evidence})),
+    requiredChecks:(ci.required??[]).map(r=>({name:r.context,bucket:r.status==='green'?'pass':r.status==='failed'?'fail':'pending',headSha:head,runId:r.evidence?.runId ?? null,evidence:r.evidence})),
     optionalFailures:[],pending:(ci.required??[]).filter(r=>r.status==='pending').map(r=>r.context),
     missing:ci.status==='unknown'?[ci.reason??'required-policy-unknown']:[]};
 }
@@ -771,6 +792,10 @@ export function ciResult(ci) {
   if (failures.length) return { status: 'blocked', blockedKind: 'required-ci', reason: `required CI failed: ${failures.map((check) => check.name).join(', ')}` };
   if (!ci.requiredGreen) return { status: 'waiting-ci', reason: `waiting for current HEAD required CI: ${[...ci.missing, ...ci.pending].join(', ')}` };
   return { status: 'complete' };
+}
+
+function allNoChange(scs) {
+  return Array.isArray(scs) && scs.length > 0 && scs.every((sc) => sc.status === 'no-change');
 }
 
 export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, originUrl) {
@@ -800,24 +825,27 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   recordActivity(paths, task, 'finalize');
   const { sessionId } = boundSession(paths, task);
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
-  assertTaskRepairScope(task, validatedHead);
   const pr = ghPr(task, ghFn, false);
   const worktree = taskWorktree(task);
   originUrl = originUrl ?? githubRepoUrl(resolveHeadRepo(task));
   if (isBaseGithubUrl(originUrl)) fail(`refusing to push to base repo ${REPO}`);
-  assertDco(worktree, task.headRefOid, validatedHead, gitFn);
   const checkout = assertWorktree(worktree, { ...task, headRefOid: validatedHead }, gitFn, originUrl);
   if (!checkout || checkout.head !== validatedHead) fail('worktree HEAD does not match validated-head');
   const branchHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
   const { scs, feedbackCoverage } = loadScs(scReport, task);
-  if (validatedHead !== task.headRefOid && scs.every((sc) => sc.status === 'no-change')) {
+  const emptyRetrigger = allNoChange(scs) && isEmptyCiRetrigger(worktree, task.headRefOid, validatedHead, gitFn);
+  assertTaskRepairScope(task, validatedHead, { emptyRetrigger });
+  assertDco(worktree, task.headRefOid, validatedHead, gitFn);
+  if (validatedHead !== task.headRefOid && scs.every((sc) => sc.status === 'no-change') && !emptyRetrigger) {
     fail('[REPAIR_SCOPE_NO_CODE] Changed HEAD requires an SC bound to an authorized fix; no-change cannot cover commits');
   }
   const noChange = validatedHead === task.headRefOid && branchHead === validatedHead && scs.every((sc) => sc.status === 'no-change');
-  const verification = noChange
-    ? { status: 'not-required-no-change', head: validatedHead, localTests: 'not-run', reason: 'all SCs are no-change and task, checkout and remote HEAD match' }
+  const verification = (noChange || emptyRetrigger)
+    ? { status: 'not-required-no-change', head: validatedHead, localTests: 'not-run', reason: emptyRetrigger
+      ? 'signed empty commit retriggered required CI once; local tests were not required'
+      : 'all SCs are no-change and task, checkout and remote HEAD match' }
     : verifiedLocal(paths, task, sessionId, validatedHead, worktree, gitFn, validationReceipt, env);
   const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot, validatedHead, verification });
   const push = pushIfNeeded(worktree, task, validatedHead, branchHead, gitFn, originUrl);
@@ -827,7 +855,33 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
     return saveResult(paths, task, sessionId, { status: 'blocked', blockedKind: 'ci-transport', reason: error.message,
       head: validatedHead, scs, feedbackCoverage, keel, verification, checks: [], pushed: push.pushed });
   }
-  return saveResult(paths, task, sessionId, { ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed: push.pushed });
+  const prior = fs.existsSync(path.join(paths.results, `${task.dispatchId}.json`))
+    ? readJson(path.join(paths.results, `${task.dispatchId}.json`), 'repair result') : null;
+  if (allNoChange(scs) && ciResult(ci).blockedKind === 'required-ci') {
+    if (prior?.ciRetrigger?.sourceHead === task.headRefOid) {
+      return saveResult(paths, task, sessionId, {
+        status: 'blocked', blockedKind: 'external',
+        reason: 'required CI still failed after one no-change empty-commit retrigger',
+        head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks,
+        pushed: push.pushed, ciRetrigger: prior.ciRetrigger,
+      });
+    }
+    if (!emptyRetrigger && validatedHead === task.headRefOid) {
+      gitOutput(['-C', worktree, '-c', 'commit.gpgsign=false', 'commit', '-s', '--allow-empty', '-m', 'ci: retrigger required checks'], gitFn);
+      const retriggerHead = gitOutput(['-C', worktree, 'rev-parse', 'HEAD'], gitFn);
+      assertDco(worktree, task.headRefOid, retriggerHead, gitFn);
+      const retriggerPush = pushIfNeeded(worktree, task, retriggerHead, validatedHead, gitFn, originUrl);
+      return saveResult(paths, task, sessionId, {
+        status: 'waiting-ci', reason: 'retried required CI once with a signed empty commit',
+        head: retriggerHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks,
+        pushed: retriggerPush.pushed, ciRetrigger: { sourceHead: task.headRefOid, method: 'empty-commit', head: retriggerHead },
+      });
+    }
+  }
+  return saveResult(paths, task, sessionId, {
+    ...ciResult(ci), head: validatedHead, scs, feedbackCoverage, keel, verification, ci, checks: ci.requiredChecks, pushed: push.pushed,
+    ...(emptyRetrigger ? { ciRetrigger: { sourceHead: task.headRefOid, method: 'empty-commit', head: validatedHead } } : {}),
+  });
   });
 }
 
@@ -842,14 +896,15 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn =
   assertIdentity(previous, task, sessionId, 'repair result');
   const head = validatedHead ?? previous.head;
   if (!isSha(head) || previous.head !== head) fail('recheck HEAD does not match the result');
-  assertTaskRepairScope(task, head);
   const { scs, feedbackCoverage } = validateScs(previous.scs, task);
   const worktree = taskWorktree(task);
+  const emptyRetrigger = previous.ciRetrigger?.method === 'empty-commit' && isEmptyCiRetrigger(worktree, task.headRefOid, head, gitFn);
+  assertTaskRepairScope(task, head, { emptyRetrigger });
   const checkout = assertWorktree(worktree, task, gitFn, originUrl);
   if (!checkout || checkout.head !== head) fail('recheck worktree HEAD changed');
   let verification;
   if (previous.verification?.status === 'not-required-no-change') {
-    if (head !== task.headRefOid || !previous.scs.every((sc) => sc.status === 'no-change')) fail('no-change verification cannot cover code changes');
+    if ((head !== task.headRefOid && !emptyRetrigger) || !previous.scs.every((sc) => sc.status === 'no-change')) fail('no-change verification cannot cover code changes');
     verification = previous.verification;
   } else {
     verification = verifiedLocal(paths, task, sessionId, head, worktree, gitFn, previous.verification?.receiptPath, env);
@@ -869,7 +924,14 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, gitFn =
       drift: { validatedHead: head, remoteHead, githubHead: observedPrHead, sourceHead: task.headRefOid } }, { requirePrLock: true });
   }
   const ci = checkStatus(task, head, ghFn);
-  return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks }, { requirePrLock: true });
+  if (allNoChange(scs) && ciResult(ci).blockedKind === 'required-ci' && previous.ciRetrigger?.sourceHead === task.headRefOid) {
+    return saveResult(paths, task, sessionId, {
+      ...common, status: 'blocked', blockedKind: 'external',
+      reason: 'required CI still failed after one no-change empty-commit retrigger',
+      ci, checks: ci.requiredChecks, ciRetrigger: previous.ciRetrigger,
+    }, { requirePrLock: true });
+  }
+  return saveResult(paths, task, sessionId, { ...common, ...ciResult(ci), ci, checks: ci.requiredChecks, ...(previous.ciRetrigger ? { ciRetrigger: previous.ciRetrigger } : {}) }, { requirePrLock: true });
   });
 }
 
@@ -879,7 +941,10 @@ export function blocked({ home, taskPath, reason, ghFn = command } = {}) {
   recordActivity(paths, task, 'blocked');
   const { sessionId } = boundSession(paths, task);
   if (typeof reason !== 'string' || !reason.trim()) fail('blocked reason is required');
-  return saveResult(paths, task, sessionId, { status: 'blocked', blockedKind: 'external', reason: reason.trim(), worktree: taskWorktree(task) });
+  return saveResult(paths, task, sessionId, {
+    status: 'blocked', blockedKind: 'external', reason: reason.trim(),
+    head: task.headRefOid, worktree: taskWorktree(task),
+  });
   });
 }
 

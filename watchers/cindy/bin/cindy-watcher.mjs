@@ -13,7 +13,7 @@ import { collectCindyReview } from './cindy-review-status.mjs';
 import { collectPrSnapshot, collectPrOwnership } from './cindy-pr-snapshot.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, DEPLOY_LOCK_NAME, inspectLocks, listPrs, lockStatus, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './cindy-state.mjs';
 import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor, normalizeActorLogin } from './cindy-feedback-policy.mjs';
-import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads } from './cindy-review-resolve.mjs';
+import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems } from './cindy-review-resolve.mjs';
 import {
   autoCleanupWatch, command as gitDefaultFn, KEEL_FLOW_VERSION, keelRunIdFor, readActivityAt,
 } from './cindy-repair.mjs';
@@ -786,7 +786,7 @@ function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix 
   const headPr = prWithHeadRepo(pr, collected);
   const dispatchId = `${dryRun ? 'dry' : 'live'}-${headPr.number}-${now}`;
   const taskPath = path.join(paths.stateDir, 'tasks', `${dispatchId}.json`);
-  const pending = { dispatchId, params: dispatchParams({ pr: headPr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix }), at: now, taskPath };
+  const pending = { dispatchId, params: dispatchParams({ pr: headPr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, handledFindings: collected?.handledFindings ?? [] }), at: now, taskPath };
   if (!dryRun) {
     fs.mkdirSync(path.dirname(taskPath), { recursive: true });
     atomic(taskPath, JSON.stringify({ dispatchId, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: headPr.id, number: headPr.number, repo: REPO, headRefOid: headPr.headRefOid, headRefName: headPr.headRefName, headRepo: headRepoOf(headPr), headOwner: headOwnerOf(headPr), feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: headPr.headRefOid, feedback: fresh }), prSnapshot: compactPrSnapshot(collected, now), params: pending.params, createdAt: now }));
@@ -853,6 +853,7 @@ export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor,
     sessionCreatedAt: previous.sessionCreatedAt ?? now,
     eligibility: 'active',
     repairRounds: Number(previous.repairRounds ?? 0) + (recovery ? 0 : 1),
+    ...(recovery ? {} : { pendingThreadClose: rememberPendingClose(previous, paths).pendingThreadClose ?? previous.pendingThreadClose }),
     activeTask: {
       ...(recovery ? previous.activeTask : {}),
       dispatchId: receipt.dispatch_id ?? previous.pendingDispatch?.dispatchId,
@@ -899,6 +900,47 @@ function resultFor(previous, paths) {
   return result;
 }
 
+function readActiveTask(previous, paths) {
+  const dispatchId = previous.activeTask?.dispatchId;
+  if (!dispatchId || !/^[A-Za-z0-9._:-]+$/.test(dispatchId)) return null;
+  try { return JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), 'utf8')); }
+  catch { return null; }
+}
+function rememberPendingClose(previous, paths) {
+  if (previous.activeTask?.status !== 'waiting-ci') return previous;
+  try {
+    const result = resultFor(previous, paths);
+    const task = readActiveTask(previous, paths);
+    const items = [...fixedThreads(result, task), ...refutedThreads(result, task)]
+      .map((item) => ({ ...item, dispatchId: result.dispatchId, head: result.head }));
+    if (!items.length) return previous;
+    const existing = previous.pendingThreadClose ?? [];
+    const seen = new Set(existing.map((item) => item.threadId));
+    const extra = items.filter((item) => !seen.has(item.threadId));
+    return extra.length ? { ...previous, pendingThreadClose: [...existing, ...extra] } : previous;
+  } catch { return previous; }
+}
+function handledFindingsFrom(paths, previous) {
+  const items = [];
+  let names = [];
+  try { names = fs.readdirSync(path.join(paths.stateDir, 'results')); } catch { return items; }
+  for (const name of names.filter((item) => item.endsWith('.json')).sort()) {
+    const result = readJsonOrNull(path.join(paths.stateDir, 'results', name));
+    if (!result || result.nodeId !== previous.nodeId) continue;
+    for (const sc of result.scs ?? []) {
+      const summary = String(sc.evidence?.[0] ?? sc.status ?? '').replace(/\s+/g, ' ').slice(0, 80);
+      const file = String(sc.evidence?.[0] ?? '').match(/([\w./-]+\.\w{1,8})/)?.[1] ?? '';
+      for (const key of sc.feedbackKeys ?? []) items.push({ key, file, summary });
+    }
+  }
+  return items.slice(-20);
+}
+function dropWaitingCiRevisionFlips(fresh, previous, paths) {
+  if (previous.activeTask?.status !== 'waiting-ci') return fresh;
+  const keys = new Set((readDispatchTask(paths, previous.activeTask.dispatchId).feedback ?? []).map((item) => item?.key).filter(Boolean));
+  if (!keys.size) return fresh;
+  return fresh.filter((item) => !keys.has(item.key) || item.source === 'ci' || item.source === 'conflict');
+}
 function consumeResult(previous, result, now) {
   if (!result) return previous;
   // A result written before the author reclaimed the PR must not revive the superseded task.
@@ -914,7 +956,8 @@ function consumeResult(previous, result, now) {
     ...previous,
     activeTask: {
       ...previous.activeTask,
-      dispatchId: result.dispatchId, sessionId: result.sessionId, head: result.head,
+      dispatchId: result.dispatchId, sessionId: result.sessionId,
+      head: result.head ?? result.sourceHead ?? previous.activeTask?.head,
       status, reason: result.reason ?? null, blockedKind: result.blockedKind ?? null,
       evidenceVersion: verified ? 2 : 1,
       receiptId: result.receiptId ?? digest(result),
@@ -1006,6 +1049,27 @@ export function reopenKeelBlocked({ previous, paths, now }) {
 // Before this, 2026-10-15 #6077's P1 thread sat 17 hours undelivered after two such blocks.
 export const INFRA_BLOCK_REASON = /preflight|submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge/i;
 export const INFRA_REOPEN_LIMIT = 3;
+export function reopenExternalBlocked({ previous, paths, now, head }) {
+  const active = previous?.activeTask;
+  if (active?.status !== 'blocked' || active.blockedKind !== 'external' || active.blockedKind === AUTHOR_RECLAIMED) return previous;
+  const rulesChanged = previous.rulesVersion != null && previous.rulesVersion !== rulesVersion();
+  const headChanged = Boolean(head && (active.head ?? active.sourceHead) && (active.head ?? active.sourceHead) !== head);
+  if (!rulesChanged && !headChanged) return previous;
+  const dispatchId = active.dispatchId;
+  if (typeof dispatchId !== 'string') return previous;
+  const done = previous.externalReopened ?? [];
+  if (done.some((item) => item.dispatchId === dispatchId && item.rulesChanged === rulesChanged && item.headChanged === headChanged)) return previous;
+  const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`));
+  if (!task || task.nodeId !== previous.nodeId) return previous;
+  const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
+  for (const item of task.feedback ?? []) if (typeof item?.key === 'string') delete feedbackCursor[item.key];
+  return {
+    ...previous, feedbackCursor, eligibility: 'active',
+    repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) - 1),
+    externalReopened: [...(previous.externalReopened ?? []), { dispatchId, at: now, rulesChanged, headChanged }],
+  };
+}
+
 export function reopenInfraBlocked({ previous, paths, now }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind === AUTHOR_RECLAIMED || KEEL_BLOCK_REASON.test(String(active.reason ?? ''))
@@ -1137,8 +1201,10 @@ export function* processPr({
   let resultError;
   try { previous = consumeResult(previous, resultFor(previous, paths), now); }
   catch (error) { resultError = error.message; }
+  if (!resultError) previous = rememberPendingClose(previous, paths);
   if (!resultError) previous = reopenInfraBlocked({ previous: reopenKeelBlocked({ previous, paths, now }), paths, now });
   if (!resultError) previous = reopenRoundLimitBlocked({ previous });
+  if (!resultError) previous = reopenExternalBlocked({ previous, paths, now, head: pr.headRefOid });
   if (resultError) {
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.activeTask?.dispatchId ?? previous.lastDispatch?.dispatchId,
@@ -1213,9 +1279,11 @@ export function* processPr({
   const allItems = feedbackItems({ pr, ...collected, receiptActor: viewer });
   const { fresh: rawFresh, cursor } = newFeedback(cursorBase, allItems);
   // Resolve only when every comment on the thread is a trusted-bot P3.
-  const { eligible: autoCloseEligible, remaining: fresh } = partitionAutoClose(rawFresh, {
+  const partitioned = partitionAutoClose(rawFresh, {
     allItems, threads: collected.threads ?? [],
   });
+  const autoCloseEligible = partitioned.eligible;
+  let fresh = dropWaitingCiRevisionFlips(partitioned.remaining, previous, paths);
   let autoClosedThisRound = [];
   if (autoCloseEligible.length > 0 && !dryRun) {
     const outcome = yield* autoCloseThreads({ eligible: autoCloseEligible, previous, ghFn, now });
@@ -1228,6 +1296,7 @@ export function* processPr({
     // `base` predates the auto-close step above; carry its receipt forward explicitly
     // so it isn't silently dropped by this reassignment.
     ...base, autoClosedThreads: previous.autoClosedThreads ?? base.autoClosedThreads,
+    mergeReadyHead: previous.mergeReadyHead ?? base.mergeReadyHead,
     labels: collected.labels ?? [], mergeReady: collected.mergeReady === true,
     reviewReason: collected.reviewReason ?? null, reviewEvidence: collected.reviewEvidence ?? null,
     admissionVerified: admitted, admissionReason: collected.admissionReason ?? previous.admissionReason ?? null,
@@ -1254,12 +1323,25 @@ export function* processPr({
       if (deadline-clock()<1000) state.scan={...state.scan,cursor:resumeCursor,deferredNumber:pr.number};
     }
   }
-  if (previous.activeTask?.status === 'complete' && !dryRun && !resultError) {
-    let refuted = [];
-    try { refuted = refutedThreads(resultFor(previous, paths), readDispatchTask(paths, previous.activeTask.dispatchId)); } catch { refuted = []; }
-    if (refuted.length > 0) {
-      const outcome = yield* closeRefutedThreads({ items: refuted, dispatchId: previous.activeTask.dispatchId, previous, ghFn, now });
-      previous = outcome.previous;
+  const currentHeadGreen = collected.ci?.status === 'green' || collected.mergeReady === true;
+  if (!dryRun && !resultError && (previous.activeTask?.status === 'complete' || (currentHeadGreen && (previous.pendingThreadClose ?? []).length))) {
+    let closable = [...(previous.pendingThreadClose ?? [])];
+    let resultHead = previous.activeTask?.head;
+    try {
+      if (previous.activeTask?.status === 'complete') {
+        const result = resultFor(previous, paths);
+        const task = readDispatchTask(paths, previous.activeTask.dispatchId);
+        closable = [...closable, ...coveredThreadItems([...fixedThreads(result, task), ...refutedThreads(result, task)], allItems, task)];
+        resultHead = result?.head ?? resultHead;
+      }
+    } catch { /* keep pending items */ }
+    const seen = new Set();
+    closable = closable.filter((item) => item?.threadId && !seen.has(item.threadId) && seen.add(item.threadId));
+    if (closable.length > 0) {
+      const outcome = yield* closeRefutedThreads({
+        items: closable, dispatchId: previous.activeTask?.dispatchId ?? closable[0].dispatchId, previous, ghFn, now, head: resultHead,
+      });
+      previous = { ...outcome.previous, pendingThreadClose: [] };
       autoClosedThisRound = [...autoClosedThisRound, ...outcome.closed];
     }
   }
@@ -1280,7 +1362,7 @@ export function* processPr({
   }
   if (!resultError && !['blocked', 'complete', 'legacy-complete', 'waiting-ci'].includes(previous.activeTask?.status)
     && Number(previous.lastDispatch?.recoveryCount ?? 0) >= MAX_RECOVERIES
-    && Date.parse(now) - Date.parse(previous.lastDispatch?.lastRecoveryAt ?? previous.lastDispatch?.at) >= RECOVERY_MIN_MS) {
+    && Date.parse(now) - (lastActivityMs(previous, paths, previous.lastDispatch?.dispatchId) ?? Date.parse(previous.lastDispatch?.lastRecoveryAt ?? previous.lastDispatch?.at)) >= RECOVERY_MIN_MS) {
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.lastDispatch.dispatchId,
       sessionId: previous.sessionId, status: 'blocked', blockedKind: 'missing-result-limit',
@@ -1294,8 +1376,9 @@ export function* processPr({
     ? readTaskForRecovery(previous, paths, now) : null;
   const blockedTask = readDispatchTask(paths, previous.activeTask?.dispatchId);
   const blockedKeys = new Set((blockedTask.feedback ?? []).map((item) => item?.key).filter(Boolean));
-  const sameBlockedCause = previous.activeTask?.status === 'blocked'
-    && previous.activeTask.head === pr.headRefOid
+  const sameBlockedCause = previous.eligibility === 'blocked'
+    && previous.activeTask?.status === 'blocked'
+    && (previous.activeTask.head ?? previous.activeTask.sourceHead) === pr.headRefOid
     && previous.activeTask.blockedKind === 'external'
     && (previous.rulesVersion == null || previous.rulesVersion === rulesVersion())
     && fresh.length > 0
@@ -1425,7 +1508,7 @@ export function* processPr({
     dispatch = { attempted: false, bound: false, reason: 'needs-owner' };
   } else if (shouldDispatch) {
     const prefix = [reclaimNote(previous, pr.headRefName), messagePrefix].filter(Boolean).join('\n');
-    const pending = { ...dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix: prefix, collected }), cursor };
+    const pending = { ...dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix: prefix, collected: { ...collected, handledFindings: handledFindingsFrom(paths, previous) } }), cursor };
     previous = { ...previous, pendingDispatch: pending };
     if (dryRun) {
       dispatch = { attempted: false, bound: false, reason: 'dry-run', pending };
@@ -1464,9 +1547,10 @@ export function* processPr({
   }
   if (!persistBlocked) {
   previous = markException({ ...previous, lastPolicyStatus: collected.policy?.status ?? previous.lastPolicyStatus ?? null }, now, events, { home: paths.home, dryRun });
-  if (collected.mergeReady === true && base.mergeReady !== true) {
+  if (collected.mergeReady === true && (base.mergeReady !== true || base.mergeReadyHead !== pr.headRefOid)) {
     events.push({ kind: 'merge-ready', number: pr.number, head: pr.headRefOid, url: pr.url });
     queueHumanNotice(paths.home, { kind: 'merge-ready', number: pr.number, head: pr.headRefOid, url: pr.url }, dryRun);
+    previous = { ...previous, mergeReadyHead: pr.headRefOid };
   }
   if (dispatch.reason === 'pending-dispatch-unknown') {
     queueHumanNotice(paths.home, { kind: 'pending-dispatch-unknown', number: pr.number, url: pr.url, head: pr.headRefOid }, dryRun);
@@ -1647,7 +1731,8 @@ export function* pollWorkflow({
   // without this it would never reach processPr, where reopenKeelBlocked hands its feedback back.
   const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous
     || reopenInfraBlocked({ previous, paths, now }) !== previous
-    || reopenRoundLimitBlocked({ previous }) !== previous;
+    || reopenRoundLimitBlocked({ previous }) !== previous
+    || reopenExternalBlocked({ previous, paths, now, head: previous.headRefOid }) !== previous;
   if (previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry
     && !localResultPending && !needsCiRecheck(previous.activeTask) && !previous.recheckDeferredAt
     && !normalized.overflow && !keelReopenDue) {
@@ -1759,7 +1844,14 @@ function* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn, remai
   }
   if (relockForDispatch?.()?.held) return 'rules-refresh-unrecorded';
   const latest = readPr(paths.home, key) ?? entry;
-  writePr(paths.home, key, { ...latest, ...outcome });
+  const next = { ...latest, ...outcome };
+  const reopened = outcome.rulesVersion
+    ? reopenExternalBlocked({ previous: { ...next, rulesVersion: entry.rulesVersion }, paths, now, head: latest.headRefOid })
+    : next;
+  writePr(paths.home, key, {
+    ...reopened, ...outcome,
+    ...(reopened.eligibility === 'active' && entry.eligibility === 'blocked' ? { pollFingerprint: null, collectRetry: true } : {}),
+  });
   return outcome.rulesVersion ? 'rules-refreshed' : 'rules-refresh-failed';
 }
 

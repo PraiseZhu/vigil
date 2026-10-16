@@ -58,6 +58,11 @@ test('single line mixing authorized and P3 tokens cannot be split, stays needs-t
   assert.equal(p.action, 'needs-triage');
   assert.equal(p.canChangeCode, false);
 });
+test('single line mixing P1 and P2 cannot authorize a code fix', () => {
+  const p = policy('**P1** / P2: inseparable suggested cleanup');
+  assert.equal(p.action, 'needs-triage');
+  assert.equal(p.canChangeCode, false);
+});
 test('pure P1-only finding (no mixing) remains normally fixable', () => {
   // 场景B：单条评论内是纯 P1(无混合)。
   const p = policy('**P1** null dereference on save path');

@@ -106,18 +106,33 @@ export function* autoCloseThreads({ eligible = [], previous = {}, ghFn, now }) {
 // the session's evidence visible in the reply. Only verified complete results qualify,
 // and a code-fix item without evidence stays open.
 const THREAD_KEY = /^(?:thread|greptile):(PRRT_[A-Za-z0-9_-]+):/;
-export function refutedThreads(result, task) {
-  if (result?.schemaVersion !== 2 || result.status !== 'complete' || result.dispatchId !== task?.dispatchId) return [];
+function evidenceLines(result, key, status) {
+  return (result.scs ?? []).filter((sc) => sc.status === status && sc.feedbackKeys?.includes(key))
+    .flatMap((sc) => sc.evidence ?? []).filter((line) => typeof line === 'string' && line.trim());
+}
+function completeCodeFixThreads(result, task, { disposition, scStatus, kind }) {
+  if (result?.schemaVersion !== 2 || !['complete', 'waiting-ci'].includes(result.status) || result.dispatchId !== task?.dispatchId) return [];
   const policy = new Map((task.repairPolicy?.items ?? []).map((item) => [item.key, item]));
   const items = [];
-  for (const { key, disposition } of result.feedbackCoverage?.dispositions ?? []) {
+  for (const { key, disposition: itemDisposition } of result.feedbackCoverage?.dispositions ?? []) {
     const threadId = THREAD_KEY.exec(key ?? '')?.[1];
-    if (disposition !== 'no-change' || !threadId || policy.get(key)?.action !== 'code-fix') continue;
-    const evidence = (result.scs ?? []).filter((sc) => sc.status === 'no-change' && sc.feedbackKeys?.includes(key))
-      .flatMap((sc) => sc.evidence ?? []).filter((line) => typeof line === 'string' && line.trim());
-    if (evidence.length) items.push({ key, threadId, evidence, triage: policy.get(key)?.reason === 'review-thread-triage' });
+    if (itemDisposition !== disposition || !threadId || policy.get(key)?.action !== 'code-fix') continue;
+    const evidence = evidenceLines(result, key, scStatus);
+    if (evidence.length) items.push({ key, threadId, evidence, kind, triage: policy.get(key)?.reason === 'review-thread-triage' });
   }
   return items;
+}
+export function refutedThreads(result, task) {
+  return completeCodeFixThreads(result, task, { disposition: 'no-change', scStatus: 'no-change', kind: 'refuted' });
+}
+export function fixedThreads(result, task) {
+  return completeCodeFixThreads(result, task, { disposition: 'fixed', scStatus: 'pass', kind: 'fixed' });
+}
+export function coveredThreadItems(items = [], observed = [], task = {}) {
+  const taskKeys = new Set((task?.feedback ?? []).map((item) => item?.key).filter((key) => typeof key === 'string'));
+  return items.filter((item) => observed
+    .filter((other) => other?.threadId === item.threadId && other.actionable !== false)
+    .every((other) => taskKeys.has(`${other.source}:${other.nativeId}`)));
 }
 // A thread from a maintainer, the author or a review app that the session graded as not needing code.
 export function triagedReplyText(evidence, dispatchId) {
@@ -128,6 +143,20 @@ export function triagedReplyText(evidence, dispatchId) {
     '**要不要改代码**：本轮不改。',
     '',
     '核实依据：',
+    ...lines,
+    '',
+    `<!-- cindy-watcher-receipt task=${dispatchId} -->`,
+  ].join('\n');
+}
+export function fixedReplyText(evidence, head, dispatchId) {
+  const shortHead = typeof head === 'string' && head.length ? head.slice(0, 12) : '';
+  const lines = evidence.slice(0, 5).map((line) => '- ' + line.replace(/\/(?:Users|home)\/[^\s'"`]+/g, '<本机路径>').replace(/\s+/g, ' ').slice(0, 300));
+  return [
+    `**发生了什么**：盯梢修复轮确认此意见成立并已修复，修复提交 \`${shortHead}\`。`,
+    '**对本 PR 意味着什么**：这条意见已处理，不再阻塞。',
+    '**要不要改代码**：已改。',
+    '',
+    '修复证据：',
     ...lines,
     '',
     `<!-- cindy-watcher-receipt task=${dispatchId} -->`,
@@ -148,19 +177,21 @@ export function refutedReplyText(evidence, dispatchId) {
 }
 // Same durable receipt as the P3 closure: `previous.autoClosedThreads[threadId]`. A reply
 // that landed before resolve was denied is still recorded so it is never posted twice.
-export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, ghFn, now }) {
+export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, ghFn, now, head }) {
   const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
   const results = [];
   const attempt = (args) => permissionGuarded(ghFn, args);
   for (const item of items) {
     if (closedThreads[item.threadId]) continue;
-    const reply = yield attempt(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${item.triage ? triagedReplyText(item.evidence, dispatchId) : refutedReplyText(item.evidence, dispatchId)}`]);
+    const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, dispatchId)
+      : item.triage ? triagedReplyText(item.evidence, dispatchId) : refutedReplyText(item.evidence, dispatchId);
+    const reply = yield attempt(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${body}`]);
     if (reply?.__degraded) {
       results.push({ threadId: item.threadId, key: item.key, degraded: true, reason: 'permission-denied' });
       continue;
     }
     const resolved = yield attempt(['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${item.threadId}`]);
-    closedThreads[item.threadId] = { at: now, key: item.key, reason: item.triage ? 'review-thread-no-change' : 'refuted-authorized-finding', dispatchId,
+    closedThreads[item.threadId] = { at: now, key: item.key, reason: item.kind === 'fixed' ? 'fixed-authorized-finding' : item.triage ? 'review-thread-no-change' : 'refuted-authorized-finding', dispatchId,
       ...(resolved?.__degraded ? { resolveDegraded: true } : {}) };
     results.push({ threadId: item.threadId, key: item.key, ...(resolved?.__degraded ? { degraded: true, reason: 'permission-denied' } : {}) });
   }

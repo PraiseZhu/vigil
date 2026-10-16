@@ -850,7 +850,7 @@ function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix 
   const dispatchId = `${dryRun ? 'dry' : 'live'}-${pr.number}-${now}`;
   const taskPath = path.join(paths.stateDir, 'tasks', `${dispatchId}.json`);
   const prSnapshot = compactPrSnapshot(collected, now);
-  const pending = { dispatchId, params: dispatchParams({ pr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, prIntent: prSnapshot?.prIntent }), at: now, taskPath };
+  const pending = { dispatchId, params: dispatchParams({ pr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, prIntent: prSnapshot?.prIntent, handledFindings: collected?.handledFindings ?? [] }), at: now, taskPath };
   if (!dryRun) {
     fs.mkdirSync(path.dirname(taskPath), { recursive: true });
     atomic(taskPath, JSON.stringify({ dispatchId, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: pr.id, number: pr.number, repo: REPO, headRefOid: pr.headRefOid, headRefName: pr.headRefName, prAuthor: collected?.pr?.author?.login ?? pr.author?.login ?? null, handoff: collected?.handoff, releaseEpoch: collected?.pr?.releaseEpoch, feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }), prSnapshot, params: pending.params, createdAt: now }));
@@ -950,6 +950,7 @@ export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor,
     sessionCreatedAt: previous.sessionCreatedAt ?? now,
     eligibility: 'active',
     repairRounds: Number(previous.repairRounds ?? 0) + (recovery ? 0 : 1),
+    ...(recovery ? {} : { pendingThreadClose: rememberPendingClose(previous, paths).pendingThreadClose ?? previous.pendingThreadClose }),
     activeTask: {
       ...(recovery ? previous.activeTask : {}),
       dispatchId: receipt.dispatch_id ?? previous.pendingDispatch?.dispatchId,
@@ -1003,6 +1004,41 @@ function readActiveTask(previous, paths) {
   try { return JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), 'utf8')); }
   catch { return null; }
 }
+function rememberPendingClose(previous, paths) {
+  if (previous.activeTask?.status !== 'waiting-ci') return previous;
+  try {
+    const result = resultFor(previous, paths);
+    const task = readActiveTask(previous, paths);
+    const items = [...fixedThreads(result, task), ...refutedThreads(result, task)]
+      .map((item) => ({ ...item, dispatchId: result.dispatchId, head: result.head }));
+    if (!items.length) return previous;
+    const existing = previous.pendingThreadClose ?? [];
+    const seen = new Set(existing.map((item) => item.threadId));
+    const extra = items.filter((item) => !seen.has(item.threadId));
+    return extra.length ? { ...previous, pendingThreadClose: [...existing, ...extra] } : previous;
+  } catch { return previous; }
+}
+function handledFindingsFrom(paths, previous) {
+  const items = [];
+  let names = [];
+  try { names = fs.readdirSync(path.join(paths.stateDir, 'results')); } catch { return items; }
+  for (const name of names.filter((item) => item.endsWith('.json')).sort()) {
+    const result = readJsonOrNull(path.join(paths.stateDir, 'results', name));
+    if (!result || result.nodeId !== previous.nodeId) continue;
+    for (const sc of result.scs ?? []) {
+      const summary = String(sc.evidence?.[0] ?? sc.status ?? '').replace(/\s+/g, ' ').slice(0, 80);
+      const file = String(sc.evidence?.[0] ?? '').match(/([\w./-]+\.\w{1,8})/)?.[1] ?? '';
+      for (const key of sc.feedbackKeys ?? []) items.push({ key, file, summary });
+    }
+  }
+  return items.slice(-20);
+}
+function dropWaitingCiRevisionFlips(fresh, previous, paths) {
+  if (previous.activeTask?.status !== 'waiting-ci') return fresh;
+  const keys = new Set((readDispatchTask(paths, previous.activeTask.dispatchId).feedback ?? []).map((item) => item?.key).filter(Boolean));
+  if (!keys.size) return fresh;
+  return fresh.filter((item) => !keys.has(item.key) || item.source === 'ci' || item.source === 'conflict');
+}
 // A result the session wrote after the last poll must be read even when the PR itself
 // has not changed; otherwise the task stays "accepted" and its threads are never closed.
 function hasUnconsumedResult(previous, paths) {
@@ -1028,7 +1064,8 @@ function consumeResult(previous, result, now) {
     ...previous,
     activeTask: {
       ...previous.activeTask,
-      dispatchId: result.dispatchId, sessionId: result.sessionId, head: result.head,
+      dispatchId: result.dispatchId, sessionId: result.sessionId,
+      head: result.head ?? result.sourceHead ?? previous.activeTask?.head,
       status, reason: result.reason ?? null, blockedKind: result.blockedKind ?? null,
       evidenceVersion: verified ? 2 : 1,
       receiptId: result.receiptId ?? digest(result),
@@ -1045,6 +1082,27 @@ function needsCiRecheck(active) {
 
 export const INFRA_BLOCK_REASON = /preflight|submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge/i;
 export const INFRA_REOPEN_LIMIT = 3;
+export function reopenExternalBlocked({ previous, paths, now, head }) {
+  const active = previous?.activeTask;
+  if (active?.status !== 'blocked' || active.blockedKind !== 'external' || active.blockedKind === AUTHOR_RECLAIMED) return previous;
+  const rulesChanged = previous.rulesVersion != null && previous.rulesVersion !== rulesVersion();
+  const headChanged = Boolean(head && (active.head ?? active.sourceHead) && (active.head ?? active.sourceHead) !== head);
+  if (!rulesChanged && !headChanged) return previous;
+  const dispatchId = active.dispatchId;
+  if (typeof dispatchId !== 'string') return previous;
+  const done = previous.externalReopened ?? [];
+  if (done.some((item) => item.dispatchId === dispatchId && item.rulesChanged === rulesChanged && item.headChanged === headChanged)) return previous;
+  const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`));
+  if (!task || task.nodeId !== previous.nodeId) return previous;
+  const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
+  for (const item of task.feedback ?? []) if (typeof item?.key === 'string') delete feedbackCursor[item.key];
+  return {
+    ...previous, feedbackCursor, eligibility: 'active',
+    repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) - 1),
+    externalReopened: [...(previous.externalReopened ?? []), { dispatchId, at: now, rulesChanged, headChanged }],
+  };
+}
+
 export function reopenInfraBlocked({ previous, paths, now }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind === AUTHOR_RECLAIMED || KEEL_BLOCK_REASON.test(String(active.reason ?? ''))
@@ -1334,9 +1392,11 @@ export function* processPr({
   let resultError;
   try { previous = consumeResult(previous, resultFor(previous, paths), now); }
   catch (error) { resultError = error.message; }
+  if (!resultError) previous = rememberPendingClose(previous, paths);
   if (!resultError) previous = reopenInfraBlocked({ previous: reopenKeelBlocked({ previous, paths, now }), paths, now });
   if (!resultError) previous = reopenProductIntentBlocked({ previous, paths, now });
   if (!resultError) previous = reopenRoundLimitBlocked({ previous });
+  if (!resultError) previous = reopenExternalBlocked({ previous, paths, now, head: pr.headRefOid });
   if (resultError) {
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.activeTask?.dispatchId ?? previous.lastDispatch?.dispatchId,
@@ -1480,7 +1540,7 @@ export function* processPr({
   // never need a human, and are never counted as pending feedback.
   const autoClose = partitionAutoClose(rawFresh);
   const autoCloseEligible = autoClose.eligible;
-  let fresh = autoClose.remaining;
+  let fresh = dropWaitingCiRevisionFlips(autoClose.remaining, previous, paths);
   let autoClosedThisRound = [];
   if (autoCloseEligible.length > 0 && !dryRun) {
     const outcome = yield* autoCloseThreads({ eligible: autoCloseEligible, previous, ghFn, now });
@@ -1495,14 +1555,11 @@ export function* processPr({
   if (policyUnknown && !base.policyUnknownSince) {
     events.push({ kind: 'policy-unknown', number: pr.number, reason: String(collected.ci?.reason ?? collected.ci?.policy?.reason ?? '').slice(0, 200) });
   }
-  if (collected.mergeReady === true && base.mergeReady !== true) {
-    events.push({ kind: 'merge-ready', number: pr.number, head: pr.headRefOid, url: pr.url });
-    queueHumanNotice(paths.home, { kind: 'merge-ready', number: pr.number, head: pr.headRefOid, url: pr.url }, dryRun);
-  }
   previous = {
     // `base` predates the auto-close step above; carry its receipt forward explicitly
     // so it isn't silently dropped by this reassignment.
     ...base, autoClosedThreads: previous.autoClosedThreads ?? base.autoClosedThreads,
+    mergeReadyHead: previous.mergeReadyHead ?? base.mergeReadyHead,
     labels: collected.labels ?? [], mergeReady: collected.mergeReady === true,
     reviewReason: collected.reviewReason ?? null, reviewEvidence: collected.reviewEvidence ?? null,
     admissionVerified: admitted, admissionReason: collected.admissionReason ?? previous.admissionReason ?? null,
@@ -1533,29 +1590,43 @@ export function* processPr({
   }
   // After the recheck: a fix normally reaches `complete` only when CI turns green here, and the
   // next poll is skipped while the fingerprint stays stable, so closing earlier never happens.
-  if (previous.activeTask?.status === 'complete' && !dryRun && !resultError) {
-    let closable = [];
-    let resultHead;
+  const currentHeadGreen = collected.ci?.status === 'green' || collected.mergeReady === true;
+  if (!dryRun && !resultError && (previous.activeTask?.status === 'complete' || (currentHeadGreen && (previous.pendingThreadClose ?? []).length))) {
+    let closable = [...(previous.pendingThreadClose ?? [])];
+    let resultHead = previous.activeTask?.head;
     try {
-      const result = resultFor(previous, paths);
-      const task = readActiveTask(previous, paths);
-      closable = coveredThreadItems([...fixedThreads(result, task), ...refutedThreads(result, task)], observed, task);
-      resultHead = result?.head;
-    } catch { closable = []; }
+      if (previous.activeTask?.status === 'complete') {
+        const result = resultFor(previous, paths);
+        const task = readActiveTask(previous, paths);
+        closable = [...closable, ...coveredThreadItems([...fixedThreads(result, task), ...refutedThreads(result, task)], observed, task)];
+        resultHead = result?.head ?? resultHead;
+      }
+    } catch { /* keep pending items */ }
+    const seen = new Set();
+    closable = closable.filter((item) => item?.threadId && !seen.has(item.threadId) && seen.add(item.threadId));
     if (closable.length > 0) {
       const outcome = yield* closeRefutedThreads({
-        items: closable, dispatchId: previous.activeTask.dispatchId, previous, ghFn, now, head: resultHead,
+        items: closable, dispatchId: previous.activeTask?.dispatchId ?? closable[0].dispatchId, previous, ghFn, now, head: resultHead,
       });
-      previous = outcome.previous;
+      previous = { ...outcome.previous, pendingThreadClose: [] };
       autoClosedThisRound = [...autoClosedThisRound, ...outcome.closed];
-      // A pushed fix can turn the thread outdated, re-surfacing its comment; once closed it is not new work.
       const closedIds = new Set(outcome.closed.map((item) => item.threadId));
       fresh = fresh.filter((item) => !closedIds.has(item.threadId));
     }
   }
+  const activeRepairPending = previous.activeTask
+    && !['complete', 'legacy-complete'].includes(previous.activeTask.status)
+    && previous.activeTask.blockedKind !== AUTHOR_RECLAIMED
+    && taskRepairPolicy(readDispatchTask(paths, previous.activeTask.dispatchId)).canChangeCode;
+  if (collected.mergeReady && (activeRepairPending
+    || taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }).canChangeCode)) {
+    collected = { ...collected, mergeReady: false, reviewReason: 'pending-authorized-feedback',
+      reviewEvidence: { ready: false, reason: 'pending-authorized-feedback', terminal: null } };
+    previous = { ...previous, mergeReady: false, reviewReason: collected.reviewReason, reviewEvidence: collected.reviewEvidence };
+  }
   if (!resultError && !['blocked', 'complete', 'legacy-complete', 'waiting-ci'].includes(previous.activeTask?.status)
     && Number(previous.lastDispatch?.recoveryCount ?? 0) >= MAX_RECOVERIES
-    && Date.parse(now) - Date.parse(previous.lastDispatch?.lastRecoveryAt ?? previous.lastDispatch?.at) >= RECOVERY_MIN_MS) {
+    && Date.parse(now) - (lastActivityMs(previous, paths, previous.lastDispatch?.dispatchId) ?? Date.parse(previous.lastDispatch?.lastRecoveryAt ?? previous.lastDispatch?.at)) >= RECOVERY_MIN_MS) {
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.lastDispatch.dispatchId,
       sessionId: previous.sessionId, status: 'blocked', blockedKind: 'missing-result-limit',
@@ -1570,8 +1641,9 @@ export function* processPr({
     ? readTaskForRecovery(previous, paths, now) : null;
   const blockedTask = readDispatchTask(paths, previous.activeTask?.dispatchId);
   const blockedKeys = new Set((blockedTask.feedback ?? []).map((item) => item?.key).filter(Boolean));
-  const sameBlockedCause = previous.activeTask?.status === 'blocked'
-    && previous.activeTask.head === pr.headRefOid
+  const sameBlockedCause = previous.eligibility === 'blocked'
+    && previous.activeTask?.status === 'blocked'
+    && (previous.activeTask.head ?? previous.activeTask.sourceHead) === pr.headRefOid
     && previous.activeTask.blockedKind === 'external'
     && (previous.rulesVersion == null || previous.rulesVersion === rulesVersion())
     && fresh.length > 0
@@ -1707,7 +1779,7 @@ export function* processPr({
     dispatch = { attempted: false, bound: false, reason: 'needs-owner' };
   } else if (shouldDispatch) {
     const prefix = [reclaimNote(previous, pr.headRefName), messagePrefix].filter(Boolean).join('\n');
-    const pending = { ...dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix: prefix, collected }), cursor };
+    const pending = { ...dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix: prefix, collected: { ...collected, handledFindings: handledFindingsFrom(paths, previous) } }), cursor };
     previous = { ...previous, pendingDispatch: pending };
     if (dryRun) {
       dispatch = { attempted: false, bound: false, reason: 'dry-run', pending };
@@ -1746,6 +1818,11 @@ export function* processPr({
   }
   if (!persistBlocked) {
   previous = markException({ ...previous, lastPolicyStatus: collected.policy?.status ?? previous.lastPolicyStatus ?? null }, now, events, { home: paths.home, dryRun });
+  if (collected.mergeReady === true && (base.mergeReady !== true || base.mergeReadyHead !== pr.headRefOid)) {
+    events.push({ kind: 'merge-ready', number: pr.number, head: pr.headRefOid, url: pr.url });
+    queueHumanNotice(paths.home, { kind: 'merge-ready', number: pr.number, head: pr.headRefOid, url: pr.url }, dryRun);
+    previous = { ...previous, mergeReadyHead: pr.headRefOid };
+  }
   if (dispatch.reason === 'pending-dispatch-unknown') {
     queueHumanNotice(paths.home, { kind: 'pending-dispatch-unknown', number: pr.number, url: pr.url, head: pr.headRefOid }, dryRun);
   }
@@ -1929,7 +2006,8 @@ export function* pollWorkflow({
   // A PR the Keel incompatibility froze has nothing new on GitHub, so its fingerprint never changes;
   // without this it would never reach processPr, where reopenKeelBlocked hands its feedback back.
   const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous
-    || reopenInfraBlocked({ previous, paths, now }) !== previous;
+    || reopenInfraBlocked({ previous, paths, now }) !== previous
+    || reopenExternalBlocked({ previous, paths, now, head: previous.headRefOid }) !== previous;
   // The same holds for a PR an older build stopped on a product-intent conflict, or whose awaiting-discussion
   // label the watcher still has to take off (including after a failed DELETE): nothing changes on GitHub.
   const intentMigrationDue = reopenProductIntentBlocked({ previous, paths, now }) !== previous || legacyIntentLabelDue(previous)
@@ -2048,7 +2126,14 @@ function* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn, remai
   }
   if (relockForDispatch?.()?.held) return 'rules-refresh-unrecorded';
   const latest = readPr(paths.home, key) ?? entry;
-  writePr(paths.home, key, { ...latest, ...outcome });
+  const next = { ...latest, ...outcome };
+  const reopened = outcome.rulesVersion
+    ? reopenExternalBlocked({ previous: { ...next, rulesVersion: entry.rulesVersion }, paths, now, head: latest.headRefOid })
+    : next;
+  writePr(paths.home, key, {
+    ...reopened, ...outcome,
+    ...(reopened.eligibility === 'active' && entry.eligibility === 'blocked' ? { pollFingerprint: null, collectRetry: true } : {}),
+  });
   return outcome.rulesVersion ? 'rules-refreshed' : 'rules-refresh-failed';
 }
 

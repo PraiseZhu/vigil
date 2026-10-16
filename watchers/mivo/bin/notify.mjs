@@ -30,10 +30,28 @@ export function noticesDir(home) {
 
 function pendingPath(home) { return path.join(noticesDir(home), 'pending.json'); }
 function sentPath(home) { return path.join(noticesDir(home), 'sent.json'); }
+function lockPath(home) { return path.join(noticesDir(home), 'pending.lock'); }
 
 function readJson(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { return fallback; }
+}
+
+function withNoticeLock(home, fn) {
+  const file = lockPath(home);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const started = Date.now();
+  while (true) {
+    try {
+      fs.writeFileSync(file, String(process.pid), { flag: 'wx', mode: 0o600 });
+      try { return fn(); }
+      finally { try { fs.unlinkSync(file); } catch {} }
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      if (Date.now() - started > 8000) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
 }
 
 export function noticeId(event = {}) {
@@ -51,27 +69,31 @@ export function pendingEvents(home) {
 
 export function enqueueNotice(home, event) {
   if (!event || typeof event !== 'object') return null;
-  const id = event.id ?? noticeId(event);
-  const sent = new Set(readJson(sentPath(home), { ids: [] }).ids ?? []);
-  if (sent.has(id)) return null;
-  const file = pendingPath(home);
-  const pending = readJson(file, { events: [] });
-  const events = Array.isArray(pending.events) ? pending.events : [];
-  if (events.some((item) => (item.id ?? noticeId(item)) === id)) return id;
-  events.push({ ...event, id, queuedAt: event.queuedAt ?? new Date().toISOString() });
-  atomicJson(file, { events });
-  return id;
+  return withNoticeLock(home, () => {
+    const id = event.id ?? noticeId(event);
+    const sent = new Set(readJson(sentPath(home), { ids: [] }).ids ?? []);
+    if (sent.has(id)) return null;
+    const file = pendingPath(home);
+    const pending = readJson(file, { events: [] });
+    const events = Array.isArray(pending.events) ? pending.events : [];
+    if (events.some((item) => (item.id ?? noticeId(item)) === id)) return id;
+    events.push({ ...event, id, queuedAt: event.queuedAt ?? new Date().toISOString() });
+    atomicJson(file, { events });
+    return id;
+  });
 }
 
 export function markNoticesSent(home, ids, at = new Date().toISOString()) {
-  const wanted = new Set(ids);
-  const file = pendingPath(home);
-  const pending = readJson(file, { events: [] });
-  const remaining = (pending.events ?? []).filter((event) => !wanted.has(event.id ?? noticeId(event)));
-  atomicJson(file, { events: remaining });
-  const sent = readJson(sentPath(home), { ids: [] });
-  const next = [...new Set([...(sent.ids ?? []), ...ids])];
-  atomicJson(sentPath(home), { ids: next, at });
+  return withNoticeLock(home, () => {
+    const wanted = new Set(ids);
+    const file = pendingPath(home);
+    const pending = readJson(file, { events: [] });
+    const remaining = (pending.events ?? []).filter((event) => !wanted.has(event.id ?? noticeId(event)));
+    atomicJson(file, { events: remaining });
+    const sent = readJson(sentPath(home), { ids: [] });
+    const next = [...new Set([...(sent.ids ?? []), ...ids])];
+    atomicJson(sentPath(home), { ids: next, at });
+  });
 }
 
 export function formatNoticeText(events = []) {
@@ -125,11 +147,8 @@ function cli(argv) {
   if (!mode) fail('mode must be check or emit');
   if (!home) fail('--home is required');
   if (mode === 'check') {
-    if (checkNotices(home)) {
-      process.stdout.write('CINDY_PRECHECK_OK\n');
-      return;
-    }
-    process.exitCode = 2;
+    process.stdout.write('CINDY_PRECHECK_OK\n');
+    if (!checkNotices(home)) process.exitCode = 2;
     return;
   }
   if (process.env.CINDY_SCRIPT_PROTOCOL === '1' || process.env.XDT_MAKER_SCRIPT_PROTOCOL === '1') {

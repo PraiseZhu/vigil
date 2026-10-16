@@ -44,7 +44,7 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 等 CI 的复查需要约 15–20 秒;剩余扫描预算不足 40 秒时不硬跑(硬跑会被超时杀掉、排在后面的 PR
 每轮同样失败),而是结束本轮并从该 PR 续扫,复查超时上限 60 秒。`waiting-ci` 不算在途:当前 head 出现新的必需 CI 失败、冲突或审查意见时,同一轮就会派新任务。被预算推迟的复查(`recheckDeferredAt`)下一轮即使指纹没变也会再查。
 
-补投只在该 dispatch 没有结果文件、且距最近 helper 活动或派发已超过 30 分钟时发生,上限仍为 3 次。helper 的 prepare / validate / finalize / blocked / recheck 都会刷新活动时间,validate 长跑期间至少每 60 秒一次。session 写结果不抢 PR 状态锁,下一轮由 watcher 消费。
+补投只在该 dispatch 没有结果文件、且距最近 helper 活动或派发已超过 30 分钟时发生,上限仍为 3 次。helper 的 prepare / validate / finalize / blocked / recheck 都会刷新活动时间;validate 心跳跑在独立子进程,长跑期间至少每 60 秒一次(可用 `VIGIL_ACTIVITY_HEARTBEAT_MS` 覆盖)。session 写结果不抢 PR 状态锁,下一轮由 watcher 消费。无代码改动且当前 head 必需 CI 仍红时,会做一次带 DCO 的空提交重触发;第二次仍红按同因升级,不再无限重跑。`waiting-ci` 任务被新反馈取代时,旧任务已有证据的 thread 会等到后续 complete 或当前 head CI 全绿再回复并 resolve。通知队列用 `pending.lock` 串行读写。
 
 同因 blocked 不再原样重投,改为写一条升级通知(每个 PR、每个原因、每个 head 一次)。规则版本变化、新 head 或新反馈时仍会重投。可合并、同因升级、needs-human 这类事件写进 `state/notices/`,用 `bin/notify.mjs` 配独立调度发出,见 [`docs/operations.md`](../../docs/operations.md)。
 

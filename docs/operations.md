@@ -62,7 +62,7 @@ discover 一次调用会扫描 `targetRepo` 下你自己的所有 open PR,不需
 | `executionMode` | `"script"` |
 | `cronExpr` | `"* * * * *"` |
 | `scriptConfig.command` | `node <watcher home>/bin/notify.mjs emit --home <watcher home>` |
-| `scriptConfig.precheck` | `node <watcher home>/bin/notify.mjs check --home <watcher home>`(有未发事件 exit 0 并打印 `CINDY_PRECHECK_OK`,否则 exit 2) |
+| `preRunHook` | `node <watcher home>/bin/notify.mjs check --home <watcher home>`（检查完整成功都打印 `CINDY_PRECHECK_OK`；有未发事件 exit 0，空队列 exit 2。宿主字段是 `preRunHook` / `schedule_set_pre_run_hook`，不是 `scriptConfig.precheck`） |
 | `scriptConfig.capabilities` | `[]` |
 | `notify` | `{"desktop": false, "feishu": true}` |
 | `workingDir` | `<watcher home>` |

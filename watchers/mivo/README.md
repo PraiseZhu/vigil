@@ -118,7 +118,7 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 - 仓库成员（OWNER/MEMBER/COLLABORATOR，含作者本人）留的 review thread（`member-thread-triage`），以及严重度读不出、来源未核验的其他未解决 thread（`thread-triage`，含仓外人员和其他机器人）：交修复会话按统一分级判定，确认 P0/P1 才改代码；其余由 watcher 贴出会话写的结论并 resolve。目标是 PR 不因为一条没人处理的讨论卡在合并前。
 - 产品意图：watcher 抓 PR 正文，优先取标题含「产品意图 / 设计意图 / Product intent」的一节（没有就取正文开头，最多 2000 字），写进任务的 `prSnapshot.prIntent` 和派工消息。反馈要求的改法会推翻 PR 正文、规格或维护者裁定里写明的界面、交互或流程时，它不算缺陷：会话不改代码，记 SC=no-change 并引用正文，watcher 回复后 resolve，继续推进。
 - 全自动推进到可合并（不合并）：严重度拿不准时会话自己复现核实，确认不了 P0/P1 就按不成立回复并 resolve；Jev 不可用也不因此 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用、作者收回才 blocked。
-- 卡住要让人看见：修复任务 blocked（外部阻塞、补投三次无结果、结果无效、派发失败）时，watcher 把事件写进 `state/notices/`，用独立的 `bin/notify.mjs` 调度发飞书（watcher 与作者是同一 GitHub 账号，@自己不会通知）。同一 blocked 原因每个 head 只升级一次，不再原样重投。规则版本变化、新 head 或新反馈时仍会重投。必需 CI 红、HEAD 漂移这类 watcher 自己会接着处理的状态不发。
+- 卡住要让人看见：修复任务 blocked（外部阻塞、补投三次无结果、结果无效、派发失败）时，watcher 把事件写进 `state/notices/`，用独立的 `bin/notify.mjs` 调度发飞书（watcher 与作者是同一 GitHub 账号，@自己不会通知）。同一 blocked 原因每个 head 只升级一次，不再原样重投。规则版本变化、新 head 或新反馈时仍会重投。必需 CI 红、HEAD 漂移这类 watcher 自己会接着处理的状态不发。无代码改动且当前 head 必需 CI 仍红时，对失败 job 做一次 `gh run rerun --failed`；第二次仍红按同因升级。`waiting-ci` 被新反馈取代时，旧任务已有证据的 thread 会等到后续 complete 或当前 head CI 全绿再回复并 resolve。validate 心跳跑在独立子进程；通知队列用 `pending.lock` 串行读写。
 - Greptile 汇总评论没有自己的 P0/P1 时不单独开会话（它的发现另以行内 thread 出现）。
 - 策略读不出（`required-policy-unknown`）和可合并（`merge-ready`）各在状态转换时出一条事件。
 

@@ -142,7 +142,7 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
     const tokens = line.match(/P[0-3]|CRITICAL|HIGH|MEDIUM|LOW/gi) ?? [];
     if (tokens.length < 2) return false;
     const mapped = tokens.map((t) => aliases[t.toUpperCase()]);
-    return mapped.some((s) => AUTHORIZED.has(s)) && mapped.includes('P3');
+    return mapped.some((s) => AUTHORIZED.has(s)) && mapped.some((s) => s === 'P2' || s === 'P3');
   });
   if (mixedOnSameLine) return result('needs-triage', severities, 'mixed-severity-inseparable');
   if (authorized && p3) return result('code-fix', severities, 'mixed-severity-authorized-p3-no-change');

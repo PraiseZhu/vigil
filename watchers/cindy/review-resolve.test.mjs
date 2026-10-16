@@ -415,7 +415,8 @@ const runClosure = (items, previous, ghFn) => {
 
 test('only verified no-change authorized review threads with evidence are closed as refuted', () => {
   assert.deepEqual(refutedThreads(refutedResult(), refutedTask).map((item) => item.threadId), ['PRRT_p1', 'PRRT_g1']);
-  for (const extra of [{ status: 'waiting-ci' }, { schemaVersion: 1 }, { dispatchId: 'other' }]) {
+  assert.deepEqual(refutedThreads(refutedResult({ status: 'waiting-ci' }), refutedTask).map((item) => item.threadId), ['PRRT_p1', 'PRRT_g1']);
+  for (const extra of [{ schemaVersion: 1 }, { dispatchId: 'other' }]) {
     assert.deepEqual(refutedThreads(refutedResult(extra), refutedTask), []);
   }
 });
