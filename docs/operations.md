@@ -86,6 +86,20 @@ node watchers/<mivo|cindy>/bin/<mivo|cindy>-repair.mjs lock-doctor --home "$WATC
 (`orphanGuards`)。只有 owner 进程确实已死、且文件修改时间超过 10 分钟的守卫才能被
 `--clear-guard <lockName>` 清除——这是故意保守的设计,避免误删一个仍在工作的进程的锁。
 
+### GitHub 读请求与缓存
+
+发现器每两分钟一轮。下面两类读请求只能用 `gh` 登录的个人账号发(GitHub App 令牌调不了
+`/user`,读分支保护要管理权限),所以跨轮缓存在 `state/kept-reads.json`:
+
+- 登录名(`gh api user`):6 小时。
+- 分支规则、分支对象、分支保护:10 分钟。改了必需检查,watcher 最多晚 10 分钟看到。
+
+`gh` 换了登录账号或想立即重读时,删掉这个文件即可,下一轮自动重建。
+
+两个 watcher 读 PR 时都不请求 `headRepository` / `headRepositoryOwner`,这样经 GitHub App
+分流时整条读请求可以走 App。mivo 只用 `isCrossRepository` 区分同仓分支与 fork;cindy 要知道
+fork 的归属,头仓改从 REST `repos/<repo>/pulls/<n>` 读,读不到(fork 已删)时按原来一样不放行。
+
 ## 4. 部署脚本
 
 `deploy.mjs` 的四个子命令是纯文件系统操作(校验哈希、原子安装、失败回滚),不依赖任何

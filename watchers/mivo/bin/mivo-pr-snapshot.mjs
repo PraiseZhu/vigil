@@ -5,7 +5,10 @@ const DEFAULT_REPO = requireConfig('targetRepo', {
   envVar: 'MIVO_WATCHER_TARGET_REPO',
   hint: '示例："your-org/your-repo"。',
 });
-const FIELDS = 'id,number,title,body,url,state,isDraft,headRefOid,headRefName,baseRefOid,baseRefName,createdAt,author,isCrossRepository,headRepository,headRepositoryOwner,mergeable,reviewDecision';
+// No headRepository / headRepositoryOwner: the gh router sends any read asking for them to the personal account
+// (a GitHub App cannot see a private fork, and GitHub then returns the field empty without an error).
+// isCrossRepository alone tells a same-repository branch from a fork, which is all this watcher needs.
+const FIELDS = 'id,number,title,body,url,state,isDraft,headRefOid,headRefName,baseRefOid,baseRefName,createdAt,author,isCrossRepository,mergeable,reviewDecision';
 const parse = (raw) => typeof raw === 'string' ? JSON.parse(raw) : raw;
 const requireValue = (ok, reason) => { if (!ok) throw new Error(`PR snapshot: ${reason}`); };
 const quote = (value) => JSON.stringify(value);
@@ -18,10 +21,7 @@ function basic(raw, repo, number) {
   requireValue(value.number === number && ['OPEN', 'CLOSED', 'MERGED'].includes(value.state) && typeof value.isDraft === 'boolean', 'invalid identity/state');
   requireValue(Number.isFinite(Date.parse(value.createdAt)) && typeof value.author?.login === 'string', 'missing author/createdAt');
   requireValue(typeof value.isCrossRepository === 'boolean', 'missing repository identity');
-  requireValue(value.headRepository?.name && value.headRepositoryOwner?.login, 'missing head repository');
-  const sameRepository = `${value.headRepositoryOwner.login}/${value.headRepository.name}`.toLowerCase() === repo.toLowerCase();
-  requireValue(sameRepository === !value.isCrossRepository, 'inconsistent repository identity');
-  return { ...value, repo, sameRepository };
+  return { ...value, repo, sameRepository: !value.isCrossRepository };
 }
 
 function* connection({ id, field, selection, ghFn, argument = '', initialCursor = null }) {

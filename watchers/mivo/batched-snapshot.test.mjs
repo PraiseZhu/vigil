@@ -1,13 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {collectPrSnapshotSync,collectPrOwnership} from './bin/mivo-pr-snapshot.mjs';
-const basic={id:'PR_1',number:1,title:'t',state:'OPEN',isDraft:false,headRefOid:'a'.repeat(40),headRefName:'feature',baseRefOid:'b'.repeat(40),baseRefName:'main',createdAt:'2026-09-09T00:00:00Z',author:{login:'owner'},isCrossRepository:false,headRepository:{name:'example-plugin'},headRepositoryOwner:{login:'example-org'}};
-function fixture({overflow=false,broken=false,drift=false}={}){
+const basic={id:'PR_1',number:1,title:'t',state:'OPEN',isDraft:false,headRefOid:'a'.repeat(40),headRefName:'feature',baseRefOid:'b'.repeat(40),baseRefName:'main',createdAt:'2026-09-09T00:00:00Z',author:{login:'owner'},isCrossRepository:false};
+// gh pr view no longer asks for headRepository/headRepositoryOwner; isCrossRepository alone decides sameRepository.
+function fixture({overflow=false,broken=false,drift=false,cross=false}={}){
  let childCalls=0,views=0,total=0;
+ const viewArgs=[];
  const page=(nodes,hasNextPage=false,endCursor=null)=>({nodes,pageInfo:{hasNextPage,endCursor}});
  const ghFn=args=>{
   total++;
-  if(args[1]==='view')return JSON.stringify({...basic,...(++views>1&&drift?{author:{login:'other'}}:{})});
+  if(args[1]==='view'){viewArgs.push(args);return JSON.stringify({...basic,isCrossRepository:cross,...(++views>1&&drift?{author:{login:'other'}}:{})});}
   if(args[1]==='checks')return '[]';
   if(args[1].startsWith('repos/'))return '[[]]';
   const q=args.at(-1),field=['timelineItems','reviewThreads','comments','reviews','labels'].find(f=>q.includes(f+'('));
@@ -16,7 +18,7 @@ function fixture({overflow=false,broken=false,drift=false}={}){
   if(field==='comments'){childCalls++;assert.match(q,/after:"next"/);value=page([{id:'overflow',body:'y'}]);}
   return JSON.stringify({data:{node:{[field]:value}}});
  };
- return {ghFn,counts:()=>({childCalls,total})};
+ return {ghFn,viewArgs,counts:()=>({childCalls,total})};
 }
 test('80 threads use one embedded page, not 80 child requests',()=>{
  const f=fixture(),s=collectPrSnapshotSync({pr:{number:1},ghFn:f.ghFn});assert.equal(s.threads.length,80);assert.equal(s.threads[79].comments[0].id,'C79');assert.equal(f.counts().childCalls,0);
@@ -30,4 +32,18 @@ test('ownership last-moment reads four identity/epoch calls, no feedback',()=>{
 });
 test('ownership lightweight path refuses changed author',()=>{
  const f=fixture({drift:true}),g=collectPrOwnership({pr:{number:1},ghFn:f.ghFn});assert.throws(()=>{let s=g.next();while(!s.done)s=g.next(s.value());},/owner/);
+});
+test('gh pr view never asks for head repository fields',()=>{
+ const f=fixture(),s=collectPrSnapshotSync({pr:{number:1},ghFn:f.ghFn});
+ assert.ok(f.viewArgs.length>=2);
+ for(const args of f.viewArgs)assert.doesNotMatch(args.join(' '),/headRepository/);
+ assert.equal(s.pr.sameRepository,true);
+});
+test('a cross-repository PR is still marked as not same-repository',()=>{
+ const s=collectPrSnapshotSync({pr:{number:1},ghFn:fixture({cross:true}).ghFn});assert.equal(s.pr.sameRepository,false);
+ const g=collectPrOwnership({pr:{number:1},ghFn:fixture({cross:true}).ghFn});let step=g.next();while(!step.done)step=g.next(step.value());assert.equal(step.value.pr.sameRepository,false);
+});
+test('missing isCrossRepository fails closed',()=>{
+ const ghFn=args=>args[1]==='view'?JSON.stringify({...basic,isCrossRepository:undefined}):'[]';
+ assert.throws(()=>collectPrSnapshotSync({pr:{number:1},ghFn}),/missing repository identity/);
 });
