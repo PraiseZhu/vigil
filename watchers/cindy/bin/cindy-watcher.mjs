@@ -69,23 +69,88 @@ export function runGhAsync(args, timeoutMs = 12000, runner = execFile) {
   });
 }
 
-const REPO_READ = new RegExp(`^repos/${REPO.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/(?:rules/branches/|branches/[^/?]+(?:/protection)?$|actions/variables/[^/?]+$|actions/workflows/[^/?]+$|contents/[^?]+\\?ref=[0-9a-f]{40}$)`);
+const ESCAPED_REPO = REPO.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const REPO_READ = new RegExp(`^repos/${ESCAPED_REPO}/(?:rules/branches/|branches/[^/?]+(?:/protection)?$|actions/variables/[^/?]+$|actions/workflows/[^/?]+$|contents/[^?]+\\?ref=[0-9a-f]{40}$)`);
+const BRANCH_POLICY_READ = new RegExp(`^repos/${ESCAPED_REPO}/(?:rules/branches/|branches/[^/?]+(?:/protection)?$)`);
 const WRITE_FLAG = /^(?:-X|--method|-f|-F|--field|--raw-field|--input)$/;
+
+// The login and the branch rules/protection always use the personal account: a GitHub App token cannot call
+// /user, and protection needs admin access. Discover runs every two minutes and these rarely change, so they
+// are also kept across rounds: the login for 6 hours, branch rules and protection for 10 minutes.
+export const VIEWER_TTL_MS = 6 * 60 * 60 * 1000;
+export const BRANCH_POLICY_TTL_MS = 10 * 60 * 1000;
+export function keptReadTtl(args) {
+  const target = String(args[1] ?? '');
+  if (args[0] !== 'api' || args.some((arg) => WRITE_FLAG.test(arg))) return 0;
+  // Only the login read is kept; a full /user read is an identity check before a write and stays live.
+  if (target === 'user') return args.length === 4 && args[2] === '-q' && args[3] === '.login' ? VIEWER_TTL_MS : 0;
+  return BRANCH_POLICY_READ.test(target) ? BRANCH_POLICY_TTL_MS : 0;
+}
+
+// File-backed store for those reads under the watcher state directory. Only non-empty successful output is kept.
+// Discover and poll run in separate processes; the last writer wins, which at most costs one more read.
+export function keptReadStore(stateDir, clock = Date.now) {
+  const file = path.join(stateDir, 'kept-reads.json');
+  let entries = null;
+  const load = () => {
+    if (entries) return entries;
+    try {
+      const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+      entries = saved?.version === 1 && saved.entries && typeof saved.entries === 'object' ? saved.entries : {};
+    } catch { entries = {}; }
+    return entries;
+  };
+  const fresh = (entry, now) => Boolean(entry) && typeof entry.value === 'string'
+    && Number.isFinite(entry.at) && Number.isFinite(entry.ttl) && entry.at <= now && now - entry.at < entry.ttl;
+  return {
+    get(key) {
+      const entry = load()[key];
+      return fresh(entry, clock()) ? entry.value : undefined;
+    },
+    set(key, value, ttl) {
+      const now = clock();
+      const kept = Object.fromEntries(Object.entries(load()).filter(([, entry]) => fresh(entry, now)));
+      kept[key] = { at: now, ttl, value };
+      entries = kept;
+      // A failed write only means the next round reads GitHub again.
+      try {
+        fs.mkdirSync(stateDir, { recursive: true });
+        atomic(file, JSON.stringify({ version: 1, entries: kept }));
+      } catch { /* keep the in-memory copy */ }
+    },
+  };
+}
 
 // Within one discover pass every PR reads the same branch rules, repository variables, review workflow and
 // pinned required-checks file. Those reads are shared per pass; anything PR-specific or writing is not.
-export function memoRepoReads(ghFn) {
+// With a store, the login and branch rules/protection are also reused across rounds (see keptReadTtl).
+export function memoRepoReads(ghFn, store = null) {
   const cache = new Map();
   return (args) => {
     const target = String(args[1] ?? '');
     if (args[0] !== 'api' || !(target === 'user' || REPO_READ.test(target)) || args.some((arg) => WRITE_FLAG.test(arg))) return ghFn(args);
     const key = JSON.stringify(args);
     if (cache.has(key)) return cache.get(key);
+    const ttl = store ? keptReadTtl(args) : 0;
+    const kept = ttl ? store.get(key) : undefined;
+    if (kept !== undefined) {
+      cache.set(key, kept);
+      return kept;
+    }
+    const keep = (output) => {
+      if (ttl && typeof output === 'string' && output.trim()) store.set(key, output, ttl);
+      return output;
+    };
     let value = ghFn(args);
-    if (typeof value?.then === 'function') value = value.catch((error) => { cache.delete(key); throw error; });
+    if (typeof value?.then === 'function') value = value.then(keep, (error) => { cache.delete(key); throw error; });
+    else keep(value);
     cache.set(key, value);
     return value;
   };
+}
+
+function readViewer(ghFn, paths, clock) {
+  return memoRepoReads(ghFn, keptReadStore(paths.stateDir, clock))(['api', 'user', '-q', '.login']);
 }
 
 // A generator yields parallel(workflows) to run several sub-workflows at once; it gets back one
@@ -791,8 +856,10 @@ export function pollFingerprint(snapshot) {
     overflow: normalized.overflow === true,
   });
 }
+// No headRepository in this query or in the PR listing: the gh router sends any read asking for it to the personal
+// account. The head repository comes from the collected snapshot (REST pulls/<n>) or the state saved for the PR.
 function* fetchPollSnapshot({ nodeId, ghFn }) {
-  const query = 'query($id:ID!){node(id:$id){... on PullRequest{state isDraft headRefOid baseRefOid mergeable isCrossRepository headRepository{name owner{login}} labels(first:50){pageInfo{hasNextPage} nodes{name}} comments(last:1){totalCount nodes{updatedAt}} reviews(last:1){totalCount nodes{updatedAt}} reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved comments(last:1){nodes{updatedAt}}}} commits(last:1){nodes{commit{checkSuites(first:30){pageInfo{hasNextPage} nodes{checkRuns(first:40){pageInfo{hasNextPage} nodes{name status conclusion databaseId detailsUrl}}}}}}}}}}';
+  const query = 'query($id:ID!){node(id:$id){... on PullRequest{state isDraft headRefOid baseRefOid mergeable isCrossRepository labels(first:50){pageInfo{hasNextPage} nodes{name}} comments(last:1){totalCount nodes{updatedAt}} reviews(last:1){totalCount nodes{updatedAt}} reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved comments(last:1){nodes{updatedAt}}}} commits(last:1){nodes{commit{checkSuites(first:30){pageInfo{hasNextPage} nodes{checkRuns(first:40){pageInfo{hasNextPage} nodes{name status conclusion databaseId detailsUrl}}}}}}}}}}';
   const raw = yield () => ghFn(['api', 'graphql', '-f', `query=${query}`, '-F', `id=${nodeId}`]);
   return normalizePollSnapshot(JSON.parse(raw));
 }
@@ -1686,10 +1753,10 @@ function* scanWorkflow({
   }
   state.receiptsUpdatedAt=now;
   persistState(state,paths);
-  const viewer = String(yield () => ghFn(['api', 'user', '-q', '.login'])).trim();
+  const viewer = String(yield () => readViewer(ghFn, paths, clock)).trim();
   const listed = JSON.parse(yield () => ghFn([
     'pr', 'list', '--repo', REPO, '--author', viewer, '--state', 'open', '--limit', '1000',
-    '--json', 'number,id,headRefOid,headRefName,isDraft,labels,url,updatedAt,title,isCrossRepository,headRepository,headRepositoryOwner',
+    '--json', 'number,id,headRefOid,headRefName,isDraft,labels,url,updatedAt,title,isCrossRepository',
   ]));
   if (!Array.isArray(listed) || listed.length >= 1000) throw new Error('Open PR listing reached safety bound; cannot claim complete coverage');
   const report = [];
@@ -1818,7 +1885,7 @@ export function* pollWorkflow({
     save({ ...previous, needsOwner: true, pollFingerprint: fingerprint });
     return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, needsOwner: true, dispatch: { attempted: false, reason: 'needs-owner' } }] };
   }
-  const viewer = String(yield () => ghFn(['api', 'user', '-q', '.login'])).trim();
+  const viewer = String(yield () => readViewer(ghFn, paths, clock)).trim();
   const headRepository = normalized.headRepository ?? previous.headRepository;
   const headRepositoryOwner = normalized.headRepositoryOwner
     ?? (headRepository?.owner ? { login: headRepository.owner.login } : previous.headRepositoryOwner);
@@ -2206,11 +2273,12 @@ export function* discoverWorkflow({
     fs.writeFileSync(v2.indexPath, `${JSON.stringify({ version: 2, migratedAt: now }, null, 2)}\n`, { mode: 0o600 });
   }
   // Repository-wide reads (branch rules, variables, workflows) are the same for every PR of a pass.
-  let ghFn = memoRepoReads(baseGh);
+  const keptReads = keptReadStore(paths.stateDir, clock);
+  let ghFn = memoRepoReads(baseGh, keptReads);
   const viewer = String(yield () => ghFn(['api', 'user', '-q', '.login'])).trim();
   const listArgs = [
     'pr', 'list', '--repo', REPO, '--author', viewer, '--state', 'open', '--limit', '1000',
-    '--json', 'number,id,headRefOid,headRefName,isDraft,labels,url,updatedAt,title,isCrossRepository,headRepository,headRepositoryOwner',
+    '--json', 'number,id,headRefOid,headRefName,isDraft,labels,url,updatedAt,title,isCrossRepository',
   ];
   let listedAt = clock();
   const listed = JSON.parse(yield () => ghFn(listArgs));
@@ -2284,7 +2352,7 @@ export function* discoverWorkflow({
       const tickAt = Math.max(clock(), listedAt + followMs);
       if (hardDeadline - tickAt < FOLLOW_MIN_PASS_MS) break;
       if (tickAt > clock()) yield () => sleepFn(tickAt - clock());
-      ghFn = memoRepoReads(baseGh);
+      ghFn = memoRepoReads(baseGh, keptReads);
       listedAt = clock();
       const relisted = JSON.parse(yield () => ghFn(listArgs));
       if (!Array.isArray(relisted)) throw new Error('Open PR listing is not an array');

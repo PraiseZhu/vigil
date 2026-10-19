@@ -1,13 +1,32 @@
 const DEFAULT_REPO = 'makecindy/cindy';
-const FIELDS = 'id,number,title,url,state,isDraft,headRefOid,headRefName,baseRefOid,baseRefName,createdAt,author,isCrossRepository,headRepository,headRepositoryOwner,mergeable,reviewDecision';
+// The head repository is read from REST pulls/<n> (see headOf), not asked for here: the gh router sends any
+// gh --json / GraphQL read that asks for headRepository or headRepositoryOwner to the personal account.
+const FIELDS = 'id,number,title,url,state,isDraft,headRefOid,headRefName,baseRefOid,baseRefName,createdAt,author,isCrossRepository,mergeable,reviewDecision';
 const parse = (raw) => typeof raw === 'string' ? JSON.parse(raw) : raw;
 const requireValue = (ok, reason) => { if (!ok) throw new Error(`PR snapshot: ${reason}`); };
 const quote = (value) => JSON.stringify(value);
+const pullArgs = (repo, number) => ['api', `repos/${repo}/pulls/${number}`];
 
-function basic(raw, repo, number) {
-  const value = parse(raw);
-  requireValue(value && typeof value === 'object' && !Array.isArray(value), 'invalid PR');
+// A PR's head repository is fixed when the PR is opened, so one REST read per collection serves both the
+// before and the after view. A deleted fork (head.repo null) fails closed, as the GraphQL field did.
+function headOf(raw, number) {
+  const pull = parse(raw);
+  requireValue(pull && typeof pull === 'object' && !Array.isArray(pull) && pull.number === number, 'invalid pull');
+  const repo = pull.head?.repo;
+  requireValue(typeof repo?.name === 'string' && repo.name && typeof repo.owner?.login === 'string' && repo.owner.login, 'missing head repository');
+  return {
+    nodeId: pull.node_id,
+    headRepository: { name: repo.name, owner: { login: repo.owner.login } },
+    headRepositoryOwner: { login: repo.owner.login },
+  };
+}
+
+function basic(raw, head, repo, number) {
+  const parsed = parse(raw);
+  requireValue(parsed && typeof parsed === 'object' && !Array.isArray(parsed), 'invalid PR');
+  const value = { ...parsed, headRepository: head.headRepository, headRepositoryOwner: head.headRepositoryOwner };
   for (const key of ['id', 'headRefOid', 'headRefName', 'baseRefOid', 'baseRefName', 'createdAt']) requireValue(typeof value[key] === 'string' && value[key].length > 0, `missing ${key}`);
+  requireValue(head.nodeId === value.id, `pull identity drift: expected ${value.id}, got ${head.nodeId}`);
   requireValue(/^[a-f0-9]{40}$/i.test(value.headRefOid) && /^[a-f0-9]{40}$/i.test(value.baseRefOid), 'invalid SHA');
   requireValue(value.number === number && ['OPEN', 'CLOSED', 'MERGED'].includes(value.state) && typeof value.isDraft === 'boolean', 'invalid identity/state');
   requireValue(Number.isFinite(Date.parse(value.createdAt)) && typeof value.author?.login === 'string', 'missing author/createdAt');
@@ -66,7 +85,9 @@ export function* collectPrSnapshot({ pr, ghFn }) {
   const number = Number(pr.number);
   requireValue(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) && Number.isSafeInteger(number) && number > 0 && typeof ghFn === 'function', 'invalid input');
   const viewArgs = ['pr', 'view', String(number), '--repo', repo, '--json', FIELDS];
-  const before = basic(yield () => ghFn(viewArgs), repo, number);
+  const beforeRaw = yield () => ghFn(viewArgs);
+  const head = headOf(yield () => ghFn(pullArgs(repo, number)), number);
+  const before = basic(beforeRaw, head, repo, number);
   for (const key of ['id', 'headRefOid', 'headRefName', 'baseRefOid', 'baseRefName']) {
     if (pr[key] !== undefined) requireValue(pr[key] === before[key], `listed ${key} drift`);
   }
@@ -98,7 +119,7 @@ export function* collectPrSnapshot({ pr, ghFn }) {
   const reviews = yield* connection({ id: before.id, field: 'reviews', selection: 'id body state submittedAt authorAssociation author{login __typename} commit{oid}', ghFn });
   const labelNodes = yield* connection({ id: before.id, field: 'labels', selection: 'name', ghFn });
   requireValue(labelNodes.every((label) => typeof label.name === 'string'), 'invalid labels');
-  const after = basic(yield () => ghFn(viewArgs), repo, number);
+  const after = basic(yield () => ghFn(viewArgs), head, repo, number);
   const afterEpoch = yield* epoch({ pr: after, ghFn });
   for (const key of ['id', 'state', 'isDraft', 'headRefOid', 'headRefName', 'baseRefOid', 'baseRefName', 'sameRepository']) requireValue(before[key] === after[key], `stale ${key}`);
   requireValue(releaseEpoch === afterEpoch, 'stale release epoch');
@@ -137,12 +158,14 @@ export function collectPrOwnershipSync({ pr, ghFn }) {
     return step.value;
   };
   const args = ['pr', 'view', String(number), '--repo', repo, '--json', FIELDS];
-  const before = basic(read(args), repo, number);
+  const beforeRaw = read(args);
+  const head = headOf(read(pullArgs(repo, number)), number);
+  const before = basic(beforeRaw, head, repo, number);
   for (const key of ['id', 'headRefOid', 'headRefName', 'baseRefOid', 'baseRefName']) {
     if (pr[key] !== undefined) requireValue(pr[key] === before[key], `listed ${key} drift`);
   }
   const releaseEpoch = readEpoch(before);
-  const after = basic(read(args), repo, number);
+  const after = basic(read(args), head, repo, number);
   const afterEpoch = readEpoch(after);
   for (const key of ['id', 'state', 'isDraft', 'headRefOid', 'headRefName', 'baseRefOid', 'baseRefName', 'sameRepository']) requireValue(before[key] === after[key], `stale ${key}`);
   requireValue(releaseEpoch === afterEpoch, 'stale release epoch');
@@ -154,9 +177,11 @@ export function* collectPrOwnership({pr,ghFn}) {
   const repo=pr.repo??DEFAULT_REPO, number=Number(pr.number);
   requireValue(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)&&Number.isSafeInteger(number)&&number>0,'invalid input');
   const args=['pr','view',String(number),'--repo',repo,'--json',FIELDS];
-  const before=basic(yield()=>ghFn(args),repo,number);
+  const beforeRaw=yield()=>ghFn(args);
+  const head=headOf(yield()=>ghFn(pullArgs(repo,number)),number);
+  const before=basic(beforeRaw,head,repo,number);
   const releaseEpoch=yield* epoch({pr:before,ghFn});
-  const after=basic(yield()=>ghFn(args),repo,number);
+  const after=basic(yield()=>ghFn(args),head,repo,number);
   const afterEpoch=yield* epoch({pr:after,ghFn});
   for(const key of ['id','state','isDraft','headRefOid','headRefName','baseRefOid','baseRefName','sameRepository']) requireValue(before[key]===after[key],`stale ${key}`);
   requireValue(before.author.login===after.author.login&&releaseEpoch===afterEpoch,'stale owner/release epoch');

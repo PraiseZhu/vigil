@@ -54,7 +54,8 @@ export function* collectCindyReview(pr, ghFn) {
   const verdict = evaluateCindyReview({ snapshot, ci });
   const latest = parse(yield () => ghFn([
     'pr', 'view', String(pr.number), '--repo', snapshot.pr.repo,
-    '--json', 'id,state,isDraft,headRefOid,baseRefOid,author,isCrossRepository,headRepository,headRepositoryOwner',
+    // Only the fields compared below; asking for headRepository would send the read to the personal account.
+    '--json', 'id,state,isDraft,headRefOid,baseRefOid,author',
   ]));
   if (['id', 'state', 'isDraft', 'headRefOid', 'baseRefOid'].some((key) => latest[key] !== snapshot.pr[key])
     || latest.author?.login !== snapshot.pr.author.login) {
