@@ -82,7 +82,8 @@ export const BRANCH_POLICY_TTL_MS = 10 * 60 * 1000;
 export function keptReadTtl(args) {
   const target = String(args[1] ?? '');
   if (args[0] !== 'api' || args.some((arg) => WRITE_FLAG.test(arg))) return 0;
-  if (target === 'user') return VIEWER_TTL_MS;
+  // Only the login read is kept; a full /user read is an identity check before a write and stays live.
+  if (target === 'user') return args.length === 4 && args[2] === '-q' && args[3] === '.login' ? VIEWER_TTL_MS : 0;
   return BRANCH_POLICY_READ.test(target) ? BRANCH_POLICY_TTL_MS : 0;
 }
 

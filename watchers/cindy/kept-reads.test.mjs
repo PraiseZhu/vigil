@@ -117,3 +117,12 @@ test('two discover rounds in the same home ask GitHub for the login once', (t) =
     assert.doesNotMatch(args.join(' '), /headRepository/);
   }
 });
+
+test('only the login read is kept; a full /user read stays live', (t) => {
+  const { stateDir } = stateDirOf(t);
+  const now = 15_000_000;
+  const full = ['api', 'user'];
+  const gh = counting(() => '{"login":"ExampleUser"}');
+  for (let i = 0; i < 2; i += 1) memoRepoReads(gh.ghFn, keptReadStore(stateDir, () => now))(full);
+  assert.equal(gh.count(full), 2);
+});
