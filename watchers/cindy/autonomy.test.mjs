@@ -321,13 +321,13 @@ test('SC6 notify.mjs check/emit: pending events exit 0, empty exit 2, emit once'
   assert.doesNotMatch(again.stdout + again.stderr, /可以点合并/);
 });
 
-test('SC8 Cindy P2 is reply-only; unknown severity is not an automatic block', () => {
+test('SC8 Cindy P2 is code-fix; unknown severity is not an automatic block', () => {
   const p2 = feedbackRepairPolicy({
     source: 'thread', user: { login: 'greptile-apps[bot]', type: 'Bot' },
     body: '**P2** must-fix this PR', sha: HEAD,
   }, { headSha: HEAD });
-  assert.equal(p2.action, 'reply-only');
-  assert.equal(p2.canChangeCode, false);
+  assert.equal(p2.action, 'code-fix');
+  assert.equal(p2.canChangeCode, true);
   const message = dispatchParams({
     pr: { number: 790, id: nodeId, headRefOid: HEAD, title: 't', headRepositoryOwner: { login: 'owner' }, headRepository: { name: 'cindy-fork' } },
     mapping: {}, fresh: [{ key: 'review:r1', source: 'review', nativeId: 'r1', revision: 't', sha: HEAD, body: 'maybe a bug', category: 'other' }],
@@ -637,14 +637,15 @@ test('R3 consumed external blocked still queues escalate when GitHub is unchange
     'external blocked must reach the notice queue without a GitHub fingerprint change');
 });
 
-test('SC8 explicit member P2 is reply-only; unlabeled member thread still opens a session', (t) => {
+test('SC8 explicit member P2 is review-thread-triage; unlabeled member thread still opens a session', (t) => {
   const labeled = feedbackRepairPolicy({
     source: 'thread', threadId: 'PRRT_low', nativeId: 'PRRT_low:c-low',
     user: { login: 'ExampleMaintainer' }, authorAssociation: 'MEMBER',
     body: '**P2** small localized defect', sha: HEAD,
   }, { headSha: HEAD });
-  assert.equal(labeled.action, 'reply-only');
-  assert.equal(labeled.canChangeCode, false);
+  assert.equal(labeled.action, 'code-fix');
+  assert.equal(labeled.reason, 'review-thread-triage');
+  assert.equal(labeled.canChangeCode, true);
   const unlabeled = feedbackRepairPolicy({
     source: 'thread', threadId: 'PRRT_ask', nativeId: 'PRRT_ask:c-ask',
     user: { login: 'ExampleMaintainer' }, authorAssociation: 'MEMBER',
@@ -780,11 +781,11 @@ const mixedThread = {
   id: 'PRRT_mix', isResolved: false, isOutdated: false, path: 'src/m.ts',
   comments: [
     { id: 'c-p1', author: { login: 'greptile-apps[bot]' }, body: '**P1** crash on empty input', createdAt: now },
-    { id: 'c-p2', author: { login: 'greptile-apps[bot]' }, body: '**P2** naming could be clearer', createdAt: now },
+    { id: 'c-p3', author: { login: 'greptile-apps[bot]' }, body: '**P3** naming could be clearer', createdAt: now },
   ],
 };
 
-test('R4-3 a thread with a fixed P1 and an answered P2 closes after a complete green result', (t) => {
+test('R4-3 a thread with a fixed P1 and an answered P3 closes after a complete green result', (t) => {
   const { home, paths } = homeOf(t);
   const dispatchId = 'live-mixed';
   seedBound(paths, {
@@ -793,23 +794,23 @@ test('R4-3 a thread with a fixed P1 and an answered P2 closes after a complete g
     activeTask: { status: 'accepted', dispatchId, head: HEAD, sessionId: 'sess-790' },
   });
   const p1 = 'greptile:PRRT_mix:c-p1';
-  const p2 = 'greptile:PRRT_mix:c-p2';
+  const p3 = 'greptile:PRRT_mix:c-p3';
   fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
   fs.writeFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), JSON.stringify({
     dispatchId, nodeId, number: 790, repo: process.env.CINDY_WATCHER_TARGET_REPO, sessionId: 'sess-790',
     headRefOid: HEAD, headRefName: 'fix/x', params: { message: 'fix' },
     feedback: [
       { key: p1, source: 'greptile', nativeId: 'PRRT_mix:c-p1', path: 'src/m.ts', body: mixedThread.comments[0].body },
-      { key: p2, source: 'greptile', nativeId: 'PRRT_mix:c-p2', path: 'src/m.ts', body: mixedThread.comments[1].body },
+      { key: p3, source: 'greptile', nativeId: 'PRRT_mix:c-p3', path: 'src/m.ts', body: mixedThread.comments[1].body },
     ],
-    repairPolicy: { items: [{ key: p1, action: 'code-fix' }, { key: p2, action: 'reply-only' }] },
+    repairPolicy: { items: [{ key: p1, action: 'code-fix' }, { key: p3, action: 'reply-only' }] },
   }));
   writeResult(paths, dispatchId, {
     status: 'complete', ci: { requiredGreen: true, head: HEAD }, verification: { status: 'pass' },
-    feedbackCoverage: { dispositions: [{ key: p1, disposition: 'fixed' }, { key: p2, disposition: 'no-change' }] },
+    feedbackCoverage: { dispositions: [{ key: p1, disposition: 'fixed' }, { key: p3, disposition: 'no-change' }] },
     scs: [
       { status: 'pass', feedbackKeys: [p1], evidence: ['guarded empty input in src/m.ts'] },
-      { status: 'no-change', feedbackKeys: [p2], evidence: ['P2 naming suggestion recorded, not changed'] },
+      { status: 'no-change', feedbackKeys: [p3], evidence: ['P3 naming suggestion recorded, not changed'] },
     ],
   });
   discover(paths, { collect: () => collectBase({ threads: [mixedThread], mergeReady: true }), dispatchFn: () => { throw new Error('no dispatch after complete'); }, recheckFn: () => ({}) });

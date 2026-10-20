@@ -164,13 +164,13 @@ test('a P1 in the same task does not authorize an SC marking P3 fixed', (t) => {
   assert.equal(f.remoteHead(), f.sourceHead);
 });
 
-for (const kind of ['P1', 'required-ci']) {
+for (const kind of ['P1', 'P2', 'required-ci']) {
   test(`${kind} authorized repair can validate, push to fixture origin and close against current-head CI`, (t) => {
     const f = fixture(t);
-    const feedback = kind === 'P1' ? finding(kind) : {
+    const feedback = kind === 'required-ci' ? {
       key: 'ci:verify', source: 'ci', sha: f.sourceHead,
       requiredFailure: { verified: true, status: 'failed', headSha: f.sourceHead },
-    };
+    } : finding(kind);
     f.saveTask([feedback]);
     assert.equal(f.validate().status, 'pass');
     f.report([f.sc('pass', [feedback.key])]);

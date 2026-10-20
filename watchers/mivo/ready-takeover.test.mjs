@@ -65,7 +65,9 @@ test('a Greptile P1 is re-graded before code changes; the reviewer account\'s P1
   assert.equal(greptile.reason, 'greptile-p1-triage');
   const reviewer = feedbackRepairPolicy({ source: 'mivo-review', sha: HEAD, body, user: { login: 'ExampleReviewer' } }, { headSha: HEAD });
   assert.equal(reviewer.reason, 'explicit-p0-p1-finding');
-  assert.equal(feedbackRepairPolicy({ source: 'greptile', sha: HEAD, body: '**P2** naming', user: { login: 'greptile-apps[bot]' } }, { headSha: HEAD }).action, 'reply-only');
+  const gp2 = feedbackRepairPolicy({ source: 'greptile', sha: HEAD, body: '**P2** naming', user: { login: 'greptile-apps[bot]' } }, { headSha: HEAD });
+  assert.equal(gp2.action, 'code-fix');
+  assert.equal(gp2.reason, 'greptile-p1-triage');
   const key = 'greptile:PRRT_g:1';
   const task = { dispatchId: 'task-3', prAuthor: 'ExampleAuthor', feedback: [{ key, author: 'greptile-apps[bot]' }],
     repairPolicy: { items: [{ key, action: 'code-fix', reason: 'greptile-p1-triage' }] } };
