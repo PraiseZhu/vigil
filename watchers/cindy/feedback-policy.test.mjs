@@ -204,6 +204,32 @@ test('same-line P2 and P3 markdown tokens stay mixed', () => {
   assert.equal(p.reason, 'mixed-severity-inseparable');
   assert.equal(p.canChangeCode, false);
 });
+for (const phrase of ['disk space is low', 'medium-sized cache never evicts']) {
+  test(`P2 finding is not mixed with prose "${phrase}"`, () => {
+    const body = `**P2** ${phrase}`;
+    const p = policy(body);
+    assert.equal(p.action, 'code-fix');
+    assert.equal(p.canChangeCode, true);
+    assert.deepEqual(p.severities, ['P2']);
+    const fb = item(body);
+    const checked = validateScs({
+      scs: [{ id: 'SC-1', status: 'pass', feedbackKeys: [fb.key], evidence: ['retry path covered'] }],
+    }, { headRefOid: head, feedback: [fb] });
+    assert.equal(checked.feedbackCoverage.dispositions[0].disposition, 'fixed');
+  });
+}
+test('same-line P2 and all-caps LOW stay mixed', () => {
+  const p = policy('**P2** retry is missing LOW naming nit');
+  assert.equal(p.action, 'needs-triage');
+  assert.equal(p.reason, 'mixed-severity-inseparable');
+  assert.equal(p.canChangeCode, false);
+});
+test('same-line P2 and severity: low label stay mixed', () => {
+  const p = policy('**P2** / severity: low');
+  assert.equal(p.action, 'needs-triage');
+  assert.equal(p.reason, 'mixed-severity-inseparable');
+  assert.equal(p.canChangeCode, false);
+});
 test('same-line P2 / LOW tokens stay mixed', () => {
   const p = policy('P2 / LOW: retry is missing and naming is off');
   assert.equal(p.action, 'needs-triage');

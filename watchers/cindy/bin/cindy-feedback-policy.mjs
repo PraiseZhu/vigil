@@ -6,7 +6,11 @@ const INFRA = new Set(['INCOMPLETE', 'CI-NOT-GREEN', 'SKIP-LLM', 'SKIP-LOCAL', '
 const aliases = { P0: 'P0', CRITICAL: 'P0', P1: 'P1', HIGH: 'P1', P2: 'P2', MEDIUM: 'P2', P3: 'P3', LOW: 'P3' };
 const TOKEN = '(P[0-3]|CRITICAL|HIGH|MEDIUM|LOW)';
 function severityTokensIn(line) {
-  return line.match(/\b(?:P[0-3]|CRITICAL|HIGH|MEDIUM|LOW)\b/gi) ?? [];
+  const tokens = [...(line.match(/\bP[0-3]\b/gi) ?? [])];
+  const labeled = /\*\*(CRITICAL|HIGH|MEDIUM|LOW)\*\*|\[(CRITICAL|HIGH|MEDIUM|LOW)\]|(?:severity|priority|严重度|优先级)\s*[:：]\s*(CRITICAL|HIGH|MEDIUM|LOW)\b/gi;
+  for (const match of line.matchAll(labeled)) tokens.push(match[1] ?? match[2] ?? match[3]);
+  tokens.push(...(line.match(/\b(?:CRITICAL|HIGH|MEDIUM|LOW)\b/g) ?? []));
+  return tokens;
 }
 const severityHeading = new RegExp('^(?:#{1,6}\\s+)?(?:[-*+]\\s+|\\d+[.)]\\s+)?(?:🤖 自动 Review\\s*·\\s*)?(?:\\*\\*|\\[)?' + TOKEN + '(?:\\*\\*|\\])?(?=\\s|:|：|[-—–]|$)(.*)$', 'i');
 const verdictHeading = /^## 🤖 自动 Review 结论[：:]\s*(\S+)\s*$/m;
