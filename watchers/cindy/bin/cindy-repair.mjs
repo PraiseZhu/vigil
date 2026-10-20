@@ -407,7 +407,7 @@ export function assertTaskRepairScope(task, head, { emptyRetrigger = false } = {
   if (!isSha(task?.headRefOid) || !isSha(head)) fail('repair scope requires valid source and target HEAD');
   const repairPolicy = taskRepairPolicy(task);
   if (head !== task.headRefOid && !repairPolicy.canChangeCode && !emptyRetrigger) {
-    fail('[REPAIR_SCOPE_NO_CODE] This task has no P0/P1, required-CI or conflict repair authority; preserve local changes, do not push. P2/P3 and unknown findings are no-change only.');
+    fail('[REPAIR_SCOPE_NO_CODE] This task has no P0/P1/P2, required-CI or conflict repair authority; preserve local changes, do not push. P3 and unknown findings are no-change only.');
   }
   return repairPolicy;
 }
@@ -591,7 +591,7 @@ export function validateScs(report, task) {
     for (const key of keys) {
       if (!expected.has(key)) fail(`SC[${index}] contains an external feedback key: ${key}`);
       if (sc.status === 'pass' && permissions.get(key)?.canChangeCode !== true) {
-        fail(`[REPAIR_SCOPE_NO_CODE] SC[${index}] cannot mark ${key} fixed; P2/P3, mixed or unconfirmed findings require no-change/triage`);
+        fail(`[REPAIR_SCOPE_NO_CODE] SC[${index}] cannot mark ${key} fixed; P3, mixed or unconfirmed findings require no-change/triage`);
       }
       covered.add(key);
     }
