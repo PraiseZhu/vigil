@@ -22,7 +22,7 @@ function trustedReviewer(item) {
 }
 // A review thread left by a person with standing in the repository (owner, member, collaborator; the PR
 // author included). Its body still grants nothing: the repair session grades it on the unified severity
-// scale, only a confirmed P0/P1 changes code, anything else is answered with evidence and resolved.
+// scale, only a confirmed P0/P1/P2 changes code, P3 is answered with evidence and resolved.
 const MEMBER_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 export function isMemberThread(item) {
   const author = item?.user ?? item?.author;
@@ -51,10 +51,15 @@ const result = (action, severities, reason) => ({ policyVersion: FEEDBACK_POLICY
 
 // Greptile's overview restates findings that arrive as their own graded inline threads. Unless it carries an
 // explicit P0/P1 finding of its own, it only opened a session with no authority (2026-10-15 #989, #993).
+function summaryHasOwnHighFinding(severities) {
+  return (severities ?? []).some((s) => s === 'P0' || s === 'P1');
+}
 export function feedbackRepairPolicy(item = {}, options = {}) {
   const policy = itemRepairPolicy(item, options);
-  if (!['code-fix', 'ignore-infra'].includes(policy.action) && trustedReviewer(item) && isGreptileSummary(String(item.body ?? ''))) {
-    return result('ignore-infra', policy.severities, 'greptile-summary-inline-threads');
+  if (trustedReviewer(item) && isGreptileSummary(String(item.body ?? ''))) {
+    if (!['code-fix', 'ignore-infra'].includes(policy.action) || (policy.action === 'code-fix' && !summaryHasOwnHighFinding(policy.severities))) {
+      return result('ignore-infra', policy.severities, 'greptile-summary-inline-threads');
+    }
   }
   // Greptile grades P1 on its own scale (2026-10-15: #925's "handwritten text lost on reload" was a false alarm).
   // Its P0/P1 gets the same unified re-grading as a member thread before any code changes.
@@ -62,7 +67,7 @@ export function feedbackRepairPolicy(item = {}, options = {}) {
     return result('code-fix', policy.severities, 'greptile-p1-triage');
   }
   // An open review thread nobody can grade by reading its text would block the merge until a person answered it.
-  // The session grades it like a member thread: only a reproduced P0/P1 changes code, anything else is answered and
+  // The session grades it like a member thread: only a reproduced P0/P1/P2 changes code, P3 is answered and
   // resolved (2026-10-15: the owner wants PRs pushed to mergeable without a person in the loop).
   if (policy.action === 'needs-triage' && THREAD_TRIAGEABLE.has(policy.reason) && typeof item.threadId === 'string' && item.threadId.length > 0) {
     return result('code-fix', policy.severities, 'thread-triage');
@@ -111,7 +116,7 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
   let summaryHigh = false;
   for (const line of substantive) {
     if (/三席聚合|(?:findings?|severity)\s*(?:counts?|summary)|汇总|统计/i.test(line)) {
-      if (/(?:P[01]|CRITICAL|HIGH)\s*[:：]?\s*[1-9]\d*/i.test(line)) summaryHigh = true;
+      if (/(?:P[012]|CRITICAL|HIGH|MEDIUM)\s*[:：]?\s*[1-9]\d*/i.test(line)) summaryHigh = true;
       continue;
     }
     const findingLine = line
@@ -129,10 +134,11 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
     if (!severities.includes(severity)) severities.push(severity);
   }
   const high = severities.some(s => s === 'P0' || s === 'P1');
-  const low = severities.some(s => s === 'P2' || s === 'P3');
+  const authorized = severities.some(s => s === 'P0' || s === 'P1' || s === 'P2');
+  const p3 = severities.some(s => s === 'P3');
   if (high && heading === 'APPROVE') return result('needs-triage', severities, 'approve-conflicts-with-high-finding');
   // Structurally separable only when each severity came from its own line (no
-  // single line mixes a high token with a low token). A single line mixing
+  // single line mixes an authorized token with a P3 token). A single line mixing
   // both cannot be attributed to one finding or the other, so it can never
   // authorize a split fix even if the header scan only recognized one of them.
   const mixedOnSameLine = substantive.some((line) => {
@@ -140,13 +146,13 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
     const tokens = line.match(/P[0-3]|CRITICAL|HIGH|MEDIUM|LOW/gi) ?? [];
     if (tokens.length < 2) return false;
     const mapped = tokens.map((t) => aliases[t.toUpperCase()]);
-    return mapped.some((s) => s === 'P0' || s === 'P1') && mapped.some((s) => s === 'P2' || s === 'P3');
+    return mapped.some((s) => s === 'P0' || s === 'P1' || s === 'P2') && mapped.some((s) => s === 'P3');
   });
   if (mixedOnSameLine) return result('needs-triage', severities, 'mixed-severity-inseparable');
-  if (high && low) return result('code-fix', severities, 'mixed-severity-high-authorized-low-no-change');
-  if (summaryHigh && !high) return result('needs-triage', severities, 'high-summary-without-finding');
-  if (high) return result('code-fix', severities, 'explicit-p0-p1-finding');
-  if (low) return result('reply-only', severities, 'p2-p3-no-code-authority');
+  if (authorized && p3) return result('code-fix', severities, 'mixed-severity-high-authorized-low-no-change');
+  if (summaryHigh && !authorized) return result('needs-triage', severities, 'high-summary-without-finding');
+  if (authorized) return result('code-fix', severities, 'explicit-p0-p1-finding');
+  if (p3) return result('reply-only', severities, 'p3-no-code-authority');
   // A Greptile overview scored 5/5 with no severity finding is a clean bill, not
   // a finding; its inline findings arrive as separate, graded items.
   if (/<!--\s*greptile_summary\s*-->/i.test(body) && /Confidence Score:\s*5\s*\/\s*5/i.test(body)) {
