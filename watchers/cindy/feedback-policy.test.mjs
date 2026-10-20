@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { feedbackRepairPolicy, taskRepairPolicy } from './bin/cindy-feedback-policy.mjs';
+import { validateScs } from './bin/cindy-repair.mjs';
 const head = 'a'.repeat(40);
 const bot = { login: 'github-actions[bot]', type: 'Bot' };
 const item = body => ({ key: 'comment:1', source: 'comment', user: bot, sha: head, body });
@@ -182,4 +183,30 @@ test('member triage thread P2 is code-fix, P3 stays reply-only', () => {
   const mixed = feedbackRepairPolicy(member('**P3** naming, also P2 defect on the same line'), { headSha: head });
   assert.equal(mixed.action, 'code-fix');
   assert.equal(mixed.reason, 'review-thread-triage');
+});
+for (const word of ['workflow', 'overflow', 'Follow']) {
+  test(`P2 finding is not mixed with a ${word} substring`, () => {
+    const body = `**P2** ${word} never retries failed jobs`;
+    const p = policy(body);
+    assert.equal(p.action, 'code-fix');
+    assert.equal(p.canChangeCode, true);
+    assert.deepEqual(p.severities, ['P2']);
+    const fb = item(body);
+    const checked = validateScs({
+      scs: [{ id: 'SC-1', status: 'pass', feedbackKeys: [fb.key], evidence: ['retry path covered'] }],
+    }, { headRefOid: head, feedback: [fb] });
+    assert.equal(checked.feedbackCoverage.dispositions[0].disposition, 'fixed');
+  });
+}
+test('same-line P2 and P3 markdown tokens stay mixed', () => {
+  const p = policy('**P2** retry is missing **P3** naming nit');
+  assert.equal(p.action, 'needs-triage');
+  assert.equal(p.reason, 'mixed-severity-inseparable');
+  assert.equal(p.canChangeCode, false);
+});
+test('same-line P2 / LOW tokens stay mixed', () => {
+  const p = policy('P2 / LOW: retry is missing and naming is off');
+  assert.equal(p.action, 'needs-triage');
+  assert.equal(p.reason, 'mixed-severity-inseparable');
+  assert.equal(p.canChangeCode, false);
 });

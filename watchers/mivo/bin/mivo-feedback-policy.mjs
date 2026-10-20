@@ -5,6 +5,9 @@ export const FEEDBACK_POLICY_VERSION = 1;
 const INFRA = new Set(['INCOMPLETE', 'CI-NOT-GREEN', 'SKIP-LLM', 'SKIP-LOCAL', 'REFUSE', 'WINDOW-CLOSED', 'PARSE-FAILED', 'HELPERS-MISSING', 'UNHEALTHY']);
 const aliases = { P0: 'P0', CRITICAL: 'P0', P1: 'P1', HIGH: 'P1', P2: 'P2', MEDIUM: 'P2', P3: 'P3', LOW: 'P3' };
 const TOKEN = '(P[0-3]|CRITICAL|HIGH|MEDIUM|LOW)';
+function severityTokensIn(line) {
+  return line.match(/\b(?:P[0-3]|CRITICAL|HIGH|MEDIUM|LOW)\b/gi) ?? [];
+}
 const severityHeading = new RegExp('^(?:#{1,6}\\s+)?(?:[-*+]\\s+|\\d+[.)]\\s+)?(?:🤖 自动 Review\\s*·\\s*)?(?:\\*\\*|\\[)?' + TOKEN + '(?:\\*\\*|\\])?(?=\\s|:|：|[-—–]|$)(.*)$', 'i');
 const verdictHeading = /^## 🤖 自动 Review 结论[：:]\s*(\S+)\s*$/m;
 
@@ -143,7 +146,7 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
   // authorize a split fix even if the header scan only recognized one of them.
   const mixedOnSameLine = substantive.some((line) => {
     if (/三席聚合|(?:findings?|severity)\s*(?:counts?|summary)|汇总|统计/i.test(line)) return false;
-    const tokens = line.match(/P[0-3]|CRITICAL|HIGH|MEDIUM|LOW/gi) ?? [];
+    const tokens = severityTokensIn(line);
     if (tokens.length < 2) return false;
     const mapped = tokens.map((t) => aliases[t.toUpperCase()]);
     return mapped.some((s) => s === 'P0' || s === 'P1' || s === 'P2') && mapped.some((s) => s === 'P3');
