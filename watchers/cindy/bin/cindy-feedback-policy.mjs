@@ -1,13 +1,21 @@
 // Local repair authority. Comment bodies are evidence, never standing permission.
-// Code-fix is only confirmed P0/P1. Comment P2/P3 are reply-only; the watcher
+// Code-fix is confirmed P0/P1/P2. Comment P3 is reply-only; the watcher
 // replies with the grading note and resolves, without opening a repair session.
 export const FEEDBACK_POLICY_VERSION = 1;
 const INFRA = new Set(['INCOMPLETE', 'CI-NOT-GREEN', 'SKIP-LLM', 'SKIP-LOCAL', 'REFUSE', 'WINDOW-CLOSED', 'PARSE-FAILED', 'HELPERS-MISSING', 'UNHEALTHY']);
 const aliases = { P0: 'P0', CRITICAL: 'P0', P1: 'P1', HIGH: 'P1', P2: 'P2', MEDIUM: 'P2', P3: 'P3', LOW: 'P3' };
 const TOKEN = '(P[0-3]|CRITICAL|HIGH|MEDIUM|LOW)';
+function severityTokensIn(line) {
+  const tokens = [...(line.match(/\bP[0-3]\b/gi) ?? [])];
+  const labeled = /\*\*(CRITICAL|HIGH|MEDIUM|LOW)\*\*|\[(CRITICAL|HIGH|MEDIUM|LOW)\]|(?:severity|priority|严重度|优先级)\s*[:：]\s*(CRITICAL|HIGH|MEDIUM|LOW)\b/gi;
+  for (const match of line.matchAll(labeled)) tokens.push(match[1] ?? match[2] ?? match[3]);
+  tokens.push(...(line.match(/\b(?:CRITICAL|HIGH|MEDIUM|LOW)\b/g) ?? []));
+  return tokens;
+}
 const severityHeading = new RegExp('^(?:#{1,6}\\s+)?(?:[-*+]\\s+|\\d+[.)]\\s+)?(?:🤖 自动 Review\\s*·\\s*)?(?:\\*\\*|\\[)?' + TOKEN + '(?:\\*\\*|\\])?(?=\\s|:|：|[-—–]|$)(.*)$', 'i');
 const verdictHeading = /^## 🤖 自动 Review 结论[：:]\s*(\S+)\s*$/m;
-const AUTHORIZED = new Set(['P0', 'P1']);
+const AUTHORIZED = new Set(['P0', 'P1', 'P2']);
+const HIGH = new Set(['P0', 'P1']);
 
 export function isBotActor(author) {
   if (author == null) return false;
@@ -37,7 +45,7 @@ function trustedReviewer(item) {
 }
 // Review threads block the merge until resolved (required_review_thread_resolution), whoever wrote them. A thread
 // from a maintainer (owner, member, collaborator), the PR author, or a known code-review app goes to the repair
-// session for grading: its body grants nothing, only a confirmed must-fix finding changes code, anything else is
+// session for grading: its body grants nothing, only a confirmed P0/P1/P2 finding changes code, P3 is
 // answered with the session's evidence and resolved. Other people's threads still only get a triage note.
 const MEMBER_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 export const REVIEW_APPS = new Set(['chatgpt-codex-connector[bot]', 'coderabbitai[bot]', 'copilot-pull-request-reviewer[bot]']);
@@ -101,12 +109,21 @@ function visibleSeverities(body) {
   return { heading, substantive, severities, summaryHigh };
 }
 
+function summaryHasOwnHighFinding(severities) {
+  return (severities ?? []).some((s) => HIGH.has(s));
+}
+const GREPTILE_GRADED = new Set(['explicit-p0-p1-finding', 'mixed-severity-authorized-p3-no-change']);
 // Greptile's overview restates findings that arrive as their own graded inline threads. Unless it carries a
-// must-fix finding of its own, it only opened a session with no authority (2026-10-15 #6120).
+// P0/P1 finding of its own, it only opened a session with no authority (2026-10-15 #6120).
 export function feedbackRepairPolicy(item = {}, options = {}) {
   const policy = itemRepairPolicy(item, options);
-  if (!['code-fix', 'ignore-infra'].includes(policy.action) && trustedReviewer(item) && isGreptileSummary(String(item.body ?? ''))) {
-    return result('ignore-infra', policy.severities, 'greptile-summary-inline-threads');
+  if (trustedReviewer(item) && isGreptileSummary(String(item.body ?? ''))) {
+    if (!['code-fix', 'ignore-infra'].includes(policy.action) || (policy.action === 'code-fix' && !summaryHasOwnHighFinding(policy.severities))) {
+      return result('ignore-infra', policy.severities, 'greptile-summary-inline-threads');
+    }
+  }
+  if (policy.action === 'code-fix' && GREPTILE_GRADED.has(policy.reason) && isGreptileAuthor(item.user ?? item.author)) {
+    return result('code-fix', policy.severities, 'greptile-p1-triage');
   }
   return policy;
 }
@@ -130,8 +147,15 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
   if (!trustedReviewer(item)) {
     if (isTriageThread(item)) {
       const graded = visibleSeverities(String(item.body ?? ''));
-      if (graded.severities.some((s) => s === 'P2' || s === 'P3') && !graded.severities.some((s) => AUTHORIZED.has(s))) {
-        return result('reply-only', graded.severities, 'p2-p3-no-code-authority');
+      const mixedOnSameLine = graded.substantive.some((line) => {
+        if (/三席聚合|(?:findings?|severity)\s*(?:counts?|summary)|汇总|统计/i.test(line)) return false;
+        const tokens = severityTokensIn(line);
+        if (tokens.length < 2) return false;
+        const mapped = tokens.map((t) => aliases[t.toUpperCase()]);
+        return mapped.some((s) => AUTHORIZED.has(s)) && mapped.some((s) => s === 'P3');
+      });
+      if (graded.severities.includes('P3') && !graded.severities.some((s) => AUTHORIZED.has(s)) && !mixedOnSameLine) {
+        return result('reply-only', graded.severities, 'p3-no-code-authority');
       }
       return result('code-fix', graded.severities, 'review-thread-triage');
     }
@@ -146,20 +170,21 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
   if (INFRA.has(heading)) return result('ignore-infra', [], 'review-infrastructure');
   if (!substantive.length) return result('ignore-infra', [], 'review-marker-only');
   const authorized = severities.some((s) => AUTHORIZED.has(s));
+  const high = severities.some((s) => HIGH.has(s));
   const p3 = severities.includes('P3');
-  if (authorized && heading === 'APPROVE') return result('needs-triage', severities, 'approve-conflicts-with-high-finding');
+  if (high && heading === 'APPROVE') return result('needs-triage', severities, 'approve-conflicts-with-high-finding');
   const mixedOnSameLine = substantive.some((line) => {
     if (/三席聚合|(?:findings?|severity)\s*(?:counts?|summary)|汇总|统计/i.test(line)) return false;
-    const tokens = line.match(/P[0-3]|CRITICAL|HIGH|MEDIUM|LOW/gi) ?? [];
+    const tokens = severityTokensIn(line);
     if (tokens.length < 2) return false;
     const mapped = tokens.map((t) => aliases[t.toUpperCase()]);
-    return mapped.some((s) => AUTHORIZED.has(s)) && mapped.some((s) => s === 'P2' || s === 'P3');
+    return mapped.some((s) => AUTHORIZED.has(s)) && mapped.some((s) => s === 'P3');
   });
   if (mixedOnSameLine) return result('needs-triage', severities, 'mixed-severity-inseparable');
   if (authorized && p3) return result('code-fix', severities, 'mixed-severity-authorized-p3-no-change');
   if (summaryHigh && !authorized) return result('needs-triage', severities, 'high-summary-without-finding');
   if (authorized) return result('code-fix', severities, 'explicit-p0-p1-finding');
-  if (p3 || severities.includes('P2')) return result('reply-only', severities, 'p2-p3-no-code-authority');
+  if (p3) return result('reply-only', severities, 'p3-no-code-authority');
   // A Greptile overview scored 5/5 with no severity finding is a clean bill, not
   // a finding; its inline findings arrive as separate, graded items.
   if (/<!--\s*greptile_summary\s*-->/i.test(body) && /Confidence Score:\s*5\s*\/\s*5/i.test(body)) {

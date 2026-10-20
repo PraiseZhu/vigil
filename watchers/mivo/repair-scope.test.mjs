@@ -138,12 +138,12 @@ function fixture(t, { changed = true } = {}) {
 }
 
 for (const status of ['pass', 'no-change']) {
-  test(`P2-only changed HEAD cannot finalize ${status}, even with a valid prior validation receipt`, (t) => {
+  test(`P3-only changed HEAD cannot finalize ${status}, even with a valid prior validation receipt`, (t) => {
     const f = fixture(t);
     assert.equal(f.validate().status, 'pass');
-    f.saveTask([{ ...finding('P2'), category: 'actionable-fix', priority: 'P1',
+    f.saveTask([{ ...finding('P3'), category: 'actionable-fix', priority: 'P1',
       repairPolicy: { action: 'code-fix', canChangeCode: true } }]);
-    f.report([f.sc(status, ['thread:P2'])]);
+    f.report([f.sc(status, ['thread:P3'])]);
     assert.throws(f.finalize, /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限/i);
     assert.equal(f.pushCalls.length, 0);
     assert.equal(f.remoteHead(), f.sourceHead);
@@ -165,23 +165,23 @@ test('P2-only unchanged HEAD closes the complete no-change flow without validati
   assert.equal(f.pushCalls.length, 0);
 });
 
-test('a P1 in the same task does not authorize an SC marking P2 fixed', (t) => {
+test('a P1 in the same task does not authorize an SC marking P3 fixed', (t) => {
   const f = fixture(t);
-  f.saveTask([finding('P1'), finding('P2')]);
+  f.saveTask([finding('P1'), finding('P3')]);
   assert.equal(f.validate().status, 'pass');
-  f.report([f.sc('pass', ['thread:P1']), f.sc('pass', ['thread:P2'])]);
+  f.report([f.sc('pass', ['thread:P1']), f.sc('pass', ['thread:P3'])]);
   assert.throws(f.finalize, /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限|no.change/i);
   assert.equal(f.pushCalls.length, 0);
   assert.equal(f.remoteHead(), f.sourceHead);
 });
 
-for (const kind of ['P1', 'required-ci']) {
+for (const kind of ['P1', 'P2', 'required-ci']) {
   test(`${kind} authorized repair can validate, push to fixture origin and close against current-head CI`, (t) => {
     const f = fixture(t);
-    const feedback = kind === 'P1' ? finding('P1') : {
+    const feedback = kind === 'required-ci' ? {
       key: 'ci:verify', source: 'ci', sha: f.sourceHead,
       requiredFailure: { verified: true, status: 'failed', headSha: f.sourceHead },
-    };
+    } : finding(kind);
     f.saveTask([feedback]);
     assert.equal(f.validate().status, 'pass');
     f.report([f.sc('pass', [feedback.key])]);
@@ -195,13 +195,13 @@ for (const kind of ['P1', 'required-ci']) {
   });
 }
 
-for (const kind of ['P3', 'unknown', 'empty']) {
+for (const kind of ['P2', 'P3', 'unknown', 'empty']) {
   test(`${kind} feedback cannot publish a changed HEAD through no-change SCs`, (t) => {
     const f = fixture(t);
     assert.equal(f.validate().status, 'pass');
     const feedback = kind === 'empty' ? [] : kind === 'unknown'
       ? [{ ...finding('P1'), key: 'thread:unknown', body: 'Please consider this improvement.' }]
-      : [finding('P3')];
+      : [finding(kind)];
     f.saveTask(feedback);
     f.report([f.sc('no-change', feedback.map(item => item.key))]);
     assert.throws(f.finalize, /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限/i);
@@ -342,9 +342,9 @@ test('mixed task can fix P1 while explicitly leaving P2 unchanged', (t) => {
     [['thread:P1', 'fixed'], ['thread:P2', 'no-change']]);
 });
 
-test('P2-only validation rejects a changed HEAD before running preflight', (t) => {
+test('P3-only validation rejects a changed HEAD before running preflight', (t) => {
   const f = fixture(t);
-  f.saveTask([finding('P2')]);
+  f.saveTask([finding('P3')]);
   let preflightRuns = 0;
   assert.throws(() => validate({ ...f.options, runFn: () => { preflightRuns++; return 'passed'; } }),
     /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限/i);
@@ -357,7 +357,7 @@ test('recheck cannot certify a changed HEAD after its feedback loses repair auth
   assert.equal(f.validate().status, 'pass');
   f.report([f.sc('pass', ['thread:P1'])]);
   assert.equal(f.finalize().status, 'complete');
-  f.saveTask([{ ...finding('P2'), key: 'thread:P1' }]);
+  f.saveTask([{ ...finding('P3'), key: 'thread:P1' }]);
   const pushesBefore = f.pushCalls.length;
   assert.throws(() => recheck(f.options), /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限|no.change/i);
   assert.equal(f.pushCalls.length, pushesBefore);

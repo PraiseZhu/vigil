@@ -56,7 +56,7 @@ test('compact snapshot keeps only what a repair turn needs', () => {
 test('script no-change only when every item is reply-only or ignore-infra', () => {
   const item = (body) => ({ source: 'greptile', user: GREPTILE, body, sha: HEAD });
   assert.ok(scriptNoChangePolicy(pr, [item('**P3** nit'), item('**P3** style')]));
-  assert.ok(scriptNoChangePolicy(pr, [item('**P3** nit'), item('**P2** bug')]), 'P2 is reply-only on Cindy');
+  assert.equal(scriptNoChangePolicy(pr, [item('**P3** nit'), item('**P2** bug')]), null);
   assert.equal(scriptNoChangePolicy(pr, [item('**P1** bug')]), null);
   assert.equal(scriptNoChangePolicy(pr, [item('looks odd, please check')]), null, 'unknown severity still needs a session');
   assert.equal(scriptNoChangePolicy(pr, []), null);
@@ -77,4 +77,10 @@ test('a Greptile summary is not a finding unless it carries its own must-fix ite
   assert.equal(feedbackRepairPolicy(summary(4), { headSha: HEAD }).action, 'ignore-infra');
   const withFinding = { ...summary(5), body: `${summary(5).body}\n**P1** real bug` };
   assert.equal(feedbackRepairPolicy(withFinding, { headSha: HEAD }).action, 'code-fix');
+});
+test('Greptile summary with P2/MEDIUM does not open a session', () => {
+  const summary = (extra) => ({ source: 'greptile', user: GREPTILE, body: `<!-- greptile_summary -->\n<h2>Confidence Score: 4/5</h2>\n${extra}`, sha: HEAD });
+  assert.equal(feedbackRepairPolicy(summary('**P2** restated'), { headSha: HEAD }).action, 'ignore-infra');
+  assert.equal(feedbackRepairPolicy(summary('**MEDIUM** restated'), { headSha: HEAD }).action, 'ignore-infra');
+  assert.equal(feedbackRepairPolicy(summary('**P2** restated\n**P3** naming'), { headSha: HEAD }).action, 'ignore-infra');
 });
