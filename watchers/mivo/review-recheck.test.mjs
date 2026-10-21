@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { planReviewRecheck, requestReviewRecheck } from './bin/mivo-pr-actions.mjs';
+import { planReviewRecheck, requestReviewRecheck, threadsAllResolved } from './bin/mivo-pr-actions.mjs';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -102,7 +102,7 @@ test('many earlier attempts on the same head do not block a new result', () => {
 function recheckGh({ threads = [{ isResolved: true }], hasNextPage = false, calls = [] } = {}) {
   return (args) => {
     calls.push(args.join(' '));
-    if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: threads, pageInfo: { hasNextPage } } } } } });
+    if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: threads, pageInfo: { hasNextPage, endCursor: hasNextPage ? null : 'end' } } } } } });
     if (args[1]?.includes('workflows/review-pr.yml') && !args.includes('workflow')) return JSON.stringify({ path: '.github/workflows/review-pr.yml', state: 'active' });
     if (args[1]?.includes('MIVO_REVIEW_MODE')) return JSON.stringify({ name: 'MIVO_REVIEW_MODE', value: 'live' });
     if (args[1]?.includes('actions/runs')) return JSON.stringify({ workflow_runs: [] });
@@ -110,7 +110,7 @@ function recheckGh({ threads = [{ isResolved: true }], hasNextPage = false, call
   };
 }
 
-for (const [name, opts] of [['an open conversation', { threads: [{ isResolved: true }, { isResolved: false }] }], ['an unreadable second page', { hasNextPage: true }]]) {
+for (const [name, opts] of [['an open conversation', { threads: [{ isResolved: true }, { isResolved: false }] }], ['a second page without a cursor', { hasNextPage: true }]]) {
   test(`${name} makes the recheck wait without dispatching or recording an attempt`, () => {
     const calls = [];
     const ghFn = recheckGh({ ...opts, calls });
@@ -126,3 +126,11 @@ for (const [name, opts] of [['an open conversation', { threads: [{ isResolved: t
     assert.ok(!calls.some((line) => line.startsWith('workflow run')));
   });
 }
+
+test('threadsAllResolved reads every page: closed history beyond 100 passes, an open thread on page 2 waits', () => {
+  const page = (nodes, hasNextPage, endCursor) => JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes, pageInfo: { hasNextPage, endCursor } } } } } });
+  const closed = Array.from({ length: 100 }, () => ({ isResolved: true }));
+  const make = (second) => (args) => (args.includes('after=c1') ? page(second, false, null) : page(closed, true, 'c1'));
+  assert.equal(run(threadsAllResolved({ repo: 'example-org/example-plugin', number: 9, ghFn: make([{ isResolved: true }]) })), true);
+  assert.equal(run(threadsAllResolved({ repo: 'example-org/example-plugin', number: 9, ghFn: make([{ isResolved: false }]) })), false);
+});

@@ -251,16 +251,25 @@ export function planReviewRecheck({ snapshot, entry, task, result, observed = []
   };
 }
 
-const THREADS_QUERY = 'query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved} pageInfo{hasNextPage}}}}}';
+const THREADS_QUERY = 'query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$after){nodes{isResolved} pageInfo{hasNextPage endCursor}}}}}';
+const THREAD_PAGE_LIMIT = 50;
 
 export function* threadsAllResolved({ repo, number, ghFn }) {
   const [owner, name] = repo.split('/');
-  const raw = parse(yield () => ghFn(['api', 'graphql', '-f', `query=${THREADS_QUERY}`,
-    '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `number=${Number(number)}`]));
-  const threads = raw?.data?.repository?.pullRequest?.reviewThreads;
-  // An unreadable or partial page is not proof that every conversation is closed.
-  if (!Array.isArray(threads?.nodes) || threads.pageInfo?.hasNextPage !== false) return false;
-  return threads.nodes.every((thread) => thread?.isResolved === true);
+  let after = null;
+  for (let page = 0; page < THREAD_PAGE_LIMIT; page += 1) {
+    const raw = parse(yield () => ghFn(['api', 'graphql', '-f', `query=${THREADS_QUERY}`,
+      '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `number=${Number(number)}`,
+      ...(after ? ['-f', `after=${after}`] : [])]));
+    const threads = raw?.data?.repository?.pullRequest?.reviewThreads;
+    // An unreadable page is not proof that every conversation is closed.
+    if (!Array.isArray(threads?.nodes) || typeof threads.pageInfo?.hasNextPage !== 'boolean') return false;
+    if (!threads.nodes.every((thread) => thread?.isResolved === true)) return false;
+    if (!threads.pageInfo.hasNextPage) return true;
+    after = threads.pageInfo.endCursor;
+    if (typeof after !== 'string' || !after) return false;
+  }
+  return false;
 }
 
 function randomId(prefix) {
