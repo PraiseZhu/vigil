@@ -117,3 +117,20 @@ test('collectCodeScanningSteps binds the default refs/pull/N/merge analysis thro
   while (!step.done) step = gen.next(step.value());
   assert.equal(step.value.status, 'green');
 });
+
+test('alerts on a second merge commit of the same head still block, and an unbound required tool stays unknown', () => {
+  const M1 = 'c'.repeat(40), M2 = 'e'.repeat(40);
+  const twoTools = { ...policy, codeScanningRules: [...policy.codeScanningRules, { tool: 'Semgrep', alertsThreshold: 'errors', securityAlertsThreshold: 'high_or_higher', sources: ['ruleset:1'] }] };
+  const parents = { [M1]: { parents: ['d'.repeat(40), HEAD] }, [M2]: { parents: ['f'.repeat(40), HEAD] } };
+  const analyses = [
+    analysis({ id: 1, ref: 'refs/pull/7/merge', commit_sha: M1 }),
+    analysis({ id: 2, ref: 'refs/pull/7/merge', commit_sha: M2, tool: { name: 'Semgrep' }, analysis_key: 'sg', category: 'sg' }),
+  ];
+  const alerts = [{ number: 5, state: 'open', tool: { name: 'Semgrep' }, rule: { id: 'sg/x', severity: 'error' },
+    most_recent_instance: { state: 'open', ref: 'refs/pull/7/merge', commit_sha: M2, location: { path: 'a.js', start_line: 1 } } }];
+  const result = evaluateCodeScanning({ pr: { number: 7, headRefOid: HEAD }, policy: twoTools, analyses, alerts, commits: parents, mergeCommitSha: [M1, M2] });
+  assert.equal(result.status, 'failed');
+  const partial = evaluateCodeScanning({ pr: { number: 7, headRefOid: HEAD }, policy: twoTools, analyses, alerts, commits: parents, mergeCommitSha: [M1] });
+  assert.equal(partial.status, 'unknown');
+  assert.equal(partial.reason, 'code-scanning-tool-unbound');
+});

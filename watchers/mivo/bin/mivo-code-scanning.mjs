@@ -66,7 +66,7 @@ function securityBlocks(level, threshold) {
   return value === 'critical';
 }
 
-function matchingInstance(alert, instances, { number, headSha, mergeCommitSha, analyses }) {
+function matchingInstance(alert, instances, { number, headSha, mergeShas, analyses }) {
   const candidates = (instances ?? []).length ? instances : [alert.most_recent_instance].filter(Boolean);
   const refs = PR_REF(number);
   return candidates.find((instance) => {
@@ -75,8 +75,8 @@ function matchingInstance(alert, instances, { number, headSha, mergeCommitSha, a
     if (!refs.test(ref)) return false;
     const commit = instance.commit_sha ?? instance.commit?.sha ?? alert.commit_sha;
     if (commit === headSha) return true;
-    if (mergeCommitSha && commit === mergeCommitSha) {
-      return analyses.some((analysis) => analysis.commit_sha === mergeCommitSha || analysis.commit_sha === headSha);
+    if (mergeShas.has(commit)) {
+      return analyses.some((analysis) => analysis.commit_sha === commit || analysis.commit_sha === headSha);
     }
     return false;
   }) ?? null;
@@ -94,6 +94,8 @@ function mergeCommitProven(commits, { headSha, baseSha, mergeCommitSha }) {
 export function evaluateCodeScanning({
   pr, policy, analyses = [], alerts = [], instances = {}, commits = {}, mergeCommitSha = null,
 } = {}) {
+  // Different tools/configs may have analysed different refs/pull/N/merge commits of the same head.
+  const mergeShas = new Set([mergeCommitSha].flat().filter(sha));
   const headSha = pr?.headRefOid ?? policy?.headSha;
   const tools = mergeCodeScanningRules(policy?.codeScanningRules ?? []);
   const policyHash = policy?.policyHash ?? digest({ tools, headSha });
@@ -118,11 +120,15 @@ export function evaluateCodeScanning({
     const ref = String(analysis.ref ?? '');
     if (!refs.test(ref)) return false;
     if (analysis.commit_sha === headSha) return true;
-    return mergeCommitSha && analysis.commit_sha === mergeCommitSha && mergeCommitProven(commits, {
-      headSha, baseSha: pr.baseRefOid ?? policy.baseSha, mergeCommitSha,
+    return mergeShas.has(analysis.commit_sha) && mergeCommitProven(commits, {
+      headSha, baseSha: pr.baseRefOid ?? policy.baseSha, mergeCommitSha: analysis.commit_sha,
     });
   });
   if (!bound.length) return { ...base, status: 'unknown', reason: 'code-scanning-head-unbound' };
+  // A partial bind is not clean: every required tool needs an analysis of the current head.
+  if (tools.some((tool) => !bound.some((analysis) => toolName(analysis.tool) === tool.tool))) {
+    return { ...base, status: 'unknown', reason: 'code-scanning-tool-unbound' };
+  }
   const blocking = [];
   for (const alert of alerts) {
     if (!alert || alert.state !== 'open') continue;
@@ -131,7 +137,7 @@ export function evaluateCodeScanning({
     if (!rule) continue;
     const alertInstances = instances[alert.number] ?? instances[String(alert.number)] ?? [];
     const instance = matchingInstance(alert, alertInstances, {
-      number: pr.number, headSha, mergeCommitSha, analyses: bound,
+      number: pr.number, headSha, mergeShas, analyses: bound,
     });
     if (!instance) continue;
     const security = alert.rule?.security_severity_level ?? instance.rule?.security_severity_level ?? null;
@@ -188,8 +194,9 @@ export function* collectCodeScanningSteps({ pr, policy, ghFn, mergeCommitSha = n
     const alerts = slurp(yield () => ghFn([
       'api', `repos/${pr.repo}/code-scanning/alerts?pr=${pr.number}&per_page=100&state=open`, '--paginate', '--slurp',
     ]), 'code-scanning alerts');
-    // Default CodeQL analyses refs/pull/N/merge; bind the newest merge commit whose parents include the head.
+    // Default CodeQL analyses refs/pull/N/merge; bind every merge commit whose parents include the head.
     if (!mergeCommitSha) {
+      mergeCommitSha = [];
       const mergeRef = new RegExp(`^refs/pull/${Number(pr.number)}/merge$`);
       const candidates = [...new Set(analyses.filter((analysis) => mergeRef.test(String(analysis?.ref ?? ''))
         && sha(analysis.commit_sha) && analysis.commit_sha !== pr.headRefOid).map((analysis) => analysis.commit_sha))];
@@ -197,7 +204,7 @@ export function* collectCodeScanningSteps({ pr, policy, ghFn, mergeCommitSha = n
       for (const candidate of candidates) {
         const commit = parse(yield () => ghFn(['api', `repos/${pr.repo}/commits/${candidate}`]));
         commits[candidate] = { parents: (commit?.parents ?? []).map((item) => item?.sha ?? item) };
-        if (commits[candidate].parents.includes(pr.headRefOid)) { mergeCommitSha = candidate; break; }
+        if (commits[candidate].parents.includes(pr.headRefOid)) mergeCommitSha.push(candidate);
       }
     }
     const instances = {};
