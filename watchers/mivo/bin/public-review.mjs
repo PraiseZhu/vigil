@@ -72,37 +72,94 @@ function runIdOf(check) {
   } catch { return null; }
 }
 
-export function evaluatePublicReview({ snapshot: s, comments = s.comments, checks = [], runs = {} }) {
-  const no = reason => ({ ready: false, reason });
+function handledComment(comment, handledFeedback, head) {
+  const records = Array.isArray(handledFeedback) ? handledFeedback : Object.values(handledFeedback ?? {});
+  const id = String(comment.id ?? comment.node_id ?? '');
+  const keys = [`comment:${id}`, `review:${id}`];
+  const body = comment.body ?? '';
+  const updated = comment.updatedAt ?? comment.updated_at ?? comment.createdAt ?? comment.created_at;
+  return records.some((record) => {
+    if (!record || record.resultHead !== head) return false;
+    if (record.replyCommentId && String(record.replyCommentId) === id) return true;
+    if (!keys.includes(record.key) && record.nativeId !== id) return false;
+    if (record.contentHash && comment.contentHash) return record.contentHash === comment.contentHash;
+    return record.body == null || record.body === body;
+  });
+}
+
+export function evaluatePublicReview({ snapshot: s, comments = s.comments, checks = [], runs = {}, handledFeedback = [] }) {
+  const blockers = [];
+  const no = (reason, extra = {}) => ({ ready: false, reason, blockers: blockers.length ? blockers : [reason], baseUpdateEligible: false, ...extra });
   if (s.pr.state !== 'OPEN' || s.pr.isDraft || !s.pr.sameRepository) return no('inactive');
   const head = s.pr.headRefOid, base = s.pr.baseRefOid;
   const latestCheck = reviewChecks(checks, head)[0];
-  if (!latestCheck) return no('waiting-review');
-  if (latestCheck.status !== 'completed') return no('review-in-progress');
-  if (latestCheck.conclusion !== 'success') return no(`review-${String(latestCheck.conclusion ?? 'unknown').toLowerCase()}`);
-  // GitHub Actions authored the check; bind it to a run of the trusted dispatch workflow in this repository.
-  const run = runs[runIdOf(latestCheck)];
-  if (!run || run.path !== REVIEW_WORKFLOW || run.event !== 'workflow_dispatch' || run.repository?.full_name !== REPO) return no('producer-unverified');
-  const reports = (s.reviews ?? []).map(reviewerReport).filter(Boolean).filter(r => r.commit === head).sort((a, b) => b.at - a.at);
-  const current = reports.find(r => cleanReportFor(r, head, base));
-  if (!current) return no(reports.some(r => r.findings) ? 'review-findings' : 'review-report-missing');
-  if (reports.some(r => r.findings && r.at > current.at)) return no('review-findings');
-  const epoch = /(\d{4}-\d\d-\d\dT[^:]+:\d\d:[^:]+)$/.exec(s.pr.releaseEpoch ?? '')?.[1];
-  if (!epoch || current.at < Date.parse(epoch)) return no('review-before-release');
-  if (!s.requiredChecksGreen) return no('waiting-ci');
-  if (s.mergeable !== 'MERGEABLE') return no('merge-conflict-or-unknown');
-  if (s.threads.some(t => !t.isResolved)) return no('unresolved-threads');
-  const latest = new Map();
-  for (const r of s.reviews) {
-    const key = r.author?.login;
-    if (!key) return no('review-author-unknown');
-    if (!latest.has(key) || Date.parse(r.submittedAt) > Date.parse(latest.get(key).submittedAt)) latest.set(key,r);
+  let run = null;
+  let current = null;
+  let reports = [];
+  if (!latestCheck) blockers.push('waiting-review');
+  else {
+    run = runs[runIdOf(latestCheck)];
+    const producerOk = run && run.path === REVIEW_WORKFLOW && run.event === 'workflow_dispatch' && run.repository?.full_name === REPO;
+    if (latestCheck.status !== 'completed') blockers.push('review-in-progress');
+    else if (!producerOk) blockers.push('producer-unverified');
+    else if (latestCheck.conclusion !== 'success') blockers.push(`review-${String(latestCheck.conclusion ?? 'unknown').toLowerCase()}`);
+    reports = (s.reviews ?? []).map(reviewerReport).filter(Boolean).filter(r => r.commit === head).sort((a, b) => b.at - a.at);
+    current = reports.find(r => cleanReportFor(r, head, base));
+    if (latestCheck.status === 'completed' && producerOk && latestCheck.conclusion === 'success') {
+      if (!current) blockers.push(reports.some(r => r.findings) ? 'review-findings' : 'review-report-missing');
+      else if (reports.some(r => r.findings && r.at > current.at)) blockers.push('review-findings');
+      const epoch = /(\d{4}-\d\d-\d\dT[^:]+:\d\d:[^:]+)$/.exec(s.pr.releaseEpoch ?? '')?.[1];
+      if (current && (!epoch || current.at < Date.parse(epoch))) blockers.push('review-before-release');
+    } else if (producerOk && reports.some(r => r.findings)) {
+      if (!blockers.includes('review-findings') && latestCheck.conclusion !== 'success') {
+        /* keep the check conclusion as the primary blocker; findings remain in evidence */
+      }
+    }
   }
-  if (s.reviewDecision === 'CHANGES_REQUESTED' || [...latest.values()].some(r => r.state === 'CHANGES_REQUESTED')) return no('review-veto');
-  if (s.labels.includes('awaiting-discussion')) return no('discussion-hold');
-  if (comments.some(c => at(c) > current.at && c.user?.login !== s.pr.author.login && c.body?.trim())) return no('new-feedback');
-  return { ready: true, reason: current.state === 'APPROVED' ? 'current-approve' : 'current-report', reviewId: current.id,
-    checkRunId: latestCheck.id, runId: run.id };
+  const scanning = s.ci?.codeScanning ?? s.codeScanning;
+  if (!s.requiredChecksGreen) blockers.push(s.ci?.status === 'failed' || scanning?.status === 'failed' ? 'waiting-ci' : 'waiting-ci');
+  if (scanning && !['green', 'not-required'].includes(scanning.status) && s.requiredChecksGreen) {
+    blockers.push(scanning.status === 'failed' ? 'code-scanning-failed' : scanning.status === 'pending' ? 'code-scanning-pending' : 'code-scanning-unknown');
+  }
+  if (s.mergeable !== 'MERGEABLE') blockers.push('merge-conflict-or-unknown');
+  const mergeState = String(s.mergeStateStatus ?? s.pr.mergeStateStatus ?? 'UNKNOWN').toUpperCase();
+  if (mergeState === 'BEHIND') blockers.push('behind');
+  else if (mergeState === 'BLOCKED') blockers.push('blocked');
+  else if (mergeState === 'DIRTY') blockers.push('dirty');
+  else if (mergeState === 'DRAFT') blockers.push('draft');
+  else if (mergeState === 'UNSTABLE') {
+    if (!s.requiredChecksGreen) blockers.push('unstable');
+  } else if (mergeState !== 'CLEAN') blockers.push('merge-state-unknown');
+  if ((s.threads ?? []).some(t => !t.isResolved)) blockers.push('unresolved-threads');
+  const latest = new Map();
+  for (const r of s.reviews ?? []) {
+    const key = r.author?.login;
+    if (!key) { blockers.push('review-author-unknown'); break; }
+    if (!latest.has(key) || Date.parse(r.submittedAt) > Date.parse(latest.get(key).submittedAt)) latest.set(key, r);
+  }
+  if (s.reviewDecision === 'CHANGES_REQUESTED' || [...latest.values()].some(r => r.state === 'CHANGES_REQUESTED')) blockers.push('review-veto');
+  if ((s.labels ?? []).includes('awaiting-discussion')) blockers.push('discussion-hold');
+  if (current && comments.some(c => at(c) > current.at && c.user?.login !== s.pr.author.login && c.body?.trim() && !handledComment(c, handledFeedback, head))) {
+    blockers.push('new-feedback');
+  }
+  const evidence = {
+    reviewId: current?.id ?? reports.find(r => r.findings)?.id ?? null,
+    checkRunId: latestCheck?.id ?? null,
+    runId: run?.id ?? null,
+    head, base,
+    findingIds: reports.filter(r => r.findings).map(r => r.id),
+    blockingFindingIds: reports.filter(r => r.findings).map(r => r.id),
+    tier: /档位\s+(light|standard|heavy)/.exec(current ? String(s.reviews?.find(r => r.id === current.id)?.body ?? '') : String(s.reviews?.find(r => reviewerReport(r)?.findings)?.body ?? ''))?.[1] ?? null,
+    mergeStateStatus: mergeState,
+    producerUnverified: blockers.includes('producer-unverified'),
+  };
+  const unique = [...new Set(blockers)];
+  const behindOnly = unique.length === 1 && unique[0] === 'behind';
+  const baseUpdateEligible = behindOnly && s.pr.baseRefName === 'main' && s.mergeable === 'MERGEABLE';
+  if (!unique.length) {
+    return { ready: true, reason: current.state === 'APPROVED' ? 'current-approve' : 'current-report', blockers: [], baseUpdateEligible: false, ...evidence };
+  }
+  return { ready: false, reason: unique[0], blockers: unique, baseUpdateEligible, ...evidence };
 }
 
 /** The review flow is live for this repository: dispatch workflow active and the mode variable set to live. */
@@ -114,7 +171,7 @@ function* reviewSystemLive(ghFn) {
   } catch { return false; }
 }
 
-export function* collectPublicReview(pr, ghFn) {
+export function* collectPublicReview(pr, ghFn, { handledFeedback = [] } = {}) {
   const snapshot = yield* collectPrSnapshot({pr: {...pr, repo: REPO}, ghFn});
   const ci = yield* collectMivoCiSteps({pr:snapshot.pr, ghFn});
   snapshot.requiredChecksGreen = ci.status === 'green';
@@ -123,7 +180,7 @@ export function* collectPublicReview(pr, ghFn) {
   const runs = {};
   const runId = latestCheck?.status === 'completed' ? runIdOf(latestCheck) : null;
   if (runId) runs[runId] = parse(yield () => ghFn(['api', `repos/${REPO}/actions/runs/${runId}`]));
-  const verdict = evaluatePublicReview({snapshot, checks, runs});
+  const verdict = evaluatePublicReview({snapshot, checks, runs, handledFeedback});
   // Ingress: the coordinator takes every Ready PR in while the review flow is live; Draft PRs are skipped.
   const reviewIngress = yield* reviewSystemLive(ghFn);
   const latest = parse(yield () => ghFn(['pr','view',String(pr.number),'--repo',REPO,'--json','id,state,isDraft,headRefOid,baseRefOid,author']));
@@ -138,5 +195,9 @@ export function* collectPublicReview(pr, ghFn) {
     ci,
     admissionVerified: reviewIngress,
     admissionReason: reviewIngress ? ciReason : 'review-ingress-missing',
-    mergeReady: verdict.ready, reviewReason: verdict.reason, reviewEvidence: verdict};
+    mergeReady: verdict.ready, reviewReason: verdict.reason, reviewEvidence: verdict,
+    mergeStateStatus: snapshot.mergeStateStatus ?? snapshot.pr.mergeStateStatus ?? 'UNKNOWN',
+    baseTipOid: snapshot.baseTipOid ?? null,
+    baseUpdateEligible: verdict.baseUpdateEligible === true,
+    reviewRuns: runs};
 }

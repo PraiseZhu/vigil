@@ -91,6 +91,11 @@ test('rerun with new attempt changes fingerprint', () => {
   assert.notEqual(first, rerun);
 });
 
+test('only changing base tip or merge state changes fingerprint', () => {
+  const base = pollFingerprint(snap());
+  assert.notEqual(pollFingerprint(snap({ baseTipOid: 'c'.repeat(40) })), base);
+  assert.notEqual(pollFingerprint(snap({ mergeStateStatus: 'BEHIND' })), base);
+});
 test('new unresolved thread changes fingerprint', () => {
   const none = pollFingerprint(snap({
     reviewThreads: [], unresolvedThreads: 0,
