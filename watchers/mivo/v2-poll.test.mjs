@@ -91,6 +91,11 @@ test('rerun with new attempt changes fingerprint', () => {
   assert.notEqual(first, rerun);
 });
 
+test('only changing base tip or merge state changes fingerprint', () => {
+  const base = pollFingerprint(snap());
+  assert.notEqual(pollFingerprint(snap({ baseTipOid: 'c'.repeat(40) })), base);
+  assert.notEqual(pollFingerprint(snap({ mergeStateStatus: 'BEHIND' })), base);
+});
 test('new unresolved thread changes fingerprint', () => {
   const none = pollFingerprint(snap({
     reviewThreads: [], unresolvedThreads: 0,
@@ -639,4 +644,26 @@ test('a same-epoch duplicate receipt cannot replace or revoke an acknowledged re
   assert.equal(result.entry.activeTask.status, 'waiting-ci');
   assert.equal(result.entry.authorReclaimed, undefined);
   assert.equal(result.entry.pendingFeedback, 0);
+});
+
+test('reconciled base update, review rechecks and member cursor version survive the scan rebuild', (t) => {
+  const { paths } = homeOf(t);
+  const requestedAt = '2026-09-27T23:00:00Z';
+  seed(paths, {
+    pollFingerprint: pollFingerprint(snap()),
+    baseUpdate: { status: 'accepted', head: HEAD, requestedAt, key: 'bu1' },
+    reviewRechecks: { [HEAD]: { attempts: [{ key: 'rr1', status: 'sent', requestedAt }] } },
+  });
+  const { entry } = poll(paths, {
+    snapshot: snap({ updatedAt: '2026-09-28T01:00:00Z', commentCount: 2 }),
+    collect: () => ({
+      pr: { id: nodeId, number: 790, state: 'OPEN', isDraft: false, sameRepository: true, author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' },
+      admissionVerified: true, checks: [], ci: { status: 'green', required: [] }, policy: { status: 'verified', required: [] },
+      comments: [], reviews: [], threads: [], labels: [], mergeReady: false,
+    }),
+    dispatchFn: () => ({ target_session_id: 'sess-790' }),
+  });
+  assert.equal(entry.baseUpdate.status, 'failed');
+  assert.equal(entry.reviewRechecks[HEAD].attempts[0].status, 'failed');
+  assert.equal(entry.memberFeedbackVersion, 2);
 });

@@ -33,14 +33,33 @@ function addRequired(required, context, appId, source) {
   if (!item.sources.includes(source)) item.sources.push(source);
 }
 
-function* loadBranchRequired({ gh, repo, baseRefName, branchPath, isProtected, into }) {
+function addScanning(scanning, rule) {
+  const tools = rule.parameters?.code_scanning_tools;
+  assert(Array.isArray(tools), 'invalid code scanning tools');
+  const source = `ruleset:${rule.ruleset_id ?? 'effective'}`;
+  for (const tool of tools) {
+    assert(tool && typeof tool.tool === 'string' && tool.tool, 'invalid code scanning tool');
+    scanning.push({
+      tool: tool.tool,
+      alertsThreshold: tool.alerts_threshold ?? null,
+      securityAlertsThreshold: tool.security_alerts_threshold ?? null,
+      sources: [source],
+    });
+  }
+}
+
+function* loadBranchRequired({ gh, repo, baseRefName, branchPath, isProtected, into, scanning = [], strict = { value: null } }) {
   const rulesPages = parse(yield () => gh(['api', `repos/${repo}/rules/branches/${encodeURIComponent(baseRefName)}?per_page=100`, '--paginate', '--slurp']));
   assert(Array.isArray(rulesPages) && rulesPages.every(Array.isArray), 'incomplete effective rules');
   for (const rule of rulesPages.flat()) {
     assert(rule && typeof rule.type === 'string', 'invalid effective rule');
-    if (rule.type !== 'required_status_checks') continue;
-    assert(Array.isArray(rule.parameters?.required_status_checks), 'invalid ruleset required checks');
-    for (const check of rule.parameters.required_status_checks) addRequired(into, check.context, check.integration_id ?? null, `ruleset:${rule.ruleset_id ?? 'effective'}`);
+    if (rule.type === 'code_scanning') addScanning(scanning, rule);
+    if (rule.type === 'required_status_checks') {
+      assert(Array.isArray(rule.parameters?.required_status_checks), 'invalid ruleset required checks');
+      if (rule.parameters?.strict_required_status_checks_policy === true) strict.value = true;
+      else if (strict.value == null && rule.parameters?.strict_required_status_checks_policy === false) strict.value = false;
+      for (const check of rule.parameters.required_status_checks) addRequired(into, check.context, check.integration_id ?? null, `ruleset:${rule.ruleset_id ?? 'effective'}`);
+    }
   }
   if (!isProtected) return into;
   let protection;
@@ -75,21 +94,28 @@ export function* collectMivoPolicySteps({ repo, number, gh }) {
     const branch = parse(yield () => gh(['api', branchPath]));
     assert(typeof branch.protected === 'boolean', 'unknown protection');
     const required = new Map();
-    const branchArgs = { gh, repo, baseRefName: before.baseRefName, branchPath, isProtected: branch.protected, into: required };
+    const scanning = [];
+    const strict = { value: null };
+    const branchArgs = { gh, repo, baseRefName: before.baseRefName, branchPath, isProtected: branch.protected, into: required, scanning, strict };
     yield* loadBranchRequired(branchArgs);
     const firstKeys = requiredKeySet(required);
+    const firstScan = JSON.stringify(scanning);
     const file = parse(yield () => gh(['api', `repos/${repo}/contents/docs/sync/required-checks.json?ref=${before.baseRefOid}`]));
     assert(file.encoding === 'base64' && typeof file.content === 'string' && file.type === 'file', 'missing BASE required-checks file');
     const config = JSON.parse(Buffer.from(file.content, 'base64').toString('utf8'));
     assert(Array.isArray(config.on_main) && Array.isArray(config.pr_only) && config.on_main.length + config.pr_only.length > 0, 'invalid BASE file policy');
     for (const context of [...config.on_main, ...config.pr_only]) addRequired(required, context, null, 'base-file');
-    const second = yield* loadBranchRequired({ ...branchArgs, into: new Map() });
+    const secondScan = [];
+    const secondStrict = { value: null };
+    const second = yield* loadBranchRequired({ ...branchArgs, into: new Map(), scanning: secondScan, strict: secondStrict });
     const after = parse(yield () => gh(viewArgs));
     const identity = { repo, prNodeId: before.id, number: Number(number), headSha: before.headRefOid, baseSha: before.baseRefOid, baseRefName: before.baseRefName };
     if (['id', 'number', 'headRefOid', 'baseRefOid', 'baseRefName'].some((key) => before[key] !== after[key])) return { status: 'stale', reason: 'PR identity changed', ...identity, checkedAt };
-    if (requiredKeySet(second) !== firstKeys) return { status: 'stale', reason: 'required-policy-changed', ...identity, checkedAt };
+    if (requiredKeySet(second) !== firstKeys || JSON.stringify(secondScan) !== firstScan) return { status: 'stale', reason: 'required-policy-changed', ...identity, checkedAt };
     const entries = [...required.values()].map((entry) => ({ ...entry, sources: entry.sources.sort() })).sort((a, b) => a.context.localeCompare(b.context) || (a.appId ?? 0) - (b.appId ?? 0));
-    return { status: 'verified', ...identity, required: entries, policyHash: digest({ baseSha: identity.baseSha, required: entries }), checkedAt };
+    const codeScanningRules = scanning.map((entry) => ({ ...entry, sources: [...entry.sources].sort() }));
+    return { status: 'verified', ...identity, required: entries, codeScanningRules, strictRequiredStatusChecks: strict.value,
+      policyHash: digest({ baseSha: identity.baseSha, required: entries, codeScanningRules, strictRequiredStatusChecks: strict.value }), checkedAt };
   } catch (error) {
     return { status: 'unknown', reason: error.message, repo, number: Number(number), checkedAt };
   }

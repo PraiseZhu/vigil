@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { collectMivoPolicySteps, evaluateMivoCi } from './mivo-pr-policy.mjs';
+import { collectCodeScanningSteps } from './mivo-code-scanning.mjs';
 
 const parse = raw => typeof raw === 'string' ? JSON.parse(raw) : raw;
 const check = (ok, reason) => { if (!ok) throw new Error(reason); };
@@ -43,10 +44,14 @@ export function* collectMivoCiSteps({ pr, ghFn }) {
     check(Array.isArray(statusPages) && statusPages.every(Array.isArray), 'status pagination incomplete');
     const statuses = statusPages.flat().map(s => ({ ...s, sha: pr.headRefOid }));
     const result = evaluateMivoCi({ policy, headSha: pr.headRefOid, checks, statuses });
+    const codeScanning = yield* collectCodeScanningSteps({ pr, policy, ghFn });
+    const rank = { failed: 4, unknown: 3, pending: 2, green: 1, 'not-required': 0 };
+    const scanStatus = codeScanning.status === 'not-required' ? result.status : codeScanning.status;
+    const status = (rank[result.status] ?? 3) >= (rank[scanStatus] ?? 3) ? result.status : scanStatus;
     const after = parse(yield () => ghFn(['pr', 'view', String(pr.number), '--repo', pr.repo, '--json', 'id,headRefOid,baseRefOid,state,isDraft']));
     check(after.id === pr.id && after.headRefOid === pr.headRefOid && after.baseRefOid === pr.baseRefOid
       && after.state === pr.state && after.isDraft === pr.isDraft, 'PR changed during CI collection');
-    return { ...result, policy, checks, statuses, ciHash: digest(result.required) };
+    return { ...result, status, policy, checks, statuses, codeScanning, ciHash: digest({ required: result.required, scanning: codeScanning.scanHash }) };
   } catch (error) { return { status: 'unknown', policy, required: [], reason: error.message }; }
 }
 

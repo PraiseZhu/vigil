@@ -8,7 +8,7 @@ const DEFAULT_REPO = requireConfig('targetRepo', {
 // No headRepository / headRepositoryOwner: the gh router sends any read asking for them to the personal account
 // (a GitHub App cannot see a private fork, and GitHub then returns the field empty without an error).
 // isCrossRepository alone tells a same-repository branch from a fork, which is all this watcher needs.
-const FIELDS = 'id,number,title,body,url,state,isDraft,headRefOid,headRefName,baseRefOid,baseRefName,createdAt,author,isCrossRepository,mergeable,reviewDecision';
+const FIELDS = 'id,number,title,body,url,state,isDraft,headRefOid,headRefName,baseRefOid,baseRefName,createdAt,author,isCrossRepository,mergeable,mergeStateStatus,reviewDecision';
 const parse = (raw) => typeof raw === 'string' ? JSON.parse(raw) : raw;
 const requireValue = (ok, reason) => { if (!ok) throw new Error(`PR snapshot: ${reason}`); };
 const quote = (value) => JSON.stringify(value);
@@ -76,6 +76,13 @@ export function* collectPrSnapshot({ pr, ghFn }) {
   for (const key of ['id', 'headRefOid', 'headRefName', 'baseRefOid', 'baseRefName']) {
     if (pr[key] !== undefined) requireValue(pr[key] === before[key], `listed ${key} drift`);
   }
+  const tipQuery = `query{node(id:${quote(before.id)}){... on PullRequest{mergeStateStatus baseRef{name target{oid}}}}}`;
+  const tipPayload = parse(yield () => ghFn(['api', 'graphql', '-f', `query=${tipQuery}`]));
+  requireValue(tipPayload && !tipPayload.errors?.length && tipPayload.data?.node, 'missing base tip');
+  const liveMergeState = typeof tipPayload.data.node.mergeStateStatus === 'string' && tipPayload.data.node.mergeStateStatus
+    ? tipPayload.data.node.mergeStateStatus : (before.mergeStateStatus || 'UNKNOWN');
+  const baseTipOid = tipPayload.data.node.baseRef?.target?.oid;
+  requireValue(typeof baseTipOid === 'string' && /^[a-f0-9]{40}$/i.test(baseTipOid), 'invalid base tip');
   const releaseEpoch = yield* epoch({ pr: before, ghFn });
   const checks = list(yield () => ghFn(['pr', 'checks', String(number), '--repo', repo, '--json', 'name,state,bucket,link']), 'checks');
   const requiredChecks = list(yield () => ghFn(['pr', 'checks', String(number), '--repo', repo, '--required', '--json', 'name,state,bucket,link']), 'required checks');
@@ -101,7 +108,7 @@ export function* collectPrSnapshot({ pr, ghFn }) {
     requireValue(comment && comment.id && typeof comment.body === 'string', 'invalid issue comment');
     return { ...comment, author: comment.author ?? comment.user, createdAt: comment.createdAt ?? comment.created_at, updatedAt: comment.updatedAt ?? comment.updated_at };
   });
-  const reviews = yield* connection({ id: before.id, field: 'reviews', selection: 'id body state submittedAt authorAssociation author{login} commit{oid}', ghFn });
+  const reviews = yield* connection({ id: before.id, field: 'reviews', selection: 'id body state submittedAt url authorAssociation author{login __typename} commit{oid}', ghFn });
   const labelNodes = yield* connection({ id: before.id, field: 'labels', selection: 'name', ghFn });
   requireValue(labelNodes.every((label) => typeof label.name === 'string'), 'invalid labels');
   const after = basic(yield () => ghFn(viewArgs), repo, number);
@@ -111,8 +118,9 @@ export function* collectPrSnapshot({ pr, ghFn }) {
   const requiredChecksGreen = requiredChecks.length > 0 && requiredChecks.every((check) => check.state === 'SUCCESS');
   const ciStatus = requiredChecksGreen ? 'green' : requiredChecks.some((check) => ['FAILURE', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'ERROR'].includes(check.state)) ? 'failed'
     : requiredChecks.length && requiredChecks.every((check) => ['SUCCESS', 'PENDING', 'QUEUED', 'IN_PROGRESS', 'WAITING', 'EXPECTED'].includes(check.state)) ? 'pending' : 'unknown';
-  return { pr: { ...after, releaseEpoch }, checks, requiredChecks, reviews, comments, threads, labels: labelNodes.map((label) => label.name),
-    mergeable: after.mergeable ?? 'UNKNOWN', reviewDecision: after.reviewDecision, requiredChecksGreen, ciStatus,
+  return { pr: { ...after, releaseEpoch, mergeStateStatus: liveMergeState }, checks, requiredChecks, reviews, comments, threads, labels: labelNodes.map((label) => label.name),
+    mergeable: after.mergeable ?? 'UNKNOWN', mergeStateStatus: liveMergeState, baseTipOid,
+    reviewDecision: after.reviewDecision, requiredChecksGreen, ciStatus,
     ciPolicySource: 'gh-required-checks-only', unifiedPolicyVerified: false, identityVerified: true };
 }
 
