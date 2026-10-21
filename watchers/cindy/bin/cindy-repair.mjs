@@ -549,14 +549,15 @@ export function prepare({ home, taskPath, ghFn = command, gitFn = command, clone
 
 // Workers a repair round opened, as reported by the session. Consult workers are capped per head
 // and may not use max/ultra; a report breaking either limit is rejected so it is fixed before push.
-const WORKER_PURPOSES = new Set(['review', 'e2e', 'consult']);
+// adjudicate = the read-only arbiter opened when the session disputes a review finding.
+const WORKER_PURPOSES = new Set(['review', 'e2e', 'consult', 'adjudicate']);
 export const MAX_CONSULT_WORKERS = 2;
 export function validateWorkers(value) {
   if (value === undefined || value === null) return null;
   if (!Array.isArray(value)) fail('SC report workers must be an array');
   const workers = value.map((item, index) => {
     if (!item || typeof item !== 'object') fail(`workers[${index}] must be an object`);
-    if (!WORKER_PURPOSES.has(item.purpose)) fail(`workers[${index}].purpose must be review, e2e or consult, got ${String(item.purpose).slice(0, 40)}`);
+    if (!WORKER_PURPOSES.has(item.purpose)) fail(`workers[${index}].purpose must be review, e2e, consult or adjudicate, got ${String(item.purpose).slice(0, 40)}`);
     for (const field of ['agent', 'model', 'effort']) {
       if (typeof item[field] !== 'string' || !item[field].trim()) fail(`workers[${index}].${field} is required`);
     }
@@ -567,6 +568,25 @@ export function validateWorkers(value) {
   const consults = workers.filter((item) => item.purpose === 'consult').length;
   if (consults > MAX_CONSULT_WORKERS) fail(`workers lists ${consults} consult workers; at most ${MAX_CONSULT_WORKERS} per head`);
   return workers;
+}
+
+// A review finding the session was allowed to fix but closes as no-change is a dispute with the
+// reviewer. It is not the session's call alone: an adjudicate worker must have ruled, or the SC
+// must say why none could be opened (missing route, no Orca tool, creation error).
+export const ADJUDICATE_SKIPPED = 'adjudicate-skipped:';
+export function assertDisputesAdjudicated({ scs, workers, task }) {
+  const permissions = new Map(taskRepairPolicy(task).items.map((item) => [item.key, item]));
+  const ruled = (workers ?? []).some((item) => item.purpose === 'adjudicate');
+  for (const sc of scs) {
+    if (sc.status !== 'no-change') continue;
+    const disputed = (sc.feedbackKeys ?? []).filter((key) => {
+      const item = permissions.get(key);
+      return item?.canChangeCode === true && item.action === 'code-fix';
+    });
+    if (!disputed.length || ruled) continue;
+    if (sc.evidence.some((line) => line.trim().startsWith(ADJUDICATE_SKIPPED))) continue;
+    fail(`[ADJUDICATE_REQUIRED] ${sc.id} closes P0/P1/P2 review feedback (${disputed.join(', ')}) as no-change without an adjudicate worker; open one from routing.json adjudicate, or add an evidence line starting with "${ADJUDICATE_SKIPPED}" stating why none could be opened`);
+  }
 }
 
 export function validateScs(report, task) {
@@ -889,6 +909,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
   const { scs, feedbackCoverage, workers } = loadScs(scReport, task);
+  assertDisputesAdjudicated({ scs, workers, task });
   const workersField = workers ? { workers } : {};
   const emptyRetrigger = allNoChange(scs) && isEmptyCiRetrigger(worktree, task.headRefOid, validatedHead, gitFn);
   assertTaskRepairScope(task, validatedHead, { emptyRetrigger });
