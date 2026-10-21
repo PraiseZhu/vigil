@@ -71,8 +71,10 @@ function originFetchConfig(task) {
   return `remote.origin.fetch=${originRefspec(task)}`;
 }
 
+// npm writes node_modules/.package-lock.json only after a finished install; a bare
+// node_modules left by a failed or timed-out npm ci must not count as installed.
 function needsDependencyInstall(worktree) {
-  if (fs.existsSync(path.join(worktree, 'node_modules'))) return false;
+  if (fs.existsSync(path.join(worktree, 'node_modules', '.package-lock.json'))) return false;
   try { return fs.statSync(path.join(worktree, 'package-lock.json')).isFile(); }
   catch { return false; }
 }

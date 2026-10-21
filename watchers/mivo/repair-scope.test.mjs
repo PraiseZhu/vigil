@@ -54,6 +54,7 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false } = 
   git('-C', worktree, 'add', '.');
   git('-C', worktree, '-c', 'commit.gpgsign=false', 'commit', '-m', 'fixture baseline');
   if (nodeModules) fs.mkdirSync(path.join(worktree, 'node_modules'));
+  if (nodeModules === true) fs.writeFileSync(path.join(worktree, 'node_modules', '.package-lock.json'), '{}');
   const sourceHead = git('-C', worktree, 'rev-parse', 'HEAD');
   git('-C', worktree, 'remote', 'add', 'origin', originUrl);
   git('-C', worktree, 'push', '-u', 'origin', 'HEAD:refs/heads/fix/scope');
@@ -568,6 +569,17 @@ test('validate runs npm ci before preflight when lockfile exists and node_module
   assert.equal(receipt.dependencyInstall.status, 'ok');
   assert.deepEqual(receipt.dependencyInstall.command, { binary: 'npm', args: ['ci'] });
   assert.equal(receipt.command.binary, '/bin/bash');
+});
+
+test('validate reinstalls when node_modules is left partial by an earlier failed npm ci', (t) => {
+  const f = fixture(t, { lockfile: true, nodeModules: 'partial' });
+  const calls = [];
+  const result = validate({
+    ...f.options,
+    runFn: (binary, args) => { calls.push(binary); return binary === 'npm' ? 'added 0 packages\n' : 'fixture checks passed\n'; },
+  });
+  assert.equal(result.status, 'pass');
+  assert.equal(calls[0], 'npm');
 });
 
 test('validate skips npm ci when node_modules already exists or lockfile is absent', (t) => {
