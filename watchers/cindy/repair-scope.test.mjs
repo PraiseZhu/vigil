@@ -9,6 +9,7 @@ import { finalize, recheck, repairPaths, validate, watchWorktreePath } from './b
 import { acquireLock, DEPLOY_LOCK_NAME, helperLockName, HELPER_LOCK_NAME, lockStatus, writePr } from './bin/cindy-state.mjs';
 
 const REPO = 'makecindy/cindy';
+const ADJUDICATOR = { purpose: 'adjudicate', agent: 'codex', model: 'arbiter-model', effort: 'medium', providerId: 'route-c', workerId: 'w-arbiter', verdict: 'finding does not hold' };
 const finding = (priority, key = `thread:${priority}`) => ({
   key, source: 'thread', user: { login: 'github-actions[bot]', type: 'Bot' },
   body: `**${priority}**: synthetic finding in src/example.ts`,
@@ -115,7 +116,8 @@ function fixture(t, { changed = true } = {}) {
     assert.fail(`unexpected GitHub call: ${JSON.stringify(args)}`);
   };
   const scReport = path.join(root, 'sc-report.json');
-  const report = scs => fs.writeFileSync(scReport, JSON.stringify({ scs }));
+  // A no-change on a fixable review finding is a dispute; the default report carries the arbiter's ruling.
+  const report = (scs, workers = [ADJUDICATOR]) => fs.writeFileSync(scReport, JSON.stringify({ scs, workers }));
   const sc = (status, feedbackKeys) => ({ id: `SC-${feedbackKeys.join('-') || 'empty'}`, status,
     feedbackKeys, evidence: ['synthetic fixture checked locally'] });
   const options = { home, taskPath, scReport, validatedHead: head, originUrl, gitFn, ghFn,
@@ -496,3 +498,27 @@ for (const [label, workers] of [
     assert.equal(fs.existsSync(path.join(f.paths.results, `${f.task.dispatchId}.json`)), false);
   });
 }
+
+test('A-1 a P0/P1/P2 review finding closed as no-change without an arbiter is rejected before any push', (t) => {
+  const f = fixture(t, { changed: false });
+  f.saveTask([finding('P2')]);
+  f.report([f.sc('no-change', ['thread:P2'])], []);
+  assert.throws(f.finalize, /ADJUDICATE_REQUIRED/);
+  assert.equal(f.pushCalls.length, 0);
+});
+
+test('A-2 adjudicate workers are accepted and kept in the result', (t) => {
+  const f = fixture(t, { changed: false });
+  f.saveTask([finding('P1')]);
+  f.report([f.sc('no-change', ['thread:P1'])]);
+  const result = f.finalize();
+  assert.equal(result.status, 'complete');
+  assert.deepEqual(result.workers, [ADJUDICATOR]);
+});
+
+test('A-3 P3 no-change needs no arbiter', (t) => {
+  const f = fixture(t, { changed: false });
+  f.saveTask([finding('P3')]);
+  f.report([f.sc('no-change', ['thread:P3'])], []);
+  assert.equal(f.finalize().status, 'complete');
+});
