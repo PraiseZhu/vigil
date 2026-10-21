@@ -52,10 +52,13 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 |---|---|---|
 | `watchHomes` | `MIVO_WATCHER_WATCH_HOMES`（逗号分隔） | `[]`（不内置任何路径） |
 | `lifelineConfigPath` | `MIVO_WATCHER_LIFELINE_CONFIG` | 未配置时不接收本地 Doctor 任务 |
+| `preflightTimeoutMinutes` | `MIVO_PREFLIGHT_TIMEOUT_MINUTES` | `60`。只接受大于 0 的有限数字或非空十进制字符串；换算毫秒后须为不超过 2147483647 的安全整数。非法值直接报错，不静默回退。env 优先于 profile。validate 的 `npm ci`（如需）与仓库预检、以及未复用收据时的 `git push` 都用此时限；两阶段各自独立计时，不共享一笔总预算。显式 `options.timeout` 仍然优先。 |
 
 拷一份 [`config/examples/mivo.profile.example.json`](../../config/examples/mivo.profile.example.json)
 到你的 watcher home 下的 `config/profile.json`，把占位值换成真实路径即可。`config/profile.json`
 已在 `.gitignore` 里排除，不会被提交。
+
+普通 `validate` 在跑仓库预检前，若工作树没有 `node_modules` 且 `package-lock.json` 是普通文件，会先执行 `npm ci`。安装失败或超时不写 PASS 收据、也不启动预检。已有 `node_modules` 或没有 lockfile 时不调用 npm。`approved-exception` 路径不自动安装、不跑预检。
 
 `lifelineConfigPath` 可连接同一目标仓的本地生命线 Doctor。配置必须由操作者提供绝对路径；
 配置中的 `repo` 要与 `targetRepo` 相同，授权须为确认 P0/P1 的修复并允许 push。
@@ -112,14 +115,16 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 
 ### 反馈出口
 
-- 审查账号的 P0/P1：修复会话修，修完 watcher 带证据回复并 resolve；不成立也带证据回复并 resolve。
-- Greptile 的 P0/P1（`greptile-p1-triage`）：Greptile 按自己的标准打 P1，所以修复会话先按统一分级重新判定，确认是 P0/P1 才改代码；其余带核实依据回复并 resolve。
-- Greptile、审查账号的 P2/P3：watcher 直接回复说明并 resolve，不开会话。
-- 仓库成员（OWNER/MEMBER/COLLABORATOR，含作者本人）留的 review thread（`member-thread-triage`），以及严重度读不出、来源未核验的其他未解决 thread（`thread-triage`，含仓外人员和其他机器人）：交修复会话按统一分级判定，确认 P0/P1 才改代码；其余由 watcher 贴出会话写的结论并 resolve。目标是 PR 不因为一条没人处理的讨论卡在合并前。
+- 审查账号的 P0/P1/P2：修复会话修，修完 watcher 带证据回复并 resolve；不成立也带证据回复并 resolve。
+- Greptile 的 P0/P1/P2（`greptile-p1-triage`）：Greptile 按自己的标准打级，所以修复会话先按统一分级重新判定，确认是 P0/P1/P2 才改代码；其余带核实依据回复并 resolve。
+- Greptile、审查账号的 P3：watcher 直接回复说明并 resolve，不开会话。P2 只走行内 finding，不从 Greptile 汇总评论派修复。
+- 仓库成员（OWNER/MEMBER/COLLABORATOR，含作者本人）留的 review thread（`member-thread-triage`），以及成员的 review 总评 / PR 主讨论区评论（`member-feedback-triage`）：交修复会话按统一分级判定，确认 P0/P1/P2 才改代码，否则 no-change 并回复说明；不解析正文命令作为授权。严重度读不出、来源未核验的其他未解决 thread（`thread-triage`，含仓外人员和其他机器人）同样先核实。P3 由 watcher 贴出会话写的结论并 resolve。目标是 PR 不因为一条没人处理的讨论卡在合并前。
+- 当前 head 上阻断合并的 CodeQL / code scanning 告警带 verified evidence 后作为可修复反馈（`required-ci-fix`），不再记外部阻塞；没权限或分析缺失保持采集 unknown，禁止 dismiss 或降阈值。
+- Ready PR 只差落后 main（`mergeStateStatus=BEHIND`）且其余门都通过时，watcher 用 GitHub `update-branch`（merge，不 rebase / 不 force push）把 main 合进 PR 分支；BEHIND 本身不算可合并。修复会话对审查机 P0/P1/P2 判定不成立且 head 未变、审查仍阻断时，watcher 对当前 head 触发有界重审（每 head 最多两次，空 `prev_run_id` 全量审查）。
 - 产品意图：watcher 抓 PR 正文，优先取标题含「产品意图 / 设计意图 / Product intent」的一节（没有就取正文开头，最多 2000 字），写进任务的 `prSnapshot.prIntent` 和派工消息。反馈要求的改法会推翻 PR 正文、规格或维护者裁定里写明的界面、交互或流程时，它不算缺陷：会话不改代码，记 SC=no-change 并引用正文，watcher 回复后 resolve，继续推进。
-- 全自动推进到可合并（不合并）：严重度拿不准时会话自己复现核实，确认不了 P0/P1 就按不成立回复并 resolve；Jev 不可用也不因此 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用、作者收回才 blocked。
+- 全自动推进到可合并（不合并）：严重度拿不准时会话自己复现核实，确认不了 P0/P1/P2 就按不成立回复并 resolve；Jev 不可用也不因此 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用、作者收回才 blocked。本地审查/e2e Worker 是局部例外：本机缺 `routing.json` 或开不了 Orca Worker 时不 blocked，先尝试一次 `start_team({worker_permission_mode:"bypassPermissions"})`，仍不行就跳过尚未运行的本地审查/e2e，并在 SC evidence 写明原因；禁止改用原生子代理。仓库预检、validate 收据、required CI 和服务器审查不豁免。
 - 卡住要让人看见：修复任务 blocked（外部阻塞、补投三次无结果、结果无效、派发失败）时，watcher 把事件写进 `state/notices/`，用独立的 `bin/notify.mjs` 调度发飞书（watcher 与作者是同一 GitHub 账号，@自己不会通知）。同一 blocked 原因每个 head 只升级一次，不再原样重投。规则版本变化、新 head 或新反馈时仍会重投。必需 CI 红、HEAD 漂移这类 watcher 自己会接着处理的状态不发。无代码改动且当前 head 必需 CI 仍红时，对失败 job 做一次 `gh run rerun --failed`；第二次仍红按同因升级。`waiting-ci` 被新反馈取代时，旧任务已有证据的 thread 会等到后续 complete 或当前 head CI 全绿再回复并 resolve。validate 心跳跑在独立子进程；通知队列用 `pending.lock` 串行读写。
-- Greptile 汇总评论没有自己的 P0/P1 时不单独开会话（它的发现另以行内 thread 出现）。
+- Greptile 汇总评论没有自己的 P0/P1 时不单独开会话（它的发现另以行内 thread 出现）。汇总里只有 P2 也不派修复，P2 只走行内 finding。
 - 策略读不出（`required-policy-unknown`）和可合并（`merge-ready`）各在状态转换时出一条事件。
 
 `handoff.e2e.test.mjs` 在隔离子进程中运行真实 CLI、Git 和状态机，GitHub/Host 传输使用替身。它验证交接、投递、取回、遗漏 Draft 的代次检查与查询失败路径，不代表真实 Host 会话已被中断。
@@ -129,7 +134,7 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 - 每个任务的 Keel `run_id` 固定为 `run-<dispatchId 里的时间戳>-<dispatchId 哈希前 6 位>`（`keelRunIdFor`）。watcher 把它写进派工消息，helper 收口时重算，不接受别的值。
 - 台账顺序不可颠倒：`prepare` 之后第一次判断必须是带这个 `run_id` 的 `pstack_decide(op:"decide", template:"J4")`。当前 Keel 只有这一步会建立 `runs/<run_id>/decisions.jsonl`（Jev 不可用时也会先写一行再报错）；然后用 `pstack_decide(op:"log")` 写入 `kind:"step"`、`summary:"vigil task=<dispatchId>"` 绑定任务。`op:"log"` 要求台账已存在，先 log 会得到 `RUN_NOT_FOUND`。可改代码的任务使用 `bug-fix` 手册，调查任务使用 `investigation`。
 - 不要调用 `pstack_start`、`keel_run`、`keel_report`、`keel_wait`、`keel_gate`、`keel_status`：它们会另建 worktree 和图 run，与本流程无关。只允许 `jev`、`pstack_decide`（decide / log / read）、`pr_threads` 和手册；`pr_reply` 每次弹确认框、`pr_wait` 长轮询、`pr_status` 会读到作者转 Ready 时写的交接记录而停手，所以都禁止。GitHub 写操作仍只走 helper 与 `gh`。
-- Jev 只在固定判断点给参考（严重度未知、CI 抖动还是真失败、P0/P1 不成立的证据、修法选择），不能单独授权改代码。
+- Jev 只在固定判断点给参考（严重度未知、CI 抖动还是真失败、P0/P1/P2 不成立的证据、修法选择），不能单独授权改代码。
 - `finalize --keel-run <run_id>` 在推送前读取 `runs/<run_id>/decisions.jsonl`。v3 任务必须具有：固定的 `run_id`、任务创建后写入的精确绑定行、实际处置判断（Keel 写入的 `pstack_decide` 决策行，带 `state_sha256`、`answer`、`policy`；手写的 `decision` 行不算），以及绑定当前 `validated-head` 的 `vigil-flow` 证据。第一条决策必然先于绑定行（它建立台账文件），所以 v3 不要求决策晚于绑定，也不再要求启动记录。缺配置、缺记录、任务或提交不匹配均报 `KEEL_RUN_REQUIRED`；结果的 `keel.contractVersion=3` 表示通过 v3 契约。
 - 收口证据通过 `pstack_decide(op:"log")` 的 `kind:"evidence"` 写入：`evidence` 包含 `kind:"vigil-flow"`、`version:3`、`taskId`、`head`、`playbook`、`manualPath`、`decisionRowIds` 和 `steps`。`decisionRowIds` 引用 `pstack_decide(op:"decide")` 返回的 `ledger_row`（形如 `<run_id>#<n>`）；`steps.reproduce`、`steps.repair` 写明实际复现/调查与处置证据；`steps.verify` 的 `head`、`receiptSha256` 必须匹配 helper `validate` 返回的验证收据。完整调用格式见派工消息。
 - 全部 SC 为 `no-change` 且提交未变时，`steps.verify` 改为 `{status:"not-run",reason:"具体原因"}`，仍需调查证据和实际判断。后续同提交的 `recheck` 保留已验证的 `keel` 结果。
@@ -184,10 +189,10 @@ node bin/notify.mjs emit --home "$MIVO_WATCHER_HOME"
 以下严重度分级与标签名是这套工具原本运作所在团队（Mivo）的约定，代码里保留了这些具体名字，
 但它们只是**可替换的配置**，不是协议的一部分：
 
-- 审查反馈严重度 `P0`/`P1`/`P2`/`P3`:P0/P1 视为必须改代码才能回复;P2/P3 只需回复不改代码。
-- 修复会话核实某条 P0/P1 讨论不成立(已验证完成的结果里该 key 为 `no-change` 且附证据)或确认已修复(`fixed` 且 SC=`pass` 附证据)时,watcher 带证据回复并关闭该讨论;没有证据的不关。新审查机(`mivo-review:` 前缀)的行内线程同样走这条路径。收口在等 CI 的复查之后执行，CI 在本轮变绿就在本轮收口；线程里只要还有一条不属于已完成任务的外部意见(例如修复期间新加的回复)就不关，交给正常派工。本轮刚关闭的线程，其评论即使因修复推送变成 outdated 而重新出现，也不再当作新反馈派工。会话不要自己回复或 resolve thread。会话结果晚于上一次轮询写入时,即使 PR 指纹未变也会重新读取,避免任务停在 accepted、讨论永远挡住合并。等 CI 的复查需要约 15–20 秒;剩余扫描预算不足 40 秒时不硬跑(硬跑会被超时杀掉、排在后面的 PR 每轮同样失败),而是结束本轮并从该 PR 续扫,复查超时上限 60 秒。
+- 审查反馈严重度 `P0`/`P1`/`P2`/`P3`:P0/P1/P2 视为必须改代码才能回复;P3 只需回复不改代码。
+- 修复会话核实某条 P0/P1/P2 讨论不成立(已验证完成的结果里该 key 为 `no-change` 且附证据)或确认已修复(`fixed` 且 SC=`pass` 附证据)时,watcher 带证据回复并关闭该讨论;没有证据的不关。新审查机(`mivo-review:` 前缀)的行内线程同样走这条路径。收口在等 CI 的复查之后执行，CI 在本轮变绿就在本轮收口；线程里只要还有一条不属于已完成任务的外部意见(例如修复期间新加的回复)就不关，交给正常派工。本轮刚关闭的线程，其评论即使因修复推送变成 outdated 而重新出现，也不再当作新反馈派工。会话不要自己回复或 resolve thread。会话结果晚于上一次轮询写入时,即使 PR 指纹未变也会重新读取,避免任务停在 accepted、讨论永远挡住合并。等 CI 的复查需要约 15–20 秒;剩余扫描预算不足 40 秒时不硬跑(硬跑会被超时杀掉、排在后面的 PR 每轮同样失败),而是结束本轮并从该 PR 续扫,复查超时上限 60 秒。
 - 本轮通过的标签名 `review:merge-ready`。
-- 审查信号（`public-review.mjs`）：审查流程由前置协调器派发 `review-pr.yml`。判「可合并」要同时满足：当前 head 上最新一条 `review-pr` check（GitHub Actions 写入、关联到本仓 `review-pr.yml` 的 workflow_dispatch run）成功；`reviewerLogin` 在同一 head/base 上提交了干净报告（Approve，或带 `<!-- mivo-review:report head=… -->` 的 COMMENT）且晚于本次 Ready；其余条件同前（必需 CI、可合并、讨论已解决、无否决、无新反馈）。
+- 审查信号（`public-review.mjs`）：审查流程由前置协调器派发 `review-pr.yml`。判「可合并」要同时满足：当前 head 上最新一条 `review-pr` check（GitHub Actions 写入、关联到本仓 `review-pr.yml` 的 workflow_dispatch run）成功；`reviewerLogin` 在同一 head/base 上提交了干净报告（Approve，或带 `<!-- mivo-review:report head=… -->` 的 COMMENT）且晚于本次 Ready；其余条件同前（必需 CI、扫描门、可合并且非 BEHIND、讨论已解决、无否决、无未处置新反馈）。
 - 审查入场：`review-pr.yml` 为 active 且仓库变量 `MIVO_REVIEW_MODE=live` 时，每个 Ready PR 都由协调器接管；读不到按未入场处理。`review-pr` check 是审查结论，不计入产品必需 CI（`mivo-pr-policy.mjs`），否则发现问题的 PR 会因「CI 不绿」永远不进修复。
 - 可信审查来源(自动触发修复的评论来源)在 `mivo-pr-policy.mjs` / `mivo-feedback-policy.mjs`
   里按来源名单判断,按需改成你自己团队的 Bot/Reviewer 名单。`reviewerLogin` 带 `<!-- review-pr:findings … -->` 的 review 及其行内线程记为 `mivo-review` 来源（不按 head 过滤：上一版留下的未解决线程同样挡住下一次审查）；它的干净报告是结论，不进反馈流。

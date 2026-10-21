@@ -25,7 +25,7 @@ cron 的无状态脚本,而是专门为 Cindy 桌面端的调度器("script 模�
 
 Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为已处理,不再据此派发修复
 (混合优先级评论不会被这套工具自动 resolve);`resolved → unresolved` 的高优先级 thread
-会重新进入待处理队列。工具自己只在两种情况下 resolve:整条 thread 都是可信 Bot 的 P2/P3;或修复会话
+会重新进入待处理队列。工具自己只在两种情况下 resolve:整条 thread 都是可信 Bot 的 P3;或修复会话
 核实某条必修意见不成立(已验证完成的结果里该 key 为 `no-change` 且附证据),此时带证据回复后关闭,
 没有证据的不关,权限不足时只降级报告、不重复回复。
 
@@ -33,7 +33,7 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 
 - 作者自己的 PR 转 Ready 后下一轮就接手,不要求必需检查先绿:CI 失败和冲突直接成为修复反馈。
 - 维护者(OWNER/MEMBER/COLLABORATOR)、作者本人和已知代码审查应用(`REVIEW_APPS`)留的 review thread
-  交修复会话按 REVIEW.md 分级(`review-thread-triage`):确认成立的 P0/P1 才改代码,P2/P3 由 watcher 回复分级说明后 resolve。
+  交修复会话按 REVIEW.md 分级(`review-thread-triage`):确认成立的 P0/P1/P2 才改代码,P3 由 watcher 回复分级说明后 resolve。
   其它应用的状态评论、没有自己必修项的 Greptile 汇总不再单独开会话。严重度未知或 Jev 不可用时按不成立记 no-change,不 blocked。
 - 修复会话 `prepare` 先对齐 watch 树:落后 fork 就快进,与 fork 分叉就把旧分支打 bundle 存进
   `_backup/` 后按 fork 重建。
@@ -88,7 +88,7 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 - 每个任务的 Keel `run_id` 固定为 `run-<dispatchId 里的时间戳>-<dispatchId 哈希前 6 位>`（`keelRunIdFor`），同时写进 task 文件的 `keelRunId`。watcher 把它写进派工消息，helper 收口时重算，不接受别的值。
 - 台账顺序不可颠倒：`prepare` 之后第一次判断必须是带这个 `run_id` 的 `pstack_decide(op:"decide", template:"J4")`。当前 Keel 只有这一步会建立 `runs/<run_id>/decisions.jsonl`（Jev 不可用时也会先写一行再报错）；然后用 `pstack_decide(op:"log")` 写入 `kind:"step"`、`summary:"vigil task=<dispatchId>"` 绑定任务。`op:"log"` 要求台账已存在，先 log 会得到 `RUN_NOT_FOUND`。可改代码的任务使用 `bug-fix` 手册，调查任务使用 `investigation`。
 - 不要调用 `pstack_start`、`keel_run`、`keel_report`、`keel_wait`、`keel_gate`、`keel_status`：它们会另建 worktree 和图 run，与本流程无关。只允许 `jev`、`pstack_decide`（decide / log / read）、`pr_threads` 和手册；`pr_reply` 每次弹确认框、`pr_wait` 长轮询、`pr_status` 会读到作者转 Ready 时写的交接记录而停手，所以都禁止。GitHub 写操作仍只走 helper 与 `gh`。
-- Jev 只在固定判断点给参考（严重度未知、CI 抖动还是真失败、P0/P1 不成立的证据、修法选择），不能单独授权改代码。
+- Jev 只在固定判断点给参考（严重度未知、CI 抖动还是真失败、P0/P1/P2 不成立的证据、修法选择），不能单独授权改代码。
 - `finalize --keel-run <run_id>` 在推送前读取 `runs/<run_id>/decisions.jsonl`。v3 任务必须具有：固定的 `run_id`、任务创建后写入的精确绑定行、实际处置判断（Keel 写入的 `pstack_decide` 决策行，带 `state_sha256`、`answer`、`policy`；手写的 `decision` 行不算），以及绑定当前 `validated-head` 的 `vigil-flow` 证据。第一条决策必然先于绑定行（它建立台账文件），所以 v3 不要求决策晚于绑定，也不再要求启动记录。缺配置、缺记录、任务或提交不匹配均报 `KEEL_RUN_REQUIRED`；结果的 `keel.contractVersion=3` 表示通过 v3 契约。
 - 收口证据通过 `pstack_decide(op:"log")` 的 `kind:"evidence"` 写入：`evidence` 包含 `kind:"vigil-flow"`、`version:3`、`taskId`、`head`、`playbook`、`manualPath`、`decisionRowIds` 和 `steps`。`decisionRowIds` 引用 `pstack_decide(op:"decide")` 返回的 `ledger_row`（形如 `<run_id>#<n>`）；`steps.reproduce`、`steps.repair` 写明实际复现/调查与处置证据；`steps.verify` 的 `head`、`receiptSha256` 必须匹配 helper `validate` 返回的验证收据。完整调用格式见派工消息。
 - 全部 SC 为 `no-change` 且提交未变时，`steps.verify` 改为 `{status:"not-run",reason:"具体原因"}`，仍需调查证据和实际判断。后续同提交的 `recheck` 保留已验证的 `keel` 结果。

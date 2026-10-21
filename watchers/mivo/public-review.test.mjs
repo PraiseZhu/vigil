@@ -7,8 +7,8 @@ const cleanBody=(extra='')=>`${header()}\n## Findings\n无。\n\n## Overall\npas
 const findingsBody=()=>`${header()}\n## Findings\n- [P1] src/a.ts:3 — 事实：……\n\n## Overall\nchanges-requested —— 1 条 P0/P1，已在对应位置开 review thread。\n\n<!-- review-pr:findings head=${h} digest=${'c'.repeat(64)} -->`;
 function fixture({state='APPROVED',body=cleanBody()}={}) {
   const report={id:'R1',author:{login:reviewer},state,submittedAt:'2026-09-10T00:10:00Z',commit:{oid:h},body};
-  return {snapshot:{pr:{state:'OPEN',isDraft:false,sameRepository:true,number:10,headRefOid:h,baseRefOid:b,releaseEpoch:'ready:2026-09-10T00:00:00Z',author:{login:'owner'}},
-      comments:[],requiredChecksGreen:true,mergeable:'MERGEABLE',threads:[],reviews:[report],labels:[]},
+  return {snapshot:{pr:{state:'OPEN',isDraft:false,sameRepository:true,number:10,headRefOid:h,baseRefOid:b,baseRefName:'main',releaseEpoch:'ready:2026-09-10T00:00:00Z',author:{login:'owner'},mergeStateStatus:'CLEAN'},
+      comments:[],requiredChecksGreen:true,mergeable:'MERGEABLE',mergeStateStatus:'CLEAN',threads:[],reviews:[report],labels:[]},
     checks:[{id:5,name:'review-pr',app:{id:15368,slug:'github-actions'},head_sha:h,status:'completed',conclusion:'success',started_at:'2026-09-10T00:05:00Z',
       external_id:'https://github.com/example-org/example-plugin/actions/runs/3',details_url:'https://github.com/example-org/example-plugin/runs/5'}],
     runs:{3:{id:3,path:'.github/workflows/review-pr.yml',event:'workflow_dispatch',repository:{full_name:'example-org/example-plugin'}}}};
@@ -63,4 +63,48 @@ test('reviewer report helpers: only the configured reviewer counts',()=>{
   assert.equal(isReviewerCleanReport(clean),true);assert.equal(isReviewerCleanReport(findings),false);
   assert.equal(reviewerReport(forged),null);
   assert.deepEqual([...reviewerFindingReviewIds([clean,findings,forged])],['R2']);
+});
+test('BEHIND is not merge-ready and is base-update eligible when other gates pass', () => {
+  const f = fixture();
+  f.snapshot.mergeStateStatus = 'BEHIND';
+  f.snapshot.pr.mergeStateStatus = 'BEHIND';
+  const v = evaluatePublicReview(f);
+  assert.equal(v.ready, false);
+  assert.equal(v.reason, 'behind');
+  assert.equal(v.baseUpdateEligible, true);
+  assert.deepEqual(v.blockers, ['behind']);
+});
+test('BEHIND with red CI is not base-update eligible', () => {
+  const f = fixture();
+  f.snapshot.mergeStateStatus = 'BEHIND';
+  f.snapshot.pr.mergeStateStatus = 'BEHIND';
+  f.snapshot.requiredChecksGreen = false;
+  const v = evaluatePublicReview(f);
+  assert.equal(v.ready, false);
+  assert.equal(v.baseUpdateEligible, false);
+  assert.ok(v.blockers.includes('behind'));
+  assert.ok(v.blockers.includes('waiting-ci'));
+});
+test('UNKNOWN merge state is not treated as clean', () => {
+  const f = fixture();
+  f.snapshot.mergeStateStatus = 'UNKNOWN';
+  const v = evaluatePublicReview(f);
+  assert.equal(v.ready, false);
+  assert.equal(v.reason, 'merge-state-unknown');
+  assert.equal(v.baseUpdateEligible, false);
+});
+test('non-main base is never base-update eligible', () => {
+  const f = fixture();
+  f.snapshot.mergeStateStatus = 'BEHIND';
+  f.snapshot.pr.mergeStateStatus = 'BEHIND';
+  f.snapshot.pr.baseRefName = 'develop';
+  const v = evaluatePublicReview(f);
+  assert.equal(v.baseUpdateEligible, false);
+});
+test('a member comment already answered for this head does not count as new feedback', () => {
+  const s = fixture();
+  s.snapshot.comments.push({ id: 15, user: { login: 'teammate' }, created_at: '2026-09-10T00:12:00Z', body: 'please rename this' });
+  assert.equal(evaluatePublicReview(s).reason, 'new-feedback');
+  const handledFeedback = { 'comment:15': { resultHead: h, replyCommentId: 99, actionKey: 'x' } };
+  assert.equal(evaluatePublicReview({ ...s, handledFeedback }).ready, true);
 });

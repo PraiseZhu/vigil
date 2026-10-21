@@ -36,7 +36,7 @@ worktree/push/清理),但它们**不是可以配进任意 cron 的无状态脚�
 
 ```sh
 npm install   # 本项目无第三方依赖,这一步只是确认 Node 版本
-npm test      # 跑全部测试(mivo + cindy 两套 Node 测试 + cindy 的 Python 测试)
+npm test      # 跑全部测试(mivo + cindy 两套 Node 测试 + 两份 Python 测试)
 ```
 
 每个 watcher 的具体配置(`profile.mjs` 的 fail-closed 机制)、CLI 用法、测试方式见各自的
@@ -111,7 +111,7 @@ discover 发现需要处理的反馈后,通过 `sessions.dispatch` 唤醒一个*
 **SC 报告格式**:`finalize` 要求的 `--sc-report` 是 `{ scs: [{ id, status: "pass"|"no-change",
 evidence: [...], feedbackKeys: [...] }] }`。每一条 feedback 必须被某个 SC 的 `feedbackKeys`
 覆盖(覆盖不全直接 fail);`status: "pass"` 只允许用在"该反馈的权限允许改代码"的 key 上——
-两套 watcher 都只有 **P0/P1** 允许改代码判 `pass`,P2/P3、混合优先级、未经确认的发现只能判
+两套 watcher 都只有 **P0/P1/P2** 允许改代码判 `pass`,P3、混合优先级、未经确认的发现只能判
 `no-change`,否则 `finalize` 会报 `REPAIR_SCOPE_NO_CODE` 拒绝。
 这个权限表来自各自的 `*-pr-policy.mjs`/`*-feedback-policy.mjs`,不是 `finalize` 自己硬编码的。
 

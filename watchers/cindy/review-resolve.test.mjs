@@ -28,10 +28,15 @@ test('P3 greptile thread item is auto-close eligible', () => {
   assert.equal(isAutoCloseEligible(item), true);
 });
 
-test('P2 greptile thread item is reply-only auto-close', () => {
+test('P2 greptile thread item is never auto-close eligible', () => {
   const [item] = threadItems({ body: 'P2: must-fix this PR' });
-  assert.equal(item.category, 'reply-resolve');
-  assert.equal(isAutoCloseEligible(item), true);
+  assert.equal(item.category, 'actionable-fix');
+  assert.equal(item.repairPolicy.action, 'code-fix');
+  assert.equal(isAutoCloseEligible(item), false);
+});
+test('contradictory reply-only policy with P2 severities is not auto-closed', () => {
+  const item = { category: 'reply-resolve', repairPolicy: { action: 'reply-only', severities: ['P2'] }, threadId: 't-fake' };
+  assert.equal(isAutoCloseEligible(item), false);
 });
 
 test('P0/P1 thread item is never auto-close eligible', () => {
@@ -453,4 +458,51 @@ test('refuted closure degrades on permission errors and never replies twice', ()
   calls.length = 0;
   runClosure(items, replied.previous, (args) => { calls.push(args); return '{}'; });
   assert.equal(calls.length, 0);
+});
+test('same thread mixed P2+P3 is not auto-closed', () => {
+  const thread = {
+    id: 't-mix-p2', isResolved: false, path: 'src/a.ts',
+    comments: [
+      { id: 'c-p2', author: GREPTILE_AUTHOR, body: 'P2: must-fix this PR', createdAt: '2026-09-10T00:00:00Z' },
+      { id: 'c-p3', author: GREPTILE_AUTHOR, body: 'P3: naming nit', createdAt: '2026-09-10T00:01:00Z' },
+    ],
+  };
+  const items = feedbackItems({ pr: PR, threads: [thread] });
+  const { eligible } = partitionAutoClose(items, { allItems: items, threads: [thread] });
+  assert.equal(eligible.length, 0);
+});
+
+test('autoCloseReplyText is P3-class', () => {
+  const text = autoCloseReplyText();
+  assert.match(text, /P3 级/);
+  assert.doesNotMatch(text, /P2\/P3/);
+});
+
+test('old auto-close receipt without dispatchId does not block a later P2 fix resolve', () => {
+  const calls = [];
+  const items = [{ key: 'thread:PRRT_reopen:PRRC_a', threadId: 'PRRT_reopen', evidence: ['fixed the P2 defect'], kind: 'fixed' }];
+  const previous = { autoClosedThreads: { PRRT_reopen: { at: '2026-09-01T00:00:00Z', key: 'thread:PRRT_reopen:PRRC_a' } } };
+  const gen = closeRefutedThreads({
+    items, dispatchId: 'fix-p2-later', previous, head: 'abcdef1234567890',
+    ghFn: (args) => { calls.push(args); return '{}'; }, now: 't',
+  });
+  let step = gen.next();
+  while (!step.done) { step.value(); step = gen.next(); }
+  assert.equal(calls.length, 2);
+  assert.equal(step.value.closed[0].threadId, 'PRRT_reopen');
+  assert.equal(step.value.previous.autoClosedThreads.PRRT_reopen.dispatchId, 'fix-p2-later');
+});
+
+test('same-task refuted rerun stays idempotent when receipt has matching dispatchId', () => {
+  const calls = [];
+  const items = [{ key: 'thread:PRRT_same:PRRC_a', threadId: 'PRRT_same', evidence: ['already guarded'], kind: 'refuted' }];
+  const previous = { autoClosedThreads: { PRRT_same: { at: 't0', key: items[0].key, reason: 'refuted-authorized-finding', dispatchId: 'live-851' } } };
+  const gen = closeRefutedThreads({
+    items, dispatchId: 'live-851', previous,
+    ghFn: (args) => { calls.push(args); return '{}'; }, now: 't',
+  });
+  let step = gen.next();
+  while (!step.done) { step.value(); step = gen.next(); }
+  assert.equal(calls.length, 0);
+  assert.deepEqual(step.value.closed, []);
 });

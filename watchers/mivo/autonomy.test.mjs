@@ -739,11 +739,11 @@ const mixedThread = {
   id: 'PRRT_mix', isResolved: false, isOutdated: false, path: 'src/m.ts',
   comments: [
     { id: 'c-p1', author: { login: 'greptile-apps[bot]' }, body: '**P1** crash on empty input', createdAt: now },
-    { id: 'c-p2', author: { login: 'greptile-apps[bot]' }, body: '**P2** naming could be clearer', createdAt: now },
+    { id: 'c-p3', author: { login: 'greptile-apps[bot]' }, body: '**P3** naming could be clearer', createdAt: now },
   ],
 };
 
-test('R4-3 a thread with a fixed P1 and an answered P2 closes after a complete green result', (t) => {
+test('R4-3 a thread with a fixed P1 and an answered P3 closes after a complete green result', (t) => {
   const { home, paths } = homeOf(t);
   const dispatchId = 'live-mixed';
   seedBound(paths, {
@@ -752,7 +752,7 @@ test('R4-3 a thread with a fixed P1 and an answered P2 closes after a complete g
     activeTask: { status: 'accepted', dispatchId, head: HEAD, sessionId: 'sess-790' },
   });
   const p1 = 'greptile:PRRT_mix:c-p1';
-  const p2 = 'greptile:PRRT_mix:c-p2';
+  const p3 = 'greptile:PRRT_mix:c-p3';
   fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
   fs.writeFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), JSON.stringify({
     dispatchId, nodeId, number: 790, repo: process.env.MIVO_WATCHER_TARGET_REPO, sessionId: 'sess-790',
@@ -760,16 +760,16 @@ test('R4-3 a thread with a fixed P1 and an answered P2 closes after a complete g
     handoff: handoffReceipt({ ...listed, releaseEpoch: 'e' }),
     feedback: [
       { key: p1, source: 'greptile', nativeId: 'PRRT_mix:c-p1', path: 'src/m.ts', body: mixedThread.comments[0].body },
-      { key: p2, source: 'greptile', nativeId: 'PRRT_mix:c-p2', path: 'src/m.ts', body: mixedThread.comments[1].body },
+      { key: p3, source: 'greptile', nativeId: 'PRRT_mix:c-p3', path: 'src/m.ts', body: mixedThread.comments[1].body },
     ],
-    repairPolicy: { items: [{ key: p1, action: 'code-fix' }, { key: p2, action: 'reply-only' }] },
+    repairPolicy: { items: [{ key: p1, action: 'code-fix' }, { key: p3, action: 'reply-only' }] },
   }));
   writeResult(paths, dispatchId, {
     status: 'complete', ci: { requiredGreen: true, head: HEAD }, verification: { status: 'pass' },
-    feedbackCoverage: { dispositions: [{ key: p1, disposition: 'fixed' }, { key: p2, disposition: 'no-change' }] },
+    feedbackCoverage: { dispositions: [{ key: p1, disposition: 'fixed' }, { key: p3, disposition: 'no-change' }] },
     scs: [
       { status: 'pass', feedbackKeys: [p1], evidence: ['guarded empty input in src/m.ts'] },
-      { status: 'no-change', feedbackKeys: [p2], evidence: ['P2 naming suggestion recorded, not changed'] },
+      { status: 'no-change', feedbackKeys: [p3], evidence: ['P3 naming suggestion recorded, not changed'] },
     ],
   });
   discover(paths, { collect: () => collectBase({ threads: [mixedThread], mergeReady: true }), dispatchFn: () => { throw new Error('no dispatch after complete'); }, recheckFn: () => ({}) });

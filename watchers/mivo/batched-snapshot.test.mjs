@@ -9,10 +9,14 @@ function fixture({overflow=false,broken=false,drift=false,cross=false}={}){
  const page=(nodes,hasNextPage=false,endCursor=null)=>({nodes,pageInfo:{hasNextPage,endCursor}});
  const ghFn=args=>{
   total++;
-  if(args[1]==='view'){viewArgs.push(args);return JSON.stringify({...basic,isCrossRepository:cross,...(++views>1&&drift?{author:{login:'other'}}:{})});}
+  if(args[1]==='view'){viewArgs.push(args);return JSON.stringify({...basic,isCrossRepository:cross,mergeStateStatus:'CLEAN',...(++views>1&&drift?{author:{login:'other'}}:{})});}
   if(args[1]==='checks')return '[]';
   if(args[1].startsWith('repos/'))return '[[]]';
-  const q=args.at(-1),field=['timelineItems','reviewThreads','comments','reviews','labels'].find(f=>q.includes(f+'('));
+  const q=args.at(-1);
+  if(typeof q==='string' && q.includes('mergeStateStatus') && q.includes('baseRef')) {
+    return JSON.stringify({data:{node:{mergeStateStatus:'CLEAN',baseRef:{name:'main',target:{oid:basic.baseRefOid}}}}});
+  }
+  const field=['timelineItems','reviewThreads','comments','reviews','labels'].find(f=>q.includes(f+'('));
   let value=page([]);
   if(field==='reviewThreads')value=page(Array.from({length:80},(_,i)=>({id:`T${i}`,isResolved:false,isOutdated:false,comments:page([{id:`C${i}`,body:'x'}],overflow&&i===0,broken?null:'next')})));
   if(field==='comments'){childCalls++;assert.match(q,/after:"next"/);value=page([{id:'overflow',body:'y'}]);}
@@ -46,4 +50,9 @@ test('a cross-repository PR is still marked as not same-repository',()=>{
 test('missing isCrossRepository fails closed',()=>{
  const ghFn=args=>args[1]==='view'?JSON.stringify({...basic,isCrossRepository:undefined}):'[]';
  assert.throws(()=>collectPrSnapshotSync({pr:{number:1},ghFn}),/missing repository identity/);
+});
+test('snapshot records mergeStateStatus and live base tip', () => {
+  const f=fixture(),s=collectPrSnapshotSync({pr:{number:1},ghFn:f.ghFn});
+  assert.equal(s.mergeStateStatus,'CLEAN');
+  assert.equal(s.baseTipOid,basic.baseRefOid);
 });

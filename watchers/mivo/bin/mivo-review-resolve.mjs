@@ -1,15 +1,17 @@
-import { TRIAGE_REASONS } from './mivo-feedback-policy.mjs';
+import { createHash } from 'node:crypto';
+import { TRIAGE_REASONS, taskRepairPolicy, FEEDBACK_POLICY_VERSION } from './mivo-feedback-policy.mjs';
+const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
-// Autonomous P2/P3 review-thread closure. No human notification, no session dispatch.
+// Autonomous P3 review-thread closure. No human notification, no session dispatch.
 // Eligibility is entirely derived from the existing policy layer:
 //   category === 'reply-resolve'  (== feedbackRepairPolicy action 'reply-only')
-// which already encodes: trusted source, P2/P3-only, current-head-bound, no code authority.
+// which already encodes: trusted source, P3-only, current-head-bound, no code authority.
 // Thread membership is tracked via the explicit `threadId` field (set only for
 // GraphQL review-thread items), never via `item.source === 'thread'` — Greptile-authored
 // thread comments carry `source: 'greptile'`, so gating on `source` would silently skip them.
 
 // The receipt marker keeps this reply out of the watcher's own feedback if the thread is ever reopened.
-const REPLY_TEXT = '这是一条 P2 级（建议类）反馈，不是阻塞性问题。按项目当前规则，这类建议本轮不安排修复；'
+const REPLY_TEXT = '这是一条 P3 级（建议类）反馈，不是阻塞性问题。按项目当前规则，这类建议本轮不安排修复；'
   + '如后续需要可另行处理。讨论到此关闭，不影响本 PR 合并。\n\n<!-- mivo-watcher-receipt task=auto-close -->';
 
 export function autoCloseReplyText() {
@@ -17,17 +19,50 @@ export function autoCloseReplyText() {
 }
 
 export function isAutoCloseEligible(item) {
+  const severities = item?.repairPolicy?.severities ?? [];
   return Boolean(item) && item.category === 'reply-resolve'
     && item.repairPolicy?.action === 'reply-only'
+    && severities.includes('P3')
+    && !severities.some((s) => s === 'P0' || s === 'P1' || s === 'P2')
     && typeof item.threadId === 'string' && item.threadId.length > 0;
 }
 
 // Splits `fresh` into items this watcher will resolve on GitHub directly (never
 // dispatched to a session) and the remainder that still flows through normal dispatch.
-export function partitionAutoClose(fresh = []) {
+function commentsHasNextPage(thread) {
+  return thread?.commentsHasNextPage === true || thread?.comments?.pageInfo?.hasNextPage === true;
+}
+export function isThreadAutoCloseEligible(items = [], { commentsHasNextPage: incomplete = false } = {}) {
+  if (incomplete) return false;
+  if (!Array.isArray(items) || items.length === 0) return false;
+  return items.every((item) => isAutoCloseEligible(item));
+}
+export function partitionAutoClose(fresh = [], { allItems = fresh, threads = [] } = {}) {
+  const byThread = new Map();
+  for (const item of allItems) {
+    if (!item?.threadId) continue;
+    const list = byThread.get(item.threadId) ?? [];
+    list.push(item);
+    byThread.set(item.threadId, list);
+  }
+  const incomplete = new Set((threads ?? []).filter(commentsHasNextPage).map((thread) => thread.id));
+  const closable = new Set();
+  for (const [threadId, items] of byThread) {
+    if (isThreadAutoCloseEligible(items, { commentsHasNextPage: incomplete.has(threadId) })) {
+      closable.add(threadId);
+    }
+  }
   const eligible = [];
   const remaining = [];
-  for (const item of fresh) (isAutoCloseEligible(item) ? eligible : remaining).push(item);
+  const seen = new Set();
+  for (const item of fresh) {
+    if (item.threadId && closable.has(item.threadId)) {
+      if (!seen.has(item.threadId)) {
+        eligible.push(item);
+        seen.add(item.threadId);
+      }
+    } else remaining.push(item);
+  }
   return { eligible, remaining };
 }
 
@@ -92,14 +127,25 @@ export function sameFeedbackContent(original, current) {
 // belong to the completed task, unedited since the task saw it. A reply added or a comment
 // edited while the repair ran keeps the thread open and goes through normal dispatch instead
 // of being resolved on evidence written for different words.
-export function coveredThreadItems(items = [], observed = [], task = {}) {
+function answeredReplyOnlyKeys(result, task) {
+  if (!result || result.dispatchId !== task?.dispatchId) return new Set();
+  const policy = new Map((task.repairPolicy?.items ?? []).map((item) => [item.key, item]));
+  const keys = new Set();
+  for (const { key, disposition } of result.feedbackCoverage?.dispositions ?? []) {
+    if (!key || disposition !== 'no-change' || !policy.has(key) || policy.get(key)?.action === 'code-fix') continue;
+    if (evidenceLines(result, key, 'no-change').length) keys.add(key);
+  }
+  return keys;
+}
+export function coveredThreadItems(items = [], observed = [], task = {}, result = null) {
   const taskItems = new Map((task?.feedback ?? []).filter((item) => typeof item?.key === 'string').map((item) => [item.key, item]));
   const closeKeys = new Set(items.map((item) => item?.key).filter(Boolean));
+  const answered = answeredReplyOnlyKeys(result, task);
   return items.filter((item) => observed
     .filter((other) => other?.threadId === item.threadId && other.actionable !== false)
     .every((other) => {
       const key = `${other.source}:${other.nativeId}`;
-      return taskItems.has(key) && closeKeys.has(key) && sameFeedbackContent(taskItems.get(key), other);
+      return taskItems.has(key) && (closeKeys.has(key) || answered.has(key)) && sameFeedbackContent(taskItems.get(key), other);
     }));
 }
 function sanitizeEvidence(evidence) {
@@ -107,7 +153,7 @@ function sanitizeEvidence(evidence) {
 }
 export function refutedReplyText(evidence, dispatchId) {
   return [
-    '**发生了什么**：盯梢修复轮核实了这条 P0/P1 意见，结论是它在当前 head 上不成立，不需要改代码。',
+    '**发生了什么**：盯梢修复轮核实了这条 P0/P1/P2 意见，结论是它在当前 head 上不成立，不需要改代码。',
     '**对本 PR 意味着什么**：这条意见不再阻塞合并；核实依据如下，若之后的提交让问题重新成立，服务器审查会在新 head 上再次提出。',
     '**要不要改代码**：不改。',
     '',
@@ -117,10 +163,10 @@ export function refutedReplyText(evidence, dispatchId) {
     `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
   ].join('\n');
 }
-// A member's thread the session graded as not needing code (P2/P3, a question, or not reproducible).
+// A member's thread the session graded as not needing code (P3, a question, or not reproducible).
 export function triagedReplyText(evidence, dispatchId) {
   return [
-    '**发生了什么**：盯梢修复轮按仓库统一分级核实了这条意见，结论是本轮不需要改代码（不成立、或属于 P2/P3 建议）。',
+    '**发生了什么**：盯梢修复轮按仓库统一分级核实了这条意见，结论是本轮不需要改代码（不成立、或属于 P3 建议）。',
     '**对本 PR 意味着什么**：这条讨论不再阻塞合并；核实依据如下。如果你认为判断有误，请点「Unresolve」重新打开这条讨论（只回复不会被处理），盯梢会重新评估。',
     '**要不要改代码**：本轮不改。',
     '',
@@ -143,7 +189,7 @@ export function fixedReplyText(evidence, head, dispatchId) {
     `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
   ].join('\n');
 }
-// Same durable receipt as the P2/P3 closure: `previous.autoClosedThreads[threadId]`.
+// Same durable receipt as the P3 closure: `previous.autoClosedThreads[threadId]`.
 export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, ghFn, now, head }) {
   const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
   const results = [];
@@ -152,7 +198,7 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
     // carries that task's dispatchId and is answered again; the same task never posts twice.
     const itemDispatchId = item.dispatchId ?? dispatchId;
     const receipt = closedThreads[item.threadId];
-    if (receipt && (!receipt.dispatchId || receipt.dispatchId === itemDispatchId)) continue;
+    if (receipt && receipt.dispatchId === itemDispatchId) continue;
     const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, itemDispatchId)
       : item.triage ? triagedReplyText(item.evidence, itemDispatchId) : refutedReplyText(item.evidence, itemDispatchId);
     const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : 'refuted-p0-p1';
@@ -163,3 +209,93 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
   }
   return { previous: { ...previous, autoClosedThreads: closedThreads }, closed: results };
 }
+const MEMBER_ITEM_KEY = /^(?:review|comment):/;
+export function completedMemberFeedback(result, task) {
+  if (result?.schemaVersion !== 2 || result.dispatchId !== task?.dispatchId) return [];
+  if (task.repairPolicy?.policyVersion !== FEEDBACK_POLICY_VERSION && Number(task.repairPolicy?.policyVersion ?? 0) < 2) return [];
+  const policy = taskRepairPolicy(task);
+  const items = [];
+  for (const { key, disposition } of result.feedbackCoverage?.dispositions ?? []) {
+    if (!MEMBER_ITEM_KEY.test(key ?? '')) continue;
+    const row = policy.items.find((item) => item.key === key);
+    if (!row || !['code-fix', 'reply-only'].includes(row.action)) continue;
+    const scStatus = disposition === 'fixed' ? 'pass' : 'no-change';
+    if (disposition !== 'fixed' && disposition !== 'no-change') continue;
+    const evidence = (result.scs ?? []).filter((sc) => sc.status === scStatus && sc.feedbackKeys?.includes(key))
+      .flatMap((sc) => sc.evidence ?? []).filter((line) => typeof line === 'string' && line.trim());
+    if (!evidence.length) continue;
+    items.push({ key, disposition, evidence, kind: disposition === 'fixed' ? 'fixed' : 'refuted', triage: TRIAGE_REASONS.has(row.reason) });
+  }
+  return items;
+}
+export function coveredFeedbackItems(items = [], observed = [], task = {}, result = null) {
+  const taskItems = new Map((task?.feedback ?? []).filter((item) => typeof item?.key === 'string').map((item) => [item.key, item]));
+  if (!items.length) return [];
+  return items.filter((item) => {
+    const current = observed.find((other) => `${other.source}:${other.nativeId}` === item.key || other.key === item.key);
+    if (!current || !taskItems.has(item.key)) return false;
+    return sameFeedbackContent(taskItems.get(item.key), current);
+  });
+}
+export function memberReplyText(item, { url, head } = {}) {
+  const evidence = item.evidence ?? [];
+  const body = item.kind === 'fixed' ? fixedReplyText(evidence, head, item.dispatchId) : item.triage ? triagedReplyText(evidence, item.dispatchId) : refutedReplyText(evidence, item.dispatchId);
+  const cite = url ? `原始意见：${url}\n\n` : '';
+  const actionKey = item.actionKey ?? digest([item.key, item.contentHash, head, item.disposition]);
+  return `${cite}${body.replace('<!-- mivo-watcher-receipt', `<!-- mivo-watcher-receipt actionKey=${actionKey} head=${head ?? ''} `)}`;
+}
+export function* replyToMemberFeedback({ items = [], comments = [], actor, repo, number, ghFn, now, head, previous = {} }) {
+  const handled = { ...(previous.handledFeedback ?? {}) };
+  const pending = [...(previous.pendingFeedbackReplies ?? [])];
+  const posted = [];
+  for (const item of items) {
+    const actionKey = digest([item.key, item.contentHash ?? item.key, head, item.disposition]);
+    const marker = `actionKey=${actionKey}`;
+    const existing = comments.find((comment) => (comment.body ?? '').includes(marker) && (!actor || (comment.user?.login ?? comment.author?.login) === actor));
+    if (handled[item.key]?.actionKey === actionKey && handled[item.key].replyCommentId) continue;
+    if (existing) {
+      handled[item.key] = {
+        key: item.key, nativeId: item.nativeId ?? null,
+        policyVersion: FEEDBACK_POLICY_VERSION, contentHash: item.contentHash ?? null, disposition: item.disposition,
+        sourceHead: item.sourceHead ?? null, resultHead: head, dispatchId: item.dispatchId, receiptId: item.receiptId ?? null,
+        replyCommentId: existing.id, actionKey, repliedAt: now,
+      };
+      posted.push({ key: item.key, commentId: existing.id, reused: true });
+      continue;
+    }
+    const body = memberReplyText({ ...item, actionKey }, { url: item.url, head });
+    pending.push({ key: item.key, actionKey, status: 'pending', at: now, head });
+    try {
+      const raw = yield () => ghFn(['api', '-X', 'POST', `repos/${repo}/issues/${number}/comments`, '-f', `body=${body}`]);
+      const created = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      handled[item.key] = {
+        key: item.key, nativeId: item.nativeId ?? null,
+        policyVersion: FEEDBACK_POLICY_VERSION, contentHash: item.contentHash ?? null, disposition: item.disposition,
+        sourceHead: item.sourceHead ?? null, resultHead: head, dispatchId: item.dispatchId, receiptId: item.receiptId ?? null,
+        replyCommentId: created.id, actionKey, repliedAt: now,
+      };
+      posted.push({ key: item.key, commentId: created.id, reused: false });
+    } catch (error) {
+      pending[pending.length - 1] = { ...pending[pending.length - 1], status: 'uncertain', error: String(error.message).slice(0, 400) };
+    }
+  }
+  return { previous: { ...previous, handledFeedback: handled, pendingFeedbackReplies: pending.filter((item) => item.status !== 'pending' || !handled[item.key]) }, posted };
+}
+export function* requestMemberReviewers({ repo, number, reviewers, ghFn, previous = {}, now, resultHead, reviewId }) {
+  const pending = [...(previous.pendingMemberRereview ?? [])];
+  const requested = [];
+  for (const login of [...new Set(reviewers.filter(Boolean))]) {
+    const key = `${login}:${reviewId ?? ''}:${resultHead}`;
+    if (pending.some((item) => item.key === key && ['pending', 'done'].includes(item.status))) continue;
+    pending.push({ key, login, status: 'pending', at: now, resultHead, reviewId });
+    try {
+      yield () => ghFn(['api', '-X', 'POST', `repos/${repo}/pulls/${number}/requested_reviewers`, '-f', `reviewers[]=${login}`]);
+      pending[pending.length - 1] = { ...pending[pending.length - 1], status: 'done' };
+      requested.push(login);
+    } catch (error) {
+      pending[pending.length - 1] = { ...pending[pending.length - 1], status: 'failed', error: String(error.message).slice(0, 400) };
+    }
+  }
+  return { previous: { ...previous, pendingMemberRereview: pending }, requested };
+}
+

@@ -16,7 +16,7 @@ const finding = (priority, key = `thread:${priority}`) => ({
 
 // Every Git mutation is confined to this test's disposable repositories. gh is
 // entirely simulated; unexpected API calls fail instead of reaching the network.
-function fixture(t, { changed = true } = {}) {
+function fixture(t, { changed = true, lockfile = false, nodeModules = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-repair-scope-'));
   const home = path.join(root, 'watcher');
   const plugin = path.join(root, 'plugin');
@@ -44,8 +44,17 @@ function fixture(t, { changed = true } = {}) {
   fs.mkdirSync(path.join(worktree, '.githooks'));
   fs.writeFileSync(path.join(worktree, '.githooks/pre-push'), '#!/bin/bash\nset -eu\nprintf "fixture checks passed\\n"\n');
   fs.writeFileSync(path.join(worktree, 'example.txt'), 'baseline\n');
+  if (lockfile) {
+    fs.writeFileSync(path.join(worktree, 'package.json'), JSON.stringify({ name: 'fixture', private: true }));
+    fs.writeFileSync(path.join(worktree, 'package-lock.json'), JSON.stringify({
+      name: 'fixture', lockfileVersion: 3, requires: true, packages: { '': { name: 'fixture' } },
+    }));
+    fs.writeFileSync(path.join(worktree, '.gitignore'), 'node_modules\n');
+  }
   git('-C', worktree, 'add', '.');
   git('-C', worktree, '-c', 'commit.gpgsign=false', 'commit', '-m', 'fixture baseline');
+  if (nodeModules) fs.mkdirSync(path.join(worktree, 'node_modules'));
+  if (nodeModules === true) fs.writeFileSync(path.join(worktree, 'node_modules', '.package-lock.json'), '{}');
   const sourceHead = git('-C', worktree, 'rev-parse', 'HEAD');
   git('-C', worktree, 'remote', 'add', 'origin', originUrl);
   git('-C', worktree, 'push', '-u', 'origin', 'HEAD:refs/heads/fix/scope');
@@ -131,19 +140,19 @@ function fixture(t, { changed = true } = {}) {
     feedbackKeys, evidence: ['synthetic fixture checked locally'] });
   const options = { home, taskPath, scReport, validatedHead: head, originUrl, gitFn, ghFn,
     env: { ...process.env, PREFLIGHT_SKIP: '0' } };
-  return { task, paths, sourceHead, head, options, saveTask, report, sc, pushCalls, ghCalls,
+  return { task, paths, worktree, sourceHead, head, options, saveTask, report, sc, pushCalls, ghCalls,
     setCiConclusion: (value) => { ciConclusionValue = value; },
     remoteHead: () => git('--git-dir', originUrl, 'rev-parse', 'refs/heads/fix/scope'),
     validate: () => validate(options), finalize: () => finalize(options) };
 }
 
 for (const status of ['pass', 'no-change']) {
-  test(`P2-only changed HEAD cannot finalize ${status}, even with a valid prior validation receipt`, (t) => {
+  test(`P3-only changed HEAD cannot finalize ${status}, even with a valid prior validation receipt`, (t) => {
     const f = fixture(t);
     assert.equal(f.validate().status, 'pass');
-    f.saveTask([{ ...finding('P2'), category: 'actionable-fix', priority: 'P1',
+    f.saveTask([{ ...finding('P3'), category: 'actionable-fix', priority: 'P1',
       repairPolicy: { action: 'code-fix', canChangeCode: true } }]);
-    f.report([f.sc(status, ['thread:P2'])]);
+    f.report([f.sc(status, ['thread:P3'])]);
     assert.throws(f.finalize, /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限/i);
     assert.equal(f.pushCalls.length, 0);
     assert.equal(f.remoteHead(), f.sourceHead);
@@ -165,23 +174,23 @@ test('P2-only unchanged HEAD closes the complete no-change flow without validati
   assert.equal(f.pushCalls.length, 0);
 });
 
-test('a P1 in the same task does not authorize an SC marking P2 fixed', (t) => {
+test('a P1 in the same task does not authorize an SC marking P3 fixed', (t) => {
   const f = fixture(t);
-  f.saveTask([finding('P1'), finding('P2')]);
+  f.saveTask([finding('P1'), finding('P3')]);
   assert.equal(f.validate().status, 'pass');
-  f.report([f.sc('pass', ['thread:P1']), f.sc('pass', ['thread:P2'])]);
+  f.report([f.sc('pass', ['thread:P1']), f.sc('pass', ['thread:P3'])]);
   assert.throws(f.finalize, /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限|no.change/i);
   assert.equal(f.pushCalls.length, 0);
   assert.equal(f.remoteHead(), f.sourceHead);
 });
 
-for (const kind of ['P1', 'required-ci']) {
+for (const kind of ['P1', 'P2', 'required-ci']) {
   test(`${kind} authorized repair can validate, push to fixture origin and close against current-head CI`, (t) => {
     const f = fixture(t);
-    const feedback = kind === 'P1' ? finding('P1') : {
+    const feedback = kind === 'required-ci' ? {
       key: 'ci:verify', source: 'ci', sha: f.sourceHead,
       requiredFailure: { verified: true, status: 'failed', headSha: f.sourceHead },
-    };
+    } : finding(kind);
     f.saveTask([feedback]);
     assert.equal(f.validate().status, 'pass');
     f.report([f.sc('pass', [feedback.key])]);
@@ -195,13 +204,13 @@ for (const kind of ['P1', 'required-ci']) {
   });
 }
 
-for (const kind of ['P3', 'unknown', 'empty']) {
+for (const kind of ['P2', 'P3', 'unknown', 'empty']) {
   test(`${kind} feedback cannot publish a changed HEAD through no-change SCs`, (t) => {
     const f = fixture(t);
     assert.equal(f.validate().status, 'pass');
     const feedback = kind === 'empty' ? [] : kind === 'unknown'
       ? [{ ...finding('P1'), key: 'thread:unknown', body: 'Please consider this improvement.' }]
-      : [finding('P3')];
+      : [finding(kind)];
     f.saveTask(feedback);
     f.report([f.sc('no-change', feedback.map(item => item.key))]);
     assert.throws(f.finalize, /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限/i);
@@ -342,9 +351,9 @@ test('mixed task can fix P1 while explicitly leaving P2 unchanged', (t) => {
     [['thread:P1', 'fixed'], ['thread:P2', 'no-change']]);
 });
 
-test('P2-only validation rejects a changed HEAD before running preflight', (t) => {
+test('P3-only validation rejects a changed HEAD before running preflight', (t) => {
   const f = fixture(t);
-  f.saveTask([finding('P2')]);
+  f.saveTask([finding('P3')]);
   let preflightRuns = 0;
   assert.throws(() => validate({ ...f.options, runFn: () => { preflightRuns++; return 'passed'; } }),
     /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限/i);
@@ -357,7 +366,7 @@ test('recheck cannot certify a changed HEAD after its feedback loses repair auth
   assert.equal(f.validate().status, 'pass');
   f.report([f.sc('pass', ['thread:P1'])]);
   assert.equal(f.finalize().status, 'complete');
-  f.saveTask([{ ...finding('P2'), key: 'thread:P1' }]);
+  f.saveTask([{ ...finding('P3'), key: 'thread:P1' }]);
   const pushesBefore = f.pushCalls.length;
   assert.throws(() => recheck(f.options), /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限|no.change/i);
   assert.equal(f.pushCalls.length, pushesBefore);
@@ -541,3 +550,114 @@ for (const [label, workers] of [
     assert.equal(fs.existsSync(path.join(f.paths.results, `${f.task.dispatchId}.json`)), false);
   });
 }
+
+test('validate runs npm ci before preflight when lockfile exists and node_modules is missing', (t) => {
+  const f = fixture(t, { lockfile: true });
+  const calls = [];
+  const result = validate({
+    ...f.options,
+    runFn: (binary, args, options) => {
+      calls.push({ binary, args: [...args], timeout: options.timeout });
+      if (binary === 'npm') return 'added 0 packages\n';
+      return 'fixture checks passed\n';
+    },
+  });
+  assert.equal(result.status, 'pass');
+  assert.deepEqual(calls.map((item) => [item.binary, ...item.args]), [['npm', 'ci'], ['/bin/bash', '.githooks/pre-push']]);
+  assert.equal(calls[0].timeout, 3_600_000);
+  const receipt = JSON.parse(fs.readFileSync(result.receiptPath, 'utf8'));
+  assert.equal(receipt.dependencyInstall.status, 'ok');
+  assert.deepEqual(receipt.dependencyInstall.command, { binary: 'npm', args: ['ci'] });
+  assert.equal(receipt.command.binary, '/bin/bash');
+});
+
+test('validate reinstalls when node_modules is left partial by an earlier failed npm ci', (t) => {
+  const f = fixture(t, { lockfile: true, nodeModules: 'partial' });
+  const calls = [];
+  const result = validate({
+    ...f.options,
+    runFn: (binary, args) => { calls.push(binary); return binary === 'npm' ? 'added 0 packages\n' : 'fixture checks passed\n'; },
+  });
+  assert.equal(result.status, 'pass');
+  assert.equal(calls[0], 'npm');
+});
+
+test('validate skips npm ci when node_modules already exists or lockfile is absent', (t) => {
+  for (const options of [{ lockfile: true, nodeModules: true }, { lockfile: false, nodeModules: false }, { lockfile: false, nodeModules: true }]) {
+    const f = fixture(t, options);
+    const calls = [];
+    const result = validate({
+      ...f.options,
+      runFn: (binary, args) => { calls.push([binary, ...args]); return 'fixture checks passed\n'; },
+    });
+    assert.equal(result.status, 'pass', JSON.stringify(options));
+    assert.deepEqual(calls, [['/bin/bash', '.githooks/pre-push']]);
+    const receipt = JSON.parse(fs.readFileSync(result.receiptPath, 'utf8'));
+    assert.equal(receipt.dependencyInstall, undefined);
+  }
+});
+
+test('validate does not start preflight when npm ci fails', (t) => {
+  const f = fixture(t, { lockfile: true });
+  const calls = [];
+  const result = validate({
+    ...f.options,
+    runFn: (binary, args) => {
+      calls.push([binary, ...args]);
+      if (binary === 'npm') {
+        const error = new Error('npm ci failed');
+        error.status = 1;
+        error.stdout = '';
+        error.stderr = 'lock mismatch';
+        throw error;
+      }
+      throw new Error('preflight must not start');
+    },
+  });
+  assert.equal(result.status, 'fail');
+  assert.deepEqual(calls, [['npm', 'ci']]);
+  const receipt = JSON.parse(fs.readFileSync(result.receiptPath, 'utf8'));
+  assert.equal(receipt.reason, 'dependency install failed');
+  assert.equal(receipt.command, null);
+  assert.equal(receipt.dependencyInstall.status, 'fail');
+  assert.equal(receipt.dependencyInstall.exitCode, 1);
+});
+
+test('validate fails when npm ci dirties tracked files', (t) => {
+  const f = fixture(t, { lockfile: true });
+  const result = validate({
+    ...f.options,
+    runFn: (binary, args) => {
+      if (binary === 'npm') {
+        fs.appendFileSync(path.join(f.worktree, 'example.txt'), 'from npm\n');
+        return 'added 0 packages\n';
+      }
+      return 'fixture checks passed\n';
+    },
+  });
+  assert.equal(result.status, 'fail');
+  const receipt = JSON.parse(fs.readFileSync(result.receiptPath, 'utf8'));
+  assert.match(receipt.reason, /dirty/);
+  assert.equal(receipt.dependencyInstall.status, 'ok');
+});
+
+test('W-3 finalize accepts omitted or empty workers with skip evidence', (t) => {
+  for (const workers of [undefined, []]) {
+    const f = fixture(t, { changed: false });
+    f.saveTask([finding('P2')]);
+    const sc = {
+      id: 'SC-thread:P2', status: 'no-change', feedbackKeys: ['thread:P2'],
+      evidence: [
+        'thread does not require a code change',
+        'review skipped: missing-routing; routing.json not present; local review worker was not started; required CI and server review still apply',
+        'e2e skipped: no-tool; start_team was not repeated; local e2e worker was not started',
+      ],
+    };
+    fs.writeFileSync(f.options.scReport, JSON.stringify(workers === undefined ? { scs: [sc] } : { scs: [sc], workers }));
+    const result = f.finalize();
+    assert.equal(result.status, 'complete');
+    if (workers === undefined) assert.equal(result.workers, undefined);
+    else assert.deepEqual(result.workers, []);
+    assert.equal(f.pushCalls.length, 0);
+  }
+});

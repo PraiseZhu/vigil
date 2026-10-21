@@ -33,7 +33,7 @@ function fixture(t) {
       headRefOid: head, headRefName: 'feature', baseRefOid: head, baseRefName: 'main',
       createdAt: '2026-09-01T00:00:00Z', author: { login: 'ExampleUser' },
       isCrossRepository: false, headRepository: { name: 'example-plugin' },
-      headRepositoryOwner: { login: 'example-org' }, mergeable: 'MERGEABLE', labels: [] },
+      headRepositoryOwner: { login: 'example-org' }, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: [] },
     timeline: [{ __typename: 'ReadyForReviewEvent', id: 'READY_1', createdAt: '2026-09-02T00:00:00Z' }],
     comments: [{ id: 601, body: 'P1 **Example core failure**\nA supported operation fails before completion.', user: { login: 'greptile[bot]', type: 'Bot' }, created_at: '2026-09-02T02:00:00Z', updated_at: '2026-09-02T02:00:00Z' }], fail: null,
   };
@@ -110,8 +110,14 @@ function fakeGhMain() {
   if (args[1] === 'graphql') {
     const query = args.find(a => a.startsWith('query='));
     if (query.includes('timelineItems(first:')) return send({ data: { node: { timelineItems: page(state.timeline) } } });
+    if (query.includes('mergeStateStatus') && query.includes('baseRef{name target{oid}}')) {
+      return send({ data: { node: { mergeStateStatus: state.pr.mergeStateStatus || 'CLEAN',
+        baseRef: { name: state.pr.baseRefName || 'main', target: { oid: state.pr.baseTipOid || state.pr.baseRefOid } } } } });
+    }
     // Same transport answers both the one-query poll snapshot and full collector.
-    return send({ data: { node: { ...state.pr, timelineItems: page(state.timeline), labels: page([]), comments: { ...page(state.comments), totalCount: state.comments.length },
+    return send({ data: { node: { ...state.pr, mergeStateStatus: state.pr.mergeStateStatus || 'CLEAN',
+      baseRef: { target: { oid: state.pr.baseTipOid || state.pr.baseRefOid } },
+      timelineItems: page(state.timeline), labels: page([]), comments: { ...page(state.comments), totalCount: state.comments.length },
       reviews: { ...page([]), totalCount: 0 }, reviewThreads: page([]), commits: page([]) } } });
   }
   const endpoint = args[1] ?? '';

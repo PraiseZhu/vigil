@@ -16,12 +16,22 @@ function threadItems({ threadId = 't1', isResolved = false, body, author = GREPT
   return feedbackItems({ pr: PR, threads });
 }
 
-test('P2 greptile thread item is auto-close eligible', () => {
-  const [item] = threadItems({ body: 'P2: naming nit, consider renaming' });
+test('P3 greptile thread item is auto-close eligible', () => {
+  const [item] = threadItems({ body: 'P3: naming nit, consider renaming' });
   assert.equal(item.category, 'reply-resolve');
   assert.equal(item.repairPolicy.action, 'reply-only');
   assert.equal(item.threadId, 't1');
   assert.equal(isAutoCloseEligible(item), true);
+});
+test('P2 greptile thread item is never auto-close eligible', () => {
+  const [item] = threadItems({ body: 'P2: must-fix this PR' });
+  assert.equal(item.category, 'actionable-fix');
+  assert.equal(item.repairPolicy.action, 'code-fix');
+  assert.equal(isAutoCloseEligible(item), false);
+});
+test('contradictory reply-only policy with P2 severities is not auto-closed', () => {
+  const item = { category: 'reply-resolve', repairPolicy: { action: 'reply-only', severities: ['P2'] }, threadId: 't-fake' };
+  assert.equal(isAutoCloseEligible(item), false);
 });
 
 test('P0/P1 thread item is never auto-close eligible', () => {
@@ -42,20 +52,20 @@ test('untrusted-source P2-looking thread item is not auto-close eligible', () =>
   assert.equal(isAutoCloseEligible(item), false);
 });
 
-test('mixed P0+P2 on same line is not auto-close eligible (needs-triage)', () => {
+test('mixed P0+P2 on same line is code-fix, not auto-close', () => {
   const [item] = threadItems({ body: 'P0 crash here, also P2 naming nit on the same line' });
-  assert.equal(item.repairPolicy.reason, 'thread-triage');
+  assert.equal(item.repairPolicy.action, 'code-fix');
   assert.equal(isAutoCloseEligible(item), false);
 });
 
-test('partitionAutoClose splits eligible P2 threads from everything else', () => {
+test('partitionAutoClose splits eligible P3 threads from everything else', () => {
   const items = [
-    ...threadItems({ threadId: 't-p2', body: 'P2: naming nit' }),
+    ...threadItems({ threadId: 't-p3', body: 'P3: naming nit' }),
     ...threadItems({ threadId: 't-p0', body: 'P0: crash on null input' }),
   ];
   const { eligible, remaining } = partitionAutoClose(items);
   assert.equal(eligible.length, 1);
-  assert.equal(eligible[0].threadId, 't-p2');
+  assert.equal(eligible[0].threadId, 't-p3');
   assert.equal(remaining.length, 1);
   assert.equal(remaining[0].threadId, 't-p0');
 });
@@ -78,7 +88,7 @@ function collectYields(gen) {
 }
 
 test('autoCloseThreads posts a reply then resolves, and records a durable receipt', () => {
-  const [item] = threadItems({ threadId: 't-p2', body: 'P2: naming nit' });
+  const [item] = threadItems({ threadId: 't-p3', body: 'P3: naming nit' });
   const ghCalls = [];
   const ghFn = (args) => { ghCalls.push(args); return '{}'; };
   const { calls, result } = collectYields(autoCloseThreads({ eligible: [item], previous: {}, ghFn, now: '2026-09-29T00:00:00Z' }));
@@ -86,24 +96,24 @@ test('autoCloseThreads posts a reply then resolves, and records a durable receip
   assert.ok(ghCalls[0].some((a) => typeof a === 'string' && a.startsWith('query=') && a.includes('addPullRequestReviewThreadReply')));
   assert.ok(ghCalls[1].some((a) => typeof a === 'string' && a.startsWith('query=') && a.includes('resolveReviewThread')));
   assert.equal(result.closed.length, 1);
-  assert.equal(result.closed[0].threadId, 't-p2');
-  assert.ok(result.previous.autoClosedThreads['t-p2']);
+  assert.equal(result.closed[0].threadId, 't-p3');
+  assert.ok(result.previous.autoClosedThreads['t-p3']);
 });
 
 test('autoCloseThreads is idempotent: already-closed thread is skipped on a re-run', () => {
-  const [item] = threadItems({ threadId: 't-p2', body: 'P2: naming nit' });
-  const previous = { autoClosedThreads: { 't-p2': { at: '2026-09-28T00:00:00Z', key: null, nativeId: null } } };
+  const [item] = threadItems({ threadId: 't-p3', body: 'P3: naming nit' });
+  const previous = { autoClosedThreads: { 't-p3': { at: '2026-09-28T00:00:00Z', key: null, nativeId: null } } };
   const ghFn = () => { throw new Error('must not call GitHub for an already-closed thread'); };
   const { calls, result } = collectYields(autoCloseThreads({ eligible: [item], previous, ghFn, now: '2026-09-29T00:00:00Z' }));
   assert.equal(calls.length, 0);
   assert.equal(result.closed.length, 0);
-  assert.ok(result.previous.autoClosedThreads['t-p2']);
+  assert.ok(result.previous.autoClosedThreads['t-p3']);
 });
 
 test('autoCloseThreads never touches non-eligible items even if forced into eligible list', () => {
   // Defensive: eligible list should only ever contain reply-resolve items in production
   // (enforced by partitionAutoClose), but the generator itself must not assume threadId shape.
-  const [item] = threadItems({ threadId: 't-p2', body: 'P2: naming nit' });
+  const [item] = threadItems({ threadId: 't-p3', body: 'P3: naming nit' });
   const ghCalls = [];
   const ghFn = (args) => { ghCalls.push(args); return '{}'; };
   const { result } = collectYields(autoCloseThreads({ eligible: [item, item], previous: {}, ghFn, now: '2026-09-29T00:00:00Z' }));
@@ -269,4 +279,78 @@ test('refuted closure replies then resolves once per thread and is idempotent', 
   calls.length = 0;
   assert.deepEqual(run(first.previous).closed, []);
   assert.equal(calls.length, 0);
+});
+test('same thread mixed P2+P3 is not auto-closed', () => {
+  const thread = {
+    id: 't-mix', isResolved: false, isOutdated: false, path: 'src/a.ts',
+    comments: [
+      { id: 'c-p2', author: GREPTILE_AUTHOR, body: 'P2: must-fix this PR', createdAt: '2026-09-10T00:00:00Z' },
+      { id: 'c-p3', author: GREPTILE_AUTHOR, body: 'P3: naming nit', createdAt: '2026-09-10T00:01:00Z' },
+    ],
+  };
+  const items = feedbackItems({ pr: PR, threads: [thread] });
+  const { eligible, remaining } = partitionAutoClose(items, { allItems: items, threads: [thread] });
+  assert.equal(eligible.length, 0);
+  assert.equal(remaining.length, items.length);
+});
+
+test('old P2 plus new P3 on the same thread is not auto-closed', () => {
+  const thread = {
+    id: 't-old', isResolved: false, isOutdated: false, path: 'src/a.ts',
+    comments: [
+      { id: 'c-p2', author: GREPTILE_AUTHOR, body: 'P2: must-fix this PR', createdAt: '2026-09-10T00:00:00Z' },
+      { id: 'c-p3', author: GREPTILE_AUTHOR, body: 'P3: naming nit', createdAt: '2026-09-10T00:01:00Z' },
+    ],
+  };
+  const allItems = feedbackItems({ pr: PR, threads: [thread] });
+  const p3 = allItems.filter((item) => item.repairPolicy?.severities?.includes('P3'));
+  const { eligible, remaining } = partitionAutoClose(p3, { allItems, threads: [thread] });
+  assert.equal(eligible.length, 0);
+  assert.equal(remaining.length, p3.length);
+});
+
+test('incomplete thread comment pagination is fail-closed', () => {
+  const thread = {
+    id: 't-page', isResolved: false, isOutdated: false, path: 'src/a.ts', commentsHasNextPage: true,
+    comments: [{ id: 'c-p3', author: GREPTILE_AUTHOR, body: 'P3: naming nit', createdAt: '2026-09-10T00:00:00Z' }],
+  };
+  const items = feedbackItems({ pr: PR, threads: [thread] });
+  const { eligible } = partitionAutoClose(items, { allItems: items, threads: [thread] });
+  assert.equal(eligible.length, 0);
+});
+
+test('autoCloseReplyText is P3-class and keeps the mivo receipt marker', () => {
+  const text = autoCloseReplyText();
+  assert.match(text, /P3 级/);
+  assert.match(text, /<!-- mivo-watcher-receipt task=auto-close -->/);
+  assert.doesNotMatch(text, /P2 级/);
+});
+
+test('old auto-close receipt without dispatchId does not block a later P2 fix resolve', () => {
+  const calls = [];
+  const items = [{ key: 'thread:PRRT_reopen:PRRC_a', threadId: 'PRRT_reopen', evidence: ['fixed the P2 defect'], kind: 'fixed' }];
+  const previous = { autoClosedThreads: { PRRT_reopen: { at: '2026-09-01T00:00:00Z', key: 'thread:PRRT_reopen:PRRC_a', reason: 'auto-close' } } };
+  const gen = closeRefutedThreads({
+    items, dispatchId: 'fix-p2-later', previous, head: 'abcdef1234567890',
+    ghFn: (args) => { calls.push(args); return '{}'; }, now: 't',
+  });
+  let step = gen.next();
+  while (!step.done) { step.value(); step = gen.next(); }
+  assert.equal(calls.length, 2);
+  assert.equal(step.value.closed[0].threadId, 'PRRT_reopen');
+  assert.equal(step.value.previous.autoClosedThreads.PRRT_reopen.dispatchId, 'fix-p2-later');
+});
+
+test('same-task refuted rerun stays idempotent when receipt has matching dispatchId', () => {
+  const calls = [];
+  const items = [{ key: 'thread:PRRT_same:PRRC_a', threadId: 'PRRT_same', evidence: ['already guarded'], kind: 'refuted' }];
+  const previous = { autoClosedThreads: { PRRT_same: { at: 't0', key: items[0].key, reason: 'refuted-p0-p1', dispatchId: 'live-851' } } };
+  const gen = closeRefutedThreads({
+    items, dispatchId: 'live-851', previous,
+    ghFn: (args) => { calls.push(args); return '{}'; }, now: 't',
+  });
+  let step = gen.next();
+  while (!step.done) { step.value(); step = gen.next(); }
+  assert.equal(calls.length, 0);
+  assert.deepEqual(step.value.closed, []);
 });

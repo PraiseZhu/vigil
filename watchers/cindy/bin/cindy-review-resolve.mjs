@@ -1,5 +1,5 @@
 // Autonomous P3 review-thread closure. Permission errors degrade; they must not fail the poll.
-const REPLY_TEXT = '这是一条 P2/P3 级（建议类）反馈，不是阻塞性问题。按 Cindy 仓当前规则，这类建议本轮不安排修复；'
+const REPLY_TEXT = '这是一条 P3 级（建议类）反馈，不是阻塞性问题。按 Cindy 仓当前规则，这类建议本轮不安排修复；'
   + '如后续需要可另行处理。讨论到此关闭，不影响本 PR 等待维护者审批。';
 
 export function autoCloseReplyText() {
@@ -17,8 +17,8 @@ export function isAutoCloseEligible(item) {
   const severities = item?.repairPolicy?.severities ?? [];
   return Boolean(item) && item.category === 'reply-resolve'
     && item.repairPolicy?.action === 'reply-only'
-    && severities.some((s) => s === 'P2' || s === 'P3')
-    && !severities.some((s) => s === 'P0' || s === 'P1')
+    && severities.includes('P3')
+    && !severities.some((s) => s === 'P0' || s === 'P1' || s === 'P2')
     && typeof item.threadId === 'string' && item.threadId.length > 0;
 }
 
@@ -118,7 +118,7 @@ function completeCodeFixThreads(result, task, { disposition, scStatus, kind }) {
     const threadId = THREAD_KEY.exec(key ?? '')?.[1];
     if (itemDisposition !== disposition || !threadId || policy.get(key)?.action !== 'code-fix') continue;
     const evidence = evidenceLines(result, key, scStatus);
-    if (evidence.length) items.push({ key, threadId, evidence, kind, triage: policy.get(key)?.reason === 'review-thread-triage' });
+    if (evidence.length) items.push({ key, threadId, evidence, kind, triage: ['review-thread-triage', 'greptile-p1-triage'].includes(policy.get(key)?.reason) });
   }
   return items;
 }
@@ -138,9 +138,9 @@ export function sameFeedbackContent(original, current) {
 }
 // Every open external comment on the thread must belong to the task, unedited since the task
 // saw it; otherwise evidence written for other words would resolve it.
-// Comments the task held as reply-only (P2/P3) need an answer, not a fix: a result that gave them
-// a no-change disposition with evidence covers them, so a thread mixing a fixed P1 and an
-// answered P2 can close. Without that result only fixed or refuted items count.
+// Comments the task held as reply-only (P3) need an answer, not a fix: a result that gave them
+// a no-change disposition with evidence covers them, so a thread mixing a fixed finding and an
+// answered P3 can close. Without that result only fixed or refuted items count.
 function answeredReplyOnlyKeys(result, task) {
   if (!result || result.dispatchId !== task?.dispatchId) return new Set();
   const policy = new Map((task.repairPolicy?.items ?? []).map((item) => [item.key, item]));
@@ -214,7 +214,7 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
     // carries that task's dispatchId and is answered again; the same task never posts twice.
     const itemDispatchId = item.dispatchId ?? dispatchId;
     const receipt = closedThreads[item.threadId];
-    if (receipt && (!receipt.dispatchId || receipt.dispatchId === itemDispatchId)) continue;
+    if (receipt && receipt.dispatchId === itemDispatchId) continue;
     const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, itemDispatchId)
       : item.triage ? triagedReplyText(item.evidence, itemDispatchId) : refutedReplyText(item.evidence, itemDispatchId);
     const reply = yield attempt(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${body}`]);
