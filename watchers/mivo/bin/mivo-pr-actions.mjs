@@ -9,7 +9,6 @@ const UNCONFIRMED_MS = 5 * 60 * 1000;
 const REVIEW_UNCONFIRMED_MS = 10 * 60 * 1000;
 const REVIEW_WORKFLOW = 'review-pr.yml';
 const REVIEW_WORKFLOW_PATH = '.github/workflows/review-pr.yml';
-const REVIEW_RECHECK_LIMIT = 2;
 
 function parse(raw) {
   return typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -239,10 +238,9 @@ export function planReviewRecheck({ snapshot, entry, task, result, observed = []
   if (log.attempts.some((item) => item.resultReceiptId === result.receiptId || (item.findingDigest === digestValue && item.resultReceiptId === (result.receiptId ?? result.dispatchId)))) {
     return { eligible: false, reason: 'same-result' };
   }
-  // Every attempt counts, including ones reconcileReviewRecheck later marks failed: the cap is per head.
-  const sent = log.attempts ?? [];
-  if (sent.length >= REVIEW_RECHECK_LIMIT) return { eligible: false, reason: 'review-recheck-limit' };
-  if (sent.length === 1 && !result.receiptId) return { eligible: false, reason: 'second-requires-new-result' };
+  // No per-head cap: each new no-change repair result may ask for one recheck. A repeat needs a result
+  // that can be told apart from the one already used.
+  if ((log.attempts ?? []).length && !result.receiptId) return { eligible: false, reason: 'second-requires-new-result' };
   return {
     eligible: true,
     reason: 'eligible',
@@ -251,6 +249,27 @@ export function planReviewRecheck({ snapshot, entry, task, result, observed = []
     sourceRunId: evidence.runId ?? null,
     findingDigest: digestValue,
   };
+}
+
+const THREADS_QUERY = 'query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$after){nodes{isResolved} pageInfo{hasNextPage endCursor}}}}}';
+const THREAD_PAGE_LIMIT = 50;
+
+export function* threadsAllResolved({ repo, number, ghFn }) {
+  const [owner, name] = repo.split('/');
+  let after = null;
+  for (let page = 0; page < THREAD_PAGE_LIMIT; page += 1) {
+    const raw = parse(yield () => ghFn(['api', 'graphql', '-f', `query=${THREADS_QUERY}`,
+      '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `number=${Number(number)}`,
+      ...(after ? ['-f', `after=${after}`] : [])]));
+    const threads = raw?.data?.repository?.pullRequest?.reviewThreads;
+    // An unreadable page is not proof that every conversation is closed.
+    if (!Array.isArray(threads?.nodes) || typeof threads.pageInfo?.hasNextPage !== 'boolean') return false;
+    if (!threads.nodes.every((thread) => thread?.isResolved === true)) return false;
+    if (!threads.pageInfo.hasNextPage) return true;
+    after = threads.pageInfo.endCursor;
+    if (typeof after !== 'string' || !after) return false;
+  }
+  return false;
 }
 
 function randomId(prefix) {
@@ -282,6 +301,11 @@ export function* requestReviewRecheck({
   ]));
   const active = (runs.workflow_runs ?? runs ?? []).filter((run) => run.path === REVIEW_WORKFLOW_PATH && ['queued', 'in_progress', 'waiting'].includes(run.status));
   if (active.length) return { entry, action: { attempted: false, reason: 'review-in-progress' } };
+  // The reviewer refuses to enter while any conversation is open. Read it live (this scan may just have
+  // resolved threads) and wait without spending this result's recheck.
+  if (!(yield* threadsAllResolved({ repo, number: pr.number, ghFn }))) {
+    return { entry, action: { attempted: false, reason: 'threads-unresolved' } };
+  }
   const roundId = randomId('vigil').slice(0, 80);
   const dispatchId = randomBytes(8).toString('hex');
   const attempt = {
