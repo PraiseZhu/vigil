@@ -23,7 +23,7 @@ export const REPO = requireConfig('targetRepo', {
 const GH = process.env.GH_BIN ?? 'gh';
 const GIT = process.env.GIT_BIN ?? 'git';
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
-const GIT_PUSH_TIMEOUT_MS = 60 * 60 * 1000;
+const MAX_PREFLIGHT_TIMEOUT_MS = 2_147_483_647;
 
 function fail(message, exitCode = 1) {
   const error = new Error(message);
@@ -38,6 +38,44 @@ function requireAbs(value, label) {
 
 function isSha(value) { return typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value); }
 function hash(value) { return createHash('sha256').update(value).digest('hex'); }
+
+function parsePreflightMinutes(value) {
+  let minutes;
+  if (typeof value === 'number') minutes = value;
+  else if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed || !/^(?:\d+(?:\.\d+)?|\.\d+)$/.test(trimmed)) minutes = NaN;
+    else minutes = Number(trimmed);
+  } else minutes = NaN;
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    fail('preflightTimeoutMinutes must be a finite number greater than 0');
+  }
+  const timeoutMs = Math.round(minutes * 60 * 1000);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_PREFLIGHT_TIMEOUT_MS) {
+    fail('preflightTimeoutMinutes must convert to a safe millisecond integer no greater than 2147483647');
+  }
+  return timeoutMs;
+}
+
+export function preflightTimeoutMs(env = process.env) {
+  return parsePreflightMinutes(optionalConfig('preflightTimeoutMinutes', {
+    env, envVar: 'MIVO_PREFLIGHT_TIMEOUT_MINUTES', fallback: 60,
+  }));
+}
+
+function originRefspec(task) {
+  return `+refs/heads/${task.headRefName}:refs/remotes/origin/${task.headRefName}`;
+}
+
+function originFetchConfig(task) {
+  return `remote.origin.fetch=${originRefspec(task)}`;
+}
+
+function needsDependencyInstall(worktree) {
+  if (fs.existsSync(path.join(worktree, 'node_modules'))) return false;
+  try { return fs.statSync(path.join(worktree, 'package-lock.json')).isFile(); }
+  catch { return false; }
+}
 
 export function pluginRepoPath(env = process.env) {
   if (env.MIVO_PLUGIN_REPO) return env.MIVO_PLUGIN_REPO;
@@ -170,7 +208,7 @@ function saveResultLocked(paths, task, sessionId, payload) {
 
 export function command(binary, args, options = {}, runner = execFileSync) {
   const timeout = options.timeout ?? (binary === GIT && args.includes('push')
-    ? GIT_PUSH_TIMEOUT_MS : DEFAULT_COMMAND_TIMEOUT_MS);
+    ? preflightTimeoutMs(options.env ?? process.env) : DEFAULT_COMMAND_TIMEOUT_MS);
   return runner(binary, args, {
     encoding: 'utf8', timeout, maxBuffer: 8 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'], ...options,
@@ -291,7 +329,7 @@ function assertWorktree(worktree, task, gitFn, expectedUrl = remoteUrl(task.repo
   assertOrigin(worktree, task.repo, gitFn, expectedUrl);
   const branch = gitOutput(['-C', worktree, 'symbolic-ref', '--quiet', '--short', 'HEAD'], gitFn);
   if (branch !== watchBranchName(task.number)) fail(`worktree branch mismatch: ${branch}`);
-  const upstream = gitOutput(['-C', worktree, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], gitFn);
+  const upstream = gitOutput(['-C', worktree, '-c', originFetchConfig(task), 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], gitFn);
   if (upstream !== `origin/${task.headRefName}`) fail(`worktree upstream mismatch: ${upstream}`);
   const status = gitOutput(['-C', worktree, 'status', '--porcelain'], gitFn);
   if (status) fail('worktree is dirty');
@@ -308,9 +346,10 @@ export function cloneWorktree(paths, task, gitFn, cloneUrl = remoteUrl(task.repo
   if (existing) return { worktree, head: existing.head, created: false };
   fs.mkdirSync(path.dirname(worktree), { recursive: true, mode: 0o700 });
   if (fs.existsSync(worktree)) fail('worktree path is unknown; refusing to remove it');
-  gitOutput(['-C', plugin, 'fetch', 'origin', task.headRefName], gitFn);
-  gitOutput(['-C', plugin, 'worktree', 'add', '-B', branch, worktree, `origin/${task.headRefName}`], gitFn);
-  gitOutput(['-C', worktree, 'branch', '--set-upstream-to', `origin/${task.headRefName}`], gitFn);
+  const refspec = originRefspec(task);
+  gitOutput(['-C', plugin, 'fetch', 'origin', refspec], gitFn);
+  gitOutput(['-C', plugin, '-c', originFetchConfig(task), 'worktree', 'add', '-B', branch, worktree, `origin/${task.headRefName}`], gitFn);
+  gitOutput(['-C', worktree, '-c', originFetchConfig(task), 'branch', '--set-upstream-to', `origin/${task.headRefName}`], gitFn);
   const checked = assertWorktree(worktree, task, gitFn, expectedUrl);
   if (!checked || checked.head !== remoteHead) fail('cloned worktree HEAD does not match observed remote head');
   return { worktree, head: checked.head, created: true };
@@ -552,21 +591,46 @@ export function validate({ home, taskPath, validatedHead, ghFn = command, owners
   let exitCode = null;
   let outputHash = null;
   let status = exception ? 'approved-exception' : 'pass';
+  let reason;
+  let ranPreflight = false;
+  let dependencyInstall;
   if (!exception) {
-    try {
-      const output = String(runFn('/bin/bash', [policy.file], {
-        cwd: worktree, env: { ...env, PREFLIGHT_SKIP: '0' }, timeout: 60 * 60 * 1000, maxBuffer: 32 * 1024 * 1024,
-      }));
-      exitCode = 0;
-      outputHash = hash(output);
-      if (/^\[preflight\] skipped(?: |$)/m.test(output)) status = 'fail';
-    } catch (error) {
-      status = 'fail';
-      exitCode = Number.isInteger(error.status) ? error.status : null;
-      outputHash = hash(String(error.stdout ?? '') + String(error.stderr ?? ''));
+    const timeoutMs = preflightTimeoutMs(env);
+    if (needsDependencyInstall(worktree)) {
+      try {
+        const output = String(runFn('npm', ['ci'], {
+          cwd: worktree, env: { ...env, PREFLIGHT_SKIP: '0' }, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024,
+        }));
+        dependencyInstall = {
+          status: 'ok', command: { binary: 'npm', args: ['ci'] }, timeoutMs, exitCode: 0, outputHash: hash(output),
+        };
+      } catch (error) {
+        status = 'fail';
+        exitCode = Number.isInteger(error.status) ? error.status : null;
+        outputHash = hash(String(error.stdout ?? '') + String(error.stderr ?? ''));
+        dependencyInstall = {
+          status: 'fail', command: { binary: 'npm', args: ['ci'] }, timeoutMs, exitCode, outputHash,
+        };
+        reason = 'dependency install failed';
+      }
+    }
+    if (status !== 'fail') {
+      try {
+        const output = String(runFn('/bin/bash', [policy.file], {
+          cwd: worktree, env: { ...env, PREFLIGHT_SKIP: '0' }, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024,
+        }));
+        ranPreflight = true;
+        exitCode = 0;
+        outputHash = hash(output);
+        if (/^\[preflight\] skipped(?: |$)/m.test(output)) status = 'fail';
+      } catch (error) {
+        ranPreflight = true;
+        status = 'fail';
+        exitCode = Number.isInteger(error.status) ? error.status : null;
+        outputHash = hash(String(error.stdout ?? '') + String(error.stderr ?? ''));
+      }
     }
   }
-  let reason;
   try {
     assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
     const after = assertWorktree(worktree, task, gitFn, originUrl);
@@ -575,9 +639,11 @@ export function validate({ home, taskPath, validatedHead, ghFn = command, owners
   } catch (error) { status = 'fail'; reason = error.message; }
   const receipt = {
     schemaVersion: 2, kind: 'mivo-repair-validation', ...identity(task, sessionId), head: validatedHead,
-    status, policy, exception, command: exception ? null : { binary: '/bin/bash', args: [policy.file] },
-    exitCode, outputHash, ...(reason ? { reason } : {}), startedAt, finishedAt: new Date().toISOString(),
+    status, policy, exception, command: ranPreflight ? { binary: '/bin/bash', args: [policy.file] } : null,
+    exitCode, outputHash, ...(dependencyInstall ? { dependencyInstall } : {}), ...(reason ? { reason } : {}),
+    startedAt, finishedAt: new Date().toISOString(),
   };
+
   const receiptPath = path.join(paths.validations, task.dispatchId, `${validatedHead}-${randomUUID()}.json`);
   immutableJson(receiptPath, receipt);
   const verification = { status, head: validatedHead, receiptPath, receiptSha256: hash(fs.readFileSync(receiptPath)) };
@@ -598,9 +664,15 @@ function verifiedLocal(paths, task, sessionId, head, worktree, gitFn, receiptPat
   if (receipt.status === 'approved-exception') {
     const exception = validationException(paths, task, sessionId, head, worktree, gitFn);
     if (!exception || exception.approvalSha256 !== receipt.exception?.approvalSha256) fail('local validation exception is no longer bound');
-  } else if (receipt.status !== 'pass' || receipt.exitCode !== 0
-    || receipt.policy?.sha256 !== validationPolicy(worktree, task, gitFn).sha256) fail('local validation did not pass for this HEAD');
-  return { status: receipt.status, head, receiptPath: file, receiptSha256: pointer.receiptSha256 };
+    return { status: receipt.status, head, receiptPath: file, receiptSha256: pointer.receiptSha256 };
+  }
+  if (receipt.status !== 'pass' || receipt.exitCode !== 0) fail('local validation did not pass for this HEAD');
+  const policy = validationPolicy(worktree, task, gitFn);
+  if (receipt.policy?.sha256 !== policy.sha256) fail('local validation did not pass for this HEAD');
+  return {
+    status: receipt.status, head, receiptPath: file, receiptSha256: pointer.receiptSha256,
+    policy: { file: policy.file, sourceHead: policy.sourceHead, sha256: policy.sha256 },
+  };
 }
 
 function pages(value, key) {
@@ -747,8 +819,12 @@ export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, o
   if (!ancestor) fail('remote branch advanced independently; refusing non-fast-forward push');
   const hookPath = gitOutput(['-C', worktree, 'rev-parse', '--git-path', 'hooks'], gitFn).trim();
   if (!hookPath) fail('effective Git hook directory unavailable');
+  const verified = guard.verification;
+  const validatedPolicy = verified?.status === 'pass' && verified.head === validatedHead && verified.policy?.file && verified.policy?.sha256
+    ? { policyFile: verified.policy.file, policySha256: verified.policy.sha256 } : null;
   const hooks = createPushHooks({ worktree, originalHooks: path.resolve(worktree, hookPath),
-    home: guard.home, taskPath: guard.taskPath, head: validatedHead, ref: `refs/heads/${task.headRefName}`, gitBinary: GIT });
+    home: guard.home, taskPath: guard.taskPath, head: validatedHead, ref: `refs/heads/${task.headRefName}`, gitBinary: GIT,
+    validatedPolicy });
   try {
     gitOutput(['-C', worktree, '-c', `core.hooksPath=${hooks.dir}`, 'push', 'origin', `HEAD:refs/heads/${task.headRefName}`],
       gitFn, { env: guard.env ?? process.env });
@@ -786,7 +862,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot, validatedHead, verification });
   const beforePush = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
   if (beforePush.pr.headRefOid !== branchHead) fail('remote branch changed before push');
-  const push = pushIfNeeded(worktree, task, validatedHead, branchHead, gitFn, originUrl, { home, taskPath, env });
+  const push = pushIfNeeded(worktree, task, validatedHead, branchHead, gitFn, originUrl, { home, taskPath, env, verification });
   // Retrying finalize after a recorded push must preserve its ownership proof.
   const pushed = push.pushed || (branchHead === validatedHead && validatedHead !== task.headRefOid);
   let ci;

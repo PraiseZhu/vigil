@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import {
   cleanupWatch, clearOwnerUnknown, cloneWorktree, prepare, pushIfNeeded,
   repairPaths, shellQuote, watchBranchName, watchWorktreePath,
@@ -54,7 +55,7 @@ test('cloneWorktree uses git worktree add -B watch/pr-N under plugin repo', (t) 
   const result = cloneWorktree(repairPaths(home), task, gitFn, undefined, undefined, HEAD, { MIVO_PLUGIN_REPO: plugin });
   assert.equal(result.worktree, watchWorktreePath(plugin, 790));
   assert.ok(calls.some((args) => args.includes('worktree') && args.includes('add') && args.includes('-B') && args.includes('watch/pr-790')));
-  assert.ok(calls.some((args) => args[0] === '-C' && args[1] === plugin && args.includes('fetch')));
+  assert.ok(calls.some((args) => args[0] === '-C' && args[1] === plugin && args.includes('fetch') && args.includes('+refs/heads/fix/x:refs/remotes/origin/fix/x')));
 });
 
 test('pushIfNeeded pushes HEAD:refs/heads/<headRef>', (t) => {
@@ -191,4 +192,52 @@ test('prepare refuses a task superseded by the author reclaiming the PR', (t) =>
     activeTask: { dispatchId: 'live-790', status: 'blocked', blockedKind: 'author-reclaimed' } });
   const { ghFn, gitFn } = prepareFns(plugin, watchWorktreePath(plugin, 790));
   assert.throws(() => prepare({ home, taskPath, ghFn, gitFn }), /task superseded: the author reclaimed this PR/);
+});
+
+test('cloneWorktree can fetch a PR branch from a single-branch clone', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vigil-narrow-clone-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull };
+  const git = (...args) => execFileSync('git', args, {
+    encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'], env,
+  }).trim();
+  const origin = path.join(root, 'origin.git');
+  const seed = path.join(root, 'seed');
+  git('init', '--bare', origin);
+  git('init', '-b', 'main', seed);
+  git('-C', seed, 'config', 'user.name', 'Example User');
+  git('-C', seed, 'config', 'user.email', 'example@example.invalid');
+  fs.writeFileSync(path.join(seed, 'README.md'), 'main\n');
+  git('-C', seed, 'add', '.');
+  git('-C', seed, '-c', 'commit.gpgsign=false', 'commit', '-m', 'main');
+  git('-C', seed, 'remote', 'add', 'origin', origin);
+  git('-C', seed, 'push', 'origin', 'HEAD:refs/heads/main');
+  git('-C', seed, 'checkout', '-b', 'fix/portable');
+  fs.writeFileSync(path.join(seed, 'fix.txt'), 'portable\n');
+  git('-C', seed, 'add', '.');
+  git('-C', seed, '-c', 'commit.gpgsign=false', 'commit', '-m', 'fix');
+  git('-C', seed, 'push', 'origin', 'HEAD:refs/heads/fix/portable');
+  const expected = git('-C', seed, 'rev-parse', 'HEAD');
+  const plugin = path.join(root, 'plugin');
+  git('clone', '--single-branch', '--branch', 'main', origin, plugin);
+  const fetchBefore = git('-C', plugin, 'config', '--get-all', 'remote.origin.fetch');
+  assert.equal(fetchBefore, '+refs/heads/main:refs/remotes/origin/main');
+  assert.throws(() => git('-C', plugin, 'rev-parse', '--verify', 'origin/fix/portable'));
+  const task = { number: 42, headRefName: 'fix/portable', headRefOid: expected, repo: 'example-org/example-plugin' };
+  const gitFn = (_bin, args, options = {}) => execFileSync('git', args, {
+    encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'], ...options, env,
+  }).trim();
+  const first = cloneWorktree(repairPaths(path.join(root, 'home')), task, gitFn, origin, origin, expected, { MIVO_PLUGIN_REPO: plugin });
+  assert.equal(first.created, true);
+  assert.equal(first.head, expected);
+  assert.equal(git('-C', plugin, 'rev-parse', 'origin/fix/portable'), expected);
+  assert.equal(git('-C', first.worktree, 'symbolic-ref', '--short', 'HEAD'), 'watch/pr-42');
+  assert.equal(git('-C', first.worktree, 'config', '--get', 'branch.watch/pr-42.remote'), 'origin');
+  assert.equal(git('-C', first.worktree, 'config', '--get', 'branch.watch/pr-42.merge'), 'refs/heads/fix/portable');
+  assert.equal(git('-C', first.worktree, '-c', 'remote.origin.fetch=+refs/heads/fix/portable:refs/remotes/origin/fix/portable', 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'), 'origin/fix/portable');
+  assert.equal(git('-C', plugin, 'config', '--get-all', 'remote.origin.fetch'), fetchBefore);
+  const second = cloneWorktree(repairPaths(path.join(root, 'home')), task, gitFn, origin, origin, expected, { MIVO_PLUGIN_REPO: plugin });
+  assert.equal(second.created, false);
+  assert.equal(second.worktree, first.worktree);
+  assert.equal(git('-C', plugin, 'config', '--get-all', 'remote.origin.fetch'), fetchBefore);
 });
