@@ -424,7 +424,7 @@ test('dispatchParams message contains repair rules and old bans', () => {
     taskPath: '/tmp/task.json',
     home: '/tmp/home',
   }).message;
-  for (const needle of ['Orca Worker', 'routing.json', 'gpt-6.1-sol', 'grok-4.6', '最多 2 个顾问', 'archive_worker', 'gh run rerun', '--failed', '发生了什么', 'resolve', '不设轮次上限', 'git merge origin/main', 'CodeQL', 'Windows']) {
+  for (const needle of ['Orca Worker', 'routing.json', 'gpt-6.1-sol', 'grok-4.6', '最多 2 个顾问', 'archive_worker', 'gh run rerun', '--failed', '发生了什么', 'resolve', '不设轮次上限', 'git merge origin/main', 'CodeQL', 'Windows', 'purpose=adjudicate', 'adjudicate.when_lead.codex ?? adjudicate', 'adjudicate-skipped:']) {
     assert.match(message, new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
   assert.doesNotMatch(message, /禁止 create_worker|不要用 Orca Worker/, 'review and e2e must be allowed to use Orca Workers');
