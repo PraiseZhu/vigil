@@ -8,7 +8,8 @@ import {
   classifyReviewFeedback, feedbackItems, newFeedback, dispatchParams, constrainRetryDispatch, scanOnce, watcherPaths, REPO,
 } from './bin/mivo-watcher.mjs';
 import { writePr } from './bin/mivo-state.mjs';
-import { command, ciResult } from './bin/mivo-repair.mjs';
+import { command, ciResult, preflightTimeoutMs } from './bin/mivo-repair.mjs';
+import { _resetProfileCacheForTests } from './bin/profile.mjs';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -427,6 +428,12 @@ test('dispatchParams message contains repair rules and old bans', () => {
     assert.match(message, new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
   assert.doesNotMatch(message, /禁止 create_worker|不要用 Orca Worker/, 'review and e2e must be allowed to use Orca Workers');
+  assert.match(message, /start_team\(\{worker_permission_mode:"bypassPermissions"\}\)/);
+  assert.match(message, /missing-routing/);
+  assert.match(message, /本机缺 routing\.json 或开不了 Orca Worker 时不 blocked/);
+  assert.match(message, /不要改用原生子代理/);
+  assert.match(message, /required CI、服务器审查要求不豁免/);
+  assert.doesNotMatch(message, /开不了 Orca（没有工具或调用报错）才 blocked/);
   assert.match(message, /^OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY$/m);
   assert.match(message, /Do not merge/);
   assert.match(message, /auto-merge/);
@@ -538,6 +545,30 @@ test('command other git and gh timeout is 120000ms', () => {
   command('gh', ['pr', 'view', '1'], {}, (_bin, _args, options) => { ghSeen = options; return ''; });
   assert.equal(gitSeen.timeout, 120_000);
   assert.equal(ghSeen.timeout, 120_000);
+});
+
+test('command git push timeout follows env then profile, and explicit timeout still wins', (t) => {
+  let seen;
+  command('git', ['push', 'origin', 'HEAD'], { env: { ...process.env, MIVO_PREFLIGHT_TIMEOUT_MINUTES: '90' } }, (_bin, _args, options) => { seen = options; return ''; });
+  assert.equal(seen.timeout, 5_400_000);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-timeout-home-'));
+  t.after(() => { fs.rmSync(home, { recursive: true, force: true }); _resetProfileCacheForTests(); });
+  fs.mkdirSync(path.join(home, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'config', 'profile.json'), JSON.stringify({ preflightTimeoutMinutes: 45 }));
+  const env = { ...process.env, MIVO_WATCHER_HOME: home };
+  delete env.MIVO_PREFLIGHT_TIMEOUT_MINUTES;
+  _resetProfileCacheForTests();
+  command('git', ['push', 'origin', 'HEAD'], { env }, (_bin, _args, options) => { seen = options; return ''; });
+  assert.equal(seen.timeout, 2_700_000);
+  command('git', ['push', 'origin', 'HEAD'], { timeout: 12_000, env: { ...process.env, MIVO_PREFLIGHT_TIMEOUT_MINUTES: '90' } }, (_bin, _args, options) => { seen = options; return ''; });
+  assert.equal(seen.timeout, 12_000);
+});
+test('illegal preflight timeout does not fall back', () => {
+  const env = { ...process.env, MIVO_PREFLIGHT_TIMEOUT_MINUTES: '0' };
+  assert.throws(() => preflightTimeoutMs(env), /preflightTimeoutMinutes/);
+  assert.throws(() => command('git', ['push', 'origin', 'HEAD'], { env }, () => ''), /preflightTimeoutMinutes/);
+  assert.throws(() => preflightTimeoutMs({ ...process.env, MIVO_PREFLIGHT_TIMEOUT_MINUTES: 'abc' }), /preflightTimeoutMinutes/);
+  assert.throws(() => preflightTimeoutMs({ ...process.env, MIVO_PREFLIGHT_TIMEOUT_MINUTES: '-1' }), /preflightTimeoutMinutes/);
 });
 
 test('P3-only dispatch carries explicit no-code policy and does not instruct automatic resolution', () => {

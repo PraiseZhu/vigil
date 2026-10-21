@@ -243,7 +243,7 @@ test('default dispatch message is the v3 flow: fixed run_id, decide first, no ps
   assert.match(message, /keel-unavailable/);
   assert.doesNotMatch(message, /pstack_ledger/);
   assert.doesNotMatch(message, /pstack_start\(/);
-  assert.doesNotMatch(message, /start_team/);
+  assert.match(message, /start_team\(\{worker_permission_mode:"bypassPermissions"\}\)/);
   // the tools that would spawn a worktree or a graph run are named only to be forbidden
   assert.match(message, /不要调用 pstack_start、keel_run、keel_report、keel_wait、keel_gate、keel_status/);
 });
