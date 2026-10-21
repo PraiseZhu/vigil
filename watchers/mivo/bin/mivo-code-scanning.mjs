@@ -86,7 +86,9 @@ function mergeCommitProven(commits, { headSha, baseSha, mergeCommitSha }) {
   if (!mergeCommitSha || !sha(mergeCommitSha)) return false;
   const commit = commits?.[mergeCommitSha] ?? commits?.find?.((item) => item.sha === mergeCommitSha);
   const parents = (commit?.parents ?? []).map((item) => item.sha ?? item);
-  return parents.includes(headSha) && (!baseSha || parents.includes(baseSha));
+  // GitHub re-creates refs/pull/N/merge against the moving base, so the base parent need not equal
+  // the PR's recorded base; a two-parent merge of the current head is what binds it.
+  return parents.length >= 2 && parents.includes(headSha);
 }
 
 export function evaluateCodeScanning({
@@ -186,6 +188,18 @@ export function* collectCodeScanningSteps({ pr, policy, ghFn, mergeCommitSha = n
     const alerts = slurp(yield () => ghFn([
       'api', `repos/${pr.repo}/code-scanning/alerts?pr=${pr.number}&per_page=100&state=open`, '--paginate', '--slurp',
     ]), 'code-scanning alerts');
+    // Default CodeQL analyses refs/pull/N/merge; bind the newest merge commit whose parents include the head.
+    if (!mergeCommitSha) {
+      const mergeRef = new RegExp(`^refs/pull/${Number(pr.number)}/merge$`);
+      const candidates = [...new Set(analyses.filter((analysis) => mergeRef.test(String(analysis?.ref ?? ''))
+        && sha(analysis.commit_sha) && analysis.commit_sha !== pr.headRefOid).map((analysis) => analysis.commit_sha))];
+      commits = { ...commits };
+      for (const candidate of candidates) {
+        const commit = parse(yield () => ghFn(['api', `repos/${pr.repo}/commits/${candidate}`]));
+        commits[candidate] = { parents: (commit?.parents ?? []).map((item) => item?.sha ?? item) };
+        if (commits[candidate].parents.includes(pr.headRefOid)) { mergeCommitSha = candidate; break; }
+      }
+    }
     const instances = {};
     for (const alert of alerts) {
       if (!alert?.number) continue;

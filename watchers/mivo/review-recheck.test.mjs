@@ -91,3 +91,10 @@ test('requestReviewRecheck uses empty prev_run_id and does not write on dry-run'
   assert.equal(sent.action.reason, 'sent');
   assert.ok(liveCalls.some((line) => line.includes('workflow run review-pr.yml') && line.includes('prev_run_id=') && line.includes('mode=live')));
 });
+
+test('attempts later marked failed still count toward the per-head cap', () => {
+  const entry = { reviewRechecks: { [HEAD]: { attempts: [
+    { key: 'k1', resultReceiptId: 'old1', status: 'failed' }, { key: 'k2', resultReceiptId: 'old2', status: 'failed' },
+  ] } } };
+  assert.equal(planReviewRecheck({ snapshot: snapshot(), entry, task: task(), result: result({ receiptId: 'fresh' }), observed }).reason, 'review-recheck-limit');
+});

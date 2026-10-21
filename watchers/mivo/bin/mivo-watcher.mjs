@@ -1737,6 +1737,9 @@ export function* processPr({
     // so it isn't silently dropped by this reassignment.
     ...base, autoClosedThreads: previous.autoClosedThreads ?? base.autoClosedThreads,
     mergeReadyHead: previous.mergeReadyHead ?? base.mergeReadyHead,
+    // reconcileBaseUpdate / reconcileReviewRecheck / migrateMemberFeedbackCursor above wrote into `previous`.
+    baseUpdate: previous.baseUpdate ?? base.baseUpdate, reviewRechecks: previous.reviewRechecks ?? base.reviewRechecks,
+    memberFeedbackVersion: previous.memberFeedbackVersion ?? base.memberFeedbackVersion,
     labels: collected.labels ?? [], mergeReady: collected.mergeReady === true,
     reviewReason: collected.reviewReason ?? null, reviewEvidence: collected.reviewEvidence ?? null,
     admissionVerified: admitted, admissionReason: collected.admissionReason ?? previous.admissionReason ?? null,

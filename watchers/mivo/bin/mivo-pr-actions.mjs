@@ -239,7 +239,8 @@ export function planReviewRecheck({ snapshot, entry, task, result, observed = []
   if (log.attempts.some((item) => item.resultReceiptId === result.receiptId || (item.findingDigest === digestValue && item.resultReceiptId === (result.receiptId ?? result.dispatchId)))) {
     return { eligible: false, reason: 'same-result' };
   }
-  const sent = (log.attempts ?? []).filter((item) => ['reserved', 'sent', 'uncertain', 'bound'].includes(item.status));
+  // Every attempt counts, including ones reconcileReviewRecheck later marks failed: the cap is per head.
+  const sent = log.attempts ?? [];
   if (sent.length >= REVIEW_RECHECK_LIMIT) return { eligible: false, reason: 'review-recheck-limit' };
   if (sent.length === 1 && !result.receiptId) return { eligible: false, reason: 'second-requires-new-result' };
   return {

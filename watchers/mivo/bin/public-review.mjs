@@ -73,7 +73,9 @@ function runIdOf(check) {
 }
 
 function handledComment(comment, handledFeedback, head) {
-  const records = Array.isArray(handledFeedback) ? handledFeedback : Object.values(handledFeedback ?? {});
+  // replyToMemberFeedback stores receipts keyed by feedback key (`comment:<id>`); keep that key.
+  const records = Array.isArray(handledFeedback) ? handledFeedback
+    : Object.entries(handledFeedback ?? {}).map(([key, record]) => (record ? { key, ...record } : record));
   const id = String(comment.id ?? comment.node_id ?? '');
   const keys = [`comment:${id}`, `review:${id}`];
   const body = comment.body ?? '';

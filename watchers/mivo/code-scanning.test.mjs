@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluateCodeScanning, mergeCodeScanningRules, codeScanningFeedbackItems } from './bin/mivo-code-scanning.mjs';
+import { evaluateCodeScanning, mergeCodeScanningRules, codeScanningFeedbackItems, collectCodeScanningSteps } from './bin/mivo-code-scanning.mjs';
 import { feedbackRepairPolicy } from './bin/mivo-feedback-policy.mjs';
 import { collectMivoPolicySync } from './bin/mivo-pr-policy.mjs';
 import { policyCiResult } from './bin/mivo-repair.mjs';
@@ -101,4 +101,19 @@ test('policy collector records code scanning rules and scanning failures block h
   }, HEAD);
   assert.equal(ci.requiredGreen, false);
   assert.ok(ci.requiredChecks.some((item) => item.kind === 'code-scanning' && item.bucket === 'fail' && item.runId == null));
+});
+
+test('collectCodeScanningSteps binds the default refs/pull/N/merge analysis through the merge commit parents', () => {
+  const MERGE = 'c'.repeat(40);
+  const ghFn = (args) => {
+    const url = args[1];
+    if (url.includes('/code-scanning/analyses')) return JSON.stringify([[analysis({ ref: 'refs/pull/7/merge', commit_sha: MERGE })]]);
+    if (url.includes('/code-scanning/alerts')) return JSON.stringify([[]]);
+    if (url.endsWith(`/commits/${MERGE}`)) return JSON.stringify({ sha: MERGE, parents: [{ sha: 'd'.repeat(40) }, { sha: HEAD }] });
+    throw new Error(`unexpected ${url}`);
+  };
+  const gen = collectCodeScanningSteps({ pr: { repo: REPO, number: 7, headRefOid: HEAD, baseRefOid: BASE }, policy, ghFn });
+  let step = gen.next();
+  while (!step.done) step = gen.next(step.value());
+  assert.equal(step.value.status, 'green');
 });

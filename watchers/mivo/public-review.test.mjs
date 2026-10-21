@@ -101,3 +101,10 @@ test('non-main base is never base-update eligible', () => {
   const v = evaluatePublicReview(f);
   assert.equal(v.baseUpdateEligible, false);
 });
+test('a member comment already answered for this head does not count as new feedback', () => {
+  const s = fixture();
+  s.snapshot.comments.push({ id: 15, user: { login: 'teammate' }, created_at: '2026-09-10T00:12:00Z', body: 'please rename this' });
+  assert.equal(evaluatePublicReview(s).reason, 'new-feedback');
+  const handledFeedback = { 'comment:15': { resultHead: h, replyCommentId: 99, actionKey: 'x' } };
+  assert.equal(evaluatePublicReview({ ...s, handledFeedback }).ready, true);
+});

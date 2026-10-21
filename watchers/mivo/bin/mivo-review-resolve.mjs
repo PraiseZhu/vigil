@@ -255,6 +255,7 @@ export function* replyToMemberFeedback({ items = [], comments = [], actor, repo,
     if (handled[item.key]?.actionKey === actionKey && handled[item.key].replyCommentId) continue;
     if (existing) {
       handled[item.key] = {
+        key: item.key, nativeId: item.nativeId ?? null,
         policyVersion: FEEDBACK_POLICY_VERSION, contentHash: item.contentHash ?? null, disposition: item.disposition,
         sourceHead: item.sourceHead ?? null, resultHead: head, dispatchId: item.dispatchId, receiptId: item.receiptId ?? null,
         replyCommentId: existing.id, actionKey, repliedAt: now,
@@ -268,6 +269,7 @@ export function* replyToMemberFeedback({ items = [], comments = [], actor, repo,
       const raw = yield () => ghFn(['api', '-X', 'POST', `repos/${repo}/issues/${number}/comments`, '-f', `body=${body}`]);
       const created = typeof raw === 'string' ? JSON.parse(raw) : raw;
       handled[item.key] = {
+        key: item.key, nativeId: item.nativeId ?? null,
         policyVersion: FEEDBACK_POLICY_VERSION, contentHash: item.contentHash ?? null, disposition: item.disposition,
         sourceHead: item.sourceHead ?? null, resultHead: head, dispatchId: item.dispatchId, receiptId: item.receiptId ?? null,
         replyCommentId: created.id, actionKey, repliedAt: now,
