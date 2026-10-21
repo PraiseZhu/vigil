@@ -57,17 +57,18 @@ test('human veto, greptile-only, and missing tier do not recheck', () => {
   assert.equal(planReviewRecheck({ snapshot: snapshot({ reviewEvidence: { ...snapshot().reviewEvidence, tier: null } }), entry: {}, task: task(), result: result(), observed }).reason, 'review-tier-unknown');
 });
 
-test('each head is capped at two dispatches and the same result cannot spend a second quota', () => {
+test('no per-head cap, but the same result cannot ask twice', () => {
   const entry = { reviewRechecks: { [HEAD]: { attempts: [{ key: 'k1', resultReceiptId: 'rcpt-1', findingDigest: 'x', status: 'sent' }] } } };
   assert.equal(planReviewRecheck({ snapshot: snapshot(), entry, task: task(), result: result(), observed }).eligible, false);
   const other = { reviewRechecks: { [HEAD]: { attempts: [{ key: 'k1', resultReceiptId: 'other', findingDigest: 'x', status: 'sent' }, { key: 'k2', resultReceiptId: 'other2', status: 'sent' }] } } };
-  assert.equal(planReviewRecheck({ snapshot: snapshot(), entry: other, task: task(), result: result({ receiptId: 'fresh' }), observed }).reason, 'review-recheck-limit');
+  assert.equal(planReviewRecheck({ snapshot: snapshot(), entry: other, task: task(), result: result({ receiptId: 'fresh' }), observed }).eligible, true);
 });
 
 test('requestReviewRecheck uses empty prev_run_id and does not write on dry-run', () => {
   const calls = [];
   const ghFn = (args) => {
     calls.push(args);
+    if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [{ isResolved: true }], pageInfo: { hasNextPage: false } } } } } });
     if (args[1]?.includes('workflows/review-pr.yml') && !args.includes('workflow')) return JSON.stringify({ path: '.github/workflows/review-pr.yml', state: 'active' });
     if (args[1]?.includes('MIVO_REVIEW_MODE')) return JSON.stringify({ name: 'MIVO_REVIEW_MODE', value: 'live' });
     if (args[1]?.includes('actions/runs')) return JSON.stringify({ workflow_runs: [] });
@@ -92,9 +93,36 @@ test('requestReviewRecheck uses empty prev_run_id and does not write on dry-run'
   assert.ok(liveCalls.some((line) => line.includes('workflow run review-pr.yml') && line.includes('prev_run_id=') && line.includes('mode=live')));
 });
 
-test('attempts later marked failed still count toward the per-head cap', () => {
-  const entry = { reviewRechecks: { [HEAD]: { attempts: [
-    { key: 'k1', resultReceiptId: 'old1', status: 'failed' }, { key: 'k2', resultReceiptId: 'old2', status: 'failed' },
-  ] } } };
-  assert.equal(planReviewRecheck({ snapshot: snapshot(), entry, task: task(), result: result({ receiptId: 'fresh' }), observed }).reason, 'review-recheck-limit');
+test('many earlier attempts on the same head do not block a new result', () => {
+  const attempts = Array.from({ length: 5 }, (_, i) => ({ key: `k${i}`, resultReceiptId: `old${i}`, status: i % 2 ? 'failed' : 'sent' }));
+  const entry = { reviewRechecks: { [HEAD]: { attempts } } };
+  assert.equal(planReviewRecheck({ snapshot: snapshot(), entry, task: task(), result: result({ receiptId: 'fresh' }), observed }).eligible, true);
 });
+
+function recheckGh({ threads = [{ isResolved: true }], hasNextPage = false, calls = [] } = {}) {
+  return (args) => {
+    calls.push(args.join(' '));
+    if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: threads, pageInfo: { hasNextPage } } } } } });
+    if (args[1]?.includes('workflows/review-pr.yml') && !args.includes('workflow')) return JSON.stringify({ path: '.github/workflows/review-pr.yml', state: 'active' });
+    if (args[1]?.includes('MIVO_REVIEW_MODE')) return JSON.stringify({ name: 'MIVO_REVIEW_MODE', value: 'live' });
+    if (args[1]?.includes('actions/runs')) return JSON.stringify({ workflow_runs: [] });
+    return '';
+  };
+}
+
+for (const [name, opts] of [['an open conversation', { threads: [{ isResolved: true }, { isResolved: false }] }], ['an unreadable second page', { hasNextPage: true }]]) {
+  test(`${name} makes the recheck wait without dispatching or recording an attempt`, () => {
+    const calls = [];
+    const ghFn = recheckGh({ ...opts, calls });
+    let saved = 0;
+    const res = run(requestReviewRecheck({
+      pr: snapshot().pr, snapshot: snapshot(), entry: {}, task: task(), result: result(), observed, ghFn,
+      ownershipSnapshot: function* () { return { pr: snapshot().pr }; }, save: () => { saved += 1; }, now, dryRun: false, viewer: 'owner', repo: 'example-org/example-plugin',
+    }), ghFn);
+    assert.equal(res.action.reason, 'threads-unresolved');
+    assert.equal(res.action.attempted, false);
+    assert.equal(saved, 0);
+    assert.equal(res.entry.reviewRechecks, undefined);
+    assert.ok(!calls.some((line) => line.startsWith('workflow run')));
+  });
+}
