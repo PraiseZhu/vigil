@@ -735,10 +735,20 @@ function legacyCheckStatus(task, head, ghFn) {
 }
 
 export function policyCiResult(ci, head) {
-  return {head, requiredGreen:ci.status === 'green', policyHash:ci.policyHash,
-    requiredChecks:(ci.required??[]).map(r=>({name:r.context,bucket:r.status==='green'?'pass':r.status==='failed'?'fail':'pending',headSha:head,runId:r.evidence?.runId ?? null,evidence:r.evidence})),
-    optionalFailures:[],pending:(ci.required??[]).filter(r=>r.status==='pending').map(r=>r.context),
-    missing:ci.status==='unknown'?[ci.reason??'required-policy-unknown']:[]};
+  const requiredChecks=(ci.required??[]).map(r=>({name:r.context,bucket:r.status==='green'?'pass':r.status==='failed'?'fail':'pending',headSha:head,runId:r.evidence?.runId ?? null,evidence:r.evidence,kind:r.kind ?? 'check'}));
+  const scanning = ci.codeScanning;
+  if (scanning && scanning.status && scanning.status !== 'not-required') {
+    const bucket = scanning.status === 'green' ? 'pass' : scanning.status === 'failed' ? 'fail' : scanning.status === 'pending' ? 'pending' : 'pending';
+    requiredChecks.push({
+      name: 'code-scanning', bucket, headSha: head, runId: null, kind: 'code-scanning',
+      evidence: { kind: 'code-scanning', sha: head, alerts: scanning.blockingAlerts ?? [], reason: scanning.reason },
+    });
+  }
+  const pending = requiredChecks.filter(r=>r.bucket==='pending').map(r=>r.name);
+  const missing = ci.status==='unknown' || scanning?.status==='unknown'
+    ? [ci.reason ?? scanning?.reason ?? 'required-policy-unknown'] : [];
+  const requiredGreen = requiredChecks.length > 0 && requiredChecks.every(r=>r.bucket==='pass') && !missing.length;
+  return {head, requiredGreen, policyHash:ci.policyHash, requiredChecks, optionalFailures:[], pending, missing};
 }
 function checkStatus(task, head, ghFn) {
   const pr=ghJson(['pr','view',String(task.number),'--repo',task.repo,'--json','id,number,state,isDraft,headRefOid,baseRefOid,baseRefName'],ghFn);

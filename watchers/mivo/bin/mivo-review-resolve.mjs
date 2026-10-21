@@ -1,4 +1,6 @@
-import { TRIAGE_REASONS } from './mivo-feedback-policy.mjs';
+import { createHash } from 'node:crypto';
+import { TRIAGE_REASONS, taskRepairPolicy, FEEDBACK_POLICY_VERSION } from './mivo-feedback-policy.mjs';
+const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 // Autonomous P3 review-thread closure. No human notification, no session dispatch.
 // Eligibility is entirely derived from the existing policy layer:
@@ -207,3 +209,91 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
   }
   return { previous: { ...previous, autoClosedThreads: closedThreads }, closed: results };
 }
+const MEMBER_ITEM_KEY = /^(?:review|comment):/;
+export function completedMemberFeedback(result, task) {
+  if (result?.schemaVersion !== 2 || result.dispatchId !== task?.dispatchId) return [];
+  if (task.repairPolicy?.policyVersion !== FEEDBACK_POLICY_VERSION && Number(task.repairPolicy?.policyVersion ?? 0) < 2) return [];
+  const policy = taskRepairPolicy(task);
+  const items = [];
+  for (const { key, disposition } of result.feedbackCoverage?.dispositions ?? []) {
+    if (!MEMBER_ITEM_KEY.test(key ?? '')) continue;
+    const row = policy.items.find((item) => item.key === key);
+    if (!row || !['code-fix', 'reply-only'].includes(row.action)) continue;
+    const scStatus = disposition === 'fixed' ? 'pass' : 'no-change';
+    if (disposition !== 'fixed' && disposition !== 'no-change') continue;
+    const evidence = (result.scs ?? []).filter((sc) => sc.status === scStatus && sc.feedbackKeys?.includes(key))
+      .flatMap((sc) => sc.evidence ?? []).filter((line) => typeof line === 'string' && line.trim());
+    if (!evidence.length) continue;
+    items.push({ key, disposition, evidence, kind: disposition === 'fixed' ? 'fixed' : 'refuted', triage: TRIAGE_REASONS.has(row.reason) });
+  }
+  return items;
+}
+export function coveredFeedbackItems(items = [], observed = [], task = {}, result = null) {
+  const taskItems = new Map((task?.feedback ?? []).filter((item) => typeof item?.key === 'string').map((item) => [item.key, item]));
+  if (!items.length) return [];
+  return items.filter((item) => {
+    const current = observed.find((other) => `${other.source}:${other.nativeId}` === item.key || other.key === item.key);
+    if (!current || !taskItems.has(item.key)) return false;
+    return sameFeedbackContent(taskItems.get(item.key), current);
+  });
+}
+export function memberReplyText(item, { url, head } = {}) {
+  const evidence = item.evidence ?? [];
+  const body = item.kind === 'fixed' ? fixedReplyText(evidence, head, item.dispatchId) : item.triage ? triagedReplyText(evidence, item.dispatchId) : refutedReplyText(evidence, item.dispatchId);
+  const cite = url ? `原始意见：${url}\n\n` : '';
+  const actionKey = item.actionKey ?? digest([item.key, item.contentHash, head, item.disposition]);
+  return `${cite}${body.replace('<!-- mivo-watcher-receipt', `<!-- mivo-watcher-receipt actionKey=${actionKey} head=${head ?? ''} `)}`;
+}
+export function* replyToMemberFeedback({ items = [], comments = [], actor, repo, number, ghFn, now, head, previous = {} }) {
+  const handled = { ...(previous.handledFeedback ?? {}) };
+  const pending = [...(previous.pendingFeedbackReplies ?? [])];
+  const posted = [];
+  for (const item of items) {
+    const actionKey = digest([item.key, item.contentHash ?? item.key, head, item.disposition]);
+    const marker = `actionKey=${actionKey}`;
+    const existing = comments.find((comment) => (comment.body ?? '').includes(marker) && (!actor || (comment.user?.login ?? comment.author?.login) === actor));
+    if (handled[item.key]?.actionKey === actionKey && handled[item.key].replyCommentId) continue;
+    if (existing) {
+      handled[item.key] = {
+        policyVersion: FEEDBACK_POLICY_VERSION, contentHash: item.contentHash ?? null, disposition: item.disposition,
+        sourceHead: item.sourceHead ?? null, resultHead: head, dispatchId: item.dispatchId, receiptId: item.receiptId ?? null,
+        replyCommentId: existing.id, actionKey, repliedAt: now,
+      };
+      posted.push({ key: item.key, commentId: existing.id, reused: true });
+      continue;
+    }
+    const body = memberReplyText({ ...item, actionKey }, { url: item.url, head });
+    pending.push({ key: item.key, actionKey, status: 'pending', at: now, head });
+    try {
+      const raw = yield () => ghFn(['api', '-X', 'POST', `repos/${repo}/issues/${number}/comments`, '-f', `body=${body}`]);
+      const created = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      handled[item.key] = {
+        policyVersion: FEEDBACK_POLICY_VERSION, contentHash: item.contentHash ?? null, disposition: item.disposition,
+        sourceHead: item.sourceHead ?? null, resultHead: head, dispatchId: item.dispatchId, receiptId: item.receiptId ?? null,
+        replyCommentId: created.id, actionKey, repliedAt: now,
+      };
+      posted.push({ key: item.key, commentId: created.id, reused: false });
+    } catch (error) {
+      pending[pending.length - 1] = { ...pending[pending.length - 1], status: 'uncertain', error: String(error.message).slice(0, 400) };
+    }
+  }
+  return { previous: { ...previous, handledFeedback: handled, pendingFeedbackReplies: pending.filter((item) => item.status !== 'pending' || !handled[item.key]) }, posted };
+}
+export function* requestMemberReviewers({ repo, number, reviewers, ghFn, previous = {}, now, resultHead, reviewId }) {
+  const pending = [...(previous.pendingMemberRereview ?? [])];
+  const requested = [];
+  for (const login of [...new Set(reviewers.filter(Boolean))]) {
+    const key = `${login}:${reviewId ?? ''}:${resultHead}`;
+    if (pending.some((item) => item.key === key && ['pending', 'done'].includes(item.status))) continue;
+    pending.push({ key, login, status: 'pending', at: now, resultHead, reviewId });
+    try {
+      yield () => ghFn(['api', '-X', 'POST', `repos/${repo}/pulls/${number}/requested_reviewers`, '-f', `reviewers[]=${login}`]);
+      pending[pending.length - 1] = { ...pending[pending.length - 1], status: 'done' };
+      requested.push(login);
+    } catch (error) {
+      pending[pending.length - 1] = { ...pending[pending.length - 1], status: 'failed', error: String(error.message).slice(0, 400) };
+    }
+  }
+  return { previous: { ...previous, pendingMemberRereview: pending }, requested };
+}
+

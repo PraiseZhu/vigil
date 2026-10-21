@@ -1,7 +1,7 @@
 // Local repair authority. Comment bodies are evidence, never standing permission.
 // Pure and bounded: callers provide an already-collected feedback item and HEAD.
 import {verifiedLifelineFeedback} from './mivo-lifeline-source.mjs';
-export const FEEDBACK_POLICY_VERSION = 1;
+export const FEEDBACK_POLICY_VERSION = 2;
 const INFRA = new Set(['INCOMPLETE', 'CI-NOT-GREEN', 'SKIP-LLM', 'SKIP-LOCAL', 'REFUSE', 'WINDOW-CLOSED', 'PARSE-FAILED', 'HELPERS-MISSING', 'UNHEALTHY']);
 const aliases = { P0: 'P0', CRITICAL: 'P0', P1: 'P1', HIGH: 'P1', P2: 'P2', MEDIUM: 'P2', P3: 'P3', LOW: 'P3' };
 const TOKEN = '(P[0-3]|CRITICAL|HIGH|MEDIUM|LOW)';
@@ -31,12 +31,17 @@ function trustedReviewer(item) {
 // author included). Its body still grants nothing: the repair session grades it on the unified severity
 // scale, only a confirmed P0/P1/P2 changes code, P3 is answered with evidence and resolved.
 const MEMBER_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
-export function isMemberThread(item) {
+export function isMemberFeedback(item) {
   const author = item?.user ?? item?.author;
   const login = typeof author === 'string' ? author : author?.login;
   const bot = /\[bot\]$/i.test(String(login ?? '')) || author?.__typename === 'Bot' || author?.type === 'Bot';
-  return typeof item?.threadId === 'string' && item.threadId.length > 0 && !bot && typeof login === 'string'
+  const sourceOk = item?.source === 'review' || item?.source === 'comment'
+    || (item?.source === 'thread' && typeof item?.threadId === 'string' && item.threadId.length > 0);
+  return sourceOk && !bot && typeof login === 'string'
     && MEMBER_ASSOCIATIONS.has(String(item.authorAssociation ?? '').toUpperCase());
+}
+export function isMemberThread(item) {
+  return isMemberFeedback(item) && typeof item?.threadId === 'string' && item.threadId.length > 0;
 }
 const isGreptileSummary = body => /<!--\s*greptile_summary\s*-->/i.test(body);
 function visibleLines(body) {
@@ -88,7 +93,7 @@ function isGreptileItem(item) {
   return item.source === 'greptile' || isGreptileAuthor(item.user ?? item.author);
 }
 // Feedback whose severity the repair session re-grades on the unified scale before changing code.
-export const TRIAGE_REASONS = new Set(['member-thread-triage', 'greptile-p1-triage', 'thread-triage']);
+export const TRIAGE_REASONS = new Set(['member-thread-triage', 'member-feedback-triage', 'greptile-p1-triage', 'thread-triage']);
 
 function itemRepairPolicy(item = {}, { headSha } = {}) {
   if (!item || typeof item !== 'object') return result('needs-triage', [], 'invalid-feedback');
@@ -97,9 +102,16 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
   if (item.source === 'lifeline-doctor') return verifiedLifelineFeedback(item,{headSha})
     ? result('code-fix',[item.doctor.severity],'verified-local-doctor-classification')
     : result('needs-triage',[],'doctor-handoff-not-verified');
-  if (item.source === 'ci' || item.source === 'conflict') {
+  if (item.source === 'ci' || item.source === 'conflict' || item.source === 'code-scanning') {
     if (!headSha || item.sha !== headSha) return result('needs-triage', [], 'unbound-head');
     if (item.source === 'conflict') return result('conflict-fix', [], 'current-merge-conflict');
+    if (item.source === 'code-scanning') {
+      const proof = item.codeScanningFailure;
+      if (!proof || proof.verified !== true || proof.status !== 'failed' || proof.headSha !== headSha) {
+        return result('needs-triage', [], 'invalid-code-scanning-evidence');
+      }
+      return result('required-ci-fix', [], 'verified-code-scanning-failure');
+    }
     const proof = item.requiredFailure;
     if (proof && (proof.verified !== true || proof.status !== 'failed' || proof.headSha !== headSha)) {
       return result('needs-triage', [], 'invalid-required-ci-evidence');
@@ -109,7 +121,9 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
     return result('required-ci-fix', [], proof ? 'verified-required-ci-failure' : 'legacy-required-ci-failure');
   }
   if (!trustedReviewer(item)) {
-    return isMemberThread(item) ? result('code-fix', [], 'member-thread-triage') : result('needs-triage', [], 'unverified-review-source');
+    if (isMemberThread(item)) return result('code-fix', [], 'member-thread-triage');
+    if (isMemberFeedback(item)) return result('code-fix', [], 'member-feedback-triage');
+    return result('needs-triage', [], 'unverified-review-source');
   }
   const body = String(item.body ?? '');
   if (body.length > 256 * 1024) return result('needs-triage', [], 'feedback-too-large');
