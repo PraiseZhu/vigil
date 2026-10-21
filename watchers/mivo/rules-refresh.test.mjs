@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { applyDispatchReceipt, dispatchParams, normalizePollSnapshot, pollFingerprint, rulesHeader, rulesVersion, rulesVersionOf, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
+import { applyDispatchReceipt, dispatchParams, normalizePollSnapshot, pollFingerprint, rulesHeader, rulesRefreshMessage, rulesVersion, rulesVersionOf, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
 import { readPr, writePr } from './bin/mivo-state.mjs';
 import { handoffReceipt } from './handoff.fixture.mjs';
 
@@ -127,4 +127,14 @@ test('a refresh that fails is retried at most three times per rules version', (t
   assert.equal(entry.rulesVersion, undefined);
   assert.deepEqual([entry.rulesRefresh.version, entry.rulesRefresh.attempts], [rulesVersion(), 3]);
   assert.match(entry.rulesRefresh.error, /host busy/);
+});
+
+test('a real dispatch carries optional worker skip; refresh does not start a team', () => {
+  const { message } = dispatchParams({ pr: { number: 7, id: 'PR_7', headRefOid: HEAD, title: 't' }, mapping: {}, fresh: [],
+    now: '2026-10-16T00:00:00Z', taskPath: '/h/state/tasks/x.json', home: '/h' });
+  assert.match(message, /start_team\(\{worker_permission_mode:"bypassPermissions"\}\)/);
+  assert.match(message, /missing-routing/);
+  const refresh = rulesRefreshMessage(rulesVersion());
+  assert.doesNotMatch(refresh, /start_team/);
+  assert.match(refresh, /这不是新任务/);
 });

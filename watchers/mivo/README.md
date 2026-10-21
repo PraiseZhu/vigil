@@ -52,10 +52,13 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 |---|---|---|
 | `watchHomes` | `MIVO_WATCHER_WATCH_HOMES`（逗号分隔） | `[]`（不内置任何路径） |
 | `lifelineConfigPath` | `MIVO_WATCHER_LIFELINE_CONFIG` | 未配置时不接收本地 Doctor 任务 |
+| `preflightTimeoutMinutes` | `MIVO_PREFLIGHT_TIMEOUT_MINUTES` | `60`。只接受大于 0 的有限数字或非空十进制字符串；换算毫秒后须为不超过 2147483647 的安全整数。非法值直接报错，不静默回退。env 优先于 profile。validate 的 `npm ci`（如需）与仓库预检、以及未复用收据时的 `git push` 都用此时限；两阶段各自独立计时，不共享一笔总预算。显式 `options.timeout` 仍然优先。 |
 
 拷一份 [`config/examples/mivo.profile.example.json`](../../config/examples/mivo.profile.example.json)
 到你的 watcher home 下的 `config/profile.json`，把占位值换成真实路径即可。`config/profile.json`
 已在 `.gitignore` 里排除，不会被提交。
+
+普通 `validate` 在跑仓库预检前，若工作树没有 `node_modules` 且 `package-lock.json` 是普通文件，会先执行 `npm ci`。安装失败或超时不写 PASS 收据、也不启动预检。已有 `node_modules` 或没有 lockfile 时不调用 npm。`approved-exception` 路径不自动安装、不跑预检。
 
 `lifelineConfigPath` 可连接同一目标仓的本地生命线 Doctor。配置必须由操作者提供绝对路径；
 配置中的 `repo` 要与 `targetRepo` 相同，授权须为确认 P0/P1 的修复并允许 push。
@@ -117,7 +120,7 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 - Greptile、审查账号的 P3：watcher 直接回复说明并 resolve，不开会话。P2 只走行内 finding，不从 Greptile 汇总评论派修复。
 - 仓库成员（OWNER/MEMBER/COLLABORATOR，含作者本人）留的 review thread（`member-thread-triage`），以及严重度读不出、来源未核验的其他未解决 thread（`thread-triage`，含仓外人员和其他机器人）：交修复会话按统一分级判定，确认 P0/P1/P2 才改代码；P3 由 watcher 贴出会话写的结论并 resolve。目标是 PR 不因为一条没人处理的讨论卡在合并前。
 - 产品意图：watcher 抓 PR 正文，优先取标题含「产品意图 / 设计意图 / Product intent」的一节（没有就取正文开头，最多 2000 字），写进任务的 `prSnapshot.prIntent` 和派工消息。反馈要求的改法会推翻 PR 正文、规格或维护者裁定里写明的界面、交互或流程时，它不算缺陷：会话不改代码，记 SC=no-change 并引用正文，watcher 回复后 resolve，继续推进。
-- 全自动推进到可合并（不合并）：严重度拿不准时会话自己复现核实，确认不了 P0/P1/P2 就按不成立回复并 resolve；Jev 不可用也不因此 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用、作者收回才 blocked。
+- 全自动推进到可合并（不合并）：严重度拿不准时会话自己复现核实，确认不了 P0/P1/P2 就按不成立回复并 resolve；Jev 不可用也不因此 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用、作者收回才 blocked。本地审查/e2e Worker 是局部例外：本机缺 `routing.json` 或开不了 Orca Worker 时不 blocked，先尝试一次 `start_team({worker_permission_mode:"bypassPermissions"})`，仍不行就跳过尚未运行的本地审查/e2e，并在 SC evidence 写明原因；禁止改用原生子代理。仓库预检、validate 收据、required CI 和服务器审查不豁免。
 - 卡住要让人看见：修复任务 blocked（外部阻塞、补投三次无结果、结果无效、派发失败）时，watcher 把事件写进 `state/notices/`，用独立的 `bin/notify.mjs` 调度发飞书（watcher 与作者是同一 GitHub 账号，@自己不会通知）。同一 blocked 原因每个 head 只升级一次，不再原样重投。规则版本变化、新 head 或新反馈时仍会重投。必需 CI 红、HEAD 漂移这类 watcher 自己会接着处理的状态不发。无代码改动且当前 head 必需 CI 仍红时，对失败 job 做一次 `gh run rerun --failed`；第二次仍红按同因升级。`waiting-ci` 被新反馈取代时，旧任务已有证据的 thread 会等到后续 complete 或当前 head CI 全绿再回复并 resolve。validate 心跳跑在独立子进程；通知队列用 `pending.lock` 串行读写。
 - Greptile 汇总评论没有自己的 P0/P1 时不单独开会话（它的发现另以行内 thread 出现）。汇总里只有 P2 也不派修复，P2 只走行内 finding。
 - 策略读不出（`required-policy-unknown`）和可合并（`merge-ready`）各在状态转换时出一条事件。
