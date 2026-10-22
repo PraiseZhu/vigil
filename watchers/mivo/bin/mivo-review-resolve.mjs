@@ -113,8 +113,113 @@ export function refutedThreads(result, task) {
   return completeCodeFixThreads(result, task, { disposition: 'no-change', scStatus: 'no-change', kind: 'refuted' })
     .map((item) => {
       const ruling = rulingRecordFor(result, task, item.key);
-      return ruling ? { ...item, ruling } : item;
+      if (ruling) return { ...item, ruling };
+      const deferral = deferralFor(task, item.key, item.evidence);
+      return deferral ? { ...item, deferral } : item;
     });
+}
+// Without an arbiter (no route, no Orca tool, creation failed) a disputed reviewer P1/P2 has no ruling record
+// and the reviewer would raise it again. The watcher turns it into a follow-up issue registered in the PR body;
+// the reviewer recognises the issue by the finding key and stops blocking, and a person decides on the issue
+// (vigil#41). P0 is never deferred. adjudicationRecord 1 is mivo-repair's ADJUDICATION_RECORD_VERSION.
+const ADJUDICATE_SKIPPED_PREFIX = 'adjudicate-skipped:';
+const FINDING_CLASS_RE = /<!--\s*mivo-finding\b[^>]*?\bclass=([A-Za-z0-9_-]{1,60})/;
+export function deferralFor(task, key, evidence = []) {
+  if (task?.adjudicationRecord !== 1 || task.severityStandard?.loaded !== true || !Number.isInteger(task.number)) return null;
+  const item = (task.feedback ?? []).find((entry) => entry?.key === key);
+  if (item?.source !== 'mivo-review') return null;
+  const body = String(item.body ?? '');
+  const severity = /^\s*\[(P[12])\]/.exec(body)?.[1];
+  const findingKey = FINDING_KEY_RE.exec(body)?.[1];
+  const skipped = evidence.find((line) => line.trim().startsWith(ADJUDICATE_SKIPPED_PREFIX));
+  if (!severity || !findingKey || !skipped) return null;
+  const path = (task.prSnapshot?.unresolvedThreads ?? []).find((thread) => thread?.id === item.threadId)?.path;
+  return { key: findingKey, severity, bugClass: FINDING_CLASS_RE.exec(body)?.[1] ?? null,
+    path: typeof path === 'string' && path && !/\s/.test(path) ? path : null, title: findingTitle(body), body, reason: skipped.trim(), pr: task.number };
+}
+function findingTitle(body) {
+  const first = String(body).split('\n').find((line) => line.trim()) ?? '';
+  const text = first.replace(/^\s*\[P[0-3]\]\s*/, '').replace(/[*`]/g, '').replace(/<!--[\s\S]*?-->/g, '').trim();
+  return text.length > 80 ? `${text.slice(0, 79)}…` : text;
+}
+export function deferralMarker(deferral) {
+  return `<!-- mivo-defer key=${deferral.key}${deferral.bugClass ? ` class=${deferral.bugClass}` : ''}${deferral.path ? ` path=${deferral.path}` : ''} -->`;
+}
+export function deferralIssueTitle(deferral) {
+  return `转 issue 跟进：#${deferral.pr} 审查意见「${deferral.title || deferral.key}」`.slice(0, 200);
+}
+export function deferralIssueBody(deferral, evidence, dispatchId) {
+  const quoted = String(deferral.body).replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').slice(0, 4000)
+    .split('\n').map((line) => `> ${line}`);
+  return [
+    `来自 PR #${deferral.pr} 的服务器审查意见（${deferral.severity}）。盯梢修复会话核实后认为不需要改，但没能开出只读裁决席，没有经过独立判定，所以转 issue 由人确认。`,
+    '',
+    '**审查意见原文**',
+    '',
+    ...quoted,
+    '',
+    '**修复会话的说法（未经裁决）**',
+    '',
+    ...sanitizeEvidence(evidence),
+    '',
+    `**为什么没有裁决**：${sanitizeLine(deferral.reason)}`,
+    '',
+    `**需要人确认**：这条意见是否成立。成立就另开 PR 修，修完关闭本 issue；不成立直接关闭并写明理由。服务器审查按问题 key 认本 issue，本 issue 打开期间这条意见不再阻断 #${deferral.pr}。`,
+    '',
+    deferralMarker(deferral),
+    `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
+  ].join('\n');
+}
+// The PR body section the reviewer reads (its deferrals.mjs): a "## 转 issue 跟进的审查问题" heading with one list line
+// per issue. Returns the new body, or null when the issue is already listed there.
+export const DEFERRAL_HEADING = '转 issue 跟进的审查问题';
+export function withDeferralEntry(body, issue, text) {
+  const lines = String(body ?? '').replace(/\r\n?/g, '\n').split('\n');
+  const entry = `- #${issue} ${String(text ?? '').replace(/\s+/g, ' ').trim()}`.trimEnd();
+  const ref = new RegExp(`(?<![\\w/#&.:-])#${issue}(?!\\d)`);
+  let fence = false;
+  let comment = false;
+  let start = -1;
+  let level = 0;
+  let end = lines.length;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^[ \t]*(```|~~~)/.test(line)) { fence = !fence; continue; }
+    if (comment) { if (line.includes('-->')) comment = false; continue; }
+    if (fence) continue;
+    if (line.includes('<!--') && !line.slice(line.indexOf('<!--')).includes('-->')) { comment = true; continue; }
+    const heading = /^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$/.exec(line);
+    if (start < 0) {
+      if (heading && heading[1].length >= 2 && heading[1].length <= 4 && heading[2] === DEFERRAL_HEADING) { start = index; level = heading[1].length; }
+    } else if (heading && heading[1].length <= level) { end = index; break; }
+  }
+  if (start < 0) return `${lines.join('\n').trimEnd()}\n\n## ${DEFERRAL_HEADING}\n\n${entry}\n`;
+  if (lines.slice(start + 1, end).some((line) => /^[ \t]*[-*+][ \t]/.test(line) && ref.test(line))) return null;
+  let insert = end;
+  while (insert > start + 1 && !lines[insert - 1].trim()) insert -= 1;
+  const next = [...lines.slice(0, insert), ...(insert === start + 1 ? [''] : []), entry, ...lines.slice(insert)];
+  return next.join('\n');
+}
+const parse = (raw) => (typeof raw === 'string' ? JSON.parse(raw) : raw);
+// Reuses an issue already opened for this finding on this PR (a retry after a crash, or an earlier round),
+// whatever its state: a person may have closed it with a decision, and a new copy would undo that.
+function* ensureDeferralIssue({ deferral, evidence, dispatchId, repo, ghFn }) {
+  const marker = `mivo-defer key=${deferral.key}`;
+  const recent = parse(yield () => ghFn(['api', `repos/${repo}/issues?state=all&sort=created&direction=desc&per_page=100`]));
+  const found = (Array.isArray(recent) ? recent : []).find((issue) => !issue?.pull_request
+    && String(issue?.body ?? '').includes(marker) && new RegExp(`#${deferral.pr}(?!\\d)`).test(String(issue?.body ?? '')));
+  if (found) return { number: found.number, state: String(found.state ?? '').toLowerCase(), created: false };
+  const created = parse(yield () => ghFn(['api', '-X', 'POST', `repos/${repo}/issues`,
+    '-f', `title=${deferralIssueTitle(deferral)}`, '-f', `body=${deferralIssueBody(deferral, evidence, dispatchId)}`]));
+  if (!Number.isInteger(created?.number)) throw new Error(`creating the follow-up issue returned no number for ${deferral.key}`);
+  return { number: created.number, state: 'open', created: true };
+}
+function* registerDeferral({ repo, pr, issue, text, ghFn }) {
+  const view = parse(yield () => ghFn(['api', `repos/${repo}/pulls/${pr}`]));
+  const next = withDeferralEntry(view?.body ?? '', issue, text);
+  if (next === null) return false;
+  yield () => ghFn(['api', '-X', 'PATCH', `repos/${repo}/pulls/${pr}`, '-f', `body=${next}`]);
+  return true;
 }
 // A reviewer finding the arbiter ruled invalid or p3 is answered with a machine-readable ruling
 // record, so the reviewer can verify the ruling and stop raising the finding again (vigil#38).
@@ -204,6 +309,20 @@ export function refutedReplyText(evidence, dispatchId, ruling = null) {
     ...(ruling ? [rulingRecordLine(ruling)] : []),
   ].join('\n');
 }
+// A disputed reviewer P1/P2 that no arbiter could judge, handed to a follow-up issue (vigil#41).
+export function deferredReplyText(evidence, dispatchId, deferral, issue) {
+  const why = sanitizeLine(deferral.reason.slice(ADJUDICATE_SKIPPED_PREFIX.length).trim()) || '原因见下';
+  return [
+    `**发生了什么**：盯梢修复轮核实后认为这条意见不需要改，但没能开出只读裁决席（${why}），没有经过独立判定，所以转成 issue #${issue} 由人确认，并登记到 PR 说明的「${DEFERRAL_HEADING}」一节。`,
+    `**对本 PR 意味着什么**：服务器审查按问题 key 认 #${issue}，它打开期间这条意见不再阻断本 PR；问题本身留在 #${issue} 里跟进，没有被判定为不成立。`,
+    `**要不要改代码**：本 PR 不改；#${issue} 确认成立后另开 PR 修。`,
+    '',
+    '修复会话的说法（未经裁决）：',
+    ...sanitizeEvidence(evidence),
+    '',
+    `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
+  ].join('\n');
+}
 // A member's thread the session graded as not needing code (P3, a question, or not reproducible).
 export function triagedReplyText(evidence, dispatchId) {
   return [
@@ -231,8 +350,9 @@ export function fixedReplyText(evidence, head, dispatchId) {
   ].join('\n');
 }
 // Same durable receipt as the P3 closure: `previous.autoClosedThreads[threadId]`.
-export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, ghFn, now, head }) {
+export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, ghFn, now, head, repo = null, pr = null }) {
   const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
+  const deferralIssues = { ...(previous.deferralIssues ?? {}) };
   const results = [];
   for (const item of items) {
     // The receipt covers one disposition. A thread reopened and handled again by a later task
@@ -240,15 +360,27 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
     const itemDispatchId = item.dispatchId ?? dispatchId;
     const receipt = closedThreads[item.threadId];
     if (receipt && receipt.dispatchId === itemDispatchId) continue;
+    // Without repo/PR the follow-up issue cannot be opened: the thread closes with the plain refuted reply, as before.
+    const deferral = item.kind !== 'fixed' && !item.triage && item.deferral && repo && Number.isInteger(pr) ? item.deferral : null;
+    let issue = null;
+    if (deferral) {
+      const known = deferralIssues[item.threadId];
+      issue = known?.key === deferral.key ? known.issue
+        : (yield* ensureDeferralIssue({ deferral, evidence: item.evidence, dispatchId: itemDispatchId, repo, ghFn })).number;
+      deferralIssues[item.threadId] = { issue, key: deferral.key, at: now };
+      yield* registerDeferral({ repo, pr, issue, text: deferral.title, ghFn });
+    }
     const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, itemDispatchId)
-      : item.triage ? triagedReplyText(item.evidence, itemDispatchId) : refutedReplyText(item.evidence, itemDispatchId, item.ruling ?? null);
-    const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : 'refuted-p0-p1';
+      : item.triage ? triagedReplyText(item.evidence, itemDispatchId)
+        : deferral ? deferredReplyText(item.evidence, itemDispatchId, deferral, issue)
+          : refutedReplyText(item.evidence, itemDispatchId, item.ruling ?? null);
+    const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : deferral ? 'deferred-to-issue' : 'refuted-p0-p1';
     yield () => ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${body}`]);
     yield () => ghFn(['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${item.threadId}`]);
-    closedThreads[item.threadId] = { at: now, key: item.key, reason, dispatchId: itemDispatchId };
-    results.push({ threadId: item.threadId, key: item.key });
+    closedThreads[item.threadId] = { at: now, key: item.key, reason, dispatchId: itemDispatchId, ...(issue ? { issue } : {}) };
+    results.push({ threadId: item.threadId, key: item.key, ...(issue ? { issue } : {}) });
   }
-  return { previous: { ...previous, autoClosedThreads: closedThreads }, closed: results };
+  return { previous: { ...previous, autoClosedThreads: closedThreads, ...(Object.keys(deferralIssues).length ? { deferralIssues } : {}) }, closed: results };
 }
 const MEMBER_ITEM_KEY = /^(?:review|comment):/;
 export function completedMemberFeedback(result, task) {
