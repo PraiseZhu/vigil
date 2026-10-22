@@ -42,7 +42,7 @@ test('标准文件读得到:全文与版本号(文件原始内容 sha256 前 12 
   assert.equal(standard.loaded, true);
   assert.equal(standard.text, STANDARD.trim());
   assert.equal(standard.version, versionOf(STANDARD));
-  assert.deepEqual(taskSeverityStandard(standard), { loaded: true, version: versionOf(STANDARD) });
+  assert.deepEqual(taskSeverityStandard(standard), { loaded: true, version: versionOf(STANDARD), text: STANDARD.trim() });
 });
 
 test('没配置或读不到:标为未加载并写明原因', () => {
@@ -79,8 +79,9 @@ test('读不到标准:提示词要求审查账号的 P0/P1/P2 必须修,不判�
   });
 });
 
-test('裁决规则:把统一分级全文交给裁决者,只按它判级;读不到标准不开裁决', () => {
-  assert.match(WORKER_RULE, /以及本消息「统一分级」一节全文；要求它只按该标准判级（KEEL J4 等其他分级说法不算）/);
+test('裁决规则:裁决材料由 helper 生成并原样交出,只按其中的统一分级判级;读不到标准不开裁决', () => {
+  assert.match(WORKER_RULE, /运行同一 helper adjudication-brief --keys <争议的反馈 key，逗号分隔> --claim <你复现与反驳的证据>，把返回的 brief 原样交给裁决者/);
+  assert.match(WORKER_RULE, /不得改写或删减 brief。裁决者只按 brief 里的统一分级判级（KEEL J4 等其他分级说法不算）/);
   assert.match(WORKER_RULE, /统一分级读不到时，审查账号（source=mivo-review）的 P0\/P1\/P2 不开裁决，直接修/);
 });
 

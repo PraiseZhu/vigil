@@ -117,12 +117,13 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 ### 反馈出口
 
 - 统一分级：修复会话、裁决 Worker 与审查机读同一份标准文件（`severityStandardPath`），派单消息带它的全文和版本号；KEEL J4 或其他分级说法与它冲突时以它为准。标准变化会改变规则版本，已绑定的会话随规则刷新拿到新标准。
-- 审查账号的 P0/P1/P2：修复会话修，修完 watcher 带证据回复并 resolve；不成立也带证据回复并 resolve。读不到统一分级时不允许判不成立。
+- 审查账号的 P0/P1/P2：修复会话修，修完 watcher 带证据回复并 resolve。读不到统一分级时不允许判不成立。
+- 各执一词交裁决：会话认为一条可修的 P0/P1/P2 不成立时不能自己定。它用 helper `adjudication-brief --keys <反馈 key> --claim <会话的说法>` 生成裁决材料（意见原文、审查机问题 key、相关文件在本 PR 的改动、会话说法、任务带的统一分级全文和交回格式），原样交给只读裁决 Worker；裁决结论逐条记进 SC JSON 的 `workers[].rulings`（`valid` / `invalid` / `p3` 加理由）。`valid` 必须修，finalize 拒绝把它记成 no-change；`invalid` / `p3` 才能 no-change，watcher 带证据回复并 resolve。审查账号的 P1/P2 还会在回复末尾附一行机读裁决记录（P0 不附：审查机不按裁决放行 P0） `<!-- mivo-ruling v=1 key=<问题 key> head=<结果 head> verdict=<invalid|p3> std=<分级版本> by=<agent/model> task=<dispatchId> -->`，审查机核对后采信，不再重复提出；之后的提交改了相关文件，裁决失效。会话写的证据和理由里的 HTML 注释会被转义，伪造不了这行记录。
 - Greptile 的 P0/P1/P2（`greptile-p1-triage`）：Greptile 按自己的标准打级，所以修复会话先按统一分级重新判定，确认是 P0/P1/P2 才改代码；其余带核实依据回复并 resolve。
 - Greptile、审查账号的 P3：watcher 直接回复说明并 resolve，不开会话。P2 只走行内 finding，不从 Greptile 汇总评论派修复。
 - 仓库成员（OWNER/MEMBER/COLLABORATOR，含作者本人）留的 review thread（`member-thread-triage`），以及成员的 review 总评 / PR 主讨论区评论（`member-feedback-triage`）：交修复会话按统一分级判定，确认 P0/P1/P2 才改代码，否则 no-change 并回复说明；不解析正文命令作为授权。严重度读不出、来源未核验的其他未解决 thread（`thread-triage`，含仓外人员和其他机器人）同样先核实。P3 由 watcher 贴出会话写的结论并 resolve。目标是 PR 不因为一条没人处理的讨论卡在合并前。
 - 当前 head 上阻断合并的 CodeQL / code scanning 告警带 verified evidence 后作为可修复反馈（`required-ci-fix`），不再记外部阻塞；没权限或分析缺失保持采集 unknown，禁止 dismiss 或降阈值。
-- Ready PR 只差落后 main（`mergeStateStatus=BEHIND`）且其余门都通过时，watcher 用 GitHub `update-branch`（merge，不 rebase / 不 force push）把 main 合进 PR 分支；BEHIND 本身不算可合并。修复会话对审查机 P0/P1/P2 判定不成立且 head 未变、审查仍阻断时，watcher 对当前 head 触发重审（空 `prev_run_id` 全量审查；不设次数上限，每个新的不成立结果最多请一次；PR 上还有未 resolve 的讨论时先等，不派发）。
+- Ready PR 只差落后 main（`mergeStateStatus=BEHIND`）且其余门都通过时，watcher 用 GitHub `update-branch`（merge，不 rebase / 不 force push）把 main 合进 PR 分支；BEHIND 本身不算可合并。watcher 不自己触发审查机重审：审查机的讨论全部 resolve 后，由前置审查（唯一派发入口）在同一 head 上重新送审，审查机按回复里的裁决记录放行。旧版本记下的重审尝试只做收尾，10 分钟后记为失败、不再算待办。
 - 产品意图：watcher 抓 PR 正文，优先取标题含「产品意图 / 设计意图 / Product intent」的一节（没有就取正文开头，最多 2000 字），写进任务的 `prSnapshot.prIntent` 和派工消息。反馈要求的改法会推翻 PR 正文、规格或维护者裁定里写明的界面、交互或流程时，它不算缺陷：会话不改代码，记 SC=no-change 并引用正文，watcher 回复后 resolve，继续推进。
 - 全自动推进到可合并（不合并）：严重度拿不准时会话自己复现核实，确认不了 P0/P1/P2 就按不成立回复并 resolve；Jev 不可用也不因此 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用、作者收回才 blocked。本地审查/e2e Worker 是局部例外：本机缺 `routing.json` 或开不了 Orca Worker 时不 blocked，先尝试一次 `start_team({worker_permission_mode:"bypassPermissions"})`，仍不行就跳过尚未运行的本地审查/e2e，并在 SC evidence 写明原因；禁止改用原生子代理。仓库预检、validate 收据、required CI 和服务器审查不豁免。
 - 卡住要让人看见：修复任务 blocked（外部阻塞、补投三次无结果、结果无效、派发失败）时，watcher 把事件写进 `state/notices/`，用独立的 `bin/notify.mjs` 调度发飞书（watcher 与作者是同一 GitHub 账号，@自己不会通知）。同一 blocked 原因每个 head 只升级一次，不再原样重投。规则版本变化、新 head 或新反馈时仍会重投。必需 CI 红、HEAD 漂移这类 watcher 自己会接着处理的状态不发。无代码改动且当前 head 必需 CI 仍红时，对失败 job 做一次 `gh run rerun --failed`；第二次仍红按同因升级。`waiting-ci` 被新反馈取代时，旧任务已有证据的 thread 会等到后续 complete 或当前 head CI 全绿再回复并 resolve。validate 心跳跑在独立子进程；通知队列用 `pending.lock` 串行读写。
