@@ -521,6 +521,23 @@ export function assertDisputesAdjudicated({ scs, workers, task }) {
   }
 }
 
+// The watcher records whether the session had the reviewer's unified severity standard (task.severityStandard).
+// Without it the session cannot grade a finding the way the reviewer does, so it may not close the reviewer's
+// own P0/P1/P2 as no-change. Tasks dispatched before the field existed keep the adjudication rule above.
+export function assertStandardAllowsDisputes({ scs, task }) {
+  if (task?.severityStandard?.loaded !== false) return;
+  const permissions = new Map(taskRepairPolicy(task).items.map((item) => [item.key, item]));
+  const reviewerKeys = new Set((task.feedback ?? []).filter((item) => item?.source === 'mivo-review').map((item) => item.key));
+  for (const sc of scs) {
+    if (sc.status !== 'no-change') continue;
+    const disputed = (sc.feedbackKeys ?? []).filter((key) => {
+      const item = permissions.get(key);
+      return reviewerKeys.has(key) && item?.canChangeCode === true && item.action === 'code-fix';
+    });
+    if (disputed.length) fail(`[SEVERITY_STANDARD_MISSING] ${sc.id} closes reviewer P0/P1/P2 (${disputed.join(', ')}) as no-change while the unified severity standard could not be read (${task.severityStandard.reason ?? 'unknown'}); fix them instead`);
+  }
+}
+
 export function validateScs(report, task) {
   const scs = Array.isArray(report) ? report : report?.scs;
   if (!Array.isArray(scs) || scs.length === 0) fail('SC report must contain a non-empty scs array');
@@ -880,6 +897,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
   const { scs, feedbackCoverage, workers } = loadScs(scReport, task);
   assertDisputesAdjudicated({ scs, workers, task });
+  assertStandardAllowsDisputes({ scs, task });
   const workersField = workers ? { workers } : {};
   const emptyRetrigger = allNoChange(scs) && isEmptyCiRetrigger(worktree, task.headRefOid, validatedHead, gitFn);
   assertTaskRepairScope(task, validatedHead, { emptyRetrigger });

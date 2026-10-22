@@ -1,6 +1,7 @@
 {
   "targetRepo": "your-org/your-plugin-repo",
   "pluginRepoPath": "/path/to/your-plugin-checkout",
+  "severityStandardPath": "/path/to/review-skill-checkout/mivo/config/severity.md",
   "watchHomes": [
     "/path/to/mivo-watcher/runtime"
   ]

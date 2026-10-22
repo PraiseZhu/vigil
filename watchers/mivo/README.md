@@ -52,6 +52,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 |---|---|---|
 | `watchHomes` | `MIVO_WATCHER_WATCH_HOMES`（逗号分隔） | `[]`（不内置任何路径） |
 | `lifelineConfigPath` | `MIVO_WATCHER_LIFELINE_CONFIG` | 未配置时不接收本地 Doctor 任务 |
+| `severityStandardPath` | `MIVO_SEVERITY_STANDARD_PATH` | 审查机发布的统一分级文件（审查仓的 `mivo/config/severity.md`，与前置审查同机检出的那份）。修复会话和裁决 Worker 只按它判 P0/P1/P2/P3；版本号是文件原始内容 sha256 的前 12 位，与审查机算法相同。未配置或读不到时不报错，但本轮审查账号的 P0/P1/P2 一律按成立处理、必须修，finalize 拒绝把它们记成 no-change |
 | `preflightTimeoutMinutes` | `MIVO_PREFLIGHT_TIMEOUT_MINUTES` | `60`。只接受大于 0 的有限数字或非空十进制字符串；换算毫秒后须为不超过 2147483647 的安全整数。非法值直接报错，不静默回退。env 优先于 profile。validate 的 `npm ci`（如需）与仓库预检、以及未复用收据时的 `git push` 都用此时限；两阶段各自独立计时，不共享一笔总预算。显式 `options.timeout` 仍然优先。 |
 
 拷一份 [`config/examples/mivo.profile.example.json`](../../config/examples/mivo.profile.example.json)
@@ -115,7 +116,8 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 
 ### 反馈出口
 
-- 审查账号的 P0/P1/P2：修复会话修，修完 watcher 带证据回复并 resolve；不成立也带证据回复并 resolve。
+- 统一分级：修复会话、裁决 Worker 与审查机读同一份标准文件（`severityStandardPath`），派单消息带它的全文和版本号；KEEL J4 或其他分级说法与它冲突时以它为准。标准变化会改变规则版本，已绑定的会话随规则刷新拿到新标准。
+- 审查账号的 P0/P1/P2：修复会话修，修完 watcher 带证据回复并 resolve；不成立也带证据回复并 resolve。读不到统一分级时不允许判不成立。
 - Greptile 的 P0/P1/P2（`greptile-p1-triage`）：Greptile 按自己的标准打级，所以修复会话先按统一分级重新判定，确认是 P0/P1/P2 才改代码；其余带核实依据回复并 resolve。
 - Greptile、审查账号的 P3：watcher 直接回复说明并 resolve，不开会话。P2 只走行内 finding，不从 Greptile 汇总评论派修复。
 - 仓库成员（OWNER/MEMBER/COLLABORATOR，含作者本人）留的 review thread（`member-thread-triage`），以及成员的 review 总评 / PR 主讨论区评论（`member-feedback-triage`）：交修复会话按统一分级判定，确认 P0/P1/P2 才改代码，否则 no-change 并回复说明；不解析正文命令作为授权。严重度读不出、来源未核验的其他未解决 thread（`thread-triage`，含仓外人员和其他机器人）同样先核实。P3 由 watcher 贴出会话写的结论并 resolve。目标是 PR 不因为一条没人处理的讨论卡在合并前。
