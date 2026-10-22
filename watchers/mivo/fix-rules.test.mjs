@@ -449,7 +449,8 @@ test('dispatchParams message contains repair rules and old bans', () => {
   assert.match(message, /禁止无依据反复 rerun/);
   assert.doesNotMatch(message, /仅已实证解决的获准修复项可 resolve/);
   assert.match(message, /P0\/P1\/P2 授权边界/);
-  assert.match(message, /P2 = 本 PR 引入或改动范围内、已证实有功能或安全影响的真实缺陷/);
+  assert.match(message, /P0\/P1\/P2\/P3 按「统一分级」一节判/);
+  assert.doesNotMatch(message, /缺测试或规范违反本身不单独构成 P2/);
   assert.match(message, /allowedFeedbackKeys/);
   assert.doesNotMatch(message, /只修复核成立的 P0\/P1[；;]/);
   assert.doesNotMatch(message, /P0\/P1-ONLY/);

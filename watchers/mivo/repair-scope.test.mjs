@@ -689,3 +689,30 @@ test('A-3 P3 no-change needs no arbiter', (t) => {
   f.report([f.sc('no-change', ['thread:P3'])], []);
   assert.equal(f.finalize().status, 'complete');
 });
+
+// Without the reviewer's unified severity standard the session cannot grade the reviewer's own finding the
+// way the reviewer does: it must fix it, an arbiter does not change that (vigil#37).
+const reviewerFinding = (priority) => ({ ...finding(priority, `mivo-review:${priority}`), source: 'mivo-review' });
+
+test('A-4 task without the severity standard: reviewer P0/P1/P2 closed as no-change is rejected even with an arbiter', (t) => {
+  const f = fixture(t, { changed: false });
+  f.task.severityStandard = { loaded: false, reason: '未配置 severityStandardPath' };
+  f.saveTask([reviewerFinding('P2')]);
+  f.report([f.sc('no-change', ['mivo-review:P2'])]);
+  assert.throws(f.finalize, /SEVERITY_STANDARD_MISSING.*未配置 severityStandardPath/);
+  assert.equal(f.pushCalls.length, 0);
+});
+
+for (const [name, severityStandard, feedback, key] of [
+  ['other sources keep the arbiter rule when the standard is missing', { loaded: false, reason: 'x' }, () => finding('P2'), 'thread:P2'],
+  ['a task that had the standard keeps the arbiter rule', { loaded: true, version: 'abcdef012345' }, () => reviewerFinding('P2'), 'mivo-review:P2'],
+  ['a task dispatched before the field existed keeps the arbiter rule', undefined, () => reviewerFinding('P2'), 'mivo-review:P2'],
+]) {
+  test(`A-5 ${name}`, (t) => {
+    const f = fixture(t, { changed: false });
+    if (severityStandard) f.task.severityStandard = severityStandard;
+    f.saveTask([feedback()]);
+    f.report([f.sc('no-change', [key])]);
+    assert.equal(f.finalize().status, 'complete');
+  });
+}
