@@ -110,7 +110,35 @@ function completeCodeFixThreads(result, task, { disposition, scStatus, kind }) {
   return items;
 }
 export function refutedThreads(result, task) {
-  return completeCodeFixThreads(result, task, { disposition: 'no-change', scStatus: 'no-change', kind: 'refuted' });
+  return completeCodeFixThreads(result, task, { disposition: 'no-change', scStatus: 'no-change', kind: 'refuted' })
+    .map((item) => {
+      const ruling = rulingRecordFor(result, task, item.key);
+      return ruling ? { ...item, ruling } : item;
+    });
+}
+// A reviewer finding the arbiter ruled invalid or p3 is answered with a machine-readable ruling
+// record, so the reviewer can verify the ruling and stop raising the finding again (vigil#38).
+// head is the head the result was finalized at; std is the standard version the task carried.
+// The reviewer never releases a P0 on a ruling, so a P0 gets no record and no promise in the reply.
+const FINDING_KEY_RE = /<!--\s*mivo-finding\s+key=([0-9a-f]{12})\b/;
+export function rulingRecordFor(result, task, key) {
+  const item = (task?.feedback ?? []).find((entry) => entry?.key === key);
+  if (item?.source !== 'mivo-review' || /^\s*\[P0\]/.test(String(item.body ?? ''))) return null;
+  const findingKey = FINDING_KEY_RE.exec(String(item.body ?? ''))?.[1];
+  const std = task.severityStandard?.loaded === true ? task.severityStandard.version : null;
+  if (!findingKey || !/^[0-9a-f]{12}$/.test(std ?? '') || !/^[0-9a-f]{40}$/.test(result?.head ?? '')) return null;
+  if (!/^[A-Za-z0-9._:-]{1,120}$/.test(task.dispatchId ?? '')) return null;
+  for (const worker of result.workers ?? []) {
+    if (worker?.purpose !== 'adjudicate') continue;
+    const ruling = (worker.rulings ?? []).find((entry) => entry?.feedbackKey === key);
+    if (!ruling || !['invalid', 'p3'].includes(ruling.verdict)) continue;
+    const by = `${worker.agent}/${worker.model}`.replace(/[^A-Za-z0-9._:/@+-]/g, '_').slice(0, 120);
+    return { key: findingKey, head: result.head, verdict: ruling.verdict, std, by, task: task.dispatchId, reason: String(ruling.reason ?? '') };
+  }
+  return null;
+}
+export function rulingRecordLine(ruling) {
+  return `<!-- mivo-ruling v=1 key=${ruling.key} head=${ruling.head} verdict=${ruling.verdict} std=${ruling.std} by=${ruling.by} task=${ruling.task} -->`;
 }
 export function fixedThreads(result, task) {
   return completeCodeFixThreads(result, task, { disposition: 'fixed', scStatus: 'pass', kind: 'fixed' });
@@ -148,19 +176,32 @@ export function coveredThreadItems(items = [], observed = [], task = {}, result 
       return taskItems.has(key) && (closeKeys.has(key) || answered.has(key)) && sameFeedbackContent(taskItems.get(key), other);
     }));
 }
-function sanitizeEvidence(evidence) {
-  return evidence.slice(0, 5).map((line) => '- ' + line.replace(/\/(?:Users|home)\/[^\s'"`]+/g, '<本机路径>').replace(/\s+/g, ' ').slice(0, 300));
+// Session text must not carry HTML comments: the receipt and ruling markers in the same reply are
+// read by machines, and a forged one inside the evidence would be read too.
+function sanitizeLine(line) {
+  return line.replace(/\/(?:Users|home)\/[^\s'"`]+/g, '<本机路径>').replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;')
+    .replace(/\s+/g, ' ').slice(0, 300);
 }
-export function refutedReplyText(evidence, dispatchId) {
+function sanitizeEvidence(evidence) {
+  return evidence.slice(0, 5).map((line) => '- ' + sanitizeLine(line));
+}
+const RULING_VERDICT_TEXT = { invalid: '不成立', p3: '属实但按统一分级只到 P3，不必修' };
+export function refutedReplyText(evidence, dispatchId, ruling = null) {
   return [
-    '**发生了什么**：盯梢修复轮核实了这条 P0/P1/P2 意见，结论是它在当前 head 上不成立，不需要改代码。',
-    '**对本 PR 意味着什么**：这条意见不再阻塞合并；核实依据如下，若之后的提交让问题重新成立，服务器审查会在新 head 上再次提出。',
+    ruling
+      ? '**发生了什么**：盯梢修复轮核实后对这条意见有异议，交给只读裁决席按统一分级判定，结论是不需要改代码。'
+      : '**发生了什么**：盯梢修复轮核实了这条 P0/P1/P2 意见，结论是它在当前 head 上不成立，不需要改代码。',
+    ruling
+      ? '**对本 PR 意味着什么**：这条意见不再阻塞合并。回帖末尾附有裁决记录，服务器审查会核对后采信，不再重复提出；之后的提交如果改了相关文件，裁决失效，服务器会重新判断。'
+      : '**对本 PR 意味着什么**：这条意见不再阻塞合并；核实依据如下，若之后的提交让问题重新成立，服务器审查会在新 head 上再次提出。',
     '**要不要改代码**：不改。',
+    ...(ruling ? ['', `**裁决**：${RULING_VERDICT_TEXT[ruling.verdict] ?? ruling.verdict}（裁决席 ${ruling.by}）。理由：${sanitizeLine(ruling.reason)}`] : []),
     '',
     '核实证据：',
     ...sanitizeEvidence(evidence),
     '',
     `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
+    ...(ruling ? [rulingRecordLine(ruling)] : []),
   ].join('\n');
 }
 // A member's thread the session graded as not needing code (P3, a question, or not reproducible).
@@ -200,7 +241,7 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
     const receipt = closedThreads[item.threadId];
     if (receipt && receipt.dispatchId === itemDispatchId) continue;
     const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, itemDispatchId)
-      : item.triage ? triagedReplyText(item.evidence, itemDispatchId) : refutedReplyText(item.evidence, itemDispatchId);
+      : item.triage ? triagedReplyText(item.evidence, itemDispatchId) : refutedReplyText(item.evidence, itemDispatchId, item.ruling ?? null);
     const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : 'refuted-p0-p1';
     yield () => ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${body}`]);
     yield () => ghFn(['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${item.threadId}`]);

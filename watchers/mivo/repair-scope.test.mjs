@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { assertOwner, finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/mivo-repair.mjs';
+import { adjudicationBrief, assertOwner, finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/mivo-repair.mjs';
 import { writePr } from './bin/mivo-state.mjs';
 import { ownershipGh } from './ownership-gh.fixture.mjs';
 
@@ -716,3 +716,111 @@ for (const [name, severityStandard, feedback, key] of [
     assert.equal(f.finalize().status, 'complete');
   });
 }
+
+// Tasks dispatched with the structured ruling contract (vigil#38): the arbiter rules per item, a valid
+// ruling must be fixed, and a no-change needs an invalid/p3 ruling for that very item.
+const STANDARD = { loaded: true, version: 'abcdef012345', text: '## 分级(示例)\n\n| P2 | 含误导性的测试 | 报 |' };
+const ruled = (rulings) => ({ ...ADJUDICATOR, rulings });
+function structured(t, feedback = [reviewerFinding('P2')]) {
+  const f = fixture(t, { changed: false });
+  f.task.severityStandard = STANDARD;
+  f.task.adjudicationRecord = 1;
+  f.saveTask(feedback);
+  return f;
+}
+
+test('A-6 a valid ruling must be fixed: no-change is rejected before any push', (t) => {
+  const f = structured(t);
+  f.report([f.sc('no-change', ['mivo-review:P2'])], [ruled([{ feedbackKey: 'mivo-review:P2', verdict: 'valid', reason: 'reachable from the save path' }])]);
+  assert.throws(f.finalize, /\[ADJUDICATED_VALID\].*mivo-review:P2/);
+  assert.equal(f.pushCalls.length, 0);
+});
+
+for (const [name, workers] of [
+  ['an arbiter without rulings', [ADJUDICATOR]],
+  ['a ruling for another item', [ruled([{ feedbackKey: 'thread:P1', verdict: 'invalid', reason: 'x' }])]],
+  ['no arbiter at all', []],
+]) {
+  test(`A-6 no-change with ${name} is rejected: each disputed item needs its own ruling`, (t) => {
+    const f = structured(t);
+    f.report([f.sc('no-change', ['mivo-review:P2'])], workers);
+    assert.throws(f.finalize, /\[ADJUDICATION_MISSING\].*mivo-review:P2/);
+    assert.equal(f.pushCalls.length, 0);
+  });
+}
+
+for (const verdict of ['invalid', 'p3']) {
+  test(`A-6 a ${verdict} ruling closes the item as no-change and the result keeps the ruling`, (t) => {
+    const f = structured(t);
+    const worker = ruled([{ feedbackKey: 'mivo-review:P2', verdict, reason: '  current head never reaches it  ' }]);
+    f.report([f.sc('no-change', ['mivo-review:P2'])], [worker]);
+    const result = f.finalize();
+    assert.equal(result.status, 'complete');
+    assert.deepEqual(result.workers[0].rulings, [{ feedbackKey: 'mivo-review:P2', verdict, reason: 'current head never reaches it' }]);
+  });
+}
+
+test('A-6 with no worker possible, an adjudicate-skipped line still lets the item close', (t) => {
+  const f = structured(t);
+  f.report([{ ...f.sc('no-change', ['mivo-review:P2']), evidence: ['current head guards it', 'adjudicate-skipped: no-tool, create_worker missing'] }], []);
+  assert.equal(f.finalize().status, 'complete');
+});
+
+for (const [ruling, error] of [
+  [{ feedbackKey: 'mivo-review:P2', verdict: 'maybe', reason: 'x' }, /verdict must be valid, invalid or p3, got maybe/],
+  [{ feedbackKey: 'mivo-review:P2', verdict: 'invalid', reason: ' ' }, /rulings\[0\]\.reason is required/],
+  [{ verdict: 'invalid', reason: 'x' }, /rulings\[0\]\.feedbackKey is required/],
+]) {
+  test(`A-6 a malformed ruling is rejected (${error.source.slice(0, 30)})`, (t) => {
+    const f = structured(t);
+    f.report([f.sc('no-change', ['mivo-review:P2'])], [ruled([ruling])]);
+    assert.throws(f.finalize, error);
+  });
+}
+
+// The arbiter's input comes from the helper, so the session cannot reword the finding, the PR change
+// or the standard it is judged by (vigil#38).
+function briefFixture(t) {
+  const f = fixture(t);
+  const body = '**P2** stale cache ~~~~ fence\n\n<!-- mivo-finding key=0123456789ab round=1 head=aaaaaaaaaaaa class=state -->';
+  f.task.headRefOid = f.head;
+  f.task.severityStandard = STANDARD;
+  f.task.prSnapshot = { pr: { baseRefOid: f.sourceHead }, unresolvedThreads: [{ id: 'PRRT_r', path: 'example.txt' }] };
+  f.saveTask([{ ...reviewerFinding('P2'), key: 'mivo-review:PRRT_r:PRRC_a', threadId: 'PRRT_r', body }, finding('P1')]);
+  return f;
+}
+
+test('B-1 the brief carries the finding verbatim, its key, the PR change, the session claim and the full standard', (t) => {
+  const f = briefFixture(t);
+  const out = adjudicationBrief({ home: f.options.home, taskPath: f.options.taskPath, keys: 'mivo-review:PRRT_r:PRRC_a', claim: 'reran the save path; cache is rebuilt' });
+  assert.equal(out.status, 'ok');
+  assert.deepEqual(out.keys, ['mivo-review:PRRT_r:PRRC_a']);
+  assert.equal(out.standardVersion, STANDARD.version);
+  const { brief } = out;
+  assert.match(brief, /- feedbackKey: mivo-review:PRRT_r:PRRC_a\n- 来源: mivo-review\n- 审查机问题 key: 0123456789ab\n- 文件: example.txt/);
+  assert.ok(brief.includes('**P2** stale cache ~~~ fence'), 'body kept, inner fence defused');
+  assert.match(brief, /-baseline\n\+synthetic repair/);
+  assert.match(brief, /## 修复会话的说法\(待核对,不是结论\)\n\n~~~~\nreran the save path; cache is rebuilt\n~~~~/);
+  assert.ok(brief.includes(`版本 ${STANDARD.version}\n\n${STANDARD.text}`));
+  assert.match(brief, /拿不准就判 valid/);
+  assert.match(brief, /\{"rulings":\[\{"feedbackKey"/);
+  assert.doesNotMatch(brief, /thread:P1/, 'only the requested items');
+});
+
+test('B-2 the brief says what it could not read instead of leaving it out silently', (t) => {
+  const f = briefFixture(t);
+  f.task.severityStandard = { loaded: false, reason: 'x' };
+  f.saveTask(f.task.feedback);
+  const gitFn = () => { throw new Error('fatal: bad revision\nmore'); };
+  const { brief, standardVersion } = adjudicationBrief({ home: f.options.home, taskPath: f.options.taskPath, keys: 'mivo-review:PRRT_r:PRRC_a', gitFn });
+  assert.equal(standardVersion, null);
+  assert.match(brief, new RegExp(`读取改动失败\\(fatal: bad revision\\);完整改动自己跑 \`git diff ${f.sourceHead}\\.\\.\\.${f.head} -- example.txt\``));
+  assert.match(brief, /修复会话没有附说法/);
+  assert.match(brief, /本任务没有带统一分级全文/);
+});
+
+test('B-3 the brief refuses unknown or missing keys', (t) => {
+  const f = briefFixture(t);
+  assert.throws(() => adjudicationBrief({ home: f.options.home, taskPath: f.options.taskPath, keys: 'mivo-review:nope' }), /unknown feedback keys: mivo-review:nope/);
+  assert.throws(() => adjudicationBrief({ home: f.options.home, taskPath: f.options.taskPath, keys: ' , ' }), /--keys requires at least one feedback key/);
+});
