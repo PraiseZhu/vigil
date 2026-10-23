@@ -41,7 +41,7 @@ Vigil 的两个 watcher **不是**可以配进任意 cron 的无状态脚本—�
 | 字段 | 取值 | 说明 |
 |---|---|---|
 | `executionMode` | `"script"` | 零 token 模式:宿主不起 agent,直接执行 `scriptConfig.command` |
-| `cronExpr` | `"* * * * *"` | 每分钟触发一次;5 字段 cron(minute hour day-of-month month day-of-week)。两轮之间在启动后第 45 秒再跟进一次转 Ready / 新推送 |
+| `cronExpr` | `"* * * * *"` | 每分钟触发;5 字段 cron(minute hour day-of-month month day-of-week)。一轮最多跑 165 秒(超时 180 秒减 15 秒余量),轮内与全量处理并行、每 15 秒用一次批量查询(含最新提交的 CI 汇总 state)复查全部 open PR,慢采集不挡节拍,一直查到整轮预算(上限 165 秒)末尾:节拍从启动后的基线算起,gh 的真实延迟会把最后一拍推到约 150–156 秒,整轮约 150–160 秒结束,所以两轮之间的检测空档约 20–30 秒。下一次触发要等本轮结束后才按 cron 排定(同一 schedule 不会重叠,也不会积压),所以选每分钟:一轮约 155 秒结束,下一次在 180 秒触发;若选 `*/2`,约 155 秒结束的一轮要等到 240 秒才再触发,中间约 85 秒无人检测。整轮预算须小于调度 timeoutMs(180 秒,留 15 秒余量)。上一轮没结束时新的触发不会出现;若手工另起进程,拿不到 `discover` 锁会直接返回 `lock-held` |
 | `timezone` | 你所在时区的 IANA id,如 `"Asia/Shanghai"` | 必填 |
 | `recurring` | `true` | discover 是常驻轮询,不是一次性任务 |
 | `scriptConfig.command` | `python3 <watcher home>/bin/mivo-watch-script.py --mode discover`(cindy watcher 换成 `cindy-watch-script.py`) | 经系统 shell 执行,cwd 为 `workingDir`;该命令必须实现 `cindy-script/1` 协议(stdout 只能是协议帧,调试输出走 stderr) |
@@ -102,7 +102,7 @@ node watchers/<mivo|cindy>/bin/<mivo|cindy>-repair.mjs lock-doctor --home "$WATC
 
 ### GitHub 读请求与缓存
 
-发现器每两分钟一轮。下面两类读请求只能用 `gh` 登录的个人账号发(GitHub App 令牌调不了
+发现器每轮最多 165 秒,每分钟排一次触发(上一轮结束后才排下一次)。采集有硬上限:每次 gh 调用前检查「整轮截止 − 派发预留」,到了就中止该 PR 的采集(标 `collectRetry`,下一轮最先处理),所以一轮不会跑过约 165 秒;整轮最后约 40 秒(派发预留 25 秒 + 最小采集 15 秒)内才出现的变化不再启动采集,同样留到下一轮开头——「新反馈通常 30 秒内派发」只在其余时段成立,最坏情况下一轮开头才处理。下面两类读请求只能用 `gh` 登录的个人账号发(GitHub App 令牌调不了
 `/user`,读分支保护要管理权限),所以跨轮缓存在 `state/kept-reads.json`:
 
 - 登录名(`gh api user`):6 小时。

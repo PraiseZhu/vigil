@@ -3,6 +3,19 @@ import { collectCindyPolicySteps, evaluateCindyCi } from './cindy-pr-policy.mjs'
 
 const parse = raw => typeof raw === 'string' ? JSON.parse(raw) : raw;
 const check = (ok, reason) => { if (!ok) throw new Error(reason); };
+// Starts every read before waiting for any: asynchronous transports run them side by side, synchronous ones in turn.
+// A synchronous transport that throws throws here, synchronously, so the caller's try/catch turns it into `unknown`;
+// a rejection is only created once an asynchronous read is already in flight, and then it reaches the awaiting caller.
+export function readAll(ghFn, list) {
+  const values = [];
+  for (const args of list) {
+    try { values.push(ghFn(args)); } catch (error) {
+      if (!values.some(value => typeof value?.then === 'function')) throw error;
+      values.push(Promise.reject(error));
+    }
+  }
+  return values.some(value => typeof value?.then === 'function') ? Promise.all(values) : values;
+}
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 export function* collectCindyCiSteps({ pr, ghFn }) {
@@ -15,6 +28,7 @@ export function* collectCindyCiSteps({ pr, ghFn }) {
     const checks = pages.flatMap(p => p.check_runs);
     const jobs = new Map();
     const runs = new Map();
+    const wanted = [];
     for (const item of checks) {
       check(item && item.head_sha === pr.headRefOid, 'check head drift');
       if (!policy.required.some(rule => rule.context === item.name && (rule.appId === null || rule.appId === item.app?.id))) continue;
@@ -26,12 +40,45 @@ export function* collectCindyCiSteps({ pr, ghFn }) {
       check(url.protocol === 'https:' && url.hostname === 'github.com' && !url.username && !url.password, 'invalid check job URL');
       const match = new RegExp(`^/${pr.repo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/actions/runs/(\\d+)/job/(\\d+)/?$`).exec(url.pathname);
       check(match, 'Actions check has no bound job URL');
-      const [, runId, jobId] = match;
-      if (!jobs.has(jobId)) jobs.set(jobId, parse(yield () => ghFn(['api', `repos/${pr.repo}/actions/jobs/${jobId}`])));
+      wanted.push({ item, runId: match[1], jobId: match[2] });
+    }
+    // Every job and run of one head is independent of the others: read them at once. A completed job or run never
+    // changes again, so those reads are kept per head (cache) and only unfinished ones are asked for every round.
+    const ciCache = ghFn.ciCache;
+    const keyOf = (kind, id) => `ci:${kind}:${pr.repo}:${pr.headRefOid}:${id}`;
+    const fromCache = (kind, id) => { try { return ciCache?.get(keyOf(kind, id)); } catch { return undefined; } };
+    const toLoad = [];
+    for (const { runId, jobId } of wanted) {
+      if (!jobs.has(jobId) && !toLoad.some(entry => entry.kind === 'jobs' && entry.id === jobId)) {
+        const kept = fromCache('jobs', jobId);
+        if (kept) jobs.set(jobId, kept); else toLoad.push({ kind: 'jobs', id: jobId });
+      }
+      if (!runs.has(runId) && !toLoad.some(entry => entry.kind === 'runs' && entry.id === runId)) {
+        const kept = fromCache('runs', runId);
+        if (kept) runs.set(runId, kept); else toLoad.push({ kind: 'runs', id: runId });
+      }
+    }
+    const remember = (kind, id, value) => {
+      if (value?.status === 'completed' && value?.head_sha === pr.headRefOid) { try { ciCache?.set(keyOf(kind, id), value); } catch { /* a cache write never fails the read */ } }
+    };
+    if (toLoad.length) {
+      const loaded = yield () => readAll(ghFn, toLoad.map(entry => ['api', `repos/${pr.repo}/actions/${entry.kind}/${entry.id}`]));
+      toLoad.forEach((entry, index) => {
+        const value = parse(loaded[index]);
+        (entry.kind === 'jobs' ? jobs : runs).set(entry.id, value);
+        remember(entry.kind, entry.id, value);
+      });
+    }
+    for (const { item, runId, jobId } of wanted) {
       const job = jobs.get(jobId);
       check(job.id === Number(jobId) && job.run_id === Number(runId) && job.head_sha === pr.headRefOid
         && job.check_run_url === `https://api.github.com/repos/${pr.repo}/check-runs/${item.id}`, 'Actions job/check mismatch');
-      if (!runs.has(runId)) runs.set(runId, parse(yield () => ghFn(['api', `repos/${pr.repo}/actions/runs/${runId}`])));
+      // A kept run that is older than the attempt the job reports was re-run since: read it again.
+      if (fromCache('runs', runId) && Number.isSafeInteger(job.run_attempt) && job.run_attempt > runs.get(runId).run_attempt) {
+        const fresh = parse(yield () => ghFn(['api', `repos/${pr.repo}/actions/runs/${runId}`]));
+        runs.set(runId, fresh);
+        remember('runs', runId, fresh);
+      }
       const run = runs.get(runId);
       check(run.id === Number(runId) && run.repository?.full_name === pr.repo && run.head_sha === pr.headRefOid
         // A partial re-run (gh run rerun --failed) bumps the run's attempt, but jobs that were not re-run keep the
@@ -56,7 +103,7 @@ export function collectCindyCiSync(options) {
   while (!step.done) {
     try {
       const value = step.value();
-      if (value?.then) throw new Error('async transport used with synchronous CI collection');
+      if (value?.then) { value.catch?.(() => {}); throw new Error('async transport used with synchronous CI collection'); }
       step = iterator.next(value);
     } catch (error) { step = iterator.throw(error); }
   }
