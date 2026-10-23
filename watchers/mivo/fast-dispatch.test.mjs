@@ -205,7 +205,7 @@ function tickFixture(t, { listFor, rollupFor = () => 'SUCCESS', followMs = 15000
     dispatchFn: (params) => { sent.push({ at: now, title: params.title }); return { target_session_id: 'sess-941' }; },
     ...extra,
   });
-  return { result, lists, batches, gates, sent };
+  return { result, lists, batches, gates, sent, elapsed: () => now };
 }
 
 test('第 20 秒出现的变化在下一个 15 秒间隔内被处理', (t) => {
@@ -216,12 +216,13 @@ test('第 20 秒出现的变化在下一个 15 秒间隔内被处理', (t) => {
   assert.ok(batches.slice(1).every((at, i) => at - batches[i] >= 15000), `batches ${batches}`);
 });
 
-test('无变化时每个间隔只发一次批量查询，并一直查到只剩派发预留', (t) => {
-  const { batches, lists, result } = tickFixture(t, { listFor: () => JSON.stringify([listedPr(942, { isDraft: true })]) });
+test('无变化时每个间隔只发一次批量查询，并一直查到整轮预算用尽（轮间空档约 15 秒）', (t) => {
+  const { batches, lists, result, elapsed } = tickFixture(t, { listFor: () => JSON.stringify([listedPr(942, { isDraft: true })]) });
   for (let i = 1; i < batches.length; i += 1) assert.equal(batches[i] - batches[i - 1], 15000);
   assert.equal(lists.length, 1, 'only the opening listing uses gh pr list');
-  const lastAllowed = watcher.ROUND_BUDGET_MS - watcher.DISPATCH_RESERVE_MS;
-  assert.ok(batches.at(-1) >= lastAllowed - 15000 && batches.at(-1) <= lastAllowed, `last batch ${batches.at(-1)} of ${lastAllowed}`);
+  const budget = watcher.ROUND_BUDGET_MS;
+  assert.ok(batches.at(-1) >= budget - 15000 && batches.at(-1) <= budget, `last batch ${batches.at(-1)} of ${budget}`);
+  assert.ok(elapsed() >= budget - 15000 && elapsed() <= budget, `the quiet round ran ${elapsed()} ms of ${budget}`);
   assert.equal(result.prs.length, 1);
 });
 
@@ -538,7 +539,7 @@ function lateChangeFixture(t, { changeAtMs, collectMs }) {
   return { paths, options, sent, order, reset: () => { now = 0; }, elapsed: () => now };
 }
 
-for (const changeAtMs of [100000, 130000]) {
+for (const changeAtMs of [100000, 130000, 150000]) {
   for (const collectMs of [60000, 100000]) {
     test(`F1 第 ${changeAtMs / 1000} 秒出现变化 + ${collectMs / 1000}s 采集：整轮不超预算，该 PR 标 collectRetry，下一轮优先并派发`, (t) => {
       const fx = lateChangeFixture(t, { changeAtMs, collectMs });
@@ -560,3 +561,48 @@ for (const changeAtMs of [100000, 130000]) {
     });
   }
 }
+
+// ---- P2-b：截止发生在 CI job/run 查询阶段（真实 collectXxxCiSync 把异常吞成 unknown）----
+test('P2-b CI 阶段被整轮截止切断：不当作无反馈，进入 deferredNumbers，下一轮最先处理并派发', (t) => {
+  const { paths, plugin } = setup(t);
+  let now = 0;
+  const sent = [];
+  const order = [];
+  let firstDone = false;
+  const ciFx = ciGh();
+  const options = (stamp) => ({
+    mode: 'discover', enabled: true, allowDispatch: true, paths, now: stamp, clock: () => now,
+    followMs: 15000, sleepFn: (ms) => { now += ms; }, fullCollectMs: 1e12,
+    gitFn: () => '', env: { MIVO_PLUGIN_REPO: plugin }, ownershipSnapshot: ownership,
+    ghFn: (args) => {
+      if (args[0] === 'api' && args[1] === 'user') return 'owner';
+      const changed = now >= 100000;
+      const listing = () => [listedPr(982, changed ? { updatedAt: '2026-10-15T00:02:10Z' } : {})];
+      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(listing());
+      if (isBatch(args)) return batchResponse(listing());
+      if (isGate(args)) return JSON.stringify({ data: { node: graphqlNode({ comments: { totalCount: changed ? 1 : 0, nodes: [] } }) } });
+      // The CI collection: every gh call takes 5 s, so a collection started late runs into the round's deadline.
+      if (args[1]?.startsWith('repos/') || (args[0] === 'pr' && args[1] === 'view')) { now += 5000; return ciFx.fn(args); }
+      return '[]';
+    },
+    collect: (pr, { ghFn }) => {
+      order.push(pr.number);
+      if (!firstDone) { firstDone = true; return quiet(pr); }
+      // The real CI collector: it turns any error into `unknown` instead of throwing.
+      const ci = collectMivoCiSync({ pr: ciPr, ghFn });
+      // Cut off → the collector reports CI unknown (nothing else is known); finished → the PR has a failing check to repair.
+      return ci.status === 'unknown' ? { ...quiet(pr), ci: { ...ci, required: [] } } : failing(pr);
+    },
+    dispatchFn: (params) => { sent.push(params.title); return { target_session_id: 'sess-982' }; },
+  });
+  scanOnce(options('2026-10-15T00:00:00Z'));
+  assert.ok(now <= watcher.ROUND_BUDGET_MS, `round ran ${now} ms`);
+  assert.equal(sent.length, 0, 'the cut-off collection delivers nothing');
+  assert.equal(readPr(paths.home, 'PR_982').collectRetry, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(statePaths(paths.home).indexPath, 'utf8')).deferredNumbers, [982]);
+  now = 0;
+  order.length = 0;
+  scanOnce(options('2026-10-15T00:03:00Z'));
+  assert.equal(order[0], 982);
+  assert.equal(sent.length, 1, 'delivered next run');
+});
