@@ -34,7 +34,7 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 - 作者自己的 PR 转 Ready 后下一轮就接手,不要求必需检查先绿:CI 失败和冲突直接成为修复反馈。
 - 维护者(OWNER/MEMBER/COLLABORATOR)、作者本人和已知代码审查应用(`REVIEW_APPS`)留的 review thread
   交修复会话按 REVIEW.md 分级(`review-thread-triage`):确认成立的 P0/P1/P2 才改代码,P3 由 watcher 回复分级说明后 resolve。
-  其它应用的状态评论、没有自己必修项的 Greptile 汇总不再单独开会话。严重度未知或 Jev 不可用时按不成立记 no-change,不 blocked。
+  其它应用的状态评论、没有自己必修项的 Greptile 汇总不再单独开会话。严重度未知时按不成立记 no-change,不 blocked；Jev 不可用是例外：`finalize` 门禁要求被引用的决策行带 Jev 结论,会话遇到 Jev 不可用要立即以 `keel-jev-unavailable:` 开头的原因 blocked。
 - 修复会话 `prepare` 先对齐 watch 树:落后 fork 就快进,与 fork 分叉就把旧分支打 bundle 存进
   `_backup/` 后按 fork 重建。
 - 因环境原因 blocked(预检跑不起来、watch 树分叉、子代理路由被拒等,见 `INFRA_BLOCK_REASON`)的轮次退还轮次、
@@ -80,14 +80,14 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 | profile 字段 | 环境变量 | 要求 |
 |---|---|---|
 | `keelLedgerRoot` | `CINDY_KEEL_LEDGER_ROOT` | Keel 插件数据目录（包含 `runs/` 的那一层）；新派发的 `keelFlowVersion>=2` 任务缺少此配置时，`finalize` 报 `KEEL_RUN_REQUIRED`，拒绝收口和推送 |
-| `keelNamespace` | `CINDY_KEEL_NAMESPACE` | 可选。Keel 插件装在企业命名空间下时填该命名空间（如重装到 `xd` 之后）。配置后，派工消息里所有 Keel 调用都写明 `ghost_id=keel` 加 `namespace="<值>"`；不配置时消息要求修复会话省略 `namespace` 参数、不得传 `null`（`null` 会让命名空间安装的 Keel 报 `GHOST_NOT_FOUND`） |
+| `keelNamespace` | `CINDY_KEEL_NAMESPACE` | 可选。Keel 插件装在企业命名空间下时填该命名空间（如重装到 `xd` 之后）。配置后，派工消息里所有 Keel 调用都写明 `ghost_id=keel` 加 `namespace="<值>"`；不配置时消息要求修复会话省略 `namespace` 参数、不得传 `null`（`null` 会让命名空间安装的 Keel 报 `GHOST_NOT_FOUND`）。已设置但不合法（只允许字母、数字、下划线、连字符，以字母或数字开头，最长 128 位）时直接报配置错误，不会被当作未配置 |
 
 ### Keel 环境变化时的行为
 
 - **台账路径提前核对**：配置了 `keelLedgerRoot` 时，`prepare` 在建 worktree 之前先确认该目录存在且可读；不满足就立即以 `keel-unavailable: ledger root unreadable (<errno>)` 报 blocked，不再拖到 `validate` 之后的 `finalize` 才发现（原因里只带错误码，不带路径）。
 - **派发前核对**：每次向修复会话派发之前，watcher 同样检查 `keelLedgerRoot` 可读。不可读时本轮不派发、不扣轮次、不在 PR 上发评论，反馈保持未交付；同时写一条 `keel-unavailable` 通知（每个 PR 每天一条）。该 PR 下一轮扫描会重新处理，台账恢复后自动派发。未配置 `keelLedgerRoot` 时不做这项检查。
 - **Jev 不可用**：`finalize` 仍要求被引用的决策行带 Jev 结论（`answer`、`policy` 非空），门禁不放宽。所以修复会话遇到 Jev 不可用（如 `JEV_NOT_CONFIGURED`）时，立即用 `blocked --reason "keel-jev-unavailable: <原文>"` 停下，不先做修复、不跑 `validate`。
-- **keel- 阻塞自动重开**：以 `keel-` 开头原因阻塞的任务，在当前 `KEEL_FLOW_VERSION` 下也会重开：距离阻塞至少 30 分钟；同一 PR 同一次准入（admission epoch）最多重开 3 次；重开时退还轮次并把该任务的反馈交回。超过上限后保持阻塞，由通知提示人处理。
+- **keel- 阻塞自动重开**：以 `keel-` 开头原因阻塞的任务，在当前 `KEEL_FLOW_VERSION` 下也会重开：距离阻塞至少 30 分钟，且已配置的 `keelLedgerRoot` 此时可读（台账仍读不到时不登记重开、不退轮次，等台账恢复后再重开）；同一 PR 同一次准入（admission epoch）最多重开 3 次；重开时退还轮次并把该任务的反馈交回。超过上限后保持阻塞，由通知提示人处理。
 
 ## 修复 session 的 Keel 流程
 

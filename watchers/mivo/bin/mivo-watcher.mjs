@@ -1347,7 +1347,8 @@ export function reopenInfraBlocked({ previous, paths, now }) {
 // matched the installed Keel; the feedback itself was never judged. The cursor still moved on, so
 // that feedback would never be re-delivered, and the blocked round was charged. Once this watcher
 // speaks a newer contract (KEEL_FLOW_VERSION), hand such tasks' feedback back once and refund their
-// rounds. A task already on the current contract is not retried, so a Keel that is broken again
+// rounds. A task already on the current contract is retried only through retryKeelBlocked (after a back-off,
+// a few times per admission epoch, and only once the ledger is readable), so a Keel that is broken again
 // cannot loop; markException keeps reporting it. Reads task/result files, writes nothing.
 const KEEL_BLOCK_REASON = /^keel-/i;
 const REOPEN_SCAN_LIMIT = 20;
@@ -1360,7 +1361,10 @@ function readJsonOrNull(file) {
 // admission epoch, so a Keel that stays broken is retried a few times and then left to markException.
 export const KEEL_RETRY_BACKOFF_MS = 30 * 60 * 1000;
 export const KEEL_RETRY_LIMIT = 3;
-function retryKeelBlocked({ previous, paths, now }) {
+function retryKeelBlocked({ previous, paths, now, keelRoot }) {
+  // While the ledger is still unreadable the retry would only be held back again by the dispatch gate and
+  // its dispatch id would already be spent, so the PR would never be delivered once the ledger is back.
+  if (keelLedgerProblem(keelRoot)) return previous;
   const active = previous.activeTask;
   const dispatchId = active.dispatchId;
   const observed = Date.parse(active.observedAt ?? '');
@@ -1380,7 +1384,7 @@ function retryKeelBlocked({ previous, paths, now }) {
     keelRetries: [...done, { dispatchId, epoch, at: now }],
   };
 }
-export function reopenKeelBlocked({ previous, paths, now }) {
+export function reopenKeelBlocked({ previous, paths, now, keelRoot = keelLedgerRoot() }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || !KEEL_BLOCK_REASON.test(String(active.reason ?? ''))) return previous;
   const reopened = new Set(previous.keelReopened ?? []);
@@ -1394,7 +1398,7 @@ export function reopenKeelBlocked({ previous, paths, now }) {
     candidates.push({ dispatchId, keys: (task.feedback ?? []).map(item => item?.key).filter(key => typeof key === 'string') });
   };
   consider(active.dispatchId, active.reason);
-  if (!candidates.length) return retryKeelBlocked({ previous, paths, now });
+  if (!candidates.length) return retryKeelBlocked({ previous, paths, now, keelRoot });
   // Earlier rounds of this PR that the same incompatibility swallowed, walking back from the newest
   // and stopping at the first round that ended any other way: a round that completed or blocked on
   // something real already handled whatever came before it.
@@ -1643,7 +1647,7 @@ export function* processPr({
   try { previous = consumeResult(previous, resultFor(previous, paths), now); }
   catch (error) { resultError = error.message; }
   if (!resultError) previous = rememberPendingClose(previous, paths);
-  if (!resultError) previous = reopenInfraBlocked({ previous: reopenKeelBlocked({ previous, paths, now }), paths, now });
+  if (!resultError) previous = reopenInfraBlocked({ previous: reopenKeelBlocked({ previous, paths, now, keelRoot }), paths, now });
   if (!resultError) previous = reopenProductIntentBlocked({ previous, paths, now });
   if (!resultError) previous = reopenRoundLimitBlocked({ previous });
   if (!resultError) previous = reopenExternalBlocked({ previous, paths, now, head: pr.headRefOid });

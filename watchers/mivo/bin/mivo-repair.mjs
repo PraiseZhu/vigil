@@ -395,9 +395,13 @@ export function keelLedgerRoot(env = process.env) {
 
 // Namespace the Keel plugin is installed under (e.g. after a reinstall into an organisation namespace).
 // Optional: unset means the root install, where the session must leave the namespace argument out.
+// An unset value is "root install". A set but illegal value stops here: reading it as unset would tell the
+// session to omit the namespace and a namespaced Keel would answer GHOST_NOT_FOUND with no hint why.
 export function keelNamespace(env = process.env) {
   const value = optionalConfig('keelNamespace', { envVar: 'MIVO_KEEL_NAMESPACE', env });
-  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value.trim()) ? value.trim() : null;
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) return value;
+  fail('配置项「keelNamespace」的值不合法（环境变量 MIVO_KEEL_NAMESPACE 或 profile.json 的 "keelNamespace" 字段）：只允许字母、数字、下划线和连字符，以字母或数字开头，最长 128 位');
 }
 
 // Why the configured ledger root cannot be used, or null when it can (or none is configured).
