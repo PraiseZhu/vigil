@@ -41,7 +41,7 @@ Vigil 的两个 watcher **不是**可以配进任意 cron 的无状态脚本—�
 | 字段 | 取值 | 说明 |
 |---|---|---|
 | `executionMode` | `"script"` | 零 token 模式:宿主不起 agent,直接执行 `scriptConfig.command` |
-| `cronExpr` | `"* * * * *"` | 每分钟触发;5 字段 cron(minute hour day-of-month month day-of-week)。一轮最多跑 165 秒(超时 180 秒减 15 秒余量),轮内与全量处理并行、每 15 秒用一次批量查询(含最新提交的 CI 汇总 state)复查全部 open PR,慢采集不挡节拍,一直查到整轮预算(165 秒)用尽,所以两轮之间的检测空档约 15 秒。下一次触发要等本轮结束后才按 cron 排定(同一 schedule 不会重叠,也不会积压),所以选每分钟:一轮约 165 秒结束时,下一次最晚 15 秒后触发;若选 `*/2`,2:45 结束的一轮要等到 4:00 才再触发,中间约 75 秒无人检测。整轮预算须小于调度 timeoutMs(180 秒,留 15 秒余量)。上一轮没结束时新的触发不会出现;若手工另起进程,拿不到 `discover` 锁会直接返回 `lock-held` |
+| `cronExpr` | `"* * * * *"` | 每分钟触发;5 字段 cron(minute hour day-of-month month day-of-week)。一轮最多跑 165 秒(超时 180 秒减 15 秒余量),轮内与全量处理并行、每 15 秒用一次批量查询(含最新提交的 CI 汇总 state)复查全部 open PR,慢采集不挡节拍,一直查到整轮预算(上限 165 秒)末尾:节拍从启动后的基线算起,gh 的真实延迟会把最后一拍推到约 150–156 秒,整轮约 150–160 秒结束,所以两轮之间的检测空档约 20–30 秒。下一次触发要等本轮结束后才按 cron 排定(同一 schedule 不会重叠,也不会积压),所以选每分钟:一轮约 155 秒结束,下一次在 180 秒触发;若选 `*/2`,约 155 秒结束的一轮要等到 240 秒才再触发,中间约 85 秒无人检测。整轮预算须小于调度 timeoutMs(180 秒,留 15 秒余量)。上一轮没结束时新的触发不会出现;若手工另起进程,拿不到 `discover` 锁会直接返回 `lock-held` |
 | `timezone` | 你所在时区的 IANA id,如 `"Asia/Shanghai"` | 必填 |
 | `recurring` | `true` | discover 是常驻轮询,不是一次性任务 |
 | `scriptConfig.command` | `python3 <watcher home>/bin/mivo-watch-script.py --mode discover`(cindy watcher 换成 `cindy-watch-script.py`) | 经系统 shell 执行,cwd 为 `workingDir`;该命令必须实现 `cindy-script/1` 协议(stdout 只能是协议帧,调试输出走 stderr) |
