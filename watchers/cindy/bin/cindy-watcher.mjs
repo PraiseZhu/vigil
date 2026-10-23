@@ -1452,12 +1452,15 @@ export function* processPr({
   try {
   // No collection may run past the round's deadline less the dispatch reserve: each gh call checks it first, so a
   // slow collection ends with an error (collectRetry, first next run) instead of overrunning the host timeout.
+  // The CI collector (and others) turn errors into `unknown`, so the cut-off is also remembered here and checked after
+  // `collect` returns: a collection that was cut off is a failed collection, however it ended.
+  let collectionCutOff = false;
   const collectGh = (args) => {
-    if (deadline - dispatchReserveMs - clock() <= 0) throw new Error('collection-budget-exhausted');
+    if (deadline - dispatchReserveMs - clock() <= 0) { collectionCutOff = true; throw new Error('collection-budget-exhausted'); }
     return ghFn(args);
   };
   collectGh.ciCache = ghFn.ciCache;
-  try { collected = yield () => collect(pr, { ghFn: collectGh }); }
+  try { collected = yield () => collect(pr, { ghFn: collectGh }); if (collectionCutOff) throw new Error('collection-budget-exhausted'); }
   catch (error) {
     state.prs[key] = {...base,lastCollectionError:{at:now,reason:String(error.message).slice(0,400)},mergeReady:false,reviewEvidence:null};
     // A PR cut short only because earlier PRs used this run's time gets a
@@ -2530,7 +2533,7 @@ export function* discoverWorkflow({
     };
     for (;;) {
       const tickAt = Math.max(clock(), lastAt + waitMs);
-      if (tickAt > hardDeadline - dispatchReserveMs) break;
+      if (tickAt > hardDeadline) break;
       if (tickAt > clock()) yield () => sleepFn(tickAt - clock());
       const tickGh = memoRepoReads(baseGh, keptReads);
       lastAt = clock();
