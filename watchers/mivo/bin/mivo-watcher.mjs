@@ -18,7 +18,7 @@ import {lifelineFeedback} from './mivo-lifeline-source.mjs';
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent, completedMemberFeedback, coveredFeedbackItems, replyToMemberFeedback, requestMemberReviewers } from './mivo-review-resolve.mjs';
 import { codeScanningFeedbackItems } from './mivo-code-scanning.mjs';
 import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck } from './mivo-pr-actions.mjs';
-import { autoCleanupWatch, command as gitDefaultFn, KEEL_FLOW_VERSION, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION } from './mivo-repair.mjs';
+import { autoCleanupWatch, command as gitDefaultFn, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION } from './mivo-repair.mjs';
 import { enqueueNotice } from './notify.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
 
@@ -693,14 +693,19 @@ export function compactPrSnapshot(collected, now) {
 // worktree and a graph run instead). A ledger exists only after pstack_decide(op:"decide") ran with
 // a run_id, and op:"log" refuses a run without one. So the watcher hands out the run id and the
 // session starts the ledger with its first severity judgement.
-function keelRulesV3({ dispatchId, canChangeCode }) {
+function keelRulesV3({ dispatchId, canChangeCode, namespace = keelNamespace() }) {
   const runId = keelRunIdFor(dispatchId);
+  // Every Keel call names the plugin the same way. A plugin installed under a namespace is not found
+  // without it; a root install is not found with namespace:null, so that case says to leave it out.
+  const keelCall = namespace
+    ? `ghost_id=keel，namespace="${namespace}"（ghost_call、ghost_info、ghost_manual 每次都带这两个参数）`
+    : 'ghost_id=keel，省略 namespace 参数（不得传 namespace:null，也不要自拟其他值）';
   const playbook = canChangeCode ? 'bug-fix' : 'investigation';
   return [
-    `KEEL_FLOW：全程用 Keel 插件（ghost_id=keel）的台账，不用 goal skill。本任务的 Keel run_id 固定为 ${runId}，不得自拟或更换。不要调用 pstack_start、keel_run、keel_report、keel_wait、keel_gate、keel_status：它们会另建 worktree 和图 run，与本流程无关，也不要执行它们返回的 next。`,
+    `KEEL_FLOW：全程用 Keel 插件（${keelCall}）的台账，不用 goal skill。本任务的 Keel run_id 固定为 ${runId}，不得自拟或更换。不要调用 pstack_start、keel_run、keel_report、keel_wait、keel_gate、keel_status：它们会另建 worktree 和图 run，与本流程无关，也不要执行它们返回的 next。`,
     `台账顺序不可颠倒：①prepare 之后的第一次判断必须是 pstack_decide({op:"decide",template:"J4",state:{items:[{id:<反馈key>,text:<摘要>}]},run_id:"${runId}"})，对本批反馈做统一分级；带 run_id 的 decide 会建立台账文件，Jev 不可用时也会先写一行（即使该调用报错，台账也已建立，继续第②步）。②再 pstack_decide({op:"log",run_id:"${runId}",kind:"step",summary:"vigil task=${dispatchId}"}) 绑定本任务（op:"log" 要求台账已存在，不能先 log）。③其余判断点继续用带 run_id 的 pstack_decide(op:"decide")，过程记录用 op:"log"。finalize 必须带 --keel-run ${runId}，helper 核对台账后才收口。`,
     'Keel 只用 jev、pstack_decide（decide / log / read）、pr_threads（只读分级）和 ghost_manual；其余 Keel 工具一律不用，尤其禁止 pr_status、pr_wait、pr_reply、pr_ready、pr_open、worktree、fanout（会弹确认框、长轮询、另建 worktree 或因交接记录停手）。GitHub 写操作只走本 helper 与 gh。',
-    'Jev 固定判断点（pstack_decide，结论留在台账）：严重度未知或混合的反馈；必需 CI 失败是基础设施抖动还是真失败；判定 P0/P1/P2 不成立时证据是否充分；修法与连带文件。Jev 结论只作参考，不能单独授权改代码或升级严重度。Jev 不可用时用 op:"log" kind:"gap" 记 JEV_UNAVAILABLE，自己核实后按证据判，确认不了 P0/P1/P2 就按不成立记 no-change，不 blocked。Keel 台账本身不可用（工具缺失、RUN_NOT_FOUND 等）时用 helper blocked --reason "keel-unavailable: <原文>"，reason 必须以 keel- 开头。',
+    'Jev 固定判断点（pstack_decide，结论留在台账）：严重度未知或混合的反馈；必需 CI 失败是基础设施抖动还是真失败；判定 P0/P1/P2 不成立时证据是否充分；修法与连带文件。Jev 结论只作参考，不能单独授权改代码或升级严重度。finalize 门禁要求被引用的决策行带 Jev 结论（answer、policy 非空），所以 Jev 不可用（如 JEV_NOT_CONFIGURED）时没有可引用的结论：立即用 helper blocked --reason "keel-jev-unavailable: <原文>" 停下，不先做修复、不跑 validate。Keel 台账本身不可用（工具缺失、RUN_NOT_FOUND 等）时用 helper blocked --reason "keel-unavailable: <原文>"，reason 必须以 keel- 开头。',
     `KEEL_FLOW_VERSION=3：用 ghost_manual 读取 pstack/skills/poteto-mode/playbooks/${playbook}.md，按复现/调查、修法/无需改动判断、验证的固定流程执行。`,
     `收口前用 pstack_decide({op:"log",run_id:"${runId}",kind:"evidence",summary:"vigil flow task=${dispatchId}",evidence:{kind:"vigil-flow",version:3,taskId:"${dispatchId}",head:<validated-head>,playbook:"${playbook}",manualPath:"pstack/skills/poteto-mode/playbooks/${playbook}.md",decisionRowIds:[<本 run 中 pstack_decide(op:"decide") 返回的 ledger_row>],steps:{reproduce:<实际复现或调查证据>,repair:<修法和处置证据>,verify:{head:<validated-head>,receiptSha256:<helper validate返回值>}}}})；全SC=no-change时verify改为{status:"not-run",reason:<无需代码验证的具体原因>}。缺证据用 blocked 保存原因，不伪造完成。`,
   ];
@@ -708,8 +713,8 @@ function keelRulesV3({ dispatchId, canChangeCode }) {
 
 // Repair sessions run Keel's pstack flow; finalize refuses to close a task whose Keel run is not bound to it.
 // Tasks keep the contract they were dispatched with (task.keelFlowVersion); only new ones get the current one.
-export function keelRules({ dispatchId, canChangeCode, version = KEEL_FLOW_VERSION }) {
-  if (version >= 3) return keelRulesV3({ dispatchId, canChangeCode });
+export function keelRules({ dispatchId, canChangeCode, version = KEEL_FLOW_VERSION, namespace = keelNamespace() }) {
+  if (version >= 3) return keelRulesV3({ dispatchId, canChangeCode, namespace });
   return [
     `KEEL_FLOW：全程用 Keel 插件（ghost_id=keel）跑流程，不用 goal skill。prepare 之后先 pstack_start({task:"PR 修复 task=${dispatchId}", repo_dir:<prepare 返回的 worktree>, playbook:"${canChangeCode ? 'bug-fix' : 'investigation'}"})，再 pstack_ledger({op:"log", run_id, kind:"step", summary:"vigil task=${dispatchId}"}) 绑定本任务；finalize 必须带 --keel-run <run_id>，helper 核对台账后才收口。`,
     'Keel 只用 jev、pstack_start、pstack_decide、pstack_ledger、pr_threads（只读分级）和 ghost_manual；禁止 pr_status、pr_wait、pr_reply、pr_ready、pr_open、pr_board、worktree、fanout_plan、fanout_ingest（会弹确认框、长轮询或因交接记录停手）。GitHub 写操作只走本 helper 与 gh。',
@@ -728,7 +733,7 @@ export const SNAPSHOT_RULE = 'PR 状态、required checks、失败 check 和未�
 // The owner wants every PR pushed to mergeable without a person in the loop (2026-10-15).
 export const INTENT_RULE = '产品意图：动手前先读 prIntent（PR 正文里作者写明的产品意图；正文没有该节时是正文开头）。某条反馈要求的改法会改变 PR 正文、仓库规格文档或维护者裁定里已经写明的界面、交互或流程时，它不是缺陷：不改代码，记 SC=no-change，evidence 第一条写明引用的是正文或规格的哪一段，watcher 会贴到该 thread 并 resolve，然后继续处理其余反馈。不要为这类反馈 blocked 或等人拍板。只是代码没按写明的设计实现（实现错了）时，照常按严重度修。';
 // Nothing a repair session can settle by reading code and running it waits for a person.
-export const AUTO_ADVANCE_RULE = '全自动推进：目标是把 PR 推到可合并（必需检查全绿、讨论全部 resolve、审查结论通过），不合并。严重度拿不准时在会话里复现和读代码核实；核实后确认是 P0/P1/P2 才改，确认不了的按不成立处理（SC=no-change，evidence 写明核实了什么、为什么不成立），不要因为「严重度未知」或 Jev 不可用而 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用这类会话自己解决不了的情况才 blocked。不向用户提问、不等用户确认；拿不准用 Jev，仍低置信就选改动最小、可撤回的做法并写进结果。';
+export const AUTO_ADVANCE_RULE = '全自动推进：目标是把 PR 推到可合并（必需检查全绿、讨论全部 resolve、审查结论通过），不合并。严重度拿不准时在会话里复现和读代码核实；核实后确认是 P0/P1/P2 才改，确认不了的按不成立处理（SC=no-change，evidence 写明核实了什么、为什么不成立），不要因为「严重度未知」而 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账或 Jev 不可用这类会话自己解决不了的情况才 blocked（Jev 不可用按 KEEL_FLOW 一节立即 blocked，原因以 keel-jev-unavailable 开头）。不向用户提问、不等用户确认；拿不准用 Jev，仍低置信就选改动最小、可撤回的做法并写进结果。';
 // Severity comes from one file the reviewer publishes (its repo's mivo/config/severity.md, pinned with the
 // pre-review checkout on the same machine). Two hand-written definitions disagreed on P2 and kept the reviewer
 // and the repair session re-litigating the same finding (2026-10-22). Version = sha256 of the raw file, first
@@ -1296,6 +1301,7 @@ function needsCiRecheck(active) {
 
 export const INFRA_BLOCK_REASON = /preflight|submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge/i;
 export const INFRA_REOPEN_LIMIT = 3;
+export const KEEL_LEDGER_HELD = 'keel-ledger-unavailable';
 export function reopenExternalBlocked({ previous, paths, now, head }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind !== 'external' || active.blockedKind === AUTHOR_RECLAIMED) return previous;
@@ -1349,6 +1355,31 @@ function readJsonOrNull(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { return null; }
 }
+// A keel- block on the current contract is an environment fault (ledger moved, plugin missing, Jev not
+// configured), not a stale prompt. It is handed back after a back-off, at most KEEL_RETRY_LIMIT times per
+// admission epoch, so a Keel that stays broken is retried a few times and then left to markException.
+export const KEEL_RETRY_BACKOFF_MS = 30 * 60 * 1000;
+export const KEEL_RETRY_LIMIT = 3;
+function retryKeelBlocked({ previous, paths, now }) {
+  const active = previous.activeTask;
+  const dispatchId = active.dispatchId;
+  const observed = Date.parse(active.observedAt ?? '');
+  if (typeof dispatchId !== 'string' || !/^[A-Za-z0-9._:-]+$/.test(dispatchId)
+    || !Number.isFinite(observed) || Date.parse(now) - observed < KEEL_RETRY_BACKOFF_MS) return previous;
+  const done = previous.keelRetries ?? [];
+  const epoch = previous.admissionEpoch ?? null;
+  if (done.some(item => item.dispatchId === dispatchId) || (previous.keelReopened ?? []).includes(dispatchId)
+    || done.filter(item => item.epoch === epoch).length >= KEEL_RETRY_LIMIT) return previous;
+  const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`));
+  if (!task || task.nodeId !== previous.nodeId) return previous;
+  const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
+  for (const item of task.feedback ?? []) if (typeof item?.key === 'string') delete feedbackCursor[item.key];
+  return {
+    ...previous, feedbackCursor, eligibility: 'active',
+    repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) - 1),
+    keelRetries: [...done, { dispatchId, epoch, at: now }],
+  };
+}
 export function reopenKeelBlocked({ previous, paths, now }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || !KEEL_BLOCK_REASON.test(String(active.reason ?? ''))) return previous;
@@ -1363,7 +1394,7 @@ export function reopenKeelBlocked({ previous, paths, now }) {
     candidates.push({ dispatchId, keys: (task.feedback ?? []).map(item => item?.key).filter(key => typeof key === 'string') });
   };
   consider(active.dispatchId, active.reason);
-  if (!candidates.length) return previous;
+  if (!candidates.length) return retryKeelBlocked({ previous, paths, now });
   // Earlier rounds of this PR that the same incompatibility swallowed, walking back from the newest
   // and stopping at the first round that ended any other way: a round that completed or blocked on
   // something real already handled whatever came before it.
@@ -1585,7 +1616,7 @@ export function* processPr({
   pr, previous: previousArg, state, paths, now, events, report, viewer, dryRun,
   dispatchFn, collect, ghFn, recheckFn, ownershipSnapshot, maintenanceSessionId,
   remaining, deadline, clock, resumeCursor, resetPrDeadline, allowCreate = true, messagePrefix = '', forceCreate = false,
-  unlockForDispatch = null, relockForDispatch = null, getPrLockToken = () => null,
+  unlockForDispatch = null, relockForDispatch = null, getPrLockToken = () => null, keelRoot = keelLedgerRoot(),
 } = {}) {
   const key = String(pr.id);
   let persistBlocked = false;
@@ -1966,6 +1997,19 @@ export function* processPr({
     sessionId: mapping.sessionId ?? previous.sessionId ?? null,
   };
   const wantsDelivery=shouldDispatch || recovery || previous.pendingDispatch?.status==='retryable';
+  // A repair session whose Keel ledger cannot be read would only block again and waste a round. Hold the
+  // delivery back untouched (cursor, rounds and PR comments stay as they are) and tell the owner; the PR is
+  // looked at again on the next scan (KEEL_LEDGER_HELD) and delivered once the ledger is back.
+  if (wantsDelivery) {
+    const problem = keelLedgerProblem(keelRoot);
+    if (problem) {
+      state.prs[key] = previous;
+      queueHumanNotice(paths.home, { kind: 'keel-unavailable', number: pr.number, url: previous.url ?? pr.url, head: pr.headRefOid,
+        day: now.slice(0, 10), cause: problem }, dryRun);
+      report.push({ number: pr.number, dispatch: { attempted: false, bound: false, reason: KEEL_LEDGER_HELD, error: problem } });
+      return;
+    }
+  }
   // Per-PR budget caps collection only. Dispatch reserve (65s/61s) uses the global deadline.
   if (wantsDelivery) resetPrDeadline?.();
   if (!dryRun && wantsDelivery && remaining()<65000) {
@@ -2348,7 +2392,7 @@ export function* pollWorkflow({
   if (state._persistBlocked) return { mode: 'poll', dispatch: !dryRun, prs: report, events };
   const collectFailed = report.some((item) => item.dispatch?.reason === 'collection-failed');
   const recheckFailed = latest.lastRecheckError?.at === now;
-  const dispatchDeferred = report.some((item) => item.dispatch?.reason === 'dispatch-budget-deferred');
+  const dispatchDeferred = report.some((item) => ['dispatch-budget-deferred', KEEL_LEDGER_HELD].includes(item.dispatch?.reason));
   if (collectFailed || recheckFailed || dispatchDeferred) {
     save({ ...latest, pollFingerprint: previous.pollFingerprint, collectRetry: true });
   } else {
@@ -2825,7 +2869,7 @@ export function* discoverWorkflow({
     }
   }
   const lastByPr = new Map(report.map((item) => [item.number, item]));
-  const deferredNumbers = [...lastByPr.values()].filter((item) => item.dispatch?.reason === 'dispatch-budget-deferred').map((item) => item.number);
+  const deferredNumbers = [...lastByPr.values()].filter((item) => ['dispatch-budget-deferred', KEEL_LEDGER_HELD].includes(item.dispatch?.reason)).map((item) => item.number);
   index = { ...index, finishedAt: now, elapsedMs: clock() - started, deferredNumbers };
   fs.writeFileSync(v2.indexPath, `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
   const closedownManual = listPrs(paths.home)

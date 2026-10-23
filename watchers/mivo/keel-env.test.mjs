@@ -99,14 +99,6 @@ test('prepare reports keel-unavailable before it touches git when the ledger dir
   assert.match(saved.reason, /^keel-unavailable/);
 });
 
-test('prepare also refuses a Keel task when no ledger root is configured at all', t => {
-  const home = tmp(t, 'keel-env-home-');
-  const { taskPath } = writeTask(home);
-  const result = prepare({ home, taskPath, ghFn, gitFn: () => { throw new Error('git must not run'); }, keelRoot: null });
-  assert.equal(result.status, 'blocked');
-  assert.match(result.reason, /^keel-unavailable/);
-});
-
 // ---- SC-4: keel- blocks come back on the current contract, with a back-off and a cap ----
 const NODE = 'PR_example';
 const BLOCKED_AT = '2026-10-24T10:00:00.000Z';

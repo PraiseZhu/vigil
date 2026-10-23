@@ -2,6 +2,8 @@
   "targetRepo": "your-org/your-plugin-repo",
   "pluginRepoPath": "/path/to/your-plugin-checkout",
   "severityStandardPath": "/path/to/review-skill-checkout/mivo/config/severity.md",
+  "keelLedgerRoot": "/path/to/keel-data-dir",
+  "keelNamespace": "your-keel-namespace",
   "watchHomes": [
     "/path/to/mivo-watcher/runtime"
   ]

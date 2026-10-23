@@ -55,7 +55,7 @@ discover 一次调用会扫描 `targetRepo` 下你自己的所有 open PR,不需
 
 ### 通知调度
 
-需要人处理的事件(首次可合并、同因 blocked 升级、needs-human / 三次补投无结果 / 结果无效 / 派发无回执)写进 watcher home 的 `state/notices/pending.json`。另建一条 script 调度,前置检查有未发事件才跑,并把通知发到飞书:
+需要人处理的事件(首次可合并、同因 blocked 升级、Keel 台账读不到导致派发暂停、needs-human / 三次补投无结果 / 结果无效 / 派发无回执)写进 watcher home 的 `state/notices/pending.json`。另建一条 script 调度,前置检查有未发事件才跑,并把通知发到飞书:
 
 | 字段 | 取值 |
 |---|---|
@@ -73,6 +73,20 @@ discover 一次调用会扫描 `targetRepo` 下你自己的所有 open PR,不需
 
 `poll` 模式(`--mode poll --pr <N> --node-id <id>`)用于手动单独排障某一个 PR,不建议配进
 常规调度,通常是你本地手动跑一次来看某个 PR 的详细判断过程。
+
+### Keel 重装或迁移后的处理
+
+Keel 插件重装到企业命名空间（如 `xd`）后，台账目录和调用方式都会变。按下面三步让盯梢跟上：
+
+1. 在 profile（或环境变量）里更新 `keelLedgerRoot` 为新的台账目录，并设置 `keelNamespace`
+   （mivo 用 `MIVO_KEEL_NAMESPACE`，cindy 用 `CINDY_KEEL_NAMESPACE`）。未配置 `keelNamespace` 时，派工消息要求修复会话
+   省略 `namespace` 参数，不得传 `null`。
+2. 重新部署（`deploy.mjs`）。派工消息变了，规则版本随之变化，卡在 `external` 的 PR 会被重开一次。
+3. 不用手工清理状态：
+   - 台账目录读不到时，盯梢不向修复会话派发、不扣轮次、不在 PR 上发评论，只写一条 `keel-unavailable` 通知（每个 PR 每天一条）；目录恢复后下一轮自动派发。
+   - `prepare` 在建 worktree 前也会核对台账目录，读不到就以 `keel-unavailable:` 开头的原因报 blocked。
+   - 以 `keel-` 开头原因阻塞的任务，距离阻塞满 30 分钟后自动重开，同一 PR 同一次准入最多 3 次；重开时退还轮次并交回该任务的反馈。
+   - Jev 缺 key（`JEV_NOT_CONFIGURED`）时，`finalize` 门禁照旧要求被引用的决策行带 Jev 结论；修复会话应立即以 `keel-jev-unavailable:` 报 blocked，再按上一条退避重开。补上 Jev 配置后无需其他操作。
 
 ## 3. 运行锁排障
 

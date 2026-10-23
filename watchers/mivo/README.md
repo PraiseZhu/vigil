@@ -79,6 +79,14 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | profile 字段 | 环境变量 | 要求 |
 |---|---|---|
 | `keelLedgerRoot` | `MIVO_KEEL_LEDGER_ROOT` | Keel 插件数据目录（包含 `runs/` 的那一层）；新派发的 `keelFlowVersion>=2` 任务缺少此配置时，`finalize` 报 `KEEL_RUN_REQUIRED`，拒绝收口和推送 |
+| `keelNamespace` | `MIVO_KEEL_NAMESPACE` | 可选。Keel 插件装在企业命名空间下时填该命名空间（如重装到 `xd` 之后）。配置后，派工消息里所有 Keel 调用都写明 `ghost_id=keel` 加 `namespace="<值>"`；不配置时消息要求修复会话省略 `namespace` 参数、不得传 `null`（`null` 会让命名空间安装的 Keel 报 `GHOST_NOT_FOUND`） |
+
+### Keel 环境变化时的行为
+
+- **台账路径提前核对**：配置了 `keelLedgerRoot` 时，`prepare` 在建 worktree 之前先确认该目录存在且可读；不满足就立即以 `keel-unavailable: ledger root unreadable (<errno>)` 报 blocked，不再拖到 `validate` 之后的 `finalize` 才发现（原因里只带错误码，不带路径）。
+- **派发前核对**：每次向修复会话派发之前，watcher 同样检查 `keelLedgerRoot` 可读。不可读时本轮不派发、不扣轮次、不在 PR 上发评论，反馈保持未交付；同时写一条 `keel-unavailable` 通知（每个 PR 每天一条）。该 PR 下一轮扫描会重新处理，台账恢复后自动派发。未配置 `keelLedgerRoot` 时不做这项检查。
+- **Jev 不可用**：`finalize` 仍要求被引用的决策行带 Jev 结论（`answer`、`policy` 非空），门禁不放宽。所以修复会话遇到 Jev 不可用（如 `JEV_NOT_CONFIGURED`）时，立即用 `blocked --reason "keel-jev-unavailable: <原文>"` 停下，不先做修复、不跑 `validate`。
+- **keel- 阻塞自动重开**：以 `keel-` 开头原因阻塞的任务，在当前 `KEEL_FLOW_VERSION` 下也会重开：距离阻塞至少 30 分钟；同一 PR 同一次准入（admission epoch）最多重开 3 次；重开时退还轮次并把该任务的反馈交回。超过上限后保持阻塞，由通知提示人处理。
 
 ## 修复 session 的 Keel 流程
 
