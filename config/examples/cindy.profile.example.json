@@ -2,6 +2,8 @@
   "targetRepo": "makecindy/cindy",
   "pluginRepoPath": "/path/to/your-cindy-checkout",
   "preflightFile": "/path/to/your/preflight.sh",
+  "keelLedgerRoot": "/path/to/keel-data-dir",
+  "keelNamespace": "your-keel-namespace",
   "watchHomes": [
     "/path/to/cindy-watcher/runtime"
   ]

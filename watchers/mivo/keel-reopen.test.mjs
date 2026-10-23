@@ -73,10 +73,11 @@ test('each dispatch id is given back once', t => {
   assert.equal(reopenKeelBlocked({ previous: once, paths, now: '2026-10-11T12:05:00.000Z' }), once);
 });
 
-test('a task already on the current contract is not retried, so a broken Keel cannot loop', t => {
+test('a keel- block on the current contract is not reopened inside its back-off window, so a broken Keel cannot loop', t => {
   const paths = watcherPaths(home(t));
   task(paths, SECOND, { keys: ['comment:2'], version: KEEL_FLOW_VERSION });
-  const previous = entry();
+  const recent = new Date(Date.parse(NOW) - 10 * 60 * 1000).toISOString();
+  const previous = entry({ activeTask: { dispatchId: SECOND, status: 'blocked', blockedKind: 'external', reason: KEEL_REASON, observedAt: recent } });
   assert.equal(reopenKeelBlocked({ previous, paths, now: NOW }), previous);
 });
 
@@ -197,7 +198,7 @@ function pollScan(t, { reason, version = 2 }) {
     number: 790, nodeId: POLL_NODE, sessionId: 'sess-790', eligibilityInitialized: true, eligibility: 'blocked', admissionVerified: true,
     admissionEpoch: handoff.releaseEpoch, handoff, headRefName: 'fix/x', title: 'fix', pollFingerprint: pollFingerprint(pollSnap()),
     feedbackCursor: cursor, repairRounds: 1,
-    activeTask: { dispatchId: POLL_TASK, status: 'blocked', blockedKind: 'external', reason, head: POLL_HEAD },
+    activeTask: { dispatchId: POLL_TASK, status: 'blocked', blockedKind: 'external', reason, head: POLL_HEAD, observedAt: NOW },
   });
   let collected = 0;
   const outcome = scanOnce({
@@ -225,7 +226,7 @@ test('a frozen PR with an unchanged poll fingerprint still gets its swallowed fe
     'the feedback is either pending again or already delivered in a new task');
 });
 
-test('an unchanged fingerprint still short-circuits for ordinary blocks, v3 blocks and finished refunds', t => {
+test('an unchanged fingerprint still short-circuits for ordinary blocks and for keel- blocks inside the back-off window', t => {
   for (const options of [{ reason: 'required CI failed: unit' }, { reason: KEEL_REASON, version: KEEL_FLOW_VERSION }]) {
     const { outcome, collected, entry: saved } = pollScan(t, options);
     assert.equal(collected, 0);

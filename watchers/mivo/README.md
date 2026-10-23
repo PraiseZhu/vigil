@@ -79,6 +79,14 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | profile 字段 | 环境变量 | 要求 |
 |---|---|---|
 | `keelLedgerRoot` | `MIVO_KEEL_LEDGER_ROOT` | Keel 插件数据目录（包含 `runs/` 的那一层）；新派发的 `keelFlowVersion>=2` 任务缺少此配置时，`finalize` 报 `KEEL_RUN_REQUIRED`，拒绝收口和推送 |
+| `keelNamespace` | `MIVO_KEEL_NAMESPACE` | 可选。Keel 插件装在企业命名空间下时填该命名空间（如重装到 `xd` 之后）。配置后，派工消息里所有 Keel 调用都写明 `ghost_id=keel` 加 `namespace="<值>"`；不配置时消息要求修复会话省略 `namespace` 参数、不得传 `null`（`null` 会让命名空间安装的 Keel 报 `GHOST_NOT_FOUND`）。已设置但不合法（只允许字母、数字、下划线、连字符，以字母或数字开头，最长 128 位）时直接报配置错误，不会被当作未配置 |
+
+### Keel 环境变化时的行为
+
+- **台账路径提前核对**：配置了 `keelLedgerRoot` 时，`prepare` 在建 worktree 之前先确认该目录存在且可读；不满足就立即以 `keel-unavailable: ledger root unreadable (<errno>)` 报 blocked，不再拖到 `validate` 之后的 `finalize` 才发现（原因里只带错误码，不带路径）。
+- **派发前核对**：每次向修复会话派发之前，watcher 同样检查 `keelLedgerRoot` 可读。不可读时本轮不派发、不扣轮次、不在 PR 上发评论，反馈保持未交付；同时写一条 `keel-unavailable` 通知（每个 PR 每天一条）。该 PR 下一轮扫描会重新处理，台账恢复后自动派发。未配置 `keelLedgerRoot` 时不做这项检查。
+- **Jev 不可用**：`finalize` 仍要求被引用的决策行带 Jev 结论（`answer`、`policy` 非空），门禁不放宽。所以修复会话遇到 Jev 不可用（如 `JEV_NOT_CONFIGURED`）时，立即用 `blocked --reason "keel-jev-unavailable: <原文>"` 停下，不先做修复、不跑 `validate`。
+- **keel- 阻塞自动重开**：以 `keel-` 开头原因阻塞的任务，在当前 `KEEL_FLOW_VERSION` 下也会重开：距离阻塞至少 30 分钟，且已配置的 `keelLedgerRoot` 此时可读（台账仍读不到时不登记重开、不退轮次，等台账恢复后再重开）；同一 PR 同一次准入（admission epoch）最多重开 3 次；重开时退还轮次并把该任务的反馈交回。超过上限后保持阻塞，由通知提示人处理。
 
 ## 修复 session 的 Keel 流程
 
@@ -126,7 +134,7 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 - 当前 head 上阻断合并的 CodeQL / code scanning 告警带 verified evidence 后作为可修复反馈（`required-ci-fix`），不再记外部阻塞；没权限或分析缺失保持采集 unknown，禁止 dismiss 或降阈值。
 - Ready PR 只差落后 main（`mergeStateStatus=BEHIND`）且其余门都通过时，watcher 用 GitHub `update-branch`（merge，不 rebase / 不 force push）把 main 合进 PR 分支；BEHIND 本身不算可合并。watcher 不自己触发审查机重审：审查机的讨论全部 resolve 后，由前置审查（唯一派发入口）在同一 head 上重新送审，审查机按回复里的裁决记录放行。旧版本记下的重审尝试只做收尾，10 分钟后记为失败、不再算待办。
 - 产品意图：watcher 抓 PR 正文，优先取标题含「产品意图 / 设计意图 / Product intent」的一节（没有就取正文开头，最多 2000 字），写进任务的 `prSnapshot.prIntent` 和派工消息。反馈要求的改法会推翻 PR 正文、规格或维护者裁定里写明的界面、交互或流程时，它不算缺陷：会话不改代码，记 SC=no-change 并引用正文，watcher 回复后 resolve，继续推进。
-- 全自动推进到可合并（不合并）：严重度拿不准时会话自己复现核实，确认不了 P0/P1/P2 就按不成立回复并 resolve；Jev 不可用也不因此 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账不可用、作者收回才 blocked。本地审查/e2e Worker 是局部例外：本机缺 `routing.json` 或开不了 Orca Worker 时不 blocked，先尝试一次 `start_team({worker_permission_mode:"bypassPermissions"})`，仍不行就跳过尚未运行的本地审查/e2e，并在 SC evidence 写明原因；禁止改用原生子代理。仓库预检、validate 收据、required CI 和服务器审查不豁免。
+- 全自动推进到可合并（不合并）：严重度拿不准时会话自己复现核实，确认不了 P0/P1/P2 就按不成立回复并 resolve；严重度未知本身不 blocked。Jev 不可用是例外：`finalize` 门禁要求被引用的决策行带 Jev 结论，没有结论就收不了口，所以会话遇到 Jev 不可用（如 `JEV_NOT_CONFIGURED`）要立即以 `keel-jev-unavailable:` 开头的原因 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账或 Jev 不可用、作者收回才 blocked。本地审查/e2e Worker 是局部例外：本机缺 `routing.json` 或开不了 Orca Worker 时不 blocked，先尝试一次 `start_team({worker_permission_mode:"bypassPermissions"})`，仍不行就跳过尚未运行的本地审查/e2e，并在 SC evidence 写明原因；禁止改用原生子代理。仓库预检、validate 收据、required CI 和服务器审查不豁免。
 - 卡住要让人看见：修复任务 blocked（外部阻塞、补投三次无结果、结果无效、派发失败）时，watcher 把事件写进 `state/notices/`，用独立的 `bin/notify.mjs` 调度发飞书（watcher 与作者是同一 GitHub 账号，@自己不会通知）。同一 blocked 原因每个 head 只升级一次，不再原样重投。规则版本变化、新 head 或新反馈时仍会重投。必需 CI 红、HEAD 漂移这类 watcher 自己会接着处理的状态不发。无代码改动且当前 head 必需 CI 仍红时，对失败 job 做一次 `gh run rerun --failed`；第二次仍红按同因升级。`waiting-ci` 被新反馈取代时，旧任务已有证据的 thread 会等到后续 complete 或当前 head CI 全绿再回复并 resolve。validate 心跳跑在独立子进程；通知队列用 `pending.lock` 串行读写。
 - Greptile 汇总评论没有自己的 P0/P1 时不单独开会话（它的发现另以行内 thread 出现）。汇总里只有 P2 也不派修复，P2 只走行内 finding。
 - 策略读不出（`required-policy-unknown`）和可合并（`merge-ready`）各在状态转换时出一条事件。
