@@ -251,7 +251,7 @@ test('a due keel- retry is left alone while the ledger is unreadable, and costs 
   const gone = path.join(tmp(t, 'keel-env-root-'), 'gone');
   assert.equal(reopenKeelBlocked({ previous, paths, now: minutesAfter(31), keelRoot: gone }), previous);
   const out = reopenKeelBlocked({ previous, paths, now: minutesAfter(31), keelRoot: tmp(t, 'keel-env-root-') });
-  assert.equal(out.keelRetries.length, 1, 'with a readable ledger the same retry is taken');
+  assert.equal(out.keelRetryIntent.dispatchId, dispatchIdAt(0), 'with a readable ledger the same retry is offered');
 });
 
 test('a blocked PR whose ledger comes back after the back-off is reopened and delivered on the next scan', t => {
@@ -365,7 +365,7 @@ test('F1: a ledger hold or an ownership stop between two scans spends nothing ei
   const h = processHarness(t);
   h.run({ remainingMs: 10000, time: minutesAfter(31) });
   const held = h.run({ keelRoot: path.join(h.okRoot, 'gone'), time: minutesAfter(32) });
-  assert.equal(held.report[0].dispatch.reason, 'keel-ledger-unavailable');
+  assert.notEqual(held.report[0].dispatch.attempted, true, 'with the ledger gone the reopen is not offered at all');
   const stopped = h.run({ liveAuthor: 'someone-else', time: minutesAfter(33) });
   assert.equal(stopped.report[0].dispatch.reason, 'ownership-changed-before-dispatch');
   assert.equal(h.sent.length, 0);

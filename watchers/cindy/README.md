@@ -85,15 +85,15 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 
 | profile 字段 | 环境变量 | 要求 |
 |---|---|---|
-| `keelLedgerRoot` | `CINDY_KEEL_LEDGER_ROOT` | Keel 插件数据目录（包含 `runs/` 的那一层）；新派发的 `keelFlowVersion>=2` 任务缺少此配置时，`finalize` 报 `KEEL_RUN_REQUIRED`，拒绝收口和推送 |
+| `keelLedgerRoot` | `CINDY_KEEL_LEDGER_ROOT` | Keel 插件数据目录（包含 `runs/` 的那一层）；新派发的 `keelFlowVersion>=2` 任务缺少此配置，或目录不存在、不可读时：`prepare` 在建 worktree 前以 `keel-unavailable:` 报 blocked，派发前门禁也不向修复会话派发（见下文「Keel 环境变化时的行为」）；真要走到 `finalize` 时同样报 `KEEL_RUN_REQUIRED`，拒绝收口和推送 |
 | `keelNamespace` | `CINDY_KEEL_NAMESPACE` | 可选。Keel 插件装在企业命名空间下时填该命名空间（如重装到 `xd` 之后）。配置后，派工消息里所有 Keel 调用都写明 `ghost_id=keel` 加 `namespace="<值>"`；不配置时消息要求修复会话省略 `namespace` 参数、不得传 `null`（`null` 会让命名空间安装的 Keel 报 `GHOST_NOT_FOUND`）。已设置但不合法（只允许字母、数字、下划线、连字符，以字母或数字开头，最长 128 位）时直接报配置错误，不会被当作未配置 |
 
 ### Keel 环境变化时的行为
 
-- **台账路径提前核对**：配置了 `keelLedgerRoot` 时，`prepare` 在建 worktree 之前先确认该目录存在且可读；不满足就立即以 `keel-unavailable: ledger root unreadable (<errno>)` 报 blocked，不再拖到 `validate` 之后的 `finalize` 才发现（原因里只带错误码，不带路径）。
-- **派发前核对**：每次向修复会话派发之前，watcher 同样检查 `keelLedgerRoot` 可读。不可读时本轮不派发、不扣轮次、不在 PR 上发评论，反馈保持未交付；同时写一条 `keel-unavailable` 通知（每个 PR 每天一条）。该 PR 下一轮扫描会重新处理，台账恢复后自动派发。未配置 `keelLedgerRoot` 时不做这项检查。
+- **台账路径提前核对**：对 `keelFlow=true` 且 `keelFlowVersion>=2` 的任务，`prepare` 在建 worktree 之前先确认 `keelLedgerRoot` 已配置、目录存在且可读；不满足就立即以 `keel-unavailable: keelLedgerRoot not configured` 或 `keel-unavailable: ledger root unreadable (<errno>)` 报 blocked，不再拖到 `validate` 之后的 `finalize` 才发现（原因里只带错误码，不带路径）。v1 及更早、没有 Keel 流程的任务不受影响。
+- **派发前核对**：每次向修复会话派发之前，watcher 同样检查 `keelLedgerRoot` 已配置且可读（与 `finalize` 对未配置根目录的拒绝一致）。不满足时本轮不派发修复会话、不扣轮次、不发 `blocked` 阻塞播报，反馈保持未交付；同时写一条 `keel-unavailable` 通知（每个 PR 每天一条，原因里写明是未配置还是读不到）。该 PR 下一轮扫描会重新处理，台账恢复后自动派发。这道门禁只拦「派发修复会话」，不拦与 Keel 无关的确定性处理：P3 线程的自动回复与 resolve 照常执行。
 - **Jev 不可用**：`finalize` 仍要求被引用的决策行带 Jev 结论（`answer`、`policy` 非空），门禁不放宽。所以修复会话遇到 Jev 不可用（如 `JEV_NOT_CONFIGURED`）时，立即用 `blocked --reason "keel-jev-unavailable: <原文>"` 停下，不先做修复、不跑 `validate`。
-- **keel- 阻塞自动重开**：以 `keel-` 开头原因阻塞的任务，在当前 `KEEL_FLOW_VERSION` 下也会重开：距离阻塞至少 30 分钟，且已配置的 `keelLedgerRoot` 此时可读（台账仍读不到时不登记重开、不退轮次，等台账恢复后再重开）；同一 PR 同一次准入（admission epoch）最多重开 3 次；重开时退还轮次并把该任务的反馈交回。超过上限后保持阻塞，由通知提示人处理。
+- **keel- 阻塞自动重开**：以 `keel-` 开头原因阻塞的任务，在当前 `KEEL_FLOW_VERSION` 下也会重开：距离阻塞至少 30 分钟，且已配置的 `keelLedgerRoot` 此时可读（台账仍读不到时不登记重开、不退轮次，等台账恢复后再重开）；同一 PR 同一次准入（admission epoch）最多重开 3 次。重开只在修复会话真正派发出去（拿到回执）时才计入次数并退还轮次；本轮因预算推迟、台账门禁、所有权复核或采集失败而没派发时，什么都不消耗，下一轮继续重开。超过上限后保持阻塞，由通知提示人处理。旧合约（`keelFlowVersion<3`）任务的一次性重开同样要求台账可读。
 
 ## 修复 session 的 Keel 流程
 
