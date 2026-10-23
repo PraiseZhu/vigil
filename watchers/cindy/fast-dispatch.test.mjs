@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { readPr, statePaths } from './bin/cindy-state.mjs';
 import * as watcher from './bin/cindy-watcher.mjs';
 import { keptReadStore, memoRepoReads, scanOnce, watcherPaths, watchGuideMessage } from './bin/cindy-watcher.mjs';
 import { collectCindyCiSync, collectCindyCi } from './bin/cindy-ci.mjs';
@@ -412,9 +413,10 @@ const coverage = [
 ];
 
 for (const [name, mutate] of coverage) {
-  test(`R2 指纹闸覆盖：${name}`, (t) => {
+  test(`R2 指纹闸覆盖：${name} 真实触发采集并派发`, (t) => {
     const { paths, plugin } = setup(t);
     let collects = 0;
+    const sent = [];
     let node = richNode();
     const round = (minute) => scanOnce({
       mode: 'discover', enabled: true, allowDispatch: true, paths, gitFn: () => '', env: { CINDY_WATCHER_REPO: plugin },
@@ -422,15 +424,19 @@ for (const [name, mutate] of coverage) {
       ghFn: (args) => (args[0] === 'api' && args[1] === 'user' ? 'owner'
         : args[0] === 'pr' && args[1] === 'list' ? JSON.stringify([listedPr(971)])
           : args[0] === 'api' && args[1] === 'graphql' ? JSON.stringify({ data: { node } }) : '[]'),
-      collect: (pr) => { collects += 1; return quiet(pr); },
-      dispatchFn: () => { throw new Error('nothing to dispatch'); },
+      // 变化之前 PR 没有任何待处理反馈；变化之后全量采集读到一条必需 CI 失败，这才是该变化背后的真实反馈。
+      collect: (pr) => { collects += 1; return collects === 1 ? quiet(pr) : failing(pr); },
+      dispatchFn: (params) => { sent.push(params.title); return { target_session_id: 'sess-971' }; },
     });
     round(0);
     round(1);
     assert.equal(collects, 1, 'unchanged: one collection only');
+    assert.equal(sent.length, 0, 'unchanged: nothing delivered');
     node = richNode(mutate);
-    round(2);
+    const changed = round(2);
     assert.equal(collects, 2, `${name} changes the fingerprint`);
+    assert.equal(sent.length, 1, `${name}: the feedback behind the change is delivered to a repair session`);
+    assert.equal(changed.prs.at(-1).dispatch.attempted, true);
   });
 }
 
@@ -485,3 +491,60 @@ test('R5 collectCindyCiSync 遇到 gh 抛错：返回 unknown，进程不因未�
   assert.match(child.stdout, /PROCESS_SURVIVED/, child.stderr);
   assert.equal(child.status, 0, child.stderr);
 });
+
+// ---- F1：任何一次采集（含轮末跟进启动的）都受整轮截止时间约束 ----
+// 采集由许多次 gh 调用组成；桩里每次调用推进假时钟 5 秒，采集 60 秒 = 12 次调用，100 秒 = 20 次。
+function lateChangeFixture(t, { changeAtMs, collectMs }) {
+  const { paths, plugin } = setup(t);
+  let now = 0;
+  const sent = [];
+  const order = [];
+  let firstDone = false;
+  const options = (stamp) => ({
+    mode: 'discover', enabled: true, allowDispatch: true, paths, now: stamp, clock: () => now,
+    followMs: 15000, sleepFn: (ms) => { now += ms; }, fullCollectMs: 1e12,
+    gitFn: () => '', env: { CINDY_WATCHER_REPO: plugin }, ownershipSnapshot: ownership,
+    ghFn: (args) => {
+      if (args[0] === 'api' && args[1] === 'user') return 'owner';
+      const changed = now >= changeAtMs;
+      const listing = () => [listedPr(981, changed ? { updatedAt: '2026-10-15T00:02:10Z' } : {})];
+      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(listing());
+      if (isBatch(args)) return batchResponse(listing());
+      if (isGate(args)) return JSON.stringify({ data: { node: graphqlNode({ comments: { totalCount: changed ? 1 : 0, nodes: [] } }) } });
+      if (args[1]?.startsWith('probe')) { now += 5000; return '{}'; }
+      return '[]';
+    },
+    collect: (pr, { ghFn }) => {
+      order.push(pr.number);
+      // The very first collection (nothing to deliver yet) is quick; every later one takes collectMs.
+      if (!firstDone) { firstDone = true; return quiet(pr); }
+      for (let i = 0; i < collectMs / 5000; i += 1) ghFn(['api', `probe${i}`]);
+      return failing(pr);
+    },
+    dispatchFn: (params) => { sent.push(params.title); return { target_session_id: 'sess-981' }; },
+  });
+  return { paths, options, sent, order, reset: () => { now = 0; }, elapsed: () => now };
+}
+
+for (const changeAtMs of [100000, 130000]) {
+  for (const collectMs of [60000, 100000]) {
+    test(`F1 第 ${changeAtMs / 1000} 秒出现变化 + ${collectMs / 1000}s 采集：整轮不超预算，该 PR 标 collectRetry，下一轮优先并派发`, (t) => {
+      const fx = lateChangeFixture(t, { changeAtMs, collectMs });
+      // 第一轮：PR 0 秒时已有一次完整采集并收口；变化出现在轮末，由跟进循环发现
+      const first = scanOnce(fx.options('2026-10-15T00:00:00Z'));
+      assert.ok(first, 'first run ends');
+      assert.ok(fx.elapsed() <= watcher.ROUND_BUDGET_MS, `round ran ${fx.elapsed()} ms of ${watcher.ROUND_BUDGET_MS}`);
+      assert.equal(fx.sent.length, 0);
+      const entry = readPr(fx.paths.home, 'PR_981');
+      assert.equal(entry.collectRetry, true, 'the PR is marked for another collection');
+      const index = JSON.parse(fs.readFileSync(statePaths(fx.paths.home).indexPath, 'utf8'));
+      assert.deepEqual(index.deferredNumbers, [981], 'and goes first next run');
+      // 下一轮：新的假时钟，变化已在 GitHub 上，该 PR 优先被采集并派发
+      fx.reset();
+      fx.order.length = 0;
+      scanOnce({ ...fx.options('2026-10-15T00:03:00Z') });
+      assert.equal(fx.order[0], 981);
+      assert.equal(fx.sent.length, 1, 'delivered next run');
+    });
+  }
+}
