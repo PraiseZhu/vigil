@@ -197,6 +197,9 @@ export const FOLLOW_INTERVAL_MS = configMs('followIntervalMs', 'MIVO_WATCHER_FOL
 export const FOLLOW_UNTIL_MS = ROUND_BUDGET_MS;
 // A Ready PR without a repair session is collected in full at least this often even if its fingerprint did not move,
 // so a change the fingerprint cannot see is delayed by at most this long.
+// A collection (or follow pass) is only started with at least this much of the round left after the dispatch reserve;
+// one that runs into that limit is cut off at the next gh call (see processPr) and retried first next run.
+export const MIN_COLLECT_MS = configMs('minCollectMs', 'MIVO_WATCHER_MIN_COLLECT_MS', 15000);
 export const FULL_COLLECT_MS = configMs('fullCollectMs', 'MIVO_WATCHER_FULL_COLLECT_MS', 600000);
 const FOLLOW_MAX_FAILURES = 3;
 const FOLLOW_BACKOFF_MAX_MS = 60000;
@@ -756,7 +759,7 @@ export function keelRules({ dispatchId, canChangeCode, version = KEEL_FLOW_VERSI
   ];
 }
 
-export const END_TURN_RULE = `本轮收口（finalize 返回 complete 或 waiting-ci、blocked、no-change）后立即结束回合：不要自己轮询、sleep 或等待，不要查询 PR、CI 或任何调度。watcher 持续检查（每轮持续约 2–3 分钟，轮内约每 ${FOLLOW_INTERVAL_MS / 1000} 秒批量检查一次变化，轮间空档约 15 秒；新转 Ready、新推送和新反馈通常在 30 秒内跟进），出现新反馈、CI 变化或冲突会再投递给你。goal 的完成条件只覆盖本批反馈，不包含等待审查结论或合并。`;
+export const END_TURN_RULE = `本轮收口（finalize 返回 complete 或 waiting-ci、blocked、no-change）后立即结束回合：不要自己轮询、sleep 或等待，不要查询 PR、CI 或任何调度。watcher 持续检查（每轮持续约 2–3 分钟，轮内约每 ${FOLLOW_INTERVAL_MS / 1000} 秒批量检查一次变化，轮间空档约 15 秒；新转 Ready、新推送和新反馈通常在 30 秒内跟进，落在轮末约 40 秒内的留到下一轮开头），出现新反馈、CI 变化或冲突会再投递给你。goal 的完成条件只覆盖本批反馈，不包含等待审查结论或合并。`;
 export const SNAPSHOT_RULE = 'PR 状态、required checks、失败 check 和未解决 thread 已由 watcher 采集，见 task 文件 prSnapshot 字段，反馈全文见 feedback[].body。先读 task 文件；只有回复/resolve thread、推送后确认 CI 或核实 task 之后的新变化时，才调用 gh 或 GitHub 插件。';
 
 // Feedback that asks to undo a design the PR body wrote down is not a defect: answer it with the body and move on.
@@ -921,7 +924,7 @@ function watchScheduleConstraint() {
   return '不要创建、恢复、修改或查询任何调度（包括名为 Mivo watcher 的共享调度）；轮询、合并后的清理都由 watcher 脚本完成。';
 }
 export function watchGuideMessage({ prNumber } = {}) {
-  return `你是 PR #${prNumber} 的专属修复 session。watcher 持续检查本 PR（每轮持续约 2–3 分钟，轮内约每 ${FOLLOW_INTERVAL_MS / 1000} 秒批量检查一次变化，轮间空档约 15 秒，新反馈通常在 30 秒内投递），出现新反馈、CI 变化或冲突时直接投递到这里；PR 合并或关闭后由脚本清理 worktree。${watchScheduleConstraint()}`;
+  return `你是 PR #${prNumber} 的专属修复 session。watcher 持续检查本 PR（每轮持续约 2–3 分钟，轮内约每 ${FOLLOW_INTERVAL_MS / 1000} 秒批量检查一次变化，轮间空档约 15 秒，新反馈通常在 30 秒内投递，落在轮末约 40 秒内的留到下一轮开头），出现新反馈、CI 变化或冲突时直接投递到这里；PR 合并或关闭后由脚本清理 worktree。${watchScheduleConstraint()}`;
 }
 export function watchSuccessorMessage({ prNumber, predecessorId, reason, summary }) {
   return `你是 PR #${prNumber} 的接班修复 session，前任 ${predecessorId} 已不可用（${reason}）；先读本 PR 状态摘要 ${summary ?? '…'}。若状态为 merge-ready，等待人工合并，不要改代码。${watchScheduleConstraint()}`;
@@ -1724,7 +1727,14 @@ export function* processPr({
   }
   let collected;
   try {
-  try { collected = yield () => collect(pr, { ghFn, handledFeedback: previous.handledFeedback ?? {} }); }
+  // No collection may run past the round's deadline less the dispatch reserve: each gh call checks it first, so a
+  // slow collection ends with an error (collectRetry, first next run) instead of overrunning the host timeout.
+  const collectGh = (args) => {
+    if (deadline - dispatchReserveMs - clock() <= 0) throw new Error('collection-budget-exhausted');
+    return ghFn(args);
+  };
+  collectGh.ciCache = ghFn.ciCache;
+  try { collected = yield () => collect(pr, { ghFn: collectGh, handledFeedback: previous.handledFeedback ?? {} }); }
   catch (error) {
     state.prs[key] = {...base,lastCollectionError:{at:now,reason:String(error.message).slice(0,400)},mergeReady:false,reviewEvidence:null};
     // A PR cut short only because earlier PRs used this run's time gets a
@@ -2867,7 +2877,7 @@ export function* discoverWorkflow({
   // Next to the full pass, a follow loop runs one batched query every followMs until the round budget (less the dispatch
   // reserve) is spent and handles a PR as soon as it turns Ready, gets a push, new feedback or a CI change. It does not
   // wait for slow collections. 0 = one pass only.
-  followMs = 0, followUntilMs = null, sleepFn = sleep, dispatchReserveMs = DISPATCH_RESERVE_MS, fullCollectMs = FULL_COLLECT_MS,
+  followMs = 0, followUntilMs = null, sleepFn = sleep, dispatchReserveMs = DISPATCH_RESERVE_MS, fullCollectMs = FULL_COLLECT_MS, minCollectMs = MIN_COLLECT_MS,
 } = {}) {
   const started = clock();
   const deadline = started + Math.min(ROUND_BUDGET_MS, Math.max(1, budgetMs));
@@ -2917,6 +2927,7 @@ export function* discoverWorkflow({
     try { known = parseBatch(yield () => ghFn(batchArgs)); } catch { known = null; }
   }
   const baselineAt = clock();
+  const lateNumbers = new Set();
   function* main() {
   yield* discoverPass(ordered, ctx, report, events);
     const listedIds = new Set(listed.map((pr) => String(pr.id)));
@@ -2994,6 +3005,21 @@ export function* discoverWorkflow({
         if (known.get(id) !== signature) changedIds.add(id);
       }
       if (changedIds.size === 0) { known = nextKnown; continue; }
+      if (hardDeadline - dispatchReserveMs - clock() < minCollectMs) {
+        // Too little of the round is left to collect and deliver: leave the PR to the next run, which takes it first.
+        for (const id of changedIds) {
+          const lock = acquireLock(paths.home, `pr-${id}`);
+          if (lock.held) continue;
+          try {
+            const entry = readPr(paths.home, id);
+            if (entry) writePr(paths.home, id, { ...entry, collectRetry: true });
+            const number = entry?.number ?? listed.find((item) => String(item.id) === id)?.number;
+            if (number != null) lateNumbers.add(number);
+          } finally { lock.release(); }
+        }
+        known = nextKnown;
+        continue;
+      }
       let relisted;
       try {
         relisted = JSON.parse(yield () => tickGh(listArgs));
@@ -3016,7 +3042,11 @@ export function* discoverWorkflow({
     if (failure) throw failure.reason;
   } else yield* main();
   const lastByPr = new Map(report.map((item) => [item.number, item]));
-  const deferredNumbers = [...lastByPr.values()].filter((item) => ['dispatch-budget-deferred', KEEL_LEDGER_HELD].includes(item.dispatch?.reason)).map((item) => item.number);
+  const deferredNumbers = [...new Set([
+    ...[...lastByPr.values()].filter((item) => ['dispatch-budget-deferred', KEEL_LEDGER_HELD].includes(item.dispatch?.reason)
+      || (item.dispatch?.reason === 'collection-failed' && String(item.error ?? '').includes('collection-budget-exhausted'))).map((item) => item.number),
+    ...lateNumbers,
+  ])];
   index = { ...index, finishedAt: now, elapsedMs: clock() - started, deferredNumbers };
   fs.writeFileSync(v2.indexPath, `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
   const closedownManual = listPrs(paths.home)

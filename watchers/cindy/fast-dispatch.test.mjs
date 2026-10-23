@@ -265,7 +265,7 @@ test('一个 PR 慢采集期间，另一个 PR 的变化在下一个节拍内被
   const result = await watcher.scanOnceAsync({
     mode: 'discover', enabled: true, allowDispatch: true, paths, now: '2026-10-15T00:00:00Z',
     gitFn: () => '', env: { CINDY_WATCHER_REPO: plugin }, ownershipSnapshot: ownership,
-    budgetMs: 3000, followUntilMs: 3000, dispatchReserveMs: 400, followMs: 100, fullCollectMs: 1e12,
+    budgetMs: 3000, followUntilMs: 3000, dispatchReserveMs: 400, minCollectMs: 100, followMs: 100, fullCollectMs: 1e12,
     ghFn: async (args) => {
       const elapsed = Date.now() - started;
       const listing = () => [listedPr(951), listedPr(952, elapsed >= 300 ? { updatedAt: '2026-10-15T00:00:30Z' } : { isDraft: true })];

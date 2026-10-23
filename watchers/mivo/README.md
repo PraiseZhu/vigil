@@ -56,6 +56,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | `scheduleTimeoutMs` | `MIVO_WATCHER_SCHEDULE_TIMEOUT_MS` | `180000`。宿主对 discover 定时任务的超时（毫秒），整轮预算以它减 15 秒为上限 |
 | `roundBudgetMs` | `MIVO_WATCHER_ROUND_BUDGET_MS` | `165000`（超时 180 秒减 15 秒安全余量）。一轮 discover 的总预算；超过 `scheduleTimeoutMs − 15000` 的值会被截到该上限 |
 | `dispatchReserveMs` | `MIVO_WATCHER_DISPATCH_RESERVE_MS` | `25000`。给派发回执留的时间：采集结束时整轮只剩不足这个时间的 PR 才会 `dispatch-budget-deferred` |
+| `minCollectMs` | `MIVO_WATCHER_MIN_COLLECT_MS` | `15000`。整轮截止减派发预留后不足这个时间时，不再启动新的采集，留给下一轮 |
 | `fullCollectMs` | `MIVO_WATCHER_FULL_COLLECT_MS` | `600000`。无修复会话的 Ready PR 即使指纹没变，距上次完整采集超过它也强制全量采集一次 |
 | `followIntervalMs` | `MIVO_WATCHER_FOLLOW_MS` | `15000`。轮内批量复查 open PR 变化的间隔；环境变量设为 `0` 只跑全量一轮 |
 | `preflightTimeoutMinutes` | `MIVO_PREFLIGHT_TIMEOUT_MINUTES` | `60`。只接受大于 0 的有限数字或非空十进制字符串；换算毫秒后须为不超过 2147483647 的安全整数。非法值直接报错，不静默回退。env 优先于 profile。validate 的 `npm ci`（如需）与仓库预检、以及未复用收据时的 `git push` 都用此时限；两阶段各自独立计时，不共享一笔总预算。显式 `options.timeout` 仍然优先。 |
@@ -97,7 +98,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 
 ### 作者交接与取回
 
-**转 Ready 就是交接**（2026-10-15 起）。作者自己的 PR 不管是网页按钮、`gh pr ready` 还是 Keel `pr_ready` 转的 Ready，watcher 通常在 30 秒内接手（见下文「并行与跟进」）：没有评论回执时，按本次 Ready 代次和当前 HEAD 合成一份隐式回执（`implicit: true`），下游归属检查照常核对仓库、PR、作者和 Ready 代次。准入不再要求 CI 先全绿，必需检查失败和冲突直接成为修复反馈；审查流程不在线（`review-ingress-missing`）时才不接手。
+**转 Ready 就是交接**（2026-10-15 起）。作者自己的 PR 不管是网页按钮、`gh pr ready` 还是 Keel `pr_ready` 转的 Ready，watcher 通常在 30 秒内接手（轮末约 40 秒内出现的留到下一轮开头，见下文「并行与跟进」）：没有评论回执时，按本次 Ready 代次和当前 HEAD 合成一份隐式回执（`implicit: true`），下游归属检查照常核对仓库、PR、作者和 Ready 代次。准入不再要求 CI 先全绿，必需检查失败和冲突直接成为修复反馈；审查流程不在线（`review-ingress-missing`）时才不接手。
 
 下面的命令仍可用，作用变成「显式留一条交接记录」：
 
@@ -162,7 +163,7 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 
 ## 并行与跟进
 
-发现器由 Cindy 脚本模式定时任务触发（建议 `* * * * *`，超时 180 秒）；一轮最多跑 165 秒。宿主调度器在本轮结束后才排下一次触发（同一 schedule 不会重叠，也不会积压），所以选每分钟能把两轮之间的空档压到约 15 秒（选 `*/2` 时 2:45 结束的一轮要到 4:00 才再触发，约 75 秒无人检测）；整轮预算须小于调度 `timeoutMs`。手工另起进程时，拿不到 `discover` 锁会直接返回 `lock-held`。
+发现器由 Cindy 脚本模式定时任务触发（建议 `* * * * *`，超时 180 秒）；一轮最多跑 165 秒。采集有硬上限:每次 gh 调用前检查「整轮截止 − 派发预留」,到了就中止该 PR 的采集(标 `collectRetry`,下一轮最先处理),所以一轮不会跑过约 165 秒;整轮最后约 40 秒(派发预留 25 秒 + 最小采集 15 秒)内才出现的变化不再启动采集,同样留到下一轮开头——「新反馈通常 30 秒内派发」只在其余时段成立,最坏情况下一轮开头才处理。宿主调度器在本轮结束后才排下一次触发（同一 schedule 不会重叠，也不会积压），所以选每分钟能把两轮之间的空档压到约 15 秒（选 `*/2` 时 2:45 结束的一轮要到 4:00 才再触发，约 75 秒无人检测）；整轮预算须小于调度 `timeoutMs`。手工另起进程时，拿不到 `discover` 锁会直接返回 `lock-held`。
 
 - **不设并发上限**：一轮里所有 open PR 同时采集、同时派发，一轮耗时约等于最慢的那个 PR，不再随 PR 数量线性增长；某个 PR 出错不影响其他 PR，错误在所有 PR 结束后再抛出。`gh` 和复查 helper 走异步子进程，不阻塞其他 PR。
 - **同一轮共享仓库级查询**：分支规则、仓库变量、审查 workflow、钉住的 required-checks 文件和当前账号，每轮只查一次。

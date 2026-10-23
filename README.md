@@ -81,7 +81,7 @@ README:[`watchers/mivo/README.md`](watchers/mivo/README.md)、
    | 字段 | 取值 | 说明 |
    |---|---|---|
    | `executionMode` | `"script"` | 零 token 模式:宿主不起 agent,直接执行 `scriptConfig.command` |
-   | `cronExpr` | `"* * * * *"` | 每分钟触发;一轮最多跑 165 秒,轮内与全量处理并行、每 15 秒批量复查一次全部 open PR 的变化(转 Ready / 新推送 / 新反馈 / CI 汇总),新反馈通常 30 秒内派发。调度器在本轮结束后才排下一次触发(同一 schedule 不重叠、不积压),选每分钟可把两轮之间的空档压到约 15 秒;`*/2` 会留出最长约 75 秒的空档。整轮预算须小于调度 `timeoutMs`(180 秒) |
+   | `cronExpr` | `"* * * * *"` | 每分钟触发;一轮最多跑 165 秒,轮内与全量处理并行、每 15 秒批量复查一次全部 open PR 的变化(转 Ready / 新推送 / 新反馈 / CI 汇总),新反馈通常 30 秒内派发(整轮最后约 40 秒内才出现的变化留到下一轮开头;每次采集到「整轮截止 − 派发预留」就中止并标 collectRetry,下一轮最先处理)。调度器在本轮结束后才排下一次触发(同一 schedule 不重叠、不积压),选每分钟可把两轮之间的空档压到约 15 秒;`*/2` 会留出最长约 75 秒的空档。整轮预算须小于调度 `timeoutMs`(180 秒) |
    | `timezone` | 如 `"Asia/Shanghai"` | 必填,IANA 时区 id |
    | `recurring` | `true` | discover 是常驻轮询 |
    | `scriptConfig.command` | `python3 <watcher home>/bin/mivo-watch-script.py --mode discover` | cwd 为 `workingDir`;必须实现 `cindy-script/1` 协议(stdout 只能是协议帧,调试输出走 stderr) |
