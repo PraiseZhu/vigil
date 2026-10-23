@@ -102,7 +102,7 @@ test('one PR whose collection fails does not hold up the others', async (t) => {
   assert.equal(readPr(paths.home, 'PR_812').sessionId, 'sess-812');
 });
 
-test('after the full round, a PR that turns Ready is followed within 45 s', (t) => {
+test('after the full round, a PR that turns Ready is followed at the next follow interval', (t) => {
   const paths = homeOf(t);
   let now = 0;
   const listings = [];
@@ -126,8 +126,9 @@ test('after the full round, a PR that turns Ready is followed within 45 s', (t) 
     dispatchFn: (params) => { sent.push({ at: now, title: params.title }); return { target_session_id: 'sess-821' }; },
     ownershipSnapshot: ownership,
   });
-  // Listing at start and once more at +45 s; +90 s leaves less than 70 s before the 120 s cut-off.
-  assert.deepEqual(listings, [0, 45000]);
+  // Listing at start, then every 45 s here (followMs): +135 s leaves less than a collection plus the dispatch reserve
+  // before the 165 s round budget ends.
+  assert.deepEqual(listings, [0, 45000, 90000]);
   assert.deepEqual(sent.map((item) => item.at), [45000]);
   assert.deepEqual(result.prs.map((item) => [item.number, item.dispatch.reason ?? item.dispatch.attempted]),
     [[821, 'draft-author-owned'], [821, result.prs[1].dispatch.reason ?? true]]);

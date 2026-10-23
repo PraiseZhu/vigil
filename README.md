@@ -81,7 +81,7 @@ README:[`watchers/mivo/README.md`](watchers/mivo/README.md)、
    | 字段 | 取值 | 说明 |
    |---|---|---|
    | `executionMode` | `"script"` | 零 token 模式:宿主不起 agent,直接执行 `scriptConfig.command` |
-   | `cronExpr` | `"* * * * *"` | 每分钟触发一次;两轮之间在启动后第 45 秒再跟进转 Ready / 新推送 |
+   | `cronExpr` | `"*/2 * * * *"` | 每 2 分钟触发一次;一轮最多跑 165 秒,轮内每 15 秒批量复查一次 PR 变化(转 Ready / 新推送 / 新反馈),新反馈通常 30 秒内派发 |
    | `timezone` | 如 `"Asia/Shanghai"` | 必填,IANA 时区 id |
    | `recurring` | `true` | discover 是常驻轮询 |
    | `scriptConfig.command` | `python3 <watcher home>/bin/mivo-watch-script.py --mode discover` | cwd 为 `workingDir`;必须实现 `cindy-script/1` 协议(stdout 只能是协议帧,调试输出走 stderr) |

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import * as watcher from './bin/mivo-watcher.mjs';
-import { scanOnce, watcherPaths, watchGuideMessage } from './bin/mivo-watcher.mjs';
+import { keptReadStore, memoRepoReads, scanOnce, watcherPaths, watchGuideMessage } from './bin/mivo-watcher.mjs';
 import { collectMivoCiSync, collectMivoCi } from './bin/mivo-ci.mjs';
 import { handoffPr, withAuthorHandoff } from './handoff.fixture.mjs';
 
@@ -127,7 +127,7 @@ test('没有修复会话的 Ready PR 指纹未变时跳过全量采集；任一�
     dispatchFn: () => { throw new Error('nothing to dispatch'); },
   });
   let n = 0;
-  const round = () => scanOnce({ ...base(), now: `2026-10-15T00:0${n++}:00Z` });
+  const round = () => scanOnce({ ...base(), now: new Date(Date.UTC(2026, 9, 15, 0, n++, 0)).toISOString() });
   round();
   assert.equal(collects, 1, 'first round collects');
   round();
@@ -291,4 +291,17 @@ test('多个 required check 的 job/run 查询并发执行，结果不变', asyn
   assert.ok(peak >= 3, `peak concurrency ${peak}`);
   assert.deepEqual(result.required.map((r) => [r.context, r.status]), expected.required.map((r) => [r.context, r.status]));
   assert.equal(result.ciHash, expected.ciHash);
+});
+
+test('已完成 run/job 的缓存写进 watcher state，下一轮（新的 memoRepoReads）直接复用', (t) => {
+  const { paths } = setup(t);
+  const first = ciGh();
+  const one = collectMivoCiSync({ pr: ciPr, ghFn: memoRepoReads(first.fn, keptReadStore(paths.stateDir, () => 1000)) });
+  assert.equal(one.status, 'green', one.reason);
+  assert.equal(first.detail(), 6);
+  const second = ciGh();
+  const two = collectMivoCiSync({ pr: ciPr, ghFn: memoRepoReads(second.fn, keptReadStore(paths.stateDir, () => 61000)) });
+  assert.equal(two.status, 'green', two.reason);
+  assert.equal(second.detail(), 0, 'a later round reads no completed job or run again');
+  assert.deepEqual(two.required.map((item) => item.evidence), one.required.map((item) => item.evidence));
 });

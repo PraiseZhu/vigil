@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { normalizePollSnapshot, pollFingerprint, scanOnce, watcherPaths, watchDispatchConflictMessage } from './bin/cindy-watcher.mjs';
+import { DISPATCH_RESERVE_MS, normalizePollSnapshot, pollFingerprint, scanOnce, watcherPaths, watchDispatchConflictMessage } from './bin/cindy-watcher.mjs';
 import { planSessionTitle, repairSessionTitle } from './bin/session-title.mjs';
 import { readPr, writePr as writePrState } from './bin/cindy-state.mjs';
 
@@ -368,8 +368,8 @@ test('collect failure does not commit fingerprint and retries next round', (t) =
 });
 
 for (const gate of [
-  { name: '65s collection reserve', collectMs: 56000, ownershipMs: 0, ownershipCalls: 0 },
-  { name: '61s ownership reserve', collectMs: 20000, ownershipMs: 40000, ownershipCalls: 1 },
+  { name: 'dispatch reserve after collection', collectMs: 56000, ownershipMs: 0, ownershipCalls: 0, budgetMs: 56000 + DISPATCH_RESERVE_MS - 1000 },
+  { name: 'dispatch reserve after ownership check', collectMs: 20000, ownershipMs: 40000, ownershipCalls: 1, budgetMs: 60000 + DISPATCH_RESERVE_MS - 4000 - 1000 },
 ]) {
   for (const retryAlreadyPending of [false, true]) {
     test(`budget-deferred poll at ${gate.name} retries unchanged feedback${retryAlreadyPending ? ' with an existing retry marker' : ''}`, (t) => {
@@ -383,7 +383,7 @@ for (const gate of [
       let slow = true;
       let ownershipCalls = 0;
       const options = {
-        snapshot, budgetMs: 120000, clock: () => elapsed,
+        snapshot, budgetMs: gate.budgetMs, clock: () => elapsed,
         collect: () => { elapsed += slow ? gate.collectMs : 0; return collectFailedCi(); },
         ownershipSnapshot: function* () {
           ownershipCalls += 1;

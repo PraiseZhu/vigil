@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { feedbackItems } from './bin/cindy-watcher.mjs';
 import { isAutoCloseEligible, isThreadAutoCloseEligible, partitionAutoClose, autoCloseThreads, autoCloseReplyText, closeRefutedThreads, refutedReplyText, refutedThreads } from './bin/cindy-review-resolve.mjs';
-import { dispatchParams, newFeedback, scanOnce, watcherPaths } from './bin/cindy-watcher.mjs';
+import { DISPATCH_RESERVE_MS, dispatchParams, newFeedback, scanOnce, watcherPaths } from './bin/cindy-watcher.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -211,7 +211,7 @@ test('dispatch-budget-deferred then next round still repairs mixed-thread P1', (
   let clock = 0;
   let sent = 0;
   const first = scanOnce(scanOpts(paths, {
-    budgetMs: 84000, perPrBudgetMs: 75000, clock: () => clock,
+    budgetMs: DISPATCH_RESERVE_MS + 19000, perPrBudgetMs: 75000, clock: () => clock,
     collect: () => { clock += 20000; return mixedCollect(); },
     dispatchFn: () => { sent += 1; return { target_session_id: 's1' }; },
   }));

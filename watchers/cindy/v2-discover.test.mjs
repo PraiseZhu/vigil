@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { END_TURN_RULE, pollFingerprint, normalizePollSnapshot, scanOnce, watcherPaths, watchGuideMessage, watchSuccessorMessage } from './bin/cindy-watcher.mjs';
+import { DISPATCH_RESERVE_MS, END_TURN_RULE, pollFingerprint, normalizePollSnapshot, scanOnce, watcherPaths, watchGuideMessage, watchSuccessorMessage } from './bin/cindy-watcher.mjs';
 import { clearOwnerUnknown } from './bin/cindy-repair.mjs';
 import { repairSessionTitle } from './bin/session-title.mjs';
 import { acquireLock, readPr, statePaths, writePr } from './bin/cindy-state.mjs';
@@ -96,7 +96,7 @@ test('unbound admitted PR creates a session without any schedule step', (t) => {
   assert.equal(result.prs[0].dispatch.attempted, true);
   assert.equal(params.target_session_id, undefined);
   assert.doesNotMatch(params.message, /schedule-params|bind-schedule|schedule_create|继续轮询/);
-  assert.match(params.message, /watcher 每分钟检查本 PR/);
+  assert.match(params.message, /watcher 持续检查本 PR/);
   assert.ok(params.message.includes(END_TURN_RULE));
   assert.equal(entry.sessionId, 'sess-new');
   assert.equal(entry.claimedAt, '2026-09-28T00:00:00Z');
@@ -406,12 +406,12 @@ test('discover dispatches after 20s collection when global remaining exceeds 65s
   assert.notEqual(result.prs[0].dispatch.reason, 'dispatch-budget-deferred');
 });
 
-test('discover still defers dispatch when global remaining is under 65s', (t) => {
+test('discover still defers dispatch when global remaining is under the dispatch reserve', (t) => {
   const { paths } = homeOf(t);
   let clock = 0;
   const calls = [];
   const { result } = discover(paths, {
-    budgetMs: 84000,
+    budgetMs: DISPATCH_RESERVE_MS + 19000,
     perPrBudgetMs: 75000,
     clock: () => clock,
     collect: (pr) => {
@@ -433,7 +433,7 @@ test('budget-deferred discover retries a bound PR on the next unchanged snapshot
   let elapsed = 0;
   const dispatchFn = (params) => { calls.push(params); return { target_session_id: 'sess-790' }; };
   const deferred = discover(paths, {
-    budgetMs: 84000, perPrBudgetMs: 75000, clock: () => elapsed,
+    budgetMs: DISPATCH_RESERVE_MS + 19000, perPrBudgetMs: 75000, clock: () => elapsed,
     collect: (pr) => { elapsed += 20000; return collectFor(pr); }, dispatchFn,
   });
   assert.equal(deferred.collected, 1);
@@ -466,7 +466,7 @@ test('discover defers later PRs after the first dispatch exhausts global remaini
   const calls = [];
   const { result } = discover(paths, {
     prs: [listed, second],
-    budgetMs: 120000,
+    budgetMs: 100000,
     perPrBudgetMs: 75000,
     clock: () => clock,
     collect: (pr) => {
@@ -492,7 +492,7 @@ test('a PR deferred for budget goes first in the next discover run', (t) => {
   let clock = 0;
   const calls = [];
   const options = {
-    prs: [listed, second], budgetMs: 120000, perPrBudgetMs: 75000, clock: () => clock,
+    prs: [listed, second], budgetMs: 100000, perPrBudgetMs: 75000, clock: () => clock,
     collect: (pr) => { clock += 20000; return collectFor(pr); },
     dispatchFn: (p) => { calls.push(p); clock += 40000; return { target_session_id: `sess-${calls.length}` }; },
   };

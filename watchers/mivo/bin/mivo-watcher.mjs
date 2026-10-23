@@ -131,9 +131,17 @@ export function keptReadStore(stateDir, clock = Date.now) {
 // Within one discover pass every PR reads the same branch rules, repository variables, review workflow and
 // pinned required-checks file. Those reads are shared per pass; anything PR-specific or writing is not.
 // With a store, the login and branch rules/protection are also reused across rounds (see keptReadTtl).
+// Completed Actions jobs and runs never change again: kept per head so the next round does not read them.
+const CI_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+function ciRunCache(store) {
+  return {
+    get(key) { const kept = store.get(key); return kept === undefined ? undefined : JSON.parse(kept); },
+    set(key, value) { store.set(key, JSON.stringify(value), CI_CACHE_TTL_MS); },
+  };
+}
 export function memoRepoReads(ghFn, store = null) {
   const cache = new Map();
-  return (args) => {
+  const memo = (args) => {
     const target = String(args[1] ?? '');
     if (args[0] !== 'api' || !(target === 'user' || REPO_READ.test(target)) || args.some((arg) => WRITE_FLAG.test(arg))) return ghFn(args);
     const key = JSON.stringify(args);
@@ -154,6 +162,8 @@ export function memoRepoReads(ghFn, store = null) {
     cache.set(key, value);
     return value;
   };
+  if (store) memo.ciCache = ciRunCache(store);
+  return memo;
 }
 
 function readViewer(ghFn, paths, clock) {
@@ -165,12 +175,27 @@ function readViewer(ghFn, paths, clock) {
 const PARALLEL = Symbol('mivo.parallel');
 export function parallel(workflows) { return { [PARALLEL]: workflows }; }
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
-// The discover schedule fires every minute (180 s timeout). Between two full rounds a run lists open PRs once
-// more at +45 s and handles the ones that changed; a follow pass starts only while 70 s are left before the
-// 120 s cut-off for a collection plus a dispatch, so a run normally ends before the next minute's round.
-export const FOLLOW_INTERVAL_MS = 45000;
-export const FOLLOW_UNTIL_MS = 120000;
-const FOLLOW_MIN_PASS_MS = 70000;
+// Timing. The host kills a discover run after its schedule timeout (180 s); the round keeps 15 s of that as a safety
+// margin. A run lists the open PRs once, handles them in parallel, then re-lists every FOLLOW_INTERVAL_MS (one batched
+// query) and handles the PRs that changed, until the round budget is spent. A collection may use the whole round
+// except the DISPATCH_RESERVE_MS a delivery receipt needs, so a PR that took 60-100 s to collect is still delivered.
+const configMs = (key, envVar, fallback) => {
+  const value = Number(optionalConfig(key, { envVar, fallback }));
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+};
+const HOST_TIMEOUT_MS = configMs('scheduleTimeoutMs', 'MIVO_WATCHER_SCHEDULE_TIMEOUT_MS', 180000);
+const HOST_SAFETY_MS = 15000;
+export const ROUND_BUDGET_MS = Math.max(30000, Math.min(configMs('roundBudgetMs', 'MIVO_WATCHER_ROUND_BUDGET_MS', 165000), HOST_TIMEOUT_MS - HOST_SAFETY_MS));
+export const DISPATCH_RESERVE_MS = Math.min(configMs('dispatchReserveMs', 'MIVO_WATCHER_DISPATCH_RESERVE_MS', 25000), ROUND_BUDGET_MS - 20000);
+// A delivery needs the reserve before its ownership re-check; the re-check itself may take a few seconds of it.
+const DISPATCH_RECHECK_MS = Math.max(0, DISPATCH_RESERVE_MS - 4000);
+export const FOLLOW_INTERVAL_MS = configMs('followIntervalMs', 'MIVO_WATCHER_FOLLOW_MS', 15000);
+export const FOLLOW_UNTIL_MS = ROUND_BUDGET_MS;
+// A follow pass starts only while a collection (15 s) plus a delivery still fit before the round ends.
+const FOLLOW_MIN_PASS_MS = DISPATCH_RESERVE_MS + 15000;
+const FOLLOW_MAX_FAILURES = 3;
+const FOLLOW_BACKOFF_MAX_MS = 60000;
+const RATE_LIMITED = /rate limit|\b429\b|secondary|abuse|\b403\b/i;
 
 function hasReviewIngress(view) {
   const reviews = view.latestReviews ?? view.reviews ?? [];
@@ -726,7 +751,7 @@ export function keelRules({ dispatchId, canChangeCode, version = KEEL_FLOW_VERSI
   ];
 }
 
-export const END_TURN_RULE = '本轮收口（finalize 返回 complete 或 waiting-ci、blocked、no-change）后立即结束回合：不要自己轮询、sleep 或等待，不要查询 PR、CI 或任何调度。watcher 每分钟检查一次（新转 Ready 和新推送约 45 秒内跟进），出现新反馈、CI 变化或冲突会再投递给你。goal 的完成条件只覆盖本批反馈，不包含等待审查结论或合并。';
+export const END_TURN_RULE = `本轮收口（finalize 返回 complete 或 waiting-ci、blocked、no-change）后立即结束回合：不要自己轮询、sleep 或等待，不要查询 PR、CI 或任何调度。watcher 持续检查（每轮全量检查一次，轮内约每 ${FOLLOW_INTERVAL_MS / 1000} 秒复查一次变化，新转 Ready、新推送和新反馈通常在 30 秒内跟进），出现新反馈、CI 变化或冲突会再投递给你。goal 的完成条件只覆盖本批反馈，不包含等待审查结论或合并。`;
 export const SNAPSHOT_RULE = 'PR 状态、required checks、失败 check 和未解决 thread 已由 watcher 采集，见 task 文件 prSnapshot 字段，反馈全文见 feedback[].body。先读 task 文件；只有回复/resolve thread、推送后确认 CI 或核实 task 之后的新变化时，才调用 gh 或 GitHub 插件。';
 
 // Feedback that asks to undo a design the PR body wrote down is not a defect: answer it with the body and move on.
@@ -891,7 +916,7 @@ function watchScheduleConstraint() {
   return '不要创建、恢复、修改或查询任何调度（包括名为 Mivo watcher 的共享调度）；轮询、合并后的清理都由 watcher 脚本完成。';
 }
 export function watchGuideMessage({ prNumber } = {}) {
-  return `你是 PR #${prNumber} 的专属修复 session。watcher 每分钟检查本 PR（转 Ready 和新推送约 45 秒内跟进），出现新反馈、CI 变化或冲突时直接投递到这里；PR 合并或关闭后由脚本清理 worktree。${watchScheduleConstraint()}`;
+  return `你是 PR #${prNumber} 的专属修复 session。watcher 持续检查本 PR（每轮全量检查一次，轮内约每 ${FOLLOW_INTERVAL_MS / 1000} 秒复查一次变化，新反馈通常在 30 秒内投递），出现新反馈、CI 变化或冲突时直接投递到这里；PR 合并或关闭后由脚本清理 worktree。${watchScheduleConstraint()}`;
 }
 export function watchSuccessorMessage({ prNumber, predecessorId, reason, summary }) {
   return `你是 PR #${prNumber} 的接班修复 session，前任 ${predecessorId} 已不可用（${reason}）；先读本 PR 状态摘要 ${summary ?? '…'}。若状态为 merge-ready，等待人工合并，不要改代码。${watchScheduleConstraint()}`;
@@ -2014,9 +2039,9 @@ export function* processPr({
       return;
     }
   }
-  // Per-PR budget caps collection only. Dispatch reserve (65s/61s) uses the global deadline.
+  // Per-PR budget caps collection only. The dispatch reserve uses the global deadline.
   if (wantsDelivery) resetPrDeadline?.();
-  if (!dryRun && wantsDelivery && remaining()<65000) {
+  if (!dryRun && wantsDelivery && remaining()<DISPATCH_RESERVE_MS) {
     state.prs[key]=previous;
     report.push({number:pr.number,dispatch:{attempted:false,reason:'dispatch-budget-deferred'}});
     return;
@@ -2033,7 +2058,7 @@ export function* processPr({
       return;
     }
   }
-  if (!dryRun && wantsDelivery && remaining()<61000) {
+  if (!dryRun && wantsDelivery && remaining()<DISPATCH_RECHECK_MS) {
     state.prs[key]=previous;
     report.push({number:pr.number,dispatch:{attempted:false,reason:'dispatch-budget-deferred'}});
     return;
@@ -2200,12 +2225,12 @@ function* scanWorkflow({
   recheckFn = recheckResult,
   ownershipSnapshot = collectPrOwnership,
   maintenanceSessionId = process.env.MIVO_MAINTENANCE_SESSION,
-  clock = Date.now, budgetMs = 120000, perPrBudgetMs = 75000,
+  clock = Date.now, budgetMs = ROUND_BUDGET_MS, perPrBudgetMs = ROUND_BUDGET_MS - DISPATCH_RESERVE_MS,
   maxPrs = 1000,
 } = {}) {
   fs.mkdirSync(paths.stateDir, { recursive: true });
   const state = loadState(paths);
-  const started = clock(), deadline = started + Math.min(120000, Math.max(1, budgetMs));
+  const started = clock(), deadline = started + Math.min(ROUND_BUDGET_MS, Math.max(1, budgetMs));
   let prDeadline = deadline;
   const originalGh = ghFn;
   const remaining = () => Math.max(0, Math.min(deadline,prDeadline)-clock());
@@ -2275,13 +2300,38 @@ function* scanWorkflow({
     viewer, repo: REPO, prs: report, events, scan:state.scan, statePath: paths.statePath };
 }
 
+// True when nothing on GitHub changed since the last settled round and no local work is due either.
+function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
+  const pendingRetry = previous.pendingDispatch?.status === 'retryable';
+  const recoveryDue = Boolean(readTaskForRecovery(previous, paths, now))
+    // Out of deliveries and still silent: nothing on GitHub changes, so this alone must reach processPr.
+    || recoveryLimitDue(previous, paths, now);
+  // A PR the Keel incompatibility froze has nothing new on GitHub, so its fingerprint never changes;
+  // without this it would never reach processPr, where reopenKeelBlocked hands its feedback back.
+  const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous
+    || reopenInfraBlocked({ previous, paths, now }) !== previous
+    || reopenExternalBlocked({ previous, paths, now, head: previous.headRefOid }) !== previous;
+  // The same holds for a PR an older build stopped on a product-intent conflict, or whose awaiting-discussion
+  // label the watcher still has to take off (including after a failed DELETE): nothing changes on GitHub.
+  const intentMigrationDue = reopenProductIntentBlocked({ previous, paths, now }) !== previous || legacyIntentLabelDue(previous)
+    || reopenRoundLimitBlocked({ previous }) !== previous;
+  const escalateDue = previous.activeTask?.status === 'blocked'
+    && previous.activeTask?.blockedKind === 'external'
+    && previous.lastException != null
+    && previous.lastException.escalated !== true;
+  return previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry && !normalized.overflow
+    && !hasUnconsumedResult(previous, paths) && !needsCiRecheck(previous.activeTask) && !previous.recheckDeferredAt
+    && !keelReopenDue && !intentMigrationDue && !escalateDue && !ciUnknownRecheckDue(previous, paths, now)
+    && !pendingActionDue(previous) && !scanRecheckDue(previous, now);
+}
+
 export function* pollWorkflow({
   now = new Date().toISOString(),
   enabled = process.env.MIVO_WATCHER_ENABLED === '1',
   allowDispatch = process.env.MIVO_WATCHER_DISPATCH === '1',
   ghFn = gh, collect = collectPr, dispatchFn = null, paths = watcherPaths(),
   recheckFn = recheckResult, ownershipSnapshot = collectPrOwnership,
-  clock = Date.now, budgetMs = 120000,
+  clock = Date.now, budgetMs = ROUND_BUDGET_MS,
   nodeId = process.env.MIVO_WATCHER_NODE_ID,
   prNumber = process.env.MIVO_WATCHER_PR,
   snapshotFn = null,
@@ -2293,7 +2343,7 @@ export function* pollWorkflow({
   perPrBudgetMs = null, unlockForDispatch = null, relockForDispatch = null, getPrLockToken = () => null,
 } = {}) {
   const started = clock();
-  const deadline = started + Math.min(120000, Math.max(1, budgetMs));
+  const deadline = started + Math.min(ROUND_BUDGET_MS, Math.max(1, budgetMs));
   let prDeadline = perPrBudgetMs ? Math.min(deadline, started + perPrBudgetMs) : deadline;
   const remaining = () => Math.max(0, Math.min(deadline, prDeadline) - clock());
   const dryRun = !(enabled && allowDispatch && typeof dispatchFn === 'function');
@@ -2343,27 +2393,7 @@ export function* pollWorkflow({
   previous = yield* notifyDispatchConflictOnce({
     previous, key: nodeId, paths, now, dryRun, dispatchFn, remaining, pr: { number },
   });
-  const pendingRetry = previous.pendingDispatch?.status === 'retryable';
-  const recoveryDue = Boolean(readTaskForRecovery(previous, paths, now))
-    // Out of deliveries and still silent: nothing on GitHub changes, so this alone must reach processPr.
-    || recoveryLimitDue(previous, paths, now);
-  // A PR the Keel incompatibility froze has nothing new on GitHub, so its fingerprint never changes;
-  // without this it would never reach processPr, where reopenKeelBlocked hands its feedback back.
-  const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous
-    || reopenInfraBlocked({ previous, paths, now }) !== previous
-    || reopenExternalBlocked({ previous, paths, now, head: previous.headRefOid }) !== previous;
-  // The same holds for a PR an older build stopped on a product-intent conflict, or whose awaiting-discussion
-  // label the watcher still has to take off (including after a failed DELETE): nothing changes on GitHub.
-  const intentMigrationDue = reopenProductIntentBlocked({ previous, paths, now }) !== previous || legacyIntentLabelDue(previous)
-    || reopenRoundLimitBlocked({ previous }) !== previous;
-  const escalateDue = previous.activeTask?.status === 'blocked'
-    && previous.activeTask?.blockedKind === 'external'
-    && previous.lastException != null
-    && previous.lastException.escalated !== true;
-  if (previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry && !normalized.overflow
-    && !hasUnconsumedResult(previous, paths) && !needsCiRecheck(previous.activeTask) && !previous.recheckDeferredAt
-    && !keelReopenDue && !intentMigrationDue && !escalateDue && !ciUnknownRecheckDue(previous, paths, now)
-    && !pendingActionDue(previous) && !scanRecheckDue(previous, now)) {
+  if (canSkipCollection({ previous, fingerprint, normalized, paths, now })) {
     // A pushed HEAD is still waiting for its in-flight result. GitHub itself has
     // not changed, so skip collection, but keep reporting the wait until it expires.
     if (previous.headChangeSince && Date.parse(now) - Date.parse(previous.headChangeSince) < HEAD_CHANGE_WAIT_MS) {
@@ -2718,6 +2748,17 @@ function* discoverOnePr(pr, ctx) {
     report.push({ number: pr.number, nodeId: key, needsHuman: previous.needsHuman, dispatch: { attempted: false, reason: 'needs-human' } });
     return done();
   }
+  // A Ready PR without a repair session gets the same fingerprint gate as a bound one: one lightweight query, and the
+  // full collection (about 40 gh calls) only when the PR, its CI, reviews, comments or threads changed.
+  let gateFingerprint = null;
+  try {
+    const snapshot = yield* fetchPollSnapshot({ nodeId: key, ghFn });
+    gateFingerprint = pollFingerprint(snapshot);
+    if (!previous.headChangeSince && canSkipCollection({ previous, fingerprint: gateFingerprint, normalized: snapshot, paths, now })) {
+      report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'fingerprint-unchanged' } });
+      return done();
+    }
+  } catch { gateFingerprint = null; /* an unreadable gate means a full collection, never a skipped one */ }
   const state = { version: 2, repo: REPO, prs: { [key]: previous } };
   const inner = [];
   yield* processPr({
@@ -2726,6 +2767,7 @@ function* discoverOnePr(pr, ctx) {
     unlockForDispatch, relockForDispatch, getPrLockToken,
   });
   let entry = state.prs[key] || previous;
+  if (gateFingerprint && !prLock.held && !state._persistBlocked) entry = settleGate(entry, gateFingerprint, inner[0]);
   if (!prLock.held && !state._persistBlocked) {
   if (!entry.sessionId && entry.pendingDispatch && entry.pendingDispatch.status !== 'retryable'
     && !String(entry.pendingDispatch.dispatchId ?? '').startsWith('dry-')) {
@@ -2739,6 +2781,17 @@ function* discoverOnePr(pr, ctx) {
   report.push(inner[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: false } });
   } finally { prLock.release(); }
   return done();
+}
+
+// Outcomes after which the same fingerprint needs no new look. Anything else (a failed collection, a deferred or
+// unconfirmed delivery, an unreadable policy) keeps the old fingerprint and marks the PR for another collection.
+const SETTLED_REASONS = new Set(['no-new-feedback', 'merge-ready', 'script-no-change', 'waiting-ci', 'task-in-flight',
+  'eligibility-blocked', 'pending-authorized-feedback']);
+function settleGate(entry, fingerprint, item) {
+  const dispatch = item?.dispatch ?? {};
+  const settled = item && !item.recheckError && ((dispatch.attempted === true && dispatch.bound === true && !dispatch.error)
+    || (dispatch.attempted !== true && SETTLED_REASONS.has(dispatch.reason)));
+  return settled ? { ...entry, pollFingerprint: fingerprint, collectRetry: false } : { ...entry, collectRetry: true };
 }
 
 // Runs every PR of a pass at once and merges their reports in listing order. A PR that throws does not stop
@@ -2763,14 +2816,14 @@ export function* discoverWorkflow({
   allowDispatch = process.env.MIVO_WATCHER_DISPATCH === '1',
   ghFn: baseGh = gh, collect = collectPr, dispatchFn = null, paths = watcherPaths(),
   recheckFn = recheckResult, ownershipSnapshot = collectPrOwnership,
-  clock = Date.now, budgetMs = 120000, maxPrs = 1000, perPrBudgetMs = 75000,
+  clock = Date.now, budgetMs = ROUND_BUDGET_MS, maxPrs = 1000, perPrBudgetMs = ROUND_BUDGET_MS - DISPATCH_RESERVE_MS,
   gitFn = gitDefaultFn, env = process.env,
   // After the full pass, keep listing open PRs every followMs until followUntilMs after the start and handle a PR
   // as soon as it turns Ready, gets a push or otherwise changes. 0 = one pass only.
   followMs = 0, followUntilMs = FOLLOW_UNTIL_MS, sleepFn = sleep,
 } = {}) {
   const started = clock();
-  const deadline = started + Math.min(120000, Math.max(1, budgetMs));
+  const deadline = started + Math.min(ROUND_BUDGET_MS, Math.max(1, budgetMs));
   const dryRun = !(enabled && allowDispatch && typeof dispatchFn === 'function');
   const v2 = v2StatePaths(paths.home);
   fs.mkdirSync(v2.prsDir, { recursive: true, mode: 0o700 });
@@ -2853,23 +2906,36 @@ export function* discoverWorkflow({
   if (followMs > 0) {
     const hardDeadline = started + followUntilMs;
     let known = new Map(listed.map((pr) => [String(pr.id), listingSignature(pr)]));
+    let failures = 0;
+    let waitMs = followMs;
     for (;;) {
-      const tickAt = Math.max(clock(), listedAt + followMs);
+      const tickAt = Math.max(clock(), listedAt + waitMs);
       if (hardDeadline - tickAt < FOLLOW_MIN_PASS_MS) break;
       if (tickAt > clock()) yield () => sleepFn(tickAt - clock());
       ghFn = memoRepoReads(baseGh, keptReads);
       listedAt = clock();
-      const relisted = JSON.parse(yield () => ghFn(listArgs));
-      if (!Array.isArray(relisted)) throw new Error('Open PR listing is not an array');
+      let relisted;
+      try {
+        relisted = JSON.parse(yield () => ghFn(listArgs));
+        if (!Array.isArray(relisted)) throw new Error('Open PR listing is not an array');
+        failures = 0;
+        waitMs = followMs;
+      } catch (error) {
+        // A failed or rate-limited batch query only costs the quick follow-up: back off and, after a few misses, leave
+        // the rest of the round to the next run. The round itself never fails because of it.
+        failures += RATE_LIMITED.test(String(error?.message)) ? 2 : 1;
+        if (failures >= FOLLOW_MAX_FAILURES) break;
+        waitMs = Math.min(followMs * 2 ** failures, FOLLOW_BACKOFF_MAX_MS);
+        continue;
+      }
       const changed = relisted.filter((pr) => known.get(String(pr.id)) !== listingSignature(pr))
         .sort((a, b) => a.number - b.number).slice(0, maxPrs);
       known = new Map(relisted.map((pr) => [String(pr.id), listingSignature(pr)]));
       if (changed.length === 0) continue;
-      const passDeadline = Math.min(hardDeadline, clock() + 120000);
       // Task ids are built from the PR number and `now`; a follow pass that dispatched the same PR again under
       // the round's start time would reuse the first task's id, overwrite its task file and take its result.
       const passNow = new Date(nowMs + (clock() - started)).toISOString();
-      yield* discoverPass(changed, { ...ctx, ghFn, deadline: passDeadline, now: passNow, nowMs: Date.parse(passNow) }, report, events);
+      yield* discoverPass(changed, { ...ctx, ghFn, deadline: hardDeadline, now: passNow, nowMs: Date.parse(passNow) }, report, events);
     }
   }
   const lastByPr = new Map(report.map((item) => [item.number, item]));

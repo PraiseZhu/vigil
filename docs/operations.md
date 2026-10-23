@@ -41,7 +41,7 @@ Vigil 的两个 watcher **不是**可以配进任意 cron 的无状态脚本—�
 | 字段 | 取值 | 说明 |
 |---|---|---|
 | `executionMode` | `"script"` | 零 token 模式:宿主不起 agent,直接执行 `scriptConfig.command` |
-| `cronExpr` | `"* * * * *"` | 每分钟触发一次;5 字段 cron(minute hour day-of-month month day-of-week)。两轮之间在启动后第 45 秒再跟进一次转 Ready / 新推送 |
+| `cronExpr` | `"*/2 * * * *"` | 每 2 分钟触发一次;5 字段 cron(minute hour day-of-month month day-of-week)。一轮最多跑 165 秒(超时 180 秒减 15 秒余量),轮内每 15 秒用一次批量查询复查 PR 变化,上一轮没结束时新的触发直接返回 `lock-held` |
 | `timezone` | 你所在时区的 IANA id,如 `"Asia/Shanghai"` | 必填 |
 | `recurring` | `true` | discover 是常驻轮询,不是一次性任务 |
 | `scriptConfig.command` | `python3 <watcher home>/bin/mivo-watch-script.py --mode discover`(cindy watcher 换成 `cindy-watch-script.py`) | 经系统 shell 执行,cwd 为 `workingDir`;该命令必须实现 `cindy-script/1` 协议(stdout 只能是协议帧,调试输出走 stderr) |
@@ -102,7 +102,7 @@ node watchers/<mivo|cindy>/bin/<mivo|cindy>-repair.mjs lock-doctor --home "$WATC
 
 ### GitHub 读请求与缓存
 
-发现器每两分钟一轮。下面两类读请求只能用 `gh` 登录的个人账号发(GitHub App 令牌调不了
+发现器每两分钟触发一轮(一轮最多 165 秒)。下面两类读请求只能用 `gh` 登录的个人账号发(GitHub App 令牌调不了
 `/user`,读分支保护要管理权限),所以跨轮缓存在 `state/kept-reads.json`:
 
 - 登录名(`gh api user`):6 小时。

@@ -66,6 +66,10 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 |---|---|---|
 | `targetRepo` | `CINDY_WATCHER_TARGET_REPO` | `makecindy/cindy`(公开仓库,可直接用,也可覆盖成别的仓) |
 | `watchHomes` | `CINDY_WATCHER_WATCH_HOMES`(逗号分隔) | `[]`(不内置任何路径) |
+| `scheduleTimeoutMs` | `CINDY_WATCHER_SCHEDULE_TIMEOUT_MS` | `180000`。宿主对 discover 定时任务的超时(毫秒),整轮预算以它减 15 秒为上限 |
+| `roundBudgetMs` | `CINDY_WATCHER_ROUND_BUDGET_MS` | `165000`(超时 180 秒减 15 秒安全余量)。一轮 discover 的总预算 |
+| `dispatchReserveMs` | `CINDY_WATCHER_DISPATCH_RESERVE_MS` | `25000`。给派发回执留的时间:采集结束时整轮只剩不足这个时间的 PR 才会 `dispatch-budget-deferred` |
+| `followIntervalMs` | `CINDY_WATCHER_FOLLOW_MS` | `15000`。轮内批量复查 open PR 变化的间隔;环境变量设为 `0` 只跑全量一轮 |
 
 
 拷一份 [`config/examples/cindy.profile.example.json`](../../config/examples/cindy.profile.example.json)
@@ -107,7 +111,7 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 
 ## 并行与跟进
 
-与 Mivo watcher 相同（详见 `../mivo/README.md`「并行与跟进」）：发现器每分钟触发一次（超时 180 秒），一轮里所有 open PR 同时采集、同时派发，不设并发上限；分支规则、仓库变量等仓库级查询每轮只查一次；两轮之间在启动后第 45 秒再跑一次 `gh pr list`，转 Ready、有新推送或有更新的 PR 立刻处理；Python 包装同时转发多个 `sessions.dispatch`（最多 12 个同时在途，宿主上限 16）。环境变量 `CINDY_WATCHER_FOLLOW_MS` 可改跟进间隔，`0` 只跑全量一轮。
+与 Mivo watcher 相同（详见 `../mivo/README.md`「并行与跟进」）：发现器由定时任务触发（建议 `*/2 * * * *`，超时 180 秒），一轮最多 165 秒（超时减 15 秒安全余量），一轮里所有 open PR 同时采集、同时派发，不设并发上限；采集可用掉整轮预算里除派发预留（默认 25 秒）以外的时间，被推迟的 PR 下一轮优先；没有修复会话的 Ready PR 也先走指纹闸（指纹没变且无 `collectRetry` 就跳过全量采集）；分支规则、仓库变量等仓库级查询每轮只查一次；已完成的 CI job / run 按 head 缓存，多个必需检查并发查询；全量处理后每隔 15 秒用一次 `gh pr list` 批量查询变化，转 Ready、有新推送或有更新的 PR 当轮立刻处理，查询失败或限流时退避、本轮照常结束；Python 包装同时转发多个 `sessions.dispatch`（最多 12 个同时在途，宿主上限 16）。时间配置（profile 字段或环境变量）：`roundBudgetMs` / `CINDY_WATCHER_ROUND_BUDGET_MS`（默认 165000）、`dispatchReserveMs` / `CINDY_WATCHER_DISPATCH_RESERVE_MS`（默认 25000）、`followIntervalMs` / `CINDY_WATCHER_FOLLOW_MS`（默认 15000，环境变量 `0` 只跑全量一轮）、`scheduleTimeoutMs` / `CINDY_WATCHER_SCHEDULE_TIMEOUT_MS`（默认 180000，整轮预算上限为它减 15 秒）。
 
 ## 修复轮次
 
