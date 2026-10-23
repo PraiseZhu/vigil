@@ -174,6 +174,12 @@ function readViewer(ghFn, paths, clock) {
 // { status, value | reason } per workflow, in order. The sync driver runs them one after another.
 const PARALLEL = Symbol('mivo.parallel');
 export function parallel(workflows) { return { [PARALLEL]: workflows }; }
+// spawn(workflow) starts a sub-workflow without waiting for it (the sync driver runs it in place); drain() waits for
+// every spawned one and returns the errors they raised.
+const SPAWN = Symbol('watcher.spawn');
+const DRAIN = Symbol('watcher.drain');
+export function spawn(workflow) { return { [SPAWN]: workflow }; }
+export function drain() { return { [DRAIN]: true }; }
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
 // Timing. The host kills a discover run after its schedule timeout (180 s); the round keeps 15 s of that as a safety
 // margin. A run lists the open PRs once, handles them in parallel, then re-lists every FOLLOW_INTERVAL_MS (one batched
@@ -187,12 +193,11 @@ const HOST_TIMEOUT_MS = configMs('scheduleTimeoutMs', 'MIVO_WATCHER_SCHEDULE_TIM
 const HOST_SAFETY_MS = 15000;
 export const ROUND_BUDGET_MS = Math.max(30000, Math.min(configMs('roundBudgetMs', 'MIVO_WATCHER_ROUND_BUDGET_MS', 165000), HOST_TIMEOUT_MS - HOST_SAFETY_MS));
 export const DISPATCH_RESERVE_MS = Math.min(configMs('dispatchReserveMs', 'MIVO_WATCHER_DISPATCH_RESERVE_MS', 25000), ROUND_BUDGET_MS - 20000);
-// A delivery needs the reserve before its ownership re-check; the re-check itself may take a few seconds of it.
-const DISPATCH_RECHECK_MS = Math.max(0, DISPATCH_RESERVE_MS - 4000);
 export const FOLLOW_INTERVAL_MS = configMs('followIntervalMs', 'MIVO_WATCHER_FOLLOW_MS', 15000);
 export const FOLLOW_UNTIL_MS = ROUND_BUDGET_MS;
-// A follow pass starts only while a collection (15 s) plus a delivery still fit before the round ends.
-const FOLLOW_MIN_PASS_MS = DISPATCH_RESERVE_MS + 15000;
+// A Ready PR without a repair session is collected in full at least this often even if its fingerprint did not move,
+// so a change the fingerprint cannot see is delayed by at most this long.
+export const FULL_COLLECT_MS = configMs('fullCollectMs', 'MIVO_WATCHER_FULL_COLLECT_MS', 600000);
 const FOLLOW_MAX_FAILURES = 3;
 const FOLLOW_BACKOFF_MAX_MS = 60000;
 const RATE_LIMITED = /rate limit|\b429\b|secondary|abuse|\b403\b/i;
@@ -958,6 +963,9 @@ function normalizeChecks(list) {
     runAttempt: item.runAttempt ?? runAttemptFromUrl(item.detailsUrl ?? item.details_url ?? item.link),
   })).sort((a, b) => String(a.id ?? a.name).localeCompare(String(b.id ?? b.name)));
 }
+const stampsOf = (nodes) => (Array.isArray(nodes) ? nodes : []).filter((item) => item && (item.id != null || item.updatedAt))
+  .map((item) => `${item.id ?? ''}@${item.updatedAt ?? ''}`);
+const latestStamp = (nodes) => (Array.isArray(nodes) ? nodes : []).map((item) => item?.updatedAt).filter(Boolean).sort().at(-1);
 export function normalizePollSnapshot(payload) {
   const node = payload?.data?.node ?? payload;
   const labels = (node.labels?.nodes ?? node.labels ?? []).map((item) => typeof item === 'string' ? item : item?.name).filter(Boolean);
@@ -984,6 +992,7 @@ export function normalizePollSnapshot(payload) {
     }
   }
   if (Array.isArray(node.checks)) checks.push(...node.checks);
+  const lastCommit = node.commits?.nodes?.[0]?.commit;
   const threadTimes = threads.flatMap((thread) => (thread.comments?.nodes ?? []).map((item) => item.updatedAt)).filter(Boolean).sort();
   const suiteNodes = node.commits?.nodes?.[0]?.commit?.checkSuites;
   const overflow = Boolean(node.overflow
@@ -1002,9 +1011,15 @@ export function normalizePollSnapshot(payload) {
     commentCount: comments?.totalCount ?? comments?.length ?? node.commentCount ?? 0,
     reviewCount: reviews?.totalCount ?? reviews?.length ?? node.reviewCount ?? 0,
     unresolvedThreads: threads.filter((thread) => thread.isResolved === false).length || node.unresolvedThreads || 0,
-    commentUpdatedAt: comments?.nodes?.[0]?.updatedAt ?? comments?.at?.(-1)?.updatedAt ?? node.commentUpdatedAt ?? null,
-    reviewUpdatedAt: reviews?.nodes?.[0]?.updatedAt ?? reviews?.at?.(-1)?.updatedAt ?? node.reviewUpdatedAt ?? null,
+    commentUpdatedAt: latestStamp(comments?.nodes) ?? comments?.at?.(-1)?.updatedAt ?? node.commentUpdatedAt ?? null,
+    reviewUpdatedAt: latestStamp(reviews?.nodes) ?? reviews?.at?.(-1)?.updatedAt ?? node.reviewUpdatedAt ?? null,
     threadUpdatedAt: threadTimes.at(-1) ?? node.threadUpdatedAt ?? null,
+    prUpdatedAt: node.updatedAt ?? node.prUpdatedAt ?? null,
+    commentStamps: stampsOf(comments?.nodes),
+    reviewStamps: stampsOf(reviews?.nodes),
+    threadStamps: threads.flatMap((thread) => stampsOf(thread.comments?.nodes)),
+    rollupState: lastCommit?.statusCheckRollup?.state ?? node.rollupState ?? null,
+    statusContexts: (lastCommit?.status?.contexts ?? []).map((item) => `${item.context}:${item.state}`).sort(),
     overflow,
   };
 }
@@ -1022,11 +1037,14 @@ export function pollFingerprint(snapshot) {
     commentUpdatedAt: normalized.commentUpdatedAt ?? null, reviewUpdatedAt: normalized.reviewUpdatedAt ?? null,
     threadUpdatedAt: normalized.threadUpdatedAt ?? null,
     unresolvedThreads: normalized.unresolvedThreads ?? 0,
+    prUpdatedAt: normalized.prUpdatedAt ?? null,
+    commentStamps: normalized.commentStamps ?? [], reviewStamps: normalized.reviewStamps ?? [], threadStamps: normalized.threadStamps ?? [],
+    rollupState: normalized.rollupState ?? null, statusContexts: normalized.statusContexts ?? [],
     overflow: normalized.overflow === true,
   });
 }
 function* fetchPollSnapshot({ nodeId, ghFn }) {
-  const query = 'query($id:ID!){node(id:$id){... on PullRequest{state isDraft headRefOid baseRefOid mergeable mergeStateStatus baseRef{target{oid}} timelineItems(last:1,itemTypes:[READY_FOR_REVIEW_EVENT,CONVERT_TO_DRAFT_EVENT]){nodes{... on ReadyForReviewEvent{id} ... on ConvertToDraftEvent{id}}} labels(first:50){pageInfo{hasNextPage} nodes{name}} comments(last:1){totalCount nodes{updatedAt}} reviews(last:1){totalCount nodes{updatedAt}} reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved comments(last:1){nodes{updatedAt}}}} commits(last:1){nodes{commit{checkSuites(first:30){pageInfo{hasNextPage} nodes{checkRuns(first:40){pageInfo{hasNextPage} nodes{name status conclusion databaseId detailsUrl}}}}}}}}}}';
+  const query = 'query($id:ID!){node(id:$id){... on PullRequest{state isDraft updatedAt headRefOid baseRefOid mergeable mergeStateStatus baseRef{target{oid}} timelineItems(last:1,itemTypes:[READY_FOR_REVIEW_EVENT,CONVERT_TO_DRAFT_EVENT]){nodes{... on ReadyForReviewEvent{id} ... on ConvertToDraftEvent{id}}} labels(first:50){pageInfo{hasNextPage} nodes{name}} comments(last:20){totalCount nodes{id updatedAt}} reviews(last:10){totalCount nodes{id updatedAt}} reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved comments(last:5){nodes{id updatedAt}}}} commits(last:1){nodes{commit{statusCheckRollup{state} status{state contexts{context state}} checkSuites(first:30){pageInfo{hasNextPage} nodes{checkRuns(first:40){pageInfo{hasNextPage} nodes{name status conclusion databaseId detailsUrl}}}}}}}}}}';
   const raw = yield () => ghFn(['api', 'graphql', '-f', `query=${query}`, '-F', `id=${nodeId}`]);
   return normalizePollSnapshot(JSON.parse(raw));
 }
@@ -1646,6 +1664,7 @@ export function* processPr({
   dispatchFn, collect, ghFn, recheckFn, ownershipSnapshot, maintenanceSessionId,
   remaining, deadline, clock, resumeCursor, resetPrDeadline, allowCreate = true, messagePrefix = '', forceCreate = false,
   unlockForDispatch = null, relockForDispatch = null, getPrLockToken = () => null, keelRoot = keelLedgerRoot(),
+  dispatchReserveMs = DISPATCH_RESERVE_MS,
 } = {}) {
   const key = String(pr.id);
   let persistBlocked = false;
@@ -2041,7 +2060,7 @@ export function* processPr({
   }
   // Per-PR budget caps collection only. The dispatch reserve uses the global deadline.
   if (wantsDelivery) resetPrDeadline?.();
-  if (!dryRun && wantsDelivery && remaining()<DISPATCH_RESERVE_MS) {
+  if (!dryRun && wantsDelivery && remaining()<dispatchReserveMs) {
     state.prs[key]=previous;
     report.push({number:pr.number,dispatch:{attempted:false,reason:'dispatch-budget-deferred'}});
     return;
@@ -2058,7 +2077,7 @@ export function* processPr({
       return;
     }
   }
-  if (!dryRun && wantsDelivery && remaining()<DISPATCH_RECHECK_MS) {
+  if (!dryRun && wantsDelivery && remaining()<Math.max(0, dispatchReserveMs - 4000)) {
     state.prs[key]=previous;
     report.push({number:pr.number,dispatch:{attempted:false,reason:'dispatch-budget-deferred'}});
     return;
@@ -2201,6 +2220,8 @@ export function* processPr({
   }
   report.push({
     number: pr.number, nodeId: pr.id, fresh: fresh.length, admissionVerified: admitted,
+    // false when the collection could not read what it needs (CI unknown, unverified policy): never a settled result.
+    collectionComplete: collected.ci?.status !== 'unknown' && (!collected.policy || collected.policy.status === 'verified'),
     admissionReason: collected.admissionReason ?? null, mergeReady: collected.mergeReady,
     repairStatus: previous.activeTask?.status ?? 'observing',
     evidenceVersion: previous.activeTask?.evidenceVersion ?? null,
@@ -2341,6 +2362,7 @@ export function* pollWorkflow({
   // dispatch may use the rest of the round, and the PR lock is released while
   // the dispatch RPC is in flight (same rules as the create path).
   perPrBudgetMs = null, unlockForDispatch = null, relockForDispatch = null, getPrLockToken = () => null,
+  dispatchReserveMs = DISPATCH_RESERVE_MS,
 } = {}) {
   const started = clock();
   const deadline = started + Math.min(ROUND_BUDGET_MS, Math.max(1, budgetMs));
@@ -2418,7 +2440,7 @@ export function* pollWorkflow({
   const state = { version: 2, repo: REPO, prs: { [String(nodeId)]: previous } };
   yield* processPr({
     pr, previous, state, paths, now, events, report, viewer, dryRun, dispatchFn, collect, ghFn,
-    recheckFn, ownershipSnapshot, remaining, deadline, clock, allowCreate: false,
+    recheckFn, ownershipSnapshot, remaining, deadline, clock, allowCreate: false, dispatchReserveMs,
     resetPrDeadline: () => { prDeadline = deadline; }, unlockForDispatch, relockForDispatch, getPrLockToken,
   });
   const latest = state.prs[String(nodeId)] || previous;
@@ -2522,6 +2544,7 @@ function* discoverOnePr(pr, ctx) {
   const {
     now, nowMs, enabled, allowDispatch, viewer, dryRun, dispatchFn, collect, ghFn, recheckFn, ownershipSnapshot,
     paths, clock, deadline, perPrBudgetMs, gitFn, env, markCursor,
+    dispatchReserveMs = DISPATCH_RESERVE_MS, fullCollectMs = FULL_COLLECT_MS,
   } = ctx;
   const report = [];
   const events = [];
@@ -2578,7 +2601,7 @@ function* discoverOnePr(pr, ctx) {
     if (deadline - clock() < 1000) return done();
     const polled = yield* pollWorkflow({
       now, enabled, allowDispatch, ghFn, collect, dispatchFn, paths, recheckFn, ownershipSnapshot,
-      clock, budgetMs: Math.max(1, deadline - clock()), perPrBudgetMs, nodeId: key, prNumber: pr.number, gitFn, env,
+      clock, budgetMs: Math.max(1, deadline - clock()), perPrBudgetMs, dispatchReserveMs, nodeId: key, prNumber: pr.number, gitFn, env,
       unlockForDispatch, relockForDispatch, getPrLockToken,
     });
     const item = polled.prs?.[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'poll-empty' } };
@@ -2613,7 +2636,7 @@ function* discoverOnePr(pr, ctx) {
       const inner = [];
       yield* processPr({
         pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
-        recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, forceCreate: true,
+        recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, dispatchReserveMs, forceCreate: true,
         messagePrefix: `${watchSuccessorMessage({ prNumber: pr.number, predecessorId, reason: text.slice(0, 120), summary })}\n${guide}`,
         unlockForDispatch, relockForDispatch, getPrLockToken,
       });
@@ -2711,7 +2734,7 @@ function* discoverOnePr(pr, ctx) {
       const inner = [];
       yield* processPr({
         pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
-        recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, messagePrefix: guide,
+        recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, dispatchReserveMs, messagePrefix: guide,
         unlockForDispatch, relockForDispatch, getPrLockToken,
       });
       let entry = state.prs[key] || previous;
@@ -2754,7 +2777,8 @@ function* discoverOnePr(pr, ctx) {
   try {
     const snapshot = yield* fetchPollSnapshot({ nodeId: key, ghFn });
     gateFingerprint = pollFingerprint(snapshot);
-    if (!previous.headChangeSince && canSkipCollection({ previous, fingerprint: gateFingerprint, normalized: snapshot, paths, now })) {
+    if (!previous.headChangeSince && fullCollectFresh(previous, now, fullCollectMs)
+      && canSkipCollection({ previous, fingerprint: gateFingerprint, normalized: snapshot, paths, now })) {
       report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'fingerprint-unchanged' } });
       return done();
     }
@@ -2763,11 +2787,11 @@ function* discoverOnePr(pr, ctx) {
   const inner = [];
   yield* processPr({
     pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
-    recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, messagePrefix: guide,
+    recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, dispatchReserveMs, messagePrefix: guide,
     unlockForDispatch, relockForDispatch, getPrLockToken,
   });
   let entry = state.prs[key] || previous;
-  if (gateFingerprint && !prLock.held && !state._persistBlocked) entry = settleGate(entry, gateFingerprint, inner[0]);
+  if (gateFingerprint && !prLock.held && !state._persistBlocked) entry = settleGate(entry, gateFingerprint, inner[0], now);
   if (!prLock.held && !state._persistBlocked) {
   if (!entry.sessionId && entry.pendingDispatch && entry.pendingDispatch.status !== 'retryable'
     && !String(entry.pendingDispatch.dispatchId ?? '').startsWith('dry-')) {
@@ -2787,17 +2811,22 @@ function* discoverOnePr(pr, ctx) {
 // unconfirmed delivery, an unreadable policy) keeps the old fingerprint and marks the PR for another collection.
 const SETTLED_REASONS = new Set(['no-new-feedback', 'merge-ready', 'script-no-change', 'waiting-ci', 'task-in-flight',
   'eligibility-blocked', 'pending-authorized-feedback']);
-function settleGate(entry, fingerprint, item) {
+function settleGate(entry, fingerprint, item, now) {
   const dispatch = item?.dispatch ?? {};
-  const settled = item && !item.recheckError && ((dispatch.attempted === true && dispatch.bound === true && !dispatch.error)
-    || (dispatch.attempted !== true && SETTLED_REASONS.has(dispatch.reason)));
-  return settled ? { ...entry, pollFingerprint: fingerprint, collectRetry: false } : { ...entry, collectRetry: true };
+  const settled = item && !item.recheckError && item.collectionComplete !== false
+    && ((dispatch.attempted === true && dispatch.bound === true && !dispatch.error)
+      || (dispatch.attempted !== true && SETTLED_REASONS.has(dispatch.reason)));
+  return settled ? { ...entry, pollFingerprint: fingerprint, collectRetry: false, lastFullCollectAt: now } : { ...entry, collectRetry: true };
 }
+const fullCollectFresh = (entry, now, limitMs) => {
+  const last = Date.parse(entry.lastFullCollectAt ?? '');
+  return Number.isFinite(last) && Date.parse(now) - last < limitMs;
+};
 
 // Runs every PR of a pass at once and merges their reports in listing order. A PR that throws does not stop
 // the others; the first error is raised after all of them have finished and released their locks.
 function* discoverPass(prs, ctx, report, events) {
-  const settled = yield parallel(prs.map((pr) => discoverOnePr(pr, ctx)));
+  const settled = yield parallel(prs.map((pr) => trackedPr(pr, ctx)));
   let failure = null;
   for (const item of settled) {
     if (item.status === 'rejected') { failure ??= item.reason; continue; }
@@ -2807,8 +2836,25 @@ function* discoverPass(prs, ctx, report, events) {
   if (failure) throw failure;
 }
 
-const listingSignature = (pr) => JSON.stringify([pr.isDraft === true, pr.headRefOid, pr.updatedAt,
-  (pr.labels ?? []).map((item) => typeof item === 'string' ? item : item?.name).sort()]);
+// One query for every open PR of the viewer: the fields a follow check compares, plus the latest commit's CI summary.
+// Only the summary state is asked for (no contexts), so the query stays cheap however many checks a PR has.
+const BATCH_QUERY = 'query($q:String!){search(query:$q,type:ISSUE,first:100){issueCount nodes{... on PullRequest{id isDraft headRefOid updatedAt labels(first:30){nodes{name}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}}';
+function parseBatch(raw) {
+  const search = JSON.parse(raw)?.data?.search;
+  if (!search || !Array.isArray(search.nodes) || !(Number(search.issueCount) <= search.nodes.length)) throw new Error('Batch PR query incomplete');
+  return new Map(search.nodes.filter((node) => node?.id).map((node) => [String(node.id), JSON.stringify([
+    node.isDraft === true, node.headRefOid, node.updatedAt,
+    (node.labels?.nodes ?? []).map((item) => item?.name).filter(Boolean).sort(),
+    node.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null,
+  ])]));
+}
+
+// Tracks the PRs being handled so a follow beat never starts a second pass on the same PR.
+function* trackedPr(pr, ctx) {
+  const key = String(pr.id);
+  ctx.inFlight?.add(key);
+  try { return yield* discoverOnePr(pr, ctx); } finally { ctx.inFlight?.delete(key); }
+}
 
 export function* discoverWorkflow({
   now = new Date().toISOString(),
@@ -2818,9 +2864,10 @@ export function* discoverWorkflow({
   recheckFn = recheckResult, ownershipSnapshot = collectPrOwnership,
   clock = Date.now, budgetMs = ROUND_BUDGET_MS, maxPrs = 1000, perPrBudgetMs = ROUND_BUDGET_MS - DISPATCH_RESERVE_MS,
   gitFn = gitDefaultFn, env = process.env,
-  // After the full pass, keep listing open PRs every followMs until followUntilMs after the start and handle a PR
-  // as soon as it turns Ready, gets a push or otherwise changes. 0 = one pass only.
-  followMs = 0, followUntilMs = FOLLOW_UNTIL_MS, sleepFn = sleep,
+  // Next to the full pass, a follow loop runs one batched query every followMs until the round budget (less the dispatch
+  // reserve) is spent and handles a PR as soon as it turns Ready, gets a push, new feedback or a CI change. It does not
+  // wait for slow collections. 0 = one pass only.
+  followMs = 0, followUntilMs = null, sleepFn = sleep, dispatchReserveMs = DISPATCH_RESERVE_MS, fullCollectMs = FULL_COLLECT_MS,
 } = {}) {
   const started = clock();
   const deadline = started + Math.min(ROUND_BUDGET_MS, Math.max(1, budgetMs));
@@ -2860,84 +2907,114 @@ export function* discoverWorkflow({
   };
   const ctx = {
     now, nowMs, enabled, allowDispatch, viewer, dryRun, dispatchFn, collect, ghFn, recheckFn, ownershipSnapshot,
-    paths, clock, deadline, perPrBudgetMs, gitFn, env, markCursor,
+    paths, clock, deadline, perPrBudgetMs, gitFn, env, markCursor, dispatchReserveMs, fullCollectMs, inFlight: new Set(),
   };
-  yield* discoverPass(ordered, ctx, report, events);
-  const listedIds = new Set(listed.map((pr) => String(pr.id)));
-  for (const stale of listPrs(paths.home)) {
-    if (deadline - clock() < CLOSEDOWN_MIN_MS) break;
-    if (!stale?.nodeId || listedIds.has(String(stale.nodeId))) continue;
-    if (stale.closedHandled === true || stale.optOut === true) continue;
-    const staleKey = String(stale.nodeId);
-    const staleLock = acquireLock(paths.home, `pr-${staleKey}`);
-    if (staleLock.held) {
-      report.push({ number: stale.number, nodeId: staleKey, dispatch: { attempted: false, reason: 'pr-lock-held' } });
-      continue;
-    }
-    try {
-      const live = readPr(paths.home, staleKey) || stale;
-      if (live.closedHandled === true || live.optOut === true) continue;
-      if (listedIds.has(String(live.nodeId))) continue;
-      let view;
-      try {
-        view = JSON.parse(yield () => ghFn([
-          'pr', 'view', String(live.number), '--repo', REPO, '--json', 'state,id',
-        ]));
-      } catch (error) {
-        report.push({
-          number: live.number, nodeId: staleKey,
-          dispatch: { attempted: false, reason: 'closedown-lookup-failed', error: String(error.message).slice(0, 400) },
-        });
-        continue;
-      }
-      const prState = view?.state;
-      if (prState !== 'MERGED' && prState !== 'CLOSED') {
-        report.push({ number: live.number, nodeId: staleKey, dispatch: { attempted: false, reason: 'stale-still-open' } });
-        continue;
-      }
-      const { dispatch } = yield* deliverClosedown({
-        previous: live, prNumber: live.number, nodeId: staleKey, state: prState,
-        paths, now, dryRun, dispatchFn, remaining: () => Math.max(0, deadline - clock()),
-        gitFn, env,
-      });
-      report.push({ number: live.number, nodeId: staleKey, dispatch });
-    } finally { staleLock.release(); }
-  }
+  const hardDeadline = followUntilMs ? started + followUntilMs : deadline;
+  const batchArgs = ['api', 'graphql', '-f', `query=${BATCH_QUERY}`, '-f', `q=repo:${REPO} is:pr is:open author:${viewer}`];
+  let known = null;
   if (followMs > 0) {
-    const hardDeadline = started + followUntilMs;
-    let known = new Map(listed.map((pr) => [String(pr.id), listingSignature(pr)]));
+    // The baseline is taken before the full pass so a change that lands while the pass runs is seen by the first beat.
+    try { known = parseBatch(yield () => ghFn(batchArgs)); } catch { known = null; }
+  }
+  const baselineAt = clock();
+  function* main() {
+  yield* discoverPass(ordered, ctx, report, events);
+    const listedIds = new Set(listed.map((pr) => String(pr.id)));
+    for (const stale of listPrs(paths.home)) {
+      if (deadline - clock() < CLOSEDOWN_MIN_MS) break;
+      if (!stale?.nodeId || listedIds.has(String(stale.nodeId))) continue;
+      if (stale.closedHandled === true || stale.optOut === true) continue;
+      const staleKey = String(stale.nodeId);
+      const staleLock = acquireLock(paths.home, `pr-${staleKey}`);
+      if (staleLock.held) {
+        report.push({ number: stale.number, nodeId: staleKey, dispatch: { attempted: false, reason: 'pr-lock-held' } });
+        continue;
+      }
+      try {
+        const live = readPr(paths.home, staleKey) || stale;
+        if (live.closedHandled === true || live.optOut === true) continue;
+        if (listedIds.has(String(live.nodeId))) continue;
+        let view;
+        try {
+          view = JSON.parse(yield () => ghFn([
+            'pr', 'view', String(live.number), '--repo', REPO, '--json', 'state,id',
+          ]));
+        } catch (error) {
+          report.push({
+            number: live.number, nodeId: staleKey,
+            dispatch: { attempted: false, reason: 'closedown-lookup-failed', error: String(error.message).slice(0, 400) },
+          });
+          continue;
+        }
+        const prState = view?.state;
+        if (prState !== 'MERGED' && prState !== 'CLOSED') {
+          report.push({ number: live.number, nodeId: staleKey, dispatch: { attempted: false, reason: 'stale-still-open' } });
+          continue;
+        }
+        const { dispatch } = yield* deliverClosedown({
+          previous: live, prNumber: live.number, nodeId: staleKey, state: prState,
+          paths, now, dryRun, dispatchFn, remaining: () => Math.max(0, deadline - clock()),
+          gitFn, env,
+        });
+        report.push({ number: live.number, nodeId: staleKey, dispatch });
+      } finally { staleLock.release(); }
+    }
+  }
+  function* follow() {
     let failures = 0;
     let waitMs = followMs;
+    let lastAt = baselineAt;
+    const failed = (error) => {
+      // A failed or rate-limited query only costs the quick follow-up: back off and, after a few misses, leave the rest
+      // of the round to the next run. The round itself never fails because of it.
+      failures += RATE_LIMITED.test(String(error?.message)) ? 2 : 1;
+      waitMs = Math.min(followMs * 2 ** failures, FOLLOW_BACKOFF_MAX_MS);
+      return failures >= FOLLOW_MAX_FAILURES;
+    };
     for (;;) {
-      const tickAt = Math.max(clock(), listedAt + waitMs);
-      if (hardDeadline - tickAt < FOLLOW_MIN_PASS_MS) break;
+      const tickAt = Math.max(clock(), lastAt + waitMs);
+      if (tickAt > hardDeadline - dispatchReserveMs) break;
       if (tickAt > clock()) yield () => sleepFn(tickAt - clock());
-      ghFn = memoRepoReads(baseGh, keptReads);
-      listedAt = clock();
+      const tickGh = memoRepoReads(baseGh, keptReads);
+      lastAt = clock();
+      let batch;
+      try { batch = parseBatch(yield () => tickGh(batchArgs)); } catch (error) { if (failed(error)) break; continue; }
+      failures = 0;
+      waitMs = followMs;
+      if (known === null) { known = batch; continue; }
+      const changedIds = new Set();
+      const nextKnown = new Map();
+      for (const [id, signature] of batch) {
+        if (ctx.inFlight.has(id)) {
+          // Busy PR: keep what was known so the next beat looks at it again once it is free.
+          if (known.has(id)) nextKnown.set(id, known.get(id));
+          continue;
+        }
+        nextKnown.set(id, signature);
+        if (known.get(id) !== signature) changedIds.add(id);
+      }
+      if (changedIds.size === 0) { known = nextKnown; continue; }
       let relisted;
       try {
-        relisted = JSON.parse(yield () => ghFn(listArgs));
+        relisted = JSON.parse(yield () => tickGh(listArgs));
         if (!Array.isArray(relisted)) throw new Error('Open PR listing is not an array');
-        failures = 0;
-        waitMs = followMs;
-      } catch (error) {
-        // A failed or rate-limited batch query only costs the quick follow-up: back off and, after a few misses, leave
-        // the rest of the round to the next run. The round itself never fails because of it.
-        failures += RATE_LIMITED.test(String(error?.message)) ? 2 : 1;
-        if (failures >= FOLLOW_MAX_FAILURES) break;
-        waitMs = Math.min(followMs * 2 ** failures, FOLLOW_BACKOFF_MAX_MS);
-        continue;
-      }
-      const changed = relisted.filter((pr) => known.get(String(pr.id)) !== listingSignature(pr))
-        .sort((a, b) => a.number - b.number).slice(0, maxPrs);
-      known = new Map(relisted.map((pr) => [String(pr.id), listingSignature(pr)]));
+      } catch (error) { if (failed(error)) break; continue; }
+      known = nextKnown;
+      const changed = relisted.filter((pr) => changedIds.has(String(pr.id))).sort((a, b) => a.number - b.number).slice(0, maxPrs);
       if (changed.length === 0) continue;
       // Task ids are built from the PR number and `now`; a follow pass that dispatched the same PR again under
       // the round's start time would reuse the first task's id, overwrite its task file and take its result.
       const passNow = new Date(nowMs + (clock() - started)).toISOString();
-      yield* discoverPass(changed, { ...ctx, ghFn, deadline: hardDeadline, now: passNow, nowMs: Date.parse(passNow) }, report, events);
+      yield spawn(discoverPass(changed, { ...ctx, ghFn: tickGh, deadline: hardDeadline, now: passNow, nowMs: Date.parse(passNow) }, report, events));
     }
+    const errors = yield drain();
+    if (errors.length > 0) throw errors[0];
   }
+  if (followMs > 0) {
+    const settled = yield parallel([main(), follow()]);
+    const failure = settled.find((item) => item.status === 'rejected');
+    if (failure) throw failure.reason;
+  } else yield* main();
   const lastByPr = new Map(report.map((item) => [item.number, item]));
   const deferredNumbers = [...lastByPr.values()].filter((item) => ['dispatch-budget-deferred', KEEL_LEDGER_HELD].includes(item.dispatch?.reason)).map((item) => item.number);
   index = { ...index, finishedAt: now, elapsedMs: clock() - started, deferredNumbers };
@@ -2948,17 +3025,21 @@ export function* discoverWorkflow({
   return { mode: 'discover', dispatch: !dryRun, viewer, repo: REPO, prs: report, events, closedownManual, scan: { cursor: index.cursor ?? 0, listed: listed.length } };
 }
 
-function driveSync(iterator) {
+function driveSync(iterator, shared = { errors: [] }) {
   let step = iterator.next();
   while (!step.done) {
     let value;
     try {
       if (step.value?.[PARALLEL]) {
         value = step.value[PARALLEL].map((workflow) => {
-          try { return { status: 'fulfilled', value: driveSync(workflow) }; }
+          try { return { status: 'fulfilled', value: driveSync(workflow, shared) }; }
           catch (reason) { return { status: 'rejected', reason }; }
         });
-      } else value = step.value();
+      } else if (step.value?.[SPAWN]) {
+        try { driveSync(step.value[SPAWN], shared); } catch (error) { shared.errors.push(error); }
+        value = undefined;
+      } else if (step.value?.[DRAIN]) value = shared.errors.splice(0);
+      else value = step.value();
     }
     catch (error) { step = iterator.throw(error); continue; }
     if (value?.then) throw new Error('scanOnce cannot use asynchronous effects');
@@ -2967,14 +3048,19 @@ function driveSync(iterator) {
   return step.value;
 }
 
-async function driveAsync(iterator) {
+async function driveAsync(iterator, shared = { spawned: [] }) {
   let step = iterator.next();
   while (!step.done) {
     let value;
     try {
-      value = step.value?.[PARALLEL]
-        ? await Promise.allSettled(step.value[PARALLEL].map((workflow) => driveAsync(workflow)))
-        : await step.value();
+      if (step.value?.[PARALLEL]) value = await Promise.allSettled(step.value[PARALLEL].map((workflow) => driveAsync(workflow, shared)));
+      else if (step.value?.[SPAWN]) {
+        shared.spawned.push(driveAsync(step.value[SPAWN], shared).then(() => null, (error) => error));
+        value = undefined;
+      } else if (step.value?.[DRAIN]) {
+        value = [];
+        while (shared.spawned.length > 0) value.push(...(await Promise.all(shared.spawned.splice(0))).filter(Boolean));
+      } else value = await step.value();
     }
     catch (error) { step = iterator.throw(error); continue; }
     step = iterator.next(value);

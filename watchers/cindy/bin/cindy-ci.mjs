@@ -4,15 +4,17 @@ import { collectCindyPolicySteps, evaluateCindyCi } from './cindy-pr-policy.mjs'
 const parse = raw => typeof raw === 'string' ? JSON.parse(raw) : raw;
 const check = (ok, reason) => { if (!ok) throw new Error(reason); };
 // Starts every read before waiting for any: asynchronous transports run them side by side, synchronous ones in turn.
+// A synchronous transport that throws throws here, synchronously, so the caller's try/catch turns it into `unknown`;
+// a rejection is only created once an asynchronous read is already in flight, and then it reaches the awaiting caller.
 export function readAll(ghFn, list) {
   const values = [];
-  let failure = null;
   for (const args of list) {
-    try { values.push(ghFn(args)); } catch (error) { failure ??= error; values.push(Promise.reject(error)); values.at(-1).catch(() => {}); }
+    try { values.push(ghFn(args)); } catch (error) {
+      if (!values.some(value => typeof value?.then === 'function')) throw error;
+      values.push(Promise.reject(error));
+    }
   }
-  if (values.some(value => typeof value?.then === 'function')) return Promise.all(values);
-  if (failure) throw failure;
-  return values;
+  return values.some(value => typeof value?.then === 'function') ? Promise.all(values) : values;
 }
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
@@ -101,7 +103,7 @@ export function collectCindyCiSync(options) {
   while (!step.done) {
     try {
       const value = step.value();
-      if (value?.then) throw new Error('async transport used with synchronous CI collection');
+      if (value?.then) { value.catch?.(() => {}); throw new Error('async transport used with synchronous CI collection'); }
       step = iterator.next(value);
     } catch (error) { step = iterator.throw(error); }
   }

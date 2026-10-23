@@ -56,6 +56,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | `scheduleTimeoutMs` | `MIVO_WATCHER_SCHEDULE_TIMEOUT_MS` | `180000`。宿主对 discover 定时任务的超时（毫秒），整轮预算以它减 15 秒为上限 |
 | `roundBudgetMs` | `MIVO_WATCHER_ROUND_BUDGET_MS` | `165000`（超时 180 秒减 15 秒安全余量）。一轮 discover 的总预算；超过 `scheduleTimeoutMs − 15000` 的值会被截到该上限 |
 | `dispatchReserveMs` | `MIVO_WATCHER_DISPATCH_RESERVE_MS` | `25000`。给派发回执留的时间：采集结束时整轮只剩不足这个时间的 PR 才会 `dispatch-budget-deferred` |
+| `fullCollectMs` | `MIVO_WATCHER_FULL_COLLECT_MS` | `600000`。无修复会话的 Ready PR 即使指纹没变，距上次完整采集超过它也强制全量采集一次 |
 | `followIntervalMs` | `MIVO_WATCHER_FOLLOW_MS` | `15000`。轮内批量复查 open PR 变化的间隔；环境变量设为 `0` 只跑全量一轮 |
 | `preflightTimeoutMinutes` | `MIVO_PREFLIGHT_TIMEOUT_MINUTES` | `60`。只接受大于 0 的有限数字或非空十进制字符串；换算毫秒后须为不超过 2147483647 的安全整数。非法值直接报错，不静默回退。env 优先于 profile。validate 的 `npm ci`（如需）与仓库预检、以及未复用收据时的 `git push` 都用此时限；两阶段各自独立计时，不共享一笔总预算。显式 `options.timeout` 仍然优先。 |
 
@@ -165,13 +166,13 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 
 - **不设并发上限**：一轮里所有 open PR 同时采集、同时派发，一轮耗时约等于最慢的那个 PR，不再随 PR 数量线性增长；某个 PR 出错不影响其他 PR，错误在所有 PR 结束后再抛出。`gh` 和复查 helper 走异步子进程，不阻塞其他 PR。
 - **同一轮共享仓库级查询**：分支规则、仓库变量、审查 workflow、钉住的 required-checks 文件和当前账号，每轮只查一次。
-- **按间隔批量跟进**：一轮 discover 先对所有 open PR 全量处理一遍；之后每隔 `followIntervalMs`（默认 15 秒）发**一次** `gh pr list`（批量轻量查询），PR 转 Ready、有新推送、标签或更新时间变了，就在当轮立刻处理这些 PR，直到整轮预算（默认 165 秒）用尽。没有变化时每个间隔只有这一次查询。剩余时间不够一次采集加一次派发（15 秒 + 派发预留）就不再开新的跟进。批量查询报错或被限流时按 2 倍间隔退避（上限 60 秒），连续失败 3 次（限流算 2 次）就不再跟进，本轮照常结束，不会因此失败。CI 状态变化不改 `gh pr list` 的字段，由下一轮开头的指纹闸发现。
+- **按间隔批量跟进，与全量处理并行**：一轮 discover 先取一次基线，再同时做两件事——对所有 open PR 全量处理，以及按 `followIntervalMs`（默认 15 秒）的节拍发**一次**批量查询（`gh api graphql` 的 search，一次覆盖全部 open PR：Draft、head、更新时间、标签和最新提交的 CI 汇总 state，只取汇总 state，不拉 contexts）。节拍不等慢采集：某个 PR 采集 100 秒时，其他 PR 的变化仍在下一个节拍内被发现并处理；正在处理的 PR 保留旧签名，空闲后下一拍再看。变化的 PR 先补一次 `gh pr list` 取完整信息再处理。没有变化时每个节拍只有这一次查询，一直查到整轮预算只剩派发预留（默认 25 秒）为止。批量查询报错或被限流时按 2 倍间隔退避（上限 60 秒），连续失败 3 次（限流算 2 次）就不再跟进，本轮照常结束，不会因此失败。一轮最长约 165 秒，配合每分钟一次的 cron，两轮之间的检测空档约 15 秒。
 - **预算与派发预留**：采集可以用掉整轮预算里除派发预留（默认 25 秒）以外的全部时间，所以采集 60–100 秒的 PR 有新反馈时当轮就派发；只有采集结束时剩余不足派发预留才推迟（`dispatch-budget-deferred`），被推迟的 PR 下一轮排在最前面。
-- **没有修复会话的 Ready PR 也先走指纹闸**：每轮先用一次轻量 GraphQL 查询取指纹（head、CI 检查、评论/审查/线程更新、冲突状态等）；指纹没变、也没有 `collectRetry`、待补投或其他本地待办时跳过全量采集（约 40 次 `gh`）。任何反馈、head、CI 或讨论变化都会改变指纹。采集失败、被推迟、台账未恢复等未收口的结果会保留旧指纹并标 `collectRetry`，下一轮再采集。
+- **没有修复会话的 Ready PR 也先走指纹闸**：每轮先用一次轻量 GraphQL 查询取指纹，覆盖 PR 更新时间、最近 20 条评论 / 10 条 review 的 id 与更新时间（旧评论被编辑也会变）、各线程最近 5 条评论的更新时间、最新提交的 `statusCheckRollup.state`、legacy commit status 的 contexts，以及 CheckRun 状态；head、冲突状态、标签、Draft 也在内。指纹没变、也没有 `collectRetry`、待补投或其他本地待办时跳过全量采集（约 40 次 `gh`）。只有**完整、可信**的采集才算收口：CI `unknown`、策略未核实、采集失败、被推迟、台账未恢复、派发未确认等都保留旧指纹并标 `collectRetry`，下一轮重新采集。另有兜底：距上次完整采集超过 `fullCollectMs`（默认 10 分钟）就强制全量采集一次，指纹看不到的变化最多延迟这么久。
 - **CI 终态缓存**：同一 PR 的多个必需检查的 job / run 查询并发执行；已完成（`completed`）的 job / run 按 `head SHA + job/run id` 缓存在 `state/kept-reads.json`（24 小时），同一 head 不再重复调用；未终态的每轮照常查询，run 被重跑（job 的 attempt 高于缓存的 run）时重新读取。
 - **派发并发**：Python 包装同时转发多个 `sessions.dispatch`；宿主同时最多接 16 个调用，包装自己最多同时发 12 个，多出来的排队，不报错。
 
-时间相关配置见上文「可选项」（`roundBudgetMs`、`dispatchReserveMs`、`followIntervalMs`、`scheduleTimeoutMs`）；`MIVO_WATCHER_FOLLOW_MS=0` 只跑全量一轮。
+时间相关配置见上文「可选项」（`roundBudgetMs`、`dispatchReserveMs`、`followIntervalMs`、`fullCollectMs`、`scheduleTimeoutMs`）；`MIVO_WATCHER_FOLLOW_MS=0` 只跑全量一轮。
 
 `waiting-ci` 不算在途：当前 head 出现新的必需 CI 失败、冲突或审查意见时，同一轮就会派新任务。被预算推迟的复查（`recheckDeferredAt`）下一轮即使指纹没变也会再查。补投只在该 dispatch 没有结果文件、且距最近 helper 活动或派发已超过 30 分钟时发生，上限仍为 3 次。session 写结果不抢 PR 状态锁。可合并与无自动出口的事件用 `bin/notify.mjs` 配独立调度发出，见 [`docs/operations.md`](../../docs/operations.md)。
 

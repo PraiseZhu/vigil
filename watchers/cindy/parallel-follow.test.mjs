@@ -106,19 +106,19 @@ test('after the full round, a PR that turns Ready is followed at the next follow
     clock: () => now, followMs: 45000, sleepFn: (ms) => { now += ms; },
     ghFn: (args) => {
       if (args[0] === 'api' && args[1] === 'user') return 'owner';
+      const current = () => [listedPr(821, now >= 45000 ? { updatedAt: '2026-10-15T00:00:40Z' } : { isDraft: true })];
+      if (isBatchQuery(args)) return batchBody(current());
       if (args[0] === 'pr' && args[1] === 'list') {
         listings.push(now);
-        const ready = now >= 45000;
-        return JSON.stringify([listedPr(821, ready ? { updatedAt: '2026-10-15T00:00:40Z' } : { isDraft: true })]);
+        return JSON.stringify(current());
       }
       return '[]';
     },
     collect: (pr) => failing(pr),
     dispatchFn: (params) => { sent.push({ at: now, title: params.title }); return { target_session_id: 'sess-821' }; },
   }));
-  // Listing at start, then every 45 s here (followMs): +135 s leaves less than a collection plus the dispatch reserve
-  // before the 165 s round budget ends.
-  assert.deepEqual(listings, [0, 45000, 90000]);
+  // Full listing at the start and once more when the batched query shows a change (no change, no listing).
+  assert.deepEqual(listings, [0, 45000]);
   assert.deepEqual(sent.map((item) => item.at), [45000]);
   assert.equal(result.prs.at(-1).dispatch.attempted, true);
   assert.equal(readPr(paths.home, 'PR_821').sessionId, 'sess-821');
@@ -156,6 +156,12 @@ const graphqlNode = (extra = {}) => ({
   reviewThreads: { nodes: [] }, commits: { nodes: [] }, ...extra,
 });
 
+// One batched query (gh api graphql search) per follow beat: the light fingerprint fields of every open PR.
+const batchBody = (prs) => JSON.stringify({ data: { search: { issueCount: prs.length, nodes: prs.map((pr) => ({ id: pr.id, number: pr.number,
+  isDraft: pr.isDraft === true, headRefOid: pr.headRefOid, updatedAt: pr.updatedAt, labels: { nodes: [] },
+  commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] } })) } } });
+const isBatchQuery = (args) => args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('search('));
+
 test('a PR dispatched again in the follow pass gets its own task, not the first task id', (t) => {
   const paths = homeOf(t);
   let now = 0;
@@ -173,6 +179,7 @@ test('a PR dispatched again in the follow pass gets its own task, not the first 
     ghFn: (args) => {
       if (args[0] === 'api' && args[1] === 'user') return 'owner';
       if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([listedPr(841, { updatedAt: `2026-10-15T00:00:0${round}Z` })]);
+      if (isBatchQuery(args)) return batchBody([listedPr(841, { updatedAt: `2026-10-15T00:00:0${round}Z` })]);
       if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { node: graphqlNode({ comments: { totalCount: round, nodes: [] } }) } });
       return '[]';
     },
