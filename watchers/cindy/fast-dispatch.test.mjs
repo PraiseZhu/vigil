@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as watcher from './bin/cindy-watcher.mjs';
 import { keptReadStore, memoRepoReads, scanOnce, watcherPaths, watchGuideMessage } from './bin/cindy-watcher.mjs';
 import { collectCindyCiSync, collectCindyCi } from './bin/cindy-ci.mjs';
@@ -10,9 +12,9 @@ import { collectCindyCiSync, collectCindyCi } from './bin/cindy-ci.mjs';
 // 反馈出现后尽快派发：整轮预算 / 派发预留 / 指纹闸 / 批量跟进 / CI 缓存（SC-1..SC-6）。
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
-const REPO = 'example-org/example-app';
 const FORK = { sameRepository: false, isCrossRepository: true, author: { login: 'owner' },
   headRepositoryOwner: { login: 'owner' }, headRepository: { name: 'cindy-fork' } };
+const REPO = 'example-org/example-app';
 const listedPr = (number, extra = {}) => ({ number, id: `PR_${number}`, headRefOid: HEAD, headRefName: `fix/${number}`,
   title: 'fix', isDraft: false, labels: [], updatedAt: '2026-10-15T00:00:00Z', ...FORK, ...extra });
 
@@ -53,6 +55,15 @@ const graphqlNode = (extra = {}) => ({
   labels: { nodes: [] }, comments: { totalCount: 0, nodes: [] }, reviews: { totalCount: 0, nodes: [] },
   reviewThreads: { nodes: [] }, commits: { nodes: [] }, ...extra,
 });
+
+// 一次批量查询（gh api graphql search）返回的每个 open PR 的轻量指纹字段，含最新提交的 CI 汇总 state。
+const batchNode = (pr, rollup = 'SUCCESS') => ({ id: pr.id, number: pr.number, isDraft: pr.isDraft === true, headRefOid: pr.headRefOid,
+  updatedAt: pr.updatedAt, labels: { nodes: (pr.labels ?? []).map((name) => ({ name })) },
+  commits: { nodes: [{ commit: { statusCheckRollup: rollup ? { state: rollup } : null } }] } });
+const batchResponse = (prs, rollupFor = () => 'SUCCESS') => JSON.stringify({ data: { search: { issueCount: prs.length,
+  nodes: prs.map((pr) => batchNode(pr, rollupFor(pr))) } } });
+const isBatch = (args) => args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('search('));
+const isGate = (args) => args[0] === 'api' && args[1] === 'graphql' && !isBatch(args);
 
 function run(t, options) {
   const { paths, plugin } = setup(t);
@@ -113,7 +124,7 @@ test('没有修复会话的 Ready PR 指纹未变时跳过全量采集；任一�
   let node = graphqlNode();
   const base = () => ({
     mode: 'discover', enabled: true, allowDispatch: true, paths, gitFn: () => '', env: { CINDY_WATCHER_REPO: plugin },
-    ownershipSnapshot: ownership,
+    ownershipSnapshot: ownership, fullCollectMs: 1e12,
     ghFn: (args) => (args[0] === 'api' && args[1] === 'user' ? 'owner'
       : args[0] === 'pr' && args[1] === 'list' ? JSON.stringify([listedPr(921)])
         : args[0] === 'api' && args[1] === 'graphql' ? JSON.stringify({ data: { node } }) : '[]'),
@@ -164,51 +175,111 @@ test('采集失败或预算推迟的无会话 PR 下一轮仍会重新采集', (
   assert.equal(collects, 2, 'a failed collection is retried although nothing changed on GitHub');
 });
 
-// ---- SC-4 ----
+// ---- SC-4 / R3 / R4 ----
 test('跟进间隔默认 15 秒', () => assert.equal(watcher.FOLLOW_INTERVAL_MS, 15000));
 
-function tickFixture(t, { listFor, followMs = 15000 }) {
+// listFor(now) 给出此刻的 open PR 列表；rollupFor(pr, now) 给出最新提交的 CI 汇总 state。
+function tickFixture(t, { listFor, rollupFor = () => 'SUCCESS', followMs = 15000, collect = (pr) => failing(pr), gate = () => graphqlNode(), extra = {} }) {
   let now = 0;
   const lists = [];
+  const batches = [];
+  const gates = [];
   const sent = [];
   const { result } = run(t, {
     clock: () => now, followMs, sleepFn: (ms) => { now += ms; },
     ghFn: (args) => {
       if (args[0] === 'api' && args[1] === 'user') return 'owner';
       if (args[0] === 'pr' && args[1] === 'list') { lists.push(now); return listFor(now); }
-      if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { node: graphqlNode() } });
+      if (isBatch(args)) { batches.push(now); return batchResponse(JSON.parse(listFor(now)), (pr) => rollupFor(pr, now)); }
+      if (isGate(args)) { gates.push(now); return JSON.stringify({ data: { node: gate(now) } }); }
       return '[]';
     },
-    collect: (pr) => failing(pr),
+    collect,
     dispatchFn: (params) => { sent.push({ at: now, title: params.title }); return { target_session_id: 'sess-941' }; },
+    ...extra,
   });
-  return { result, lists, sent };
+  return { result, lists, batches, gates, sent };
 }
 
 test('第 20 秒出现的变化在下一个 15 秒间隔内被处理', (t) => {
-  const { lists, sent } = tickFixture(t, {
+  const { batches, sent } = tickFixture(t, {
     listFor: (now) => JSON.stringify([listedPr(941, now >= 20000 ? { updatedAt: '2026-10-15T00:00:20Z' } : { isDraft: true })]),
   });
   assert.deepEqual(sent.map((item) => item.at), [30000]);
-  assert.ok(lists.slice(1).every((at, i) => at - lists[i] >= 15000), `lists ${lists}`);
+  assert.ok(batches.slice(1).every((at, i) => at - batches[i] >= 15000), `batches ${batches}`);
 });
 
-test('无变化时每个间隔只发一次批量查询', (t) => {
-  const { lists, result } = tickFixture(t, { listFor: () => JSON.stringify([listedPr(942, { isDraft: true })]) });
-  assert.ok(lists.length >= 8, `ticks ${lists}`);
-  for (let i = 1; i < lists.length; i += 1) assert.equal(lists[i] - lists[i - 1], 15000);
-  assert.ok(lists.at(-1) <= watcher.ROUND_BUDGET_MS, 'ticks stay inside the round budget');
+test('无变化时每个间隔只发一次批量查询，并一直查到只剩派发预留', (t) => {
+  const { batches, lists, result } = tickFixture(t, { listFor: () => JSON.stringify([listedPr(942, { isDraft: true })]) });
+  for (let i = 1; i < batches.length; i += 1) assert.equal(batches[i] - batches[i - 1], 15000);
+  assert.equal(lists.length, 1, 'only the opening listing uses gh pr list');
+  const lastAllowed = watcher.ROUND_BUDGET_MS - watcher.DISPATCH_RESERVE_MS;
+  assert.ok(batches.at(-1) >= lastAllowed - 15000 && batches.at(-1) <= lastAllowed, `last batch ${batches.at(-1)} of ${lastAllowed}`);
   assert.equal(result.prs.length, 1);
 });
 
 test('批量查询报错或限流时退避并正常结束本轮', (t) => {
-  const { lists, result } = tickFixture(t, {
+  const { batches, result } = tickFixture(t, {
     listFor: (now) => { if (now > 0) throw new Error('gh: API rate limit exceeded (HTTP 403)'); return JSON.stringify([listedPr(943, { isDraft: true })]); },
   });
   assert.ok(result, 'round still returns');
-  const gaps = lists.slice(1).map((at, i) => at - lists[i]);
+  const gaps = batches.slice(1).map((at, i) => at - batches[i]);
   assert.ok(gaps.length >= 1 && gaps.length <= 4, `bounded attempts ${gaps}`);
   assert.ok(gaps.every((gap, i) => i === 0 || gap > gaps[i - 1]), `backoff grows ${gaps}`);
+});
+
+test('批量查询带最新提交的 CI 汇总 state（只取 state，不拉 contexts），纯 CI 变化当轮触发采集并派发', (t) => {
+  let collects = 0;
+  const { sent } = tickFixture(t, {
+    // 第 20 秒 CI 由 PENDING 变 FAILURE；head、updatedAt、标签、Draft 都没变。
+    listFor: () => JSON.stringify([listedPr(944)]),
+    rollupFor: (_pr, now) => (now >= 20000 ? 'FAILURE' : 'PENDING'),
+    gate: (now) => graphqlNode(now >= 20000 ? { commits: { nodes: [{ commit: { statusCheckRollup: { state: 'FAILURE' } } }] } } : {}),
+    collect: (pr) => { collects += 1; return collects === 1 ? quiet(pr) : failing(pr); },
+  });
+  assert.deepEqual(sent.map((item) => item.at), [30000], 'the CI failure at 20 s is delivered at the next 15 s beat');
+});
+
+test('批量查询文本只要汇总 state', (t) => {
+  const seen = [];
+  tickFixture(t, {
+    listFor: () => JSON.stringify([listedPr(945, { isDraft: true })]),
+    extra: { ghFn: (args) => {
+      if (args[0] === 'api' && args[1] === 'user') return 'owner';
+      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([listedPr(945, { isDraft: true })]);
+      if (isBatch(args)) { seen.push(args.join(' ')); return batchResponse([listedPr(945, { isDraft: true })]); }
+      return '[]';
+    } },
+  });
+  assert.ok(seen.length > 0, 'a batch query ran');
+  assert.match(seen[0], /statusCheckRollup\{state\}/);
+  assert.doesNotMatch(seen[0], /contexts|checkRuns|reviewThreads/);
+});
+
+// R3：慢采集不能挡住轮内检测（真实异步，缩小时间尺度：整轮 3000ms、预留 400ms、节拍 100ms）。
+test('一个 PR 慢采集期间，另一个 PR 的变化在下一个节拍内被处理', async (t) => {
+  const started = Date.now();
+  const sent = [];
+  const { paths, plugin } = setup(t);
+  const result = await watcher.scanOnceAsync({
+    mode: 'discover', enabled: true, allowDispatch: true, paths, now: '2026-10-15T00:00:00Z',
+    gitFn: () => '', env: { CINDY_WATCHER_REPO: plugin }, ownershipSnapshot: ownership,
+    budgetMs: 3000, followUntilMs: 3000, dispatchReserveMs: 400, followMs: 100, fullCollectMs: 1e12,
+    ghFn: async (args) => {
+      const elapsed = Date.now() - started;
+      const listing = () => [listedPr(951), listedPr(952, elapsed >= 300 ? { updatedAt: '2026-10-15T00:00:30Z' } : { isDraft: true })];
+      if (args[0] === 'api' && args[1] === 'user') return 'owner';
+      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(listing());
+      if (isBatch(args)) return batchResponse(listing());
+      if (isGate(args)) return JSON.stringify({ data: { node: graphqlNode() } });
+      return '[]';
+    },
+    collect: async (pr) => { if (pr.number === 951) await new Promise((resolve) => setTimeout(resolve, 1500)); return failing(pr); },
+    dispatchFn: async (params) => { sent.push({ number: Number(params.title.match(/#(\d+)/)[1]), at: Date.now() - started }); return { target_session_id: `sess-${params.title.match(/#(\d+)/)[1]}` }; },
+  });
+  const second = sent.find((item) => item.number === 952);
+  assert.ok(second, `PR 952 was delivered: ${JSON.stringify(result.prs.map((item) => [item.number, item.dispatch.reason ?? item.dispatch.attempted]))}`);
+  assert.ok(second.at < 1000, `PR 952 delivered at ${second.at} ms; the slow PR 951 needs 1500 ms`);
 });
 
 // ---- SC-5 ----
@@ -294,4 +365,123 @@ test('已完成 run/job 的缓存写进 watcher state，下一轮（新的 memoR
   assert.equal(two.status, 'green', two.reason);
   assert.equal(second.detail(), 0, 'a later round reads no completed job or run again');
   assert.deepEqual(two.required.map((item) => item.evidence), one.required.map((item) => item.evidence));
+});
+
+// ---- R1：采集不完整时不得收口 ----
+const unknownCi = (listed) => ({ ...quiet(listed), checks: [],
+  ci: { status: 'unknown', required: [], reason: 'HTTP 503 fixture' }, policy: { status: 'verified', required: [{ context: 'unit' }] } });
+
+test('R1 无会话 PR 遇到 CI unknown 后保留旧指纹，API 恢复后下一轮重新采集并派发', (t) => {
+  const { paths, plugin } = setup(t);
+  let collects = 0;
+  const sent = [];
+  const base = () => ({
+    mode: 'discover', enabled: true, allowDispatch: true, paths, gitFn: () => '', env: { CINDY_WATCHER_REPO: plugin },
+    ownershipSnapshot: ownership, fullCollectMs: 1e12,
+    ghFn: (args) => (args[0] === 'api' && args[1] === 'user' ? 'owner'
+      : args[0] === 'pr' && args[1] === 'list' ? JSON.stringify([listedPr(961)])
+        : args[0] === 'api' && args[1] === 'graphql' ? JSON.stringify({ data: { node: graphqlNode() } }) : '[]'),
+    collect: (pr) => { collects += 1; return collects === 1 ? unknownCi(pr) : failing(pr); },
+    dispatchFn: (params) => { sent.push(params.title); return { target_session_id: 'sess-961' }; },
+  });
+  scanOnce({ ...base(), now: '2026-10-15T00:00:00Z' });
+  assert.equal(collects, 1);
+  scanOnce({ ...base(), now: '2026-10-15T00:05:00Z' });
+  assert.equal(collects, 2, 'the incomplete collection is retried although GitHub did not change');
+  assert.equal(sent.length, 1, 'and the recovered required CI failure reaches a repair session');
+});
+
+// ---- R2：指纹覆盖全量采集会读到的变化 + 兜底全量 ----
+const richNode = (mutate = (node) => node) => mutate({
+  ...graphqlNode(), updatedAt: '2026-10-15T00:00:00Z',
+  comments: { totalCount: 3, nodes: [{ id: 'c1', updatedAt: '2026-10-15T00:00:01Z' }, { id: 'c2', updatedAt: '2026-10-15T00:00:02Z' }, { id: 'c3', updatedAt: '2026-10-15T00:00:03Z' }] },
+  reviews: { totalCount: 3, nodes: [{ id: 'r1', updatedAt: '2026-10-15T00:00:01Z' }, { id: 'r2', updatedAt: '2026-10-15T00:00:02Z' }, { id: 'r3', updatedAt: '2026-10-15T00:00:03Z' }] },
+  reviewThreads: { nodes: [{ isResolved: false, comments: { nodes: [{ id: 't1', updatedAt: '2026-10-15T00:00:01Z' }, { id: 't2', updatedAt: '2026-10-15T00:00:02Z' }, { id: 't3', updatedAt: '2026-10-15T00:00:03Z' }] } }] },
+  commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' }, status: { state: 'PENDING', contexts: [{ context: 'legacy', state: 'PENDING' }] },
+    checkSuites: { nodes: [] } } }] },
+});
+
+const coverage = [
+  ['PR updatedAt', (node) => ({ ...node, updatedAt: '2026-10-15T00:00:09Z' })],
+  ['旧评论被编辑（最新评论不变）', (node) => ({ ...node, comments: { ...node.comments, nodes: [node.comments.nodes[0], { id: 'c2', updatedAt: '2026-10-15T00:00:08Z' }, node.comments.nodes[2]] } })],
+  ['旧 review 被编辑', (node) => ({ ...node, reviews: { ...node.reviews, nodes: [node.reviews.nodes[0], { id: 'r2', updatedAt: '2026-10-15T00:00:08Z' }, node.reviews.nodes[2]] } })],
+  ['线程里较早的评论被编辑', (node) => ({ ...node, reviewThreads: { nodes: [{ isResolved: false, comments: { nodes: [{ id: 't1', updatedAt: '2026-10-15T00:00:01Z' }, { id: 't2', updatedAt: '2026-10-15T00:00:08Z' }, { id: 't3', updatedAt: '2026-10-15T00:00:03Z' }] } }] } })],
+  ['statusCheckRollup.state', (node) => ({ ...node, commits: { nodes: [{ commit: { ...node.commits.nodes[0].commit, statusCheckRollup: { state: 'FAILURE' } } }] } })],
+  ['legacy commit status context', (node) => ({ ...node, commits: { nodes: [{ commit: { ...node.commits.nodes[0].commit, status: { state: 'FAILURE', contexts: [{ context: 'legacy', state: 'FAILURE' }] } } }] } })],
+  ['CheckRun 状态', (node) => ({ ...node, commits: { nodes: [{ commit: { ...node.commits.nodes[0].commit, checkSuites: { nodes: [{ checkRuns: { nodes: [{ name: 'unit', status: 'COMPLETED', conclusion: 'FAILURE', databaseId: 7 }] } }] } } }] } })],
+];
+
+for (const [name, mutate] of coverage) {
+  test(`R2 指纹闸覆盖：${name}`, (t) => {
+    const { paths, plugin } = setup(t);
+    let collects = 0;
+    let node = richNode();
+    const round = (minute) => scanOnce({
+      mode: 'discover', enabled: true, allowDispatch: true, paths, gitFn: () => '', env: { CINDY_WATCHER_REPO: plugin },
+      ownershipSnapshot: ownership, fullCollectMs: 1e12, now: new Date(Date.UTC(2026, 9, 15, 0, minute, 0)).toISOString(),
+      ghFn: (args) => (args[0] === 'api' && args[1] === 'user' ? 'owner'
+        : args[0] === 'pr' && args[1] === 'list' ? JSON.stringify([listedPr(971)])
+          : args[0] === 'api' && args[1] === 'graphql' ? JSON.stringify({ data: { node } }) : '[]'),
+      collect: (pr) => { collects += 1; return quiet(pr); },
+      dispatchFn: () => { throw new Error('nothing to dispatch'); },
+    });
+    round(0);
+    round(1);
+    assert.equal(collects, 1, 'unchanged: one collection only');
+    node = richNode(mutate);
+    round(2);
+    assert.equal(collects, 2, `${name} changes the fingerprint`);
+  });
+}
+
+test('R2 兜底：指纹没变，距上次全量采集超过上限也强制全量一次', (t) => {
+  const { paths, plugin } = setup(t);
+  let collects = 0;
+  const round = (minute) => scanOnce({
+    mode: 'discover', enabled: true, allowDispatch: true, paths, gitFn: () => '', env: { CINDY_WATCHER_REPO: plugin },
+    ownershipSnapshot: ownership, fullCollectMs: 10 * 60 * 1000, now: new Date(Date.UTC(2026, 9, 15, 0, minute, 0)).toISOString(),
+    ghFn: (args) => (args[0] === 'api' && args[1] === 'user' ? 'owner'
+      : args[0] === 'pr' && args[1] === 'list' ? JSON.stringify([listedPr(972)])
+        : args[0] === 'api' && args[1] === 'graphql' ? JSON.stringify({ data: { node: richNode() } }) : '[]'),
+    collect: (pr) => { collects += 1; return quiet(pr); },
+    dispatchFn: () => { throw new Error('nothing to dispatch'); },
+  });
+  round(0);
+  round(5);
+  assert.equal(collects, 1, 'inside the limit: skipped');
+  round(11);
+  assert.equal(collects, 2, 'past the limit: one forced full collection');
+  round(12);
+  assert.equal(collects, 2, 'and the clock restarts from it');
+});
+
+test('R2 默认兜底上限为 10 分钟', () => assert.equal(watcher.FULL_COLLECT_MS, 10 * 60 * 1000));
+
+// ---- R5：同步入口遇到 gh 错误必须同步返回 unknown ----
+test('R5 collectCindyCiSync 遇到 gh 抛错：返回 unknown，进程不因未处理拒绝退出', () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const ciUrl = pathToFileURL(path.join(here, 'bin', 'cindy-ci.mjs')).href;
+  const script = `
+    import { collectCindyCiSync } from ${JSON.stringify(ciUrl)};
+    const head = 'a'.repeat(40), base = 'b'.repeat(40), repo = ${JSON.stringify(REPO)};
+    const rules = [[{ type: 'required_status_checks', ruleset_id: 7, parameters: { required_status_checks: [{ context: 'a', integration_id: 15368 }, { context: 'b', integration_id: 15368 }] } }]];
+    const ghFn = (args) => {
+      const e = args[1] ?? '';
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'PR_1', number: 5, headRefOid: head, baseRefOid: base, baseRefName: 'main', state: 'OPEN', isDraft: false });
+      if (e === 'repos/' + repo + '/rules/branches/main') return JSON.stringify(rules);
+      if (e === 'repos/' + repo + '/branches/main/protection') return JSON.stringify({ url: 'x', required_status_checks: null });
+      if (e === 'repos/' + repo + '/commits/' + head + '/check-runs?per_page=100&filter=all') return JSON.stringify([{ check_runs: ['a', 'b'].map((name, i) => ({ id: 11 + i, name, head_sha: head, app: { id: 15368, slug: 'github-actions' }, status: 'completed', conclusion: 'success', started_at: '2026-10-15T10:00:00Z', details_url: 'https://github.com/' + repo + '/actions/runs/' + (100 + i) + '/job/' + (200 + i) })) }]);
+      if (/actions\\/(jobs|runs)\\//.test(e)) throw new Error('HTTP 503 fixture');
+      return '[]';
+    };
+    const result = collectCindyCiSync({ pr: { repo, number: 5, id: 'PR_1', headRefOid: head, baseRefOid: base, state: 'OPEN', isDraft: false }, ghFn });
+    console.log('STATUS=' + result.status);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    console.log('PROCESS_SURVIVED');
+  `;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', env: { ...process.env } });
+  assert.match(child.stdout, /STATUS=unknown/, child.stderr);
+  assert.match(child.stdout, /PROCESS_SURVIVED/, child.stderr);
+  assert.equal(child.status, 0, child.stderr);
 });

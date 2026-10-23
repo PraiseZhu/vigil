@@ -9,9 +9,9 @@ import { FOLLOW_INTERVAL_MS, scanOnce, watcherPaths } from './bin/cindy-watcher.
 // collect 桩按真实采集量（约 42 次 gh 调用：快照、CI、评论、线程、策略）通过传入的 ghFn 计数。
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
-const COLLECT_CALLS = 42;
 const FORK = { sameRepository: false, isCrossRepository: true, author: { login: 'owner' },
   headRepositoryOwner: { login: 'owner' }, headRepository: { name: 'cindy-fork' } };
+const COLLECT_CALLS = 42;
 const listedPr = (number, extra = {}) => ({ number, id: `PR_${number}`, headRefOid: HEAD, headRefName: `fix/${number}`,
   title: 'fix', isDraft: false, labels: [], updatedAt: '2026-10-15T00:00:00Z', ...FORK, ...extra });
 const quiet = (listed) => ({
@@ -25,50 +25,63 @@ const quiet = (listed) => ({
 function* ownership() {
   return { pr: { state: 'OPEN', isDraft: false, ...FORK, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' } };
 }
-const node = (comments = 0) => ({ state: 'OPEN', isDraft: false, headRefOid: HEAD, baseRefOid: BASE, mergeable: 'MERGEABLE',
+const node = (comments = 0, rollup = 'PENDING') => ({ state: 'OPEN', isDraft: false, headRefOid: HEAD, baseRefOid: BASE, mergeable: 'MERGEABLE',
   labels: { nodes: [] }, comments: { totalCount: comments, nodes: [] }, reviews: { totalCount: 0, nodes: [] },
-  reviewThreads: { nodes: [] }, commits: { nodes: [] } });
+  reviewThreads: { nodes: [] }, commits: { nodes: [{ commit: { statusCheckRollup: { state: rollup } } }] } });
 
-test('5 个 open PR 的一整轮：无变化与 1 个新反馈的 gh 调用次数', (t) => {
+const failingFor = (listed) => ({ ...quiet(listed), checks: [{ name: 'unit', state: 'FAILURE', bucket: 'fail' }],
+  ci: { status: 'failed', required: [{ context: 'unit', status: 'failed', evidence: { id: 1, runId: 2, attempt: 1 } }] } });
+const isBatch = (args) => args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('search('));
+const batchBody = (prs) => JSON.stringify({ data: { search: { issueCount: prs.length, nodes: prs.map((pr) => ({ id: pr.id, number: pr.number,
+  isDraft: pr.isDraft === true, headRefOid: pr.headRefOid, updatedAt: pr.updatedAt, labels: { nodes: [] },
+  commits: { nodes: [{ commit: { statusCheckRollup: { state: pr.rollup ?? 'PENDING' } } }] } })) } } });
+
+test('5 个 open PR 的一整轮：无变化与 1 个真实新反馈（CI 失败并派发）的 gh 调用次数', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-call-budget-'));
   const plugin = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-call-budget-plugin-'));
   t.after(() => { fs.rmSync(home, { recursive: true, force: true }); fs.rmSync(plugin, { recursive: true, force: true }); });
   const paths = watcherPaths(home);
   fs.mkdirSync(paths.stateDir, { recursive: true });
-  let calls = 0;
+  let stamps = [];
   let now = 0;
-  let commentOn = null;
-  const listing = () => JSON.stringify([951, 952, 953, 954, 955].map((n) => listedPr(n,
-    commentOn === n ? { updatedAt: '2026-10-15T00:05:00Z' } : {})));
+  let broken = null;
+  let sent = 0;
+  const listing = () => [951, 952, 953, 954, 955].map((n) => listedPr(n, broken === n ? { updatedAt: '2026-10-15T00:05:00Z', rollup: 'FAILURE' } : {}));
   const round = (stamp) => {
-    calls = 0;
+    stamps = [];
     now = 0;
-    return scanOnce({
+    sent = 0;
+    const result = scanOnce({
       mode: 'discover', enabled: true, allowDispatch: true, paths, now: stamp, clock: () => now,
-      followMs: FOLLOW_INTERVAL_MS, sleepFn: (ms) => { now += ms; },
+      followMs: FOLLOW_INTERVAL_MS, sleepFn: (ms) => { now += ms; }, fullCollectMs: 1e12,
       gitFn: () => '', env: { CINDY_WATCHER_REPO: plugin }, ownershipSnapshot: ownership,
       ghFn: (args) => {
-        calls += 1;
+        stamps.push(now);
         if (args[0] === 'api' && args[1] === 'user') return 'owner';
-        if (args[0] === 'pr' && args[1] === 'list') return listing();
+        if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(listing());
+        if (isBatch(args)) return batchBody(listing());
         if (args[0] === 'api' && args[1] === 'graphql') {
           const id = Number(String(args.at(-1)).replace(/\D/g, ''));
-          return JSON.stringify({ data: { node: node(commentOn === id ? 1 : 0) } });
+          return JSON.stringify({ data: { node: node(0, broken === id ? 'FAILURE' : 'PENDING') } });
         }
         return '[]';
       },
-      collect: (pr, { ghFn }) => { for (let i = 0; i < COLLECT_CALLS; i += 1) ghFn(['api', `repos/x/y/pulls/${pr.number}/probe${i}`]); return quiet(pr); },
-      dispatchFn: () => ({ target_session_id: 'sess' }),
+      collect: (pr, { ghFn }) => {
+        for (let i = 0; i < COLLECT_CALLS; i += 1) ghFn(['api', `repos/x/y/pulls/${pr.number}/probe${i}`]);
+        return broken === pr.number ? failingFor(pr) : quiet(pr);
+      },
+      dispatchFn: (params) => { sent += 1; return { target_session_id: `sess-${params.title.match(/#(\d+)/)[1]}` }; },
     });
+    return { calls: stamps.length, first60: stamps.filter((at) => at < 60000).length, sent, result };
   };
   round('2026-10-15T00:00:00Z');
-  round('2026-10-15T00:02:00Z');
-  const none = calls;
-  commentOn = 955;
-  round('2026-10-15T00:04:00Z');
-  const one = calls;
-  console.log(`CALL_BUDGET none-changed=${none} one-feedback=${one}`);
-  // 无变化：5 次指纹查询 + 1 次登录 + 1 次列表 + 每 15 秒一次批量查询，不再全量采集。
-  assert.ok(none <= 20, `no-change round used ${none} gh calls`);
-  assert.ok(one <= 20 + COLLECT_CALLS + 4, `one-feedback round used ${one} gh calls`);
+  const none = round('2026-10-15T00:02:00Z');
+  broken = 955;
+  const one = round('2026-10-15T00:04:00Z');
+  console.log(`CALL_BUDGET none-changed=${none.calls} first60s=${none.first60} one-feedback=${one.calls} first60s=${one.first60} sent=${one.sent}`);
+  assert.equal(one.sent, 1, 'the one new feedback is really delivered');
+  // 无变化：登录 1 + 列表 1 + 基线批量 1 + 5 次指纹 + 每 15 秒一次批量查询，不再全量采集。
+  assert.ok(none.calls <= 20, `no-change round used ${none.calls} gh calls`);
+  assert.ok(none.first60 <= 12, `first 60 s of a no-change round used ${none.first60} gh calls`);
+  assert.ok(one.calls <= none.calls + COLLECT_CALLS + 4, `one-feedback round used ${one.calls} gh calls`);
 });
