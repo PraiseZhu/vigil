@@ -11,7 +11,7 @@ import { readPr, writePr } from './bin/cindy-state.mjs';
 // KEEL reinstalled into a namespace (xd) moved the ledger and made `namespace:null` calls fail with
 // GHOST_NOT_FOUND. Fixtures use placeholder ids only. New symbols are read off the module namespaces
 // so a missing export fails one test, not the file.
-const { KEEL_FLOW_VERSION, prepare, repairPaths } = repair;
+const { KEEL_FLOW_VERSION, keelNamespace, prepare, repairPaths } = repair;
 const { dispatchParams, feedbackItems, newFeedback, pollFingerprint, reopenKeelBlocked, scanOnce, watcherPaths } = watcher;
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -104,10 +104,10 @@ const NODE = 'PR_example';
 const BLOCKED_AT = '2026-10-24T10:00:00.000Z';
 const KEEL_REASON = 'keel-unavailable: ledger root unreadable (ENOENT)';
 const dispatchIdAt = n => `live-904-2026-10-24T10:0${n}:00.000Z`;
-function keelTask(paths, dispatchId, keys = ['comment:1']) {
+function keelTask(paths, dispatchId, keys = ['comment:1'], nodeId = NODE) {
   fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
   fs.writeFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), JSON.stringify({
-    dispatchId, nodeId: NODE, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, feedback: keys.map(key => ({ key })) }));
+    dispatchId, nodeId, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, feedback: keys.map(key => ({ key })) }));
 }
 const blockedEntry = (dispatchId, extra = {}) => ({
   number: 904, nodeId: NODE, sessionId: 'session-1', eligibility: 'blocked', repairRounds: 2, admissionEpoch: 'epoch-1',
@@ -232,4 +232,86 @@ test('the PR is looked at again on the next scan, and delivered once the ledger 
     dispatchFn: () => ({ target_session_id: 'sess-790' }), ownershipSnapshot: function* () { return { pr: OWNER_PR }; },
   });
   assert.equal(again.prs[0].dispatch.attempted, true);
+});
+
+// ---- a due retry must not be spent while the ledger is still unreadable ----
+const POLL_TASK = 'live-790-2026-10-24T10:00:00.000Z';
+function blockedPoll(t) {
+  const paths = watcherPaths(tmp(t, 'keel-env-home-'));
+  fs.mkdirSync(paths.stateDir, { recursive: true });
+  const cursor = newFeedback({}, feedbackItems({ pr: { headRefOid: HEAD }, comments: [COMMENT], receiptActor: 'owner' })).cursor;
+  keelTask(paths, POLL_TASK, ['comment:101'], POLL_NODE);
+  writePr(paths.home, POLL_NODE, {
+    number: 790, nodeId: POLL_NODE, sessionId: 'sess-790', eligibilityInitialized: true, eligibility: 'blocked',
+    admissionVerified: true, admissionEpoch: 'e', headRefName: 'fix/x', title: 'fix', url: 'https://github.com/makecindy/cindy/pull/790',
+    pollFingerprint: pollFingerprint(pollSnap()), feedbackCursor: cursor, repairRounds: 1,
+    activeTask: { dispatchId: POLL_TASK, status: 'blocked', blockedKind: 'external', reason: KEEL_REASON, head: HEAD, observedAt: BLOCKED_AT },
+  });
+  const sent = [];
+  const scan = now => scanOnce({
+    mode: 'poll', enabled: true, allowDispatch: true, paths, now, nodeId: POLL_NODE, prNumber: 790,
+    snapshotFn: () => pollSnap(), ghFn: args => args[0] === 'api' ? 'owner' : '[]',
+    collect: () => ({
+      pr: { id: POLL_NODE, number: 790, ...OWNER_PR }, admissionVerified: true, mergeReady: false,
+      comments: [COMMENT], reviews: [], threads: [], labels: [], mergeable: 'MERGEABLE',
+      ci: { status: 'green', required: [] }, policy: { status: 'verified', required: [] },
+    }),
+    dispatchFn: params => { sent.push(params); return { target_session_id: 'sess-790' }; },
+    ownershipSnapshot: function* () { return { pr: OWNER_PR }; },
+  });
+  return { sent, scan, entry: () => readPr(paths.home, POLL_NODE) };
+}
+
+test('a due keel- retry is left alone while the ledger is unreadable, and costs no reopen', t => {
+  const paths = watcherPaths(tmp(t, 'keel-env-home-'));
+  keelTask(paths, dispatchIdAt(0));
+  const previous = blockedEntry(dispatchIdAt(0));
+  const gone = path.join(tmp(t, 'keel-env-root-'), 'gone');
+  assert.equal(reopenKeelBlocked({ previous, paths, now: minutesAfter(31), keelRoot: gone }), previous);
+  const out = reopenKeelBlocked({ previous, paths, now: minutesAfter(31), keelRoot: tmp(t, 'keel-env-root-') });
+  assert.equal(out.keelRetries.length, 1, 'with a readable ledger the same retry is taken');
+});
+
+test('a blocked PR whose ledger comes back after the back-off is reopened and delivered on the next scan', t => {
+  const root = path.join(tmp(t, 'keel-env-root-'), 'ledger');
+  withEnv(t, 'CINDY_KEEL_LEDGER_ROOT', root);
+  const harness = blockedPoll(t);
+  const early = harness.scan(minutesAfter(31));
+  assert.equal(harness.sent.length, 0);
+  assert.equal(harness.entry().keelRetries, undefined, 'nothing is spent while the ledger is still gone');
+  assert.equal(harness.entry().repairRounds, 1);
+  assert.notEqual(early.prs[0].dispatch.attempted, true);
+  fs.mkdirSync(root, { recursive: true });
+  const later = harness.scan(minutesAfter(32));
+  assert.equal(harness.sent.length, 1, 'the feedback is delivered once the ledger is back');
+  assert.equal(later.prs[0].dispatch.attempted, true);
+  assert.equal(harness.entry().keelRetries.length, 1);
+});
+
+// ---- an illegal keelNamespace fails loudly instead of being read as "not configured" ----
+test('keelNamespace: unset is null, a legal value is returned as is', () => {
+  assert.equal(keelNamespace({}), null);
+  assert.equal(keelNamespace({ CINDY_KEEL_NAMESPACE: '' }), null);
+  assert.equal(keelNamespace({ CINDY_KEEL_NAMESPACE: 'xd' }), 'xd');
+  assert.equal(keelNamespace({ CINDY_KEEL_NAMESPACE: 'Org_1-b' }), 'Org_1-b');
+});
+
+test('keelNamespace: an illegal value throws and names the field and the variable, not a path', t => {
+  for (const value of ['xd.corp', 'my org', '-xd', ' xd', 'a'.repeat(129)]) {
+    assert.throws(() => keelNamespace({ CINDY_KEEL_NAMESPACE: value }), error => {
+      assert.match(error.message, /keelNamespace/);
+      assert.match(error.message, /CINDY_KEEL_NAMESPACE/);
+      assert.doesNotMatch(error.message, /\/(?:tmp|Users|home)\//);
+      return true;
+    }, JSON.stringify(value));
+  }
+  const home = tmp(t, 'keel-env-home-');
+  fs.mkdirSync(path.join(home, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'config', 'profile.json'), JSON.stringify({ keelNamespace: 5 }));
+  assert.throws(() => keelNamespace({ CINDY_WATCHER_HOME: home }), /keelNamespace/);
+});
+
+test('an illegal keelNamespace stops the dispatch message instead of silently dropping the namespace', t => {
+  withEnv(t, 'CINDY_KEEL_NAMESPACE', 'xd.corp');
+  assert.throws(() => message(), /keelNamespace/);
 });

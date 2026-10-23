@@ -4,8 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
-import { KEEL_FLOW_VERSION, prepare, repairPaths } from './bin/mivo-repair.mjs';
-import { REPO, dispatchParams, feedbackItems, newFeedback, processPr, reopenKeelBlocked, watcherPaths } from './bin/mivo-watcher.mjs';
+import { KEEL_FLOW_VERSION, keelNamespace, prepare, repairPaths } from './bin/mivo-repair.mjs';
+import { REPO, dispatchParams, feedbackItems, newFeedback, pollFingerprint, processPr, reopenKeelBlocked, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
 import { pendingEvents } from './bin/notify.mjs';
 import { readPr, writePr } from './bin/mivo-state.mjs';
 
@@ -13,6 +13,7 @@ import { readPr, writePr } from './bin/mivo-state.mjs';
 // GHOST_NOT_FOUND. Fixtures use placeholder ids only.
 const HEAD = 'a'.repeat(40);
 const REMOTE = 'b'.repeat(40);
+const BASE = 'c'.repeat(40);
 const NOW = '2026-10-24T12:00:00.000Z';
 
 function tmp(t, prefix) {
@@ -104,10 +105,10 @@ const NODE = 'PR_example';
 const BLOCKED_AT = '2026-10-24T10:00:00.000Z';
 const KEEL_REASON = 'keel-unavailable: ledger root unreadable (ENOENT)';
 const dispatchIdAt = n => `live-904-2026-10-24T10:0${n}:00.000Z`;
-function keelTask(paths, dispatchId, keys = ['comment:1']) {
+function keelTask(paths, dispatchId, keys = ['comment:1'], nodeId = NODE) {
   fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
   fs.writeFileSync(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`), JSON.stringify({
-    dispatchId, nodeId: NODE, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, feedback: keys.map(key => ({ key })) }));
+    dispatchId, nodeId, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, feedback: keys.map(key => ({ key })) }));
 }
 const blockedEntry = (dispatchId, extra = {}) => ({
   number: 904, nodeId: NODE, sessionId: 'session-1', eligibility: 'blocked', repairRounds: 2, admissionEpoch: 'epoch-1',
@@ -208,8 +209,111 @@ test('an unreadable ledger root skips dispatch, charges no round, and queues a n
   assert.equal(notices[0].number, 904);
 });
 
-test('the PR is retried on the next scan once the ledger is back', t => {
-  const { report } = runProcessPr(t, { keelRoot: path.join(tmp(t, 'keel-env-root-'), 'gone'), dispatched: [] });
-  assert.equal(report[0].dispatch.reason, 'keel-ledger-unavailable');
-  assert.ok(report.every(item => item.dispatch?.attempted !== true));
+// ---- the poll scan, end to end ----
+const POLL_NODE = 'PR_790';
+const POLL_TASK = 'live-790-2026-10-24T10:00:00.000Z';
+const COMMENT = { id: 101, body: 'P1: example finding', user: { login: 'ExampleReviewer', type: 'User' }, updated_at: '2026-10-24T06:00:00Z' };
+const pollSnap = () => ({
+  state: 'OPEN', isDraft: false, headRefOid: HEAD, baseRefOid: BASE, updatedAt: NOW, mergeable: 'MERGEABLE',
+  labels: [], checkState: 'SUCCESS', commentCount: 1, reviewCount: 0, commentUpdatedAt: NOW, reviewUpdatedAt: null, unresolvedThreads: 0,
+});
+// blocked = the PR sits blocked on a keel- reason with its comment already consumed; otherwise the comment is
+// new feedback and the poll fingerprint is stale.
+function pollHarness(t, { blocked }) {
+  const paths = watcherPaths(tmp(t, 'keel-env-home-'));
+  fs.mkdirSync(paths.stateDir, { recursive: true });
+  const listed = handoffPr({ repo: REPO, id: POLL_NODE, number: 790, headRefOid: HEAD, baseRefOid: BASE, state: 'OPEN',
+    isDraft: false, author: { login: 'owner' }, releaseEpoch: 'e' });
+  const consumed = newFeedback({}, feedbackItems({ pr: listed, comments: [COMMENT], receiptActor: 'owner' })).cursor;
+  const handoff = handoffReceipt(listed);
+  keelTask(paths, POLL_TASK, ['comment:101'], POLL_NODE);
+  writePr(paths.home, POLL_NODE, {
+    number: 790, nodeId: POLL_NODE, sessionId: 'sess-790', eligibilityInitialized: true, eligibility: blocked ? 'blocked' : 'active',
+    admissionVerified: true, admissionEpoch: handoff.releaseEpoch, handoff, headRefName: 'fix/x', title: 'fix',
+    url: `https://github.com/${REPO}/pull/790`, pollFingerprint: blocked ? pollFingerprint(pollSnap()) : 'stale',
+    feedbackCursor: blocked ? consumed : {}, repairRounds: 1,
+    ...(blocked ? { activeTask: { dispatchId: POLL_TASK, status: 'blocked', blockedKind: 'external', reason: KEEL_REASON, head: HEAD, observedAt: BLOCKED_AT } } : {}),
+  });
+  const sent = [];
+  const scan = now => scanOnce({
+    mode: 'poll', enabled: true, allowDispatch: true, paths, now, nodeId: POLL_NODE, prNumber: 790,
+    snapshotFn: () => pollSnap(),
+    ghFn: args => args[0] === 'api' ? 'owner' : '[]',
+    collect: (...args) => withAuthorHandoff({ pr: listed, checks: [], requiredChecks: [], ci: { status: 'green', required: [] }, comments: [COMMENT],
+      reviews: [], threads: [], labels: [], mergeable: 'MERGEABLE', admissionVerified: true, requiredChecksGreen: true, mergeReady: false,
+      policy: { status: 'verified' } }, args[0]),
+    dispatchFn: params => { sent.push(params); return { target_session_id: 'sess-790' }; },
+    ownershipSnapshot: function* () { return { pr: listed }; },
+  });
+  return { paths, sent, scan, entry: () => readPr(paths.home, POLL_NODE) };
+}
+
+test('SC-5 end to end: held while the ledger is gone, looked at again and delivered once it is back', t => {
+  const root = path.join(tmp(t, 'keel-env-root-'), 'ledger');
+  withEnv(t, 'MIVO_KEEL_LEDGER_ROOT', root);
+  const harness = pollHarness(t, { blocked: false });
+  const held = harness.scan(NOW);
+  assert.equal(held.prs[0].dispatch.reason, 'keel-ledger-unavailable');
+  assert.equal(harness.sent.length, 0);
+  assert.equal(harness.entry().collectRetry, true, 'the poll fingerprint must not swallow the retry');
+  assert.equal(harness.entry().repairRounds, 1);
+  fs.mkdirSync(root, { recursive: true });
+  const again = harness.scan('2026-10-24T12:01:00.000Z');
+  assert.equal(again.prs[0].dispatch.attempted, true);
+  assert.equal(harness.sent.length, 1);
+});
+
+// ---- a due retry must not be spent while the ledger is still unreadable ----
+test('a due keel- retry is left alone while the ledger is unreadable, and costs no reopen', t => {
+  const paths = watcherPaths(tmp(t, 'keel-env-home-'));
+  keelTask(paths, dispatchIdAt(0));
+  const previous = blockedEntry(dispatchIdAt(0));
+  const gone = path.join(tmp(t, 'keel-env-root-'), 'gone');
+  assert.equal(reopenKeelBlocked({ previous, paths, now: minutesAfter(31), keelRoot: gone }), previous);
+  const out = reopenKeelBlocked({ previous, paths, now: minutesAfter(31), keelRoot: tmp(t, 'keel-env-root-') });
+  assert.equal(out.keelRetries.length, 1, 'with a readable ledger the same retry is taken');
+});
+
+test('a blocked PR whose ledger comes back after the back-off is reopened and delivered on the next scan', t => {
+  const root = path.join(tmp(t, 'keel-env-root-'), 'ledger');
+  withEnv(t, 'MIVO_KEEL_LEDGER_ROOT', root);
+  const harness = pollHarness(t, { blocked: true });
+  const early = harness.scan(minutesAfter(31));
+  assert.equal(harness.sent.length, 0);
+  assert.equal(harness.entry().keelRetries, undefined, 'nothing is spent while the ledger is still gone');
+  assert.equal(harness.entry().repairRounds, 1);
+  assert.notEqual(early.prs[0].dispatch.attempted, true);
+  fs.mkdirSync(root, { recursive: true });
+  const later = harness.scan(minutesAfter(32));
+  assert.equal(harness.sent.length, 1, 'the feedback is delivered once the ledger is back');
+  assert.equal(later.prs[0].dispatch.attempted, true);
+  assert.equal(harness.entry().keelRetries.length, 1);
+});
+
+// ---- an illegal keelNamespace fails loudly instead of being read as "not configured" ----
+test('keelNamespace: unset is null, a legal value is returned as is', () => {
+  assert.equal(keelNamespace({}), null);
+  assert.equal(keelNamespace({ MIVO_KEEL_NAMESPACE: '' }), null);
+  assert.equal(keelNamespace({ MIVO_KEEL_NAMESPACE: 'xd' }), 'xd');
+  assert.equal(keelNamespace({ MIVO_KEEL_NAMESPACE: 'Org_1-b' }), 'Org_1-b');
+});
+
+test('keelNamespace: an illegal value throws and names the field and the variable, not a path', t => {
+  for (const value of ['xd.corp', 'my org', '-xd', ' xd', 'a'.repeat(129)]) {
+    assert.throws(() => keelNamespace({ MIVO_KEEL_NAMESPACE: value }), error => {
+      assert.match(error.message, /keelNamespace/);
+      assert.match(error.message, /MIVO_KEEL_NAMESPACE/);
+      assert.doesNotMatch(error.message, /\/(?:tmp|Users|home)\//);
+      return true;
+    }, JSON.stringify(value));
+  }
+  const home = tmp(t, 'keel-env-home-');
+  fs.mkdirSync(path.join(home, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'config', 'profile.json'), JSON.stringify({ keelNamespace: 5 }));
+  assert.throws(() => keelNamespace({ MIVO_WATCHER_HOME: home }), /keelNamespace/);
+});
+
+test('an illegal keelNamespace stops the dispatch message instead of silently dropping the namespace', t => {
+  withEnv(t, 'MIVO_KEEL_NAMESPACE', 'xd.corp');
+  assert.throws(() => message(), /keelNamespace/);
 });
