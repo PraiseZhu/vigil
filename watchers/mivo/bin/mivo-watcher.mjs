@@ -603,6 +603,28 @@ function recoveryLimitDue(previous, paths, now) {
   return Number.isFinite(last) && Date.parse(now) - last >= RECOVERY_MIN_MS;
 }
 
+// missing-result-limit used to be a dead end: only the author could move the PR. A new head, new feedback or a
+// changed required-CI state hands it back to the watcher, a few times per admission epoch; with no change nothing
+// is re-sent to a session that does not return results.
+export const MISSING_RESULT_RESET_LIMIT = 3;
+export function reopenMissingResult({ previous, pr, fresh, ciStatus, epoch, now, home, dryRun }) {
+  const active = previous.activeTask;
+  if (active?.status !== 'blocked' || active.blockedKind !== 'missing-result-limit') return previous;
+  const seen = previous.missingResult ?? {};
+  const headChanged = Boolean(seen.head) && seen.head !== pr.headRefOid;
+  const ciChanged = seen.ci != null && ciStatus != null && seen.ci !== ciStatus;
+  if (!(fresh.length > 0 || headChanged || ciChanged)) return previous;
+  const done = previous.missingResultResets ?? [];
+  if (done.filter((item) => item.epoch === epoch).length >= MISSING_RESULT_RESET_LIMIT) {
+    queueHumanNotice(home, { kind: 'missing-result-reset-limit', number: pr.number, url: previous.url ?? pr.url, head: pr.headRefOid }, dryRun);
+    return previous;
+  }
+  return { ...previous, eligibility: 'active', missingResult: null,
+    missingResultResets: [...done, { dispatchId: active.dispatchId, epoch, at: now, head: pr.headRefOid }],
+    activeTask: { ...active, blockedKind: 'missing-result-reopened',
+      reason: 'New head, feedback or CI state after missing-result-limit; handed back to the watcher.' } };
+}
+
 function readTaskForRecovery(previous, paths, now = new Date().toISOString()) {
   const dispatchId = previous?.lastDispatch?.dispatchId;
   if (typeof dispatchId !== 'string' || !dispatchId || dispatchId.startsWith('dry-')) return null;
@@ -1319,7 +1341,29 @@ export function scanRecheckDue(previous, now) {
   if (!previous.scanCheckedAt) return true;
   return Date.parse(now) - Date.parse(previous.scanCheckedAt) >= CI_UNKNOWN_RECHECK_MS;
 }
-function consumeResult(previous, result, now) {
+// Coverage ledger: what a finished round (complete / waiting-ci) judged for each feedback key, stamped with the
+// cursor stamp it was delivered under. A Draft -> Ready round keeps cursor keys that the ledger still vouches for.
+function ledgerAfterResult(previous, result, status) {
+  const dispositions = result?.feedbackCoverage?.dispositions;
+  if (!['complete', 'waiting-ci'].includes(status) || !Array.isArray(dispositions)) return previous.feedbackLedger;
+  const ledger = { ...(previous.feedbackLedger ?? {}) };
+  for (const { key, disposition } of dispositions) {
+    const stamp = previous.feedbackCursor?.[key];
+    if (typeof key !== 'string' || typeof stamp !== 'string' || typeof disposition !== 'string') continue;
+    if (ledger[key]?.dispatchId === result.dispatchId) continue;
+    ledger[key] = { stamp, disposition, resultHead: result.head ?? null, dispatchId: result.dispatchId };
+  }
+  return ledger;
+}
+
+// Only judged-and-unchanged feedback survives the clearing: an unfinished, revoked, blocked or never-covered
+// key is dropped (delivered again), and so is any key whose stamp moved or whose old judgement was "fixed".
+function coveredCursor(cursor = {}, ledger = {}) {
+  return Object.fromEntries(Object.entries(cursor).filter(([key, stamp]) =>
+    ledger[key]?.stamp === stamp && ledger[key]?.disposition === 'no-change'));
+}
+
+export function consumeResult(previous, result, now) {
   if (!result) return previous;
   // A result written before the author reclaimed the PR must not revive the superseded task.
   if (previous.activeTask?.blockedKind === AUTHOR_RECLAIMED && result.dispatchId === previous.activeTask.dispatchId) return previous;
@@ -1342,6 +1386,7 @@ function consumeResult(previous, result, now) {
       observedAt: result.observedAt ?? now,
     },
     eligibility: status === 'blocked' ? 'blocked' : 'active',
+    ...(ledgerAfterResult(previous, result, status) ? { feedbackLedger: ledgerAfterResult(previous, result, status) } : {}),
   };
 }
 
@@ -1578,19 +1623,23 @@ function queueHumanNotice(home, event, dryRun) {
   if (dryRun || !home || !event) return;
   enqueueNotice(home, event);
 }
-function markException(previous, now, events, { home, dryRun } = {}) {
+export function markException(previous, now, events, { home, dryRun } = {}) {
   if (previous.activeTask?.status !== 'blocked' && !previous.dispatchError) return previous;
   // Author reclaiming a PR is the normal handoff contract, not an incident.
   if (previous.activeTask?.blockedKind === AUTHOR_RECLAIMED && !previous.dispatchError) return previous;
   // A reopened product-intent round is handed back to the watcher, not an incident.
   if (previous.activeTask?.blockedKind === 'product-intent-reopened' && !previous.dispatchError) return previous;
+  if (previous.activeTask?.blockedKind === 'missing-result-reopened' && !previous.dispatchError) return previous;
   const event = {
     kind: previous.dispatchError ? 'dispatch-blocked' : 'repair-blocked', number: previous.number, nodeId: previous.nodeId,
     sessionId: previous.sessionId, dispatchId: previous.dispatchError?.dispatchId ?? previous.activeTask?.dispatchId,
     head: previous.activeTask?.head, blockedKind: previous.dispatchError?.kind ?? previous.activeTask?.blockedKind,
     reason: previous.dispatchError?.reason ?? previous.activeTask?.reason,
   };
-  const fingerprint = digest({ ...event, cause: blockedCause(event.blockedKind, event.reason) });
+  const cause = blockedCause(event.blockedKind, event.reason);
+  const fingerprint = digest({ ...event, cause });
+  // The PR comment is keyed by what the reader sees, not by which dispatch hit it.
+  const noticeFingerprint = digest({ number: event.number, head: event.head, blockedKind: event.blockedKind, cause });
   if (previous.lastException?.fingerprint === fingerprint) {
     queueHumanNotice(home, {
       kind: 'blocked-escalate', number: previous.number, url: previous.url, head: event.head,
@@ -1608,12 +1657,12 @@ function markException(previous, now, events, { home, dryRun } = {}) {
       blockedKind: event.blockedKind, cause: blockedCause(event.blockedKind, event.reason),
     }, dryRun);
   }
-  return { ...previous, lastException: { fingerprint, at: now, event, escalated: event.blockedKind === 'external' } };
+  return { ...previous, lastException: { fingerprint, noticeFingerprint, at: now, event, escalated: event.blockedKind === 'external' } };
 }
 
 // A stuck PR has to be visible where its author looks (2026-10-15: blocked rounds only reached the
 // Mini's run log). Kinds the watcher resolves by itself on a later poll are not announced.
-const QUIET_BLOCKED_KINDS = new Set(['required-ci', 'optional-ci', 'ci-transport', 'head-drift', 'round-limit-reset', 'product-intent-reopened', AUTHOR_RECLAIMED]);
+const QUIET_BLOCKED_KINDS = new Set(['required-ci', 'optional-ci', 'ci-transport', 'head-drift', 'round-limit-reset', 'product-intent-reopened', 'missing-result-reopened', AUTHOR_RECLAIMED]);
 const NOTICE_ATTEMPTS = 3;
 const NOTICE_HISTORY = 20;
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
@@ -1647,7 +1696,8 @@ export function* announceBlocked({ previous: start, pr, author, ghFn, now }) {
   const stillBlocked = previous.activeTask?.status === 'blocked' || previous.dispatchError;
   if (!exception?.fingerprint || !stillBlocked || QUIET_BLOCKED_KINDS.has(exception.event?.blockedKind)) return previous;
   const notices = previous.blockedNotices ?? {};
-  const record = notices[exception.fingerprint] ?? {};
+  const noticeKey = exception.noticeFingerprint ?? exception.fingerprint;
+  const record = notices[noticeKey] ?? {};
   if (record.commentAt || Number(record.attempts ?? 0) >= NOTICE_ATTEMPTS) return previous;
   const keep = (next) => Object.fromEntries(Object.entries(next).slice(-NOTICE_HISTORY));
   const next = { ...record, attempts: Number(record.attempts ?? 0) + 1, kind: exception.event?.blockedKind ?? null };
@@ -1659,7 +1709,7 @@ export function* announceBlocked({ previous: start, pr, author, ghFn, now }) {
   } catch (error) {
     next.lastError = String(error.message).slice(0, 300);
   }
-  return { ...previous, blockedNotices: keep({ ...notices, [exception.fingerprint]: next }) };
+  return { ...previous, blockedNotices: keep({ ...notices, [noticeKey]: next }) };
 }
 
 function rememberDispatchFailure(state, key, error, now, paths) {
@@ -1858,7 +1908,8 @@ export function* processPr({
   if (doctor.error) events.push({kind:'doctor-source-blocked',number:pr.number,code:doctor.error});
   const observed = feedbackItems({ pr, ...collected, receiptActor: viewer });
   previous = migrateMemberFeedbackCursor(previous, observed);
-  const cursorBase = previous.wasDraft === true && !authorPushed ? {} : (previous.feedbackCursor || {});
+  const cursorBase = previous.wasDraft === true && !authorPushed
+    ? coveredCursor(previous.feedbackCursor, previous.feedbackLedger) : (previous.feedbackCursor || {});
   const { fresh: rawFresh, cursor } = newFeedback(cursorBase, [
     ...observed,
     ...doctor.items.map(item=>withCategory(item,{headSha:pr.headRefOid})),
@@ -2012,9 +2063,11 @@ export function* processPr({
       ...previous.activeTask, dispatchId: previous.lastDispatch.dispatchId,
       sessionId: previous.sessionId, status: 'blocked', blockedKind: 'missing-result-limit',
       reason: 'No result after three bounded recovery deliveries; inspect the existing session before resuming.',
-    } };
+    }, missingResult: { head: pr.headRefOid, ci: collected.ci?.status ?? null, at: now } };
   }
   fresh = includeOpenThreadFeedback(fresh, observed);
+  if (!resultError) previous = reopenMissingResult({ previous, pr, fresh, ciStatus: collected.ci?.status ?? null,
+    epoch: collected.pr?.releaseEpoch ?? previous.admissionEpoch ?? null, now, home: paths.home, dryRun });
   const terminal = ['blocked', 'complete', 'legacy-complete'].includes(previous.activeTask?.status);
   const inFlight = Boolean(previous.lastDispatch?.dispatchId) && !terminal && previous.activeTask?.status !== 'waiting-ci';
   const recovery = admitted && !collected.mergeReady && !resultError

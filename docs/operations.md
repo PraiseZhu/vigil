@@ -55,7 +55,7 @@ discover 一次调用会扫描 `targetRepo` 下你自己的所有 open PR,不需
 
 ### 通知调度
 
-需要人处理的事件(首次可合并、同因 blocked 升级、Keel 台账读不到导致派发暂停、needs-human / 三次补投无结果 / 结果无效 / 派发无回执)写进 watcher home 的 `state/notices/pending.json`。另建一条 script 调度,前置检查有未发事件才跑,并把通知发到飞书:
+需要人处理的事件(首次可合并、同因 blocked 升级、Keel 台账读不到导致派发暂停、needs-human / 三次补投无结果 / `missing-result-reset-limit`（自动复位次数用尽，仍无结果）/ 结果无效 / 派发无回执)写进 watcher home 的 `state/notices/pending.json`。另建一条 script 调度,前置检查有未发事件才跑,并把通知发到飞书:
 
 | 字段 | 取值 |
 |---|---|
