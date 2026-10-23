@@ -652,7 +652,7 @@ export function keelRules({ dispatchId, canChangeCode, version = KEEL_FLOW_VERSI
   ];
 }
 
-export const END_TURN_RULE = `本轮收口（finalize 返回 complete 或 waiting-ci、blocked、no-change）后立即结束回合：不要自己轮询、sleep 或等待，不要查询 PR、CI、维护者审批或任何调度。watcher 持续检查（每轮全量检查一次，轮内约每 ${FOLLOW_INTERVAL_MS / 1000} 秒复查一次变化，新转 Ready、新推送和新反馈通常在 30 秒内跟进），出现新反馈、CI 变化或冲突会再投递给你。goal 的完成条件只覆盖本批反馈，不包含等待维护者审批或合并。`;
+export const END_TURN_RULE = `本轮收口（finalize 返回 complete 或 waiting-ci、blocked、no-change）后立即结束回合：不要自己轮询、sleep 或等待，不要查询 PR、CI、维护者审批或任何调度。watcher 持续检查（每轮持续约 2–3 分钟，轮内约每 ${FOLLOW_INTERVAL_MS / 1000} 秒批量检查一次变化，轮间空档约 15 秒；新转 Ready、新推送和新反馈通常在 30 秒内跟进），出现新反馈、CI 变化或冲突会再投递给你。goal 的完成条件只覆盖本批反馈，不包含等待维护者审批或合并。`;
 export const SNAPSHOT_RULE = 'PR 状态、required checks、失败 check 和未解决 thread 已由 watcher 采集，见 task 文件 prSnapshot 字段，反馈全文见 feedback[].body。先读 task 文件；只有回复/resolve thread、推送后确认 CI 或核实 task 之后的新变化时，才调用 gh 或 GitHub 插件。';
 
 export const AUTO_ADVANCE_RULE = '全自动推进：目标是把 PR 推到可合并（必需检查全绿、讨论全部 resolve、审查结论通过），不合并。严重度拿不准时在会话里复现和读代码核实；核实后确认是 P0/P1/P2 才改，确认不了的按不成立处理（SC=no-change，evidence 写明核实了什么、为什么不成立），不要因为「严重度未知」而 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账或 Jev 不可用这类会话自己解决不了的情况才 blocked（Jev 不可用按 KEEL_FLOW 一节立即 blocked，原因以 keel-jev-unavailable 开头）。不向用户提问、不等用户确认；拿不准用 Jev，仍低置信就选改动最小、可撤回的做法并写进结果。';
@@ -784,7 +784,7 @@ function watchScheduleConstraint() {
   return '不要创建、恢复、修改或查询任何调度（包括名为 Cindy watcher 的共享调度）；轮询、合并后的清理都由 watcher 脚本完成。';
 }
 export function watchGuideMessage({ prNumber } = {}) {
-  return `你是 PR #${prNumber} 的专属修复 session。watcher 持续检查本 PR（每轮全量检查一次，轮内约每 ${FOLLOW_INTERVAL_MS / 1000} 秒复查一次变化，新反馈通常在 30 秒内投递），出现新反馈、CI 变化或冲突时直接投递到这里；PR 合并或关闭后由脚本清理工作树。${watchScheduleConstraint()}`;
+  return `你是 PR #${prNumber} 的专属修复 session。watcher 持续检查本 PR（每轮持续约 2–3 分钟，轮内约每 ${FOLLOW_INTERVAL_MS / 1000} 秒批量检查一次变化，轮间空档约 15 秒，新反馈通常在 30 秒内投递），出现新反馈、CI 变化或冲突时直接投递到这里；PR 合并或关闭后由脚本清理工作树。${watchScheduleConstraint()}`;
 }
 export function watchSuccessorMessage({ prNumber, predecessorId, reason, summary }) {
   return `你是 PR #${prNumber} 的接班修复 session，前任 ${predecessorId} 已不可用（${reason}）；先读本 PR 状态摘要 ${summary ?? '…'}。若状态为 awaiting-maintainer-approval，等待维护者审批，不要改代码、不要催审。${watchScheduleConstraint()}`;

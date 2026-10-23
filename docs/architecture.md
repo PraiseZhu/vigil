@@ -41,8 +41,8 @@ docs/              本文档 + 运维指南
 
 两个 watcher 不是"裸脚本,自己决定怎么跑",而是**专门为 Cindy 桌面端的调度器设计**的:
 
-- Cindy 侧创建一条 `executionMode: "script"` 的 schedule,`cronExpr` 设为每 2 分钟一次
-  (`*/2 * * * *`),`scriptConfig.command` 指向 `python3 <watcher home>/bin/<name>-watch-script.py
+- Cindy 侧创建一条 `executionMode: "script"` 的 schedule,`cronExpr` 设为每分钟一次
+  (`* * * * *`;调度器在本轮结束后才排下一次触发,整轮最长约 165 秒,选每分钟能把两轮之间的空档压到约 15 秒),`scriptConfig.command` 指向 `python3 <watcher home>/bin/<name>-watch-script.py
   --mode discover`。
 - 这条 schedule 的 `scriptConfig.capabilities` 只授予 `sessions.dispatch` 这一项能力(白名单
   默认全拒),discover 脚本因此**只能**唤醒/派发修复 session,不能调用任何其他宿主能力。

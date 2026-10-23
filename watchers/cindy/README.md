@@ -111,7 +111,7 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 
 ## 并行与跟进
 
-与 Mivo watcher 相同（详见 `../mivo/README.md`「并行与跟进」）：发现器由定时任务触发（建议 `*/2 * * * *`，超时 180 秒），一轮最多 165 秒（超时减 15 秒安全余量），一轮里所有 open PR 同时采集、同时派发，不设并发上限；采集可用掉整轮预算里除派发预留（默认 25 秒）以外的时间，被推迟的 PR 下一轮优先；没有修复会话的 Ready PR 也先走指纹闸（指纹没变且无 `collectRetry` 就跳过全量采集）；分支规则、仓库变量等仓库级查询每轮只查一次；已完成的 CI job / run 按 head 缓存，多个必需检查并发查询；全量处理后每隔 15 秒用一次 `gh pr list` 批量查询变化，转 Ready、有新推送或有更新的 PR 当轮立刻处理，查询失败或限流时退避、本轮照常结束；Python 包装同时转发多个 `sessions.dispatch`（最多 12 个同时在途，宿主上限 16）。时间配置（profile 字段或环境变量）：`roundBudgetMs` / `CINDY_WATCHER_ROUND_BUDGET_MS`（默认 165000）、`dispatchReserveMs` / `CINDY_WATCHER_DISPATCH_RESERVE_MS`（默认 25000）、`followIntervalMs` / `CINDY_WATCHER_FOLLOW_MS`（默认 15000，环境变量 `0` 只跑全量一轮）、`scheduleTimeoutMs` / `CINDY_WATCHER_SCHEDULE_TIMEOUT_MS`（默认 180000，整轮预算上限为它减 15 秒）。
+与 Mivo watcher 相同（详见 `../mivo/README.md`「并行与跟进」）：发现器由定时任务触发（建议 `* * * * *`，超时 180 秒；宿主在本轮结束后才排下一次触发，同一 schedule 不重叠不积压，选每分钟可把两轮空档压到约 15 秒，整轮预算须小于调度 `timeoutMs`），一轮最多 165 秒（超时减 15 秒安全余量），一轮里所有 open PR 同时采集、同时派发，不设并发上限；采集可用掉整轮预算里除派发预留（默认 25 秒）以外的时间，被推迟的 PR 下一轮优先；没有修复会话的 Ready PR 也先走指纹闸（指纹没变且无 `collectRetry` 就跳过全量采集）；分支规则、仓库变量等仓库级查询每轮只查一次；已完成的 CI job / run 按 head 缓存，多个必需检查并发查询；全量处理后每隔 15 秒用一次 `gh pr list` 批量查询变化，转 Ready、有新推送或有更新的 PR 当轮立刻处理，查询失败或限流时退避、本轮照常结束；Python 包装同时转发多个 `sessions.dispatch`（最多 12 个同时在途，宿主上限 16）。时间配置（profile 字段或环境变量）：`roundBudgetMs` / `CINDY_WATCHER_ROUND_BUDGET_MS`（默认 165000）、`dispatchReserveMs` / `CINDY_WATCHER_DISPATCH_RESERVE_MS`（默认 25000）、`followIntervalMs` / `CINDY_WATCHER_FOLLOW_MS`（默认 15000，环境变量 `0` 只跑全量一轮）、`scheduleTimeoutMs` / `CINDY_WATCHER_SCHEDULE_TIMEOUT_MS`（默认 180000，整轮预算上限为它减 15 秒）。
 
 ## 修复轮次
 
