@@ -726,13 +726,16 @@ export function compactPrSnapshot(collected, now) {
 // worktree and a graph run instead). A ledger exists only after pstack_decide(op:"decide") ran with
 // a run_id, and op:"log" refuses a run without one. So the watcher hands out the run id and the
 // session starts the ledger with its first severity judgement.
-function keelRulesV3({ dispatchId, canChangeCode, namespace = keelNamespace() }) {
-  const runId = keelRunIdFor(dispatchId);
-  // Every Keel call names the plugin the same way. A plugin installed under a namespace is not found
-  // without it; a root install is not found with namespace:null, so that case says to leave it out.
-  const keelCall = namespace
+// Every Keel call names the plugin the same way. A plugin installed under a namespace is not found
+// without it; a root install is not found with namespace:null, so that case says to leave it out.
+function keelCallText(namespace) {
+  return namespace
     ? `ghost_id=keel，namespace="${namespace}"（ghost_call、ghost_info、ghost_manual 每次都带这两个参数）`
     : 'ghost_id=keel，省略 namespace 参数（不得传 namespace:null，也不要自拟其他值）';
+}
+function keelRulesV3({ dispatchId, canChangeCode, namespace = keelNamespace() }) {
+  const runId = keelRunIdFor(dispatchId);
+  const keelCall = keelCallText(namespace);
   const playbook = canChangeCode ? 'bug-fix' : 'investigation';
   return [
     `KEEL_FLOW：全程用 Keel 插件（${keelCall}）的台账，不用 goal skill。本任务的 Keel run_id 固定为 ${runId}，不得自拟或更换。不要调用 pstack_start、keel_run、keel_report、keel_wait、keel_gate、keel_status：它们会另建 worktree 和图 run，与本流程无关，也不要执行它们返回的 next。`,
@@ -749,9 +752,9 @@ function keelRulesV3({ dispatchId, canChangeCode, namespace = keelNamespace() })
 export function keelRules({ dispatchId, canChangeCode, version = KEEL_FLOW_VERSION, namespace = keelNamespace() }) {
   if (version >= 3) return keelRulesV3({ dispatchId, canChangeCode, namespace });
   return [
-    `KEEL_FLOW：全程用 Keel 插件（ghost_id=keel）跑流程，不用 goal skill。prepare 之后先 pstack_start({task:"PR 修复 task=${dispatchId}", repo_dir:<prepare 返回的 worktree>, playbook:"${canChangeCode ? 'bug-fix' : 'investigation'}"})，再 pstack_ledger({op:"log", run_id, kind:"step", summary:"vigil task=${dispatchId}"}) 绑定本任务；finalize 必须带 --keel-run <run_id>，helper 核对台账后才收口。`,
+    `KEEL_FLOW：全程用 Keel 插件（${keelCallText(namespace)}）跑流程，不用 goal skill。prepare 之后先 pstack_start({task:"PR 修复 task=${dispatchId}", repo_dir:<prepare 返回的 worktree>, playbook:"${canChangeCode ? 'bug-fix' : 'investigation'}"})，再 pstack_ledger({op:"log", run_id, kind:"step", summary:"vigil task=${dispatchId}"}) 绑定本任务；finalize 必须带 --keel-run <run_id>，helper 核对台账后才收口。`,
     'Keel 只用 jev、pstack_start、pstack_decide、pstack_ledger、pr_threads（只读分级）和 ghost_manual；禁止 pr_status、pr_wait、pr_reply、pr_ready、pr_open、pr_board、worktree、fanout_plan、fanout_ingest（会弹确认框、长轮询或因交接记录停手）。GitHub 写操作只走本 helper 与 gh。',
-    'Jev 固定判断点（pstack_decide 或 jev，结论用 pstack_ledger 记 decision）：严重度未知或混合的反馈；必需 CI 失败是基础设施抖动还是真失败；判定 P0/P1/P2 不成立时证据是否充分；修法与连带文件。Jev 结论只作参考，不能单独授权改代码或升级严重度。Jev 不可用时记 JEV_UNAVAILABLE，自己核实后按证据判，确认不了 P0/P1/P2 就按不成立记 no-change，不 blocked。Keel 本身不可用时用 helper blocked --reason keel-unavailable。',
+    'Jev 固定判断点（pstack_decide 或 jev，结论用 pstack_ledger 记 decision）：严重度未知或混合的反馈；必需 CI 失败是基础设施抖动还是真失败；判定 P0/P1/P2 不成立时证据是否充分；修法与连带文件。Jev 结论只作参考，不能单独授权改代码或升级严重度。' + (version === 2 ? 'finalize 门禁要求被引用的决策行带 Jev 结论（answer、policy 非空），所以 Jev 不可用（如 JEV_NOT_CONFIGURED）时没有可引用的结论：立即用 helper blocked --reason "keel-jev-unavailable: <原文>" 停下，不先做修复、不跑 validate。' : 'Jev 不可用时记 JEV_UNAVAILABLE，自己核实后按证据判，确认不了 P0/P1/P2 就按不成立记 no-change，不 blocked。') + 'Keel 本身不可用时用 helper blocked --reason keel-unavailable。',
     ...(version === 2 ? [
       'KEEL_FLOW_VERSION=2：读取 pstack_start 返回的 playbook 手册，按复现/调查、修法/无需改动判断、验证的固定流程执行。适用判断点用 pstack_decide 并绑定本 run；只有启动 J2 或手写 decision 不能收口。',
       `收口前用 pstack_ledger({op:"log",run_id,kind:"evidence",summary:"vigil flow task=${dispatchId}",evidence:{kind:"vigil-flow",version:2,taskId:"${dispatchId}",head:<validated-head>,playbook:"${canChangeCode ? 'bug-fix' : 'investigation'}",manualPath:"pstack/skills/poteto-mode/playbooks/${canChangeCode ? 'bug-fix' : 'investigation'}.md",decisionRowIds:[<本run中pstack_decide返回的row_id>],steps:{reproduce:<实际复现或调查证据>,repair:<修法和处置证据>,verify:{head:<validated-head>,receiptSha256:<helper validate返回值>}}}})；全SC=no-change时verify改为{status:"not-run",reason:<无需代码验证的具体原因>}。缺证据用 blocked 保存原因，不伪造完成。`,
@@ -1139,8 +1142,10 @@ export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor,
       return { bound: false, reason: 'session-owned-by-other-pr', otherPr: owner.number ?? null };
     }
   }
+  const retryCommit = keelRetryCommit(previous, now, recovery);
   state.prs[key] = {
     ...previous,
+    ...retryCommit.fields,
     number: pr.number,
     nodeId: pr.id,
     headRefOid: pr.headRefOid,
@@ -1158,7 +1163,7 @@ export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor,
     taskName: mapping.taskName ?? previous.taskName,
     sessionCreatedAt: previous.sessionCreatedAt ?? now,
     eligibility: 'active',
-    repairRounds: Number(previous.repairRounds ?? 0) + (recovery ? 0 : 1),
+    repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) + (recovery ? 0 : 1) - retryCommit.refund),
     ...(recovery ? {} : { pendingThreadClose: rememberPendingClose(previous, paths).pendingThreadClose ?? previous.pendingThreadClose }),
     activeTask: {
       ...(recovery ? previous.activeTask : {}),
@@ -1410,7 +1415,7 @@ export const KEEL_RETRY_LIMIT = 3;
 function retryKeelBlocked({ previous, paths, now, keelRoot }) {
   // While the ledger is still unreadable the retry would only be held back again by the dispatch gate and
   // its dispatch id would already be spent, so the PR would never be delivered once the ledger is back.
-  if (keelLedgerProblem(keelRoot)) return previous;
+  if (keelLedgerProblem(keelRoot, { required: true })) return previous;
   const active = previous.activeTask;
   const dispatchId = active.dispatchId;
   const observed = Date.parse(active.observedAt ?? '');
@@ -1424,10 +1429,20 @@ function retryKeelBlocked({ previous, paths, now, keelRoot }) {
   if (!task || task.nodeId !== previous.nodeId) return previous;
   const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
   for (const item of task.feedback ?? []) if (typeof item?.key === 'string') delete feedbackCursor[item.key];
+  // Only the intent is recorded here. The retry is counted, and its round refunded, when the delivery gets a
+  // receipt (keelRetryCommit in applyDispatchReceipt). A scan that does not deliver (budget deferral, ledger
+  // hold, ownership stop, failed collection) spends nothing, and the next scan offers the same reopen again.
+  return { ...previous, feedbackCursor, eligibility: 'active', keelRetryIntent: { dispatchId, epoch, at: now } };
+}
+// Turns the reopen intent into a counted retry once its delivery has a receipt. A recovery redelivery is not a retry.
+function keelRetryCommit(previous, now, recovery) {
+  const intent = previous.keelRetryIntent;
+  if (!intent || recovery) return { refund: 0, fields: {} };
+  const counted = intent.dispatchId === previous.activeTask?.dispatchId;
   return {
-    ...previous, feedbackCursor, eligibility: 'active',
-    repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) - 1),
-    keelRetries: [...done, { dispatchId, epoch, at: now }],
+    refund: counted ? 1 : 0,
+    fields: { keelRetryIntent: undefined,
+      ...(counted ? { keelRetries: [...(previous.keelRetries ?? []), { dispatchId: intent.dispatchId, epoch: intent.epoch, at: now }] } : {}) },
   };
 }
 export function reopenKeelBlocked({ previous, paths, now, keelRoot = keelLedgerRoot() }) {
@@ -1445,6 +1460,9 @@ export function reopenKeelBlocked({ previous, paths, now, keelRoot = keelLedgerR
   };
   consider(active.dispatchId, active.reason);
   if (!candidates.length) return retryKeelBlocked({ previous, paths, now, keelRoot });
+  // The same gate as the retry: while the ledger cannot be read the delivery would be held back, and the
+  // reopened dispatch ids would already be spent.
+  if (keelLedgerProblem(keelRoot, { required: true })) return previous;
   // Earlier rounds of this PR that the same incompatibility swallowed, walking back from the newest
   // and stopping at the first round that ended any other way: a round that completed or blocked on
   // something real already handled whatever came before it.
@@ -2058,11 +2076,12 @@ export function* processPr({
     sessionId: mapping.sessionId ?? previous.sessionId ?? null,
   };
   const wantsDelivery=shouldDispatch || recovery || previous.pendingDispatch?.status==='retryable';
-  // A repair session whose Keel ledger cannot be read would only block again and waste a round. Hold the
-  // delivery back untouched (cursor, rounds and PR comments stay as they are) and tell the owner; the PR is
-  // looked at again on the next scan (KEEL_LEDGER_HELD) and delivered once the ledger is back.
+  // A repair session whose Keel ledger is missing or unreadable would only block again and waste a round. Hold
+  // the delivery back (cursor, rounds and the PR's blocked broadcast stay as they are) and tell the owner; the PR
+  // is looked at again on the next scan (KEEL_LEDGER_HELD) and delivered once the ledger is back. This gate stops
+  // the dispatch of a repair session only: the deterministic thread handling above it needs no Keel and still ran.
   if (wantsDelivery) {
-    const problem = keelLedgerProblem(keelRoot);
+    const problem = keelLedgerProblem(keelRoot, { required: true });
     if (problem) {
       state.prs[key] = previous;
       queueHumanNotice(paths.home, { kind: 'keel-unavailable', number: pr.number, url: previous.url ?? pr.url, head: pr.headRefOid,

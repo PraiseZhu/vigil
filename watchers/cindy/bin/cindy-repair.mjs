@@ -445,8 +445,8 @@ export function keelNamespace(env = process.env) {
 
 // Why the configured ledger root cannot be used, or null when it can (or none is configured).
 // The reason carries the errno code only, never the path: it is posted to the PR.
-export function keelLedgerProblem(root) {
-  if (!root) return null;
+export function keelLedgerProblem(root, { required = false } = {}) {
+  if (!root) return required ? 'keelLedgerRoot not configured' : null;
   try {
     if (!fs.statSync(root).isDirectory()) return 'ledger root is not a directory';
     fs.accessSync(root, fs.constants.R_OK | fs.constants.X_OK);
@@ -555,7 +555,7 @@ export function prepare({ home, taskPath, ghFn = command, gitFn = command, clone
   const { sessionId } = boundSession(paths, task);
   // A Keel task that cannot finalize is stopped here, before a worktree is built and work is done on it:
   // finalize reads the ledger and rejects a missing or unreadable one only after validate.
-  const keelProblem = task.keelFlow === true ? keelLedgerProblem(keelRoot) : null;
+  const keelProblem = task.keelFlow === true && Number(task.keelFlowVersion ?? 1) >= 2 ? keelLedgerProblem(keelRoot, { required: true }) : null;
   if (keelProblem) {
     return saveResult(paths, task, sessionId, {
       status: 'blocked', blockedKind: 'external', reason: `keel-unavailable: ${keelProblem}`,
