@@ -1167,6 +1167,22 @@ export function blocked({ home, taskPath, reason, ghFn = command } = {}) {
   });
 }
 
+/**
+ * validate 类阻塞用来判断「base 是否真的变了」的依据：被验证 head 与 base 的 merge-base。
+ * base 分支 tip 前进而 merge-base 不变，不算环境变化。取不到（对象缺失、唯一性不成立）返回 null。
+ */
+export function validationMergeBase({ worktree, validatedHead, baseRefOid, baseRefName, gitFn = command } = {}) {
+  if (!worktree || !isSha(validatedHead)) return null;
+  const candidates = [isSha(baseRefOid) ? baseRefOid : null, baseRefName ? `refs/remotes/upstream/${baseRefName}` : null].filter(Boolean);
+  for (const base of candidates) {
+    try {
+      const found = gitOutput(['-C', worktree, 'merge-base', '--all', validatedHead, base], gitFn).split('\n').map((line) => line.trim()).filter(Boolean);
+      if (found.length === 1 && isSha(found[0])) return found[0];
+    } catch { /* 对象不在本地：试下一个候选 */ }
+  }
+  return null;
+}
+
 // 阻塞若源于本地 validate 失败，把那份失败收据的指纹带给 watcher，供它判断环境是否真的变了。
 function latestFailedValidation(paths, task) {
   try {
@@ -1177,8 +1193,11 @@ function latestFailedValidation(paths, task) {
     const bytes = fs.readFileSync(files[0].file);
     const receipt = JSON.parse(bytes);
     if (receipt.status === 'pass' || receipt.status === 'approved-exception') return null;
+    const snapshot = task.prSnapshot?.pr ?? {};
     return {
-      validatedHead: receipt.head, policySha256: receipt.policy?.sha256 ?? null, runtimeSha256: receipt.runtimeSha256 ?? null,
+      validatedHead: receipt.head,
+      mergeBase: validationMergeBase({ worktree: taskWorktree(task), validatedHead: receipt.head, baseRefOid: snapshot.baseRefOid, baseRefName: snapshot.baseRefName }),
+      policySha256: receipt.policy?.sha256 ?? null, runtimeSha256: receipt.runtimeSha256 ?? null,
       failureSetState: receipt.failureSetState ?? 'legacy', failureSetSha256: receipt.failureSetSha256 ?? null,
       failureKind: receipt.failureKind ?? null, receiptSha256: hash(bytes),
     };
