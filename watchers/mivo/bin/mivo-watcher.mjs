@@ -1413,8 +1413,8 @@ export function reopenExternalBlocked({ previous, paths, now, head }) {
   if (active?.status !== 'blocked' || active.blockedKind !== 'external' || active.blockedKind === AUTHOR_RECLAIMED) return previous;
   // validate 类阻塞只经 reopenInfraBlocked 的五要素判据决定是否重开：部署新版（rulesVersion 变化）不是重开理由；
   // 同一 dispatch 已被 infra 路径重开时，这里不再退第二次轮次。head 变化照旧重开。
-  // 与 reopenInfraBlocked 同一入口分类：只有它会处理的 validate 类阻塞才让位给五要素判据。
-  const validateClass = isValidateClassBlock(active) && INFRA_BLOCK_REASON.test(String(active.reason ?? ''));
+  // 与 reopenInfraBlocked 共用同一个 isValidateClassBlock 分类（reason 不必命中 INFRA_BLOCK_REASON）。
+  const validateClass = isValidateClassBlock(active);
   const rulesChanged = !validateClass && previous.rulesVersion != null && previous.rulesVersion !== rulesVersion();
   const headChanged = Boolean(head && (active.head ?? active.sourceHead) && (active.head ?? active.sourceHead) !== head);
   if (!rulesChanged && !headChanged) return previous;
@@ -1505,7 +1505,7 @@ export function validationReopenDecision({ previous, active, observe }) {
 export function reopenInfraBlocked({ previous, paths, now, observe, currentBase = null }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind === AUTHOR_RECLAIMED || KEEL_BLOCK_REASON.test(String(active.reason ?? ''))
-    || !INFRA_BLOCK_REASON.test(String(active.reason ?? ''))) return previous;
+    || !(INFRA_BLOCK_REASON.test(String(active.reason ?? '')) || isValidateClassBlock(active))) return previous;
   if (isValidateClassBlock(active)) {
     const decision = validationReopenDecision({ previous, active, observe: observe ?? (() => observeValidationContext({ previous, paths, currentBase })) });
     if (decision !== 'changed') return previous;
