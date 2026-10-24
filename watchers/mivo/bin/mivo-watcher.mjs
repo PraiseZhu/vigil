@@ -607,22 +607,30 @@ function recoveryLimitDue(previous, paths, now) {
 // changed required-CI state hands it back to the watcher, a few times per admission epoch; with no change nothing
 // is re-sent to a session that does not return results.
 export const MISSING_RESULT_RESET_LIMIT = 3;
-export function reopenMissingResult({ previous, pr, fresh, ciStatus, epoch, now, home, dryRun }) {
+// The dead task never returned a result, so nothing it was handed was judged, yet delivery already moved the cursor
+// past those keys. The reset takes them back out of the cursor and returns them in `revived`; the caller delivers
+// them together with the new feedback (same pattern as reopenExternalBlocked / reopenInfraBlocked).
+export function reopenMissingResult({ previous, pr, fresh, ciStatus, epoch, now, home, dryRun, paths }) {
+  const unchanged = { previous, revived: [] };
   const active = previous.activeTask;
-  if (active?.status !== 'blocked' || active.blockedKind !== 'missing-result-limit') return previous;
+  if (active?.status !== 'blocked' || active.blockedKind !== 'missing-result-limit') return unchanged;
   const seen = previous.missingResult ?? {};
   const headChanged = Boolean(seen.head) && seen.head !== pr.headRefOid;
   const ciChanged = seen.ci != null && ciStatus != null && seen.ci !== ciStatus;
-  if (!(fresh.length > 0 || headChanged || ciChanged)) return previous;
+  if (!(fresh.length > 0 || headChanged || ciChanged)) return unchanged;
   const done = previous.missingResultResets ?? [];
   if (done.filter((item) => item.epoch === epoch).length >= MISSING_RESULT_RESET_LIMIT) {
     queueHumanNotice(home, { kind: 'missing-result-reset-limit', number: pr.number, url: previous.url ?? pr.url, head: pr.headRefOid }, dryRun);
-    return previous;
+    return unchanged;
   }
-  return { ...previous, eligibility: 'active', missingResult: null,
+  const task = readDispatchTask(paths, active.dispatchId);
+  const revived = (task.feedback ?? []).map((item) => item?.key).filter((key) => typeof key === 'string');
+  const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
+  for (const key of revived) delete feedbackCursor[key];
+  return { revived, previous: { ...previous, feedbackCursor, eligibility: 'active', missingResult: null,
     missingResultResets: [...done, { dispatchId: active.dispatchId, epoch, at: now, head: pr.headRefOid }],
     activeTask: { ...active, blockedKind: 'missing-result-reopened',
-      reason: 'New head, feedback or CI state after missing-result-limit; handed back to the watcher.' } };
+      reason: 'New head, feedback or CI state after missing-result-limit; handed back to the watcher.' } } };
 }
 
 function readTaskForRecovery(previous, paths, now = new Date().toISOString()) {
@@ -1910,10 +1918,8 @@ export function* processPr({
   previous = migrateMemberFeedbackCursor(previous, observed);
   const cursorBase = previous.wasDraft === true && !authorPushed
     ? coveredCursor(previous.feedbackCursor, previous.feedbackLedger) : (previous.feedbackCursor || {});
-  const { fresh: rawFresh, cursor } = newFeedback(cursorBase, [
-    ...observed,
-    ...doctor.items.map(item=>withCategory(item,{headSha:pr.headRefOid})),
-  ]);
+  const observedAll = [...observed, ...doctor.items.map(item=>withCategory(item,{headSha:pr.headRefOid}))];
+  const { fresh: rawFresh, cursor } = newFeedback(cursorBase, observedAll);
   // Green CI/review does not finish a newly confirmed local product failure.
   // Keep the existing owner's recovery alive until its repair result completes.
   if (rawFresh.some(item=>item.source==='lifeline-doctor' && item.repairPolicy.canChangeCode)
@@ -2058,7 +2064,9 @@ export function* processPr({
       reviewEvidence: { ready: false, reason: 'pending-authorized-feedback', terminal: null } };
     previous = { ...previous, mergeReady: false, reviewReason: collected.reviewReason, reviewEvidence: collected.reviewEvidence };
   }
+  let limitReachedNow = false;
   if (!resultError && recoveryLimitDue(previous, paths, now)) {
+    limitReachedNow = true;
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.lastDispatch.dispatchId,
       sessionId: previous.sessionId, status: 'blocked', blockedKind: 'missing-result-limit',
@@ -2066,8 +2074,22 @@ export function* processPr({
     }, missingResult: { head: pr.headRefOid, ci: collected.ci?.status ?? null, at: now } };
   }
   fresh = includeOpenThreadFeedback(fresh, observed);
-  if (!resultError) previous = reopenMissingResult({ previous, pr, fresh, ciStatus: collected.ci?.status ?? null,
-    epoch: collected.pr?.releaseEpoch ?? previous.admissionEpoch ?? null, now, home: paths.home, dryRun });
+  let revivedKeys = [];
+  if (!resultError) {
+    const limited = previous;
+    const reopened = reopenMissingResult({ previous, pr, fresh, ciStatus: collected.ci?.status ?? null,
+      epoch: collected.pr?.releaseEpoch ?? previous.admissionEpoch ?? null, now, home: paths.home, dryRun, paths });
+    previous = reopened.previous;
+    revivedKeys = reopened.revived;
+    const have = new Set(fresh.map((item) => item.key));
+    fresh = [...fresh, ...observedAll.map((item) => ({ ...item, key: `${item.source}:${item.nativeId}` }))
+      .filter((item) => revivedKeys.includes(item.key) && !have.has(item.key) && item.actionable !== false && item.deferred !== true)];
+    // Reaching the limit and resetting in the same scan: markException below only sees the reopened task, so
+    // the limit is reported here, from the state that hit it, and its exception record is carried over.
+    if (limitReachedNow && previous !== limited) {
+      previous = { ...previous, lastException: markException(limited, now, events, { home: paths.home, dryRun }).lastException };
+    }
+  }
   const terminal = ['blocked', 'complete', 'legacy-complete'].includes(previous.activeTask?.status);
   const inFlight = Boolean(previous.lastDispatch?.dispatchId) && !terminal && previous.activeTask?.status !== 'waiting-ci';
   const recovery = admitted && !collected.mergeReady && !resultError
@@ -2124,6 +2146,8 @@ export function* processPr({
     if (Object.hasOwn(cursorBase, item.key)) retainedCursor[item.key] = cursorBase[item.key];
     else delete retainedCursor[item.key];
   }
+  // Revived keys stay out of the cursor until a delivery is acknowledged, so a skipped delivery repeats next scan.
+  for (const key of revivedKeys) delete retainedCursor[key];
   previous = {
     ...previous, feedbackCursor: retainedCursor, pendingFeedback: fresh.length,
     sessionId: mapping.sessionId ?? previous.sessionId ?? null,

@@ -120,7 +120,7 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 
 再次转 Ready 时游标不再整体清空，而是只保留「覆盖账本」（`feedbackLedger`）还担保的那部分：一个完成轮次（`complete` 或 `waiting-ci`）被消费时，把它对每个反馈 key 的处置记入账本（`stamp` 即当时的游标戳 `revision:contentHash[:sha]`、`disposition`、`resultHead`、`dispatchId`）。转 Ready 时，账本里 `stamp` 与当前游标相同、且旧处置为 `no-change` 的反馈不再重投；其余全部照常重投——被作废（`author-reclaimed`）、blocked 没有覆盖、没有结果的任务所带的反馈，内容或 revision 变了的反馈，CI / 冲突 / code-scanning 在新 sha 上的反馈，以及旧处置为 `fixed` 的反馈（第一版保守，Draft 期间作者可能改回代码）。
 
-`missing-result-limit`（补投三次无结果）不再是死路：同一 PR 出现新 head、新反馈或必需 CI 状态变化时，watcher 自动把它转回 active（`blockedKind: missing-result-reopened`，不发评论）并按新反馈派发；同一 Ready 代次内最多自动复位 3 次（`missingResultResets`），超过后保持终态并写一条 `missing-result-reset-limit` 通知。没有任何变化时不复位，不会对不交结果的会话反复投递。
+`missing-result-limit`（补投三次无结果）不再是死路：同一 PR 出现新 head、新反馈或必需 CI 状态变化时，watcher 自动把它转回 active（`blockedKind: missing-result-reopened`，不发评论）并按新反馈派发；同一 Ready 代次内最多自动复位 3 次（`missingResultResets`），超过后保持终态并写一条 `missing-result-reset-limit` 通知。没有任何变化时不复位，不会对不交结果的会话反复投递。复位时死任务当初领到、却从未得到判定的反馈（读它的 task 文件）也从游标里取回，与新反馈一起派发，不会被静默当成已处理；若 limit 与复位发生在同一次扫描，limit 的人工通知照常写出。
 
 PR 上的「盯梢停下了」评论按 (PR, head, blockedKind, 归一化原因) 去重，同一组合只发一次，不再因为每个新派发的 `dispatchId` 不同而重复；原因或 head 变了才再发。通知队列与升级逻辑不变。
 
