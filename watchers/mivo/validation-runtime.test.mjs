@@ -119,3 +119,27 @@ test('runStreaming：总超时独立记 validate-timeout，且整个进程组（
   await sleep(200);
   assert.equal(alive(grandchild), false);
 });
+
+test('持有者在 spawn 之后、记录进程组之前崩溃：遗留进程组不会逃过回收，并发数不会超过上限', async (t) => {
+  const home = tmp(t);
+  const pidFile = path.join(home, 'job.pid');
+  const logPath = path.join(home, 'job.log');
+  const runtimeUrl = new URL('./bin/mivo-validation-runtime.mjs', import.meta.url).href;
+  const code = `
+    import { acquireValidationSlot, runStreaming } from ${JSON.stringify(runtimeUrl)};
+    const slot = await acquireValidationSlot({ home: ${JSON.stringify(home)}, limit: 1, pollMs: 20 });
+    // 模拟持有者恰在 spawn 之后、写下进程组号之前被杀。
+    await runStreaming('/bin/sh', ['-c', 'echo $$ > ' + ${JSON.stringify(pidFile)} + '; exec sleep 60'], {
+      cwd: ${JSON.stringify(home)}, env: process.env, logPath: ${JSON.stringify(logPath)}, stallMs: 600000, timeoutMs: 600000,
+      pgidFile: slot.pgidFile, onGroup: () => process.kill(process.pid, 'SIGKILL'),
+    });
+  `;
+  const holder = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: 'ignore' });
+  await new Promise((resolve) => holder.on('exit', resolve));
+  t.after(() => { try { process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch {} });
+  const next = await acquireValidationSlot({ home, limit: 1, pollMs: 20 });
+  next.release();
+  await sleep(1500);
+  const leftover = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, 'utf8')) : null;
+  assert.equal(leftover === null ? false : alive(leftover), false, '遗留的命令进程必须已被终止或根本没有启动');
+});
