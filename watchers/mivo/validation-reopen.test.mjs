@@ -6,6 +6,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { consumeResult, observeValidationContext, reopenInfraBlocked } from './bin/mivo-watcher.mjs';
 import * as repair from './bin/mivo-repair.mjs';
+import { PARSER_VERSION } from './bin/mivo-validation-evidence.mjs';
 const validationMergeBase = (...args) => repair.validationMergeBase(...args);
 
 const BLOCK = {
@@ -172,4 +173,56 @@ test('SC7 reason 含 preflight 但属环境/配置故障（pathspec、submodule�
   }
   const { paths, previous } = setup(t, { block: null, reason: 'local preflight failed' });
   assert.equal(reopenInfraBlocked({ previous, paths, now: 'n', observe: () => null }), previous, '真正的 validate 失败仍走五要素判据');
+});
+
+test('比对规则升级：旧解析器版本判定的测试失败重开一次，当前版本、无版本的旧收据、非测试失败都不重开', (t) => {
+  const { paths, previous } = setup(t);
+  const older = { ...CURRENT, receiptParserVersion: 1, receiptFailureKind: 'test-failure' };
+  const next = reopenInfraBlocked({ previous, paths, now: 'n', observe: () => older });
+  assert.equal(next.eligibility, 'active');
+  assert.equal(next.infraReopened.length, 1);
+  assert.equal(next.repairRounds, 1);
+  for (const [name, observed] of [
+    ['当前版本', { ...CURRENT, receiptParserVersion: PARSER_VERSION, receiptFailureKind: 'test-failure' }],
+    ['无版本的旧收据', { ...CURRENT, receiptParserVersion: null, receiptFailureKind: null }],
+    ['无输出挂起', { ...CURRENT, receiptParserVersion: 1, receiptFailureKind: 'stalled' }],
+  ]) assert.equal(reopenInfraBlocked({ previous, paths, now: 'n', observe: () => observed }), previous, name);
+  assert.equal(reopenInfraBlocked({ previous: next, paths, now: 'n', observe: () => older }), next, '同一 dispatch 只重开一次');
+});
+
+test('比对规则升级：observeValidationContext 从最新失败收据读出解析器版本与失败类型，默认观测下也能重开', (t) => {
+  const { paths, previous } = setup(t);
+  const dir = path.join(paths.stateDir, 'validations', 'd1');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${'a'.repeat(40)}-00000000-0000-4000-8000-000000000000.json`), JSON.stringify({
+    status: 'fail', exitCode: 1, parserVersion: 1, failureKind: 'test-failure', failureSetState: 'parsed', failureSetSha256: BLOCK.failureSetSha256,
+  }));
+  const env = { ...process.env, MIVO_PLUGIN_REPO: path.join(paths.stateDir, 'missing-repo') };
+  const observed = observeValidationContext({ previous, paths, env });
+  assert.equal(observed.receiptParserVersion, 1);
+  assert.equal(observed.receiptFailureKind, 'test-failure');
+  assert.equal(reopenInfraBlocked({ previous, paths, now: 'n', observe: () => observed }).eligibility, 'active');
+});
+
+test('比对规则升级：本轮没跑验证就停下时，退回读同一 PR 最近的验证收据；每份旧收据只触发一次重开', (t) => {
+  const { paths, previous: base } = setup(t, { block: null, reason: 'helper validate 全量单测 5 个未修改用例失败' });
+  const previous = { ...base, number: 7, activeTask: { ...base.activeTask, dispatchId: 'd1' } };
+  const write = (dir, body) => {
+    fs.mkdirSync(path.join(paths.stateDir, 'validations', dir), { recursive: true });
+    fs.writeFileSync(path.join(paths.stateDir, 'validations', dir, `${'b'.repeat(40)}-00000000-0000-4000-8000-000000000001.json`), JSON.stringify(body));
+  };
+  write('live-7-2026-10-24T11:51:00.000Z', { nodeId: 'PR_1', status: 'fail', parserVersion: 1, failureKind: 'test-failure', failureSetState: 'parsed' });
+  write('live-70-2026-10-24T12:00:00.000Z', { nodeId: 'PR_70', status: 'fail', parserVersion: 1, failureKind: 'test-failure', failureSetState: 'parsed' });
+  const env = { ...process.env, MIVO_PLUGIN_REPO: path.join(paths.stateDir, 'missing-repo') };
+  const observed = observeValidationContext({ previous, paths, env });
+  assert.equal(observed.receiptParserVersion, 1, '退回读同一 PR 的上一份收据');
+  assert.match(observed.parserReceiptSha256, /^[0-9a-f]{64}$/);
+  const next = reopenInfraBlocked({ previous, paths, now: 'n', observe: () => observed });
+  assert.equal(next.eligibility, 'active');
+  assert.equal(next.infraReopened.at(-1).parserReceipt, observed.parserReceiptSha256, '记下触发重开的旧收据');
+  const again = { ...next, eligibility: 'blocked', activeTask: { ...previous.activeTask, dispatchId: 'd2' } };
+  fs.writeFileSync(path.join(paths.stateDir, 'tasks', 'd2.json'), JSON.stringify({ nodeId: 'PR_1', feedback: [] }));
+  assert.equal(reopenInfraBlocked({ previous: again, paths, now: 'n', observe: () => observed }), again, '同一份旧收据不再触发重开');
+  const other = observeValidationContext({ previous: { ...previous, number: 70, nodeId: 'PR_X' }, paths, env });
+  assert.equal(other.receiptParserVersion ?? null, null, '不读别的 PR 的收据');
 });

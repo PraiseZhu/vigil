@@ -19,7 +19,7 @@ import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThrea
 import { codeScanningFeedbackItems } from './mivo-code-scanning.mjs';
 import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck } from './mivo-pr-actions.mjs';
 import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath } from './mivo-repair.mjs';
-import { canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
+import { PARSER_VERSION, canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
 
@@ -1474,7 +1474,41 @@ export function observeValidationContext({ previous, paths, env = process.env, g
       }
     }
   } catch { /* 没有失败收据：不构成变化证据 */ }
-  return { mergeBase, policySha256, runtimeSha256: runtime, ...failure };
+  return { mergeBase, policySha256, runtimeSha256: runtime, ...failure, ...parserCheckReceipt({ previous, paths }) };
+}
+
+const RECEIPT_NAME = /^[0-9a-f]{40}-[0-9a-f-]{36}\.json$/;
+// 比对规则升级判断用的收据：优先本轮 dispatch 的最新一份；本轮没跑验证就停下时，退回同一 PR（核对 nodeId）最近的一份。
+function parserCheckReceipt({ previous, paths }) {
+  const root = path.join(paths.stateDir, 'validations');
+  const newest = (dir) => {
+    try {
+      return fs.readdirSync(dir).filter((name) => RECEIPT_NAME.test(name))
+        .map((name) => ({ file: path.join(dir, name), at: fs.statSync(path.join(dir, name)).mtimeMs })).sort((a, b) => b.at - a.at)[0] ?? null;
+    } catch { return null; }
+  };
+  let hit = newest(path.join(root, String(previous.activeTask?.dispatchId)));
+  if (!hit) {
+    let dirs = [];
+    try { dirs = fs.readdirSync(root).filter((name) => name.startsWith(`live-${previous.number}-`)); } catch { /* 没有验证目录 */ }
+    hit = dirs.map((name) => newest(path.join(root, name))).filter(Boolean).sort((a, b) => b.at - a.at)[0] ?? null;
+  }
+  if (!hit) return {};
+  try {
+    const bytes = fs.readFileSync(hit.file);
+    const receipt = JSON.parse(bytes);
+    if (receipt.status === 'pass' || (receipt.nodeId && receipt.nodeId !== previous.nodeId)) return {};
+    return { receiptParserVersion: Number.isInteger(receipt.parserVersion) ? receipt.parserVersion : null, receiptFailureKind: receipt.failureKind ?? null,
+      parserReceiptSha256: createHash('sha256').update(bytes).digest('hex') };
+  } catch { return {}; }
+}
+
+// 失败指纹的比对规则升级后，按旧规则判定的测试失败可能已能对上基线放行：重开一次让会话按新规则重新验证。
+// 没有版本号的旧收据不算（避免部署时把所有旧阻塞一齐重派）；挂起/超时与比对规则无关；同一份旧收据只触发一次。
+function parserUpgradeChange(previous, current) {
+  if (!current || current.receiptFailureKind !== 'test-failure' || !Number.isInteger(current.receiptParserVersion)
+    || current.receiptParserVersion >= PARSER_VERSION) return false;
+  return !(previous.infraReopened ?? []).some((item) => item.parserReceipt && item.parserReceipt === current.parserReceiptSha256);
 }
 
 // 与上次 validate 类 blocked 相比：head、base、policy、运行指纹、失败集合任一已知变化 → changed；
@@ -1483,11 +1517,13 @@ export function validationReopenDecision({ previous, active, observe }) {
   const block = active.validationBlock;
   if (!block) {
     const taskHead = active.head ?? null;
-    return taskHead && previous.headRefOid && taskHead !== previous.headRefOid ? 'changed' : 'unknown';
+    if (taskHead && previous.headRefOid && taskHead !== previous.headRefOid) return 'changed';
+    return parserUpgradeChange(previous, observe()) ? 'changed' : 'unknown';
   }
   if (block.remoteHead && previous.headRefOid && block.remoteHead !== previous.headRefOid) return 'changed';
   const current = observe();
   if (!current) return 'unknown';
+  if (parserUpgradeChange(previous, current)) return 'changed';
   let unknown = false;
   // base 分支 tip 前进不算变化，只比较被验证 head 与 base 的 merge-base；任一侧取不到就按 unknown。
   if (!current.mergeBase || !block.mergeBase) unknown = true;
@@ -1508,9 +1544,15 @@ export function reopenInfraBlocked({ previous, paths, now, observe, currentBase 
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind === AUTHOR_RECLAIMED || KEEL_BLOCK_REASON.test(String(active.reason ?? ''))
     || !(INFRA_BLOCK_REASON.test(String(active.reason ?? '')) || isValidateClassBlock(active))) return previous;
+  let parserReceipt = null;
   if (isValidateClassBlock(active)) {
-    const decision = validationReopenDecision({ previous, active, observe: observe ?? (() => observeValidationContext({ previous, paths, currentBase })) });
+    const read = observe ?? (() => observeValidationContext({ previous, paths, currentBase }));
+    let seen = false;
+    let observed = null;
+    const once = () => { if (!seen) { seen = true; observed = read(); } return observed; };
+    const decision = validationReopenDecision({ previous, active, observe: once });
     if (decision !== 'changed') return previous;
+    if (seen && parserUpgradeChange(previous, observed)) parserReceipt = observed.parserReceiptSha256 ?? null;
   }
   const dispatchId = active.dispatchId;
   const done = previous.infraReopened ?? [];
@@ -1524,7 +1566,7 @@ export function reopenInfraBlocked({ previous, paths, now, observe, currentBase 
   return {
     ...previous, feedbackCursor, eligibility: 'active',
     repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) - 1),
-    infraReopened: [...done, { dispatchId, epoch, at: now, reason: String(active.reason ?? '').slice(0, 200) }],
+    infraReopened: [...done, { dispatchId, epoch, at: now, reason: String(active.reason ?? '').slice(0, 200), ...(parserReceipt ? { parserReceipt } : {}) }],
   };
 }
 
