@@ -1430,8 +1430,6 @@ export function reopenExternalBlocked({ previous, paths, now, head }) {
 }
 
 const VALIDATE_BLOCK_REASON = /preflight|validat/i;
-// 这些是环境/配置故障，不是「validate 失败」：保持原有重开规则。
-const NON_VALIDATE_INFRA_REASON = /submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge/i;
 
 // 只读观测本机当前的 policy / 运行指纹 / 最新失败收据，不跑测试、不碰网络。观测不到的部分记 null。
 export function observeValidationContext({ previous, paths, env = process.env, gitFn = gitDefaultFn }) {
@@ -1492,7 +1490,7 @@ export function reopenInfraBlocked({ previous, paths, now, observe }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind === AUTHOR_RECLAIMED || KEEL_BLOCK_REASON.test(String(active.reason ?? ''))
     || !INFRA_BLOCK_REASON.test(String(active.reason ?? ''))) return previous;
-  if (active.validationBlock || (VALIDATE_BLOCK_REASON.test(String(active.reason ?? '')) && !NON_VALIDATE_INFRA_REASON.test(String(active.reason ?? '')))) {
+  if (active.validationBlock || VALIDATE_BLOCK_REASON.test(String(active.reason ?? ''))) {
     const decision = validationReopenDecision({ previous, active, observe: observe ?? (() => observeValidationContext({ previous, paths })) });
     if (decision !== 'changed') return previous;
   }
