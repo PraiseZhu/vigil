@@ -141,7 +141,7 @@ node watchers/<mivo|cindy>/deploy.mjs apply --plan <file>
 
 | 目录 | 内容 |
 |---|---|
-| `slots/` | 并发槽位（`slot-<n>.json`，记录 pid 与进程组）；持有进程已死会被下一个申请者回收，并终止遗留进程组 |
+| `slots/` | 并发槽位（`slot-<n>.json`，记录 pid 与进程组）；持有进程已死会被下一个申请者回收，并终止遗留进程组（命令经 `sh` 先落盘进程组号到 `slot-<n>.json.pgid` 再 `exec`，持有者在 spawn 后任意时刻崩溃都能回收） |
 | `logs/` | 每次运行的流式日志，0600、不可变；收据里有 `logSha256` |
 | `<dispatchId>/` | 验证收据与按 head 的指针（既有结构） |
 | `pass-cache/` | 通过收据的复用索引（不可信，每次复用都重新校验收据、日志与全部键） |
@@ -155,7 +155,7 @@ node watchers/<mivo|cindy>/deploy.mjs apply --plan <file>
 - 排队的 validate 不是故障：心跳仍在写，不要因为它没产出结果就补投。
 - `validate-stalled`（长时间无输出）与 `validate-timeout`（总超时）是环境/卡死问题，不是测试失败；它们的失败集合记 `unparsed`，不会参与基线比较。
 - Mivo 的 `baseline-only-failure` 是机器判定的状态，需要 `git merge-base` 能解析（validate 会有界地 fetch 目标 base 分支）；它不放宽远端必需 CI。Cindy 不实现该状态，原因见 Cindy README。
-- validate 类阻塞的重开改为按证据判断（head、base、policy、运行指纹、失败集合）；升级前留下的、没有 `validationBlock` 的旧阻塞只在远端 head 变化时才会重开。
+- validate 类阻塞的重开改为按证据判断（head、merge-base、policy、运行指纹、失败集合；base 分支 tip 前进而 merge-base 不变不算变化）；升级前留下的、没有 `validationBlock` 的旧阻塞只在远端 head 变化时才会重开。
 
 ## 8. 测试环境变量
 

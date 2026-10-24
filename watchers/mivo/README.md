@@ -59,7 +59,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | `minCollectMs` | `MIVO_WATCHER_MIN_COLLECT_MS` | `15000`。整轮截止减派发预留后不足这个时间时，不再启动新的采集，留给下一轮 |
 | `fullCollectMs` | `MIVO_WATCHER_FULL_COLLECT_MS` | `600000`。无修复会话的 Ready PR 即使指纹没变，距上次完整采集超过它也强制全量采集一次 |
 | `followIntervalMs` | `MIVO_WATCHER_FOLLOW_MS` | `15000`。轮内批量复查 open PR 变化的间隔；环境变量设为 `0` 只跑全量一轮 |
-| `validateConcurrency` | `MIVO_VALIDATE_CONCURRENCY` | `2`。同一 watcher home 同时运行的 validate 上限，正整数；非法值（0、负数、小数、空串、非数字）直接报错，不静默回退。超限的 validate 排队等槽位，**排队不是失败**：不记失败、不消耗重试或 missing-result 计数。持有槽位的进程崩溃后，槽位按 pid 存活判定回收，并先终止它遗留的进程组 |
+| `validateConcurrency` | `MIVO_VALIDATE_CONCURRENCY` | `2`。同一 watcher home 同时运行的 validate 上限，正整数；非法值（0、负数、小数、空串、非数字）直接报错，不静默回退。超限的 validate 排队等槽位，**排队不是失败**：不记失败、不消耗重试或 missing-result 计数。持有槽位的进程崩溃后，槽位按 pid 存活判定回收，并先终止它遗留的进程组：命令经 `sh` 启动，`sh` 先把进程组号落盘到槽位旁的 `.pgid` 文件、确认持有者仍存活才 `exec` 真正的命令，所以持有者在 spawn 之后任意时刻崩溃，要么组号已落盘可被回收，要么命令根本没有开始 |
 | `validateStallMinutes` | `MIVO_VALIDATE_STALL_MINUTES` | `10`。连续无新输出（stdout/stderr 都没有新字节）超过它就终止整个进程组，收据记 `failureKind: validate-stalled`，不当作测试失败；规则同 `preflightTimeoutMinutes`。心跳不算输出 |
 | `preflightTimeoutMinutes` | `MIVO_PREFLIGHT_TIMEOUT_MINUTES` | `60`。只接受大于 0 的有限数字或非空十进制字符串；换算毫秒后须为不超过 2147483647 的安全整数。非法值直接报错，不静默回退。env 优先于 profile。validate 的 `npm ci`（如需）与仓库预检、以及未复用收据时的 `git push` 都用此时限；两阶段各自独立计时，不共享一笔总预算。显式 `options.timeout` 仍然优先。 |
 
@@ -88,7 +88,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 - **流式日志**：命令的 stdout/stderr 按到达顺序写入 `state/validations/logs/` 下 0600 的不可变日志（`wx` 创建，不覆盖）。收据记录 `logPath`、`logSha256`。总超时（`preflightTimeoutMinutes`）与无输出看门狗（`validateStallMinutes`）是两个独立原因：`validate-timeout`、`validate-stalled`，都终止整个进程组，都不是「测试失败」，失败集合记 `unparsed`。
 - **固定 TMPDIR**：子进程环境注入 `TMPDIR=realpath(os.tmpdir())`（避开 `/var` → `/private/var` 软链）。policy 文件与它的 sha256 不变。
 - **同条件复用通过收据**：同一 PR、同一 `validatedHead`、同一 policy sha256、同一运行指纹（platform、arch、node 版本、uid、`realpath(TMPDIR)`、`package-lock.json` sha256）已有 pass 收据，且收据、日志、哈希全部复验通过时，不再运行 validate，直接写一份绑定当前派发/会话的新收据，`reusedFrom` 指向原始收据（owner 复核照旧）。任一要素不同、日志或收据被改、索引损坏，都重新运行。旧版收据（没有 `validationEvidenceVersion`）不进入复用。
-- **失败集合**：收据新增 `logSha256`、`failureSetState`（`parsed`/`unparsed`）、`failureSet`（元素 `{step, file, test, errorSha}`，`step` 取 hook 的 `[preflight] ❌ <step> 失败` 标记，`file/test` 取 vitest 失败行，`errorSha` 为归一化首条断言信息的哈希）、`failureSetSha256`。解析不完整（lint 报错、截断、计数对不上、未处理错误）一律 `unparsed`，`unparsed` 不与任何集合相等。旧收据照常可读。
+- **失败集合**：收据新增 `logSha256`、`failureSetState`（`parsed`/`unparsed`）、`failureSet`（元素 `{step, file, test, errorSha}`，`step` 取 hook 的 `[preflight] ❌ <step> 失败` 标记，`file/test` 取失败行，`errorSha` 为归一化首条断言信息的哈希）。认得三种失败块：vitest 的 `FAIL <file> > <test>`、vitest 文件级失败 `FAIL <file> [ <file> ]`（`test` 记 `<file>`，按 `Test Files N failed` 核对文件数）、node:test 的 spec（`✖ failing tests:` 段）与 TAP（`not ok N - name` 的 yaml 块，`subtestsFailed` 的套件行不计），各自按 `Tests N failed` / `ℹ fail N` / `# fail N` 核对计数；其中 node:test 是按 Node 自带报告格式写的，目标仓 pre-push 本身只跑 vitest，没有取到线上真实日志回放过、`failureSetSha256`。解析不完整（lint 报错、截断、计数对不上、未处理错误）一律 `unparsed`，`unparsed` 不与任何集合相等。旧收据照常可读。
 
 ### 仅基线失败的受控通过（`baseline-only-failure`）
 
@@ -100,7 +100,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 
 ### validate 类阻塞不再原样重投
 
-validate 类阻塞（原因含 preflight/validat，且不属于 pathspec、submodule 等环境故障）重开前，watcher 比较上次阻塞时记录的五要素：远端 head、base、policy sha256、运行指纹、失败集合。全部未变（或关键观测缺失）则不重新派发，也不消耗每代次 3 次的上限；任一已知变化才照常重开。新的失败收据若失败集合与阻塞时完全相同，视为未变；新的 `unparsed` 证据视为变化。没有 `validationBlock` 的旧阻塞只在远端 head 变化时重开。
+validate 类阻塞（原因含 preflight/validat，且不属于 pathspec、submodule 等环境故障）重开前，watcher 比较上次阻塞时记录的五要素：远端 head、merge-base（被验证 head 与 base 的 merge-base，不是 base 分支 tip——base 前进但 merge-base 不变不重开）、policy sha256、运行指纹、失败集合。merge-base 取不到（对象不在本地）时该项按未知处理：不单独触发重开，其他要素变化仍照常重开。全部未变（或关键观测缺失）则不重新派发，也不消耗每代次 3 次的上限；任一已知变化才照常重开。新的失败收据若失败集合与阻塞时完全相同，视为未变；新的 `unparsed` 证据视为变化。没有 `validationBlock` 的旧阻塞只在远端 head 变化时重开。
 
 ### 新版任务必需的 Keel 配置
 
