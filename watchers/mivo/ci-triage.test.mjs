@@ -113,3 +113,22 @@ test('unknown 状态不做分诊，原样返回', () => {
   const input = { status: 'unknown', required: [], reason: 'x' };
   assert.equal(applyCiTriage(input, { checks: [] }), input);
 });
+
+test('#1254 重跑场景：上游同名 job 已是终态但同一 head 还有 CI 分片在重跑，门的红继续暂缓', () => {
+  const freshness = check('pr-ci-freshness', { conclusion: 'failure', completed: ago(60 * 60e3) });
+  const verify = check('verify', { conclusion: 'skipped', completed: ago(60 * 60e3) });
+  const shard = check('Linux unit shard (2/4)', { status: 'in_progress' });
+  const jobsById = new Map([[String(freshness.id), job(freshness.id, '合并前 stale-green 校验')]]);
+  const out = applyCiTriage(resultOf([rule(freshness)]), { checks: [freshness, verify, shard], jobsById, now: NOW });
+  assert.equal(out.required[0].status, 'pending');
+  assert.equal(out.required[0].reason, 'gate-waiting-upstream');
+});
+
+test('门红超过 3 小时后不再因为其它 job 还在排队而暂缓', () => {
+  const freshness = check('pr-ci-freshness', { conclusion: 'failure', completed: ago(4 * 60 * 60e3) });
+  const verify = check('verify', { conclusion: 'skipped', completed: ago(4 * 60 * 60e3) });
+  const stuck = check('Windows plugin smoke', { status: 'queued' });
+  const jobsById = new Map([[String(freshness.id), job(freshness.id, '合并前 stale-green 校验')]]);
+  const out = applyCiTriage(resultOf([rule(freshness)]), { checks: [freshness, verify, stuck], jobsById, now: NOW });
+  assert.equal(out.required[0].status, 'failed');
+});

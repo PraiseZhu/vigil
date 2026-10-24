@@ -11,6 +11,9 @@
 
 export const GATE_RERUN_GRACE_MS = 10 * 60 * 1000; // pr-gate-rerun fires on CI completion; give it this long
 export const GATE_RERUN_MAX_ATTEMPT = 3; // pr-gate-rerun only re-runs while run_attempt < 3
+// A gate keeps waiting while any Actions check on the head still runs, but not forever: a job stuck in the queue
+// must not hide a red gate for good.
+export const GATE_MAX_HOLD_MS = 3 * 60 * 60 * 1000;
 
 const BAD = new Set(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale']);
 const INFRA_CONCLUSIONS = new Set(['cancelled', 'action_required', 'startup_failure', 'stale']);
@@ -139,7 +142,11 @@ export function triageRule(rule, { checks = [], jobsById = new Map(), required =
     const failedUp = upstream.filter((item) => item.status === 'completed' && BAD.has(String(item.conclusion ?? '').toLowerCase())).map((item) => item.name);
     const actionsPending = latestByName(checks).some((item) => item.app?.slug === 'github-actions' && item.status !== 'completed' && !isGate(item.name));
     triage.upstream = { pending: pendingUp, failed: failedUp, seen: upstream.length };
-    if (pendingUp.length || (!upstream.length && actionsPending)) return { triage, defer: 'gate-waiting-upstream' };
+    // Any running Actions check counts, not only the named upstream: a CI re-run recomputes verify later, and a job
+    // of another workflow can share the upstream's name (2026-10-25, #1254: org-market preflight's skipped `verify`
+    // shadowed CI's verify while CI shards were re-running).
+    const gateAge = now - (Date.parse(check.completed_at ?? '') || now);
+    if (pendingUp.length || (actionsPending && gateAge < GATE_MAX_HOLD_MS)) return { triage, defer: 'gate-waiting-upstream' };
     const otherRequiredFailed = required.some((item) => item !== rule && item.status === 'failed' && !isGate(item.context));
     if (failedUp.length && otherRequiredFailed) return { triage, defer: 'gate-upstream-failed' };
     const doneAt = Math.max(0, ...upstream.map((item) => Date.parse(item.completed_at ?? '') || 0));
