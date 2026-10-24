@@ -206,3 +206,52 @@ test('F3 同一轮 infra 与 external 都命中时只退一轮（repairRounds 3�
   assert.equal(afterExternal.repairRounds, 2);
   assert.equal(afterExternal.externalReopened, undefined);
 });
+
+// validate 类阻塞的唯一分类：原因不属于环境故障，且（带 validationBlock 或原因指向 preflight/validate）。
+// 下面两条原因不含 INFRA_BLOCK_REASON 的任何关键词（preflight/submodule/…），线上同形文字占多数。
+const VALIDATE_ONLY_REASONS = [
+  'helper validate 的完整 pre-push 仍以 exit 1 失败，原因是未修改的 scripts/example.test.mjs',
+  'helper validate DCO fails on example-commit',
+];
+
+test('F3 infra 入口：reason 不含 INFRA 关键词的 validate 类阻塞（有/无 validationBlock）也走五要素判据', (t) => {
+  for (const reason of VALIDATE_ONLY_REASONS) {
+    const withBlock = externalFixture(t, { reason });
+    const b = withBlock.validationBlock;
+    const unchanged = { mergeBase: b.mergeBase, policySha256: b.policySha256, runtimeSha256: b.runtimeSha256, receiptSha256: b.receiptSha256,
+      failureSetState: 'parsed', failureSetSha256: b.failureSetSha256 };
+    assert.equal(reopenInfraBlocked({ previous: withBlock.previous, paths: withBlock.paths, now: 'n', observe: () => ({ ...unchanged }) }), withBlock.previous, `${reason}：五要素不变不重开`);
+    const changed = reopenInfraBlocked({ previous: withBlock.previous, paths: withBlock.paths, now: 'n', observe: () => ({ ...unchanged, mergeBase: 'n'.repeat(40) }) });
+    assert.equal(changed.eligibility, 'active', `${reason}：五要素变化重开`);
+    assert.equal(changed.infraReopened.length, 1);
+    assert.equal(changed.repairRounds, 1);
+
+    const legacy = externalFixture(t, { reason, block: false });
+    assert.equal(reopenInfraBlocked({ previous: legacy.previous, paths: legacy.paths, now: 'n' }), legacy.previous, `${reason}：legacy head 未变不重开`);
+    const moved = reopenInfraBlocked({ previous: { ...legacy.previous, headRefOid: 'c'.repeat(40) }, paths: legacy.paths, now: 'n' });
+    assert.equal(moved.eligibility, 'active', `${reason}：legacy head 变化重开`);
+    assert.equal(moved.infraReopened.length, 1);
+  }
+});
+
+test('F3 external 入口：reason 不含 INFRA 关键词的 validate 类阻塞不因 rulesVersion 变化重投；head 变化仍重开且同一 dispatch 只退一轮', (t) => {
+  for (const reason of VALIDATE_ONLY_REASONS) {
+    for (const block of [true, false]) {
+      const { paths, previous } = externalFixture(t, { reason, block });
+      assert.notEqual(previous.rulesVersion, rulesVersion());
+      const kept = reopenExternalBlocked({ previous, paths, now: 'n', head: previous.headRefOid });
+      assert.equal(kept, previous, `${reason} block=${block}：部署新版不重投`);
+      assert.equal(kept.repairRounds, 2);
+
+      const moved = reopenExternalBlocked({ previous, paths, now: 'n', head: 'c'.repeat(40) });
+      assert.equal(moved.eligibility, 'active', `${reason} block=${block}：head 变化重开`);
+      assert.equal(moved.externalReopened.length, 1);
+
+      const start = { ...previous, repairRounds: 3, headRefOid: 'c'.repeat(40) };
+      const afterInfra = reopenInfraBlocked({ previous: start, paths, now: 'n', observe: () => ({ mergeBase: 'n'.repeat(40) }) });
+      assert.equal(afterInfra.infraReopened?.length, 1);
+      const afterExternal = reopenExternalBlocked({ previous: afterInfra, paths, now: 'n', head: 'c'.repeat(40) });
+      assert.equal(afterExternal.repairRounds, 2, `${reason} block=${block}：infra+external 只退一轮`);
+    }
+  }
+});
