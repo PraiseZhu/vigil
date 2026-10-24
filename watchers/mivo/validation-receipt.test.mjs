@@ -92,6 +92,131 @@ test('parseFailureSet：无法完整解析时标记 unparsed，且 unparsed 不�
   assert.equal(sameFailureSet(lone, { state: 'parsed', failureSet: [], failureSetSha256: canonicalFailureSet([]).sha256 }), false);
 });
 
+// 以下样例由真实 Node/Vitest 运行产出后脱敏（路径、名称改成占位），保持原有行格式。
+const NODE_SPEC_FAIL = [
+  '[preflight] ▶ ops',
+  '✔ passes (0.57ms)',
+  '✖ compares values (0.59ms)',
+  '▶ group',
+  '  ✖ inner fails (0.13ms)',
+  '✖ group (0.26ms)',
+  'ℹ tests 3',
+  'ℹ suites 1',
+  'ℹ pass 1',
+  'ℹ fail 2',
+  'ℹ cancelled 0',
+  '',
+  '✖ failing tests:',
+  '',
+  'test at scripts/ops/example-thing.test.mjs:4:1',
+  '✖ compares values (0.59ms)',
+  '  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:',
+  '  ',
+  '  1 !== 2',
+  '  ',
+  '      at TestContext.<anonymous> (file:///work/example-plugin/scripts/ops/example-thing.test.mjs:4:40)',
+  '      at Test.run (node:internal/test_runner/test:1201:25)',
+  '  {',
+  "    code: 'ERR_ASSERTION',",
+  '  }',
+  '',
+  'test at scripts/ops/example-thing.test.mjs:5:32',
+  '✖ inner fails (0.13ms)',
+  '  Error: boom: inner',
+  '      at TestContext.<anonymous> (file:///work/example-plugin/scripts/ops/example-thing.test.mjs:5:66)',
+  '[preflight] ❌ ops 失败',
+].join('\n');
+
+const NODE_TAP_FAIL = [
+  'TAP version 13',
+  '# Subtest: passes',
+  'ok 1 - passes',
+  '# Subtest: compares values',
+  'not ok 2 - compares values',
+  '  ---',
+  "  duration_ms: 0.62",
+  "  type: 'test'",
+  "  location: '/work/example-plugin/scripts/ops/example-thing.test.mjs:4:1'",
+  "  failureType: 'testCodeFailure'",
+  '  error: |-',
+  '    Expected values to be strictly equal:',
+  '    ',
+  '    1 !== 2',
+  '    ',
+  "  code: 'ERR_ASSERTION'",
+  '  stack: |-',
+  '    TestContext.<anonymous> (file:///work/example-plugin/scripts/ops/example-thing.test.mjs:4:40)',
+  '  ...',
+  '# Subtest: group',
+  '    # Subtest: inner fails',
+  '    not ok 1 - inner fails',
+  '      ---',
+  "      location: '/work/example-plugin/scripts/ops/example-thing.test.mjs:5:32'",
+  "      failureType: 'testCodeFailure'",
+  "      error: 'boom: inner'",
+  '      ...',
+  '    1..1',
+  'not ok 3 - group',
+  '  ---',
+  "  location: '/work/example-plugin/scripts/ops/example-thing.test.mjs:5:6'",
+  "  failureType: 'subtestsFailed'",
+  "  error: '1 subtest failed'",
+  '  ...',
+  '1..3',
+  '# tests 3',
+  '# pass 1',
+  '# fail 2',
+  '[preflight] ❌ ops 失败',
+].join('\n');
+
+const VITEST_FILE_LEVEL = [
+  '⎯⎯⎯⎯⎯⎯ Failed Suites 1 ⎯⎯⎯⎯⎯⎯⎯',
+  '',
+  ' FAIL  scripts/ops/example-load.test.mjs [ scripts/ops/example-load.test.mjs ]',
+  "Error: Cannot find module './missing.mjs' imported from /work/example-plugin/scripts/ops/example-load.test.mjs",
+  ' ❯ scripts/ops/example-load.test.mjs:1:1',
+  '',
+  ' Test Files  1 failed | 3 passed (4)',
+  '      Tests  no tests',
+  '[preflight] ❌ test 失败',
+].join('\n');
+
+test('parseFailureSet：node:test 的 spec 输出（failing tests 段）解析出失败，嵌套套件不重复计数', () => {
+  const parsed = parseFailureSet(NODE_SPEC_FAIL, { worktree: WT });
+  assert.equal(parsed.state, 'parsed', parsed.reason);
+  assert.deepEqual(parsed.failureSet.map((item) => [item.step, item.file, item.test]), [
+    ['ops', 'scripts/ops/example-thing.test.mjs', 'compares values'],
+    ['ops', 'scripts/ops/example-thing.test.mjs', 'inner fails'],
+  ]);
+  assert.equal(parseFailureSet(NODE_SPEC_FAIL.replace('1 !== 2', '1 !== 3'), { worktree: WT }).failureSet.some((item) => item.errorSha === parsed.failureSet[0].errorSha), false);
+  assert.equal(parseFailureSet(NODE_SPEC_FAIL.replace('ℹ fail 2', 'ℹ fail 3'), { worktree: WT }).state, 'unparsed', '失败计数对不上');
+  assert.equal(parseFailureSet(NODE_SPEC_FAIL.split('\n').filter((line) => !line.startsWith('test at scripts/ops/example-thing.test.mjs:5')).join('\n'), { worktree: WT }).state, 'unparsed', '缺失败块');
+});
+
+test('parseFailureSet：node:test 的 TAP 输出解析出叶子失败，忽略 subtestsFailed 的套件行', () => {
+  const parsed = parseFailureSet(NODE_TAP_FAIL, { worktree: WT });
+  assert.equal(parsed.state, 'parsed', parsed.reason);
+  assert.deepEqual(parsed.failureSet.map((item) => [item.file, item.test]), [
+    ['scripts/ops/example-thing.test.mjs', 'compares values'],
+    ['scripts/ops/example-thing.test.mjs', 'inner fails'],
+  ]);
+  const spec = parseFailureSet(NODE_SPEC_FAIL, { worktree: WT });
+  assert.notEqual(parsed.failureSetSha256, null);
+  assert.equal(spec.state, 'parsed');
+  assert.equal(parseFailureSet(NODE_TAP_FAIL.replace('# fail 2', '# fail 5'), { worktree: WT }).state, 'unparsed');
+});
+
+test('parseFailureSet：vitest 文件级失败（FAIL file [ file ]、Tests no tests）按 Test Files 计数解析', () => {
+  const parsed = parseFailureSet(VITEST_FILE_LEVEL, { worktree: WT });
+  assert.equal(parsed.state, 'parsed', parsed.reason);
+  assert.equal(parsed.failureSet.length, 1);
+  assert.equal(parsed.failureSet[0].file, 'scripts/ops/example-load.test.mjs');
+  assert.equal(parsed.failureSet[0].test, '<file>');
+  assert.equal(parseFailureSet(VITEST_FILE_LEVEL.replace('1 failed | 3 passed', '2 failed | 2 passed'), { worktree: WT }).state, 'unparsed', 'Test Files 计数对不上');
+  const mixed = [HOOK_FAIL.replace('[preflight] ❌ test 失败', ''), VITEST_FILE_LEVEL.split('\n').slice(2, 5).join('\n'), '[preflight] ❌ test 失败'].join('\n');
+  assert.equal(parseFailureSet(mixed, { worktree: WT }).state, 'unparsed', 'Test Files 1 failed 但出现两个文件');
+});
+
 test('isFailureSubset：非空子集 true；多一个元素、空集合、旧收据（无字段）都为 false', () => {
   const full = parseFailureSet(HOOK_FAIL, { worktree: WT });
   const one = { state: 'parsed', failureSet: [full.failureSet[0]] };
