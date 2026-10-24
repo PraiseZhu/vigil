@@ -59,6 +59,15 @@ function killGroup(pgid, signal) {
   try { process.kill(-pgid, signal); } catch {}
 }
 
+// 命令自己在 exec 前把进程组号写进槽位旁的 .pgid 文件（rename 保证读到的是完整内容），
+// 这样持有者无论在 spawn 之后的哪一刻崩溃，回收者都能找到并终止遗留进程组。
+function readPgid(file) {
+  try {
+    const value = Number(fs.readFileSync(`${file}.pgid`, 'utf8').trim());
+    return Number.isSafeInteger(value) && value > 1 ? value : null;
+  } catch { return null; }
+}
+
 function readSlot(file) {
   try { return { slot: JSON.parse(fs.readFileSync(file, 'utf8')), mtimeMs: fs.statSync(file).mtimeMs }; }
   catch (error) {
@@ -76,13 +85,14 @@ async function reclaimIfStale(file) {
   const { slot, mtimeMs } = read;
   if (!slot) return Date.now() - mtimeMs > SLOT_INIT_GRACE_MS && removeSlot(file, null);
   if (pidAlive(slot.pid)) return false;
-  if (groupAlive(slot.pgid)) {
-    killGroup(slot.pgid, 'SIGTERM');
+  const pgid = Number.isInteger(slot.pgid) ? slot.pgid : readPgid(file);
+  if (groupAlive(pgid)) {
+    killGroup(pgid, 'SIGTERM');
     const deadline = Date.now() + KILL_GRACE_MS;
-    while (groupAlive(slot.pgid) && Date.now() < deadline) await sleep(50);
-    if (groupAlive(slot.pgid)) killGroup(slot.pgid, 'SIGKILL');
+    while (groupAlive(pgid) && Date.now() < deadline) await sleep(50);
+    if (groupAlive(pgid)) killGroup(pgid, 'SIGKILL');
     await sleep(50);
-    if (groupAlive(slot.pgid)) return false;
+    if (groupAlive(pgid)) return false;
   }
   return removeSlot(file, slot.token);
 }
@@ -98,6 +108,7 @@ function removeSlot(file, token) {
     return false;
   }
   fs.rmSync(stash, { force: true });
+  fs.rmSync(`${file}.pgid`, { force: true });
   return true;
 }
 
@@ -129,9 +140,13 @@ export async function acquireValidationSlot({ home, limit, pollMs = 250, signal 
           fs.writeFileSync(file, JSON.stringify({ ...read.slot, ...patch }), { mode: 0o600 });
         };
         return {
-          file, token,
+          file, token, pgidFile: `${file}.pgid`,
           setGroup: (pgid) => write({ pgid }),
-          release: () => { if (readSlot(file)?.slot?.token === token) fs.rmSync(file, { force: true }); },
+          release: () => {
+            if (readSlot(file)?.slot?.token !== token) return;
+            fs.rmSync(file, { force: true });
+            fs.rmSync(`${file}.pgid`, { force: true });
+          },
         };
       }
     }
@@ -144,14 +159,19 @@ export async function acquireValidationSlot({ home, limit, pollMs = 250, signal 
  * 任一字节输出刷新无输出计时；超过 stallMs 判 validate-stalled，超过 timeoutMs 判 validate-timeout，
  * 两者都终止整个进程组。正常的非零退出作为结果返回而不是抛错。
  */
-export function runStreaming(binary, args, { cwd, env, logPath, stallMs, timeoutMs, onGroup } = {}) {
+export function runStreaming(binary, args, { cwd, env, logPath, stallMs, timeoutMs, onGroup, pgidFile } = {}) {
   fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
   const fd = fs.openSync(logPath, 'wx', 0o600);
   return new Promise((resolve) => {
     let failureKind = null;
     let settled = false;
     let ioError = null;
-    const child = spawn(binary, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    // 给了 pgidFile 就经 sh 启动：sh 是新进程组的组长，先落盘 $$（= 进程组号），确认父进程还活着才 exec 真正的命令。
+    // 父进程在 spawn 之后任何时刻崩溃，要么组号已落盘可被回收，要么命令根本没有开始。
+    const wrapped = pgidFile
+      ? ['/bin/sh', ['-c', 'printf %s "$$" > "$1.tmp" && mv -f "$1.tmp" "$1"; kill -0 "$2" 2>/dev/null || exit 111; shift 2; exec "$@"', 'sh', pgidFile, String(process.pid), binary, ...args]]
+      : [binary, args];
+    const child = spawn(wrapped[0], wrapped[1], { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     const pgid = child.pid;
     if (onGroup && pgid) onGroup(pgid);
     const terminate = (kind) => {

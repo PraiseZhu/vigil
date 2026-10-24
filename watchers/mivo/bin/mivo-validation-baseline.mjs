@@ -113,7 +113,7 @@ export async function compareBaseline({
       const startedAt = new Date().toISOString();
       const logBase = path.join(paths.validations, 'logs', `baseline-${key}-${randomUUID()}`);
       const stepEnv = { ...env, PREFLIGHT_SKIP: '0', TMPDIR: runtime.tmpdir };
-      const base = { cwd: dir, env: stepEnv, timeout: config.timeoutMs, stallMs: config.stallMs, maxBuffer: 32 * 1024 * 1024, onGroup: (pgid) => slot.setGroup(pgid) };
+      const base = { cwd: dir, env: stepEnv, timeout: config.timeoutMs, stallMs: config.stallMs, maxBuffer: 32 * 1024 * 1024, onGroup: (pgid) => slot.setGroup(pgid), pgidFile: slot.pgidFile };
       if (needsInstall(dir)) {
         const install = await runStep('npm', ['ci'], base, `${logBase}-npm-ci.log`);
         if (!install.ok) return null;

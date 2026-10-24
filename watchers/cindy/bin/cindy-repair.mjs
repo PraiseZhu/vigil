@@ -744,7 +744,7 @@ const sha256Of = (value) => createHash('sha256').update(value).digest('hex');
 async function runLogged(binary, args, options) {
   const result = await runStreaming(binary, args, {
     cwd: options.cwd, env: options.env, logPath: options.logPath,
-    stallMs: options.stallMs, timeoutMs: options.timeout, onGroup: options.onGroup,
+    stallMs: options.stallMs, timeoutMs: options.timeout, onGroup: options.onGroup, pgidFile: options.pgidFile,
   });
   const text = fs.readFileSync(options.logPath, 'utf8');
   if (result.exitCode === 0 && !result.failureKind) return text;
@@ -823,7 +823,7 @@ export async function validate({ home, taskPath, validatedHead, gitFn = command,
       }
       const base = {
         cwd: worktree, env: { ...env, PREFLIGHT_SKIP: '0', TMPDIR: runtime.tmpdir }, timeout: config.timeoutMs,
-        stallMs: config.stallMs, maxBuffer: 32 * 1024 * 1024, onGroup: (pgid) => slot.setGroup(pgid),
+        stallMs: config.stallMs, maxBuffer: 32 * 1024 * 1024, onGroup: (pgid) => slot.setGroup(pgid), pgidFile: slot.pgidFile,
       };
       const logPath = path.join(paths.validations, 'logs', `${task.dispatchId}-${validatedHead}-${randomUUID()}-preflight.log`);
       const step = await runLoggedStep(runFn, '/bin/bash', [policy.file], base, logPath);
