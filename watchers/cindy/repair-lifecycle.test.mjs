@@ -12,7 +12,7 @@ import { prepare, validate, finalize, recheck, cleanupWatch, keelRunIdFor } from
 import { readPr } from './bin/cindy-state.mjs';
 
 const REPO = 'makecindy/cindy', ID = 'PR_lifecycle', NUMBER = 790, SESSION = 'lifecycle-owner';
-test('discover → bind → prepare → failing preflight → repair → DCO → push → waiting CI → recheck → consume → cleanup', t => {
+test('discover → bind → prepare → failing preflight → repair → DCO → push → waiting CI → recheck → consume → cleanup', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-lifecycle-'));
   const home = path.join(root, 'watcher'), plugin = path.join(root, 'plugin');
   const originUrl = path.join(root, 'fork.git'), seed = path.join(root, 'seed');
@@ -96,7 +96,7 @@ test('discover → bind → prepare → failing preflight → repair → DCO →
   const preflight = path.join(root, 'preflight.sh');
   fs.writeFileSync(preflight, '#!/bin/bash\nset -eu\nnode check.mjs\n');
   const validationEnv = { ...env, CINDY_PREFLIGHT_BIN: preflight };
-  assert.equal(validate({ ...options, env: validationEnv, validatedHead: sourceHead }).status, 'fail');
+  assert.equal((await validate({ ...options, env: validationEnv, validatedHead: sourceHead })).status, 'fail');
   assert.equal(pushes, 0);
   fs.writeFileSync(path.join(worktree, 'add.mjs'), 'export default (a, b) => a + b;\n');
   git('-C', worktree, 'add', 'add.mjs');
@@ -104,7 +104,7 @@ test('discover → bind → prepare → failing preflight → repair → DCO →
   const head = git('-C', worktree, 'rev-parse', 'HEAD');
   assert.notEqual(head, sourceHead);
   assert.match(git('-C', worktree, 'log', '-1', '--format=%B'), /Signed-off-by:/);
-  const local = validate({ ...options, env: validationEnv, validatedHead: head });
+  const local = await validate({ ...options, env: validationEnv, validatedHead: head });
   assert.equal(local.status, 'pass');
   const scReport = path.join(root, 'sc.json');
   fs.writeFileSync(scReport, JSON.stringify({ scs: [{ id: 'SC-add', status: 'pass',

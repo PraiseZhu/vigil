@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { apply, FILES, stateFingerprint, verify } from './deploy.mjs';
 import { finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/cindy-repair.mjs';
@@ -129,9 +130,9 @@ function fixture(t, { changed = true } = {}) {
 }
 
 for (const status of ['pass', 'no-change']) {
-  test(`P3-only changed HEAD cannot finalize ${status}, even with a valid prior validation receipt`, (t) => {
+  test(`P3-only changed HEAD cannot finalize ${status}, even with a valid prior validation receipt`, async (t) => {
     const f = fixture(t);
-    assert.equal(f.validate().status, 'pass');
+    assert.equal((await f.validate()).status, 'pass');
     f.saveTask([{ ...finding('P3'), category: 'actionable-fix', priority: 'P1',
       repairPolicy: { action: 'code-fix', canChangeCode: true } }]);
     f.report([f.sc(status, ['thread:P3'])]);
@@ -142,7 +143,7 @@ for (const status of ['pass', 'no-change']) {
   });
 }
 
-test('P3-only unchanged HEAD closes the complete no-change flow without validation or push', (t) => {
+test('P3-only unchanged HEAD closes the complete no-change flow without validation or push', async (t) => {
   const f = fixture(t, { changed: false });
   f.saveTask([finding('P3')]);
   f.report([f.sc('no-change', ['thread:P3'])]);
@@ -156,10 +157,10 @@ test('P3-only unchanged HEAD closes the complete no-change flow without validati
   assert.equal(f.pushCalls.length, 0);
 });
 
-test('a P1 in the same task does not authorize an SC marking P3 fixed', (t) => {
+test('a P1 in the same task does not authorize an SC marking P3 fixed', async (t) => {
   const f = fixture(t);
   f.saveTask([finding('P1'), finding('P3')]);
-  assert.equal(f.validate().status, 'pass');
+  assert.equal((await f.validate()).status, 'pass');
   f.report([f.sc('pass', ['thread:P1']), f.sc('pass', ['thread:P3'])]);
   assert.throws(f.finalize, /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限|no.change/i);
   assert.equal(f.pushCalls.length, 0);
@@ -167,14 +168,14 @@ test('a P1 in the same task does not authorize an SC marking P3 fixed', (t) => {
 });
 
 for (const kind of ['P1', 'P2', 'required-ci']) {
-  test(`${kind} authorized repair can validate, push to fixture origin and close against current-head CI`, (t) => {
+  test(`${kind} authorized repair can validate, push to fixture origin and close against current-head CI`, async (t) => {
     const f = fixture(t);
     const feedback = kind === 'required-ci' ? {
       key: 'ci:verify', source: 'ci', sha: f.sourceHead,
       requiredFailure: { verified: true, status: 'failed', headSha: f.sourceHead },
     } : finding(kind);
     f.saveTask([feedback]);
-    assert.equal(f.validate().status, 'pass');
+    assert.equal((await f.validate()).status, 'pass');
     f.report([f.sc('pass', [feedback.key])]);
     const result = f.finalize();
     assert.equal(result.status, 'complete');
@@ -187,9 +188,9 @@ for (const kind of ['P1', 'P2', 'required-ci']) {
 }
 
 for (const kind of ['P2', 'P3', 'unknown', 'empty']) {
-  test(`${kind} feedback cannot publish a changed HEAD through no-change SCs`, (t) => {
+  test(`${kind} feedback cannot publish a changed HEAD through no-change SCs`, async (t) => {
     const f = fixture(t);
-    assert.equal(f.validate().status, 'pass');
+    assert.equal((await f.validate()).status, 'pass');
     const feedback = kind === 'empty' ? [] : kind === 'unknown'
       ? [{ ...finding('P1'), key: 'thread:unknown', body: 'Please consider this improvement.' }]
       : [finding(kind)];
@@ -211,7 +212,7 @@ test('SC3 validate heartbeat refreshes activity during a blocking preflight', as
   const { validate } = await import(`./bin/cindy-repair.mjs?heartbeat=${Date.now()}`);
   const f = fixture(t);
   const file = path.join(f.paths.home, 'state', 'activity', `${f.task.dispatchId}.json`);
-  const result = validate({
+  const result = await validate({
     ...f.options,
     runFn: () => {
       const first = JSON.parse(fs.readFileSync(file, 'utf8')).at;
@@ -223,7 +224,7 @@ test('SC3 validate heartbeat refreshes activity during a blocking preflight', as
   assert.equal(result.status, 'pass');
 });
 
-test('SC7 no-change required-CI failure retriggers once with a signed empty commit, then escalates', (t) => {
+test('SC7 no-change required-CI failure retriggers once with a signed empty commit, then escalates', async (t) => {
   const f = fixture(t, { changed: false });
   f.saveTask([finding('P3')]);
   f.report([f.sc('no-change', ['thread:P3'])]);
@@ -239,7 +240,7 @@ test('SC7 no-change required-CI failure retriggers once with a signed empty comm
   assert.match(second.reason, /after one no-change empty-commit retrigger/);
 });
 
-test('R4 replacing a required-CI task on the same original head must not empty-commit again', (t) => {
+test('R4 replacing a required-CI task on the same original head must not empty-commit again', async (t) => {
   const f = fixture(t, { changed: false });
   const ci = (head) => ({
     key: 'ci:verify', source: 'ci', nativeId: 'verify', sha: head,
@@ -275,7 +276,7 @@ const fixtureGit = (...args) => execFileSync('git', args, {
   env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
 }).trim();
 
-test('R3-4 a session-made empty commit after the retrigger was spent is not pushed', (t) => {
+test('R3-4 a session-made empty commit after the retrigger was spent is not pushed', async (t) => {
   const f = fixture(t, { changed: false });
   const ci = (head) => ({
     key: 'ci:verify', source: 'ci', nativeId: 'verify', sha: head,
@@ -303,7 +304,7 @@ test('R3-4 a session-made empty commit after the retrigger was spent is not push
   assert.equal(f.remoteHead(), retriggerHead);
 });
 
-test('R3-4 the retrigger quota survives a lost result file for the same head', (t) => {
+test('R3-4 the retrigger quota survives a lost result file for the same head', async (t) => {
   const f = fixture(t, { changed: false });
   f.saveTask([finding('P3')]);
   f.report([f.sc('no-change', ['thread:P3'])]);
@@ -335,10 +336,10 @@ test('R3-2 the validate heartbeat stops once its helper process is gone', async 
   assert.equal(fs.readFileSync(file, 'utf8'), first, 'an orphaned heartbeat must not keep the task looking active');
 });
 
-test('mixed task can fix P1 while explicitly leaving P3 unchanged', (t) => {
+test('mixed task can fix P1 while explicitly leaving P3 unchanged', async (t) => {
   const f = fixture(t);
   f.saveTask([finding('P1'), finding('P3')]);
-  assert.equal(f.validate().status, 'pass');
+  assert.equal((await f.validate()).status, 'pass');
   f.report([f.sc('pass', ['thread:P1']), f.sc('no-change', ['thread:P3'])]);
   const result = f.finalize();
   assert.equal(result.status, 'complete');
@@ -347,19 +348,19 @@ test('mixed task can fix P1 while explicitly leaving P3 unchanged', (t) => {
     [['thread:P1', 'fixed'], ['thread:P3', 'no-change']]);
 });
 
-test('P3-only validation rejects a changed HEAD before running preflight', (t) => {
+test('P3-only validation rejects a changed HEAD before running preflight', async (t) => {
   const f = fixture(t);
   f.saveTask([finding('P3')]);
   let preflightRuns = 0;
-  assert.throws(() => validate({ ...f.options, runFn: () => { preflightRuns++; return 'passed'; } }),
+  await assert.rejects(() => validate({ ...f.options, runFn: () => { preflightRuns++; return 'passed'; } }),
     /repair.scope|code.*authority|scope.*code|P0\/P1|P0.*P1|代码权限|无.*权限/i);
   assert.equal(preflightRuns, 0);
   assert.equal(f.pushCalls.length, 0);
 });
 
-test('recheck cannot certify a changed HEAD after its feedback loses repair authority', (t) => {
+test('recheck cannot certify a changed HEAD after its feedback loses repair authority', async (t) => {
   const f = fixture(t);
-  assert.equal(f.validate().status, 'pass');
+  assert.equal((await f.validate()).status, 'pass');
   f.report([f.sc('pass', ['thread:P1'])]);
   assert.equal(f.finalize().status, 'complete');
   f.saveTask([{ ...finding('P3'), key: 'thread:P1' }]);
@@ -368,7 +369,7 @@ test('recheck cannot certify a changed HEAD after its feedback loses repair auth
   assert.equal(f.pushCalls.length, pushesBefore);
 });
 
-test('apply during validate preflight is refused; validate still writes a receipt', (t) => {
+test('apply during validate preflight is refused; validate still writes a receipt', async (t) => {
   const f = fixture(t);
   fs.mkdirSync(path.join(f.options.home, 'bin'), { recursive: true });
   for (const name of FILES) fs.writeFileSync(path.join(f.options.home, 'bin', name), 'old');
@@ -378,7 +379,7 @@ test('apply during validate preflight is refused; validate still writes a receip
     files: verify(f.options.home), stateSha: stateFingerprint(f.options.home), sessionIds: [],
   };
   let applyError;
-  const result = validate({
+  const result = await validate({
     ...f.options,
     runFn: () => {
       try { apply(plan); } catch (error) { applyError = error; }
@@ -394,12 +395,12 @@ test('apply during validate preflight is refused; validate still writes a receip
   assert.equal(fs.readFileSync(path.join(f.options.home, 'bin', FILES[0]), 'utf8'), 'old');
 });
 
-test('validate refuses immediately when deploy.lock is live and writes no receipt', (t) => {
+test('validate refuses immediately when deploy.lock is live and writes no receipt', async (t) => {
   const f = fixture(t);
   const deploy = acquireLock(f.options.home, DEPLOY_LOCK_NAME);
   t.after(() => deploy.release());
   let preflightRuns = 0;
-  assert.throws(
+  await assert.rejects(
     () => validate({ ...f.options, runFn: () => { preflightRuns++; return 'passed'; } }),
     /deploy lock held/,
   );
@@ -408,9 +409,9 @@ test('validate refuses immediately when deploy.lock is live and writes no receip
   assert.equal(fs.existsSync(dir), false);
 });
 
-test('v2 finalize never pushes with missing config or only a task registration', t => {
+test('v2 finalize never pushes with missing config or only a task registration', async t => {
   const f = fixture(t);
-  assert.equal(f.validate().status, 'pass');
+  assert.equal((await f.validate()).status, 'pass');
   f.report([f.sc('pass', ['thread:P1'])]);
   f.task.keelFlow = true;
   f.task.keelFlowVersion = 2;
@@ -433,9 +434,9 @@ function keelLedger(t, runId, rows) {
   return root;
 }
 
-test('finalize with a Keel ledger root refuses to push without a bound Keel run', (t) => {
+test('finalize with a Keel ledger root refuses to push without a bound Keel run', async (t) => {
   const f = fixture(t);
-  assert.equal(f.validate().status, 'pass');
+  assert.equal((await f.validate()).status, 'pass');
   f.report([f.sc('pass', ['thread:P1'])]);
   f.task.keelFlow = true;
   f.saveTask(f.task.feedback);
@@ -446,9 +447,9 @@ test('finalize with a Keel ledger root refuses to push without a bound Keel run'
   assert.equal(f.remoteHead(), f.sourceHead);
 });
 
-test('finalize pushes once the Keel run carries this task binding and reports it', (t) => {
+test('finalize pushes once the Keel run carries this task binding and reports it', async (t) => {
   const f = fixture(t);
-  assert.equal(f.validate().status, 'pass');
+  assert.equal((await f.validate()).status, 'pass');
   f.report([f.sc('pass', ['thread:P1'])]);
   f.task.keelFlow = true;
   f.saveTask(f.task.feedback);
@@ -462,9 +463,9 @@ test('finalize pushes once the Keel run carries this task binding and reports it
   assert.equal(f.remoteHead(), f.head);
 });
 
-test('finalize keeps closing tasks dispatched before the Keel prompt', (t) => {
+test('finalize keeps closing tasks dispatched before the Keel prompt', async (t) => {
   const f = fixture(t);
-  assert.equal(f.validate().status, 'pass');
+  assert.equal((await f.validate()).status, 'pass');
   f.report([f.sc('pass', ['thread:P1'])]);
   const keelRoot = keelLedger(t, 'run-3', []);
   const result = finalize({ ...f.options, keelRoot });
@@ -472,7 +473,7 @@ test('finalize keeps closing tasks dispatched before the Keel prompt', (t) => {
   assert.deepEqual(result.keel, { status: 'not-required-legacy-task' });
 });
 
-test('W-1 finalize keeps the workers the session reported', (t) => {
+test('W-1 finalize keeps the workers the session reported', async (t) => {
   const f = fixture(t, { changed: false });
   f.saveTask([finding('P3')]);
   const workers = [
@@ -489,7 +490,7 @@ for (const [label, workers] of [
   ['a third consult worker', [1, 2, 3].map((n) => ({ purpose: 'consult', agent: 'codex', model: `m${n}`, effort: 'medium' }))],
   ['a consult worker at max effort', [{ purpose: 'consult', agent: 'codex', model: 'm', effort: 'max' }]],
 ]) {
-  test(`W-2 finalize rejects ${label} before any push`, (t) => {
+  test(`W-2 finalize rejects ${label} before any push`, async (t) => {
     const f = fixture(t, { changed: false });
     f.saveTask([finding('P3')]);
     fs.writeFileSync(f.options.scReport, JSON.stringify({ scs: [f.sc('no-change', ['thread:P3'])], workers }));
@@ -499,7 +500,7 @@ for (const [label, workers] of [
   });
 }
 
-test('A-1 a P0/P1/P2 review finding closed as no-change without an arbiter is rejected before any push', (t) => {
+test('A-1 a P0/P1/P2 review finding closed as no-change without an arbiter is rejected before any push', async (t) => {
   const f = fixture(t, { changed: false });
   f.saveTask([finding('P2')]);
   f.report([f.sc('no-change', ['thread:P2'])], []);
@@ -507,7 +508,7 @@ test('A-1 a P0/P1/P2 review finding closed as no-change without an arbiter is re
   assert.equal(f.pushCalls.length, 0);
 });
 
-test('A-2 adjudicate workers are accepted and kept in the result', (t) => {
+test('A-2 adjudicate workers are accepted and kept in the result', async (t) => {
   const f = fixture(t, { changed: false });
   f.saveTask([finding('P1')]);
   f.report([f.sc('no-change', ['thread:P1'])]);
@@ -516,9 +517,115 @@ test('A-2 adjudicate workers are accepted and kept in the result', (t) => {
   assert.deepEqual(result.workers, [ADJUDICATOR]);
 });
 
-test('A-3 P3 no-change needs no arbiter', (t) => {
+test('A-3 P3 no-change needs no arbiter', async (t) => {
   const f = fixture(t, { changed: false });
   f.saveTask([finding('P3')]);
   f.report([f.sc('no-change', ['thread:P3'])], []);
   assert.equal(f.finalize().status, 'complete');
+});
+
+const HOOK_FAIL_LOG = [
+  '[preflight] ▶ test',
+  ' FAIL  scripts/ops/example.test.mjs > example > owns the env file',
+  'AssertionError: expected 501 to be +0',
+  ' ❯ scripts/ops/example.test.mjs:12:5',
+  '      Tests  1 failed | 10 passed (11)',
+  '[preflight] ❌ test 失败',
+].join('\n');
+const failing = (stdout, extra = {}) => () => { throw Object.assign(new Error('Command failed'), { status: 1, stdout, stderr: '', ...extra }); };
+const readReceipt = (verification) => JSON.parse(fs.readFileSync(verification.receiptPath, 'utf8'));
+
+test('SC2 同条件第二次 validate 复用通过收据：零次调用 runFn，新收据绑定当前身份并指向原收据', async (t) => {
+  const f = fixture(t);
+  let runs = 0;
+  const first = await validate({ ...f.options, runFn: () => { runs++; return 'ok\n'; } });
+  assert.equal(first.status, 'pass');
+  assert.equal(runs, 1);
+  const second = await validate({ ...f.options, runFn: () => { runs++; return 'must not run\n'; } });
+  assert.equal(runs, 1, '复用时不再运行 validate');
+  assert.equal(second.status, 'pass');
+  assert.notEqual(second.receiptPath, first.receiptPath);
+  const receipt = readReceipt(second);
+  assert.equal(receipt.reusedFrom.receiptPath, first.receiptPath);
+  assert.equal(receipt.reusedFrom.receiptSha256, first.receiptSha256);
+  assert.equal(receipt.dispatchId, f.task.dispatchId);
+  assert.equal(receipt.exitCode, 0);
+});
+
+test('SC2 日志被篡改时不复用，重新运行', async (t) => {
+  const f = fixture(t);
+  let runs = 0;
+  const runFn = () => { runs++; return 'ok\n'; };
+  const first = await validate({ ...f.options, runFn });
+  fs.appendFileSync(readReceipt(first).logPath, 'tampered');
+  await validate({ ...f.options, runFn });
+  assert.equal(runs, 2, '日志篡改后必须重跑');
+});
+
+test('SC5 子进程环境注入 TMPDIR=realpath(os.tmpdir())，policy 哈希不变', async (t) => {
+  const f = fixture(t);
+  const seen = [];
+  const before = await validate({ ...f.options, env: { ...f.options.env, TMPDIR: '/var/tmp/not-real-link' },
+    runFn: (_bin, _args, opts) => { seen.push(opts.env.TMPDIR); return 'ok\n'; } });
+  assert.deepEqual(seen, [fs.realpathSync(os.tmpdir())]);
+  const receipt = readReceipt(before);
+  assert.equal(receipt.runtime.tmpdir, fs.realpathSync(os.tmpdir()));
+  assert.match(receipt.policy.sha256, /^[0-9a-f]{64}$/);
+});
+
+test('SC4 收据记录日志哈希与失败集合；解析不出时标记 unparsed', async (t) => {
+  const f = fixture(t);
+  const failed = await validate({ ...f.options, runFn: failing(HOOK_FAIL_LOG) });
+  assert.equal(failed.status, 'fail');
+  const receipt = readReceipt(failed);
+  assert.equal(receipt.validationEvidenceVersion, 1);
+  assert.equal(receipt.logSha256, createHash('sha256').update(fs.readFileSync(receipt.logPath)).digest('hex'));
+  assert.equal(receipt.failureSetState, 'parsed');
+  assert.deepEqual(receipt.failureSet.map((item) => [item.step, item.file, item.test]), [['test', 'scripts/ops/example.test.mjs', 'example > owns the env file']]);
+  assert.match(receipt.failureSetSha256, /^[0-9a-f]{64}$/);
+  assert.equal(fs.statSync(receipt.logPath).mode & 0o777, 0o600);
+  const g = fixture(t);
+  const odd = await validate({ ...g.options, runFn: failing('lint exploded') });
+  const oddReceipt = readReceipt(odd);
+  assert.equal(oddReceipt.failureSetState, 'unparsed');
+  assert.equal(oddReceipt.failureSetSha256, null);
+});
+
+test('SC3 无输出看门狗：stalled 以独立原因记录，不当作测试失败', async (t) => {
+  const f = fixture(t);
+  const stalled = await validate({ ...f.options, runFn: failing('', { status: null, failureKind: 'validate-stalled' }) });
+  assert.equal(stalled.status, 'fail');
+  const receipt = readReceipt(stalled);
+  assert.equal(receipt.failureKind, 'validate-stalled');
+  assert.equal(receipt.exitCode, null);
+  assert.equal(receipt.failureSetState, 'unparsed');
+});
+
+test('SC1 并发上限：上限 1 时两个 validate 争用同一 home，runFn 峰值为 1，排队的不记为失败', async (t) => {
+  const f = fixture(t);
+  let running = 0;
+  let peak = 0;
+  const runFn = async () => {
+    running++; peak = Math.max(peak, running);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    running--;
+    throw Object.assign(new Error('Command failed'), { status: 1, stdout: HOOK_FAIL_LOG, stderr: '' });
+  };
+  const env = { ...f.options.env, CINDY_VALIDATE_CONCURRENCY: '1' };
+  const results = await Promise.all([validate({ ...f.options, env, runFn }), validate({ ...f.options, env, runFn })]);
+  assert.equal(peak, 1);
+  assert.deepEqual(results.map((item) => item.status), ['fail', 'fail']);
+});
+
+
+test('SC1 helper 锁在异步 validate 整个运行期间持有（不会被同步 finally 提前释放）', async (t) => {
+  const f = fixture(t);
+  let liveDuring = null;
+  await validate({ ...f.options, runFn: async () => {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    liveDuring = lockStatus(f.options.home, helperLockName(790)).live;
+    return 'ok\n';
+  } });
+  assert.equal(liveDuring, true);
+  assert.equal(lockStatus(f.options.home, helperLockName(790)).live, false);
 });
