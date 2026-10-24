@@ -11,6 +11,10 @@ import { collectCindyCiSync } from './cindy-ci.mjs';
 import { taskRepairPolicy } from './cindy-feedback-policy.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, clearOrphanGuard, DEPLOY_LOCK_NAME, helperLockName, inspectLocks, lockStatus, readPr, writePr } from './cindy-state.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
+import { acquireValidationSlot, runStreaming, validationConfig } from './cindy-validation-runtime.mjs';
+import {
+  PARSER_VERSION, canonicalRuntime, emptyFailureSet, lookupPass, parseFailureSet, publishPass, runtimeSha256,
+} from './cindy-validation-evidence.mjs';
 
 // 这是一个真实可公开的仓库，默认值保留；可用 CINDY_WATCHER_TARGET_REPO / profile.json 的
 // targetRepo 覆盖成你自己要盯梢的仓库。
@@ -240,10 +244,19 @@ function withHelperOp(home, pr, fn) {
       ? lock.reason : 'helper 运行锁占用，请稍后重试';
     fail(`busy: ${why}`, 2);
   }
+  // fn 可能返回 Promise（validate 是异步的）：锁必须撑到它真正结束，不能在同步 finally 里提前释放。
+  let released = false;
+  const release = () => { if (!released) { released = true; lock.release(); } };
   try {
     refuseDeployLock(root);
-    return fn();
-  } finally { lock.release(); }
+    const result = fn();
+    if (result && typeof result.then === 'function') return Promise.resolve(result).finally(release);
+    release();
+    return result;
+  } catch (error) {
+    release();
+    throw error;
+  }
 }
 function taskFrom(home, taskPath) {
   const paths = repairPaths(home);
@@ -724,11 +737,47 @@ function validationException(paths, task, sessionId, head, worktree, gitFn) {
   return { approvalPath: file, approvalSha256: binding.approvalSha256, approvalRef: approval.approvalRef, reason: approval.reason };
 }
 
-export function validate({ home, taskPath, validatedHead, gitFn = command, runFn = command, env = process.env, originUrl } = {}) {
-  return withHelperOp(home, peekTaskNumber(taskPath), () => {
+const sha256Of = (value) => createHash('sha256').update(value).digest('hex');
+
+// 默认的命令执行器：独立进程组 + 流式 0600 日志 + 无输出看门狗。返回日志全文；
+// 非零退出/看门狗终止时抛出带 status/failureKind 的错误（与 execFileSync 的错误形状兼容）。
+async function runLogged(binary, args, options) {
+  const result = await runStreaming(binary, args, {
+    cwd: options.cwd, env: options.env, logPath: options.logPath,
+    stallMs: options.stallMs, timeoutMs: options.timeout, onGroup: options.onGroup,
+  });
+  const text = fs.readFileSync(options.logPath, 'utf8');
+  if (result.exitCode === 0 && !result.failureKind) return text;
+  throw Object.assign(new Error(`${binary} ${args.join(' ')} exited ${result.exitCode ?? result.signal ?? 'abnormally'}`), {
+    status: result.exitCode, signal: result.signal, failureKind: result.failureKind, stdout: '', stderr: '', logPath: options.logPath,
+  });
+}
+
+// 运行一步并保证日志文件落盘（不可变、0600）。注入的 runFn 若没写日志，就把它的输出写进去。
+async function runLoggedStep(runFn, binary, args, base, logPath) {
+  let output = '';
+  let error = null;
+  try { output = String(await runFn(binary, args, { ...base, logPath })); }
+  catch (caught) {
+    error = caught;
+    output = String(caught?.stdout ?? '') + String(caught?.stderr ?? '');
+  }
+  if (!fs.existsSync(logPath)) {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(logPath, output, { flag: 'wx', mode: 0o600 });
+  } else if (error) output = fs.readFileSync(logPath, 'utf8');
+  return {
+    ok: !error, output, exitCode: error ? (Number.isInteger(error.status) ? error.status : null) : 0,
+    failureKind: error?.failureKind ?? null, logPath, logSha256: sha256Of(fs.readFileSync(logPath)),
+  };
+}
+
+export async function validate({ home, taskPath, validatedHead, gitFn = command, runFn = runLogged, env = process.env, originUrl, slotPollMs = 250 } = {}) {
+  return withHelperOp(home, peekTaskNumber(taskPath), async () => {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
   const stopHeartbeat = startActivityHeartbeat(paths, task, 'validate');
+  let slot = null;
   try {
   const { sessionId } = boundSession(paths, task);
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
@@ -744,18 +793,51 @@ export function validate({ home, taskPath, validatedHead, gitFn = command, runFn
   let exitCode = null;
   let outputHash = null;
   let status = exception ? 'approved-exception' : 'pass';
+  let runtime = null;
+  let log = null;
+  let failureKind = null;
+  let failure = null;
+  let reusedFrom = null;
+  let reusedTimes = null;
+  let identityKey = null;
   if (!exception) {
-    try {
-      const output = String(runFn('/bin/bash', [policy.file], {
-        cwd: worktree, env: { ...env, PREFLIGHT_SKIP: '0' }, timeout: 60 * 60 * 1000, maxBuffer: 32 * 1024 * 1024,
-      }));
+    const config = validationConfig({ env });
+    runtime = canonicalRuntime({ worktree });
+    identityKey = { repo: task.repo, nodeId: task.nodeId, number: task.number, head: validatedHead, policySha256: policy.sha256, runtimeSha256: runtimeSha256(runtime) };
+    const hit = lookupPass({ validations: paths.validations, identity: identityKey });
+    if (hit) {
+      reusedFrom = { receiptPath: hit.receiptPath, receiptSha256: hit.receiptSha256 };
+      reusedTimes = { startedAt: hit.receipt.startedAt, finishedAt: hit.receipt.finishedAt };
       exitCode = 0;
-      outputHash = hash(output);
-      if (/^\[preflight\] skipped(?: |$)/m.test(output)) status = 'fail';
-    } catch (error) {
-      status = 'fail';
-      exitCode = Number.isInteger(error.status) ? error.status : null;
-      outputHash = hash(String(error.stdout ?? '') + String(error.stderr ?? ''));
+      outputHash = hit.receipt.outputHash;
+      log = { logPath: hit.receipt.logPath, logSha256: hit.receipt.logSha256 };
+      failure = emptyFailureSet();
+    } else {
+      const queuedAt = Date.now();
+      slot = await acquireValidationSlot({ home: paths.home, limit: config.concurrency, pollMs: slotPollMs });
+      if (Date.now() - queuedAt > 1_000) {
+        // 排队期间 worktree 可能已变：拿到槽位后重新核对，再决定是否真的运行。
+        boundSession(paths, task);
+        const again = assertWorktree(worktree, task, gitFn, forkUrl);
+        if (!again || again.head !== validatedHead) fail('worktree HEAD changed while waiting for a validation slot');
+      }
+      const base = {
+        cwd: worktree, env: { ...env, PREFLIGHT_SKIP: '0', TMPDIR: runtime.tmpdir }, timeout: config.timeoutMs,
+        stallMs: config.stallMs, maxBuffer: 32 * 1024 * 1024, onGroup: (pgid) => slot.setGroup(pgid),
+      };
+      const logPath = path.join(paths.validations, 'logs', `${task.dispatchId}-${validatedHead}-${randomUUID()}-preflight.log`);
+      const step = await runLoggedStep(runFn, '/bin/bash', [policy.file], base, logPath);
+      exitCode = step.exitCode;
+      outputHash = step.logSha256;
+      log = { logPath: step.logPath, logSha256: step.logSha256 };
+      if (step.ok) {
+        failure = emptyFailureSet();
+        if (/^\[preflight\] skipped(?: |$)/m.test(step.output)) { status = 'fail'; failureKind = 'evidence-invalid'; failure = { state: 'unparsed', failureSet: [], failureSetSha256: null }; }
+      } else {
+        status = 'fail';
+        failureKind = step.failureKind ?? 'test-failure';
+        failure = step.failureKind ? { state: 'unparsed', failureSet: [], failureSetSha256: null } : parseFailureSet(step.output, { worktree });
+      }
     }
   }
   let reason;
@@ -763,18 +845,29 @@ export function validate({ home, taskPath, validatedHead, gitFn = command, runFn
     const after = assertWorktree(worktree, task, gitFn, originUrl);
     if (!after || after.head !== validatedHead) fail('HEAD changed during local validation');
     if (policy && validationPolicy(worktree, task, gitFn, env).sha256 !== policy.sha256) fail('preflight policy changed during validation');
-  } catch (error) { status = 'fail'; reason = error.message; }
+    if (runtime && runtimeSha256(canonicalRuntime({ worktree })) !== runtimeSha256(runtime)) fail('validation runtime fingerprint changed during validation');
+  } catch (error) { status = 'fail'; reason = error.message; failureKind ??= 'evidence-invalid'; }
   const receipt = {
     schemaVersion: 2, kind: 'cindy-repair-validation', ...identity(task, sessionId), head: validatedHead,
     status, policy, exception, command: exception ? null : { binary: '/bin/bash', args: [policy.file] },
-    exitCode, outputHash, ...(reason ? { reason } : {}), startedAt, finishedAt: new Date().toISOString(),
+    exitCode, outputHash, ...(reason ? { reason } : {}),
+    ...(runtime ? {
+      validationEvidenceVersion: 1, parserVersion: PARSER_VERSION, runtime, runtimeSha256: runtimeSha256(runtime),
+      logPath: log?.logPath ?? null, logSha256: log?.logSha256 ?? null,
+      failureSetState: failure?.state ?? 'unparsed', failureSet: failure?.failureSet ?? [], failureSetSha256: failure?.failureSetSha256 ?? null,
+      failureKind, reusedFrom, ...(reusedFrom ? { reusedAt: new Date().toISOString() } : {}),
+    } : {}),
+    startedAt: reusedTimes?.startedAt ?? startedAt, finishedAt: reusedTimes?.finishedAt ?? new Date().toISOString(),
   };
   const receiptPath = path.join(paths.validations, task.dispatchId, `${validatedHead}-${randomUUID()}.json`);
   immutableJson(receiptPath, receipt);
   const verification = { status, head: validatedHead, receiptPath, receiptSha256: hash(fs.readFileSync(receiptPath)) };
   atomicJson(validationPointer(paths, task, validatedHead), verification);
+  if (status === 'pass' && !reusedFrom && identityKey) {
+    publishPass({ validations: paths.validations, identity: identityKey, receiptPath, receiptSha256: verification.receiptSha256 });
+  }
   return verification;
-  } finally { stopHeartbeat(); }
+  } finally { slot?.release(); stopHeartbeat(); }
   });
 }
 
@@ -1066,11 +1159,30 @@ export function blocked({ home, taskPath, reason, ghFn = command } = {}) {
   recordActivity(paths, task, 'blocked');
   const { sessionId } = boundSession(paths, task);
   if (typeof reason !== 'string' || !reason.trim()) fail('blocked reason is required');
+  const validationBlock = latestFailedValidation(paths, task);
   return saveResult(paths, task, sessionId, {
     status: 'blocked', blockedKind: 'external', reason: reason.trim(),
-    head: task.headRefOid, worktree: taskWorktree(task),
+    head: task.headRefOid, worktree: taskWorktree(task), ...(validationBlock ? { validationBlock } : {}),
   });
   });
+}
+
+// 阻塞若源于本地 validate 失败，把那份失败收据的指纹带给 watcher，供它判断环境是否真的变了。
+function latestFailedValidation(paths, task) {
+  try {
+    const dir = path.join(paths.validations, task.dispatchId);
+    const files = fs.readdirSync(dir).filter((name) => /^[0-9a-f]{40}-[0-9a-f-]{36}\.json$/.test(name))
+      .map((name) => ({ file: path.join(dir, name), at: fs.statSync(path.join(dir, name)).mtimeMs })).sort((a, b) => b.at - a.at);
+    if (!files.length) return null;
+    const bytes = fs.readFileSync(files[0].file);
+    const receipt = JSON.parse(bytes);
+    if (receipt.status === 'pass' || receipt.status === 'approved-exception') return null;
+    return {
+      validatedHead: receipt.head, policySha256: receipt.policy?.sha256 ?? null, runtimeSha256: receipt.runtimeSha256 ?? null,
+      failureSetState: receipt.failureSetState ?? 'legacy', failureSetSha256: receipt.failureSetSha256 ?? null,
+      failureKind: receipt.failureKind ?? null, receiptSha256: hash(bytes),
+    };
+  } catch { return null; }
 }
 
 export function shellQuote(value) {
@@ -1223,7 +1335,7 @@ export function lockDoctorClearGuard({ home, lockName, now } = {}) {
   return clearOrphanGuard(requireAbs(home, 'home'), lockName, now);
 }
 
-function cli(argv) {
+async function cli(argv) {
   const args = [...argv];
   const modes = new Set(['prepare', 'validate', 'finalize', 'recheck', 'blocked', 'cleanup', 'clear-owner-unknown', 'lock-doctor']);
   const modeIndex = args.findIndex((item) => modes.has(item));
@@ -1246,7 +1358,7 @@ function cli(argv) {
   else {
     const task = value('--task');
     if (mode === 'prepare') result = prepare({ home, taskPath: task });
-    else if (mode === 'validate') result = validate({ home, taskPath: task, validatedHead: value('--validated-head') });
+    else if (mode === 'validate') result = await validate({ home, taskPath: task, validatedHead: value('--validated-head') });
     else if (mode === 'finalize') result = finalize({ home, taskPath: task, scReport: value('--sc-report'), validatedHead: value('--validated-head'), validationReceipt: value('--validation-receipt', false), keelRun: value('--keel-run', false) });
     else if (mode === 'recheck') result = recheck({ home, taskPath: task, validatedHead: value('--validated-head', false) });
     else if (mode === 'blocked') result = blocked({ home, taskPath: task, reason: value('--reason') });
@@ -1258,6 +1370,6 @@ function cli(argv) {
 
 if (process.argv[1] && fs.existsSync(process.argv[1])
   && fs.realpathSync(fileURLToPath(import.meta.url)) === fs.realpathSync(process.argv[1])) {
-  try { cli(process.argv.slice(2)); }
+  try { await cli(process.argv.slice(2)); }
   catch (error) { process.stderr.write(`cindy-repair: ${error.message}\n`); process.exitCode = Number(error.exitCode) || 1; }
 }

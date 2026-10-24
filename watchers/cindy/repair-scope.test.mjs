@@ -601,22 +601,19 @@ test('SC3 无输出看门狗：stalled 以独立原因记录，不当作测试�
   assert.equal(receipt.failureSetState, 'unparsed');
 });
 
-test('SC1 并发上限：上限 1 时两个 validate 争用同一 home，runFn 峰值为 1，排队的不记为失败', async (t) => {
+test('SC1 validate 运行期间占用一个并发槽位，结束后释放（同 PR 并发由 helper 锁拒绝为 busy，不进入排队）', async (t) => {
   const f = fixture(t);
-  let running = 0;
-  let peak = 0;
-  const runFn = async () => {
-    running++; peak = Math.max(peak, running);
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    running--;
-    throw Object.assign(new Error('Command failed'), { status: 1, stdout: HOOK_FAIL_LOG, stderr: '' });
-  };
-  const env = { ...f.options.env, CINDY_VALIDATE_CONCURRENCY: '1' };
-  const results = await Promise.all([validate({ ...f.options, env, runFn }), validate({ ...f.options, env, runFn })]);
-  assert.equal(peak, 1);
-  assert.deepEqual(results.map((item) => item.status), ['fail', 'fail']);
+  const slots = path.join(f.paths.validations, 'slots');
+  let during = null;
+  await validate({ ...f.options, runFn: async () => {
+    during = fs.readdirSync(slots).filter((name) => /^slot-\d+\.json$/.test(name)).length;
+    return 'ok\n';
+  } });
+  assert.equal(during, 1);
+  assert.deepEqual(fs.readdirSync(slots).filter((name) => /^slot-\d+\.json$/.test(name)), []);
+  const env = { ...f.options.env, CINDY_VALIDATE_CONCURRENCY: '0' };
+  await assert.rejects(() => validate({ ...f.options, env, runFn: () => 'ok\n' }), /validateConcurrency/);
 });
-
 
 test('SC1 helper 锁在异步 validate 整个运行期间持有（不会被同步 finally 提前释放）', async (t) => {
   const f = fixture(t);

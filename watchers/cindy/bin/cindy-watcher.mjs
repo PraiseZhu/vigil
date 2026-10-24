@@ -16,7 +16,9 @@ import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor, normalizeActo
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent } from './cindy-review-resolve.mjs';
 import {
   autoCleanupWatch, command as gitDefaultFn, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt,
+  pluginRepoPath, preflightFile, watchWorktreePath,
 } from './cindy-repair.mjs';
+import { canonicalRuntime, runtimeSha256 } from './cindy-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
 import { optionalConfig } from './profile.mjs';
 export const DISPATCH_PARAM_KEYS = Object.freeze(['title', 'message', 'target_session_id']);
@@ -1196,6 +1198,7 @@ export function consumeResult(previous, result, now) {
       dispatchId: result.dispatchId, sessionId: result.sessionId,
       head: result.head ?? result.sourceHead ?? previous.activeTask?.head,
       status, reason: result.reason ?? null, blockedKind: result.blockedKind ?? null,
+      ...(result.validationBlock ? { validationBlock: { ...result.validationBlock, remoteHead: previous.headRefOid ?? null, baseRefOid: previous.baseRefOid ?? null } } : {}),
       evidenceVersion: verified ? 2 : 1,
       receiptId: result.receiptId ?? digest(result),
       observedAt: result.observedAt ?? now,
@@ -1351,10 +1354,70 @@ export function reopenExternalBlocked({ previous, paths, now, head }) {
   };
 }
 
-export function reopenInfraBlocked({ previous, paths, now }) {
+const VALIDATE_BLOCK_REASON = /preflight|validat/i;
+// 这些是环境/配置故障，不是「validate 失败」：保持原有重开规则。
+const NON_VALIDATE_INFRA_REASON = /submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge/i;
+
+// 只读观测本机当前的 policy / 运行指纹 / 最新失败收据，不跑测试、不碰网络。观测不到的部分记 null。
+export function observeValidationContext({ previous, paths, env = process.env }) {
+  let policySha256 = null;
+  let runtime = null;
+  try {
+    const worktree = watchWorktreePath(pluginRepoPath(env), previous.number);
+    policySha256 = createHash('sha256').update(fs.readFileSync(preflightFile(env), 'utf8')).digest('hex');
+    runtime = runtimeSha256(canonicalRuntime({ worktree }));
+  } catch { /* worktree 缺失或不可读：留给调用方当作 unknown */ }
+  let failure = {};
+  try {
+    const dir = path.join(paths.stateDir, 'validations', previous.activeTask.dispatchId);
+    const files = fs.readdirSync(dir).filter((name) => /^[0-9a-f]{40}-[0-9a-f-]{36}\.json$/.test(name))
+      .map((name) => ({ file: path.join(dir, name), at: fs.statSync(path.join(dir, name)).mtimeMs })).sort((a, b) => b.at - a.at);
+    if (files.length) {
+      const bytes = fs.readFileSync(files[0].file);
+      const receipt = JSON.parse(bytes);
+      if (receipt.status !== 'pass') {
+        failure = { receiptSha256: createHash('sha256').update(bytes).digest('hex'), failureSetState: receipt.failureSetState ?? 'legacy', failureSetSha256: receipt.failureSetSha256 ?? null };
+      }
+    }
+  } catch { /* 没有失败收据：不构成变化证据 */ }
+  return { policySha256, runtimeSha256: runtime, ...failure };
+}
+
+// 与上次 validate 类 blocked 相比：head、base、policy、运行指纹、失败集合任一已知变化 → changed；
+// 全部未变 → unchanged；关键观测缺失 → unknown。unchanged 与 unknown 都不重新派发。
+export function validationReopenDecision({ previous, active, observe }) {
+  const block = active.validationBlock;
+  if (!block) {
+    const taskHead = active.head ?? null;
+    return taskHead && previous.headRefOid && taskHead !== previous.headRefOid ? 'changed' : 'unknown';
+  }
+  for (const key of ['remoteHead', 'baseRefOid']) {
+    const now = key === 'remoteHead' ? previous.headRefOid : previous.baseRefOid;
+    if (block[key] && now && block[key] !== now) return 'changed';
+  }
+  const current = observe();
+  if (!current) return 'unknown';
+  let unknown = false;
+  for (const key of ['policySha256', 'runtimeSha256']) {
+    if (!current[key]) { unknown = true; continue; }
+    if (block[key] && current[key] !== block[key]) return 'changed';
+  }
+  if (current.receiptSha256 && current.receiptSha256 !== block.receiptSha256) {
+    const same = current.failureSetState === 'parsed' && block.failureSetState === 'parsed'
+      && current.failureSetSha256 === block.failureSetSha256;
+    if (!same) return 'changed';
+  }
+  return unknown ? 'unknown' : 'unchanged';
+}
+
+export function reopenInfraBlocked({ previous, paths, now, observe }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind === AUTHOR_RECLAIMED || KEEL_BLOCK_REASON.test(String(active.reason ?? ''))
     || !INFRA_BLOCK_REASON.test(String(active.reason ?? ''))) return previous;
+  if (active.validationBlock || (VALIDATE_BLOCK_REASON.test(String(active.reason ?? '')) && !NON_VALIDATE_INFRA_REASON.test(String(active.reason ?? '')))) {
+    const decision = validationReopenDecision({ previous, active, observe: observe ?? (() => observeValidationContext({ previous, paths })) });
+    if (decision !== 'changed') return previous;
+  }
   const dispatchId = active.dispatchId;
   const done = previous.infraReopened ?? [];
   const epoch = previous.admissionEpoch ?? null;
