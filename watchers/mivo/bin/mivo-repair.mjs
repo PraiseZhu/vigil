@@ -15,6 +15,7 @@ import { taskRepairPolicy } from './mivo-feedback-policy.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, readPr, writePr } from './mivo-state.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
 import { acquireValidationSlot, runStreaming, validationConfig } from './mivo-validation-runtime.mjs';
+import { compareBaseline, verifyBaselineBinding } from './mivo-validation-baseline.mjs';
 import {
   PARSER_VERSION, canonicalRuntime, emptyFailureSet, lookupPass, parseFailureSet, publishPass, runtimeSha256,
 } from './mivo-validation-evidence.mjs';
@@ -296,7 +297,7 @@ export function assertOwner({ home, taskPath, ghFn = command, ownershipFn = coll
         assertIdentity(result, task, sessionId, 'repair result');
         controlled = result.schemaVersion === 2 && result.kind === 'mivo-repair-result'
           && result.head === validatedHead && result.pushed === true
-          && ['pass', 'approved-exception'].includes(result.verification?.status)
+          && ['pass', 'approved-exception', 'baseline-only-failure'].includes(result.verification?.status)
           && result.verification.head === validatedHead;
       }
     }
@@ -474,7 +475,7 @@ export function verifyKeelRun({ task, runId, root = keelLedgerRoot(), validatedH
   if (verification?.head !== validatedHead) reject('local verification HEAD does not match');
   if (verification.status === 'not-required-no-change') {
     if (steps.verify?.status !== 'not-run' || typeof steps.verify.reason !== 'string' || !steps.verify.reason.trim()) reject('no-change flow must explain why local tests were not run');
-  } else if (!['pass', 'approved-exception'].includes(verification.status)
+  } else if (!['pass', 'approved-exception', 'baseline-only-failure'].includes(verification.status)
     || steps.verify?.head !== validatedHead || !/^[a-f0-9]{64}$/.test(verification.receiptSha256 ?? '')
     || steps.verify?.receiptSha256 !== verification.receiptSha256) reject('flow must reference the current local validation receipt');
   return { status: 'verified', runId, rows: rows.length, decisions: refs.length, contractVersion: version };
@@ -799,7 +800,7 @@ export async function validate({ home, taskPath, validatedHead, ghFn = command, 
   const stopHeartbeat = startActivityHeartbeat(paths, task, 'validate');
   let slot = null;
   try {
-  const { sessionId } = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
+  const { sessionId, pr: ownedPr } = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
   assertTaskRepairScope(task, validatedHead);
   const worktree = taskWorktree(task);
@@ -821,6 +822,8 @@ export async function validate({ home, taskPath, validatedHead, ghFn = command, 
   let reusedFrom = null;
   let reusedTimes = null;
   let identityKey = null;
+  let baseline = null;
+  let baselineAttempt = null;
   if (!exception) {
     const config = validationConfig({ env });
     const timeoutMs = config.timeoutMs;
@@ -879,6 +882,21 @@ export async function validate({ home, taskPath, validatedHead, ghFn = command, 
           status = 'fail';
           failureKind = step.failureKind ?? 'test-failure';
           failure = step.failureKind ? { state: 'unparsed', failureSet: [], failureSetSha256: null } : parseFailureSet(step.output, { worktree });
+          if (step.exitCode === 1 && !step.failureKind && failure.state === 'parsed' && failure.failureSet.length) {
+            // 先放槽位再跑基线：基线自己申请槽位，不持一个槽等另一个槽。
+            slot.release(); slot = null;
+            try {
+              const outcome = await compareBaseline({
+                paths, repo: task.repo, worktree, validatedHead, baseRefName: ownedPr?.baseRefName, prFailure: failure,
+                policySha256: policy.sha256, runtime, config, env,
+                git: (args, options) => gitOutput(args, gitFn, options),
+                runStep: (binary, args, stepBase, logPath) => runLoggedStep(runFn, binary, args, stepBase, logPath),
+                needsInstall: needsDependencyInstall, slotPollMs,
+              });
+              baselineAttempt = outcome.accepted ? { accepted: true } : { accepted: false, reason: outcome.reason };
+              if (outcome.accepted) { status = 'baseline-only-failure'; baseline = outcome.baseline; }
+            } catch (error) { baselineAttempt = { accepted: false, reason: `baseline-error: ${String(error.message).slice(0, 200)}` }; }
+          }
         }
       }
     }
@@ -898,7 +916,7 @@ export async function validate({ home, taskPath, validatedHead, ghFn = command, 
       validationEvidenceVersion: 1, parserVersion: PARSER_VERSION, runtime, runtimeSha256: runtimeSha256(runtime),
       logPath: log?.logPath ?? null, logSha256: log?.logSha256 ?? null,
       failureSetState: failure?.state ?? 'unparsed', failureSet: failure?.failureSet ?? [], failureSetSha256: failure?.failureSetSha256 ?? null,
-      failureKind, reusedFrom, ...(reusedFrom ? { reusedAt: new Date().toISOString() } : {}),
+      failureKind, reusedFrom, ...(baseline ? { baseline } : {}), ...(baselineAttempt ? { baselineAttempt } : {}), ...(reusedFrom ? { reusedAt: new Date().toISOString() } : {}),
     } : {}),
     startedAt: reusedTimes?.startedAt ?? startedAt, finishedAt: reusedTimes?.finishedAt ?? new Date().toISOString(),
   };
@@ -927,6 +945,17 @@ function verifiedLocal(paths, task, sessionId, head, worktree, gitFn, receiptPat
     const exception = validationException(paths, task, sessionId, head, worktree, gitFn);
     if (!exception || exception.approvalSha256 !== receipt.exception?.approvalSha256) fail('local validation exception is no longer bound');
     return { status: receipt.status, head, receiptPath: file, receiptSha256: pointer.receiptSha256 };
+  }
+  if (receipt.status === 'baseline-only-failure') {
+    const policy = validationPolicy(worktree, task, gitFn);
+    if (receipt.policy?.sha256 !== policy.sha256) fail('local validation did not pass for this HEAD');
+    if (receipt.runtimeSha256 !== runtimeSha256(canonicalRuntime({ worktree }))) fail('baseline-only validation runtime fingerprint changed');
+    const problem = verifyBaselineBinding({ validations: paths.validations, receipt });
+    if (problem) fail(`baseline-only validation is not valid: ${problem}`);
+    return {
+      status: receipt.status, head, receiptPath: file, receiptSha256: pointer.receiptSha256,
+      policy: { file: policy.file, sourceHead: policy.sourceHead, sha256: policy.sha256 },
+    };
   }
   if (receipt.status !== 'pass' || receipt.exitCode !== 0) fail('local validation did not pass for this HEAD');
   const policy = validationPolicy(worktree, task, gitFn);
@@ -1092,7 +1121,7 @@ export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, o
   const hookPath = gitOutput(['-C', worktree, 'rev-parse', '--git-path', 'hooks'], gitFn).trim();
   if (!hookPath) fail('effective Git hook directory unavailable');
   const verified = guard.verification;
-  const validatedPolicy = verified?.status === 'pass' && verified.head === validatedHead && verified.policy?.file && verified.policy?.sha256
+  const validatedPolicy = ['pass', 'baseline-only-failure'].includes(verified?.status) && verified.head === validatedHead && verified.policy?.file && verified.policy?.sha256
     ? { policyFile: verified.policy.file, policySha256: verified.policy.sha256 } : null;
   const hooks = createPushHooks({ worktree, originalHooks: path.resolve(worktree, hookPath),
     home: guard.home, taskPath: guard.taskPath, head: validatedHead, ref: `refs/heads/${task.headRefName}`, gitBinary: GIT,

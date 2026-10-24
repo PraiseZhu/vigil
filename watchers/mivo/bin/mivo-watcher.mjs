@@ -1380,7 +1380,7 @@ export function consumeResult(previous, result, now) {
     : result.status === 'complete' && !verified ? 'legacy-complete' : result.status;
   if (status === 'complete' && verified && (
     result.ci?.requiredGreen !== true || result.ci?.head !== result.head
-    || !['passed', 'pass', 'approved-exception', 'not-required-no-change'].includes(result.verification?.status)
+    || !['passed', 'pass', 'approved-exception', 'baseline-only-failure', 'not-required-no-change'].includes(result.verification?.status)
   )) throw new Error('complete result lacks current-head CI and validation evidence');
   return {
     ...previous,
