@@ -18,7 +18,8 @@ import {lifelineFeedback} from './mivo-lifeline-source.mjs';
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent, completedMemberFeedback, coveredFeedbackItems, replyToMemberFeedback, requestMemberReviewers } from './mivo-review-resolve.mjs';
 import { codeScanningFeedbackItems } from './mivo-code-scanning.mjs';
 import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck } from './mivo-pr-actions.mjs';
-import { autoCleanupWatch, command as gitDefaultFn, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION } from './mivo-repair.mjs';
+import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath } from './mivo-repair.mjs';
+import { canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
 
@@ -1380,7 +1381,7 @@ export function consumeResult(previous, result, now) {
     : result.status === 'complete' && !verified ? 'legacy-complete' : result.status;
   if (status === 'complete' && verified && (
     result.ci?.requiredGreen !== true || result.ci?.head !== result.head
-    || !['passed', 'pass', 'approved-exception', 'not-required-no-change'].includes(result.verification?.status)
+    || !['passed', 'pass', 'approved-exception', 'baseline-only-failure', 'not-required-no-change'].includes(result.verification?.status)
   )) throw new Error('complete result lacks current-head CI and validation evidence');
   return {
     ...previous,
@@ -1389,6 +1390,7 @@ export function consumeResult(previous, result, now) {
       dispatchId: result.dispatchId, sessionId: result.sessionId,
       head: result.head ?? result.sourceHead ?? previous.activeTask?.head,
       status, reason: result.reason ?? null, blockedKind: result.blockedKind ?? null,
+      ...(result.validationBlock ? { validationBlock: { ...result.validationBlock, remoteHead: previous.headRefOid ?? null, baseRefOid: previous.baseRefOid ?? null } } : {}),
       evidenceVersion: verified ? 2 : 1,
       receiptId: result.receiptId ?? digest(result),
       observedAt: result.observedAt ?? now,
@@ -1409,11 +1411,16 @@ export const KEEL_LEDGER_HELD = 'keel-ledger-unavailable';
 export function reopenExternalBlocked({ previous, paths, now, head }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind !== 'external' || active.blockedKind === AUTHOR_RECLAIMED) return previous;
-  const rulesChanged = previous.rulesVersion != null && previous.rulesVersion !== rulesVersion();
+  // validate 类阻塞只经 reopenInfraBlocked 的五要素判据决定是否重开：部署新版（rulesVersion 变化）不是重开理由；
+  // 同一 dispatch 已被 infra 路径重开时，这里不再退第二次轮次。head 变化照旧重开。
+  // 与 reopenInfraBlocked 共用同一个 isValidateClassBlock 分类（reason 不必命中 INFRA_BLOCK_REASON）。
+  const validateClass = isValidateClassBlock(active);
+  const rulesChanged = !validateClass && previous.rulesVersion != null && previous.rulesVersion !== rulesVersion();
   const headChanged = Boolean(head && (active.head ?? active.sourceHead) && (active.head ?? active.sourceHead) !== head);
   if (!rulesChanged && !headChanged) return previous;
   const dispatchId = active.dispatchId;
   if (typeof dispatchId !== 'string') return previous;
+  if (validateClass && (previous.infraReopened ?? []).some((item) => item.dispatchId === dispatchId)) return previous;
   const done = previous.externalReopened ?? [];
   if (done.some((item) => item.dispatchId === dispatchId && item.rulesChanged === rulesChanged && item.headChanged === headChanged)) return previous;
   const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`));
@@ -1427,10 +1434,82 @@ export function reopenExternalBlocked({ previous, paths, now, head }) {
   };
 }
 
-export function reopenInfraBlocked({ previous, paths, now }) {
+const VALIDATE_BLOCK_REASON = /preflight|validat/i;
+// 这些是环境/配置故障，不是「validate 失败」：保持原有重开规则。
+const NON_VALIDATE_INFRA_REASON = /submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge/i;
+// 「validate 类阻塞」的唯一分类：reason 属于环境/配置故障的一律不算（即使挂着 validationBlock）；
+// 其余的，挂了失败收据（validationBlock）或 reason 指向 preflight/validate 的才算。
+export function isValidateClassBlock(active) {
+  const reason = String(active?.reason ?? '');
+  if (NON_VALIDATE_INFRA_REASON.test(reason)) return false;
+  return Boolean(active?.validationBlock) || VALIDATE_BLOCK_REASON.test(reason);
+}
+
+// 只读观测本机当前的 policy / 运行指纹 / 最新失败收据，不跑测试、不碰网络。观测不到的部分记 null。
+export function observeValidationContext({ previous, paths, env = process.env, gitFn = gitDefaultFn, currentBase = null }) {
+  let policySha256 = null;
+  let runtime = null;
+  let mergeBase = null;
+  try {
+    const worktree = watchWorktreePath(pluginRepoPath(env), previous.number);
+    const block = previous.activeTask?.validationBlock;
+    // 当前 base 优先取本轮 poll/采集结果（currentBase），其次取 state 条目里上一轮持久化的值；旧条目没有该字段时首轮为 unknown。
+    mergeBase = validationMergeBase({ worktree, validatedHead: block?.validatedHead ?? previous.headRefOid,
+      baseRefOid: currentBase?.baseRefOid ?? previous.baseRefOid, baseRefName: currentBase?.baseRefName ?? previous.baseRefName, gitFn });
+    policySha256 = createHash('sha256').update(fs.readFileSync(path.join(worktree, '.githooks', 'pre-push'), 'utf8').trim()).digest('hex');
+    runtime = runtimeSha256(canonicalRuntime({ worktree }));
+  } catch { /* worktree 缺失或不可读：留给调用方当作 unknown */ }
+  let failure = {};
+  try {
+    const dir = path.join(paths.stateDir, 'validations', previous.activeTask.dispatchId);
+    const files = fs.readdirSync(dir).filter((name) => /^[0-9a-f]{40}-[0-9a-f-]{36}\.json$/.test(name))
+      .map((name) => ({ file: path.join(dir, name), at: fs.statSync(path.join(dir, name)).mtimeMs })).sort((a, b) => b.at - a.at);
+    if (files.length) {
+      const bytes = fs.readFileSync(files[0].file);
+      const receipt = JSON.parse(bytes);
+      if (receipt.status !== 'pass') {
+        failure = { receiptSha256: createHash('sha256').update(bytes).digest('hex'), failureSetState: receipt.failureSetState ?? 'legacy', failureSetSha256: receipt.failureSetSha256 ?? null };
+      }
+    }
+  } catch { /* 没有失败收据：不构成变化证据 */ }
+  return { mergeBase, policySha256, runtimeSha256: runtime, ...failure };
+}
+
+// 与上次 validate 类 blocked 相比：head、base、policy、运行指纹、失败集合任一已知变化 → changed；
+// 全部未变 → unchanged；关键观测缺失 → unknown。unchanged 与 unknown 都不重新派发。
+export function validationReopenDecision({ previous, active, observe }) {
+  const block = active.validationBlock;
+  if (!block) {
+    const taskHead = active.head ?? null;
+    return taskHead && previous.headRefOid && taskHead !== previous.headRefOid ? 'changed' : 'unknown';
+  }
+  if (block.remoteHead && previous.headRefOid && block.remoteHead !== previous.headRefOid) return 'changed';
+  const current = observe();
+  if (!current) return 'unknown';
+  let unknown = false;
+  // base 分支 tip 前进不算变化，只比较被验证 head 与 base 的 merge-base；任一侧取不到就按 unknown。
+  if (!current.mergeBase || !block.mergeBase) unknown = true;
+  else if (current.mergeBase !== block.mergeBase) return 'changed';
+  for (const key of ['policySha256', 'runtimeSha256']) {
+    if (!current[key]) { unknown = true; continue; }
+    if (block[key] && current[key] !== block[key]) return 'changed';
+  }
+  if (current.receiptSha256 && current.receiptSha256 !== block.receiptSha256) {
+    const same = current.failureSetState === 'parsed' && block.failureSetState === 'parsed'
+      && current.failureSetSha256 === block.failureSetSha256;
+    if (!same) return 'changed';
+  }
+  return unknown ? 'unknown' : 'unchanged';
+}
+
+export function reopenInfraBlocked({ previous, paths, now, observe, currentBase = null }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind === AUTHOR_RECLAIMED || KEEL_BLOCK_REASON.test(String(active.reason ?? ''))
-    || !INFRA_BLOCK_REASON.test(String(active.reason ?? ''))) return previous;
+    || !(INFRA_BLOCK_REASON.test(String(active.reason ?? '')) || isValidateClassBlock(active))) return previous;
+  if (isValidateClassBlock(active)) {
+    const decision = validationReopenDecision({ previous, active, observe: observe ?? (() => observeValidationContext({ previous, paths, currentBase })) });
+    if (decision !== 'changed') return previous;
+  }
   const dispatchId = active.dispatchId;
   const done = previous.infraReopened ?? [];
   const epoch = previous.admissionEpoch ?? null;
@@ -1770,7 +1849,7 @@ export function* processPr({
   try { previous = consumeResult(previous, resultFor(previous, paths), now); }
   catch (error) { resultError = error.message; }
   if (!resultError) previous = rememberPendingClose(previous, paths);
-  if (!resultError) previous = reopenInfraBlocked({ previous: reopenKeelBlocked({ previous, paths, now, keelRoot }), paths, now });
+  if (!resultError) previous = reopenInfraBlocked({ previous: reopenKeelBlocked({ previous, paths, now, keelRoot }), paths, now, currentBase: { baseRefOid: pr.baseRefOid, baseRefName: pr.baseRefName } });
   if (!resultError) previous = reopenProductIntentBlocked({ previous, paths, now });
   if (!resultError) previous = reopenRoundLimitBlocked({ previous });
   if (!resultError) previous = reopenExternalBlocked({ previous, paths, now, head: pr.headRefOid });
@@ -1889,7 +1968,10 @@ export function* processPr({
   // it (controlledHead), or it was just taken over as the author's push or a new handoff.
   const trustedHead = { handoffId: handoff.id, head: ownerPr.headRefOid };
   previous = { ...previous, handoff, trustedHead };
-  base = { ...base, handoff, trustedHead };
+  // 当前 base 随采集结果落进 state 条目：下一轮（含快路径）的 merge-base 观测据此比较；旧条目没有该字段时首轮 unknown。
+  const baseFields = { baseRefOid: ownerPr.baseRefOid ?? base.baseRefOid ?? null, baseRefName: ownerPr.baseRefName ?? base.baseRefName ?? null };
+  previous = { ...previous, ...baseFields };
+  base = { ...base, handoff, trustedHead, ...baseFields };
   if (hasWatchOff(collected.labels)) {
     previous = { ...base, labels: collected.labels ?? [], optOut: true };
     state.prs[key] = previous;
@@ -2439,7 +2521,7 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
   // A PR the Keel incompatibility froze has nothing new on GitHub, so its fingerprint never changes;
   // without this it would never reach processPr, where reopenKeelBlocked hands its feedback back.
   const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous
-    || reopenInfraBlocked({ previous, paths, now }) !== previous
+    || reopenInfraBlocked({ previous, paths, now, currentBase: { baseRefOid: normalized?.baseRefOid } }) !== previous
     || reopenExternalBlocked({ previous, paths, now, head: previous.headRefOid }) !== previous;
   // The same holds for a PR an older build stopped on a product-intent conflict, or whose awaiting-discussion
   // label the watcher still has to take off (including after a failed DELETE): nothing changes on GitHub.

@@ -14,7 +14,7 @@ function policySha(tree) {
   return createHash('sha256').update(fs.readFileSync(path.join(tree, '.githooks/pre-push'), 'utf8').trim()).digest('hex');
 }
 
-function fixture(t, { revoke = false, hookFail = false, reuseValidatedHook = false } = {}) {
+async function fixture(t, { revoke = false, hookFail = false, reuseValidatedHook = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vigil push fixture '));
   const home = path.join(root, 'watcher'), plugin = path.join(root, 'plugin');
   const tree = watchWorktreePath(plugin, 790), origin = path.join(root, 'origin.git');
@@ -58,7 +58,7 @@ function fixture(t, { revoke = false, hookFail = false, reuseValidatedHook = fal
   const scReport = path.join(root, 'sc.json');
   fs.writeFileSync(scReport, JSON.stringify({ scs: [{ id: 'SC-1', status: 'pass', feedbackKeys: ['thread:one'], evidence: ['isolated repository fixture'] }] }));
   const options = { home, taskPath, scReport, validatedHead: head, ghFn, gitFn, originUrl: origin, env: { ...env, PREFLIGHT_SKIP: '0' } };
-  assert.equal(validate(options).status, 'pass');
+  assert.equal((await validate(options)).status, 'pass');
   if (reuseValidatedHook) {
     git('-C', tree, 'config', 'core.hooksPath', '.githooks');
   } else {
@@ -83,16 +83,16 @@ function guardRemoved(f) {
   assert.ok(f.config() === '.githooks' || f.config().endsWith(`${path.sep}hooks`) || f.config().endsWith('/hooks'));
 }
 
-test('Draft during the real pre-push hook prevents publication after repository checks', t => {
-  const f = fixture(t, { revoke: true });
+test('Draft during the real pre-push hook prevents publication after repository checks', async t => {
+  const f = await fixture(t, { revoke: true });
   assert.throws(f.finalize, /handoff|pre-push|non-draft/i);
   assert.equal(fs.existsSync(f.signal), true, 'the real repository hook ran');
   assert.equal(f.remote(), f.sourceHead, 'revoked ownership must not publish a commit');
   guardRemoved(f);
 });
 
-test('an authorized push preserves original hook arguments, stdin and other hooks', t => {
-  const f = fixture(t);
+test('an authorized push preserves original hook arguments, stdin and other hooks', async t => {
+  const f = await fixture(t);
   const result = f.finalize();
   assert.equal(result.pushed, true); assert.equal(f.remote(), f.head);
   assert.equal(fs.readFileSync(f.hookArgs, 'utf8').split('\n')[0], 'origin');
@@ -101,16 +101,16 @@ test('an authorized push preserves original hook arguments, stdin and other hook
   guardRemoved(f);
 });
 
-test('a failing original pre-push hook still rejects the push and restores configuration', t => {
-  const f = fixture(t, { hookFail: true });
+test('a failing original pre-push hook still rejects the push and restores configuration', async t => {
+  const f = await fixture(t, { hookFail: true });
   assert.throws(f.finalize, /hook command failed|failed to push|pre-push/i);
   assert.equal(f.remote(), f.sourceHead);
   assert.equal(fs.existsSync(f.hookInput), true);
   guardRemoved(f);
 });
 
-test('a bound PASS receipt skips the original pre-push when the hook identity matches', t => {
-  const f = fixture(t, { reuseValidatedHook: true });
+test('a bound PASS receipt skips the original pre-push when the hook identity matches', async t => {
+  const f = await fixture(t, { reuseValidatedHook: true });
   assert.equal(f.hookRuns(), 1, 'validate runs the repository hook once');
   const result = f.finalize();
   assert.equal(result.pushed, true);
@@ -133,8 +133,8 @@ function runWrapper(f, { validatedPolicy, stdin }) {
   } finally { hooks.cleanup(); }
 }
 
-test('skipping the original pre-push still rejects mismatched refs', t => {
-  const f = fixture(t, { reuseValidatedHook: true });
+test('skipping the original pre-push still rejects mismatched refs', async t => {
+  const f = await fixture(t, { reuseValidatedHook: true });
   const before = f.hookRuns();
   assert.throws(() => runWrapper(f, {
     validatedPolicy: { policyFile: '.githooks/pre-push', policySha256: policySha(f.tree) },
@@ -143,8 +143,8 @@ test('skipping the original pre-push still rejects mismatched refs', t => {
   assert.equal(f.hookRuns(), before);
 });
 
-test('a policy hash mismatch still runs the original pre-push', t => {
-  const f = fixture(t, { reuseValidatedHook: true });
+test('a policy hash mismatch still runs the original pre-push', async t => {
+  const f = await fixture(t, { reuseValidatedHook: true });
   const before = f.hookRuns();
   runWrapper(f, {
     validatedPolicy: { policyFile: '.githooks/pre-push', policySha256: 'a'.repeat(64) },
@@ -154,8 +154,8 @@ test('a policy hash mismatch still runs the original pre-push', t => {
   assert.equal(fs.readFileSync(f.hookArgs, 'utf8').split('\n')[0], 'origin');
 });
 
-test('missing validatedPolicy keeps the original pre-push', t => {
-  const f = fixture(t, { reuseValidatedHook: true });
+test('missing validatedPolicy keeps the original pre-push', async t => {
+  const f = await fixture(t, { reuseValidatedHook: true });
   const before = f.hookRuns();
   runWrapper(f, {
     validatedPolicy: null,

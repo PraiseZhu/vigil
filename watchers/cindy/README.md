@@ -73,6 +73,9 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 | `minCollectMs` | `CINDY_WATCHER_MIN_COLLECT_MS` | `15000`。整轮截止减派发预留后不足这个时间时,不再启动新的采集,留给下一轮 |
 | `fullCollectMs` | `CINDY_WATCHER_FULL_COLLECT_MS` | `600000`。无修复会话的 Ready PR 即使指纹没变,距上次完整采集超过它也强制全量采集一次 |
 | `followIntervalMs` | `CINDY_WATCHER_FOLLOW_MS` | `15000`。轮内批量复查 open PR 变化的间隔;环境变量设为 `0` 只跑全量一轮 |
+| `validateConcurrency` | `CINDY_VALIDATE_CONCURRENCY` | `2`。同一 watcher home 同时运行的 validate 上限，正整数；非法值直接报错，不静默回退。超限的 validate 排队等槽位，排队不是失败。槽位按 pid 存活判定回收，并终止遗留进程组：命令经 `sh` 启动，先把进程组号落盘到槽位旁的 `.pgid` 文件、确认持有者仍存活才 `exec`，持有者在 spawn 后任意时刻崩溃都能回收 |
+| `validateStallMinutes` | `CINDY_VALIDATE_STALL_MINUTES` | `10`。连续无新输出超过它就终止整个进程组，收据记 `failureKind: validate-stalled`，不当作测试失败 |
+| `preflightTimeoutMinutes` | `CINDY_PREFLIGHT_TIMEOUT_MINUTES` | `60`。validate 的总超时（此前硬编码 60 分钟，现可配置）；只接受大于 0 的有限数字，换算毫秒后须为不超过 2147483647 的安全整数。非法值直接报错 |
 
 
 拷一份 [`config/examples/cindy.profile.example.json`](../../config/examples/cindy.profile.example.json)
@@ -81,6 +84,22 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
 其余环境变量(`CINDY_WATCHER_MODE`/`CINDY_WATCHER_PR`/`CINDY_WATCHER_NODE_ID`/
 `CINDY_WATCHER_ENABLED`/`CINDY_WATCHER_DISPATCH`/`CINDY_WATCHER_BRIDGE`)是运行时/调度相关
 的开关,不经过 profile 机制,直接读 `process.env`,具体含义见对应源码文件头部注释。
+
+### validate 运行方式与证据（本地预检）
+
+- **异步、限并发**：`validate` 是异步命令。helper 运行锁（每 PR 一把）撑到 validate 真正结束，部署锁互斥不被异步化破坏；同一 PR 的并发 validate 仍由 helper 锁拒绝为 `busy`，限并发针对不同 PR 之间的争用。
+- **流式日志**：stdout/stderr 流式写入 `state/validations/logs/` 下 0600 的不可变日志；收据记 `logPath`、`logSha256`。无输出看门狗与总超时是两个独立原因（`validate-stalled`、`validate-timeout`），都终止整个进程组。
+- **固定 TMPDIR**：子进程注入 `TMPDIR=realpath(os.tmpdir())`；policy 文件（外部预检脚本）及其 sha256 不变。
+- **同条件复用通过收据**：同一 PR、同一 `validatedHead`、同一外部预检脚本 sha256、同一运行指纹（platform、arch、node、uid、`realpath(TMPDIR)`、`package-lock.json` sha256）已有完整 pass 收据时不再重跑，写一份绑定当前派发的新收据，`reusedFrom` 指向原收据；任一要素变化或收据/日志被改都重跑。
+- **失败集合**：收据记 `failureSetState`、`failureSet`（`{step, file, test, errorSha}`）、`failureSetSha256`；无法完整解析记 `unparsed`，不与任何集合相等。外部预检脚本的输出格式不由本仓约定，解析器只认 vitest 的 `FAIL` 行；其他格式（含 node:test）一律 `unparsed`，不会被当作「失败没有变化」的证据。
+
+### 为什么 Cindy 没有「仅基线失败受控通过」
+
+Mivo 侧的 `baseline-only-failure` 依赖仓库内的 `.githooks/pre-push`：它可以在 merge-base 的干净树里原样复跑同一份 policy，并通过受控 pre-push 让 `git push` 不再重跑。Cindy 的 policy 是外部脚本（`CINDY_PREFLIGHT_BIN`），PR 在 fork 上，也没有受控 pre-push hook，基线树里没有「同一份 policy」可比，且新增 hook 会改变 fork push 的边界。因此本 watcher **不实现**基线受控通过，也不接受 `baseline-only-failure` 状态；本地 validate 失败就是失败。失败集合的记录是为了让 infra 重开判据能识别「失败没有变化」。
+
+### validate 类阻塞不再原样重投
+
+与 Mivo 相同：validate 类阻塞（判定只有一个：原因不属于 submodule、pathspec、worktree HEAD 等环境/配置故障，且（带 `validationBlock`，或原因含 preflight/validat）；原因不必命中 infra 关键词（例如「helper validate … exit 1」「validate DCO fails」这类文字也算）。infra 重开与 external 的 `rulesVersion` 重开用的是同一个判定）重开前比较上次阻塞时的远端 head、merge-base（被验证 head 与 base 的 merge-base，base 分支 tip 前进但 merge-base 不变不重开；取不到时按未知处理）、外部预检脚本 sha256、运行指纹、失败集合；全部未变（或关键观测缺失）不重新派发、不消耗每代次上限，任一已知变化才重开。原因属于 pathspec、submodule、worktree HEAD 等环境/配置故障的阻塞，即使带着 `validationBlock`，也按原有 infra 规则重开，不套五要素。当前 base（`baseRefOid`/`baseRefName`）取自本轮 poll/采集结果并随采集写进 PR 状态条目；升级前的旧条目没有这两个字段，首轮 merge-base 记为未知，下一轮写入后即可比较。部署新版（`rulesVersion` 变化）不是 validate 类阻塞的重开理由，同一 dispatch 已被五要素判据重开的，external 路径不再重复重开；非 validate 类 external 阻塞随 `rulesVersion` 变化重开的行为不变。
 
 ### 新版任务必需的 Keel 配置
 

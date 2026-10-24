@@ -75,3 +75,14 @@ export function optionalConfig(key, { envVar, env = process.env, fallback } = {}
   if (profile && profile[key] !== undefined && profile[key] !== '') return profile[key];
   return fallback;
 }
+
+/**
+ * 严格可选配置：仅当 env 与 profile 中该键都「缺失」时才用 fallback。
+ * 显式空串、null、布尔、数组、对象一律原样返回给调用方校验，不会被静默回退吞掉。
+ */
+export function optionalConfigStrict(key, { envVar, env = process.env, fallback } = {}) {
+  if (envVar && env[envVar] !== undefined) return env[envVar];
+  const profile = loadProfile(env);
+  if (profile && Object.hasOwn(profile, key)) return profile[key];
+  return fallback;
+}
