@@ -78,6 +78,16 @@ test('parseFailureSet：报错里临时目录的随机名不进 errorSha（同�
   assert.notEqual(a.failureSet[0].errorSha, other.failureSet[0].errorSha, '临时目录以外的差异仍区分');
 });
 
+test('parseFailureSet：报错里每次运行都变的时间戳不进 errorSha', () => {
+  const withTs = (ts) => HOOK_FAIL.replace('AssertionError: expected 420 to be 384', `AssertionError: run_id=timer-${ts.compact} at ${ts.iso} expected 420 to be 384`);
+  const a = parseFailureSet(withTs({ compact: '20261024T132343Z', iso: '2026-10-24T13:23:43.120Z' }), { worktree: WT });
+  const b = parseFailureSet(withTs({ compact: '20261024T133945Z', iso: '2026-10-24T13:39:45Z' }), { worktree: WT });
+  assert.equal(a.state, 'parsed');
+  assert.equal(a.failureSet[1].errorSha, b.failureSet[1].errorSha);
+  const other = parseFailureSet(withTs({ compact: '20261024T132343Z', iso: '2026-10-24T13:23:43.120Z' }).replace('expected 420 to be 384', 'expected 421 to be 384'), { worktree: WT });
+  assert.notEqual(a.failureSet[1].errorSha, other.failureSet[1].errorSha, '时间戳以外的差异仍区分');
+});
+
 test('parseFailureSet：数字/expected 不同的同名失败是不同元素', () => {
   const other = HOOK_FAIL.replace('expected 501 to be +0', 'expected 502 to be +0').replace('+ 501', '+ 502');
   const a = parseFailureSet(HOOK_FAIL, { worktree: WT });
