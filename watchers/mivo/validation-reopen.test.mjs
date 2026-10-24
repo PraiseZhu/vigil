@@ -162,3 +162,14 @@ test('SC7 validationMergeBase 取不到时返回 null：对象缺失、base 为�
   assert.equal(validationMergeBase({ worktree: watch, validatedHead: B, baseRefOid: null, baseRefName: null }), null);
   assert.equal(validationMergeBase({ worktree: path.join(watch, 'missing'), validatedHead: B, baseRefOid: B, baseRefName: 'main' }), null);
 });
+
+test('SC7 reason 含 preflight 但属环境/配置故障（pathspec、submodule、worktree HEAD）：沿用原有重开规则，不被 validate 判据拦住', (t) => {
+  for (const reason of ['preflight exit 1: pathspec example-protocol did not match', 'preflight could not start: submodule update failed', 'preflight refused: worktree HEAD does not match validated-head']) {
+    const { paths, previous } = setup(t, { block: null, reason });
+    const next = reopenInfraBlocked({ previous, paths, now: 'n', observe: () => null });
+    assert.equal(next.eligibility, 'active', reason);
+    assert.equal(next.infraReopened.length, 1, reason);
+  }
+  const { paths, previous } = setup(t, { block: null, reason: 'local preflight failed' });
+  assert.equal(reopenInfraBlocked({ previous, paths, now: 'n', observe: () => null }), previous, '真正的 validate 失败仍走五要素判据');
+});
