@@ -1,0 +1,15 @@
+{
+  "ownerLogin": "ExampleUser",
+  "projectNumber": 1,
+  "stateDir": "/path/to/acceptance-state",
+  "worktreeDir": "/path/to/acceptance-worktrees",
+  "startAt": "2026-01-01T00:00:00.000Z",
+  "githubTokenFile": "/path/to/github.token",
+  "autoRepos": ["ExampleUser/*"],
+  "forkRepos": ["makecindy/cindy"],
+  "watchRepos": ["example-org/handoff-repo"],
+  "stallMinutes": 30,
+  "writeCommand": ["node", "/path/to/host/write-gate.mjs"],
+  "appConfigPath": "/path/to/github-app.json",
+  "slackBotTokenFile": "/path/to/slack.token"
+}

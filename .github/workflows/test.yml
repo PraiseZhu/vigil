@@ -24,5 +24,7 @@ jobs:
         run: node --env-file=watchers/cindy/test.env --test watchers/cindy/*.test.mjs
       - name: cindy-watcher python tests
         run: python3 -B watchers/cindy/cindy-watch-script.test.py
+      - name: acceptance-watcher tests
+        run: node --env-file=watchers/acceptance/test.env --test watchers/acceptance/*.test.mjs
       - name: check sanitized (generic patterns only; CI has no local denylist)
         run: node scripts/check-sanitized.mjs
