@@ -58,3 +58,14 @@ test('Cindy 没有等上游的门：失败的必需检查不会被暂缓', () =>
   const out = applyCiTriage(resultOf([rule(verify)]), { checks: [verify, pending], jobsById: new Map(), now: NOW });
   assert.equal(out.required[0].status, 'failed');
 });
+
+test('同一 head 上同一分片第二次被取消：不再当 infra', () => {
+  const verify = check('verify', { conclusion: 'failure' });
+  const first = check('Linux unit tests (2/4)', { conclusion: 'cancelled' });
+  const second = check('Linux unit tests (2/4)', { conclusion: 'cancelled' });
+  second.started_at = '2026-10-25T07:30:00Z';
+  const out = applyCiTriage(resultOf([rule(verify)]), { checks: [verify, first, second], jobsById: new Map(), now: NOW });
+  const [child] = out.required[0].triage.children;
+  assert.equal(child.kind, 'code');
+  assert.match(child.note, /已失败 2 次/);
+});

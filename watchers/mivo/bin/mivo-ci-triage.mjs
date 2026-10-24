@@ -103,6 +103,13 @@ export function latestByName(checks = []) {
 const failedStepOf = (job) => (Array.isArray(job?.steps) ? job.steps : [])
   .find((step) => BAD.has(String(step?.conclusion ?? '').toLowerCase()))?.name ?? null;
 
+// GitHub reports a job that hits its timeout-minutes as cancelled. One cancel is usually noise; the same check
+// failing again on the same head is not (2026-10-25, #1254: Linux unit shard (2/4) stopped at its 15-minute limit twice).
+export const REPEAT_FAILURES = 2;
+const failedAttempts = (checks, name) => checks.filter((item) => item?.name === name && item.status === 'completed'
+  && BAD.has(String(item.conclusion ?? '').toLowerCase())).length;
+const repeatNote = (count) => `同一 head 上已失败 ${count} 次，不再当偶发：多为停在 job 超时上限（测试卡死或变慢），按真实失败排查。`;
+
 function codeHint(name, step, pr) {
   const entry = CODE_CHECKS.find((item) => matches(item.context, name));
   if (!entry) return null;
@@ -116,9 +123,14 @@ export function failingJobsOnHead(checks = []) {
     && BAD.has(String(check.conclusion ?? '').toLowerCase()) && !isGate(check.name) && !AGGREGATES.some((agg) => agg.context.test(check.name)));
 }
 
-function describeJob(check, jobsById, pr) {
+function describeJob(check, jobsById, pr, checks = []) {
   const step = failedStepOf(jobsById?.get?.(String(check.id)));
   const conclusion = String(check.conclusion ?? '').toLowerCase();
+  const attempts = failedAttempts(checks, check.name);
+  if (INFRA_CONCLUSIONS.has(conclusion) && attempts >= REPEAT_FAILURES) {
+    const hint = codeHint(check.name, step, pr);
+    return { name: check.name, step, kind: 'code', conclusion, command: hint?.command ?? null, note: repeatNote(attempts) };
+  }
   if (INFRA_CONCLUSIONS.has(conclusion)) return { name: check.name, step, kind: 'infra', conclusion, command: null, note: `结论 ${conclusion}：多为取消或需要批准，重跑一次，不改代码。` };
   const hint = codeHint(check.name, step, pr);
   return { name: check.name, step, kind: hint?.kind ?? 'code', conclusion, command: hint?.command ?? null, note: hint?.note ?? null };
@@ -154,16 +166,18 @@ export function triageRule(rule, { checks = [], jobsById = new Map(), required =
     if (!failedUp.length && doneAt && now - doneAt < GATE_RERUN_GRACE_MS && attempt < GATE_RERUN_MAX_ATTEMPT) return { triage, defer: 'gate-rerun-expected' };
     return { triage, defer: null };
   }
-  if (INFRA_CONCLUSIONS.has(conclusion)) {
+  const attempts = failedAttempts(checks, name);
+  if (INFRA_CONCLUSIONS.has(conclusion) && attempts < REPEAT_FAILURES) {
     return { triage: { kind: 'infra', check: name, step, hint: `结论 ${conclusion}：多为并发取消、runner 回收或需要维护者批准，gh run rerun <run-id> --failed 一次，仍失败再当真实失败处理；不改代码。` }, defer: null };
   }
   const aggregate = AGGREGATES.find((item) => item.context.test(name));
   if (aggregate) {
-    const children = failingJobsOnHead(checks).map((item) => describeJob(item, jobsById, pr));
+    const children = failingJobsOnHead(checks).map((item) => describeJob(item, jobsById, pr, checks));
     return { triage: { kind: 'aggregate', check: name, step, hint: aggregate.hint, children }, defer: null };
   }
   const hint = codeHint(name, step, pr);
-  return { triage: { kind: hint?.kind ?? 'code', check: name, step, command: hint?.command ?? null, hint: hint?.note ?? null }, defer: null };
+  const note = INFRA_CONCLUSIONS.has(conclusion) ? repeatNote(attempts) : hint?.note ?? null;
+  return { triage: { kind: INFRA_CONCLUSIONS.has(conclusion) ? 'code' : hint?.kind ?? 'code', check: name, step, command: hint?.command ?? null, hint: note }, defer: null };
 }
 
 const precedence = (required) => required.some((item) => item.status === 'failed') ? 'failed'

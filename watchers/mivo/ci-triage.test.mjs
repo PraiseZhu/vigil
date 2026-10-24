@@ -132,3 +132,22 @@ test('门红超过 3 小时后不再因为其它 job 还在排队而暂缓', () 
   const out = applyCiTriage(resultOf([rule(freshness)]), { checks: [freshness, verify, stuck], jobsById, now: NOW });
   assert.equal(out.required[0].status, 'failed');
 });
+
+test('同一 head 上同一 job 第二次被取消（停在超时上限）：不再当 infra，按真实失败排查', () => {
+  const verify = check('verify', { conclusion: 'failure' });
+  const first = check('Linux unit shard (2/4)', { conclusion: 'cancelled', started: ago(60 * 60e3), completed: ago(45 * 60e3) });
+  const second = check('Linux unit shard (2/4)', { conclusion: 'cancelled', started: ago(30 * 60e3), completed: ago(15 * 60e3) });
+  const out = applyCiTriage(resultOf([rule(verify)]), { checks: [verify, first, second], jobsById: new Map(), now: NOW });
+  const [child] = out.required[0].triage.children;
+  assert.equal(child.kind, 'code');
+  assert.equal(child.command, 'npm run test:unit -- --shard=2/4');
+  assert.match(child.note, /已失败 2 次/);
+});
+
+test('必需检查本身第二次被取消：分类 code 而不是 infra', () => {
+  const first = check('cindyplugin build', { conclusion: 'cancelled', started: ago(60 * 60e3) });
+  const second = check('cindyplugin build', { conclusion: 'cancelled', started: ago(20 * 60e3) });
+  const out = applyCiTriage(resultOf([rule(second)]), { checks: [first, second], jobsById: new Map(), now: NOW });
+  assert.equal(out.required[0].triage.kind, 'code');
+  assert.match(out.required[0].triage.hint, /已失败 2 次/);
+});
