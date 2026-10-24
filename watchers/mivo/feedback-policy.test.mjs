@@ -214,3 +214,12 @@ test('same-line P2 / LOW tokens stay mixed', () => {
   assert.equal(p.reason, 'mixed-severity-inseparable');
   assert.equal(p.canChangeCode, false);
 });
+
+test('pr-hygiene 机器人通知（如「冲突已解决」）不进修复；人贴同样标记不被吞', () => {
+  const body = '<!-- pr-hygiene:conflict --> ✅ 冲突已解决(2026-10-24),CI 应已恢复触发。';
+  for (const user of [{ login: 'github-actions[bot]', type: 'Bot' }, { login: 'github-actions', __typename: 'Bot' }]) {
+    assert.equal(feedbackRepairPolicy({ source: 'comment', nativeId: '1', body, user }).action, 'ignore-infra', user.login);
+  }
+  const human = feedbackRepairPolicy({ source: 'comment', nativeId: '2', body: '<!-- pr-hygiene:conflict --> 这里还有冲突要处理', user: { login: 'someone', type: 'User' }, authorAssociation: 'MEMBER' });
+  assert.notEqual(human.action, 'ignore-infra');
+});
