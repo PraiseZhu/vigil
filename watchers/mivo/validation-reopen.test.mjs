@@ -3,14 +3,17 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { consumeResult, reopenInfraBlocked } from './bin/mivo-watcher.mjs';
+import { execFileSync } from 'node:child_process';
+import { consumeResult, observeValidationContext, reopenInfraBlocked } from './bin/mivo-watcher.mjs';
+import * as repair from './bin/mivo-repair.mjs';
+const validationMergeBase = (...args) => repair.validationMergeBase(...args);
 
 const BLOCK = {
   validatedHead: 'a'.repeat(40), policySha256: 'p'.repeat(64), runtimeSha256: 'r'.repeat(64),
   failureSetState: 'parsed', failureSetSha256: 'f'.repeat(64), receiptSha256: '1'.repeat(64),
-  remoteHead: 'a'.repeat(40), baseRefOid: 'b'.repeat(40),
+  remoteHead: 'a'.repeat(40), baseRefOid: 'b'.repeat(40), mergeBase: 'm'.repeat(40),
 };
-const CURRENT = { policySha256: BLOCK.policySha256, runtimeSha256: BLOCK.runtimeSha256, receiptSha256: BLOCK.receiptSha256,
+const CURRENT = { mergeBase: BLOCK.mergeBase, policySha256: BLOCK.policySha256, runtimeSha256: BLOCK.runtimeSha256, receiptSha256: BLOCK.receiptSha256,
   failureSetState: 'parsed', failureSetSha256: BLOCK.failureSetSha256 };
 
 function setup(t, { block = BLOCK, reason = 'local preflight failed', extra = {} } = {}) {
@@ -41,7 +44,7 @@ test('SC7 全部未变：零派发，previous 原样返回、计数不变，反�
 
 for (const [name, mutate] of [
   ['远端 head', (ctx) => ({ ...ctx, previousPatch: { headRefOid: 'c'.repeat(40) } })],
-  ['base', (ctx) => ({ ...ctx, previousPatch: { baseRefOid: 'd'.repeat(40) } })],
+  ['merge-base', (ctx) => ({ ...ctx, mergeBase: 'n'.repeat(40) })],
   ['policy sha256', (ctx) => ({ ...ctx, policySha256: 'q'.repeat(64) })],
   ['运行指纹', (ctx) => ({ ...ctx, runtimeSha256: 's'.repeat(64) })],
   ['失败集合', (ctx) => ({ ...ctx, receiptSha256: '2'.repeat(64), failureSetSha256: 'e'.repeat(64) })],
@@ -90,4 +93,72 @@ test('SC7 consumeResult 把验证阻塞上下文连同当时的远端 head/base 
   const next = consumeResult(previous, { schemaVersion: 2, status: 'blocked', blockedKind: 'external', reason: 'local preflight failed',
     dispatchId: 'd1', sessionId: 's', head: 'a'.repeat(40), validationBlock: block }, 'now');
   assert.deepEqual(next.activeTask.validationBlock, { ...block, remoteHead: 'a'.repeat(40), baseRefOid: 'b'.repeat(40) });
+});
+
+test('SC7 仅 base 分支 tip 前进而 merge-base 不变：不重开、计数不变', (t) => {
+  const { paths, previous } = setup(t);
+  const moved = { ...previous, baseRefOid: 'd'.repeat(40) };
+  const snapshot = structuredClone(moved);
+  assert.equal(reopenInfraBlocked({ previous: moved, paths, now: 'n', observe: () => ({ ...CURRENT }) }), moved);
+  assert.deepEqual(moved, snapshot);
+});
+
+test('SC7 取不到 merge-base（本次观测或记录里缺失）：该项按 unknown 处理，不重开，其他项变化仍重开', (t) => {
+  const { paths, previous } = setup(t);
+  assert.equal(reopenInfraBlocked({ previous, paths, now: 'n', observe: () => ({ ...CURRENT, mergeBase: null }) }), previous);
+  const { mergeBase, ...legacy } = BLOCK;
+  const old = setup(t, { block: legacy });
+  assert.equal(reopenInfraBlocked({ previous: old.previous, paths: old.paths, now: 'n', observe: () => ({ ...CURRENT }) }), old.previous);
+  const changed = reopenInfraBlocked({ previous: old.previous, paths: old.paths, now: 'n', observe: () => ({ ...CURRENT, policySha256: 'q'.repeat(64) }) });
+  assert.equal(changed.eligibility, 'active');
+});
+
+function gitRepo(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vigil-mergebase-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_AUTHOR_NAME: 'ExampleUser',
+    GIT_AUTHOR_EMAIL: 'user@example.invalid', GIT_COMMITTER_NAME: 'ExampleUser', GIT_COMMITTER_EMAIL: 'user@example.invalid' };
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, env, encoding: 'utf8' }).trim();
+  const repo = path.join(dir, 'plugin');
+  fs.mkdirSync(repo);
+  git(repo, 'init', '-q', '-b', 'main');
+  fs.mkdirSync(path.join(repo, '.githooks'));
+  fs.writeFileSync(path.join(repo, '.githooks', 'pre-push'), '#!/usr/bin/env bash\nexit 0\n');
+  git(repo, 'add', '.');
+  git(repo, 'commit', '-q', '-m', 'base');
+  const A = git(repo, 'rev-parse', 'HEAD');
+  git(repo, 'worktree', 'add', '-q', '-b', 'watch/pr-1', path.join(repo, '.worktrees', 'watch', 'pr-1'), A);
+  const watch = path.join(repo, '.worktrees', 'watch', 'pr-1');
+  fs.writeFileSync(path.join(watch, 'feature.txt'), 'x\n');
+  git(watch, 'add', '.');
+  git(watch, 'commit', '-q', '-m', 'feature');
+  const B = git(watch, 'rev-parse', 'HEAD');
+  return { dir, repo, watch, git, A, B, env: { MIVO_PLUGIN_REPO: repo } };
+}
+
+test('SC7 validationMergeBase 与 observeValidationContext：base tip 前进 merge-base 不变，PR 合入 base 后 merge-base 才变', (t) => {
+  const { dir, repo, watch, git, A, B, env } = gitRepo(t);
+  assert.equal(validationMergeBase({ worktree: watch, validatedHead: B, baseRefOid: A, baseRefName: 'main' }), A);
+  const paths = { stateDir: path.join(dir, 'state') };
+  const previous = { nodeId: 'PR_1', number: 1, headRefOid: B, baseRefOid: A,
+    activeTask: { dispatchId: 'd1', validationBlock: { validatedHead: B } } };
+  assert.equal(observeValidationContext({ previous, paths, env }).mergeBase, A);
+
+  fs.writeFileSync(path.join(repo, 'unrelated.txt'), 'y\n');
+  git(repo, 'add', '.');
+  git(repo, 'commit', '-q', '-m', 'unrelated base progress');
+  const C = git(repo, 'rev-parse', 'HEAD');
+  assert.notEqual(C, A);
+  assert.equal(observeValidationContext({ previous: { ...previous, baseRefOid: C }, paths, env }).mergeBase, A, 'base tip 前进但 merge-base 不变');
+
+  git(repo, 'merge', '-q', '--no-ff', '-m', 'merge pr', 'watch/pr-1');
+  const D = git(repo, 'rev-parse', 'HEAD');
+  assert.equal(observeValidationContext({ previous: { ...previous, baseRefOid: D }, paths, env }).mergeBase, B, 'PR 已并入 base，merge-base 变化');
+});
+
+test('SC7 validationMergeBase 取不到时返回 null：对象缺失、base 为空', (t) => {
+  const { watch, B } = gitRepo(t);
+  assert.equal(validationMergeBase({ worktree: watch, validatedHead: B, baseRefOid: 'e'.repeat(40), baseRefName: null }), null);
+  assert.equal(validationMergeBase({ worktree: watch, validatedHead: B, baseRefOid: null, baseRefName: null }), null);
+  assert.equal(validationMergeBase({ worktree: path.join(watch, 'missing'), validatedHead: B, baseRefOid: B, baseRefName: 'main' }), null);
 });
