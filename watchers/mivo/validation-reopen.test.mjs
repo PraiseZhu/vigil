@@ -222,7 +222,8 @@ test('比对规则升级：本轮没跑验证就停下时，退回读同一 PR �
   assert.equal(next.infraReopened.at(-1).parserReceipt, observed.parserReceiptSha256, '记下触发重开的旧收据');
   const again = { ...next, eligibility: 'blocked', activeTask: { ...previous.activeTask, dispatchId: 'd2' } };
   fs.writeFileSync(path.join(paths.stateDir, 'tasks', 'd2.json'), JSON.stringify({ nodeId: 'PR_1', feedback: [] }));
-  assert.equal(reopenInfraBlocked({ previous: again, paths, now: 'n', observe: () => observed }), again, '同一份旧收据不再触发重开');
+  assert.equal(observed.ownReceipt, false, '本轮没有自己的收据');
+  assert.equal(reopenInfraBlocked({ previous: again, paths, now: 'n', observe: () => ({ ...observed, ownReceipt: true }) }), again, '同一份旧收据不再触发重开');
   const other = observeValidationContext({ previous: { ...previous, number: 70, nodeId: 'PR_X' }, paths, env });
   assert.equal(other.receiptParserVersion ?? null, null, '不读别的 PR 的收据');
 });

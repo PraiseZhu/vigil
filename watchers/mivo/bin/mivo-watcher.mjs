@@ -1488,26 +1488,31 @@ function parserCheckReceipt({ previous, paths }) {
     } catch { return null; }
   };
   let hit = newest(path.join(root, String(previous.activeTask?.dispatchId)));
+  const ownReceipt = Boolean(hit);
   if (!hit) {
     let dirs = [];
     try { dirs = fs.readdirSync(root).filter((name) => name.startsWith(`live-${previous.number}-`)); } catch { /* 没有验证目录 */ }
     hit = dirs.map((name) => newest(path.join(root, name))).filter(Boolean).sort((a, b) => b.at - a.at)[0] ?? null;
   }
-  if (!hit) return {};
+  if (!hit) return { ownReceipt };
   try {
     const bytes = fs.readFileSync(hit.file);
     const receipt = JSON.parse(bytes);
-    if (receipt.status === 'pass' || (receipt.nodeId && receipt.nodeId !== previous.nodeId)) return {};
-    return { receiptParserVersion: Number.isInteger(receipt.parserVersion) ? receipt.parserVersion : null, receiptFailureKind: receipt.failureKind ?? null,
+    if (receipt.status === 'pass' || (receipt.nodeId && receipt.nodeId !== previous.nodeId)) return { ownReceipt };
+    return { ownReceipt, receiptExitCode: receipt.exitCode ?? null, receiptParserVersion: Number.isInteger(receipt.parserVersion) ? receipt.parserVersion : null, receiptFailureKind: receipt.failureKind ?? null,
       parserReceiptSha256: createHash('sha256').update(bytes).digest('hex') };
-  } catch { return {}; }
+  } catch { return { ownReceipt }; }
 }
 
 // 失败指纹的比对规则升级后，按旧规则判定的测试失败可能已能对上基线放行：重开一次让会话按新规则重新验证。
-// 没有版本号的旧收据不算（避免部署时把所有旧阻塞一齐重派）；挂起/超时与比对规则无关；同一份旧收据只触发一次。
+// 挂起/超时与比对规则无关；同一份旧收据只触发一次（只读当前 dispatch 或同一 PR 的收据，已关闭的 PR 不处理，不会一齐重派）。
+// 没有版本号、退出码 1 的旧收据（#52 之前的测试失败）同样按旧规则判定过，也算一次。
 function parserUpgradeChange(previous, current) {
-  if (!current || current.receiptFailureKind !== 'test-failure' || !Number.isInteger(current.receiptParserVersion)
-    || current.receiptParserVersion >= PARSER_VERSION) return false;
+  if (!current) return false;
+  const older = Number.isInteger(current.receiptParserVersion)
+    ? current.receiptFailureKind === 'test-failure' && current.receiptParserVersion < PARSER_VERSION
+    : current.receiptExitCode === 1;
+  if (!older) return false;
   return !(previous.infraReopened ?? []).some((item) => item.parserReceipt && item.parserReceipt === current.parserReceiptSha256);
 }
 
@@ -1518,7 +1523,10 @@ export function validationReopenDecision({ previous, active, observe }) {
   if (!block) {
     const taskHead = active.head ?? null;
     if (taskHead && previous.headRefOid && taskHead !== previous.headRefOid) return 'changed';
-    return parserUpgradeChange(previous, observe()) ? 'changed' : 'unknown';
+    const current = observe();
+    // 本轮没跑 validate 就以验证失败停下（只引用了上一轮的结果）：重开一次，让会话按当前规则重新验证。
+    if (current?.ownReceipt === false) return 'changed';
+    return parserUpgradeChange(previous, current) ? 'changed' : 'unknown';
   }
   if (block.remoteHead && previous.headRefOid && block.remoteHead !== previous.headRefOid) return 'changed';
   const current = observe();
