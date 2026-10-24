@@ -539,6 +539,36 @@ function recoveryLimitDue(previous, paths, now) {
   return Number.isFinite(last) && Date.parse(now) - last >= RECOVERY_MIN_MS;
 }
 
+// missing-result-limit used to be a dead end: only the author could move the PR. A new head, new feedback or a
+// changed required-CI state hands it back to the watcher, a few times per admission epoch; with no change nothing
+// is re-sent to a session that does not return results.
+export const MISSING_RESULT_RESET_LIMIT = 3;
+// The dead task never returned a result, so nothing it was handed was judged, yet delivery already moved the cursor
+// past those keys. The reset takes them back out of the cursor and returns them in `revived`; the caller delivers
+// them together with the new feedback (same pattern as the other reopen* functions).
+export function reopenMissingResult({ previous, pr, fresh, ciStatus, epoch, now, home, dryRun, paths }) {
+  const unchanged = { previous, revived: [] };
+  const active = previous.activeTask;
+  if (active?.status !== 'blocked' || active.blockedKind !== 'missing-result-limit') return unchanged;
+  const seen = previous.missingResult ?? {};
+  const headChanged = Boolean(seen.head) && seen.head !== pr.headRefOid;
+  const ciChanged = seen.ci != null && ciStatus != null && seen.ci !== ciStatus;
+  if (!(fresh.length > 0 || headChanged || ciChanged)) return unchanged;
+  const done = previous.missingResultResets ?? [];
+  if (done.filter((item) => item.epoch === epoch).length >= MISSING_RESULT_RESET_LIMIT) {
+    queueHumanNotice(home, { kind: 'missing-result-reset-limit', number: pr.number, url: previous.url ?? pr.url, head: pr.headRefOid }, dryRun);
+    return unchanged;
+  }
+  const task = readDispatchTask(paths, active.dispatchId);
+  const revived = (task.feedback ?? []).map((item) => item?.key).filter((key) => typeof key === 'string');
+  const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
+  for (const key of revived) delete feedbackCursor[key];
+  return { revived, previous: { ...previous, feedbackCursor, eligibility: 'active', missingResult: null,
+    missingResultResets: [...done, { dispatchId: active.dispatchId, epoch, at: now, head: pr.headRefOid }],
+    activeTask: { ...active, blockedKind: 'missing-result-reopened',
+      reason: 'New head, feedback or CI state after missing-result-limit; handed back to the watcher.' } } };
+}
+
 function readTaskForRecovery(previous, paths, now = new Date().toISOString()) {
   const dispatchId = previous?.lastDispatch?.dispatchId;
   if (typeof dispatchId !== 'string' || !dispatchId || dispatchId.startsWith('dry-')) return null;
@@ -1126,7 +1156,29 @@ function includeOpenThreadFeedback(fresh, observed) {
   }
   return feedback;
 }
-function consumeResult(previous, result, now) {
+// Coverage ledger: what a finished round (complete / waiting-ci) judged for each feedback key, stamped with the
+// cursor stamp it was delivered under. A Draft -> Ready round keeps cursor keys that the ledger still vouches for.
+function ledgerAfterResult(previous, result, status) {
+  const dispositions = result?.feedbackCoverage?.dispositions;
+  if (!['complete', 'waiting-ci'].includes(status) || !Array.isArray(dispositions)) return previous.feedbackLedger;
+  const ledger = { ...(previous.feedbackLedger ?? {}) };
+  for (const { key, disposition } of dispositions) {
+    const stamp = previous.feedbackCursor?.[key];
+    if (typeof key !== 'string' || typeof stamp !== 'string' || typeof disposition !== 'string') continue;
+    if (ledger[key]?.dispatchId === result.dispatchId) continue;
+    ledger[key] = { stamp, disposition, resultHead: result.head ?? null, dispatchId: result.dispatchId };
+  }
+  return ledger;
+}
+
+// Only judged-and-unchanged feedback survives the clearing: an unfinished, revoked, blocked or never-covered
+// key is dropped (delivered again), and so is any key whose stamp moved or whose old judgement was "fixed".
+function coveredCursor(cursor = {}, ledger = {}) {
+  return Object.fromEntries(Object.entries(cursor).filter(([key, stamp]) =>
+    ledger[key]?.stamp === stamp && ledger[key]?.disposition === 'no-change'));
+}
+
+export function consumeResult(previous, result, now) {
   if (!result) return previous;
   // A result written before the author reclaimed the PR must not revive the superseded task.
   if (previous.activeTask?.blockedKind === AUTHOR_RECLAIMED && result.dispatchId === previous.activeTask.dispatchId) return previous;
@@ -1149,6 +1201,7 @@ function consumeResult(previous, result, now) {
       observedAt: result.observedAt ?? now,
     },
     eligibility: status === 'blocked' ? 'blocked' : 'active',
+    ...(ledgerAfterResult(previous, result, status) ? { feedbackLedger: ledgerAfterResult(previous, result, status) } : {}),
   };
 }
 
@@ -1359,6 +1412,7 @@ function markException(previous, now, events, { home, dryRun } = {}) {
   if (previous.activeTask?.status !== 'blocked' && !previous.dispatchError) return previous;
   // Author reclaiming a PR is the normal handoff contract, not an incident.
   if (previous.activeTask?.blockedKind === AUTHOR_RECLAIMED && !previous.dispatchError) return previous;
+  if (previous.activeTask?.blockedKind === 'missing-result-reopened' && !previous.dispatchError) return previous;
   const event = {
     kind: previous.dispatchError ? 'dispatch-blocked' : 'repair-blocked', number: previous.number, nodeId: previous.nodeId,
     sessionId: previous.sessionId, dispatchId: previous.dispatchError?.dispatchId ?? previous.activeTask?.dispatchId,
@@ -1519,7 +1573,8 @@ export function* processPr({
     previous = { ...previous, roundsEpoch: collected.pr.releaseEpoch };
     base = { ...base, roundsEpoch: collected.pr.releaseEpoch };
   }
-  const cursorBase = previous.wasDraft === true ? {} : (previous.feedbackCursor || {});
+  const cursorBase = previous.wasDraft === true
+    ? coveredCursor(previous.feedbackCursor, previous.feedbackLedger) : (previous.feedbackCursor || {});
   const allItems = feedbackItems({ pr, ...collected, receiptActor: viewer });
   const { fresh: rawFresh, cursor } = newFeedback(cursorBase, allItems);
   // Resolve only when every comment on the thread is a trusted-bot P3.
@@ -1609,12 +1664,30 @@ export function* processPr({
       reviewEvidence: { ready: false, reason: 'pending-authorized-feedback', terminal: null } };
     previous = { ...previous, mergeReady: false, reviewReason: collected.reviewReason, reviewEvidence: collected.reviewEvidence };
   }
+  let limitReachedNow = false;
   if (!resultError && recoveryLimitDue(previous, paths, now)) {
+    limitReachedNow = true;
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.lastDispatch.dispatchId,
       sessionId: previous.sessionId, status: 'blocked', blockedKind: 'missing-result-limit',
       reason: 'No result after three bounded recovery deliveries; inspect the existing session before resuming.',
-    } };
+    }, missingResult: { head: pr.headRefOid, ci: collected.ci?.status ?? null, at: now } };
+  }
+  let revivedKeys = [];
+  if (!resultError) {
+    const limited = previous;
+    const reopened = reopenMissingResult({ previous, pr, fresh, ciStatus: collected.ci?.status ?? null,
+      epoch: collected.pr?.releaseEpoch ?? previous.admissionEpoch ?? null, now, home: paths.home, dryRun, paths });
+    previous = reopened.previous;
+    revivedKeys = reopened.revived;
+    const have = new Set(fresh.map((item) => item.key));
+    fresh = [...fresh, ...allItems.map((item) => ({ ...item, key: `${item.source}:${item.nativeId}` }))
+      .filter((item) => revivedKeys.includes(item.key) && !have.has(item.key) && item.actionable !== false && item.deferred !== true)];
+    // Reaching the limit and resetting in the same scan: markException below only sees the reopened task, so
+    // the limit is reported here, from the state that hit it, and its exception record is carried over.
+    if (limitReachedNow && previous !== limited) {
+      previous = { ...previous, lastException: markException(limited, now, events, { home: paths.home, dryRun }).lastException };
+    }
   }
   const terminal = ['blocked', 'complete', 'legacy-complete'].includes(previous.activeTask?.status);
   const inFlight = Boolean(previous.lastDispatch?.dispatchId) && !terminal && previous.activeTask?.status !== 'waiting-ci';
@@ -1651,6 +1724,8 @@ export function* processPr({
     if (Object.hasOwn(cursorBase, item.key)) retainedCursor[item.key] = cursorBase[item.key];
     else delete retainedCursor[item.key];
   }
+  // Revived keys stay out of the cursor until a delivery is acknowledged, so a skipped delivery repeats next scan.
+  for (const key of revivedKeys) delete retainedCursor[key];
   previous = {
     ...previous, feedbackCursor: retainedCursor, pendingFeedback: fresh.length,
     sessionId: mapping.sessionId ?? previous.sessionId ?? null,

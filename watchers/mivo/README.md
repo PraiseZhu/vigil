@@ -118,6 +118,12 @@ node "$MIVO_WATCHER_HOME/bin/mivo-handoff.mjs" reclaim --repo your-org/your-plug
 
 `reclaim` 将 PR 转回 Draft 并确认结果。watcher 在 discover、poll 和 scan 入口观察到 Draft 时作废活动任务；修复 helper 每次读取 GitHub 的 Ready/Draft 代次，即使巡检错过中间的 Draft、HEAD 也未变化，旧任务仍会被拒绝。再次转 Ready 是新的交接：新代次、新任务，旧任务永远不能续用；修复轮次计数（`repairRounds`，只作记录）也按新代次重新计数。
 
+再次转 Ready 时游标不再整体清空，而是只保留「覆盖账本」（`feedbackLedger`）还担保的那部分：一个完成轮次（`complete` 或 `waiting-ci`）被消费时，把它对每个反馈 key 的处置记入账本（`stamp` 即当时的游标戳 `revision:contentHash[:sha]`、`disposition`、`resultHead`、`dispatchId`）。转 Ready 时，账本里 `stamp` 与当前游标相同、且旧处置为 `no-change` 的反馈不再重投；其余全部照常重投——被作废（`author-reclaimed`）、blocked 没有覆盖、没有结果的任务所带的反馈，内容或 revision 变了的反馈，CI / 冲突 / code-scanning 在新 sha 上的反馈，以及旧处置为 `fixed` 的反馈（第一版保守，Draft 期间作者可能改回代码）。
+
+`missing-result-limit`（补投三次无结果）不再是死路：同一 PR 出现新 head、新反馈或必需 CI 状态变化时，watcher 自动把它转回 active（`blockedKind: missing-result-reopened`，不发评论）并按新反馈派发；同一 Ready 代次内最多自动复位 3 次（`missingResultResets`），超过后保持终态并写一条 `missing-result-reset-limit` 通知。没有任何变化时不复位，不会对不交结果的会话反复投递。复位时死任务当初领到、却从未得到判定的反馈（读它的 task 文件）也从游标里取回，与新反馈一起派发，不会被静默当成已处理；若 limit 与复位发生在同一次扫描，limit 的人工通知照常写出。
+
+PR 上的「盯梢停下了」评论按 (PR, head, blockedKind, 归一化原因) 去重，同一组合只发一次，不再因为每个新派发的 `dispatchId` 不同而重复；原因或 head 变了才再发。通知队列与升级逻辑不变。
+
 修复不设轮次上限：同一 PR 只要还有新反馈、还没到可合并，watcher 就继续派修复轮次。旧版本按 6 轮上限停下的 PR（`blockedKind: round-limit`），下一次扫描会转回 active（`round-limit-reset`，不发评论），压住没投的反馈照常投递。
 
 修复会话每次改文件、提交或外发回复前执行 `mivo-repair.mjs assert-owner --home <home> --task <task>`。`prepare`、`validate` 前后、`finalize` 推送前和 CI 复查也执行同一归属检查。网络失败不放行，旧任务没有交接回执也不放行。已确认受控 push 的回执只允许同一任务继续验证/收口，不允许旧任务继续修改已推进的 HEAD。

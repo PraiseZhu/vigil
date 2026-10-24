@@ -39,6 +39,7 @@ Review thread 的"已处理"判定:thread 一旦被标记 `resolved` 就视为�
   `_backup/` 后按 fork 重建。
 - 因环境原因 blocked(预检跑不起来、watch 树分叉、子代理路由被拒等,见 `INFRA_BLOCK_REASON`)的轮次退还轮次、
   把反馈放回队列重投,每个 Ready 代次最多 3 次;新的 Ready 代次重新计修复轮次。
+- 再次转 Ready 时游标只保留「覆盖账本」（`feedbackLedger`）还担保的部分：完成轮次（`complete` / `waiting-ci`）消费时把每个反馈 key 的 `stamp`（游标戳）、`disposition`、`resultHead`、`dispatchId` 记入账本；转 Ready 时账本里 `stamp` 未变且旧处置为 `no-change` 的反馈不再重投。被撤销、blocked 无覆盖、无结果任务的反馈，内容 / revision / CI sha 变化的反馈，以及旧处置为 `fixed` 的反馈照常重投。`missing-result-limit` 遇到新 head、新反馈或必需 CI 状态变化时自动转回 active（`missing-result-reopened`），同一 Ready 代次最多 3 次，超过后保持终态并写 `missing-result-reset-limit` 通知；无变化不复位。复位时死任务领到却从未得到判定的反馈（读它的 task 文件）也从游标取回、与新反馈一起派发；limit 与复位在同一次扫描发生时，limit 的人工通知照常写出。cindy 没有 PR 评论形式的「盯梢停下了」通知，故不涉及评论去重。
 - 终点仍是 `awaiting-maintainer-approval`:仓库要求有写权限的维护者批准并经合并队列合入,watcher 不代替审批。
 
 等 CI 的复查需要约 15–20 秒;剩余扫描预算不足 40 秒时不硬跑(硬跑会被超时杀掉、排在后面的 PR
