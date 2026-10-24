@@ -29,8 +29,16 @@ export function runtimeSha256(runtime) {
 const ANSI = /\u001b\[[0-9;]*[A-Za-z]/g;
 const MARKER = /^\[preflight\] ❌ (.+?) 失败\s*$/;
 const FAIL_TEST = /^\s*FAIL\s+(\S+)\s+>\s+(.+?)\s*$/;
+const FAIL_FILE = /^\s*FAIL\s+(\S+)\s+\[\s*(\S+)\s*\]\s*$/;
 const FAIL_OTHER = /^\s*FAIL\s/;
 const TESTS_FAILED = /^\s*Tests\s+(\d+) failed/;
+const FILES_FAILED = /^\s*Test Files\s+(\d+) failed/;
+const NODE_FAIL_COUNT = /^(?:ℹ fail|# fail) (\d+)\s*$/;
+const NODE_SPEC_HEAD = /^✖ failing tests:\s*$/;
+const NODE_SPEC_LOC = /^test at (.+?):\d+:\d+\s*$/;
+const NODE_SPEC_NAME = /^✖ (.+?) \(\d+(?:\.\d+)?m?s\)\s*$/;
+const TAP_NOT_OK = /^(\s*)not ok \d+ - (.+?)\s*$/;
+const TAP_END = /^\s*\.\.\.\s*$/;
 const STACK = /^\s*(?:❯|at\s)/;
 const SECTION_END = /^\s*(?:⎯{3,}|Test Files\b|Tests\s)/;
 
@@ -50,66 +58,145 @@ export function emptyFailureSet() {
 }
 
 function normalizeError(lines, worktree) {
-  return lines.map((line) => {
+  const kept = [...lines];
+  while (kept.length && kept[kept.length - 1].trim() === '') kept.pop();
+  return kept.map((line) => {
     let out = line.replace(/\s+$/, '');
     if (worktree) out = out.split(worktree).join('<WT>');
     return out.replace(/:\d+:\d+(?=\)?$)/, '');
   }).join('\n');
 }
 
+/** tap 的 yaml 块里取 location / failureType / error。 */
+function tapFields(blockLines) {
+  const scalar = (key) => {
+    const hit = blockLines.map((line) => new RegExp(`^\\s*${key}:\\s*(.*)$`).exec(line)).find(Boolean);
+    return hit ? hit[1].replace(/^'(.*)'$/, '$1') : null;
+  };
+  const at = blockLines.findIndex((line) => /^\s*error:/.test(line));
+  const errorLines = [];
+  if (at >= 0) {
+    const rest = /^\s*error:\s*(.*)$/.exec(blockLines[at])[1];
+    if (/^\|/.test(rest)) {
+      const indent = blockLines[at].match(/^\s*/)[0].length;
+      for (const line of blockLines.slice(at + 1)) {
+        if (line.trim() !== '' && line.match(/^\s*/)[0].length <= indent) break;
+        errorLines.push(line);
+      }
+    } else if (rest) errorLines.push(rest.replace(/^'(.*)'$/, '$1'));
+  }
+  return { location: scalar('location'), failureType: scalar('failureType'), errorLines };
+}
+
 /**
- * 解析一次「失败的」hook/vitest 输出。只有全部失败块都被覆盖、尾标记与失败计数一致时才给 parsed；
+ * 解析一次「失败的」hook 输出。认得三种失败块：vitest（`FAIL file > test`、文件级 `FAIL file [ file ]`）、
+ * node:test 的 spec（`✖ failing tests:` 段）与 TAP（`not ok N - name` 的 yaml 块）。
+ * 只有全部失败块都被覆盖、尾标记与各自的失败计数一致时才给 parsed；
  * 其余（lint 报错、截断、未处理错误、计数对不上、缺断言信息）一律 unparsed。
  */
 export function parseFailureSet(text, { worktree } = {}) {
   const lines = String(text ?? '').replace(ANSI, '').replace(/\r\n?/g, '\n').split('\n');
   const bound = [];
   let pending = new Map();
-  let claimed = null;
+  let vitestClaim = null;
+  let filesClaim = null;
+  let nodeClaim = null;
   let current = null;
   let markers = 0;
   let problem = null;
-  const closeCurrent = () => { current = null; };
+  let specMode = false;
+  let specFile = null;
+  let tap = null;
+  const relFile = (raw) => {
+    let file = raw;
+    if (worktree && path.isAbsolute(file)) file = path.relative(worktree, file);
+    if (path.isAbsolute(file) || file.startsWith('..')) { problem ??= 'failure file outside the worktree'; return null; }
+    return file.split(path.sep).join('/');
+  };
+  const addEntry = (kind, rawFile, test) => {
+    const file = relFile(rawFile);
+    if (file === null) return null;
+    const key = `${file}\u0000${test}`;
+    if (!pending.has(key)) pending.set(key, { kind, file, test, errorLines: [] });
+    return pending.get(key);
+  };
+  const finishTap = (block) => {
+    const { location, failureType, errorLines } = tapFields(block.lines);
+    if (failureType === 'subtestsFailed' || /#\s*(?:SKIP|TODO)\b/.test(block.name)) return;
+    const raw = location?.replace(/:\d+:\d+$/, '');
+    if (!raw) { problem ??= 'tap failure without a location'; return; }
+    const entry = addEntry('node', raw, block.name);
+    if (entry && !entry.errorLines.length) entry.errorLines.push(...errorLines);
+  };
+  const reset = () => { current = null; specMode = false; specFile = null; tap = null; };
   for (const line of lines) {
+    if (tap) {
+      if (TAP_END.test(line)) { finishTap(tap); tap = null; } else tap.lines.push(line);
+      continue;
+    }
     const marker = MARKER.exec(line);
     if (marker) {
-      closeCurrent();
       markers++;
+      const testEntries = [...pending.values()].filter((entry) => entry.kind === 'vitest').length;
+      const nodeEntries = [...pending.values()].filter((entry) => entry.kind === 'node').length;
+      const vitestFiles = new Set([...pending.values()].filter((entry) => entry.kind !== 'node').map((entry) => entry.file)).size;
+      reset();
       if (pending.size === 0) { problem ??= `step ${marker[1]} failed without test failures`; continue; }
-      if (claimed === null || claimed !== pending.size) { problem ??= 'failed test count does not match the summary'; }
+      if (testEntries !== (vitestClaim ?? 0)) problem ??= 'failed test count does not match the summary';
+      if (nodeEntries !== (nodeClaim ?? 0)) problem ??= 'failed node:test count does not match the summary';
+      if (filesClaim !== null && filesClaim !== vitestFiles) problem ??= 'failed file count does not match the summary';
       for (const entry of pending.values()) {
         if (!entry.errorLines.length) { problem ??= 'failed test has no assertion message'; continue; }
         bound.push({ step: marker[1], file: entry.file, test: entry.test, errorSha: sha(normalizeError(entry.errorLines, worktree)) });
       }
       pending = new Map();
-      claimed = null;
+      vitestClaim = null; filesClaim = null; nodeClaim = null;
+      continue;
+    }
+    const failFile = FAIL_FILE.exec(line);
+    if (failFile && failFile[1] === failFile[2]) {
+      current = addEntry('vitestFile', failFile[1], '<file>');
+      if (current) current.collecting = !current.errorLines.length;
       continue;
     }
     const fail = FAIL_TEST.exec(line);
     if (fail) {
-      let file = fail[1];
-      if (worktree && path.isAbsolute(file)) file = path.relative(worktree, file);
-      if (path.isAbsolute(file) || file.startsWith('..')) { problem ??= 'failure file outside the worktree'; continue; }
-      const key = `${file}\u0000${fail[2]}`;
-      if (!pending.has(key)) pending.set(key, { file: file.split(path.sep).join('/'), test: fail[2], errorLines: [] });
-      current = pending.get(key);
-      current.collecting = !current.errorLines.length;
+      current = addEntry('vitest', fail[1], fail[2]);
+      if (current) current.collecting = !current.errorLines.length;
       continue;
     }
-    if (FAIL_OTHER.test(line)) { closeCurrent(); problem ??= 'failure that is not a single test'; continue; }
+    if (FAIL_OTHER.test(line)) { current = null; problem ??= 'failure that is not a single test'; continue; }
+    const notOk = TAP_NOT_OK.exec(line);
+    if (notOk) { current = null; tap = { name: notOk[2], lines: [] }; continue; }
     const count = TESTS_FAILED.exec(line);
-    if (count) { claimed = Number(count[1]); closeCurrent(); continue; }
+    if (count) { vitestClaim = Number(count[1]); current = null; continue; }
+    const files = FILES_FAILED.exec(line);
+    if (files) { filesClaim = Number(files[1]); current = null; continue; }
+    const nodeCount = NODE_FAIL_COUNT.exec(line);
+    if (nodeCount) { nodeClaim = Number(nodeCount[1]); current = null; continue; }
+    if (NODE_SPEC_HEAD.test(line)) { specMode = true; current = null; continue; }
+    if (specMode) {
+      const loc = NODE_SPEC_LOC.exec(line);
+      if (loc) { specFile = loc[1]; current = null; continue; }
+      const name = specFile ? NODE_SPEC_NAME.exec(line) : null;
+      if (name) {
+        current = addEntry('node', specFile, name[1]);
+        if (current) current.collecting = !current.errorLines.length;
+        specFile = null;
+        continue;
+      }
+    }
     if (/Unhandled (?:Rejection|Error)/i.test(line)) { problem ??= 'unhandled error in output'; continue; }
-    if (SECTION_END.test(line)) { closeCurrent(); continue; }
+    if (SECTION_END.test(line)) { current = null; continue; }
     if (current?.collecting) {
       if (STACK.test(line)) { current.collecting = false; continue; }
       if (line.trim() === '' && !current.errorLines.length) continue;
       current.errorLines.push(line);
     }
   }
-  for (const entry of pending.values()) { if (entry) { problem ??= 'failures not closed by a step marker'; break; } }
+  if (tap) problem ??= 'tap failure block was cut off';
+  if (pending.size) problem ??= 'failures not closed by a step marker';
   if (!markers) problem ??= 'no preflight failure marker';
-  for (const item of bound) { delete item.collecting; }
   if (problem) return unparsed(problem);
   if (!bound.length) return unparsed('no failures recognized');
   const { failureSet, sha256 } = canonicalFailureSet(bound);
