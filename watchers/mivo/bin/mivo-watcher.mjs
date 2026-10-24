@@ -22,6 +22,7 @@ import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FL
 import { PARSER_VERSION, canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
+import { triageText } from './mivo-ci-triage.mjs';
 
 // 目标仓库在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
 export const REPO = requireConfig('targetRepo', {
@@ -266,7 +267,8 @@ function failedRequiredCiItems({ pr, ci }) {
       nativeId: rule.appId != null ? `${native}#${rule.appId}` : native,
       revision: `${rule.status}:${checkId ?? ''}:${attempt ?? ''}`,
       sha: evidence.sha ?? pr.headRefOid ?? null,
-      body: `${native} failed ${rule.reason ?? ''} check=${checkId ?? ''} run=${runId ?? ''}${attempt != null ? ` attempt=${attempt}` : ''} ${url}`.trim(),
+      body: [`${native} failed ${rule.reason ?? ''} check=${checkId ?? ''} run=${runId ?? ''}${attempt != null ? ` attempt=${attempt}` : ''} ${url}`.trim(), triageText(rule.triage)].filter(Boolean).join('\n'),
+      ...(rule.triage ? { ciTriage: rule.triage } : {}),
       contentHash: digest({
         context: native, appId: rule.appId, status: rule.status,
         id: checkId, runId, attempt, url,
@@ -885,7 +887,7 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       WORKER_RULE,
       '按 PR 的仓库规则执行；保留原 PR 已批准的验收例外和未测项，不把基础层测试写成真实宿主 E2E。',
       '整体目标是按逐项权限处理本批反馈；获准修复才提交并 push，P3 只说明暂不修，未知严重度在会话里核实，不以回复冒充修复。required CI 通过或记录外部阻塞；不自行合并。',
-      '必须项红先读 job 日志 ##[error] 分类：pr-format-gate 的 Windows 证据/竞态、pr-size-gate 的 freshness(verify fail/pending) → 先修真正红的上游 job，上游全绿后对该门 gh run rerun <run-id> --failed 一次；只有日志明确是格式/行数问题才改 PR。Windows 偶发：同 head 首次失败且日志命中基础设施特征（下载失败/runner 取消/超时/磁盘/网络）重跑一次，仍红当真实失败。可选 check（Greptile Review check、Windows trace A/B diagnostic、stale branch reminder 等非 required）不当必修。CodeQL 等任务内带 verified code-scanning evidence 的阻断告警同 required CI 核实修复；没权限/分析缺失是采集问题，不凭猜测修；禁止 dismiss/降阈值。',
+      '必须项红先看 feedback 里 watcher 写好的分诊（分类/失败步骤/本地复现/处理，task 文件 feedback[].ciTriage 有结构化版本）：format 用 gh pr edit 改 PR 元数据、不改代码；code 先跑给出的本地命令复现再修；aggregate（verify 等汇总门）只修列出的失败子 job；waits-upstream（pr-ci-freshness、pr-format-gate 的 Windows 证据步）不为它改代码，上游没跑完或刚跑完时 watcher 已暂缓派发，派到你这里说明上游已收口：先修红的上游，上游全绿后对该门 gh run rerun <run-id> --failed 一次；infra 重跑一次或 blocked。分诊为 unknown 或与 ciErrors 不符时以日志为准。Windows 偶发：同 head 首次失败且日志命中基础设施特征（下载失败/runner 取消/超时/磁盘/网络）重跑一次，仍红当真实失败。可选 check（Greptile Review check、Windows trace A/B diagnostic、stale branch reminder 等非 required）不当必修。CodeQL 等任务内带 verified code-scanning evidence 的阻断告警同 required CI 核实修复；没权限/分析缺失是采集问题，不凭猜测修；禁止 dismiss/降阈值。',
       '要先复核再决定改不改的意见（repairPolicy 里 reason=member-thread-triage：仓库成员含作者本人留的 thread；member-feedback-triage：成员的 review 总评或 PR 主讨论区评论；greptile-p1-triage：Greptile 按它自己的标准打的 P0/P1/P2；thread-triage：严重度读不出或来源未核验的）：先按统一分级重新判定，拿不准用 Jev 并自己复现核实。确认成立的 P0/P1/P2 才改代码并记 SC=pass；P3、提问或不成立记 SC=no-change。两种情况 evidence 第一条都写一句给评论人看的人话结论（发生了什么 / 对本 PR 意味着什么 / 要不要改代码），watcher 会把它贴到该 thread 并 resolve；不要以「严重度未知」blocked 这类项。',
       '三审/Greptile：只修复核成立的 P0/P1/P2；reply-resolve 类别现仅表示 reply-only（P3）：用「发生了什么 / 对本 PR 意味着什么 / 要不要改代码」在当前会话说明，不改代码、不主动 GitHub 回复、不自动 resolve。混合/未知严重度 needs-triage 不授整条修复，在会话里核实。ignore-infra 不处理。与写明产品意图冲突的按上面「产品意图」处理。修复不设轮次上限，一直推进到可合并；获准冲突修复用 git merge origin/main，不 rebase/force push。',
       ...(taskPath ? [

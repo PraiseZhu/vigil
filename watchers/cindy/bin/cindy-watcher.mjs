@@ -21,6 +21,7 @@ import {
 import { canonicalRuntime, runtimeSha256 } from './cindy-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
 import { optionalConfig } from './profile.mjs';
+import { triageText } from './cindy-ci-triage.mjs';
 export const DISPATCH_PARAM_KEYS = Object.freeze(['title', 'message', 'target_session_id']);
 export const REPO = 'makecindy/cindy';
 const GH = process.env.GH_BIN ?? 'gh';
@@ -297,7 +298,8 @@ function failedRequiredCiItems({ pr, ci }) {
       nativeId: rule.appId != null ? `${native}#${rule.appId}` : native,
       revision: `${rule.status}:${checkId ?? ''}:${attempt ?? ''}`,
       sha: evidence.sha ?? pr.headRefOid ?? null,
-      body: `${native} failed ${rule.reason ?? ''} check=${checkId ?? ''} run=${runId ?? ''}${attempt != null ? ` attempt=${attempt}` : ''} ${url}`.trim(),
+      body: [`${native} failed ${rule.reason ?? ''} check=${checkId ?? ''} run=${runId ?? ''}${attempt != null ? ` attempt=${attempt}` : ''} ${url}`.trim(), triageText(rule.triage)].filter(Boolean).join('\n'),
+      ...(rule.triage ? { ciTriage: rule.triage } : {}),
       contentHash: digest({
         context: native, appId: rule.appId, status: rule.status,
         id: checkId, runId, attempt, url,
@@ -742,7 +744,7 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       WORKER_RULE,
       '只改本 PR 必需代码+测试。不合并、不开 auto-merge、不删远端分支、不改 CI 配置、不请求/代替维护者审批。给人看的回复先说人话：发生了什么 / 对本 PR 意味着什么 / 改了什么。',
       '整体目标是按逐项权限处理本批反馈；获准修复才提交并 push fork，P3 只说明暂不修，未知严重度在会话里核实，确认不了的按不成立记 no-change，不以回复冒充修复。required CI 通过或记录外部阻塞。',
-      '必须项红：不许 gh run rerun。先读 job 日志分类；与本 PR 相关则修代码；判定 flaky/外部时不要自己做空提交，记 SC=no-change 按 helper finalize 收口，helper 会对同一 head 只用一次签名空提交重触发，仍红由 watcher 升级通知。可选 check 不当必修。',
+      '必须项红：不许 gh run rerun。先看 feedback 里 watcher 写好的分诊（分类/失败步骤/本地复现/处理，task 文件 feedback[].ciTriage 有结构化版本）：format（DCO、PR 设计依据）改提交签名或 PR 元数据；code 先跑给出的本地命令复现再修；aggregate（verify、Windows unit tests 汇总门）只修列出的失败子 job；分诊为 unknown 或与 ciErrors 不符时以日志为准。与本 PR 相关则修代码；判定 flaky/外部时不要自己做空提交，记 SC=no-change 按 helper finalize 收口，helper 会对同一 head 只用一次签名空提交重触发，仍红由 watcher 升级通知。可选 check 不当必修。',
       '维护者、作者本人或代码审查应用留的 review thread（repairPolicy 里 reason=review-thread-triage）：先按仓库 REVIEW.md 的统一分级判定，拿不准用 Jev。确认必修（评论 P0/P1/P2）才改代码，SC=pass，修完回复人话并 resolve；P3 建议、提问或不成立记 SC=no-change，evidence 第一条写一句给评论人看的人话结论（发生了什么 / 对本 PR 意味着什么 / 要不要改代码），watcher 会贴到该 thread 并 resolve。不要以「严重度未知」blocked 这类项。',
       'Greptile / github-actions[bot]：只修复核成立的 P0/P1/P2；P3 reply-only。自动回复+resolve 作用于可信来源且已定级为 P3 的 thread。回复/resolve 遇到 403 只在会话内报告，不让整轮失败。混合/未知严重度 needs-triage，在会话里核实后确认不了就 no-change。修复不设轮次上限，一直推进到可合并；冲突处理 = fetch upstream main 后 merge 进 PR 分支再 push fork，不 rebase/force push，绝不 push 到 makecindy/cindy。',
       ...(taskPath ? [
