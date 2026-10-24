@@ -1269,10 +1269,29 @@ export function blocked({ home, taskPath, reason, kind = 'external', ghFn = comm
   recordActivity(paths, task, 'blocked');
   const { sessionId } = boundSession(paths, task);
   if (typeof reason !== 'string' || !reason.trim()) fail('blocked reason is required');
+  const validationBlock = latestFailedValidation(paths, task);
   return saveResult(paths, task, sessionId, {
     status: 'blocked', blockedKind: kind, reason: reason.trim(),
-    head: task.headRefOid, worktree: taskWorktree(task),
+    head: task.headRefOid, worktree: taskWorktree(task), ...(validationBlock ? { validationBlock } : {}),
   });
+}
+
+// 阻塞若源于本地 validate 失败，把那份失败收据的指纹带给 watcher，供它判断环境是否真的变了。
+function latestFailedValidation(paths, task) {
+  try {
+    const dir = path.join(paths.validations, task.dispatchId);
+    const files = fs.readdirSync(dir).filter((name) => /^[0-9a-f]{40}-[0-9a-f-]{36}\.json$/.test(name))
+      .map((name) => ({ file: path.join(dir, name), at: fs.statSync(path.join(dir, name)).mtimeMs })).sort((a, b) => b.at - a.at);
+    if (!files.length) return null;
+    const bytes = fs.readFileSync(files[0].file);
+    const receipt = JSON.parse(bytes);
+    if (receipt.status === 'pass' || receipt.status === 'approved-exception') return null;
+    return {
+      validatedHead: receipt.head, policySha256: receipt.policy?.sha256 ?? null, runtimeSha256: receipt.runtimeSha256 ?? null,
+      failureSetState: receipt.failureSetState ?? 'legacy', failureSetSha256: receipt.failureSetSha256 ?? null,
+      failureKind: receipt.failureKind ?? null, receiptSha256: hash(bytes),
+    };
+  } catch { return null; }
 }
 
 export function shellQuote(value) {
