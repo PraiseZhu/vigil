@@ -18,7 +18,7 @@ import {lifelineFeedback} from './mivo-lifeline-source.mjs';
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent, completedMemberFeedback, coveredFeedbackItems, replyToMemberFeedback, requestMemberReviewers } from './mivo-review-resolve.mjs';
 import { codeScanningFeedbackItems } from './mivo-code-scanning.mjs';
 import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck } from './mivo-pr-actions.mjs';
-import { autoCleanupWatch, command as gitDefaultFn, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath } from './mivo-repair.mjs';
+import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath } from './mivo-repair.mjs';
 import { canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
@@ -1434,11 +1434,14 @@ const VALIDATE_BLOCK_REASON = /preflight|validat/i;
 const NON_VALIDATE_INFRA_REASON = /submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge/i;
 
 // 只读观测本机当前的 policy / 运行指纹 / 最新失败收据，不跑测试、不碰网络。观测不到的部分记 null。
-export function observeValidationContext({ previous, paths, env = process.env }) {
+export function observeValidationContext({ previous, paths, env = process.env, gitFn = gitDefaultFn }) {
   let policySha256 = null;
   let runtime = null;
+  let mergeBase = null;
   try {
     const worktree = watchWorktreePath(pluginRepoPath(env), previous.number);
+    const block = previous.activeTask?.validationBlock;
+    mergeBase = validationMergeBase({ worktree, validatedHead: block?.validatedHead ?? previous.headRefOid, baseRefOid: previous.baseRefOid, baseRefName: previous.baseRefName, gitFn });
     policySha256 = createHash('sha256').update(fs.readFileSync(path.join(worktree, '.githooks', 'pre-push'), 'utf8').trim()).digest('hex');
     runtime = runtimeSha256(canonicalRuntime({ worktree }));
   } catch { /* worktree 缺失或不可读：留给调用方当作 unknown */ }
@@ -1455,7 +1458,7 @@ export function observeValidationContext({ previous, paths, env = process.env })
       }
     }
   } catch { /* 没有失败收据：不构成变化证据 */ }
-  return { policySha256, runtimeSha256: runtime, ...failure };
+  return { mergeBase, policySha256, runtimeSha256: runtime, ...failure };
 }
 
 // 与上次 validate 类 blocked 相比：head、base、policy、运行指纹、失败集合任一已知变化 → changed；
@@ -1466,13 +1469,13 @@ export function validationReopenDecision({ previous, active, observe }) {
     const taskHead = active.head ?? null;
     return taskHead && previous.headRefOid && taskHead !== previous.headRefOid ? 'changed' : 'unknown';
   }
-  for (const key of ['remoteHead', 'baseRefOid']) {
-    const now = key === 'remoteHead' ? previous.headRefOid : previous.baseRefOid;
-    if (block[key] && now && block[key] !== now) return 'changed';
-  }
+  if (block.remoteHead && previous.headRefOid && block.remoteHead !== previous.headRefOid) return 'changed';
   const current = observe();
   if (!current) return 'unknown';
   let unknown = false;
+  // base 分支 tip 前进不算变化，只比较被验证 head 与 base 的 merge-base；任一侧取不到就按 unknown。
+  if (!current.mergeBase || !block.mergeBase) unknown = true;
+  else if (current.mergeBase !== block.mergeBase) return 'changed';
   for (const key of ['policySha256', 'runtimeSha256']) {
     if (!current[key]) { unknown = true; continue; }
     if (block[key] && current[key] !== block[key]) return 'changed';
