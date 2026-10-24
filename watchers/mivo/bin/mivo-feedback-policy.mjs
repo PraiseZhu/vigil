@@ -31,6 +31,11 @@ function trustedReviewer(item) {
 // author included). Its body still grants nothing: the repair session grades it on the unified severity
 // scale, only a confirmed P0/P1/P2 changes code, P3 is answered with evidence and resolved.
 const MEMBER_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+function isBotAuthor(item) {
+  const author = item?.user ?? item?.author;
+  const login = typeof author === 'string' ? author : author?.login;
+  return /\[bot\]$/i.test(String(login ?? '')) || author?.__typename === 'Bot' || author?.type === 'Bot';
+}
 export function isMemberFeedback(item) {
   const author = item?.user ?? item?.author;
   const login = typeof author === 'string' ? author : author?.login;
@@ -120,6 +125,8 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
     // infer CI authority from a comment mentioning checks or from optional checks.
     return result('required-ci-fix', [], proof ? 'verified-required-ci-failure' : 'legacy-required-ci-failure');
   }
+  // pr-hygiene workflow 的机器人通知（如「冲突已解决」）：冲突本身由 conflict 来源处理，通知被编辑一次就派一轮只会空转。
+  if (isBotAuthor(item) && /<!--\s*pr-hygiene:/.test(String(item.body ?? ''))) return result('ignore-infra', [], 'pr-hygiene-notice');
   if (!trustedReviewer(item)) {
     if (isMemberThread(item)) return result('code-fix', [], 'member-thread-triage');
     if (isMemberFeedback(item)) return result('code-fix', [], 'member-feedback-triage');

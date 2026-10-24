@@ -222,7 +222,32 @@ test('比对规则升级：本轮没跑验证就停下时，退回读同一 PR �
   assert.equal(next.infraReopened.at(-1).parserReceipt, observed.parserReceiptSha256, '记下触发重开的旧收据');
   const again = { ...next, eligibility: 'blocked', activeTask: { ...previous.activeTask, dispatchId: 'd2' } };
   fs.writeFileSync(path.join(paths.stateDir, 'tasks', 'd2.json'), JSON.stringify({ nodeId: 'PR_1', feedback: [] }));
-  assert.equal(reopenInfraBlocked({ previous: again, paths, now: 'n', observe: () => observed }), again, '同一份旧收据不再触发重开');
+  assert.equal(observed.ownReceipt, false, '本轮没有自己的收据');
+  assert.equal(reopenInfraBlocked({ previous: again, paths, now: 'n', observe: () => ({ ...observed, ownReceipt: true }) }), again, '同一份旧收据不再触发重开');
   const other = observeValidationContext({ previous: { ...previous, number: 70, nodeId: 'PR_X' }, paths, env });
   assert.equal(other.receiptParserVersion ?? null, null, '不读别的 PR 的收据');
+});
+
+test('本轮没跑 validate 就以验证失败停下：重开一次；观测不到时不重开', (t) => {
+  const { paths, previous } = setup(t, { block: null, reason: '上一轮 helper validate 对同一 HEAD 已失败' });
+  const next = reopenInfraBlocked({ previous, paths, now: 'n', observe: () => ({ ...CURRENT, ownReceipt: false }) });
+  assert.equal(next.eligibility, 'active');
+  assert.equal(reopenInfraBlocked({ previous: next, paths, now: 'n', observe: () => ({ ...CURRENT, ownReceipt: false }) }), next, '同一 dispatch 只重开一次');
+  assert.equal(reopenInfraBlocked({ previous, paths, now: 'n', observe: () => ({ ...CURRENT, ownReceipt: true }) }), previous, '本轮跑过 validate 的不因此重开');
+  assert.equal(reopenInfraBlocked({ previous, paths, now: 'n', observe: () => null }), previous);
+});
+
+test('没有版本号、退出码 1 的旧测试失败收据：也按比对规则升级重开一次；默认观测能识别', (t) => {
+  const { paths, previous } = setup(t, { block: null, reason: 'helper validate 失败：5 项未改动用例' });
+  const dir = path.join(paths.stateDir, 'validations', 'd1');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${'a'.repeat(40)}-00000000-0000-4000-8000-000000000002.json`), JSON.stringify({ nodeId: 'PR_1', status: 'fail', exitCode: 1 }));
+  const env = { ...process.env, MIVO_PLUGIN_REPO: path.join(paths.stateDir, 'missing-repo') };
+  const observed = observeValidationContext({ previous, paths, env });
+  assert.equal(observed.ownReceipt, true);
+  const next = reopenInfraBlocked({ previous, paths, now: 'n', observe: () => observed });
+  assert.equal(next.eligibility, 'active');
+  assert.equal(next.infraReopened.at(-1).parserReceipt, observed.parserReceiptSha256);
+  fs.writeFileSync(path.join(dir, `${'a'.repeat(40)}-00000000-0000-4000-8000-000000000002.json`), JSON.stringify({ nodeId: 'PR_1', status: 'fail', exitCode: 2 }));
+  assert.equal(reopenInfraBlocked({ previous, paths, now: 'n', observe: () => observeValidationContext({ previous, paths, env }) }), previous, '退出码不是 1 的旧收据不触发');
 });

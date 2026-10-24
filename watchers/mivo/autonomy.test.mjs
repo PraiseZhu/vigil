@@ -894,3 +894,22 @@ test('R5-1 a reclaimer that saw a dead lock cannot delete a newer live lock', as
   assert.equal(br.code, 0, br.err);
   assert.deepEqual(pendingEvents(home).map((event) => event.number).sort(), [20, 21], 'both queued notices must survive');
 });
+
+test('blocked：以 validate/preflight 失败为由停下前，本轮必须已有 validate 收据；环境故障与其他原因照常可停', (t) => {
+  const setupTask = () => {
+    const { home, paths } = homeOf(t);
+    const { taskPath, paths: rp } = writeTask(home, { handoff: handoffReceipt({ ...listed, releaseEpoch: 'e' }), feedback: [] });
+    seedBound(paths, { activeTask: { status: 'accepted', dispatchId: 'live-790', head: HEAD, sessionId: 'sess-790' } });
+    return { home, taskPath, rp };
+  };
+  const a = setupTask();
+  assert.throws(() => blocked({ home: a.home, taskPath: a.taskPath, reason: '上一轮 helper validate 对同一 HEAD 已失败：5 个未修改用例要求 root:root' }), /本轮还没有 validate 收据/);
+  const b = setupTask();
+  assert.equal(blocked({ home: b.home, taskPath: b.taskPath, reason: 'preflight 失败：pathspec 匹配不到子模块文件' }).status, 'blocked', '环境故障照常可停');
+  const c = setupTask();
+  assert.equal(blocked({ home: c.home, taskPath: c.taskPath, reason: '缺权限：无法读上游 workflow' }).status, 'blocked');
+  const d = setupTask();
+  fs.mkdirSync(path.join(d.rp.validations, 'live-790'), { recursive: true });
+  fs.writeFileSync(path.join(d.rp.validations, 'live-790', `${HEAD}-00000000-0000-4000-8000-000000000000.json`), JSON.stringify({ status: 'fail', exitCode: 1, head: HEAD }));
+  assert.equal(blocked({ home: d.home, taskPath: d.taskPath, reason: 'helper validate 全量单测 5 个未修改用例失败' }).status, 'blocked', '本轮跑过 validate 后可停');
+});

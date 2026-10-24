@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 import { REPO, observeValidationContext, pollFingerprint, reopenExternalBlocked, reopenInfraBlocked, rulesVersion, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
 import { readPr, writePr } from './bin/mivo-state.mjs';
+import { PARSER_VERSION } from './bin/mivo-validation-evidence.mjs';
 
 // 生产 state 条目没有 baseRefOid/baseRefName；当前 base 只来自 poll / 采集结果。
 // 这里用真实 git 仓 + scanOnce 的真实调用链（快路径 canSkipCollection 与 processPr）验证，不往 previous 手工注入 baseRefOid。
@@ -229,6 +230,12 @@ test('F3 infra 入口：reason 不含 INFRA 关键词的 validate 类阻塞（�
     assert.equal(changed.repairRounds, 1);
 
     const legacy = externalFixture(t, { reason, block: false });
+    const noReceipt = reopenInfraBlocked({ previous: legacy.previous, paths: legacy.paths, now: 'n' });
+    assert.equal(noReceipt.eligibility, 'active', `${reason}：本轮没有自己的 validate 收据就停下，重开一次`);
+    // 本轮已按当前规则跑过 validate（有自己的收据）时，legacy 阻塞仍只在 head 变化时重开。
+    fs.mkdirSync(path.join(legacy.paths.stateDir, 'validations', 'd1'), { recursive: true });
+    fs.writeFileSync(path.join(legacy.paths.stateDir, 'validations', 'd1', `${'a'.repeat(40)}-00000000-0000-4000-8000-000000000003.json`),
+      JSON.stringify({ nodeId: 'PR_1', status: 'fail', exitCode: 1, parserVersion: PARSER_VERSION, failureKind: 'test-failure' }));
     assert.equal(reopenInfraBlocked({ previous: legacy.previous, paths: legacy.paths, now: 'n' }), legacy.previous, `${reason}：legacy head 未变不重开`);
     const moved = reopenInfraBlocked({ previous: { ...legacy.previous, headRefOid: 'c'.repeat(40) }, paths: legacy.paths, now: 'n' });
     assert.equal(moved.eligibility, 'active', `${reason}：legacy head 变化重开`);

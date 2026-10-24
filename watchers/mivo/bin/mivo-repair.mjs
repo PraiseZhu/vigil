@@ -1269,6 +1269,9 @@ export function blocked({ home, taskPath, reason, kind = 'external', ghFn = comm
   recordActivity(paths, task, 'blocked');
   const { sessionId } = boundSession(paths, task);
   if (typeof reason !== 'string' || !reason.trim()) fail('blocked reason is required');
+  if (isValidateFailureReason(reason) && !hasValidationReceipt(paths, task)) {
+    fail('本轮还没有 validate 收据：以 validate/preflight 失败为由停下前，先运行同一 helper validate --validated-head <完整SHA>，以本轮结果为准（helper 会复用通过收据、按基线判定 main 自身的失败）。若是环境/工具故障（如 pathspec、submodule、worktree HEAD），在 reason 里写明具体故障。');
+  }
   const validationBlock = latestFailedValidation(paths, task);
   return saveResult(paths, task, sessionId, {
     status: 'blocked', blockedKind: kind, reason: reason.trim(),
@@ -1293,6 +1296,18 @@ export function validationMergeBase({ worktree, validatedHead, baseRefOid, baseR
 }
 
 // 阻塞若源于本地 validate 失败，把那份失败收据的指纹带给 watcher，供它判断环境是否真的变了。
+// 与 watcher 的 validate 类判定同口径：原因指向 preflight/validate/pre-push，且不是环境/配置故障，也不是 Keel 不可用。
+const VALIDATE_FAILURE_REASON = /preflight|validat|pre-push/i;
+const ENV_FAILURE_REASON = /submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge/i;
+function isValidateFailureReason(reason) {
+  const text = String(reason ?? '').trim();
+  return VALIDATE_FAILURE_REASON.test(text) && !ENV_FAILURE_REASON.test(text) && !/^keel-/i.test(text);
+}
+function hasValidationReceipt(paths, task) {
+  try { return fs.readdirSync(path.join(paths.validations, task.dispatchId)).some((name) => /^[0-9a-f]{40}-[0-9a-f-]{36}\.json$/.test(name)); }
+  catch { return false; }
+}
+
 function latestFailedValidation(paths, task, gitFn = command) {
   try {
     const dir = path.join(paths.validations, task.dispatchId);
