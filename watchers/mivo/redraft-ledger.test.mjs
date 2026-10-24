@@ -41,9 +41,10 @@ function cursorFor({ comments = [COMMENT], ci = { status: 'green', required: [] 
 }
 
 // One poll of a PR whose state is `entry`; GitHub now shows `comments` / `ci` on `head`.
-function poll(t, { entry, comments = [COMMENT], ci = { status: 'green', required: [] }, head = HEAD, now = NOW } = {}) {
+function poll(t, { entry, comments = [COMMENT], ci = { status: 'green', required: [] }, head = HEAD, now = NOW, prepare } = {}) {
   const paths = watcherPaths(home(t));
   fs.mkdirSync(paths.stateDir, { recursive: true });
+  prepare?.(paths);
   const pr = listed(head);
   writePr(paths.home, NODE, {
     number: 790, nodeId: NODE, sessionId: 'sess-790', eligibilityInitialized: true, eligibility: 'active', admissionVerified: true,
@@ -185,6 +186,44 @@ test('missing-result-limit resets recorded in an earlier admission epoch do not 
   const resets = [1, 2, 3].map((n) => ({ dispatchId: `live-790-earlier-${n}`, epoch: 'ready:PR_790:old:2026-09-01T00:00:00Z', at: NOW }));
   const { sent } = poll(t, { comments: [COMMENT, NEW_COMMENT], entry: limited({ missingResultResets: resets }) });
   assert.equal(sent.length, 1);
+});
+
+// ---- the dead task's feedback comes back with the reset (nothing it was handed may be silently dropped) ----
+
+const deadTask = (keys) => (paths) => {
+  fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
+  fs.writeFileSync(path.join(paths.stateDir, 'tasks', `${OLD_TASK}.json`), JSON.stringify({
+    dispatchId: OLD_TASK, nodeId: NODE, number: 790, feedback: keys.map((key) => ({ key })) }));
+};
+const newTaskKeys = (paths) => {
+  const dir = path.join(paths.stateDir, 'tasks');
+  const files = fs.readdirSync(dir).filter((name) => name !== `${OLD_TASK}.json`);
+  assert.equal(files.length, 1, 'exactly one new task is written');
+  return JSON.parse(fs.readFileSync(path.join(dir, files[0]), 'utf8')).feedback.map((item) => item.key).sort();
+};
+
+test('missing-result-limit reset delivers the dead task\'s feedback together with the new feedback', t => {
+  const { sent, paths } = poll(t, { comments: [COMMENT, NEW_COMMENT], prepare: deadTask(['comment:101']), entry: limited() });
+  assert.equal(sent.length, 1);
+  assert.deepEqual(newTaskKeys(paths), ['comment:101', 'comment:202']);
+});
+
+test('missing-result-limit reset on a new head alone still delivers what the dead task was handed', t => {
+  const { sent, paths } = poll(t, { comments: [COMMENT], head: NEXT_HEAD, prepare: deadTask(['comment:101']), entry: limited({ headRefOid: HEAD }) });
+  assert.equal(sent.length, 1);
+  assert.deepEqual(newTaskKeys(paths), ['comment:101']);
+});
+
+test('reaching missing-result-limit and resetting in one scan still writes the limit notice and delivers both', t => {
+  const { sent, paths, entry } = poll(t, { comments: [COMMENT, NEW_COMMENT], prepare: deadTask(['comment:101']),
+    entry: { eligibility: 'active', feedbackCursor: cursorFor(),
+      lastDispatch: { dispatchId: OLD_TASK, at: '2026-10-20T08:00:00.000Z', recoveryCount: 3 },
+      activeTask: { dispatchId: OLD_TASK, status: 'accepted', head: HEAD } } });
+  assert.ok(pendingEvents(paths.home).some((event) => event.kind === 'missing-result-limit' && event.number === 790),
+    'the person is still told that the session returned nothing');
+  assert.equal(sent.length, 1);
+  assert.deepEqual(newTaskKeys(paths), ['comment:101', 'comment:202']);
+  assert.equal(entry.missingResultResets.length, 1);
 });
 
 // ---- SC-5: one "watcher stopped" comment per (PR, head, kind, cause) ----
