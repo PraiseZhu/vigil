@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { collectCindyPolicySteps, evaluateCindyCi } from './cindy-pr-policy.mjs';
+import { AGGREGATES, applyCiTriage, failingJobsOnHead } from './cindy-ci-triage.mjs';
 
 const parse = raw => typeof raw === 'string' ? JSON.parse(raw) : raw;
 const check = (ok, reason) => { if (!ok) throw new Error(reason); };
@@ -18,7 +19,7 @@ export function readAll(ghFn, list) {
 }
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
-export function* collectCindyCiSteps({ pr, ghFn }) {
+export function* collectCindyCiSteps({ pr, ghFn, now = Date.now() }) {
   const policy = yield* collectCindyPolicySteps({ repo: pr.repo, number: pr.number, gh: ghFn });
   if (policy.status !== 'verified' || policy.prNodeId !== pr.id || policy.headSha !== pr.headRefOid
     || policy.baseSha !== pr.baseRefOid) return { policy, status: 'unknown', required: [], reason: 'policy-or-snapshot-unverified' };
@@ -89,7 +90,25 @@ export function* collectCindyCiSteps({ pr, ghFn }) {
     const statusPages = parse(yield () => ghFn(['api', `repos/${pr.repo}/commits/${pr.headRefOid}/statuses?per_page=100`, '--paginate', '--slurp']));
     check(Array.isArray(statusPages) && statusPages.every(Array.isArray), 'status pagination incomplete');
     const statuses = statusPages.flat().map(s => ({ ...s, sha: pr.headRefOid }));
-    const result = evaluateCindyCi({ policy, headSha: pr.headRefOid, checks, statuses });
+    const evaluated = evaluateCindyCi({ policy, headSha: pr.headRefOid, checks, statuses });
+    // An aggregate (verify, Windows unit tests) is never the thing to fix: read the failed step of each failed
+    // job below it so the repair session starts from the real cause. A failed read only drops the detail.
+    if (evaluated.required?.some((rule) => rule.status === 'failed' && AGGREGATES.some((agg) => agg.context.test(rule.context)))) {
+      const extra = [];
+      for (const item of failingJobsOnHead(checks).slice(0, 12)) {
+        const jobId = /\/actions\/runs\/\d+\/job\/(\d+)\/?$/.exec(String(item.details_url ?? ''))?.[1];
+        if (!jobId || jobs.has(jobId)) continue;
+        const kept = fromCache('jobs', jobId);
+        if (kept) jobs.set(jobId, kept); else extra.push(jobId);
+      }
+      if (extra.length) {
+        try {
+          const loaded = yield () => readAll(ghFn, extra.map((id) => ['api', `repos/${pr.repo}/actions/jobs/${id}`]));
+          extra.forEach((id, index) => { const value = parse(loaded[index]); jobs.set(id, value); remember('jobs', id, value); });
+        } catch { /* triage keeps the job name without its failed step */ }
+      }
+    }
+    const result = applyCiTriage(evaluated, { checks, jobsById: jobs, now, pr: pr.number });
     const after = parse(yield () => ghFn(['pr', 'view', String(pr.number), '--repo', pr.repo, '--json', 'id,headRefOid,baseRefOid,state,isDraft']));
     check(after.id === pr.id && after.headRefOid === pr.headRefOid && after.baseRefOid === pr.baseRefOid
       && after.state === pr.state && after.isDraft === pr.isDraft, 'PR changed during CI collection');
