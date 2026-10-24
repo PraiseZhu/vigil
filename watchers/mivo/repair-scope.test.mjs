@@ -918,3 +918,86 @@ test('SC1 并发上限：上限 1 时两个 validate 争用同一 home，runFn �
   assert.equal(peak, 1);
   assert.deepEqual(results.map((item) => item.status), ['fail', 'fail']);
 });
+
+// ---- SC-6 仅基线失败的受控通过 ----
+const failLog = (...tests) => ['[preflight] ▶ test', ...tests.flatMap(([name, message]) => [
+  ` FAIL  scripts/ops/example.test.mjs > example > ${name}`, `AssertionError: ${message}`, ' ❯ scripts/ops/example.test.mjs:12:5', '']),
+`      Tests  ${tests.length} failed | 10 passed (${tests.length + 10})`, '[preflight] ❌ test 失败'].join('\n');
+const A = ['owns the env file', 'expected 501 to be +0'];
+const B = ['reads the mode', 'expected 420 to be 384'];
+
+function baselineFixture(t) {
+  const f = fixture(t);
+  execFileSync('git', ['-C', f.worktree, 'push', 'origin', `${f.sourceHead}:refs/heads/main`], { stdio: 'ignore' });
+  const baselineRuns = [];
+  const route = ({ pr, base }) => (_binary, _args, opts) => {
+    if (opts.cwd === f.worktree) return pr();
+    baselineRuns.push(opts.cwd);
+    return base();
+  };
+  const outcome = (log) => () => { throw Object.assign(new Error('Command failed'), { status: 1, stdout: log, stderr: '' }); };
+  const passes = () => 'ok\n';
+  const worktreesLeft = () => {
+    const dir = path.join(f.paths.validations, 'baseline-worktrees');
+    return fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+  };
+  return { f, baselineRuns, route, outcome, passes, worktreesLeft };
+}
+
+test('SC6 PR 失败集合 ⊆ 基线失败集合：产出 baseline-only-failure（保留真实 exit 1），基线 worktree 被清理，可受控 push 并 finalize', async (t) => {
+  const { f, route, outcome, baselineRuns, worktreesLeft } = baselineFixture(t);
+  const verification = await validate({ ...f.options, runFn: route({ pr: outcome(failLog(A)), base: outcome(failLog(A, B)) }) });
+  assert.equal(verification.status, 'baseline-only-failure');
+  const receipt = readReceipt(verification);
+  assert.equal(receipt.exitCode, 1);
+  assert.equal(receipt.failureKind, 'test-failure');
+  assert.equal(receipt.baseline.mergeBase, f.sourceHead);
+  assert.equal(receipt.baseline.policySha256, receipt.policy.sha256);
+  assert.equal(receipt.baseline.runtimeSha256, receipt.runtimeSha256);
+  assert.equal(baselineRuns.length, 1);
+  assert.deepEqual(worktreesLeft(), []);
+  assert.doesNotMatch(execFileSync('git', ['-C', f.worktree, 'worktree', 'list'], { encoding: 'utf8' }), /baseline-worktrees/);
+  f.report([f.sc('pass', ['thread:P1'])]);
+  const result = f.finalize();
+  assert.equal(result.status, 'complete');
+  assert.equal(result.verification.status, 'baseline-only-failure');
+  assert.equal(result.ci.requiredGreen, true, '远端必需 CI 仍要求全绿');
+  assert.equal(f.pushCalls.length, 1);
+});
+
+for (const [name, pr, base] of [
+  ['PR 比基线多一个失败', failLog(A, B), failLog(A)],
+  ['同名失败但 errorSha 不同', failLog([A[0], 'expected 502 to be +0']), failLog(A)],
+  ['基线通过（PR 独有的失败）', failLog(A), null],
+  ['基线输出无法解析', failLog(A), 'lint exploded'],
+  ['PR 输出无法解析', 'lint exploded', failLog(A)],
+]) {
+  test(`SC6 ${name} → fail，不得受控通过`, async (t) => {
+    const { f, route, outcome, passes } = baselineFixture(t);
+    const verification = await validate({ ...f.options, runFn: route({
+      pr: pr === 'lint exploded' ? outcome(pr) : outcome(pr), base: base === null ? passes : outcome(base) }) });
+    assert.equal(verification.status, 'fail');
+  });
+}
+
+test('SC6 stalled / timeout 不跑基线；同键基线只跑一次（缓存命中）', async (t) => {
+  const { f, route, outcome, baselineRuns, worktreesLeft } = baselineFixture(t);
+  const stalled = await validate({ ...f.options, runFn: route({
+    pr: () => { throw Object.assign(new Error('stalled'), { status: null, failureKind: 'validate-stalled', stdout: '' }); }, base: outcome(failLog(A)) }) });
+  assert.equal(stalled.status, 'fail');
+  assert.equal(baselineRuns.length, 0);
+  const options = { ...f.options, runFn: route({ pr: outcome(failLog(A)), base: outcome(failLog(A)) }) };
+  assert.equal((await validate(options)).status, 'baseline-only-failure');
+  assert.equal((await validate(options)).status, 'baseline-only-failure');
+  assert.equal(baselineRuns.length, 1, '同 mergeBase/policy/指纹的基线结果被缓存');
+  assert.deepEqual(worktreesLeft(), []);
+});
+
+test('SC6 并发的两个 validate 对同一基线键只跑一次基线', async (t) => {
+  const { f, route, outcome, baselineRuns } = baselineFixture(t);
+  const slowBase = async () => { await new Promise((resolve) => setTimeout(resolve, 200)); return outcome(failLog(A))(); };
+  const options = { ...f.options, slotPollMs: 20, runFn: route({ pr: outcome(failLog(A)), base: slowBase }) };
+  const results = await Promise.all([validate(options), validate(options)]);
+  assert.deepEqual(results.map((item) => item.status), ['baseline-only-failure', 'baseline-only-failure']);
+  assert.equal(baselineRuns.length, 1);
+});
