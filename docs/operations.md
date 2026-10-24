@@ -155,7 +155,7 @@ node watchers/<mivo|cindy>/deploy.mjs apply --plan <file>
 - 排队的 validate 不是故障：心跳仍在写，不要因为它没产出结果就补投。
 - `validate-stalled`（长时间无输出）与 `validate-timeout`（总超时）是环境/卡死问题，不是测试失败；它们的失败集合记 `unparsed`，不会参与基线比较。
 - Mivo 的 `baseline-only-failure` 是机器判定的状态，需要 `git merge-base` 能解析（validate 会有界地 fetch 目标 base 分支）；它不放宽远端必需 CI。Cindy 不实现该状态，原因见 Cindy README。
-- validate 类阻塞的重开改为按证据判断（head、merge-base、policy、运行指纹、失败集合；base 分支 tip 前进而 merge-base 不变不算变化）；升级前留下的、没有 `validationBlock` 的旧阻塞只在远端 head 变化时才会重开。
+- validate 类阻塞的重开改为按证据判断（head、merge-base、policy、运行指纹、失败集合；base 分支 tip 前进而 merge-base 不变不算变化）；升级前留下的、没有 `validationBlock` 的旧阻塞只在远端 head 变化时才会重开。带 `validationBlock` 但原因是 pathspec、submodule、worktree HEAD 等环境/配置故障的阻塞，按原有 infra 规则重开，不套五要素。当前 base 随每轮采集写进 PR 状态条目（`baseRefOid`/`baseRefName`）；升级前的旧条目没有这两个字段，首轮 merge-base 为未知，下一轮写入后才能比较。部署新版（`rulesVersion` 变化）不会重投 validate 类阻塞，也不会与五要素判据重复退还轮次。
 
 ## 8. 测试环境变量
 

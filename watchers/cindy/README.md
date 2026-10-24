@@ -99,7 +99,7 @@ Mivo 侧的 `baseline-only-failure` 依赖仓库内的 `.githooks/pre-push`：�
 
 ### validate 类阻塞不再原样重投
 
-与 Mivo 相同：validate 类阻塞重开前比较上次阻塞时的远端 head、merge-base（被验证 head 与 base 的 merge-base，base 分支 tip 前进但 merge-base 不变不重开；取不到时按未知处理）、外部预检脚本 sha256、运行指纹、失败集合；全部未变（或关键观测缺失）不重新派发、不消耗每代次上限，任一已知变化才重开。
+与 Mivo 相同：validate 类阻塞重开前比较上次阻塞时的远端 head、merge-base（被验证 head 与 base 的 merge-base，base 分支 tip 前进但 merge-base 不变不重开；取不到时按未知处理）、外部预检脚本 sha256、运行指纹、失败集合；全部未变（或关键观测缺失）不重新派发、不消耗每代次上限，任一已知变化才重开。原因属于 pathspec、submodule、worktree HEAD 等环境/配置故障的阻塞，即使带着 `validationBlock`，也按原有 infra 规则重开，不套五要素。当前 base（`baseRefOid`/`baseRefName`）取自本轮 poll/采集结果并随采集写进 PR 状态条目；升级前的旧条目没有这两个字段，首轮 merge-base 记为未知，下一轮写入后即可比较。部署新版（`rulesVersion` 变化）不是 validate 类阻塞的重开理由，同一 dispatch 已被五要素判据重开的，external 路径不再重复重开；非 validate 类 external 阻塞随 `rulesVersion` 变化重开的行为不变。
 
 ### 新版任务必需的 Keel 配置
 
