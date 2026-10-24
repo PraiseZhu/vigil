@@ -14,6 +14,10 @@ import { createPushHooks } from './mivo-pre-push.mjs';
 import { taskRepairPolicy } from './mivo-feedback-policy.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, readPr, writePr } from './mivo-state.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
+import { acquireValidationSlot, runStreaming, validationConfig } from './mivo-validation-runtime.mjs';
+import {
+  PARSER_VERSION, canonicalRuntime, emptyFailureSet, lookupPass, parseFailureSet, publishPass, runtimeSha256,
+} from './mivo-validation-evidence.mjs';
 
 // 目标仓库在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
 export const REPO = requireConfig('targetRepo', {
@@ -752,10 +756,48 @@ function validationException(paths, task, sessionId, head, worktree, gitFn) {
   return { approvalPath: file, approvalSha256: binding.approvalSha256, approvalRef: approval.approvalRef, reason: approval.reason };
 }
 
-export function validate({ home, taskPath, validatedHead, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, runFn = command, env = process.env, originUrl = remoteUrl(REPO) } = {}) {
+const sha256Of = (value) => createHash('sha256').update(value).digest('hex');
+
+// 默认的命令执行器：独立进程组 + 流式 0600 日志 + 无输出看门狗。返回日志全文；
+// 非零退出/看门狗终止时抛出带 status/failureKind 的错误（与 execFileSync 的错误形状兼容）。
+async function runLogged(binary, args, options) {
+  const result = await runStreaming(binary, args, {
+    cwd: options.cwd, env: options.env, logPath: options.logPath,
+    stallMs: options.stallMs, timeoutMs: options.timeout, onGroup: options.onGroup,
+  });
+  const text = fs.readFileSync(options.logPath, 'utf8');
+  if (result.exitCode === 0 && !result.failureKind) return text;
+  throw Object.assign(new Error(`${binary} ${args.join(' ')} exited ${result.exitCode ?? result.signal ?? 'abnormally'}`), {
+    status: result.exitCode, signal: result.signal, failureKind: result.failureKind, stdout: '', stderr: '', logPath: options.logPath,
+  });
+}
+
+// 运行一步并保证日志文件落盘（不可变、0600）。注入的 runFn 若没写日志，就把它的输出写进去。
+async function runLoggedStep(runFn, binary, args, base, logPath) {
+  let output = '';
+  let error = null;
+  try { output = String(await runFn(binary, args, { ...base, logPath })); }
+  catch (caught) {
+    error = caught;
+    output = String(caught?.stdout ?? '') + String(caught?.stderr ?? '');
+  }
+  if (!fs.existsSync(logPath)) {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(logPath, output, { flag: 'wx', mode: 0o600 });
+  } else if (error) output = fs.readFileSync(logPath, 'utf8');
+  const bytes = fs.readFileSync(logPath);
+  return {
+    ok: !error, output: error ? output : String(output),
+    exitCode: error ? (Number.isInteger(error.status) ? error.status : null) : 0,
+    failureKind: error?.failureKind ?? null, logPath, logSha256: sha256Of(bytes),
+  };
+}
+
+export async function validate({ home, taskPath, validatedHead, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, runFn = runLogged, env = process.env, originUrl = remoteUrl(REPO), slotPollMs = 250 } = {}) {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
   const stopHeartbeat = startActivityHeartbeat(paths, task, 'validate');
+  let slot = null;
   try {
   const { sessionId } = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
@@ -772,40 +814,72 @@ export function validate({ home, taskPath, validatedHead, ghFn = command, owners
   let reason;
   let ranPreflight = false;
   let dependencyInstall;
+  let runtime = null;
+  let log = null;
+  let failureKind = null;
+  let failure = null;
+  let reusedFrom = null;
+  let reusedTimes = null;
+  let identityKey = null;
   if (!exception) {
-    const timeoutMs = preflightTimeoutMs(env);
-    if (needsDependencyInstall(worktree)) {
-      try {
-        const output = String(runFn('npm', ['ci'], {
-          cwd: worktree, env: { ...env, PREFLIGHT_SKIP: '0' }, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024,
-        }));
-        dependencyInstall = {
-          status: 'ok', command: { binary: 'npm', args: ['ci'] }, timeoutMs, exitCode: 0, outputHash: hash(output),
-        };
-      } catch (error) {
-        status = 'fail';
-        exitCode = Number.isInteger(error.status) ? error.status : null;
-        outputHash = hash(String(error.stdout ?? '') + String(error.stderr ?? ''));
-        dependencyInstall = {
-          status: 'fail', command: { binary: 'npm', args: ['ci'] }, timeoutMs, exitCode, outputHash,
-        };
-        reason = 'dependency install failed';
+    const config = validationConfig({ env });
+    const timeoutMs = config.timeoutMs;
+    runtime = canonicalRuntime({ worktree });
+    const runtimeHash = runtimeSha256(runtime);
+    identityKey = { repo: task.repo, nodeId: task.nodeId, number: task.number, head: validatedHead, policySha256: policy.sha256, runtimeSha256: runtimeHash };
+    const hit = lookupPass({ validations: paths.validations, identity: identityKey });
+    if (hit) {
+      reusedFrom = { receiptPath: hit.receiptPath, receiptSha256: hit.receiptSha256 };
+      reusedTimes = { startedAt: hit.receipt.startedAt, finishedAt: hit.receipt.finishedAt };
+      exitCode = 0;
+      outputHash = hit.receipt.outputHash;
+      ranPreflight = true;
+      log = { logPath: hit.receipt.logPath, logSha256: hit.receipt.logSha256 };
+      failure = emptyFailureSet();
+    } else {
+      const queuedAt = Date.now();
+      slot = await acquireValidationSlot({ home: paths.home, limit: config.concurrency, pollMs: slotPollMs });
+      if (Date.now() - queuedAt > 1_000) {
+        // 排队期间身份可能已变：拿到槽位后重新核对，再决定是否真的运行。
+        assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
+        const again = assertWorktree(worktree, task, gitFn, originUrl);
+        if (!again || again.head !== validatedHead) fail('worktree HEAD changed while waiting for a validation slot');
       }
-    }
-    if (status !== 'fail') {
-      try {
-        const output = String(runFn('/bin/bash', [policy.file], {
-          cwd: worktree, env: { ...env, PREFLIGHT_SKIP: '0' }, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024,
-        }));
+      const childEnv = { ...env, PREFLIGHT_SKIP: '0', TMPDIR: runtime.tmpdir };
+      const logsDir = path.join(paths.validations, 'logs');
+      const logBase = path.join(logsDir, `${task.dispatchId}-${validatedHead}-${randomUUID()}`);
+      const base = { cwd: worktree, env: childEnv, timeout: timeoutMs, stallMs: config.stallMs, maxBuffer: 32 * 1024 * 1024, onGroup: (pgid) => slot.setGroup(pgid) };
+      if (needsDependencyInstall(worktree)) {
+        const step = await runLoggedStep(runFn, 'npm', ['ci'], base, `${logBase}-npm-ci.log`);
+        dependencyInstall = {
+          status: step.ok ? 'ok' : 'fail', command: { binary: 'npm', args: ['ci'] }, timeoutMs,
+          exitCode: step.exitCode, outputHash: step.logSha256, logPath: step.logPath, logSha256: step.logSha256,
+          ...(step.failureKind ? { failureKind: step.failureKind } : {}),
+        };
+        if (!step.ok) {
+          status = 'fail';
+          exitCode = step.exitCode;
+          outputHash = step.logSha256;
+          reason = 'dependency install failed';
+          failureKind = step.failureKind ?? 'dependency-install';
+          failure = { state: 'unparsed', failureSet: [], failureSetSha256: null };
+          log = { logPath: step.logPath, logSha256: step.logSha256 };
+        }
+      }
+      if (status !== 'fail') {
+        const step = await runLoggedStep(runFn, '/bin/bash', [policy.file], base, `${logBase}-preflight.log`);
         ranPreflight = true;
-        exitCode = 0;
-        outputHash = hash(output);
-        if (/^\[preflight\] skipped(?: |$)/m.test(output)) status = 'fail';
-      } catch (error) {
-        ranPreflight = true;
-        status = 'fail';
-        exitCode = Number.isInteger(error.status) ? error.status : null;
-        outputHash = hash(String(error.stdout ?? '') + String(error.stderr ?? ''));
+        exitCode = step.exitCode;
+        outputHash = step.logSha256;
+        log = { logPath: step.logPath, logSha256: step.logSha256 };
+        if (step.ok) {
+          failure = emptyFailureSet();
+          if (/^\[preflight\] skipped(?: |$)/m.test(step.output)) { status = 'fail'; failureKind = 'evidence-invalid'; failure = { state: 'unparsed', failureSet: [], failureSetSha256: null }; }
+        } else {
+          status = 'fail';
+          failureKind = step.failureKind ?? 'test-failure';
+          failure = step.failureKind ? { state: 'unparsed', failureSet: [], failureSetSha256: null } : parseFailureSet(step.output, { worktree });
+        }
       }
     }
   }
@@ -814,20 +888,30 @@ export function validate({ home, taskPath, validatedHead, ghFn = command, owners
     const after = assertWorktree(worktree, task, gitFn, originUrl);
     if (!after || after.head !== validatedHead) fail('HEAD changed during local validation');
     if (policy && validationPolicy(worktree, task, gitFn).sha256 !== policy.sha256) fail('preflight policy changed during validation');
-  } catch (error) { status = 'fail'; reason = error.message; }
+    if (runtime && runtimeSha256(canonicalRuntime({ worktree })) !== runtimeSha256(runtime)) fail('validation runtime fingerprint changed during validation');
+  } catch (error) { status = 'fail'; reason = error.message; failureKind ??= 'evidence-invalid'; }
   const receipt = {
     schemaVersion: 2, kind: 'mivo-repair-validation', ...identity(task, sessionId), head: validatedHead,
     status, policy, exception, command: ranPreflight ? { binary: '/bin/bash', args: [policy.file] } : null,
     exitCode, outputHash, ...(dependencyInstall ? { dependencyInstall } : {}), ...(reason ? { reason } : {}),
-    startedAt, finishedAt: new Date().toISOString(),
+    ...(runtime ? {
+      validationEvidenceVersion: 1, parserVersion: PARSER_VERSION, runtime, runtimeSha256: runtimeSha256(runtime),
+      logPath: log?.logPath ?? null, logSha256: log?.logSha256 ?? null,
+      failureSetState: failure?.state ?? 'unparsed', failureSet: failure?.failureSet ?? [], failureSetSha256: failure?.failureSetSha256 ?? null,
+      failureKind, reusedFrom, ...(reusedFrom ? { reusedAt: new Date().toISOString() } : {}),
+    } : {}),
+    startedAt: reusedTimes?.startedAt ?? startedAt, finishedAt: reusedTimes?.finishedAt ?? new Date().toISOString(),
   };
 
   const receiptPath = path.join(paths.validations, task.dispatchId, `${validatedHead}-${randomUUID()}.json`);
   immutableJson(receiptPath, receipt);
   const verification = { status, head: validatedHead, receiptPath, receiptSha256: hash(fs.readFileSync(receiptPath)) };
   atomicJson(validationPointer(paths, task, validatedHead), verification);
+  if (status === 'pass' && !reusedFrom && identityKey) {
+    publishPass({ validations: paths.validations, identity: identityKey, receiptPath, receiptSha256: verification.receiptSha256 });
+  }
   return verification;
-  } finally { stopHeartbeat(); }
+  } finally { slot?.release(); stopHeartbeat(); }
 }
 
 function verifiedLocal(paths, task, sessionId, head, worktree, gitFn, receiptPath = null) {
@@ -1260,7 +1344,7 @@ export function autoCleanupWatch({
   }
 }
 
-function cli(argv) {
+async function cli(argv) {
   const args = [...argv];
   const modes = new Set(['assert-owner', 'prepare', 'validate', 'finalize', 'recheck', 'blocked', 'adjudication-brief', 'cleanup', 'clear-owner-unknown']);
   const modeIndex = args.findIndex((item) => modes.has(item));
@@ -1280,7 +1364,7 @@ function cli(argv) {
     const task = value('--task');
     if (mode === 'assert-owner') result = assertOwner({ home, taskPath: task });
     else if (mode === 'prepare') result = prepare({ home, taskPath: task });
-    else if (mode === 'validate') result = validate({ home, taskPath: task, validatedHead: value('--validated-head') });
+    else if (mode === 'validate') result = await validate({ home, taskPath: task, validatedHead: value('--validated-head') });
     else if (mode === 'finalize') result = finalize({ home, taskPath: task, scReport: value('--sc-report'), validatedHead: value('--validated-head'), validationReceipt: value('--validation-receipt', false), keelRun: value('--keel-run', false) });
     else if (mode === 'recheck') result = recheck({ home, taskPath: task, validatedHead: value('--validated-head', false) });
     else if (mode === 'blocked') result = blocked({ home, taskPath: task, reason: value('--reason'), kind: value('--kind', false) ?? 'external' });
@@ -1293,6 +1377,6 @@ function cli(argv) {
 
 if (process.argv[1] && fs.existsSync(process.argv[1])
   && fs.realpathSync(fileURLToPath(import.meta.url)) === fs.realpathSync(process.argv[1])) {
-  try { cli(process.argv.slice(2)); }
+  try { await cli(process.argv.slice(2)); }
   catch (error) { process.stderr.write(`mivo-repair: ${error.message}\n`); process.exitCode = Number(error.exitCode) || 1; }
 }
