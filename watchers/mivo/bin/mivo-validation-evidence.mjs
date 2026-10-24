@@ -6,7 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
-export const PARSER_VERSION = 1;
+// 2：errorSha 归一化去掉临时目录随机名与运行时间戳；旧版本的基线缓存按版本号自动失效重算。
+export const PARSER_VERSION = 2;
 const sha = (value) => createHash('sha256').update(value).digest('hex');
 
 /** 同条件复用与基线比较共用的运行指纹。lockfile 缺失记 null，读取权限类错误直接抛出。 */
@@ -57,12 +58,18 @@ export function emptyFailureSet() {
   return { state: 'parsed', failureSet, failureSetSha256: sha256 };
 }
 
+// mkdtemp 一类的临时目录每次运行名字都不同（/tmp、/private/tmp、/var/folders/…/T 下的第一段），不能进 errorSha。
+const TEMP_PATH = /(?:\/private)?(?:\/tmp|\/var\/folders\/[^/\s]+\/[^/\s]+\/T)\/[^/\s"'`)]+/g;
+// 运行时间戳（20261024T132343Z、ISO 8601）同样每次不同。
+const TIMESTAMP = /\b\d{8}T\d{6}Z\b|\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/g;
+
 function normalizeError(lines, worktree) {
   const kept = [...lines];
   while (kept.length && kept[kept.length - 1].trim() === '') kept.pop();
   return kept.map((line) => {
     let out = line.replace(/\s+$/, '');
     if (worktree) out = out.split(worktree).join('<WT>');
+    out = out.replace(TEMP_PATH, '<TMP>').replace(TIMESTAMP, '<TS>');
     return out.replace(/:\d+:\d+(?=\)?$)/, '');
   }).join('\n');
 }
