@@ -59,6 +59,8 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | `minCollectMs` | `MIVO_WATCHER_MIN_COLLECT_MS` | `15000`。整轮截止减派发预留后不足这个时间时，不再启动新的采集，留给下一轮 |
 | `fullCollectMs` | `MIVO_WATCHER_FULL_COLLECT_MS` | `600000`。无修复会话的 Ready PR 即使指纹没变，距上次完整采集超过它也强制全量采集一次 |
 | `followIntervalMs` | `MIVO_WATCHER_FOLLOW_MS` | `15000`。轮内批量复查 open PR 变化的间隔；环境变量设为 `0` 只跑全量一轮 |
+| `validateConcurrency` | `MIVO_VALIDATE_CONCURRENCY` | `2`。同一 watcher home 同时运行的 validate 上限，正整数；非法值（0、负数、小数、空串、非数字）直接报错，不静默回退。超限的 validate 排队等槽位，**排队不是失败**：不记失败、不消耗重试或 missing-result 计数。持有槽位的进程崩溃后，槽位按 pid 存活判定回收，并先终止它遗留的进程组 |
+| `validateStallMinutes` | `MIVO_VALIDATE_STALL_MINUTES` | `10`。连续无新输出（stdout/stderr 都没有新字节）超过它就终止整个进程组，收据记 `failureKind: validate-stalled`，不当作测试失败；规则同 `preflightTimeoutMinutes`。心跳不算输出 |
 | `preflightTimeoutMinutes` | `MIVO_PREFLIGHT_TIMEOUT_MINUTES` | `60`。只接受大于 0 的有限数字或非空十进制字符串；换算毫秒后须为不超过 2147483647 的安全整数。非法值直接报错，不静默回退。env 优先于 profile。validate 的 `npm ci`（如需）与仓库预检、以及未复用收据时的 `git push` 都用此时限；两阶段各自独立计时，不共享一笔总预算。显式 `options.timeout` 仍然优先。 |
 
 拷一份 [`config/examples/mivo.profile.example.json`](../../config/examples/mivo.profile.example.json)
@@ -79,6 +81,26 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 过期世代、已降级的记录、变更证据与调用者自填的权限标记均不能授权写代码。
 普通作者评论仍按原来的调查权限处理；本地接入不改变 GitHub CI、审查或单写者要求，
 不把队列接收或分支修复当作正式业务部署完成。
+
+### validate 运行方式与证据（本地预检）
+
+- **异步、限并发**：`validate` 是异步命令（CLI 仍只输出一个 JSON）。槽位在 `state/validations/slots/`，申请不到就排队；排队期间心跳照常，拿到槽位后若等待超过 1 秒会重新核对所有权与 worktree HEAD 再运行。
+- **流式日志**：命令的 stdout/stderr 按到达顺序写入 `state/validations/logs/` 下 0600 的不可变日志（`wx` 创建，不覆盖）。收据记录 `logPath`、`logSha256`。总超时（`preflightTimeoutMinutes`）与无输出看门狗（`validateStallMinutes`）是两个独立原因：`validate-timeout`、`validate-stalled`，都终止整个进程组，都不是「测试失败」，失败集合记 `unparsed`。
+- **固定 TMPDIR**：子进程环境注入 `TMPDIR=realpath(os.tmpdir())`（避开 `/var` → `/private/var` 软链）。policy 文件与它的 sha256 不变。
+- **同条件复用通过收据**：同一 PR、同一 `validatedHead`、同一 policy sha256、同一运行指纹（platform、arch、node 版本、uid、`realpath(TMPDIR)`、`package-lock.json` sha256）已有 pass 收据，且收据、日志、哈希全部复验通过时，不再运行 validate，直接写一份绑定当前派发/会话的新收据，`reusedFrom` 指向原始收据（owner 复核照旧）。任一要素不同、日志或收据被改、索引损坏，都重新运行。旧版收据（没有 `validationEvidenceVersion`）不进入复用。
+- **失败集合**：收据新增 `logSha256`、`failureSetState`（`parsed`/`unparsed`）、`failureSet`（元素 `{step, file, test, errorSha}`，`step` 取 hook 的 `[preflight] ❌ <step> 失败` 标记，`file/test` 取 vitest 失败行，`errorSha` 为归一化首条断言信息的哈希）、`failureSetSha256`。解析不完整（lint 报错、截断、计数对不上、未处理错误）一律 `unparsed`，`unparsed` 不与任何集合相等。旧收据照常可读。
+
+### 仅基线失败的受控通过（`baseline-only-failure`）
+
+仅当 PR 的 validate 以 exit 1 失败、失败集合解析完整且非空时才会跑基线（通过的运行零额外开销）。基线在干净的 detached worktree 里检出 `git merge-base(validatedHead, origin/<base>)`，同宿主、同命令（`bash .githooks/pre-push`）、同 policy、同运行指纹各跑一次；基线日志与收据不可变，基线结果按 `sha256(repo, mergeBase, policy, package-lock blob, 运行指纹)` 缓存，同键并发加锁只跑一次，用完的 worktree 定点清理（清理失败则不受控通过）。
+
+接受条件缺一不可：PR 失败集合非空且每个元素（含 `errorSha`）都在基线失败集合里；基线本身 exit 1；两次 policy 哈希与运行指纹相同（含 `package-lock.json` 一致）；收据 head = validatedHead 且 owner 复核通过。基线通过、PR 多一个失败、`errorSha` 不同、任一方 `unparsed`/stalled/超时都判 fail。
+
+状态是机器判定的 `baseline-only-failure`，**不扩展 `validationException`**（后者仍是人批准）。收据保留真实 `exitCode: 1` 与 PR 日志，不会写成 pass。该状态接入 `pushIfNeeded`（传 `validatedPolicy`，受控 pre-push 不再重跑）、`finalize`/`recheck`（重新核验两份原始收据，不只看状态字符串）、Keel 校验与 watcher 消费；**远端必需 CI 仍要求全绿**，`requiredGreen` 不变。
+
+### validate 类阻塞不再原样重投
+
+validate 类阻塞（原因含 preflight/validat，且不属于 pathspec、submodule 等环境故障）重开前，watcher 比较上次阻塞时记录的五要素：远端 head、base、policy sha256、运行指纹、失败集合。全部未变（或关键观测缺失）则不重新派发，也不消耗每代次 3 次的上限；任一已知变化才照常重开。新的失败收据若失败集合与阻塞时完全相同，视为未变；新的 `unparsed` 证据视为变化。没有 `validationBlock` 的旧阻塞只在远端 head 变化时重开。
 
 ### 新版任务必需的 Keel 配置
 
