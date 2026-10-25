@@ -47,12 +47,26 @@ export class WriteBusyError extends Error {
 }
 
 export class WriteRejectedError extends Error {
-  constructor(message = '外发被拒', { exitCode, reason } = {}) {
+  constructor(message = '外发被拒', { exitCode, reason, files } = {}) {
     super(message);
     this.name = 'WriteRejectedError';
     this.code = 'WRITE_GATE_REJECTED';
     this.exitCode = exitCode;
     this.reason = reason;
+    // 写闸扫到密钥（reason=secret-found）时带回的文件名：只有文件名，没有内容。
+    this.files = Array.isArray(files) ? files.filter((file) => typeof file === 'string' && file) : [];
+  }
+}
+
+/** 写闸 / writeCommand 退出码 1 等「其他失败」（#43 接口：1 其他失败，4 才是拒绝）。 */
+export class WriteFailedError extends Error {
+  constructor(message = '外发失败', { exitCode, reason, detail } = {}) {
+    super(message);
+    this.name = 'WriteFailedError';
+    this.code = 'WRITE_GATE_FAILED';
+    this.exitCode = exitCode;
+    this.reason = reason;
+    this.detail = detail;
   }
 }
 
@@ -296,6 +310,15 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
       throw new Error(redact(parsed.errors.map((err) => err.message).join('; '), [token]));
     }
     return parsed.data ?? parsed;
+  }
+
+  /**
+   * 用账号令牌的只读查询（doctor 查看板 viewerCanUpdate 用：App 令牌看不到个人账号下的看板，
+   * 写看板走的又是账号令牌）。只收 query，mutation 一律拒绝。
+   */
+  async function ownerGraphql(query, variables) {
+    if (/^\s*mutation\b/.test(String(query || ''))) throw new Error('ownerGraphql 只做只读查询');
+    return graphqlWrite(query, variables);
   }
 
   async function ghApi(method, apiPath, body) {
@@ -605,13 +628,26 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
         await sleepFn(30000);
         continue;
       }
-      let reason;
+      let reply = null;
       try {
-        reason = JSON.parse(last.stdout)?.reason;
+        reply = JSON.parse(last.stdout);
       } catch {
-        reason = undefined;
+        reply = null;
       }
-      throw new WriteRejectedError('外发被拒', { exitCode: last.code, reason });
+      const reason = typeof reply?.reason === 'string' ? reply.reason : undefined;
+      if (last.code === 4) {
+        throw new WriteRejectedError(`外发被拒${reason ? `：${reason}` : ''}`, {
+          exitCode: last.code,
+          reason,
+          files: reply?.files,
+        });
+      }
+      // 1（和别的非 0）是「其他失败」：写闸执行出错、账本坏、连不上写闸……不是拒绝。
+      throw new WriteFailedError(`外发失败${reason ? `：${reason}` : `（退出码 ${last.code}）`}`, {
+        exitCode: last.code,
+        reason,
+        detail: typeof reply?.detail === 'string' ? reply.detail : undefined,
+      });
     }
     throw new WriteBusyError('外发忙');
   }
@@ -625,5 +661,5 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
     return directWrite(prepared);
   }
 
-  return { graphql, write, fetchBranch, profile };
+  return { graphql, ownerGraphql, write, fetchBranch, profile };
 }

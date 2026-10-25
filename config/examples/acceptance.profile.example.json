@@ -8,6 +8,7 @@
   "autoRepos": ["ExampleUser/*"],
   "forkRepos": ["makecindy/cindy"],
   "watchRepos": ["example-org/handoff-repo"],
+  "verdictOnlyIssues": ["ExampleUser/example-repo#1"],
   "stallMinutes": 30,
   "writeCommand": ["node", "/path/to/host/write-gate.mjs"],
   "appConfigPath": "/path/to/github-app.json",

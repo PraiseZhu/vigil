@@ -9,6 +9,9 @@ import { collectTasks } from './tasks.mjs';
 import { shouldTrigger } from './trigger.mjs';
 import { createRounds, latestRound, parseRounds, RoundError } from './rounds.mjs';
 import { buildDispatchMessage } from './message.mjs';
+import { setAcceptanceFields } from './board.mjs';
+import { collectTree } from './collect.mjs';
+import { appendAlert, hostPaths } from '../host/paths.mjs';
 
 export const EXIT = Object.freeze({ OK: 0, FAIL: 1, NOTHING: 3, REJECTED: 4 });
 
@@ -134,7 +137,69 @@ function disputedAndPending(body) {
   return { disputed, pending };
 }
 
-async function cmdStart({ flags, github, profile, now, stdout, stderr }) {
+/** 认领用的 home：profile.json 在 <home>/config/ 下。拿不到（测试里的纯对象 profile）就是 null。 */
+function homeOf(profile) {
+  if (typeof profile?.profilePath !== 'string' || !path.isAbsolute(profile.profilePath)) return null;
+  return path.dirname(path.dirname(profile.profilePath));
+}
+
+function defaultAlert(profile, now) {
+  return (entry) => {
+    const home = homeOf(profile);
+    if (!home) return;
+    appendAlert(hostPaths(home), { ...entry, now, profile });
+  };
+}
+
+/**
+ * 认领成功后看板写「验收中」：总 issue 和任务树里的子 issue（和 close 写「通过」的范围一致）。
+ * 写失败不让认领失败：记一条提醒、stderr 留一行，返回没写成的条目。
+ */
+async function markClaimed({ github, profile, task, started, now, stderr, alert }) {
+  const failed = [];
+  let targets = [task.ref];
+  try {
+    const tree = await collectTree({ github, profile, ref: task.ref });
+    targets = [tree.root.ref, ...tree.issues.filter((entry) => entry.role !== 'root').map((entry) => entry.ref)];
+  } catch (error) {
+    failed.push({ ref: task.ref, error: String(error?.message || error) });
+    targets = [];
+  }
+  for (const target of targets) {
+    try {
+      const { owner, name, number } = parseIssueRef(target);
+      await setAcceptanceFields(github, profile, {
+        repo: `${owner}/${name}`,
+        issue: number,
+        acceptance: '验收中',
+        round: started.round,
+        ref: target,
+        root: task.ref,
+        dedupeKey: `board-claim:${target}:${started.round}:${started.commentId}`,
+      });
+    } catch (error) {
+      failed.push({ ref: target, error: String(error?.message || error) });
+    }
+  }
+  if (failed.length) {
+    const detail = failed.map((entry) => `${entry.ref}：${entry.error}`).join('；');
+    stderr.write(`看板「验收中」没写成（认领照常）：${detail}\n`);
+    try {
+      alert({
+        kind: 'board-claim-failed',
+        issue: task.ref,
+        round: started.round,
+        reason: '认领后看板「验收中」没写成',
+        detail,
+      });
+    } catch {
+      // 提醒也写不下去就只留 stderr。
+    }
+  }
+  return failed;
+}
+
+async function cmdStart({ flags, github, profile, now, stdout, stderr, alert }) {
   const issue = requireIssue(flags);
   const tasks = await collectTasks(github, profile);
   const task = tasks.find((candidate) => sameIssue(candidate.ref, issue));
@@ -145,6 +210,10 @@ async function cmdStart({ flags, github, profile, now, stdout, stderr }) {
   const decision = shouldTrigger(task, { now, profile });
   if (!decision.trigger) {
     stderr.write(`任务 ${task.ref} 现在不该验收${decision.reason ? `（${decision.reason}）` : ''}\n`);
+    return EXIT.NOTHING;
+  }
+  if (task.outOfScope?.length) {
+    stderr.write(`任务 ${task.ref} 的任务树里有不在任何名单里的仓，不认领：${task.outOfScope.join(', ')}\n`);
     return EXIT.NOTHING;
   }
   const rounds = createRounds({ github, profile, now });
@@ -158,6 +227,7 @@ async function cmdStart({ flags, github, profile, now, stdout, stderr }) {
     }
     throw error;
   }
+  await markClaimed({ github, profile, task, started, now, stderr, alert: alert || defaultAlert(profile, now) });
   const message = buildDispatchMessage({
     issue: task.ref,
     kind: task.kind,
@@ -283,6 +353,7 @@ export async function runRound(argv, options = {}) {
     now = () => Date.now(),
     stdout = process.stdout,
     stderr = process.stderr,
+    alert,
   } = options;
 
   let parsed;
@@ -299,7 +370,7 @@ export async function runRound(argv, options = {}) {
     return EXIT.FAIL;
   }
 
-  const context = { flags: parsed.flags, github, profile, now, stdout, stderr };
+  const context = { flags: parsed.flags, github, profile, now, stdout, stderr, alert };
   try {
     if (parsed.command === 'start') return await cmdStart(context);
     if (parsed.command === 'status') return await cmdStatus(context);

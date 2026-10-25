@@ -38,6 +38,7 @@
 | `autoRepos` | 否 | 全自动仓，支持 `owner/*`；默认 `` `${ownerLogin}/*` `` |
 | `forkRepos` | 否 | 也算全自动，默认 `["makecindy/cindy"]` |
 | `watchRepos` | 否 | watch 档仓，默认 `[]` |
+| `verdictOnlyIssues` | 否 | 只出裁决的 issue（显式名单，形如 `["owner/repo#43"]`，不收通配），默认 `[]`：照常验收、写看板和裁决，但不关、不勾、不开修正、不推送，由人复核后关（见 [`docs/acceptance-session.md`](../../docs/acceptance-session.md)） |
 | `stallMinutes` | 否 | 卡住判定阈值，默认 30 |
 | `writeCommand` | 否 | 写操作出口 argv；没配则直接用 `gh`/`git` |
 | `appConfigPath` | 否 | GitHub App 配置 JSON；配了读请求走 App 令牌 |
@@ -67,6 +68,20 @@ stdout 是 JSON 数组。该开始的任务：
 [{ "issue": "example-owner/example-repo#2", "round": 2, "stale": true, "lastProgressAt": "2026-10-24T01:00:00.000Z" }]
 ```
 
+任务树里有不在任何名单里的仓（写闸会按仓拒绝读写它）时不派发，报：
+
+```json
+[{ "issue": "example-owner/example-repo#3", "outOfScope": ["someone-else/other-repo"] }]
+```
+
+最新裁决是「通过」、issue 却还开着（不在 `verdictOnlyIssues`、不是 watch 档）时报：
+
+```json
+[{ "issue": "example-owner/example-repo#4", "passedButOpen": true, "round": 2, "url": "https://github.com/…" }]
+```
+
+这两种 tick 都不起轮次，只往 `alerts.jsonl` 写提醒（`task-out-of-scope` / `passed-but-open`，同一任务 24 小时一次）。
+
 没有任务时输出 `[]`。不加 `--json` 则每条一行。`poll` **不发任何写请求、不写本地缓存、不调模型**。失败时往 stderr 写错误并退出码 1。
 
 ## 写操作出口
@@ -75,7 +90,8 @@ stdout 是 JSON 数组。该开始的任务：
 
 - 退出码 0：stdout JSON 即结果
 - 退出码 75：每 30 秒重试、最多 6 次（共 7 次尝试），`dedupeKey` 不变；用完抛 `WriteBusyError`（「外发忙」）
-- 其它非 0：抛 `WriteRejectedError`（「外发被拒」），不重试，也不改成直接写
+- 退出码 4：抛 `WriteRejectedError`（「外发被拒」，带 `reason`，扫到密钥时带 `files`），不重试，也不改成直接写
+- 退出码 1 和其它非 0：抛 `WriteFailedError`（「外发失败」，其他失败），不重试，也不改成直接写
 
 没配 `writeCommand` 时直接用 `gh` / `git`，写一律走账号令牌。
 

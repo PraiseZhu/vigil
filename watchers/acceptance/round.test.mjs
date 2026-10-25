@@ -430,7 +430,7 @@ test('SC3 本地进度记录会推后 lastProgressAt', async () => {
     now: () => Date.parse('2026-10-24T01:40:00.000Z'),
   });
   const json40 = JSON.parse(at40.stdout.trim());
-  assert.equal(json40.lastProgressAt, '2026-10-24T01:20:00.000Z');
+  assert.equal(json40.lastProgressAt, '2026-10-24T09:20:00+08:00');
   assert.equal(json40.stalled, false);
 
   const at51 = await capture(['status', '--issue', `${REPO}#1`, '--json'], {

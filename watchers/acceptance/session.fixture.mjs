@@ -8,6 +8,8 @@ import { OWNER, OTHER_REPO, REPO, roundComment } from './fake-gh.fixture.mjs';
 export { OWNER, OTHER_REPO, REPO };
 export const FORK_REPO = 'makecindy/cindy';
 export const CLOCK = '2026-10-24T02:00:00.000Z';
+/** CLOCK 的北京时间写法（#43 决策：轮次评论、裁决里的时间一律写北京时间，带 +08:00）。 */
+export const CLOCK_BEIJING = '2026-10-24T10:00:00+08:00';
 export const ACCEPTANCE_OPTIONS = ['验收中', '要修', '修正中', '通过'];
 
 export const DEFAULT_ROOT_BODY = [
@@ -392,4 +394,28 @@ export function writeJsonFile(dir, name, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
   return file;
+}
+
+/** defaultTree 里每条 SC（总 issue SC1/SC2、子 issue SC3–SC5、跨仓子 issue SC7/SC8）。 */
+export const DEFAULT_SCS = Object.freeze([
+  [REPO, 1, 1],
+  [REPO, 1, 2],
+  [REPO, 2, 3],
+  [REPO, 2, 4],
+  [REPO, 2, 5],
+  [OTHER_REPO, 7, 7],
+  [OTHER_REPO, 7, 8],
+]);
+
+/**
+ * 覆盖 defaultTree 全部 SC 的裁决条目：verdict 要求任务树里每条 SC 都有结论。
+ * `overrides` 按 `owner/repo#n SC<k>` 换掉某几条（比如某条要修）；没列的默认「通过」。
+ */
+export function fullConclusions(overrides = {}, { scs = DEFAULT_SCS, rootRepo = REPO } = {}) {
+  return scs.map(([repo, number, sc]) => {
+    const actualRepo = repo === REPO ? rootRepo : repo;
+    const ref = `${actualRepo}#${number}`;
+    const key = `${ref} SC${sc}`;
+    return { ref, sc, result: '通过', evidence: 'ok', ...(overrides[key] || {}) };
+  });
 }

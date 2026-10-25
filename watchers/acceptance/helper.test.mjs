@@ -10,11 +10,13 @@ import { sessionPath } from './bin/push.mjs';
 import { HANDOFF_REPO, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import {
   CLOCK,
+  CLOCK_BEIJING,
   OTHER_REPO,
   REPO,
   createFakeGithub,
   createWorld,
   defaultTree,
+  fullConclusions,
   writeJsonFile,
 } from './session.fixture.mjs';
 
@@ -107,15 +109,15 @@ test('SC4 close 勾掉已验证的项、人工手测标行尾、关总 issue、�
     assert.equal(world.get(ref).project['裁决'], roundUrl, ref);
   }
 
-  // 顺序：先勾选（issue.edit × 2），再关 issue，最后写看板（× 3）。
+  // 顺序：先勾选（issue.edit × 2），再写看板（× 3），最后才关 issue（看板写失败就停在关单之前）。
   const types = typesOf(world);
   assert.deepEqual(types, [
     'issue.edit',
     'issue.edit',
+    'project.field.set',
+    'project.field.set',
+    'project.field.set',
     'issue.close',
-    'project.field.set',
-    'project.field.set',
-    'project.field.set',
   ]);
 });
 
@@ -180,19 +182,18 @@ test('SC10 progress 写最近进度时间，done 要求先有裁决', async () =
 
   const progress = await run(world, profile, ['progress', '--issue', `${REPO}#1`, '--round', '1']);
   assert.equal(progress.code, 0, progress.err);
-  assert.equal(progress.out.trim(), CLOCK);
+  assert.equal(progress.out.trim(), CLOCK_BEIJING);
   const cache = readIssueCache(profile, `${REPO}#1`);
   assert.equal(cache.round.round, 1);
-  assert.equal(cache.round.lastProgressAt, CLOCK);
+  assert.equal(cache.round.lastProgressAt, CLOCK_BEIJING);
+  assert.equal(Date.parse(cache.round.lastProgressAt), Date.parse(CLOCK), '北京时间和 UTC 指同一时刻');
 
   const wrong = await run(world, profile, ['progress', '--issue', `${REPO}#1`, '--round', '4']);
   assert.equal(wrong.code, 3);
   assert.match(wrong.err, /期望第 4 轮/);
 
   // 写裁决之后才能 done。
-  const verdict = writeJsonFile(home, 'verdict.json', {
-    items: [{ ref: `${REPO}#2`, sc: 3, result: '通过', evidence: 'ok' }],
-  });
+  const verdict = writeJsonFile(home, 'verdict.json', { items: fullConclusions() });
   const judged = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', verdict]);
   assert.equal(judged.code, 0, judged.err);
   assert.equal(JSON.parse(judged.out).status, '通过');
@@ -202,7 +203,7 @@ test('SC10 progress 写最近进度时间，done 要求先有裁决', async () =
   assert.match(done.out, /第 1 轮结束/);
   const session = JSON.parse(fs.readFileSync(sessionPath(profile, `${REPO}#1`), 'utf8'));
   assert.equal(session.round, 1);
-  assert.equal(session.doneAt, CLOCK);
+  assert.equal(session.doneAt, CLOCK_BEIJING);
   assert.match(fs.readFileSync(cachePath(profile, `${REPO}#1`), 'utf8'), /"lastVerdict": "通过"/);
 });
 

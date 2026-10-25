@@ -123,6 +123,14 @@ function toTask(issue, profile) {
     sameLogin(loginOf(child.author), profile.ownerLogin),
   );
   const kind = ownerChildren.length >= 1 ? 'parent' : 'standalone';
+  // 任务树里有不在任何名单里的仓：写闸按仓拒绝读写它，验收走不完（裁决出了、issue 却关不上），所以不派发、只提醒。
+  const outOfScope = [
+    ...new Set(
+      ownerChildren
+        .map((child) => child.repository?.nameWithOwner || repo)
+        .filter((childRepo) => !repoTier(childRepo, profile)),
+    ),
+  ];
   return {
     ref: issueRef(repo, issue.number),
     repo,
@@ -148,6 +156,7 @@ function toTask(issue, profile) {
       url: pr.url,
     })),
     rounds: parseRounds(issue.comments?.nodes || [], profile.ownerLogin),
+    outOfScope,
   };
 }
 

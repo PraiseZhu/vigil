@@ -6,7 +6,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadAcceptanceProfile, watcherHome } from '../bin/profile.mjs';
+import { isVerdictOnly, loadAcceptanceProfile, watcherHome } from '../bin/profile.mjs';
 import { createGithub, WRITE_TYPES } from '../bin/github.mjs';
 import { bodyVersion, latestRound, parseRef, parseRounds } from '../bin/rounds.mjs';
 import {
@@ -117,7 +117,8 @@ const READ_QUERIES = new Set([
 ]);
 
 const ROUND_FIRST_LINE = /^\s*\[验收机\]\s*第/;
-const CHECKBOX_LINE = /^(\s*[-*]\s+\[)[ xX](\].*)$/;
+// 行尾可能带 \r（CRLF 正文）：`.` 不匹配 \r，所以用 [^\n]*，否则 CRLF 正文的勾选全被拒。
+const CHECKBOX_LINE = /^(\s*[-*]\s+\[)[ xX](\][^\n]*)$/;
 
 /**
  * branch.push 扫密钥的基准：写闸自己去 GitHub 读目标仓默认分支的头提交，绝不用沙箱交来的 base。
@@ -133,6 +134,28 @@ export const DEFAULT_HEAD_QUERY = `query ($owner: String!, $name: String!) {
 }`;
 
 const COMMIT_OID = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
+
+/**
+ * 只出裁决的总 issue（profile 的 verdictOnlyIssues）：绑定到它的验收轮照常发评论、写看板和裁决，
+ * 但这些动作一律 4 verdict-only——不关、不勾、不开修正、不推送。
+ */
+const VERDICT_ONLY_BLOCKED = new Set([
+  'issue.close',
+  'issue.edit',
+  'issue.create',
+  'issue.reopen',
+  'subissue.add',
+  'branch.push',
+  'pr.create',
+  'pr.ready',
+]);
+
+/** 认领时宿主经 exec 模式写看板：只许把「验收」写成「验收中」，别的字段、别的值都要绑定本轮。 */
+const CLAIM_BOARD_FIELDS = Object.freeze({ 验收: '验收中' });
+
+function defaultLog(line) {
+  process.stderr.write(`${line}\n`);
+}
 
 const reject = (reason, detail) =>
   detail === undefined ? { code: 4, body: { reason } } : { code: 4, body: { reason, detail } };
@@ -231,6 +254,7 @@ export function createGate({
   which,
   sleep,
   repoRoot,
+  log = defaultLog,
 } = {}) {
   if (typeof home !== 'string' || !path.isAbsolute(home)) throw new Error('createGate 需要绝对路径的 home');
   if (!profile) throw new Error('createGate 需要 profile');
@@ -305,6 +329,19 @@ export function createGate({
   function appendLedger(entry) {
     fs.mkdirSync(path.dirname(paths.ledgerFile), { recursive: true, mode: 0o700 });
     fs.appendFileSync(paths.ledgerFile, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+  }
+
+  /** 验收轮（serve）的账本记录只在同一条认领评论下算数：同号的新轮次不会拿到旧轮次的结果。 */
+  function scopedToRound() {
+    return Boolean(binding && binding.kind !== 'correction' && binding.commentId != null);
+  }
+
+  function ledgerHit(ledger, dedupeKey) {
+    return ledger.find((entry) => {
+      if (entry.dedupeKey !== dedupeKey) return false;
+      if (!scopedToRound()) return true;
+      return entry.boundCommentId != null && String(entry.boundCommentId) === String(binding.commentId);
+    });
   }
 
   function scopeOf(repo) {
@@ -429,6 +466,9 @@ export function createGate({
 
   /** 验收轮绑定：只认本轮、只认本轮任务树。返回 null 表示放行。 */
   async function checkAcceptanceWrite(action) {
+    if (isVerdictOnly(profile, binding.root) && VERDICT_ONLY_BLOCKED.has(action.type)) {
+      return reject('verdict-only', `${binding.root} 只出裁决（verdictOnlyIssues）：不关、不勾、不开修正、不推送，${action.type} 不做`);
+    }
     const state = await readIssueState(binding.root);
     if (!state) return reject('not-current-round', `找不到绑定的总 issue ${binding.root}`);
     const { latest } = state;
@@ -544,6 +584,7 @@ export function createGate({
 
   /** exec 模式（宿主 start / abort）：只认认领和中断两条动作。返回 null 表示放行。 */
   async function checkExecWrite(action) {
+    if (action.type === 'project.field.set') return checkExecBoard(action);
     if (action.type !== 'comment.create' && action.type !== 'comment.update') {
       return reject('needs-round-binding', `${action.type} 需要本轮绑定`);
     }
@@ -587,6 +628,39 @@ export function createGate({
     if (Number(match[1]) !== latest.round) {
       return reject('needs-round-binding', `期望第 ${latest.round} 轮，收到第 ${match[1]} 轮`);
     }
+    return null;
+  }
+
+  /**
+   * exec 模式的看板（宿主认领后写「验收中」）：字段只能是「验收」=「验收中」；action.root 是总 issue，
+   * 它最新一轮必须正是 action.round 且还在验收中；目标必须在这棵任务树里（总 issue、子 issue、修正子 issue）。
+   */
+  async function checkExecBoard(action) {
+    const fields = action.fields && typeof action.fields === 'object' && !Array.isArray(action.fields) ? action.fields : null;
+    const names = fields ? Object.keys(fields) : [];
+    const expected = Object.keys(CLAIM_BOARD_FIELDS);
+    if (names.length !== expected.length || names.some((name) => fields[name] !== CLAIM_BOARD_FIELDS[name])) {
+      return reject('needs-round-binding', '执行模式的看板只许把「验收」写成「验收中」（认领时）');
+    }
+    let rootRef;
+    try {
+      const parsed = parseRef(action.root);
+      rootRef = refOf(parsed.repo, parsed.number);
+    } catch {
+      return reject('needs-round-binding', '执行模式的看板动作要带总 issue（root）');
+    }
+    if (!scopeOf(parseRef(rootRef).repo)) return reject('repo-not-allowed', `${rootRef} 不在配置的名单里`);
+    const state = await readIssueState(rootRef);
+    if (!state) return reject('needs-round-binding', `找不到 ${rootRef}`);
+    const { latest } = state;
+    if (!latest || latest.status !== '验收中' || latest.round !== Number(action.round)) {
+      const actual = latest ? `第 ${latest.round} 轮（${latest.status}）` : '还没有轮次';
+      return reject('needs-round-binding', `期望第 ${action.round} 轮（验收中），实际${actual}`);
+    }
+    const claimTree = await collectTree({ github, profile, ref: rootRef });
+    const refs = new Set([...claimTree.issues.map((entry) => entry.ref), ...claimTree.corrections.map((entry) => entry.ref)]);
+    const target = refOf(action.repo, action.issue);
+    if (!refs.has(target)) return reject('not-in-tree', `${target} 不在 ${rootRef} 的任务树`);
     return null;
   }
 
@@ -738,17 +812,31 @@ export function createGate({
       return reject('tier-not-allowed', `watch 档不写 ${action.type}`);
     }
 
-    // 账本查重放在仓范围、分档之后：名单外的仓、档位不许的动作，哪怕账本里有同名 key 也照样拒绝。
-    const seen = ledger.find((entry) => entry.dedupeKey === action.dedupeKey);
-    if (seen) return { code: 0, body: seen.result ?? {} };
-
     // 8. 执行锁：同一时间只执行一条写动作；30 秒拿不到就回 75，什么都不执行
     const gotLock = await acquireLock(paths.execLock, { now, waitMs: lockWaitMs, sleep });
     if (!gotLock) return { code: 75, body: { reason: 'busy' } };
     try {
-      // 9. 绑定本轮
+      // 修正轮（#60 prbot）的重放语义不变：账本先于绑定检查（它靠同 key 重放拿回上次的结果）。
+      const ledgerFirst = binding?.kind === 'correction';
+      const lookup = () => {
+        const current = readLedger();
+        if (!current) return fail('ledger-corrupt', '账本里有读不出的行，先修账本');
+        const seen = ledgerHit(current, action.dedupeKey);
+        return seen ? { code: 0, body: seen.result ?? {} } : null;
+      };
+      if (ledgerFirst) {
+        const replay = lookup();
+        if (replay) return replay;
+      }
+      // 9. 绑定本轮（exec 模式是归属：认领 / 中断 / 认领时的看板）
       const bindingProblem = binding ? await checkBoundWrite(action) : await checkExecWrite(action);
       if (bindingProblem) return bindingProblem;
+      // 账本查重放在仓范围、分档、绑定之后：名单外的仓、档位不许的动作、不是本轮的动作，
+      // 哪怕账本里有同名 key 也照样拒绝；验收轮的记录还只在同一条认领评论下算数（轮次评论被删后同号重认领不会拿回旧结果）。
+      if (!ledgerFirst) {
+        const replay = lookup();
+        if (replay) return replay;
+      }
       // 10. 推送前在写闸里扫密钥；推的是扫过的那份副本
       let toWrite = action;
       if (GATE_ACTIONS.has(action.type)) {
@@ -775,6 +863,7 @@ export function createGate({
         type: action.type,
         result: result ?? {},
         at: new Date(now()).toISOString(),
+        ...(scopedToRound() ? { boundCommentId: binding.commentId } : {}),
       });
       if (binding && action.type === 'issue.create' && result?.issue) {
         createdThisRound.add(refOf(action.repo, result.issue));
@@ -792,6 +881,17 @@ export function createGate({
       outcome = await evaluate(action);
     } catch (error) {
       outcome = fail('gate-error', redact(error?.message || String(error), profile));
+    }
+    if (action?.type === 'probe') {
+      // 探针（doctor）：只回结果、只记日志，不写提醒——仓外探针本来就该被拒，不能进 Slack 摘要。
+      if (outcome.code !== 0) {
+        try {
+          log(`写闸探针：退出码 ${outcome.code}（${outcome.body?.reason ?? '未给原因'}）`);
+        } catch {
+          // 日志写不下去也不影响结果。
+        }
+      }
+      return { code: outcome.code, body: outcome.body };
     }
     if (outcome.alert === 'secret-found') {
       appendAlert(paths, {

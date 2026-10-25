@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // 通过（#46 SC4）：在子 issue 里勾掉验证过的验收项、黑盒项标「人工手测」，
-// 关总 issue，再把看板「验收」写「通过」、「裁决」写本轮评论链接。
+// 再把看板「验收」写「通过」、「裁决」写本轮评论链接，最后才关总 issue。
+// 顺序是 勾选 → 看板 → 关单：看板写失败就停在关单之前，issue 还开着、下一轮能接着验，不会「关了但看板没写」。
 import fs from 'node:fs';
 import { setAcceptanceFields } from './board.mjs';
 import { collectTree, fetchIssueBody } from './collect.mjs';
 import { createRounds, parseRef } from './rounds.mjs';
+import { assertNotVerdictOnly } from './profile.mjs';
 
 const SC_LINE = /^\s*[-*]\s*(?:\[\s*([xX ])\s*\])?\s*(?:\*\*)?SC(\d+)\b/;
 const MANUAL_SUFFIX = '人工手测';
@@ -61,6 +63,7 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
   const tree = await collectTree({ github, profile, ref });
   if (tree.root.tier === 'watch') throw new Error('watch 档只出裁决、写看板');
   if (!tree.root.tier) throw new Error(`${tree.root.ref} 不在任何名单里`);
+  assertNotVerdictOnly(profile, tree.root.ref, 'close');
 
   const verified = readVerified(flags.get('verified'));
   const grouped = new Map();
@@ -95,15 +98,6 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
     edited.push(issueRef);
   }
 
-  const root = parseRef(tree.root.ref);
-  await github.write({
-    type: 'issue.close',
-    dedupeKey: `close:${tree.root.ref}:${n}`,
-    repo: root.repo,
-    issue: root.number,
-    reason: 'completed',
-  });
-
   const targets = [tree.root.ref, ...tree.issues.filter((entry) => entry.role !== 'root').map((entry) => entry.ref)];
   for (const target of targets) {
     const { repo, number } = parseRef(target);
@@ -116,6 +110,15 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
       ref: target,
     });
   }
+
+  const root = parseRef(tree.root.ref);
+  await github.write({
+    type: 'issue.close',
+    dedupeKey: `close:${tree.root.ref}:${n}`,
+    repo: root.repo,
+    issue: root.number,
+    reason: 'completed',
+  });
 
   stdout.write(`${JSON.stringify({ ref: tree.root.ref, round: n, closed: tree.root.ref, edited, board: targets })}\n`);
   return 0;

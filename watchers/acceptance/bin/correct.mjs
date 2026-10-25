@@ -5,6 +5,7 @@ import { setAcceptanceFields } from './board.mjs';
 import { collectTree } from './collect.mjs';
 import { createRounds, parseRef } from './rounds.mjs';
 import { redact } from './redact.mjs';
+import { assertNotVerdictOnly } from './profile.mjs';
 
 const ITEM_ARG = /^([\w.-]+\/[\w.-]+#\d+)\s*SC(\d+)$/;
 
@@ -48,6 +49,7 @@ export async function runCorrect({ github, profile, ref, n, flags, now = () => D
   const tree = await collectTree({ github, profile, ref });
   if (tree.root.tier === 'watch') throw new Error('watch 档只出裁决、写看板');
   if (!tree.root.tier) throw new Error(`${tree.root.ref} 不在任何名单里`);
+  assertNotVerdictOnly(profile, tree.root.ref, 'correct');
 
   const parsed = parseItemArg(flags.get('item'));
   const why = String(flags.get('why') || '').trim();
@@ -71,6 +73,20 @@ export async function runCorrect({ github, profile, ref, n, flags, now = () => D
   const verdictUrl = current.url;
 
   if (existing) {
+    // 复用的修正子 issue 可能是搜索找到、还没挂上的（上一轮在 issue.create 之后、subissue.add 之前中断）：
+    // 非 fork 档补挂到总 issue 下，否则它一直是孤儿，总 issue 的任务树里看不到它。
+    const attached = tree.issues.some((entry) => entry.ref.toLowerCase() === existing.ref.toLowerCase());
+    if (!fork && !attached) {
+      const sub = parseRef(existing.ref);
+      await github.write({
+        type: 'subissue.add',
+        dedupeKey: `correct-sub:${tree.root.ref}:${parsed.ref}:SC${parsed.sc}:${n}`,
+        repo: root.repo,
+        issue: root.number,
+        subRepo: sub.repo,
+        subIssue: sub.number,
+      });
+    }
     await setAcceptanceFields(github, profile, {
       repo: root.repo,
       issue: root.number,
