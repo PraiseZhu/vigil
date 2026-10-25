@@ -50,6 +50,16 @@ function passedButOpenRetry(task, f, profile) {
   return { trigger: true, reason: 'passed-but-open' };
 }
 
+/**
+ * 最近一次裁决里有「有争议」（#46 SC8）：`task.dispute` 由 tasks.mjs 从那条轮次评论算出。
+ * 没有裁决结果就等（宿主起只读裁决运行），有了就触发下一轮，按裁决定这些条目。
+ */
+function disputeOf(task, f) {
+  const dispute = task?.dispute;
+  if (!dispute || !f || dispute.round !== f.round || !(dispute.items || []).length) return null;
+  return dispute;
+}
+
 export function shouldTrigger(task, { now, profile }) {
   if (!task?.tier) return { trigger: false, reason: 'no-tier' };
   if (task.closedAt && Date.parse(task.closedAt) < Date.parse(profile.startAt)) {
@@ -62,10 +72,13 @@ export function shouldTrigger(task, { now, profile }) {
 
   const isParent = task.kind === 'parent' && (task.children || []).length >= 1;
   const f = lastFinal(task.rounds);
+  const dispute = disputeOf(task, f);
+  if (dispute && !dispute.adjudication) return { trigger: false, reason: 'awaiting-adjudication', dispute };
 
   if (isParent) {
     if ((task.children || []).some(childOpen)) return { trigger: false, reason: 'children-open' };
     if (!f) return { trigger: true, reason: 'no-verdict' };
+    if (dispute) return { trigger: true, reason: 'adjudicated' };
     if (f.bodyVersion !== task.bodyVersion) return { trigger: true, reason: 'body-changed' };
     if ((task.children || []).some((child) => child.closedAt && f.finishedAt && Date.parse(child.closedAt) > Date.parse(f.finishedAt))) {
       return { trigger: true, reason: 'children-closed-after-verdict' };
@@ -76,6 +89,7 @@ export function shouldTrigger(task, { now, profile }) {
   const merged = (task.linkedPrs || []).filter((pr) => pr.mergedAt);
   if (!merged.length) return { trigger: false, reason: 'no-merged-pr' };
   if (!f) return { trigger: true, reason: 'no-verdict' };
+  if (dispute) return { trigger: true, reason: 'adjudicated' };
   if (merged.some((pr) => f.finishedAt && Date.parse(pr.mergedAt) > Date.parse(f.finishedAt))) {
     return { trigger: true, reason: 'pr-merged-after-verdict' };
   }

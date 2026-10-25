@@ -1,7 +1,7 @@
 // #61 SC2 / SC3：Slack 消息体的纯函数测试（Ready、ready-stalled、单条提醒、摘要）。
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { alertBlocks, digestBlocks, prLink, readyBlocks, stalledBlocks } from './host/slack-blocks.mjs';
+import { alertBlocks, capBlocks, ciLink, digestBlocks, prLink, readyBlocks, stalledBlocks } from './host/slack-blocks.mjs';
 import { REPO } from './fake-gh.fixture.mjs';
 
 const MENTION = 'U0123456789';
@@ -261,4 +261,26 @@ test('#70 复审：打开 PR 的链接要 repo 和 PR 号都对得上，任一�
   assert.equal(otherPr.link, own, 'PR 号不对 → 自己拼');
   const button = buttons(readyBlocks(readyEvent({ prUrl: `https://github.com/${REPO}/pull/99` })))[0];
   assert.equal(button.url, own);
+});
+
+test('#61 CI 链接：checks.url 只是 PR 页（prbot 给的）时改成 /checks；没给就按 PR 链接拼 /checks；真 checks 地址原样', () => {
+  const ciOf = (event) => {
+    const payload = readyBlocks({ event }, {});
+    const fields = payload.blocks.find((block) => block.type === 'fields').fields;
+    return fields.find((field) => field.text.startsWith('*CI*')).text;
+  };
+  const prPage = `https://github.com/${REPO}/pull/12`;
+  assert.ok(ciOf(readyEvent({ checks: { green: 2, total: 3, url: prPage } })).includes(`<${prPage}/checks|CI 2/3 绿>`));
+  assert.ok(ciOf(readyEvent({ checks: { green: 3, total: 3 } })).includes(`<${prPage}/checks|CI 3/3 绿>`));
+  const run = `https://github.com/${REPO}/actions/runs/1`;
+  assert.ok(ciOf(readyEvent({ checks: { green: 3, total: 3, url: run } })).includes(`<${run}|CI 3/3 绿>`));
+  assert.equal(ciLink('https://example.invalid/x', { link: '' }), '', '不是 github.com 的不放链接');
+  assert.equal(ciLink(undefined, { link: prPage }), `${prPage}/checks`);
+});
+
+test('#61 每日上限通知：不 @、只有固定文字和条数', () => {
+  const payload = capBlocks(30, {});
+  assert.match(payload.text, /已达上限（30 条）/);
+  assert.equal(payload.text.includes('<@'), false);
+  assert.match(JSON.stringify(payload.blocks), /明天的第一条摘要/);
 });

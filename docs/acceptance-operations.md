@@ -19,7 +19,7 @@
 | 每小时巡检 | `watchers/acceptance/host/ensure.sh` | 给每小时一次的 routine 调用：心跳不超过 180 秒就不做事，否则把 `loop` 拉起来并写一条提醒 |
 | 资源门 | `host/round.mjs` | 认领**之前**过内存门（MemAvailable ≥ 3 GiB）和测试锁（mivo 同时只跑一轮）；最多 2 轮同时跑 |
 | 写闸 | `host/write-gate.mjs` | 所有写动作在沙箱外再查一遍，以它为准（见第 3 节） |
-| 模型 | `host/round.mjs` + `<home>/config/host.json` | pi 用 **DeepSeek V4.1 Flash**，推理 **max**；有争议条目的裁决运行用 `anthropic/claude-opus-5-5`，推理 **medium** |
+| 模型 | `host/round.mjs` + `<home>/config/host.json` | pi 用 **DeepSeek V4.1 Flash**，推理 **max**；有争议条目的裁决运行（`host/adjudicate.mjs`）用 `anthropic/claude-opus-5-5`，推理 **medium**（`adjudicateCommand`） |
 | 卡住 | `host/tick.mjs`、`host/round.mjs` | 按**宿主观察到的活动**判卡住（见第 4 节「轮次生命周期」）；卡住时**先结束进程，再 `round.mjs abort`** |
 | 代码 | `host/prefetch.mjs` | 认领之后、起 pi 之前，宿主把本轮任务树里每个仓的 main 检出好，只读挂进沙箱（见第 4 节） |
 | 提醒 | `state/host/alerts.jsonl` | 本 issue 只**发现**并写文件，不调 Slack（见第 7 节） |
@@ -32,9 +32,15 @@
   "credentialDirs": ["<可选：额外要遮罩的绝对目录>"],
   "homeAllowDirs": ["<可选：沙箱里要只读看到的 HOME 内目录，比如 pi 的安装目录、pi 配置副本目录>"],
   "egressAllow": ["github.com:443", "codeload.github.com:443", "<LLM 网关 host>:443"],
-  "maxRoundMinutes": 120
+  "maxRoundMinutes": 120,
+  "adjudicateCommand": ["pi", "--model", "anthropic/claude-opus-5-5", "--thinking", "medium"],
+  "adjudicateMaxMinutes": 30,
+  "slackDailyCap": 30
 }
 ```
+
+`adjudicateCommand` / `adjudicateMaxMinutes` 见下面「模型」；`slackDailyCap` 见
+[`docs/acceptance-slack.md`](acceptance-slack.md) 第 5 节。
 
 `egressAllow` 是沙箱**唯一**能出网的名单（见第 4 节「网络」）：只写 `host:port`（小写，不认通配、不认 URL），
 LLM 网关的 host 取 pi 的 `models.json` 里 `baseUrl` 的主机名；`git clone https://github.com/<公开仓>`
@@ -65,9 +71,27 @@ LLM 网关的 host 取 pi 的 `models.json` 里 `baseUrl` 的主机名；`git cl
 ### 模型
 
 - 验收轮：pi 用 DeepSeek V4.1 Flash，推理 max（写进 `piCommand`）。
-- 有争议条目的裁决运行：`anthropic/claude-opus-5-5`，推理 medium。
-  **待实现**：本 issue 只把规则写进文档和调度约定；裁决运行本身和 #60（修正轮）共用同一套流程，
-  代码还没写（归 #60）。现在 `round.mjs status --json` 的 `disputed` 只会被记下来。
+- 有争议条目的裁决运行：`anthropic/claude-opus-5-5`，推理 medium（写进 `adjudicateCommand`，形状和
+  `piCommand` 一样，要拷 pi 配置副本就照上面 `piCommand` 的 `sh -c` 写法）。
+  **已实现**（`host/adjudicate.mjs`，#46 SC8；原先写的是「待实现，归 #60」，#60 只负责把修正轮的争议写成单行）：
+  - 最近一次出结论的轮次评论里有 `- 有争议：<owner/repo#n> SC<k> · …` 行、宿主还没有这一轮的裁决结果时，
+    `trigger` 判 `awaiting-adjudication`（不再判「已是最新」静默卡死），`poll --json` 报
+    `{"issue","adjudicate":true,"round","items"}`，tick 用剩下的空槽起一个后台 `host/adjudicate.mjs run`。
+  - 同一任务同一轮同时只跑一个（锁），出过结果不再起；和验收轮、修正轮共用两个槽和内存门。
+  - 跑在和验收轮同一个 bwrap 沙箱里（同样的遮罩、`--unshare-net` + `egressAllow` 出网代理），但**没有写闸
+    socket**：沙箱里的 `gh` 直接拒绝、helper 读不到 profile、沙箱里没有任何令牌——GitHub 一个字都写不了。
+    争议条目、SC 原文、双方理由、相关 PR 由宿主在沙箱外只读收好，写进给 pi 的消息；代码和验收轮一样由宿主预取
+    （`host/prefetch.mjs`）、只读挂进去（预取失败算一次失败）。
+  - pi 最后一行输出 `{"items":[{"ref","sc","ruling":"成立"|"不成立","why"}]}`，宿主逐条校验（每条争议都要有结论）后
+    写进 `<home>/state/host/adjudications/<owner>__<repo>__<号>__<轮次>.json`（宿主状态目录，沙箱里看不到也写不了）。
+  - 下一轮：`trigger` 判 `adjudicated` 触发，`round.mjs start` 的派发消息带上「裁决结果」一节（结果文件在沙箱里
+    看不到，所以直接写内容），验收会话按 `SESSION.md` 第 3 节照裁决定这些条目。
+  - 总时长上限 `adjudicateMaxMinutes`（默认 30）：超时先结束进程，写 `adjudicate-timeout`；失败（输出不合格、
+    pi 退出码非 0、沙箱起不来）写 `adjudicate-failed`，隔 5 分钟重试，一共最多 3 次（重试 2 次），用完写
+    `adjudicate-needs-human`（Slack 立即发），之后不再起，由我人工裁决（手写结果文件或改裁决评论）。
+  - 没配 `adjudicateCommand` 就不起，写 `adjudicate-not-configured` 提醒（一天一次），条目一直等着。
+  - 只看**验收轮**的结论评论；修正轮（prbot）在修正子 issue 上标的「有争议」会让修正子 issue 停在开着
+    （prbot 写「需人工处理」`all-disputed`），不会自动进裁决运行。
 
 ## 2. 令牌
 
@@ -258,13 +282,15 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 一行一条写进 `state/host/alerts.jsonl`（`ts`、`kind`、`issue`、`round`、`reason`、`detail`）。
 **不调 Slack。**
 
-- 发 Slack 归 #61：Slack app 显示为 Jasper，发到 `#praise-automation-dashboard`；
+- 发 Slack 归 #61：Slack app 显示为 Jasper，发到 profile 的 `slackChannelId` 指的那个频道（频道名不写进仓库）；
   修正 PR 已 Ready 的消息只带「打开 PR」链接。怎么配频道、令牌、哪些事件立即发、哪些进摘要，
   见 [`docs/acceptance-slack.md`](acceptance-slack.md)。
 - **验收结论不发通知**：通过/要修、中断都只在 GitHub 的轮次评论和看板里。
 
 常见 `kind`：`loop-restarted`、`tick-failed`、`round-stale`、`round-stalled`、`round-failed`、`round-timeout`、
-`prefetch-failed`、`sandbox-down`、`sandbox-unavailable`、`gate-unavailable`、`gate-rejected`、`secret-found`、`write-rejected`、`egress-denied`。
+`prefetch-failed`、`sandbox-down`、`sandbox-unavailable`、`gate-unavailable`、`gate-rejected`、`secret-found`、`write-rejected`、`egress-denied`；裁决运行的
+`adjudicate-failed`、`adjudicate-timeout`、`adjudicate-needs-human`、`adjudicate-not-configured`；
+Slack 自己的 `slack-failed`（重试用完）、`slack-history-failed`（读频道历史失败）。
 
 ## 6. 上线顺序
 
@@ -350,6 +376,9 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
   `ownerLogin` 名下）。修正轮推分支、写闸核对 PR head 用的都是同一个对照。
 - `常驻循环`：心跳里的 pid 活着且心跳不超过 3 分钟。
 - `令牌文件`：`…TokenFile` / App 私钥文件全部通过 600、属主当前用户、非空检查。
+- `Slack 频道`：只读——bot 令牌能过 `auth.test`，bot 在 `slackChannelId` 那个频道里（`conversations.info`
+  的 `is_member`；令牌没有 `channels:read` / `groups:read` 就退到 `conversations.history limit=1`，bot 不在频道里
+  会报 `not_in_channel`）。不发任何消息；没配 `slackChannelId` 就跳过（算通过）。
 - `bwrap 遮罩`：在 bwrap 里跑一个读文件的小脚本，名单上的文件和凭证目录必须一个都读不到；
   bwrap 不可用算失败。遮罩名单按 `<home>/config/host.json` 算（`credentialDirs` 也遮），并且先查
   `credentialDirs` / `homeAllowDirs` 每一项都存在、不与可写绑定（`stateDir`、`worktreeDir`）互相包含。
@@ -374,3 +403,5 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 | pi 连不上模型网关 | `pi.log`、`alerts.jsonl` 的 `egress-denied` | `egressAllow` 里要有 `models.json` 的 `baseUrl` 主机名 `:443` |
 | `secret-found` | 提醒里的 `reason`（只有文件名） | 按 #46 SC7 记「需人工处理」，别自己推 |
 | `tick-failed` | `heartbeat.lastTick.error` | 多半是 `poll.mjs` 或配置报错，跑一次 `poll.mjs --json` 看 |
+| 任务一直不再验（最近裁决有「有争议」） | `poll.mjs --json` 的 `adjudicate` 条目、`state/host/adjudications/runs/` | 没配 `adjudicateCommand` 就补上；`adjudicate-needs-human` 后要人工裁决 |
+| `adjudicate-timeout` / `adjudicate-failed` | `<home>/run/adj-*/pi.log`、`out.log` | 会自动重试（最多 3 次）；输出不合格多半是 pi 没按单行 JSON 收尾 |

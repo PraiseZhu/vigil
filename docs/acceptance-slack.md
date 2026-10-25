@@ -55,6 +55,16 @@
 `include_all_metadata=true`、按 `cursor` 分页、最多 20 页）把「我们发过的每条消息」的
 `metadata.event_payload.ids` 收回来，按这些 id 认为已经发过。只读自己发的消息，不读别人的内容。
 
+**权限要求**（缺了会怎样）：
+
+- bot 必须**在目标频道里**（频道里 `/invite` 它）。不在的话 `chat.postMessage` 报 `not_in_channel`、读历史也读不了。
+- 读历史要 `channels:history`（公开频道）或 `groups:history`（私有频道）。**缺了不再卡住发送**：首次没有账本
+  （或账本坏了）时读历史失败，就写一条 `slack-history-failed` 提醒（原因里写清要这两个 scope、bot 要在频道里），
+  把**现有**的事件都记成已处理（不补发历史，宁可漏发也不重发），账本照常建立，之后「从现在起」的新事件照常发。
+  那条提醒自己进摘要。只有通知预算用完时才是「这一拍不发、下拍再翻」。
+- 可选 `channels:read` / `groups:read`：`doctor` 的「Slack 频道」检查先用 `conversations.info` 看 `is_member`，
+  没有这个 scope 就退到 `conversations.history limit=1`（bot 不在频道里会报 `not_in_channel`）。都是只读，不发消息。
+
 ## 4. 事件表
 
 `at` / `ts` 早于 profile `startAt` 的事件一律不看。事件 id =
@@ -71,8 +81,10 @@
 | prbot | 未知 type | **忽略** |
 | alerts | `secret-found` | **ping**（只列文件名） |
 | alerts | `sandbox-unavailable` | **ping**（沙箱起不来） |
-| alerts | `round-failed`、`gate-unavailable`、`sandbox-unavailable`、`round-stalled`、`round-stale` | 中断类：第 1 次进摘要（`sandbox-unavailable` 照上一行立即发）；同一 issue **6 小时内第 2 次及以上**合成一条「同一任务连续中断」立即发，每个 issue 每 6 小时窗口只发一次。6 小时按事件自己的时间算（循环停摆后一次补发积压时，隔得久的不算连续） |
-| alerts | `gate-rejected`、`write-rejected`、`loop-restarted`、`tick-failed`、`prbot-tick-failed` | **摘要** |
+| alerts | `round-stalled`、`round-stale`、`round-timeout`（首次轮次卡住 / 卡死 / 超时）、`sandbox-down`、`prefetch-failed`、`gate-rejected`、`write-rejected`（写闸拒绝）、`loop-restarted`（调度循环停摆，`ensure.sh` 拉起）、`adjudicate-needs-human`（裁决运行重试用完） | **ping**（#43：即时提醒）；同一任务（没有 issue 的按同一 kind）**同一原因 6 小时内只立即发一次**，再来就进摘要。6 小时按事件自己的时间算 |
+| alerts | `round-failed`、`gate-unavailable`、`sandbox-unavailable`、`round-stalled`、`round-stale`、`round-timeout` | 中断类：同一 issue **6 小时内第 2 次及以上**合成一条「同一任务连续中断」立即发，每个 issue 每 6 小时窗口只发一次（第 1 次：`round-failed`、`gate-unavailable` 进摘要，其余照上两行立即发）。6 小时按事件自己的时间算（循环停摆后一次补发积压时，隔得久的不算连续） |
+| alerts | `tick-failed`、`prbot-tick-failed`、`adjudicate-failed`、`adjudicate-timeout`、`adjudicate-not-configured`、`slack-history-failed` | **摘要** |
+| alerts | `slack-failed` | **不发**（Slack 自己的发送失败；发不出去还往 Slack 报会绕圈，靠心跳和 `ensure.sh` 报出来，见第 5 节） |
 | alerts | 其它未知 kind | **摘要**（未知的也进摘要，不丢） |
 | — | 验收结论本身（通过 / 要修 / 中断） | **不发**：只在 GitHub 的轮次评论和看板里 |
 
@@ -85,12 +97,21 @@
 - 每条发出去的消息都带
   `metadata: { event_type: "vigil_acceptance_notice", event_payload: { ids: [...] } }`。
   账本删掉后靠它重建，同一事件 id 只发一次。
-- **重建失败就这一拍不发**，心跳写 `ledger-rebuild-failed`；宁可不发，也不重发。
+- **重建失败不再整拍不发**：心跳写 `ledger-rebuild-failed`，写 `slack-history-failed` 提醒，现有事件记成已处理
+  （宁可不发，也不重发），账本照常建，从下一个新事件起照常发（见第 3 节「权限要求」）。只有通知预算用完才这一拍不发。
 - 发送失败（网络错、HTTP 非 2xx、`ok:false`、429）按 **1、5、15 分钟**重试，不 sleep：
   下次时间记在账本里，后面几拍再试。第 4 次还失败就放弃，记进账本的 `failed` 并写心跳。
+- **失败可见**：放弃（重试用完）时再写一条 `slack-failed` 提醒（`state/host/alerts.jsonl`），并在账本记
+  `failing: { since, lastAt, kind, error, count }`；tick 把它写进心跳的**持久字段** `slackFailing`——之后每一拍都留着
+  （哪怕这一拍没读到账本，比如令牌坏了、通知超时，也沿用上一拍的），**直到下一次有消息发成功才清掉**。
+  每小时的 `ensure.sh` 读到 `slackFailing` 就在标准输出打一行
+  `slack-failed: since=… last=… kind=… error=… count=…`（循环正常也打），routine 就能看到。
+- **每日上限**：host.json `slackDailyCap`（正整数，默认 **30**；**摘要算 1 条**），按本机日期零点重新计数。
+  到了上限：立即发的事件改进摘要，到点的摘要也留着，等第二天第一拍一起发；当天第一次碰到上限时发**一条**
+  「今天的 Slack 通知已达上限（N 条）」（不 @、不算进条数）。这样循环类故障最多每天 @ 我 30 次。
 - 每拍在验收调度**之后**、写心跳之前发一次（#70 复审：Slack 卡住不能拖慢验收；这一拍新写的提醒也一起发）。
   结果写在 `state/host/heartbeat.json` 的 `slack` 字段：
-  `{ ok, reason?, sent, digested, pending, deferred, failed: [{ id, kind, error }] }`。
+  `{ ok, reason?, sent, digested, pending, deferred, capped?, failed: [{ id, kind, error }] }`（`capped` = 这一拍因为每日上限没单独发的条数）。
   通知出错只进心跳，不影响这一拍的验收调度。
 - 扫到密钥的提醒只列文件名（`reason` 里第一个全角冒号后面的那串）；所有发出去的文字都再过一遍
   `bin/redact.mjs`，令牌、私钥、本机路径不会漏出去。
@@ -111,7 +132,7 @@
 ## 6. Ready 消息长什么样
 
 标题「修正 PR 已 Ready：`owner/repo#n`」，字段：任务 issue（总 issue）、修正子 issue、head SHA 前 7 位、
-`CI x/y 绿`（有 checks.url 就是链接）、改动文件数和增删行数（`N 个文件 +a −d`）、修了哪几条 SC（`SC3、SC5`）。
+`CI x/y 绿`（链接指向 PR 的 `/checks` 页：事件的 `checks.url` 只是 PR 页时也改成 `/checks`；给的是别的 github.com 地址就原样用）、改动文件数和增删行数（`N 个文件 +a −d`）、修了哪几条 SC（`SC3、SC5`）。
 
 - `handoff: "owner"`：只有**一个**按钮，文字「打开 PR」，`url` 是 PR 链接。没有第二个按钮，
   消息里也没有「合并」字样。
@@ -156,7 +177,10 @@ head SHA 前 7 位。
 |---|---|---|
 | 一条都不发 | `state/host/heartbeat.json` 的 `slack.reason` | `not-configured` → 补 `slackChannelId` / `slackBotTokenFile`；`profile-error` → 跑一次 `node bin/doctor.mjs` |
 | 心跳 `token-file-*` | 令牌文件的属主和权限 | `chown` 成跑验收机的用户，`chmod 600`，确认不是符号链接、不是空文件 |
-| 心跳 `ledger-rebuild-failed` | 令牌的 scope、频道 id | 补 `channels:history`（私有频道 `groups:history`），确认 bot 在频道里 |
+| 心跳 `ledger-rebuild-failed` / 提醒 `slack-history-failed` | 令牌的 scope、频道 id | 补 `channels:history`（私有频道 `groups:history`），确认 bot 在频道里；读历史失败不再拦发送，只是那一拍之前的事件不补发 |
+| `ensure.sh` 输出 `slack-failed: …` / 心跳有 `slackFailing` | 账本的 `failing`、`failed` | 发送重试用完；看 `error`（`slack-not_in_channel` → `/invite` bot；`http-…` / `rate-limited` → 等），下一次发成功自动清 |
+| 一天只来了一条「已达上限」 | 账本的 `daily` | 到了 `slackDailyCap`；剩下的明天进第一条摘要。上限不够就调大 host.json 的 `slackDailyCap` |
+| 不确定 bot 在不在频道里 | `node bin/doctor.mjs` 的「Slack 频道」 | 只读检查 `auth.test` + 频道成员；不发消息 |
 | 心跳 `send-failed` | 账本里的 `retry` / `failed` | 看 `error`：`http-…` / `rate-limited` / `slack-…`；1、5、15 分钟后自动重试，第 4 次放弃 |
 | 消息重复 | 账本的 `ids` 和频道里的消息 metadata | 正常不该发生；删账本会走重建，重建失败时不发 |
 | 摘要迟迟不来 | 账本的 `digestNextAt` | 第一条摘要要等 60 分钟；等不了就把账本里的 `digestNextAt` 改早一点 |

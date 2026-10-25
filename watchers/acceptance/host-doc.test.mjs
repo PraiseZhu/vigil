@@ -47,8 +47,12 @@ test('SC2 文档写清模型：验收轮 DeepSeek V4.1 Flash + max，裁决运�
   assert.match(doc, /anthropic\/claude-opus-5-5/);
   assert.match(doc, /推理 \*\*medium\*\*/);
   assert.match(doc, /有争议/);
-  assert.match(doc, /待实现/);
-  assert.match(doc, /#60/);
+  // #46 SC8：裁决运行已实现（host/adjudicate.mjs），文档写清配置。
+  assert.match(doc, /已实现/);
+  assert.match(doc, /host\/adjudicate\.mjs/);
+  assert.match(doc, /adjudicateCommand/);
+  assert.match(doc, /adjudicateMaxMinutes/);
+  assert.doesNotMatch(doc, /\*\*待实现\*\*/);
 });
 
 test('SC2 文档写清写闸：动作类型、分档、总开关、exec 接成 writeCommand', () => {
@@ -86,7 +90,8 @@ test('SC2 文档写清卡住与提醒：先结束进程再 abort；提醒只写 
   assert.match(doc, /alerts\.jsonl/);
   assert.match(doc, /不调 Slack/);
   assert.match(doc, /#61/);
-  assert.match(doc, /#praise-automation-dashboard/);
+  // 频道名不进仓库（AGENTS.md 脱敏）：只写「profile 的 slackChannelId 指的频道」。
+  assert.match(doc, /slackChannelId/);
   assert.match(doc, /Jasper/);
   assert.match(doc, /验收结论不发通知/);
 });

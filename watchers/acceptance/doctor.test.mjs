@@ -380,3 +380,27 @@ test('#60 修正轮交接配置：host.json 配了 prbot 就要求每个具体�
   assert.equal(checkOf(fromFile, '修正轮交接配置').ok, false);
   assert.equal(fromFile.ok, false);
 });
+
+test('#61 doctor 加一项只读的 Slack 检查：结果原样报出；没配频道就跳过（算通过）', async () => {
+  const fixture = makeFixture();
+  const seen = [];
+  const failing = await runDoctor({
+    profileEnv: fixture.profileEnv,
+    probes: makeProbes(),
+    github: makeGithub(),
+    now: () => NOW,
+    boardItem: `${REPO}#1`,
+    slackCheck: async ({ profile }) => {
+      seen.push(profile.ownerLogin);
+      return { ok: false, detail: 'bot 不在目标频道里：在频道里 /invite 它' };
+    },
+  });
+  assert.equal(failing.ok, false);
+  assert.deepEqual(checkOf(failing, 'Slack 频道'), { name: 'Slack 频道', ok: false, detail: 'bot 不在目标频道里：在频道里 /invite 它' });
+  assert.deepEqual(seen, [OWNER], '检查拿到的是加载后的 profile');
+
+  // 默认实现：夹具没配 slackChannelId，跳过、不触网。
+  const skipped = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, boardItem: `${REPO}#1` });
+  assert.equal(checkOf(skipped, 'Slack 频道').ok, true);
+  assert.match(checkOf(skipped, 'Slack 频道').detail, /跳过/);
+});

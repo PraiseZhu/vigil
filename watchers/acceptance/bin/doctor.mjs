@@ -10,6 +10,7 @@ import { createGithub } from './github.mjs';
 import { hostPaths, isAlive } from '../host/paths.mjs';
 import { createProbes } from '../host/probes.mjs';
 import { handoffFor, preflightCommands, repoConfig } from '../host/prbot-config.mjs';
+import { checkSlackAccess } from '../host/slack-notify.mjs';
 
 /** 令牌账号 == ownerLogin 用这条。 */
 export const VIEWER_QUERY = `query {
@@ -150,6 +151,7 @@ export async function runDoctor({
   now = () => Date.now(),
   github,
   hostConfig,
+  slackCheck = checkSlackAccess,
 } = {}) {
   const checks = [];
   const add = (name, ok, detail = '') => {
@@ -392,6 +394,14 @@ export async function runDoctor({
       ? badKeyFiles.join('；')
       : `检查了 ${keyFiles.length} 个密钥文件（权限 600、属主当前用户）`,
   );
+
+  // Slack（#61）：只读检查令牌能过 auth.test、bot 在目标频道里；没配 Slack 就跳过（算通过）。
+  try {
+    const slack = await slackCheck({ profile });
+    add('Slack 频道', slack?.ok, slack?.detail || '');
+  } catch (error) {
+    add('Slack 频道', false, firstLine(error?.message));
+  }
 
   // 遮罩：先查 host.json 的 credentialDirs / homeAllowDirs（存在、不与可写绑定重叠），再在 bwrap 里实测读不到。
   const maskProblems = hostConfigError ? [hostConfigError] : checkMaskConfig({ hostConfig: hostSettings, profile });

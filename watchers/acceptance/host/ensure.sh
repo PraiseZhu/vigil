@@ -27,7 +27,22 @@ read_heartbeat() {
   ' "$HB" "${ACCEPTANCE_NOW_MS:-}"
 }
 
+# Slack 发送失败（重试用完，#61）：心跳的 slackFailing 一直留到下一次发成功。有就打一行到标准输出，
+# routine 每小时跑这个脚本时就能看到（不管循环在不在）。
+report_slack_failing() {
+  node -e '
+    const fs = require("node:fs");
+    let hb = null;
+    try { hb = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch { hb = null; }
+    const f = hb && hb.slackFailing;
+    if (!f || typeof f !== "object") process.exit(0);
+    const clean = (v) => String(v ?? "").replace(/[^A-Za-z0-9_:.+-]/g, "").slice(0, 80);
+    process.stdout.write("slack-failed: since=" + clean(f.since) + " last=" + clean(f.lastAt) + " kind=" + clean(f.kind) + " error=" + clean(f.error) + " count=" + (Number(f.count) || 0) + "\n");
+  ' "$HB" || true
+}
+
 state="$(read_heartbeat)"
+report_slack_failing
 case "$state" in
   missing)
     reason=heartbeat-stale
