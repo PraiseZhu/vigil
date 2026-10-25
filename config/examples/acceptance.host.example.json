@@ -1,0 +1,17 @@
+{
+  "piCommand": ["pi", "--model", "<model id>", "--thinking", "max"],
+  "prbot": {
+    "piCommand": ["pi", "--model", "<deepseek-v4.1-flash id>", "--thinking", "high"],
+    "reviewCheckPattern": "review",
+    "repos": {
+      "example-owner/example-repo": {
+        "handoff": "watcher",
+        "preflight": [".githooks/pre-push"],
+        "testLock": true,
+        "handoffNew": ["node", "scripts/new.mjs", "--pr", "{pr}"],
+        "forbiddenPaths": [".github/workflows/**"]
+      },
+      "makecindy/cindy": { "handoff": "watcher" }
+    }
+  }
+}

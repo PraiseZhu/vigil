@@ -63,3 +63,6 @@ config/sanitize-denylist.local
 
 # acceptance 真 bwrap 测试的临时目录（放在 /tmp 之外才测得出遮罩）
 watchers/acceptance/.sandbox-real-test-*/
+
+# acceptance #60 真 bwrap 预检测试的临时目录（同样放在 /tmp 之外）
+watchers/acceptance/.prbot-sandbox-real-test-*/

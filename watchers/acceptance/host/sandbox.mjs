@@ -195,12 +195,19 @@ export async function probeBwrap(run) {
 }
 
 /** 沙箱内的 pi 环境：白名单 + 沙箱内的 HOME/TMPDIR/哨兵目录 + 两个内部变量。 */
-export function sandboxEnv({ base = process.env, roundDir, socketPath, sandboxBin } = {}) {
+export function sandboxEnv({
+  base = process.env,
+  roundDir,
+  socketPath,
+  sandboxBin,
+  allowlist = ENV_ALLOWLIST,
+  internal = INTERNAL_ENV,
+} = {}) {
   if (typeof roundDir !== 'string' || !path.isAbsolute(roundDir)) {
     throw new Error('sandboxEnv 需要绝对路径的 roundDir');
   }
   const env = {};
-  for (const key of ENV_ALLOWLIST) {
+  for (const key of allowlist) {
     if (base?.[key] !== undefined) env[key] = base[key];
   }
   env.HOME = path.join(roundDir, 'home');
@@ -209,8 +216,8 @@ export function sandboxEnv({ base = process.env, roundDir, socketPath, sandboxBi
   if (sandboxBin) pathParts.push(sandboxBin);
   if (env.PATH) pathParts.push(env.PATH);
   env.PATH = pathParts.length ? pathParts.join(path.delimiter) : '/usr/bin:/bin';
-  env.ACCEPTANCE_WATCHER_HOME = path.join(roundDir, 'home-acc');
-  env.ACCEPTANCE_GATE_SOCKET = socketPath;
+  if (internal.includes('ACCEPTANCE_WATCHER_HOME')) env.ACCEPTANCE_WATCHER_HOME = path.join(roundDir, 'home-acc');
+  if (internal.includes('ACCEPTANCE_GATE_SOCKET') && socketPath) env.ACCEPTANCE_GATE_SOCKET = socketPath;
   return env;
 }
 

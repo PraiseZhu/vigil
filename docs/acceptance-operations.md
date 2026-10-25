@@ -88,7 +88,9 @@
 放行的动作类型（`github.mjs` 的 11 类 + 只读 + 探测）：`comment.create`、`comment.update`、
 `issue.create`、`issue.close`、`issue.reopen`、`issue.edit`、`subissue.add`、`project.field.set`、
 `branch.push`、`pr.create`、`pr.ready`，以及 `read.graphql`、`probe`。
-`pr.update-branch`、`ci.rerun` 现在返回 4（`reason=not-implemented`，归 #60）；
+`pr.update-branch`、`ci.rerun` 在 #60 之前返回 4（`reason=not-implemented`），现在由
+[`docs/acceptance-prbot.md`](acceptance-prbot.md) 的两个 gate-action 实现，只给 auto / fork 档；
+watch 档仍然返回 4（`reason=tier-not-allowed`）。
 不加 `pr.merge`：写闸对白名单外的类型一律返回 4（`reason=not-allowed`），合并先由我在 GitHub 里点。
 `pr.create` 必须带 `draft: true`（否则 4 `not-allowed`），转 Ready 只能走 `pr.ready` 的 CI 复核；head 在非 fork 档只写分支名，
 fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`。
@@ -110,6 +112,9 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
    `ISSUE_COMMENTS_QUERY`），自己写的 GraphQL 文本返回 4（`query-not-allowed`）；搜索只放行
    本轮总 issue 的修正搜索（`search-not-allowed`）。
 6. 执行锁 `state/write-gate/exec.lock`：30 秒拿不到返回 75（`busy`），什么都没执行。
+   #60 新增的只读查询（PR 状态 / PR 头 / 按分支找 PR / Ready 后的 review 与 check run / main 同名检查）
+   也走同一张登记表，调用方不能自带 GraphQL 文本。修正轮的写操作见
+   [`docs/acceptance-prbot.md`](acceptance-prbot.md)。
 7. 绑定本轮：回读最新轮次评论，不是第 n 轮或已不是「验收中」返回 4（`not-current-round`）；
    目标不在本轮任务树返回 4（`not-in-tree`）；裁决评论里的正文版本和当前正文不一致返回 4
    （`body-version-mismatch`，版本函数和 tasks/rounds 是同一个 `bodyVersion`）。

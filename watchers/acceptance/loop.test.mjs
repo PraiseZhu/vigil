@@ -38,9 +38,15 @@ function killQuiet(pid, signal = 'SIGKILL') {
 
 /** 拷一份 host/ 到临时目录，把 tick.mjs 换成假 tick（记 ppid、写心跳、睡一会儿）。 */
 function makeHostCopy(home, tickLog) {
-  // 整个 watchers/acceptance 拷一份（host/ 里的模块 import ../bin/*，只拷 host/ 会断）。
+  // 只拷 host/ 和 bin/（host/ 里的模块 import ../bin/*，只拷 host/ 会断）。
+  // 不拷整个 watchers/acceptance：别的测试会同时在那里建 / 删 .xxx-real-test- 临时目录，整拷会偶发 ENOENT。
   const root = tmpDir('acceptance-host-copy-');
-  fs.cpSync(HERE, path.join(root, 'acceptance'), { recursive: true });
+  for (const sub of ['host', 'bin']) {
+    fs.cpSync(path.join(HERE, sub), path.join(root, 'acceptance', sub), {
+      recursive: true,
+      filter: (src) => !path.basename(src).startsWith('.') || src === path.join(HERE, sub),
+    });
+  }
   const dir = path.join(root, 'acceptance', 'host');
   fs.writeFileSync(
     path.join(dir, 'tick.mjs'),

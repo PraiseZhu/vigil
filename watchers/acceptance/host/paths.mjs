@@ -14,6 +14,7 @@ export function hostPaths(home) {
   const stateRoot = path.join(home, 'state');
   const gateDir = path.join(stateRoot, 'write-gate');
   const hostDir = path.join(stateRoot, 'host');
+  const prbotDir = path.join(stateRoot, 'prbot');
   return {
     home,
     stateRoot,
@@ -28,6 +29,11 @@ export function hostPaths(home) {
     roundsDir: path.join(hostDir, 'rounds'),
     slotsDir: path.join(hostDir, 'slots'),
     testLock: path.join(hostDir, 'locks', 'mivo-test.lock'),
+    prbotDir,
+    prbotEventsFile: path.join(prbotDir, 'events.jsonl'),
+    prbotLocksDir: path.join(prbotDir, 'locks'),
+    prbotRoundsDir: path.join(prbotDir, 'rounds'),
+    prbotReadyDir: path.join(prbotDir, 'ready'),
     hostConfig: path.join(home, 'config', 'host.json'),
     loopLog: path.join(hostDir, 'loop.log'),
     roundRunDir: path.join(home, 'run'),
