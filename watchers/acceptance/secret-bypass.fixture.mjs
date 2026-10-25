@@ -12,18 +12,22 @@ export const BYPASS_LABELS = Object.freeze({
   merge: '密钥只在合并提交里',
   nul: '含 NUL 的「二进制」文件',
   header: '新增行像「+++ /dev/null」补丁头',
+  message: '密钥只在提交说明里（文件全干净）',
+  late: '密钥在第 500 个对象之后（不在第一批 cat-file 里）',
 });
 
 export const BYPASS_KINDS = Object.freeze({
   merge: 'merged/leak.pem',
   nul: 'assets/blob.bin',
   header: 'notes/patch.txt',
+  message: null,
+  late: 'zz-last/leak.pem',
 });
 
 /** 仓库：main 一个干净提交，acceptance/1-2-sc3 上按 kind 把假私钥藏进去。 */
 export async function buildBypassRepo(kind) {
-  const file = BYPASS_KINDS[kind];
-  if (!file) throw new Error(`未知的绕过方式：${kind}`);
+  if (!Object.hasOwn(BYPASS_KINDS, kind)) throw new Error(`未知的绕过方式：${kind}`);
+  let file = BYPASS_KINDS[kind];
   const repoDir = fs.mkdtempSync(path.join(tmpDir(), `acceptance-bypass-${kind}-`));
   const git = async (args) => {
     const result = await spawnRun('git', args, { cwd: repoDir, env: localEnv() });
@@ -62,6 +66,17 @@ export async function buildBypassRepo(kind) {
     write(file, Buffer.concat([Buffer.from([0]), Buffer.from(`${BYPASS_KEY}\n`)]));
     await git(['add', '-A']);
     await git(['commit', '-q', '-m', 'binary']);
+  } else if (kind === 'message') {
+    // 文件全干净，假私钥只写在提交说明里。
+    write('clean.txt', 'clean\n');
+    await git(['add', '-A']);
+    await git(['commit', '-q', '-m', `notes\n\n${BYPASS_KEY}`]);
+  } else if (kind === 'late') {
+    // 600 个内容各不相同的干净文件，密钥文件按路径排在最后：rev-list 里它在第 500 个对象之后。
+    for (let i = 0; i < 600; i += 1) write(`bulk/f${String(i).padStart(4, '0')}.txt`, `clean ${i}\n`);
+    write(file, `${BYPASS_KEY}\n`);
+    await git(['add', '-A']);
+    await git(['commit', '-q', '-m', 'bulk']);
   } else {
     // 新增行「++ /dev/null」在补丁里显示成「+++ /dev/null」，像一个新文件头。
     write(file, `++ /dev/null\n${BYPASS_KEY}\n`);
@@ -69,6 +84,7 @@ export async function buildBypassRepo(kind) {
     await git(['commit', '-q', '-m', 'header']);
   }
   const tip = (await git(['rev-parse', 'HEAD'])).trim();
+  if (kind === 'message') file = `（提交说明 ${tip.slice(0, 12)}）`;
   const bundlePath = path.join(repoDir, 'push.bundle');
   await git(['bundle', 'create', bundlePath, branch]);
   return { repoDir, branch, mainSha, tip, file, bundlePath };

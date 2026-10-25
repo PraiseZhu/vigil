@@ -92,6 +92,8 @@
 [`docs/acceptance-prbot.md`](acceptance-prbot.md) 的两个 gate-action 实现，只给 auto / fork 档；
 watch 档仍然返回 4（`reason=tier-not-allowed`）。
 不加 `pr.merge`：写闸对白名单外的类型一律返回 4（`reason=not-allowed`），合并先由我在 GitHub 里点。
+`pr.create` 必须带 `draft: true`（否则 4 `not-allowed`），转 Ready 只能走 `pr.ready` 的 CI 复核；head 在非 fork 档只写分支名，
+fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`。
 
 按档限制：
 
