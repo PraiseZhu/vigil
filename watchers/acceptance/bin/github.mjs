@@ -168,6 +168,9 @@ function baseEnv() {
   if (process.env.HOME) env.HOME = process.env.HOME;
   if (process.env.LANG) env.LANG = process.env.LANG;
   if (process.env.TZ) env.TZ = process.env.TZ;
+  // 沙箱里的 gh（host/sandbox-bin/gh）只认这个 socket，读要经写闸；不带过去 helper 在沙箱里一步都读不了。
+  // 它只是一个 socket 路径，不是凭证；宿主上的真 gh 不看它。
+  if (process.env.ACCEPTANCE_GATE_SOCKET) env.ACCEPTANCE_GATE_SOCKET = process.env.ACCEPTANCE_GATE_SOCKET;
   return env;
 }
 

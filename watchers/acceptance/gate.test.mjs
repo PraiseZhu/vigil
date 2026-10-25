@@ -884,6 +884,41 @@ test('SC11 沙箱的 gh：只放行 gh api graphql --input -，其余一律拒�
   }
 });
 
+test('SC11 沙箱里的 helper 读 GitHub：bin/github.mjs 起 gh 时把写闸 socket 带过去，读经写闸取回', async () => {
+  // 部署首跑踩到的：baseEnv() 只给 gh 透传 PATH/HOME/LANG/TZ，沙箱里的 gh 拿不到 socket 就拒绝，
+  // helper 的 collect 第一步就挂。这里走真的 createGithub → 真的 sandbox-bin/gh → 真的写闸。
+  const { home, profile } = setupEnvironment();
+  const world = defaultTree();
+  const { server, socketPath } = await openGate({ home, profile, github: gateGithub(world), binding: bindingFor(world), which: async () => false });
+  const script = [
+    `import { createGithub } from ${JSON.stringify(path.join(path.dirname(HERE_HOST), 'bin', 'github.mjs'))};`,
+    `import { run } from ${JSON.stringify(path.join(HERE_HOST, 'proc.mjs'))};`,
+    `import { ROOT_QUERY } from ${JSON.stringify(path.join(path.dirname(HERE_HOST), 'bin', 'collect.mjs'))};`,
+    `const profile = JSON.parse(process.env.TEST_PROFILE);`,
+    `const github = createGithub({ profile, run });`,
+    `const [owner, name] = process.env.TEST_REPO.split('/');`,
+    `const data = await github.graphql(ROOT_QUERY, { owner, name, number: 1 });`,
+    `process.stdout.write(JSON.stringify(data));`,
+  ].join('\n');
+  try {
+    const result = await runNode(['--input-type=module', '-e', script], {
+      env: {
+        PATH: `${path.join(HERE_HOST, 'sandbox-bin')}${path.delimiter}${process.env.PATH}`,
+        ACCEPTANCE_GATE_SOCKET: socketPath,
+        TEST_PROFILE: JSON.stringify(profile),
+        TEST_REPO: REPO,
+      },
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.doesNotMatch(result.stderr, /沙箱里只允许经写闸读/);
+    const parsed = JSON.parse(result.stdout);
+    const issue = parsed?.repository?.issue || parsed?.data?.repository?.issue;
+    assert.ok(issue, result.stdout.slice(0, 200));
+  } finally {
+    await server.close();
+  }
+});
+
 test('SC9 branch.push 推的是写闸扫过的那份副本：扫完后原 bundle 被换掉也推不出去', async () => {
   const { home, profile } = setupEnvironment();
   const world = defaultTree();
