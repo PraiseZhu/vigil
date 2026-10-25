@@ -1,10 +1,10 @@
 // #47 SC12：常驻循环的 contract 测试。真跑 host/loop（tick 换成假的），真跑 host/ensure.sh。
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test, { after } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { hostPaths, isAlive, readAlerts } from './host/paths.mjs';
 import { runTick } from './host/tick.mjs';
 import { tmpDir, writeProfile } from './fake-gh.fixture.mjs';
@@ -51,7 +51,7 @@ function makeHostCopy(home, tickLog) {
   fs.writeFileSync(
     path.join(dir, 'tick.mjs'),
     `#!/usr/bin/env node
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 const home = process.env.ACCEPTANCE_WATCHER_HOME;
@@ -295,4 +295,26 @@ test('SC12 tick 写心跳：时间、pid、上一拍结果、在跑的轮次', a
   assert.equal(onDisk.pid, heartbeat.pid);
   assert.deepEqual(onDisk.lastTick, heartbeat.lastTick);
   assert.deepEqual(onDisk.running, []);
+});
+
+test('SC12 tick 起的后台进程要放手（unref）：起了一个要跑很久的子进程，父进程照样马上退出，常驻循环不停拍', async () => {
+  const procUrl = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), 'host', 'proc.mjs')).href;
+  const script = `const { spawnBackground } = await import(${JSON.stringify(procUrl)});
+    const child = spawnBackground(process.execPath, ['-e', 'setTimeout(() => {}, 30000)']);
+    process.stdout.write(String(child.pid));`;
+  const started = Date.now();
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 20000 });
+  const elapsed = Date.now() - started;
+  const pid = Number(result.stdout);
+  try {
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(elapsed < 10000, `父进程等了子进程 ${elapsed}ms 才退`);
+    assert.ok(pid > 0);
+  } finally {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // 已经退了。
+    }
+  }
 });
