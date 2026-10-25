@@ -192,7 +192,8 @@ test('SC10 progress 写最近进度时间，done 要求先有裁决', async () =
   assert.equal(wrong.code, 3);
   assert.match(wrong.err, /期望第 4 轮/);
 
-  // 写裁决之后才能 done。
+  // 写裁决之后才能 done。「通过」之前总 issue 要已关（helper close 做的事），这里直接置为已关。
+  world.get(`${REPO}#1`).state = 'closed';
   const verdict = writeJsonFile(home, 'verdict.json', { items: fullConclusions() });
   const judged = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', verdict]);
   assert.equal(judged.code, 0, judged.err);
