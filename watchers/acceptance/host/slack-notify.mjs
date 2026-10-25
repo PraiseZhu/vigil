@@ -34,6 +34,7 @@ export const INTERRUPTION_ALERT_KINDS = Object.freeze([
   'round-failed',
   'gate-unavailable',
   'sandbox-unavailable',
+  'round-stalled',
   'round-stale',
 ]);
 
@@ -42,6 +43,8 @@ export const BLOCKED_ALERT_KINDS = Object.freeze(['secret-found', 'sandbox-unava
 
 const INTERRUPTION_WINDOW_MS = 6 * 60 * 60 * 1000;
 const MAX_HISTORY_PAGES = 20;
+/** 单次请求最多等这么久：Slack 卡住不能把整拍（以及验收）拖住。 */
+export const REQUEST_TIMEOUT_MS = 15000;
 
 /** 事件 id：`sha256(来源名 + "\n" + 原始行文本)` 前 16 位十六进制。 */
 export function eventId(source, line) {
@@ -285,28 +288,31 @@ function apiUrl(base, method) {
 }
 
 /** 发一次请求。失败原因只用固定短语，绝不带出令牌或响应正文里的可疑内容。 */
-async function requestJson({ base, token, fetch, method, httpMethod = 'POST', query, body }) {
+async function requestJson({ base, token, fetch, method, httpMethod = 'POST', query, body, timeoutMs = REQUEST_TIMEOUT_MS }) {
   const url = query ? `${apiUrl(base, method)}?${new URLSearchParams(query).toString()}` : apiUrl(base, method);
   const init = {
     method: httpMethod,
     headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(timeoutMs),
   };
   if (body !== undefined) {
     init.headers['content-type'] = 'application/json; charset=utf-8';
     init.body = JSON.stringify(body);
   }
   let response;
+  let parsed = null;
+  let status = 0;
   try {
     response = await fetch(url, init);
-  } catch {
-    return { ok: false, error: 'network-error' };
-  }
-  const status = Number(response?.status ?? 0);
-  let parsed = null;
-  try {
-    parsed = await response.json();
-  } catch {
-    parsed = null;
+    status = Number(response?.status ?? 0);
+    try {
+      parsed = await response.json();
+    } catch (error) {
+      if (error?.name === 'TimeoutError' || error?.name === 'AbortError') throw error;
+      parsed = null;
+    }
+  } catch (error) {
+    return { ok: false, error: error?.name === 'TimeoutError' || error?.name === 'AbortError' ? 'timeout' : 'network-error' };
   }
   if (status === 429) return { ok: false, error: 'rate-limited' };
   if (!(status >= 200 && status < 300)) return { ok: false, error: `http-${status || 'unknown'}` };
@@ -406,6 +412,7 @@ export async function notifySlack({
   now = () => Date.now(),
   fetch: fetchImpl = globalThis.fetch,
   apiBase = SLACK_API_BASE,
+  requestTimeoutMs = REQUEST_TIMEOUT_MS,
 } = {}) {
   const summary = { ok: true, sent: 0, digested: 0, pending: 0, failed: [] };
   const fail = (reason, extra = {}) => ({ ...summary, ok: false, reason, ...extra });
@@ -433,7 +440,7 @@ export async function notifySlack({
   const startAtMs = Date.parse(prof.startAt ?? '');
   if (!Number.isFinite(startAtMs)) return fail('profile-error');
 
-  const ctx = { base: apiBase, token: token.token, channel, fetch: fetchImpl };
+  const ctx = { base: apiBase, token: token.token, channel, fetch: fetchImpl, timeoutMs: requestTimeoutMs };
 
   let ledger = readLedger(home);
   if (!ledger.exists || ledger.broken) {
@@ -488,7 +495,8 @@ export async function notifySlack({
       continue;
     }
     if (notice.source === 'alerts' && INTERRUPTION_ALERT_KINDS.includes(notice.type)) {
-      const win = touchWindow(windows, notice, nowMs);
+      // 按事件自己的时间算窗口：循环停摆后一次补发积压时，不能把隔了很久的中断算成「连续」。
+      const win = touchWindow(windows, notice, notice.atMs);
       if (win.count >= 2) {
         if (win.collapsedAt) {
           // 这个 6 小时窗口已经发过合成的那条了。

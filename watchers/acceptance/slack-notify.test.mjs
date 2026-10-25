@@ -850,3 +850,95 @@ test('静态：只有 host/slack-notify.mjs 拿 slackBotTokenFile 去读文件�
   }
 });
 
+
+// ---- 审阅后补的测试（Pi 初稿之后）----
+
+test('事件里的文字进 mrkdwn 前转义：@channel、伪造链接、伪造 repo 都不生效', async () => {
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  prbotEvent(
+    home,
+    {
+      type: 'needs-human',
+      issue: `${REPO}#2`,
+      root: `${REPO}#1`,
+      repo: 'evil>|x/y',
+      pr: 9,
+      reason: '<!channel> 快看 <https://evil.example/|打开 PR> & <@U0BADBAD1>',
+      detail: '<https://evil.example/merge|合并>',
+    },
+    t0,
+  );
+  await withSlack(undefined, async (fake) => {
+    await notifySlack({ home, profile, now: () => t0, fetch: fake.fetch, apiBase: fake.apiBase });
+    const [body] = bodies(fake.posts());
+    const blocksText = JSON.stringify(body.blocks);
+    assert.equal(blocksText.includes('<!channel>'), false);
+    assert.equal(blocksText.includes('<https://evil'), false);
+    assert.equal(blocksText.includes('<@U0BADBAD1>'), false);
+    assert.match(blocksText, /&lt;!channel&gt;/);
+    assert.match(blocksText, /&amp;/);
+    assert.equal(blocksText.includes('evil>'), false, '不合规的 repo 名不拿来拼链接');
+    assert.equal(blocksText.includes('github.com/evil'), false);
+  });
+});
+
+test('Slack 不回话时单次请求超时返回、排重试，不把这一拍拖住', async () => {
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  prbotEvent(home, { type: 'ready', ...readyEvent() }, t0);
+  const sockets = new Set();
+  const server = http.createServer(() => {
+    // 故意一直不回。
+  });
+  server.on('connection', (socket) => sockets.add(socket));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const apiBase = `http://127.0.0.1:${server.address().port}/api/`;
+    // 没账本时先查频道历史：查不动也要按时返回，这一拍不发。
+    const rebuild = await notifySlack({ home, profile, now: () => t0, apiBase, requestTimeoutMs: 200 });
+    assert.equal(rebuild.reason, 'ledger-rebuild-failed');
+    fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(home, 'state', 'slack', 'ledger.json'), JSON.stringify({ version: 1, ids: [] }), { mode: 0o600 });
+    const startedAt = Date.now();
+    const result = await notifySlack({
+      home,
+      profile,
+      now: () => t0,
+      apiBase,
+      requestTimeoutMs: 200,
+    });
+    assert.ok(Date.now() - startedAt < 5000, '超时之后就返回');
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'send-failed');
+    const ledger = readLedger(home);
+    assert.equal(ledger.retry.length, 1);
+    assert.equal(ledger.retry[0].attempts, 1);
+    assert.equal(ledger.retry[0].nextAttemptAt, new Date(t0 + 60000).toISOString());
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('round-stalled 也算中断；连续中断按事件时间算：隔 7 小时的两次在同一拍补发也不合成', async () => {
+  const t0 = Date.parse(START_AT);
+  const stalled = setup();
+  await withSlack(undefined, async (fake) => {
+    alertEvent(stalled.home, { kind: 'round-stalled', issue: `${REPO}#4`, round: 1, reason: '卡住 1' }, t0);
+    alertEvent(stalled.home, { kind: 'round-stalled', issue: `${REPO}#4`, round: 2, reason: '卡住 2' }, t0 + 60000);
+    const result = await notifySlack({ home: stalled.home, profile: stalled.profile, now: () => t0 + 120000, fetch: fake.fetch, apiBase: fake.apiBase });
+    assert.equal(result.sent, 1);
+    assert.match(fake.posts()[0].body, /同一任务连续中断/);
+  });
+
+  const apart = setup();
+  await withSlack(undefined, async (fake) => {
+    alertEvent(apart.home, { kind: 'round-failed', issue: `${REPO}#5`, round: 1, reason: '早' }, t0);
+    alertEvent(apart.home, { kind: 'round-failed', issue: `${REPO}#5`, round: 2, reason: '晚' }, t0 + 7 * 3600000);
+    const result = await notifySlack({ home: apart.home, profile: apart.profile, now: () => t0 + 8 * 3600000, fetch: fake.fetch, apiBase: fake.apiBase });
+    assert.equal(result.sent, 0, '两次隔了 7 小时，不算连续');
+    assert.equal(result.digested, 2);
+    assert.equal(fake.posts().length, 0);
+  });
+});

@@ -194,7 +194,8 @@ export async function runTick({
       await notify({ home, env: { ...env, ACCEPTANCE_WATCHER_HOME: home }, now, ...notifyOptions }),
     );
   } catch (error) {
-    heartbeat.slack = slackHeartbeat({ ok: false, reason: 'notify-error', error: String(error?.message || error) });
+    // 异常文字不进心跳（万一里面带了请求头之类的东西），只记原因。
+    heartbeat.slack = slackHeartbeat({ ok: false, reason: 'notify-error', error: String(error?.name || 'unknown') });
   }
 
   function writeHeartbeat() {

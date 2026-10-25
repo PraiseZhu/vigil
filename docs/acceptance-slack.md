@@ -27,6 +27,8 @@
 - **只有 `watchers/acceptance/host/slack-notify.mjs` 读这个文件**。它用
   `O_RDONLY | O_NOFOLLOW` 打开（符号链接直接拒绝），再 `fstat` 检查普通文件、属主、600、非空；
   任一不满足就不发，心跳里写 `token-file-unreadable` / `token-file-mode` / `token-file-empty` 这类原因。
+  注意：profile 加载（#47 的 `bin/profile.mjs`）本身就检查这个文件是 600，所以运行前权限就不对时，
+  加载 profile 先失败（心跳是 `profile-error`，整台验收机都停）；`token-file-*` 只在运行中文件被改坏时出现。
 - **不读环境变量**：设了 `ACCEPTANCE_SLACK_BOT_TOKEN` 或 `SLACK_BOT_TOKEN` 也不会用。
 - 令牌只出现在 HTTP 的 `Authorization: Bearer` 头里：**不进请求 body、不进日志、不进心跳、不进账本、
   不进异常信息**。本模块也不起子进程，所以令牌不会出现在任何子进程环境里。
@@ -65,8 +67,8 @@
 | prbot | 未知 type | **忽略** |
 | alerts | `secret-found` | **ping**（只列文件名） |
 | alerts | `sandbox-unavailable` | **ping**（沙箱起不来） |
-| alerts | `round-failed`、`gate-unavailable`、`sandbox-unavailable`、`round-stale` | 中断类：同一 issue **6 小时内第 2 次及以上**合成一条「同一任务连续中断」，每个 issue 每 6 小时窗口只发一次 |
-| alerts | `gate-rejected`、`write-rejected`、`round-stalled`、`loop-restarted`、`tick-failed`、`prbot-tick-failed` | **摘要** |
+| alerts | `round-failed`、`gate-unavailable`、`sandbox-unavailable`、`round-stalled`、`round-stale` | 中断类：第 1 次进摘要（`sandbox-unavailable` 照上一行立即发）；同一 issue **6 小时内第 2 次及以上**合成一条「同一任务连续中断」立即发，每个 issue 每 6 小时窗口只发一次。6 小时按事件自己的时间算（循环停摆后一次补发积压时，隔得久的不算连续） |
+| alerts | `gate-rejected`、`write-rejected`、`loop-restarted`、`tick-failed`、`prbot-tick-failed` | **摘要** |
 | alerts | 其它未知 kind | **摘要**（未知的也进摘要，不丢） |
 | — | 验收结论本身（通过 / 要修 / 中断） | **不发**：只在 GitHub 的轮次评论和看板里 |
 
@@ -86,8 +88,12 @@
   结果写在 `state/host/heartbeat.json` 的 `slack` 字段：
   `{ ok, reason?, sent, digested, pending, failed: [{ id, kind, error }] }`。
   通知出错只进心跳，不影响这一拍的验收调度。
-- 扫到密钥的提醒只列文件名（`reason` 里冒号后面的那串）；所有发出去的文字都再过一遍
+- 扫到密钥的提醒只列文件名（`reason` 里第一个全角冒号后面的那串）；所有发出去的文字都再过一遍
   `bin/redact.mjs`，令牌、私钥、本机路径不会漏出去。
+- 事件里的文字（原因、细节、issue 名、文件名）可能来自模型或仓库内容，放进消息前把 `& < >` 转义，
+  `<!channel>`、`<@U…>`、`<https://别处|打开 PR>` 这类写法只会显示成字面文字。仓库名只认 `owner/repo`，
+  CI 链接只认 `https://github.com/` 下面的地址。
+- 每个 Slack 请求最多等 15 秒，超时按发送失败处理（进重试），不会把这一拍和验收调度拖住。
 
 ## 6. Ready 消息长什么样
 

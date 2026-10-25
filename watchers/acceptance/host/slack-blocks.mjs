@@ -18,6 +18,18 @@ function str(value) {
   return typeof value === 'string' ? value : '';
 }
 
+/**
+ * 事件里的文字（原因、细节、issue 名、文件名……）可能来自模型或仓库内容，放进 mrkdwn 前必须转义：
+ * 不转义的话 `<!channel>`、`<@U…>`、`<https://别处|打开 PR>` 都会被 Slack 当成真的 @ 或链接。
+ * 只转 Slack 要求的三个字符（& < >）。
+ */
+export function esc(value) {
+  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** 仓库名只认 owner/repo（GitHub 允许的字符），别的一律当没有。 */
+const REPO_NAME = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
 function clip(text, limit) {
   const value = String(text ?? '');
   return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
@@ -44,7 +56,8 @@ function view(notice) {
  * 不一致（伪造的、指向别的仓的）或形状不对，就按事件里的 repo+pr 自己拼。
  */
 export function prLink(event) {
-  const repo = str(event?.repo).includes('/') ? str(event.repo) : splitRef(event?.issue)?.repo || splitRef(event?.root)?.repo || '';
+  const candidate = str(event?.repo).includes('/') ? str(event.repo) : splitRef(event?.issue)?.repo || splitRef(event?.root)?.repo || '';
+  const repo = REPO_NAME.test(candidate) ? candidate : '';
   const prNumber = Number(event?.pr);
   const pr = Number.isInteger(prNumber) && prNumber > 0 ? prNumber : null;
   const url = str(event?.prUrl).trim();
@@ -56,7 +69,7 @@ export function prLink(event) {
     const samePr = Number(match[3]) === pr;
     return { repo, pr, link: sameRepo && samePr ? url : built };
   }
-  if (match) return { repo: `${match[1]}/${match[2]}`, pr: Number(match[3]), link: url };
+  if (match && REPO_NAME.test(`${match[1]}/${match[2]}`)) return { repo: `${match[1]}/${match[2]}`, pr: Number(match[3]), link: url };
   return { repo, pr, link: '' };
 }
 
@@ -65,10 +78,10 @@ function head7(sha) {
   return /^[0-9a-fA-F]{7,}$/.test(value) ? value.slice(0, 7) : '';
 }
 
-/** 只有 http(s) 的链接才放进 mrkdwn；别的一律当普通文字。 */
+/** CI 链接只认 https://github.com/ 下面、不带 `| < >` 的地址（否则能在 `<url|文字>` 里改掉显示的文字）；别的不放链接。 */
 function httpUrl(value) {
   const url = str(value).trim();
-  return /^https?:\/\/\S+$/.test(url) ? url : '';
+  return /^https:\/\/github\.com\/[^\s|<>]+$/.test(url) ? url : '';
 }
 
 function header(text) {
@@ -118,7 +131,7 @@ export function readyBlocks(notice, profile) {
   const event = view(notice);
   const target = prLink(event);
   const title = `修正 PR 已 Ready：${readyName(event, target)}`;
-  const sc = Array.isArray(event.sc) ? event.sc.map((item) => `SC${item}`) : [];
+  const sc = Array.isArray(event.sc) ? event.sc.filter((item) => Number.isInteger(item) && item > 0).map((item) => `SC${item}`) : [];
   const checks = event.checks && typeof event.checks === 'object' ? event.checks : null;
   const total = checks ? Number(checks.total) : NaN;
   const diff = event.diff && typeof event.diff === 'object' ? event.diff : null;
@@ -126,8 +139,8 @@ export function readyBlocks(notice, profile) {
 
   const blocks = [header(title)];
   const fields = fieldsBlock([
-    ['任务 issue', str(event.root)],
-    ['修正子 issue', str(event.issue)],
+    ['任务 issue', esc(str(event.root))],
+    ['修正子 issue', esc(str(event.issue))],
     ['head', head7(event.headSha)],
     [
       'CI',
@@ -178,7 +191,7 @@ export function stalledBlocks(notice, profile) {
     '多半是审查流程不在线（review-ingress-missing），请看 Mac mini 和审查入口。',
   ];
   if (target.link) lines.push(`PR：${target.link}`);
-  if (str(event.readyAt)) lines.push(`转 Ready：${str(event.readyAt)}`);
+  if (str(event.readyAt)) lines.push(`转 Ready：${esc(str(event.readyAt))}`);
   const sha = head7(event.headSha);
   if (sha) lines.push(`head：${sha}`);
   const blocks = [header(title), section(lines.join('\n'))];
@@ -205,7 +218,8 @@ const ALERT_TITLES = {
 /** `secret-found` 的 reason 形如「…没推：a.js, b.txt」：只取冒号后面的文件名列表。 */
 function secretFileList(reason) {
   const text = str(reason).trim();
-  const at = Math.max(text.lastIndexOf('：'), text.lastIndexOf(':'));
+  // 写闸的格式是「branch.push 扫到疑似密钥，没推：a.js, b.txt」：取第一个全角冒号后面（文件名里可能有半角冒号）。
+  const at = text.indexOf('：');
   return (at >= 0 ? text.slice(at + 1) : text).trim();
 }
 
@@ -223,25 +237,25 @@ export function alertBlocks(notice, profile) {
   const blocks = [header(title)];
   if (type === 'secret-found') {
     const files = secretFileList(event.reason);
-    blocks.push(section(`文件名：${files || '（提醒里没给文件名）'}`));
+    blocks.push(section(`文件名：${esc(files) || '（提醒里没给文件名）'}`));
     return finish({ text: `${title}｜文件名：${files}`, blocks }, profile);
   }
 
   const lines = [];
   if (type === 'interrupted-repeat') {
     const count = Number(event.windowCount) || 0;
-    const kinds = Array.isArray(event.windowKinds) && event.windowKinds.length ? event.windowKinds.join('、') : '中断类提醒';
+    const kinds = Array.isArray(event.windowKinds) && event.windowKinds.length ? esc(event.windowKinds.join('、')) : '中断类提醒';
     lines.push(`6 小时内同一任务连续中断 ${count} 次（${kinds}），后面这些不再逐条发。`);
   }
-  if (str(event.reason)) lines.push(`原因：${str(event.reason)}`);
+  if (str(event.reason)) lines.push(`原因：${esc(str(event.reason))}`);
   if (type === 'needs-human' && str(event.detail)) {
-    lines.push(`细节：${str(event.detail)}`);
+    lines.push(`细节：${esc(str(event.detail))}`);
   }
   const target = prLink(event);
   if (target.link) lines.push(`PR：${target.link}`);
   const sha = head7(event.headSha);
   if (sha) lines.push(`head：${sha}`);
-  if (str(event.root) && str(event.root) !== issue) lines.push(`任务 issue：${str(event.root)}`);
+  if (str(event.root) && str(event.root) !== issue) lines.push(`任务 issue：${esc(str(event.root))}`);
   if (lines.length) blocks.push(section(lines.join('\n')));
 
   return finish({ text: `${title}${str(event.reason) ? `｜${str(event.reason)}` : ''}`, blocks }, profile);
@@ -259,7 +273,7 @@ export function digestBlocks(notices, profile) {
     const issue = str(data.issue);
     const reason = clip(str(data.reason), 140);
     const head = [type, issue].filter(Boolean).join(' ');
-    lines.push(`· ${head}${reason ? `：${reason}` : ''}`);
+    lines.push(`· ${esc(head)}${reason ? `：${esc(reason)}` : ''}`);
   }
   if (items.length > 40) lines.push(`…还有 ${items.length - 40} 条`);
   const title = `验收机摘要（${items.length} 条）`;

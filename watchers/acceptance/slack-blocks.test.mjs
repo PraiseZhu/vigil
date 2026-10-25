@@ -146,3 +146,19 @@ test('摘要：多条合成一条，永不 @（即使 profile 配了 slackMentio
   assert.ok(body.includes(`${REPO}#5`));
   assert.equal(body.includes(`<@${MENTION}>`), false, '摘要永不 @');
 });
+
+test('secret-found 文件名里带半角冒号也整段保留；CI 链接只认 github.com 且不带 | < >', () => {
+  const secret = textOf(
+    alertBlocks(
+      { source: 'alerts', type: 'secret-found', event: { kind: 'secret-found', reason: 'branch.push 扫到疑似密钥，没推：dir/a:b.txt, c.js' } },
+      {},
+    ),
+  );
+  assert.match(secret, /dir\/a:b\.txt, c\.js/);
+
+  for (const url of ['https://evil.example/checks', `https://github.com/${REPO}/checks|打开 PR`, 'javascript:alert(1)']) {
+    const body = textOf(readyBlocks(readyEvent({ checks: { green: 3, total: 3, url } }), {}));
+    assert.equal(body.includes(url), false, url);
+    assert.match(body, /CI 3\/3 绿/);
+  }
+});
