@@ -357,7 +357,8 @@ export async function runTick({
           const repoName = String(item.issue || '').split('#')[0].split('/')[1] || '';
           return !(testLockHeld && TEST_LOCK_PATTERN.test(repoName));
         }).length;
-        let prbotFree = Math.max(0, MAX_ROUNDS - liveSlotCount(paths) - pendingAcceptance);
+        // 写闸总开关关着：修正轮的写（推分支、开 PR、写评论）同样全被拒，起了只会白跑、白耗重试次数，所以也不起。
+        let prbotFree = gateEnabled ? Math.max(0, MAX_ROUNDS - liveSlotCount(paths) - pendingAcceptance) : 0;
         for (const entry of found || []) {
           const lockFile = path.join(paths.prbotLocksDir, `${entry.issue.replace(/[^\w.-]+/g, '__')}.lock`);
           const held = readLockPayload(lockFile);

@@ -420,8 +420,13 @@ test('SC11 写闸转发：沙箱那一侧的 socket 原样转给内层写闸，�
   assert.equal(fs.existsSync(publicPath), false);
 });
 
-test('SC11 tick：写闸总开关关着 → 不起轮次、不 abort、不写提醒，心跳记 gate: disabled', async () => {
+test('SC11 tick：写闸总开关关着 → 验收轮、修正轮都不起，不 abort、不写提醒，心跳记 gate: disabled', async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  fs.writeFileSync(
+    path.join(home, 'config', 'host.json'),
+    JSON.stringify({ piCommand: ['pi'], prbot: { piCommand: ['pi'], repos: { [REPO]: { handoff: 'owner' } } } }),
+  );
+  const startedPrbot = [];
   const started = [];
   const aborted = [];
   const poll = [
@@ -440,10 +445,18 @@ test('SC11 tick：写闸总开关关着 → 不起轮次、不 abort、不写提
       aborted.push(argv);
       return { code: 4, stdout: '', stderr: 'gate-disabled' };
     },
+    spawnPrbot: (issue) => {
+      startedPrbot.push(issue);
+      return 2;
+    },
+    discoverPrbot: async () => [{ issue: `${REPO}#10` }],
+    checkPrbotStalled: async () => [],
+    cleanupPrbot: () => [],
     notify: async () => ({ ok: true }),
     now: () => Date.parse('2026-10-24T02:00:00.000Z'),
   });
   assert.equal(heartbeat.gate, 'disabled');
+  assert.deepEqual(startedPrbot, [], '修正轮也不起');
   assert.equal(heartbeat.lastTick.ok, true);
   assert.deepEqual(started, []);
   assert.deepEqual(aborted, []);

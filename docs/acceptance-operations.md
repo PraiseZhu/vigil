@@ -169,7 +169,7 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 `host/round.mjs` 是**唯一**起 pi 的入口，pi 一定在 `bwrap` 里：
 
 - 认领之前先看写闸总开关、再跑 bwrap 探针：总开关关着就不认领、**不写**提醒（只读期每拍都会碰到，
-  写提醒就是刷屏），心跳里记 `gate: disabled`；探针不过就不认领（issue 上不会多一对「验收中 → 中断」评论），
+  写提醒就是刷屏），心跳里记 `gate: disabled`；tick 这时验收轮、修正轮（prbot）都不起（修正轮的写同样全被拒，起了只会白耗重试次数）；探针不过就不认领（issue 上不会多一对「验收中 → 中断」评论），
   写一条 `sandbox-down` 提醒，一小时内只写一条。
 
 - pi 起来之后宿主出错（查进度失败等）：先结束 pi（SIGTERM，宽限期后 SIGKILL），再 `abort`

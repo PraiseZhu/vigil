@@ -579,6 +579,9 @@ test('SC1 tick 每一拍调用修正轮发现、ready-stalled 和清理；同一
     path.join(configDir, 'host.json'),
     JSON.stringify({ piCommand: ['pi', '--model', 'example/model'], prbot: { piCommand: ['pi', '--model', 'example/model'] } }),
   );
+  // 写闸总开关开着才起修正轮（关着时 tick 什么轮次都不起）。
+  fs.mkdirSync(path.join(home, 'state', 'write-gate'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'state', 'write-gate', 'enabled'), '1');
   const started = [];
   const heartbeat = await runTick({
     home,
@@ -1493,6 +1496,9 @@ test('#60 修正 8：发现阶段跳过已收尾的修正（不再每分钟起�
 
   // tick：这一拍有 1 个该开始的验收轮、2 个修正轮 —— 修正轮只起 1 个，给验收轮留 1 个槽。
   const tickHome = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  // 写闸总开关开着才起轮次（总开关关着时验收轮和修正轮都不起，见 host-round.test.mjs）。
+  fs.mkdirSync(path.join(tickHome, 'state', 'write-gate'), { recursive: true });
+  fs.writeFileSync(path.join(tickHome, 'state', 'write-gate', 'enabled'), '1');
   fs.writeFileSync(
     path.join(tickHome, 'config', 'host.json'),
     JSON.stringify({ piCommand: ['pi'], prbot: { piCommand: ['pi'], repos: { [REPO]: { handoff: 'owner' } } } }),
