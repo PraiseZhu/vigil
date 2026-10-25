@@ -1,6 +1,6 @@
 {
   "piCommand": ["pi", "--model", "<model id>", "--thinking", "max"],
-  "egressAllow": ["github.com:443", "codeload.github.com:443", "llm-gateway.example.invalid:443"],
+  "egressAllow": ["llm-gateway.example.invalid:443"],
   "adjudicateCommand": ["pi", "--model", "anthropic/claude-opus-5-5", "--thinking", "medium"],
   "adjudicateMaxMinutes": 30,
   "slackDailyCap": 30,

@@ -31,7 +31,7 @@
   "piCommand": ["pi", "--model", "<model id>", "--thinking", "max"],
   "credentialDirs": ["<可选：额外要遮罩的绝对目录>"],
   "homeAllowDirs": ["<可选：沙箱里要只读看到的 HOME 内目录，比如 pi 的安装目录、pi 配置副本目录>"],
-  "egressAllow": ["github.com:443", "codeload.github.com:443", "<LLM 网关 host>:443"],
+  "egressAllow": ["<LLM 网关 host>:443"],
   "maxRoundMinutes": 120,
   "adjudicateCommand": ["pi", "--model", "anthropic/claude-opus-5-5", "--thinking", "medium"],
   "adjudicateMaxMinutes": 30,
@@ -43,8 +43,9 @@
 [`docs/acceptance-slack.md`](acceptance-slack.md) 第 5 节。
 
 `egressAllow` 是沙箱**唯一**能出网的名单（见第 4 节「网络」）：只写 `host:port`（小写，不认通配、不认 URL），
-LLM 网关的 host 取 pi 的 `models.json` 里 `baseUrl` 的主机名；`git clone https://github.com/<公开仓>`
-要 `github.com:443` 和 `codeload.github.com:443`。**不配就是空名单，pi 连不上模型网关，这一轮跑不起来。**
+LLM 网关的 host 取 pi 的 `models.json` 里 `baseUrl` 的主机名。代码由宿主预取、只读挂进沙箱（见下面「代码预取」），
+pi 不用自己 `git clone`，所以**只放行网关就够**；名单越短越好（每个放行的主机都是一条潜在的外传通道）。
+沙箱里固定关掉 npm 的更新检查（`NPM_CONFIG_UPDATE_NOTIFIER=false`），跑 `npm test` 不会去连 registry。**不配就是空名单，pi 连不上模型网关，这一轮跑不起来。**
 写错（通配、URL、缺端口）整轮直接起不来，不会悄悄放宽。
 
 `maxRoundMinutes` 可选：一轮的总时长上限（分钟，宿主墙钟，从认领算起），缺了或不是正数按 120。

@@ -32,7 +32,10 @@ export const EGRESS_ENV = Object.freeze([
 ]);
 
 /** 沙箱内部用的变量：两个指向沙箱内路径的（不是宿主的），加上出网变量。 */
-export const INTERNAL_ENV = Object.freeze(['ACCEPTANCE_WATCHER_HOME', 'ACCEPTANCE_GATE_SOCKET', ...EGRESS_ENV]);
+/** 固定值的安静变量：npm 的更新检查会去连 registry（沙箱出网被拒、每轮一条 egress-denied 提醒），直接关掉。 */
+export const QUIET_ENV = Object.freeze({ NPM_CONFIG_UPDATE_NOTIFIER: 'false', NO_UPDATE_NOTIFIER: '1' });
+
+export const INTERNAL_ENV = Object.freeze(['ACCEPTANCE_WATCHER_HOME', 'ACCEPTANCE_GATE_SOCKET', ...EGRESS_ENV, ...Object.keys(QUIET_ENV)]);
 
 /**
  * 系统级固定遮罩（代码里写死，host.json 关不掉，只能用 credentialDirs 追加）：
@@ -357,6 +360,7 @@ export function sandboxEnv({
   env.PATH = pathParts.length ? pathParts.join(path.delimiter) : '/usr/bin:/bin';
   if (internal.includes('ACCEPTANCE_WATCHER_HOME')) env.ACCEPTANCE_WATCHER_HOME = path.join(roundDir, 'home-acc');
   if (internal.includes('ACCEPTANCE_GATE_SOCKET') && socketPath) env.ACCEPTANCE_GATE_SOCKET = socketPath;
+  for (const [key, value] of Object.entries(QUIET_ENV)) if (internal.includes(key)) env[key] = value;
   if (egressPort !== undefined && egressPort !== null) {
     if (!Number.isInteger(egressPort) || egressPort < 1 || egressPort > 65535) throw new Error('sandboxEnv 的 egressPort 不对');
     const proxy = `http://127.0.0.1:${egressPort}`;
