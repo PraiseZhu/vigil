@@ -320,3 +320,23 @@ test('SC15 除 github.mjs 外 bin 下没有 spawn/execFile/child_process', () =>
     assert.doesNotMatch(src, /execFile/);
   }
 });
+
+test('安全 branch.push 的 bundlePath 必须是绝对路径，不会被 git 当成选项', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const run = createFakeRun();
+  const github = createGithub({ profile, run });
+  for (const bundlePath of ['--upload-pack=touch /tmp/x', 'relative/x.bundle', '', undefined]) {
+    await assert.rejects(
+      github.write({ type: 'branch.push', dedupeKey: 'k', repo: REPO, branch: 'acceptance/1-2-sc3', bundlePath }),
+      /bundlePath/,
+    );
+  }
+  for (const branch of ['-x', 'a..b', 'bad branch']) {
+    await assert.rejects(
+      github.write({ type: 'branch.push', dedupeKey: 'k', repo: REPO, branch, bundlePath: path.join(home, 'x.bundle') }),
+      /分支名/,
+    );
+  }
+  assert.equal(run.calls.length, 0, '参数不合法时不应调 git');
+});

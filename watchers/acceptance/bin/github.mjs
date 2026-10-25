@@ -344,6 +344,16 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
   async function pushBranch(action) {
     const token = getOwnerToken();
     const { repo, branch, bundlePath } = action;
+    // 参数会进 git 命令行：bundle 必须是绝对路径（不可能以 - 开头被当成选项），分支和仓名只收安全字符。
+    if (typeof bundlePath !== 'string' || !path.isAbsolute(bundlePath)) {
+      throw new Error('branch.push 的 bundlePath 必须是绝对路径');
+    }
+    if (typeof branch !== 'string' || !/^[A-Za-z0-9._/][A-Za-z0-9._/-]*$/.test(branch) || branch.includes('..')) {
+      throw new Error(`branch.push 的分支名不合法：${branch}`);
+    }
+    if (typeof repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || repo.startsWith('-')) {
+      throw new Error(`branch.push 的仓名不合法：${repo}`);
+    }
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'acceptance-push-'));
     const env = gitEnv(token);
     try {
