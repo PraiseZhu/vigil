@@ -195,7 +195,7 @@ export async function runPreflightInSandbox({
       cwd: worktree,
       timeoutMs,
     });
-    runs.push({ command, code: result?.code ?? 1, stderr: firstLine(result?.stderr) });
+    runs.push({ command, code: result?.code ?? 1, stdout: String(result?.stdout || '').slice(0, 64 * 1024), stderr: firstLine(result?.stderr) });
     if (!result || result.code !== 0) {
       return { ok: false, unavailable: false, code: result?.code ?? 1, runs, env: sandbox.env, args: sandbox.args };
     }

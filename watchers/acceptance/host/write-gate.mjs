@@ -629,8 +629,18 @@ export function createGate({
       }
       case 'pr.create': {
         const head = String(action.head || '');
-        const headBranch = head.includes(':') ? head.slice(head.indexOf(':') + 1) : head;
+        const colon = head.indexOf(':');
+        const headOwner = colon >= 0 ? head.slice(0, colon) : null;
+        const headBranch = colon >= 0 ? head.slice(colon + 1) : head;
         if (headBranch !== branch) return reject('not-allowed', `PR 的 head 必须是 ${branch}`);
+        // head 的仓前缀：非 fork 不带；fork 只能是我自己（ownerLogin），不能拿别人 fork 里的同名分支开 PR。
+        if (correctionForkRepo(marker, tree)) {
+          if (headOwner === null || headOwner.toLowerCase() !== String(profile.ownerLogin || '').toLowerCase()) {
+            return reject('not-allowed', `fork 模式 PR 的 head 必须是 ${profile.ownerLogin}:${branch}`);
+          }
+        } else if (headOwner !== null) {
+          return reject('not-allowed', 'PR 的 head 不能带别的仓的前缀');
+        }
         if (action.draft !== true) return reject('not-allowed', '修正 PR 一律先开 Draft');
         const prMarker = parseMarker(action.body);
         if (

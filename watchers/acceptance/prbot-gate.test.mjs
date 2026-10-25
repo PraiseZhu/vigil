@@ -304,6 +304,21 @@ test('SC5 修正轮只允许这条分支的 Draft PR；别的分支 / 非 Draft 
     dedupeKey: 'pr-other-marker',
   });
   assert.equal(foreignBody.body.reason, 'not-allowed');
+  // 非 fork 档：head 不许带任何仓前缀（别人的、我自己的都不行）。
+  for (const prefixed of [`StrangerUser:${BRANCH}`, `${OWNER}:${BRANCH}`]) {
+    const outcome = await gate.handle({
+      type: 'pr.create',
+      repo: REPO,
+      head: prefixed,
+      base: 'main',
+      draft: true,
+      title: '修正',
+      body: [`任务 issue：${REPO}#1`, CORRECTION_MARKER].join('\n'),
+      dedupeKey: `pr-prefixed-${prefixed}`,
+    });
+    assert.equal(outcome.code, 4, prefixed);
+    assert.equal(outcome.body.reason, 'not-allowed', prefixed);
+  }
 });
 
 test('SC6 auto 档可以 pr.update-branch / ci.rerun；watch 档两个都 4 tier-not-allowed', async () => {
@@ -448,6 +463,13 @@ test('SC6 github 出口：update-branch / rerun 走 REST；fetchBranch 的令牌
     assert.equal(call.env.GIT_CONFIG_VALUE_0.includes(token), false, 'extraheader 里不是明文令牌');
     assert.equal(call.env.GH_TOKEN, undefined);
   }
+  // 默认浅取 50；depth: 0 = 全量（修正轮的宿主镜像用它）。
+  assert.ok(gitCalls.some((call) => call.args.includes('fetch') && call.args.includes('--depth=50')));
+  gitCalls.length = 0;
+  await github.fetchBranch({ repo: REPO, branch: 'main', dir, depth: 0 });
+  const full = gitCalls.find((call) => call.args.includes('fetch'));
+  assert.ok(full);
+  assert.equal(full.args.some((arg) => arg.startsWith('--depth')), false);
 });
 
 async function claimedGate({ home, profile, world, github }) {
@@ -582,7 +604,27 @@ test('SC5 fork 模式：只推 ownerLogin 名下的 fork；pr.ready 只认从这
   });
   assert.equal(upstreamPush.code, 4);
   assert.equal(upstreamPush.body.reason, 'not-allowed');
-  assert.deepEqual(written.map((action) => action.type), ['pr.ready']);
+
+  // fork 模式开 PR：head 只能是 ownerLogin:<分支>；不带前缀、别人的前缀、空前缀一律 4。
+  const forkPr = (head, key) =>
+    gate.handle({
+      type: 'pr.create',
+      repo: FORK_UPSTREAM,
+      head,
+      base: 'main',
+      draft: true,
+      title: '修正',
+      body: [`任务 issue：${FORK_UPSTREAM}#1`, marker].join('\n'),
+      dedupeKey: key,
+    });
+  for (const bad of [BRANCH, `StrangerUser:${BRANCH}`, `:${BRANCH}`]) {
+    const outcome = await forkPr(bad, `fork-pr-${bad}`);
+    assert.equal(outcome.code, 4, bad);
+    assert.equal(outcome.body.reason, 'not-allowed', bad);
+  }
+  const own = await forkPr(`${OWNER}:${BRANCH}`, 'fork-pr-own');
+  assert.equal(own.code, 0, JSON.stringify(own));
+  assert.deepEqual(written.map((action) => action.type), ['pr.ready', 'pr.create']);
 });
 
 test('SC5 prbot 自己拼的修正 PR 正文过得了真写闸：标记照抄修正子 issue（验收轮号，不是修正轮号）', async () => {

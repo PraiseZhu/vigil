@@ -14,11 +14,13 @@ import {
   cleanupWorktrees,
   defaultPrepareWorktree,
   HOST_GIT_HARDENING,
+  bundleHead,
   correctionBranch,
   discoverCorrections,
   matchesForbidden,
   parseCorrectionRounds,
   pollDraft,
+  prbotStatePath,
   runPrbotCorrection,
   stopReason,
 } from './host/prbot.mjs';
@@ -26,6 +28,7 @@ import { PR_BY_BRANCH_QUERY, PR_STATUS_QUERY } from './host/write-gate.mjs';
 import { runTick } from './host/tick.mjs';
 import { createFakeGithub, createWorld, defaultTree } from './session.fixture.mjs';
 import { clock, OWNER, REPO, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
+import { spawnRun } from './bin/localgit.mjs';
 
 const CORRECTION_REF = `${REPO}#9`;
 const CORRECTION_MARKER = `[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#2 SC3 · 第 1 轮`;
@@ -460,7 +463,7 @@ test('SC1/SC2/SC5/SC11 一次完整跑通：认领 → 评估 → 修复 → Dra
     meminfoPath: meminfo,
     sleep: async () => {},
     makeGate: () => fakeGate,
-    prepareWorktree: () => ({ worktree }),
+    prepareWorktree: () => ({ worktree, mirror: path.join(tmpDir(), 'mirror') }),
     piRunner: async () => ({ ok: true, stdout: '', code: 0 }),
     bundleFactory: async () => ({ bundlePath: '/tmp/fake.bundle', headSha: 'c'.repeat(40), cleanup() {} }),
     run: async (cmd, args) => {
@@ -517,6 +520,10 @@ test('SC1/SC2/SC5/SC11 一次完整跑通：认领 → 评估 → 修复 → Dra
   const diffRun = runs.find((entry) => entry.args.includes('diff'));
   assert.ok(diffRun);
   assert.deepEqual(diffRun.args.slice(0, 4), ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false']);
+  // 看改动在宿主镜像里（--git-dir 指向镜像），不在 pi 写过的工作树里。
+  assert.equal(diffRun.args.includes('-C'), false);
+  assert.match(diffRun.args[diffRun.args.indexOf('--git-dir') + 1], /mirror[/\\]\.git$/);
+  assert.equal(runs.some((entry) => entry.args.includes(worktree)), false);
 });
 
 test('SC1 tick 每一拍调用修正轮发现、ready-stalled 和清理；同一修正子 issue 已在跑就不重开', async () => {
@@ -582,6 +589,8 @@ async function runOnce({
   preflightRunner,
   hostRuns = [],
   dirty = '',
+  onPush,
+  overrides = {},
 } = {}) {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
@@ -597,6 +606,7 @@ async function runOnce({
         return { code: 0, body: { data: {} } };
       }
       if (action.type === 'pr.create') return { code: 0, body: { pr: 12, url: `https://example.invalid/${REPO}/pull/12` } };
+      if (action.type === 'branch.push' && onPush) return onPush(action);
       return { code: 0, body: {} };
     },
   };
@@ -619,7 +629,7 @@ async function runOnce({
     makeGate: () => gate,
     prepareWorktree: (options) => {
       piCalls.push({ refresh: options.refresh });
-      return { worktree };
+      return { worktree, mirror: path.join(tmpDir(), 'mirror') };
     },
     piRunner: async ({ prompt }) => {
       piCalls.at(-1).prompt = prompt;
@@ -638,6 +648,7 @@ async function runOnce({
     },
     statusProvider: async () => statuses[Math.min(polls++, statuses.length - 1)],
     mainChecksProvider: async () => ({ names: new Set(), sha: 'd'.repeat(40) }),
+    ...overrides,
   });
   return { code, actions, events: readPrbotEvents(paths).map((event) => event.type), allEvents: readPrbotEvents(paths), paths };
 }
@@ -669,6 +680,7 @@ test('SC6/SC7 一次修正轮：检查没跑完只等；真失败 -> 再修 -> �
 });
 
 test('SC7 冲突：pi 先取回最新 main 再合（prepareWorktree refresh + 提示里写明合 main）', async () => {
+  const sandboxed = [];
   const world = defaultTree({ roundStatus: '要修' });
   addCorrection(world);
   const first = 'c'.repeat(40);
@@ -679,8 +691,17 @@ test('SC7 冲突：pi 先取回最新 main 再合（prepareWorktree refresh + �
     heads: [first, second],
     piCalls,
     statuses: [prStatus(first, [greenRun()], { mergeStateStatus: 'DIRTY' }), prStatus(second, [greenRun()])],
+    preflightRunner: async ({ commands }) => {
+      sandboxed.push(commands);
+      return { ok: true, runs: [] };
+    },
   });
   assert.equal(result.code, 0, JSON.stringify(result.actions.map((action) => action.type)));
+  // 最新 main 由宿主取进镜像；导进工作树这一步在沙箱里跑，而且只在解决冲突那一次。
+  assert.equal(sandboxed.length, 1);
+  assert.deepEqual(sandboxed[0][0].slice(0, 3), ['git', 'fetch', '-q']);
+  assert.match(sandboxed[0][0][3], /mirror$/);
+  assert.equal(sandboxed[0][0][4], '+refs/remotes/origin/main:refs/remotes/origin/main');
   assert.equal(piCalls.length, 2);
   assert.equal(piCalls[0].refresh, false);
   assert.equal(piCalls[1].refresh, true);
@@ -767,24 +788,28 @@ test('SC4 handoffNew 生成的交接文件：add / commit 在沙箱里跑，宿�
     hostConfig: { prbot: { piCommand: ['pi'], repos: { [REPO]: { handoffNew: ['node', 'scripts/handoff.mjs', '{pr}'] } } } },
     preflightRunner: async ({ commands }) => {
       sandboxed.push(commands);
-      return { ok: true, runs: [] };
+      const status = commands[0]?.[1] === 'status';
+      return { ok: true, runs: [{ command: commands[0], code: 0, stdout: status ? '?? handoff/12.md\n' : '' }] };
     },
     statuses: [prStatus('e'.repeat(40), [greenRun()])],
   });
   assert.equal(result.code, 0, JSON.stringify(result.actions.map((action) => action.type)));
   assert.deepEqual(sandboxed[0], [['node', 'scripts/handoff.mjs', '12']]);
-  assert.deepEqual(sandboxed[1], [['git', 'add', '-A'], ['git', 'commit', '-q', '-s', '-m', 'chore: handoff files']]);
-  assert.equal(hostRuns.some((entry) => entry.args.includes('add') || entry.args.includes('commit')), false);
+  assert.deepEqual(sandboxed[1], [['git', 'status', '--porcelain']], 'status 也在沙箱里看');
+  assert.deepEqual(sandboxed[2], [['git', 'add', '-A'], ['git', 'commit', '-q', '-s', '-m', 'chore: handoff files']]);
+  assert.equal(hostRuns.some((entry) => entry.args.includes('add') || entry.args.includes('commit') || entry.args.includes('status')), false);
   assert.equal(result.actions.filter((action) => action.type === 'branch.push').length, 2);
 });
 
 test('SC5 准备工作树：从 PR 所在的上游仓取 main（fork 模式也一样），归属标记不进提交，宿主 git 关钩子', async () => {
   const worktreeDir = tmpDir();
   const fetches = [];
+  const fetchDirs = [];
   const runs = [];
   const github = {
-    async fetchBranch({ repo, branch, dir }) {
+    async fetchBranch({ repo, branch, dir, depth }) {
       fetches.push({ repo, branch });
+      fetchDirs.push({ dir, depth });
       fs.mkdirSync(path.join(dir, '.git', 'info'), { recursive: true });
     },
   };
@@ -819,4 +844,239 @@ test('SC5 准备工作树：从 PR 所在的上游仓取 main（fork 模式也�
   await defaultPrepareWorktree({ github, state, profile, run, refresh: true });
   assert.deepEqual(fetches.at(-1), { repo: 'makecindy/cindy', branch: 'main' });
   assert.equal(fetches.length, 2, '解决冲突前重取 main');
+  // 带令牌的 fetch 只进宿主镜像（工作树同级的 .mirror/），从不在 pi 写过的工作树里跑。
+  for (const { dir, depth } of fetchDirs) {
+    assert.equal(dir, path.join(path.dirname(first.worktree), '.mirror', path.basename(first.worktree)));
+    assert.equal(depth, 0);
+  }
+  assert.equal(again.mirror, fetchDirs[0].dir);
+});
+
+// ---- #68 第三轮复审：宿主绝不在 pi 写过的工作树里跑（带令牌的）git ----
+
+const FAKE_TOKEN = 'fake-token-value-not-real';
+
+/** 测试里的「沙箱」：真 git，但带 IN_SANDBOX=1；植入的钩子只在宿主上（没有这个变量）留痕。 */
+function sandboxEnv() {
+  const env = { PATH: process.env.PATH, HOME: tmpDir(), IN_SANDBOX: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+  return env;
+}
+
+async function git(args, options = {}) {
+  const result = await spawnRun('git', args, { env: sandboxEnv(), ...options });
+  assert.equal(result.code, 0, `git ${args.join(' ')}: ${result.stderr}`);
+  return String(result.stdout).trim();
+}
+
+async function hostileSetup({ forbiddenPaths } = {}) {
+  const up = path.join(tmpDir(), 'upstream');
+  await git(['init', '-q', '-b', 'main', up]);
+  fs.mkdirSync(path.join(up, 'src'));
+  fs.writeFileSync(path.join(up, 'src', 'app.mjs'), 'export const x = 1;\n');
+  await git(['-C', up, 'add', '-A']);
+  await git(['-C', up, '-c', 'user.name=u', '-c', 'user.email=u@example.invalid', 'commit', '-q', '-m', 'init']);
+  const upstreamMain = await git(['-C', up, 'rev-parse', 'HEAD']);
+
+  const marks = path.join(tmpDir(), 'marks');
+  fs.mkdirSync(marks);
+  const evil = path.join(tmpDir(), 'evil.sh');
+  fs.writeFileSync(evil, `#!/bin/sh\n[ -n "$IN_SANDBOX" ] || env > "${marks}/hit.$$"\nexit 0\n`, { mode: 0o755 });
+
+  const fetches = [];
+  const hostRuns = [];
+  let worktree = null;
+  // 真的 fetchBranch 带令牌；这里同样把假令牌放进环境，看它会不会进到钩子里。
+  const fetchBranch = async ({ repo, branch, dir, depth }) => {
+    fetches.push({ repo, branch, dir, depth });
+    const env = { ...sandboxEnv(), IN_SANDBOX: '', EXAMPLE_ACCESS_TOKEN: FAKE_TOKEN };
+    delete env.IN_SANDBOX;
+    fs.mkdirSync(dir, { recursive: true });
+    for (const args of [['init', '-q', dir], ['-C', dir, 'fetch', '-q', up, `+refs/heads/${branch}:refs/remotes/origin/${branch}`]]) {
+      const result = await spawnRun('git', args, { env });
+      assert.equal(result.code, 0, result.stderr);
+    }
+  };
+  const run = async (cmd, args, options = {}) => {
+    hostRuns.push({ cmd, args, env: options.env, cwd: options.cwd });
+    return spawnRun(cmd, args, options);
+  };
+  // pi：在「沙箱」里改文件、提交，然后植入钩子和恶意配置，并把工作树里的 origin/main 挪到自己的提交上。
+  const piRunner = async ({ worktree: dir }) => {
+    worktree = dir;
+    fs.mkdirSync(path.join(dir, 'ci'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'ci', 'deploy.yml'), 'x: 1\n');
+    fs.writeFileSync(path.join(dir, 'src', 'app.mjs'), 'export const x = 2;\n');
+    await git(['-C', dir, 'add', '-A']);
+    await git(['-C', dir, '-c', 'core.hooksPath=/dev/null', 'commit', '-q', '-s', '-m', 'fix']);
+    await git(['-C', dir, 'update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    const hooks = path.join(dir, '.git', 'hooks');
+    fs.mkdirSync(hooks, { recursive: true });
+    for (const name of ['reference-transaction', 'post-checkout', 'pre-commit', 'post-merge', 'pre-auto-gc', 'fsmonitor-watchman', 'post-rewrite']) {
+      fs.copyFileSync(evil, path.join(hooks, name));
+      fs.chmodSync(path.join(hooks, name), 0o755);
+    }
+    const mirror = path.join(path.dirname(dir), '.mirror', path.basename(dir));
+    fs.appendFileSync(
+      path.join(dir, '.git', 'config'),
+      [
+        '[core]',
+        `\tfsmonitor = ${evil}`,
+        `\thooksPath = ${hooks}`,
+        `\tsshCommand = ${evil}`,
+        `\tpager = ${evil}`,
+        `\talternateRefsCommand = ${evil}`,
+        '[credential]',
+        `\thelper = !${evil}`,
+        '[http]',
+        '\tproxy = http://127.0.0.1:9',
+        '\tsslVerify = false',
+        '[alias]',
+        `\tfetch = !${evil}`,
+        `\tbundle = !${evil}`,
+        '[protocol "ext"]',
+        '\tallow = always',
+        `[url "ext::${evil} %S"]`,
+        `\tinsteadOf = ${mirror}`,
+        `[remote "${mirror}"]`,
+        `\tuploadpack = ${evil}`,
+        '[diff]',
+        `\texternal = ${evil}`,
+        '',
+      ].join('\n'),
+    );
+    return { ok: true, stdout: '', code: 0 };
+  };
+  // 预检 / 打包 / 导 main 都是「沙箱」里跑的：真 git，但 IN_SANDBOX=1。
+  const sandboxed = [];
+  const preflightRunner = async ({ commands, worktree: dir }) => {
+    const runs = [];
+    for (const command of commands) {
+      sandboxed.push(command);
+      const result = await spawnRun(command[0], command.slice(1), { cwd: dir, env: sandboxEnv() });
+      runs.push({ command, code: result.code, stdout: String(result.stdout) });
+      if (result.code !== 0) return { ok: false, code: result.code, runs };
+    }
+    return { ok: true, code: 0, runs };
+  };
+  const pushed = [];
+  const hostConfig = { prbot: { piCommand: ['pi'], repos: forbiddenPaths ? { [REPO]: { forbiddenPaths } } : {} } };
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const fakeGithub = createFakeGithub(world);
+  const github = new Proxy(fakeGithub, { get: (target, key) => (key === 'fetchBranch' ? fetchBranch : target[key]) });
+  process.env.EXAMPLE_ACCESS_TOKEN = FAKE_TOKEN;
+  let result;
+  try {
+    result = await runOnce({
+      world,
+      hostConfig,
+      onPush: async (action) => {
+        // 写闸会把 bundle 导进一个空仓：这里同样验证它自带全部对象，再停下（4）。
+        const bare = path.join(tmpDir(), 'gate.git');
+        await git(['init', '-q', '--bare', bare]);
+        await git(['--git-dir', bare, 'fetch', '-q', action.bundlePath, `refs/heads/${action.branch}:refs/heads/${action.branch}`]);
+        pushed.push({ action, head: await git(['--git-dir', bare, 'rev-parse', `refs/heads/${action.branch}`]) });
+        return { code: 4, body: { reason: 'test-stop' } };
+      },
+      overrides: {
+        github,
+        run,
+        piRunner,
+        preflightRunner,
+        bundleFactory: undefined,
+        prepareWorktree: defaultPrepareWorktree,
+      },
+    });
+  } finally {
+    delete process.env.EXAMPLE_ACCESS_TOKEN;
+  }
+  return { result, marks, fetches, hostRuns, sandboxed, pushed, worktree: () => worktree, upstreamMain };
+}
+
+function assertHostClean({ marks, fetches, hostRuns, worktree }) {
+  assert.deepEqual(fs.readdirSync(marks), [], '植入的钩子 / 配置命令一个都没在宿主上跑');
+  const dir = worktree();
+  assert.ok(dir, 'pi 跑过');
+  for (const fetch of fetches) {
+    assert.equal(fetch.dir === dir || fetch.dir.startsWith(dir + path.sep), false, `带令牌的 fetch 不在工作树里跑：${fetch.dir}`);
+    assert.equal(fetch.depth, 0, '镜像取全量历史');
+  }
+  // pi 跑过之后宿主上的 git：没有一条指向工作树（-C / --git-dir / cwd），环境里没有令牌。
+  const after = hostRuns.filter((entry) => entry.cmd === 'git');
+  const touchesWorktree = (entry) =>
+    [entry.cwd, ...entry.args].some((arg) => typeof arg === 'string' && (arg === dir || arg.startsWith(dir + path.sep)));
+  const late = after.filter((entry) => !(entry.args.includes('init') || entry.args.includes('checkout') || entry.args.includes('config') || (entry.args.includes('fetch') && entry.args.includes('-C'))));
+  for (const entry of late) {
+    assert.equal(touchesWorktree(entry), false, `宿主 git 碰了工作树：${entry.args.join(' ')}`);
+    assert.deepEqual(entry.args.slice(0, HOST_GIT_HARDENING.length), HOST_GIT_HARDENING);
+  }
+  for (const entry of hostRuns) {
+    assert.equal(Object.keys(entry.env || {}).some((key) => /TOKEN/i.test(key)), false, '宿主 git 的环境里没有令牌');
+    assert.equal(Object.values(entry.env || {}).includes(FAKE_TOKEN), false);
+  }
+}
+
+test('SC3/SC5 pi 植入钩子 + 恶意 .git/config + 挪 origin/main：宿主上什么都不跑、令牌不外泄；打包在沙箱、基准用宿主镜像', async () => {
+  const setup = await hostileSetup();
+  // 测试里的写闸收到推送后回 4 停下（宿主记「需人工处理」，返回 1）。
+  assert.equal(setup.result.code, 1, JSON.stringify(setup.result.actions.map((action) => action.type)));
+  assertHostClean(setup);
+  // 打包、看 status 这些碰工作树 .git 的都在沙箱里。
+  assert.ok(setup.sandboxed.some((command) => command[0] === 'git' && command[1] === 'bundle' && command[2] === 'create'));
+  // pi 把工作树里的 origin/main 挪到了自己的提交上，改动检查照样看得到改动（基准是宿主镜像），照样推。
+  assert.equal(setup.pushed.length, 1, '推了一次');
+  const head = await git(['-C', setup.worktree(), 'rev-parse', 'refs/heads/' + setup.pushed[0].action.branch]);
+  assert.equal(setup.pushed[0].head, head, 'bundle 里的提交就是 pi 的提交，空仓也能导入');
+  // 推之后宿主还要用 pi 写过的工作树吗？不用：所有宿主 git 都在镜像里。
+  const mirrorRuns = setup.hostRuns.filter((entry) => entry.args.includes('--git-dir'));
+  assert.ok(mirrorRuns.some((entry) => entry.args.includes('diff')));
+  for (const entry of mirrorRuns) {
+    assert.equal(entry.env.GIT_CONFIG_GLOBAL, '/dev/null');
+    assert.equal(entry.env.GIT_CONFIG_NOSYSTEM, '1');
+  }
+  // 对照：要是宿主像以前那样在工作树里 fetch，植入的东西真的会在宿主上跑（说明上面的「没留痕」不是假象）。
+  const dir = setup.worktree();
+  const mirror = path.join(path.dirname(dir), '.mirror', path.basename(dir));
+  const env = { ...sandboxEnv() };
+  delete env.IN_SANDBOX;
+  await spawnRun('git', ['-C', dir, 'fetch', '-q', mirror, '+refs/remotes/origin/main:refs/remotes/origin/main'], { env });
+  assert.ok(fs.readdirSync(setup.marks).length > 0, '对照组：宿主在工作树里跑 git 会触发植入的钩子 / 配置');
+});
+
+test('SC12 禁改路径对着宿主镜像的 main 比：pi 挪了工作树的 origin/main 也藏不住改动，不推', async () => {
+  const setup = await hostileSetup({ forbiddenPaths: ['ci/**'] });
+  assert.equal(setup.result.code, 1);
+  assert.equal(setup.pushed.length, 0, '碰了禁改路径不推');
+  assert.equal(setup.result.actions.some((action) => action.type === 'branch.push'), false);
+  assertHostClean(setup);
+});
+
+test('SC3 bundle 头只用纯 JS 读：只认自带全部对象的 bundle，有前置提交 / 格式不对 / 没这条分支都不认', () => {
+  const sha = 'a'.repeat(40);
+  const ok = Buffer.from(`# v2 git bundle\n${sha} refs/heads/acceptance/1-2-sc3\n\nPACK`, 'latin1');
+  assert.equal(bundleHead(ok, 'acceptance/1-2-sc3'), sha);
+  assert.equal(bundleHead(Buffer.from(`# v3 git bundle\n@object-format=sha1\n${sha} refs/heads/b\n\nPACK`), 'b'), sha);
+  assert.equal(bundleHead(ok, 'other'), null);
+  assert.equal(bundleHead(Buffer.from(`# v2 git bundle\n-${'b'.repeat(40)} base\n${sha} refs/heads/b\n\nPACK`), 'b'), null);
+  assert.equal(bundleHead(Buffer.from(`not a bundle\n${sha} refs/heads/b\n\n`), 'b'), null);
+  assert.equal(bundleHead(Buffer.from(`# v2 git bundle\n${sha} refs/heads/b`), 'b'), null);
+});
+
+test('SC3 沙箱把 push.bundle 换成指向宿主文件的符号链接：宿主不跟链接、不推，bundle-failed', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const secret = path.join(tmpDir(), 'host-secret.txt');
+  fs.writeFileSync(secret, `# v2 git bundle\n${'a'.repeat(40)} refs/heads/acceptance/1-2-sc3\n\n`);
+  const result = await runOnce({
+    world,
+    preflightRunner: async ({ commands, roundDir }) => {
+      if (commands[0][1] === 'bundle') fs.symlinkSync(secret, path.join(roundDir, 'push.bundle'));
+      return { ok: true, runs: [] };
+    },
+    overrides: { bundleFactory: undefined },
+  });
+  assert.equal(result.code, 1);
+  assert.equal(result.actions.some((action) => action.type === 'branch.push'), false);
+  const state = JSON.parse(fs.readFileSync(prbotStatePath(result.paths, CORRECTION_REF), 'utf8'));
+  assert.equal(state.failureReason, 'bundle-failed');
 });

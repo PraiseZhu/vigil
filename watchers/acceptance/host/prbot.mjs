@@ -15,7 +15,7 @@ import { collectTasks, repoTier } from '../bin/tasks.mjs';
 import { redact } from '../bin/redact.mjs';
 import { appendAlert, hostPaths, isAlive, readLockPayload, releaseLock, tryAcquireLock } from './paths.mjs';
 import { appendPrbotEvent } from './prbot-events.mjs';
-import { createLocalGit, localEnv } from '../bin/localgit.mjs';
+import { localEnv } from '../bin/localgit.mjs';
 import { run as procRun } from './proc.mjs';
 import { MEMORY_GATE_BYTES, acquireSlot, readHostConfig, readMemAvailable } from './round.mjs';
 import {
@@ -481,8 +481,10 @@ function buildPrompt(state) {
 }
 
 /**
- * 宿主上对 pi 写过的工作树跑 git：pi 能改 .git/config，所以一律关掉钩子和 fsmonitor，
- * 环境用 localEnv（剥掉令牌 / askpass），绝不把宿主的完整环境交给 pi 控制过的仓。
+ * 宿主上的 git 一律带这几项：关掉钩子、fsmonitor、外部 diff 和分页器。
+ * 注意：hostGit 只用在**全新、沙箱还没碰过**的工作树上（建分支、写提交身份）；
+ * 沙箱跑过之后，宿主再也不在工作树里跑任何 git —— 打包、导入 main、看改动都在沙箱里跑，
+ * 或者在宿主自己的镜像仓（mirrorGit）里对着复制出来的 bundle 跑。
  */
 export const HOST_GIT_HARDENING = Object.freeze([
   '-c', 'core.hooksPath=/dev/null',
@@ -495,6 +497,20 @@ export function hostGit(run, worktree, args) {
   return run('git', [...HOST_GIT_HARDENING, '-C', worktree, ...args], { env: localEnv(process.env) });
 }
 
+/**
+ * 宿主自己的 main 镜像：和工作树同级的 .mirror/ 下，从不挂进沙箱的可写绑定。
+ * 带令牌的 fetch 只在这里跑（pi 改不了它的 .git/config 和钩子）。
+ */
+export function mirrorPathFor(worktree) {
+  return path.join(path.dirname(worktree), '.mirror', path.basename(worktree));
+}
+
+/** 在宿主镜像仓里跑 git：不读全局 / 系统配置，环境里没有令牌，钩子和 fsmonitor 关掉。 */
+export function mirrorGit(run, mirror, args) {
+  const env = { ...localEnv(process.env), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+  return run('git', [...HOST_GIT_HARDENING, '--git-dir', path.join(mirror, '.git'), ...args], { env });
+}
+
 export async function defaultPrepareWorktree({ github, state, profile, run, refresh = false }) {
   const { owner, name, number } = parseRef(state.issue);
   const root = path.join(profile.worktreeDir, 'prbot');
@@ -504,13 +520,23 @@ export async function defaultPrepareWorktree({ github, state, profile, run, refr
   const upstream = state.prRepo || parseRef(state.root || state.issue).repo;
   fs.mkdirSync(root, { recursive: true });
   if (typeof github.fetchBranch !== 'function') throw new Error('github 没有 fetchBranch');
+  const mirror = mirrorPathFor(worktree);
+  fs.mkdirSync(path.dirname(mirror), { recursive: true, mode: 0o700 });
   if (fs.existsSync(worktree)) {
     if (!fs.existsSync(marker)) throw new Error('工作树已存在但没有 .acc-owned.json，拒绝覆盖');
-    // 解决冲突前把最新 main 取回来（只更新 origin/main，不动分支）。
-    if (refresh) await github.fetchBranch({ repo: upstream, branch: 'main', dir: worktree });
-    return { worktree, reused: true };
+    // 解决冲突前把最新 main 取进宿主镜像（带令牌的 git 绝不在 pi 写过的工作树里跑）；
+    // 再由修正轮在沙箱里把镜像的 origin/main 导进工作树。
+    if (refresh || !fs.existsSync(mirror)) await github.fetchBranch({ repo: upstream, branch: 'main', dir: mirror, depth: 0 });
+    return { worktree, mirror, reused: true };
   }
-  await github.fetchBranch({ repo: upstream, branch: 'main', dir: worktree });
+  // 取全量历史：工作树打出来的 bundle 要能在写闸的空仓里单独导入（浅克隆打的 bundle 缺父提交）。
+  await github.fetchBranch({ repo: upstream, branch: 'main', dir: mirror, depth: 0 });
+  // 工作树是全新的、沙箱还没碰过：只有这时在宿主上对它跑 git（不带令牌，从本机镜像取）。
+  fs.mkdirSync(worktree, { recursive: true, mode: 0o700 });
+  const init = await hostGit(run, worktree, ['init', '-q']);
+  if (init?.code !== 0) throw new Error('建工作树失败');
+  const imported = await hostGit(run, worktree, ['fetch', '-q', mirror, '+refs/remotes/origin/main:refs/remotes/origin/main']);
+  if (imported?.code !== 0) throw new Error('从镜像取 main 失败');
   const checkout = await hostGit(run, worktree, ['checkout', '-q', '-B', state.branch, 'origin/main']);
   if (checkout?.code !== 0) throw new Error('建修正分支失败');
   // pi 在沙箱里 git commit -s：沙箱里的 HOME 是空的，提交身份写进这个工作树自己的配置。
@@ -526,35 +552,85 @@ export async function defaultPrepareWorktree({ github, state, profile, run, refr
   const exclude = path.join(worktree, '.git', 'info', 'exclude');
   fs.mkdirSync(path.dirname(exclude), { recursive: true });
   fs.appendFileSync(exclude, '\n/.acc-owned.json\n');
-  return { worktree, reused: false };
+  return { worktree, mirror, reused: false };
 }
 
-function prepareBundle({ state, worktree, localgit }) {
-  const git = localgit || createLocalGit();
+/**
+ * bundle 头里 refs/heads/<branch> 指向的提交。只认自带全部对象的 bundle（有前置提交的不认）。
+ * 纯 JS 读文件头，不在宿主上对 pi 产出的东西跑 git。
+ */
+export function bundleHead(buffer, branch) {
+  const text = Buffer.from(buffer).subarray(0, 64 * 1024).toString('latin1');
+  const end = text.indexOf('\n\n');
+  if (end < 0) return null;
+  const lines = text.slice(0, end).split('\n');
+  if (!/^# v[23] git bundle$/.test(lines[0])) return null;
+  let head = null;
+  for (const line of lines.slice(1)) {
+    if (line.startsWith('@')) continue;
+    if (line.startsWith('-')) return null;
+    const match = /^([0-9a-f]{40}|[0-9a-f]{64}) (\S+)$/.exec(line);
+    if (!match) return null;
+    if (match[2] === `refs/heads/${branch}`) head = match[1];
+  }
+  return head;
+}
+
+/**
+ * 打包（默认 bundleFactory）：`git bundle create` 在沙箱里跑（工作树的 .git 是 pi 写过的），
+ * 沙箱退出后把 bundle 复制进宿主自己的临时目录（不跟符号链接），之后只用这份副本。
+ */
+async function sandboxBundle({ state, worktree, roundDir, preflight, home, profile, hostConfig, env, run }) {
+  if (!/^[A-Za-z0-9._/][A-Za-z0-9._/-]*$/.test(String(state.branch)) || String(state.branch).includes('..')) {
+    throw new Error(`分支名不合法：${state.branch}`);
+  }
+  fs.mkdirSync(roundDir, { recursive: true, mode: 0o700 });
+  const inside = path.join(roundDir, 'push.bundle');
+  fs.rmSync(inside, { force: true });
+  const made = await preflight({
+    home,
+    profile,
+    hostConfig,
+    roundDir,
+    worktree,
+    commands: [['git', 'bundle', 'create', inside, `refs/heads/${state.branch}`]],
+    env,
+    run,
+  });
+  if (made?.unavailable) throw new Error('沙箱起不来：不打包');
+  if (!made?.ok) throw new Error('打包失败');
+  let data;
+  const fd = fs.openSync(inside, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error('bundle 不是普通文件');
+    data = fs.readFileSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  const headSha = bundleHead(data, state.branch);
+  if (!headSha) throw new Error(`bundle 里没有分支 ${state.branch}`);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'prbot-bundle-'));
   const bundlePath = path.join(tmp, 'push.bundle');
-  return Promise.resolve(
-    git.branchSha({ branch: state.branch, cwd: worktree }).then(async (resolved) => {
-      const headSha = String(resolved?.stdout || '').trim();
-      if (resolved?.code !== 0 || !/^[0-9a-f]{40,64}$/.test(headSha)) {
-        throw new Error(`本地没有分支 ${state.branch}`);
-      }
-      const bundled = await git.createBundle({ branch: state.branch, file: bundlePath, cwd: worktree });
-      if (bundled?.code !== 0 || !fs.existsSync(bundlePath)) throw new Error('打包失败');
-      return {
-        bundlePath,
-        headSha,
-        cleanup() {
-          fs.rmSync(tmp, { recursive: true, force: true });
-        },
-      };
-    }),
-  );
+  fs.writeFileSync(bundlePath, data, { mode: 0o600 });
+  return {
+    bundlePath,
+    headSha,
+    cleanup() {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    },
+  };
 }
 
-async function diffFiles({ worktree, state, run }) {
-  const result = await hostGit(run, worktree, ['diff', '--name-only', `origin/main...${state.branch}`, '--']);
-  // 读不出改了哪些文件就当失败（null），不能当「什么都没改」放过禁改路径检查。
+/**
+ * 这次要推的提交改了哪些文件：把复制出来的 bundle 导进宿主镜像，对着宿主自己取的 origin/main 比。
+ * 基准不读工作树里的 origin/main（pi 能挪它）。读不出就当失败（null），不能当「什么都没改」。
+ */
+async function bundleFiles({ run, mirror, bundle, state }) {
+  if (typeof mirror !== 'string' || !path.isAbsolute(mirror)) return null;
+  if (!/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(String(bundle?.headSha))) return null;
+  const imported = await mirrorGit(run, mirror, ['fetch', '-q', bundle.bundlePath, `+refs/heads/${state.branch}:refs/prbot/${state.branch}`]);
+  if (!imported || imported.code !== 0) return null;
+  const result = await mirrorGit(run, mirror, ['diff', '--name-only', `refs/remotes/origin/main...${bundle.headSha}`, '--']);
   if (!result || result.code !== 0) return null;
   return String(result.stdout || '')
     .split('\n')
@@ -715,6 +791,7 @@ export function cleanupWorktrees({ home, profile, fsImpl = fs } = {}) {
     if (!finished) continue;
     try {
       fsImpl.rmSync(dir, { recursive: true, force: true });
+      fsImpl.rmSync(mirrorPathFor(dir), { recursive: true, force: true });
       removed.push(dir);
     } catch {
       // 删不掉就留着，下一次再清理。
@@ -794,7 +871,7 @@ export async function runPrbotCorrection({
   prepareWorktree = defaultPrepareWorktree,
   piRunner,
   preflightRunner,
-  bundleFactory = prepareBundle,
+  bundleFactory = sandboxBundle,
   makeGate,
   statusProvider,
   mainChecksProvider,
@@ -822,6 +899,40 @@ export async function runPrbotCorrection({
   const context = { paths, settings, profile: acceptanceProfile, github: gateGithub, run, now, sleep, log };
   const pi = piRunner || runPiInSandbox;
   const preflight = preflightRunner || runPreflightInSandbox;
+  // 打包在沙箱里跑；返回宿主临时目录里的副本。
+  const makeBundle = (state, tag) =>
+    bundleFactory({
+      state,
+      worktree: state.worktree,
+      localgit,
+      roundDir: path.join(paths.roundRunDir, 'prbot', `${stateKey(issue)}-r${state.round}-${tag}`),
+      preflight,
+      home,
+      profile: acceptanceProfile,
+      hostConfig: settings,
+      env,
+      run,
+    });
+  // 要推的提交过一遍改动检查：没改动 / 读不出 / 碰了禁改路径都不推。返回 true 表示可以推。
+  const changesAllowed = async (state, bundle) => {
+    const files = await bundleFiles({ run, mirror: state.mirror, bundle, state });
+    if (files === null) {
+      state.failureReason = 'diff-failed';
+      return false;
+    }
+    if (!files.length) {
+      // 没有任何改动：全部有争议就交给人裁，否则就是 pi 没修出东西。
+      state.failureReason = state.mustFix.length ? 'no-change' : 'all-disputed';
+      return false;
+    }
+    const forbidden = repoConfig(settings, state.repo).forbiddenPaths || [];
+    const hits = files.filter((file) => matchesForbidden(file, forbidden));
+    if (hits.length) {
+      state.forbiddenPaths = hits;
+      return false;
+    }
+    return true;
+  };
   const gateFor = (binding) =>
     makeGate ? makeGate({ binding, ...context }) : createGate({ home, profile: acceptanceProfile, github: gateGithub, run, binding });
 
@@ -1019,6 +1130,38 @@ export async function runPrbotCorrection({
           continue;
         }
         state.worktree = work.worktree;
+        state.mirror = work.mirror;
+        if (state.mergeMain) {
+          // 解决冲突：宿主已把最新 main 取进镜像；导进工作树这一步在沙箱里跑（工作树的 .git 是 pi 写过的）。
+          const imported = await preflight({
+            home,
+            profile: acceptanceProfile,
+            hostConfig: settings,
+            roundDir: path.join(paths.roundRunDir, 'prbot', `${stateKey(issue)}-r${state.round}-main`),
+            worktree: state.worktree,
+            commands: [['git', 'fetch', '-q', String(state.mirror), '+refs/remotes/origin/main:refs/remotes/origin/main']],
+            env,
+            run,
+          });
+          if (imported?.unavailable) {
+            appendAlert(paths, {
+              kind: 'sandbox-unavailable',
+              issue,
+              round: state.round,
+              reason: '沙箱起不来：不导入最新 main',
+              now,
+              profile: acceptanceProfile,
+            });
+            state.status = '中断';
+            if (gate) await updateComment({ gate, state, status: '中断', note: '沙箱起不来，不导入最新 main', sleep, now });
+            return 1;
+          }
+          if (!imported?.ok) {
+            state.failureReason = 'main-import-failed';
+            state.stage = 'stop';
+            continue;
+          }
+        }
         const roundDir = path.join(paths.roundRunDir, 'prbot', `${stateKey(issue)}-r${state.round}`);
         state.piIterations = (state.piIterations || 0) + 1;
         const result = await pi({
@@ -1059,25 +1202,6 @@ export async function runPrbotCorrection({
         }
         state.fixed = state.mustFix.map((item) => item.sc);
         state.mergeMain = false;
-        const files = await diffFiles({ worktree: state.worktree, state, run });
-        if (files === null) {
-          state.failureReason = 'diff-failed';
-          state.stage = 'stop';
-          continue;
-        }
-        if (!files.length) {
-          // 没有任何改动：全部有争议就交给人裁，否则就是 pi 没修出东西。
-          state.failureReason = state.mustFix.length ? 'no-change' : 'all-disputed';
-          state.stage = 'stop';
-          continue;
-        }
-        const forbidden = repoConfig(settings, state.repo).forbiddenPaths || [];
-        const hits = files.filter((file) => matchesForbidden(file, forbidden));
-        if (hits.length) {
-          state.forbiddenPaths = hits;
-          state.stage = 'stop';
-          continue;
-        }
         state.steps.push('修复：pi 在工作树里写了复现测试和最小修复');
         state.stage = 'preflight';
         continue;
@@ -1139,8 +1263,21 @@ export async function runPrbotCorrection({
       }
 
       if (state.stage === 'draft') {
-        const bundle = await bundleFactory({ state, worktree: state.worktree, localgit });
+        let bundle;
         try {
+          bundle = await makeBundle(state, 'bundle');
+        } catch (error) {
+          state.bundleError = String(error?.message || error);
+          state.failureReason = 'bundle-failed';
+          state.stage = 'stop';
+          continue;
+        }
+        try {
+          // 改动检查对着真正要推的这个提交做（预检之后），基准是宿主镜像里的 main。
+          if (!(await changesAllowed(state, bundle))) {
+            state.stage = 'stop';
+            continue;
+          }
           const pushed = await gateWrite(
             gate,
             {
@@ -1238,8 +1375,23 @@ export async function runPrbotCorrection({
               state.stage = 'stop';
               continue;
             }
-            const dirty = await hostGit(run, state.worktree, ['status', '--porcelain']);
-            if (dirty?.code === 0 && String(dirty.stdout || '').trim()) {
+            // 有没有交接文件要提交：status 也在沙箱里看（宿主不对 pi 写过的工作树跑 git）。
+            const status = await preflight({
+              home,
+              profile: acceptanceProfile,
+              hostConfig: settings,
+              roundDir: path.join(paths.roundRunDir, 'prbot', `${stateKey(issue)}-r${state.round}-handoff-status`),
+              worktree: state.worktree,
+              commands: [['git', 'status', '--porcelain']],
+              env,
+              run,
+            });
+            if (!status?.ok) {
+              state.failureReason = 'handoff-commit-failed';
+              state.stage = 'stop';
+              continue;
+            }
+            if (String(status.runs?.[0]?.stdout || '').trim()) {
               // add / commit 会跑仓里的 clean filter 和钩子：放进同一个沙箱里跑，不在宿主上跑。
               const committed = await preflight({
                 home,
@@ -1259,8 +1411,20 @@ export async function runPrbotCorrection({
                 state.stage = 'stop';
                 continue;
               }
-              const next = await bundleFactory({ state, worktree: state.worktree, localgit });
+              let next;
               try {
+                next = await makeBundle(state, 'handoff-bundle');
+              } catch (error) {
+                state.bundleError = String(error?.message || error);
+                state.failureReason = 'bundle-failed';
+                state.stage = 'stop';
+                continue;
+              }
+              try {
+                if (!(await changesAllowed(state, next))) {
+                  state.stage = 'stop';
+                  continue;
+                }
                 const pushedAgain = await gateWrite(
                   gate,
                   {

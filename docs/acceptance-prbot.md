@@ -14,7 +14,7 @@
 | 2 评估 | 从最新裁决取「要修」的 SC；人工手测层不修；pi 认为某条不成立就标「有争议」并写明理由（裁决本身仍归 #46 SC8，本 issue 不另起裁决流程） | 同一修正子 issue 最多 2 个修正轮，第 3 轮写「需人工处理」 |
 | 3 修复 | 沙箱外从 **PR 所在仓**（fork 模式是上游）的 main 建工作树（带 `.acc-owned.json`，写进 `.git/info/exclude`，不会被提交；提交身份写在工作树自己的配置里），pi 只在 bwrap 里跑一个入口：先写会变红的复现测试，再最小修复，`git commit -s`；最多 4 次 pi。pi 一个文件都没改 →「需人工处理」`no-change`（全部有争议则 `all-disputed`）；读不出改动 → `diff-failed` | bwrap 不可用 → 不跑模型，这一轮「中断」+ 提醒 `sandbox-unavailable`；没有任何环境变量 / 配置能关掉沙箱 |
 | 4 本地预检 | 在**新的** bwrap 里跑目标仓自己的推送前检查（`prbot.repos[repo].preflight`，默认没有就跳过）；环境白名单只有 PATH、HOME、LANG、TZ、TERM、TMPDIR、NODE_OPTIONS（bwrap 自己会加一个 PWD），凭证全遮 | 红了返工最多 2 次，仍红 →「需人工处理」；bwrap 不可用 → 不跑预检，这一轮「中断」 |
-| 5 提交和建 Draft | host 打 git bundle，经写闸 `branch.push`，再 `pr.create`（一定 `draft: true`）；都带 `dedupeKey`；同一标记 / 分支已有 PR 就复用 | GitHub 报错按 1、2、4、8、16 分钟退避，5 次后「中断」+ `interrupted-exhausted`；写闸 75 按 #44 SC15 重试 |
+| 5 提交和建 Draft | 沙箱里打 git bundle（宿主只读复制出来的副本），先过改动 / 禁改路径检查，再经写闸 `branch.push`，再 `pr.create`（一定 `draft: true`）；都带 `dedupeKey`；同一标记 / 分支已有 PR 就复用 | GitHub 报错按 1、2、4、8、16 分钟退避，5 次后「中断」+ `interrupted-exhausted`；写闸 75 按 #44 SC15 重试 |
 | 6 盯 Draft CI | 每 2 分钟经写闸读 head 检查。还在排队 / 跑的检查只等，不算失败；全部跑完且有失败才进入重跑 / 再修。落后 main 发 `pr.update-branch`；和 main 冲突（DIRTY）交给 pi 先取回最新 main 再 `git merge origin/main` 解决，同一 head 只叫一次 pi；两者共用 3 次额度。同一个 head 上第一次看到失败先 `ci.rerun` 一次（写闸自己查 run id 是否属于这个 PR 当前 head）；单个 head 最多等 60 分钟 | 超时 / 冲突额度用完 →「需人工处理」 |
 | 7 自动再修 | 每个 PR 最多 2 次再修；只有 head 变了或出现新的失败指纹才再修；main 上同名检查也红就不改代码，附检查名 / main SHA / 链接写「需人工处理」 | 同一 head + 同一失败再看到只计一次再修额度、不再叫 pi；超过上限 → 停下写「需人工处理」，不空转。再修 / 解决冲突后的重推沿用同一个 PR，不再发 `draft-opened` |
 | 8 转 Ready | 写闸执行 `pr.ready` 前复核：仍是 Draft、head 和动作里的 SHA 一致、head 上至少 1 条检查且全部完成、全绿 | 任意一条不满足 → 4 `reason=ready-precondition`，保持 Draft 继续盯 |
@@ -112,10 +112,21 @@ Draft 已开、每次 CI 结果、再修开始、每轮进度**不发** Slack；
 
 ## 宿主上的 git
 
-pi 写过的工作树不可信。宿主上对它跑的 git（建分支、`diff`）一律带
-`-c core.hooksPath=/dev/null -c core.fsmonitor=false -c diff.external= -c core.pager=cat`，环境用
-`localgit` 收窄过的白名单（没有令牌）。`handoffNew` 生成文件之后的 `git add` / `git commit` 在预检沙箱里跑，
-不在宿主上跑。修正 PR 正文第一行是「任务 issue：<总 issue>」，最后一行照抄修正子 issue 上的修正标记
+pi 写过的工作树不可信：它的 `.git/config`、钩子、`origin/main` 都可能被改过。规则是
+**沙箱跑过之后，宿主再也不在工作树里跑任何 git**：
+
+- 带令牌的 `fetch` 只在宿主自己的镜像仓里跑（`profile.worktreeDir/prbot/.mirror/<工作树名>`，不在任何沙箱可写绑定里；
+  取全量历史，打出来的 bundle 才能在写闸的空仓里单独导入）。
+- 新工作树从镜像本地取 main、建分支、写提交身份：这时它是全新的、沙箱还没碰过，宿主 git 带
+  `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c diff.external= -c core.pager=cat`，环境没有令牌。
+- 解决冲突前：宿主把最新 main 取进镜像，再在沙箱里 `git fetch <镜像> origin/main` 导进工作树。
+- 打包（`git bundle create`）、`handoffNew` 之后的 `status` / `add` / `commit` 都在预检沙箱里跑。宿主只用纯 JS 读
+  bundle 头（不跟符号链接，只认自带全部对象的 bundle），复制进自己的临时目录。
+- 改动 / 禁改路径检查对着**真正要推的那个 bundle**做（预检之后、推之前），在镜像里导入 bundle、
+  和宿主自己取的 `origin/main` 比；镜像上的 git 不读全局 / 系统配置。读不出 → `diff-failed`，打包失败 → `bundle-failed`，
+  导入 main 失败 → `main-import-failed`。
+
+修正 PR 正文第一行是「任务 issue：<总 issue>」，最后一行照抄修正子 issue 上的修正标记
 （轮次是验收轮，不是修正轮），所以真写闸的 `pr.create` 认得。
 
 ## 写闸（#60 新增）
