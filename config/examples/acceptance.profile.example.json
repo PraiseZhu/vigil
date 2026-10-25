@@ -11,5 +11,7 @@
   "stallMinutes": 30,
   "writeCommand": ["node", "/path/to/host/write-gate.mjs"],
   "appConfigPath": "/path/to/github-app.json",
-  "slackBotTokenFile": "/path/to/slack.token"
+  "slackBotTokenFile": "/path/to/slack.token",
+  "slackChannelId": "C0123456789",
+  "slackMentionUserId": "U0123456789"
 }

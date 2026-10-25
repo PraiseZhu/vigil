@@ -41,7 +41,11 @@
 | `stallMinutes` | 否 | 卡住判定阈值，默认 30 |
 | `writeCommand` | 否 | 写操作出口 argv；没配则直接用 `gh`/`git` |
 | `appConfigPath` | 否 | GitHub App 配置 JSON；配了读请求走 App 令牌 |
-| `slackBotTokenFile` | 否 | Slack 令牌文件（绝对路径）；配了就检查权限是 600，本 issue 不读不用 |
+| `slackBotTokenFile` | 否 | Slack bot 令牌文件（绝对路径）；配了就检查权限是 600，只有 `host/slack-notify.mjs` 读它 |
+| `slackChannelId` | 否 | Slack 频道 id（`C` / `G` 开头）；没配就不发通知 |
+| `slackMentionUserId` | 否 | 立即发（ping）时 @ 的用户 id（`U` 开头）；摘要不 @ |
+
+Slack 通知怎么配、哪些事件立即发、哪些进摘要，见 [`docs/acceptance-slack.md`](../../docs/acceptance-slack.md)（#61）。
 
 令牌文件必须存在、是普通文件、属主是当前用户、权限不含组/他人位、去空白后非空。`appConfigPath` 指向 `{ "appId", "installationId", "privateKeyFile" }`，其中私钥文件同样过密钥校验。
 

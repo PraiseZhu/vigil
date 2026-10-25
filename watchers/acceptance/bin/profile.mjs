@@ -81,6 +81,17 @@ function optionalAbsolute(raw, key, file) {
   return raw[key];
 }
 
+/** 可选字符串键，只做格式校验（#61 的 Slack 频道 / @ 用户 id）；没配返回 undefined。 */
+function optionalPattern(raw, key, file, pattern, hint) {
+  if (!Object.hasOwn(raw, key) || raw[key] === undefined || raw[key] === null) {
+    return undefined;
+  }
+  if (typeof raw[key] !== 'string' || !pattern.test(raw[key])) {
+    throw invalid(key, file, hint);
+  }
+  return raw[key];
+}
+
 function requireRepoList(raw, key, file, fallback) {
   if (!Object.hasOwn(raw, key) || raw[key] === undefined || raw[key] === null) {
     return fallback;
@@ -216,8 +227,14 @@ export function loadAcceptanceProfile(env = process.env) {
   const appConfigPath = optionalAbsolute(raw, 'appConfigPath', file);
   const appPrivateKeyFile = appConfigPath ? loadAppConfig(appConfigPath, file).privateKeyFile : undefined;
 
+  // #61 复审决定：Slack 令牌文件权限不对 / 读不到不能让整台验收机停下，所以这里只校验路径是绝对路径，
+  // 不做 checkSecretFile（那会抛错，loadAcceptanceProfile 失败整拍就停）。权限 / 属主 / 符号链接 / 空文件
+  // 由 host/slack-notify.mjs 在读之前检查：不满足就不读令牌、跳过通知、原因写进心跳；doctor 照样报出来。
   const slackBotTokenFile = optionalAbsolute(raw, 'slackBotTokenFile', file);
-  if (slackBotTokenFile) checkSecretFile(slackBotTokenFile, 'slackBotTokenFile');
+
+  // #61：Slack 频道 id 和可选的 @ 用户 id，都只做格式校验，代码里不写死任何频道。
+  const slackChannelId = optionalPattern(raw, 'slackChannelId', file, /^[CG][A-Z0-9]+$/, '应以 C 或 G 开头，只含大写字母和数字');
+  const slackMentionUserId = optionalPattern(raw, 'slackMentionUserId', file, /^U[A-Z0-9]+$/, '应以 U 开头，只含大写字母和数字');
 
   return Object.freeze({
     ownerLogin,
@@ -234,6 +251,8 @@ export function loadAcceptanceProfile(env = process.env) {
     appConfigPath,
     appPrivateKeyFile,
     slackBotTokenFile,
+    slackChannelId,
+    slackMentionUserId,
     profilePath: file,
   });
 }

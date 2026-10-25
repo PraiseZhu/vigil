@@ -475,6 +475,8 @@ test('守卫 10 not-allowed：pr.create 正文必须带同一个修正标记（r
   for (const [label, body] of [
     ['无标记', `任务 issue：${REPO}#1`],
     ['root 不同', markerFor(OTHER_REPO)],
+    // #70 复审：只有 root 不同（item / sc / round 都和本轮一样）也要拒。
+    ['只有 root 不同', `[验收机] 修正 · 总 ${REPO}#99 · 项 ${REPO}#2 SC3 · 第 1 轮`],
     ['item 不同', `[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#7 SC3 · 第 1 轮`],
     ['sc 不同', `[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#2 SC4 · 第 1 轮`],
     ['round 不同', `[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#2 SC3 · 第 2 轮`],
