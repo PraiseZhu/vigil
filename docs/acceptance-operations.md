@@ -304,7 +304,7 @@ Slack 自己的 `slack-failed`（重试用完）、`slack-history-failed`（读�
    ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/bin/doctor.mjs
    ```
 
-   逐项 `✓`/`✗`，缺哪项改哪项；全 `✓` 才继续。检查项见第 8 节。
+   逐项 `✓`/`✗`，缺哪项改哪项。这时「常驻循环」必然是 `✗`（第 6 步才起），某个仓故意不配 prbot 交接时「修正轮交接配置」也是 `✗`；除这两项外全 `✓` 才继续。检查项见第 8 节。
 3. **部署 `host/`**：把 `watchers/acceptance/` 放到盒子上（`<home>` 之外），先让写闸总开关**关着只读运行 24 小时**：
    这一段时间里所有写动作都会被拒（`gate-disabled`），只读盘点、`doctor`、心跳、提醒都正常。
    看 `state/host/alerts.jsonl` 和 `state/host/heartbeat.json` 有没有异常。
@@ -354,6 +354,21 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 `alerts.jsonl` 和 GitHub 上的轮次评论，确认没有还停在「验收中」的轮次。
 
 恢复就是把第 6 节的第 6 步再做一遍；`ensure.sh` 也会在心跳过期时自己把循环拉起来。
+
+注意：
+
+- `abort` 也是经写闸写的：**总开关关着时回滚会被拒**。要回滚就先回滚、再关总开关（或临时打开总开关回滚完再关）。
+- `stop.sh` 只停常驻循环，不停已经在跑的轮次；要连轮次一起停，结束对应的 `host/round.mjs` 进程（宿主看到 pi 退出会自己把这一轮标「中断」），或者等它跑完。
+- 清场一律用 `abort` / `rollback.mjs`，**不要删 GitHub 上的轮次评论**：轮次以评论为准，删了会读不出当前轮次。
+
+### 更新部署
+
+1. 确认没有轮次在跑：`<home>/state/host/rounds/` 为空（或心跳里 `running` 为空）。有就等它跑完。
+2. `stop.sh` 停常驻循环。
+3. 在部署的检出里 `git pull --ff-only`（只快进；本地有改动就先查清楚，不要覆盖）。
+4. 看新版本的 PR 有没有新配置项（`host.json` / `profile.json`），改配置前先备份。
+5. 跑一遍 `doctor`。
+6. 起常驻循环（第 6 节第 6 步），或等每小时的保活把它拉起来。
 
 ## 8. `doctor` 检查项
 
