@@ -123,8 +123,11 @@ export function checkSecretFile(file, key) {
   }
 }
 
-/** 令牌文件键的约定：键名以 TokenFile 结尾。返回 profile 里配了的全部令牌文件路径（供宿主遮罩用）。 */
-export const TOKEN_FILE_KEY = /TokenFile$/;
+/**
+ * 密钥文件键的约定：令牌文件键名以 TokenFile 结尾；App 私钥文件记在 appPrivateKeyFile（键名以 PrivateKeyFile 结尾）。
+ * tokenFiles 返回 profile 里配了的全部密钥文件路径，供宿主沙箱统一遮罩。
+ */
+export const TOKEN_FILE_KEY = /(TokenFile|PrivateKeyFile|^privateKeyFile)$/;
 export function tokenFiles(profile) {
   return Object.entries(profile || {})
     .filter(([key, value]) => TOKEN_FILE_KEY.test(key) && typeof value === 'string' && value)
@@ -211,7 +214,7 @@ export function loadAcceptanceProfile(env = process.env) {
   }
 
   const appConfigPath = optionalAbsolute(raw, 'appConfigPath', file);
-  if (appConfigPath) loadAppConfig(appConfigPath, file);
+  const appPrivateKeyFile = appConfigPath ? loadAppConfig(appConfigPath, file).privateKeyFile : undefined;
 
   const slackBotTokenFile = optionalAbsolute(raw, 'slackBotTokenFile', file);
   if (slackBotTokenFile) checkSecretFile(slackBotTokenFile, 'slackBotTokenFile');
@@ -229,6 +232,7 @@ export function loadAcceptanceProfile(env = process.env) {
     stallMinutes,
     writeCommand: writeCommand ? Object.freeze(writeCommand) : undefined,
     appConfigPath,
+    appPrivateKeyFile,
     slackBotTokenFile,
     profilePath: file,
   });

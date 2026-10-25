@@ -232,3 +232,20 @@ test('profile 没配 slackBotTokenFile 时照常加载（#44 不用 Slack）', (
   assert.equal(profile.slackBotTokenFile, undefined);
   assert.deepEqual(tokenFiles(profile).map((entry) => entry.key), ['githubTokenFile']);
 });
+
+test('profile tokenFiles 也列出 App 私钥文件（宿主沙箱一并遮罩）', () => {
+  const home = tmpDir();
+  const raw = baseProfile(home);
+  const pem = writeSecret(path.join(home, 'secrets', 'app.pem'), 'fake-pem-not-real');
+  const appConfig = path.join(home, 'app.json');
+  writeJson(appConfig, { appId: '1', installationId: '2', privateKeyFile: pem });
+  raw.appConfigPath = appConfig;
+  writeJson(path.join(home, 'config', 'profile.json'), raw);
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  assert.equal(profile.appPrivateKeyFile, pem);
+  assert.deepEqual(
+    tokenFiles(profile).map((entry) => entry.key).sort(),
+    ['appPrivateKeyFile', 'githubTokenFile'],
+  );
+  assert.ok(!JSON.stringify(profile).includes('fake-pem-not-real'));
+});
