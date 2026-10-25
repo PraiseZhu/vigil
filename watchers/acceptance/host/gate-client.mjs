@@ -17,6 +17,8 @@ function send(socketPath, payload) {
   return new Promise((resolve, reject) => {
     const socket = net.connect(socketPath);
     let buffer = '';
+    // 同 bin/github.mjs：按 UTF-8 流式解码，跨块的多字节字符不拼成乱码。
+    socket.setEncoding('utf8');
     socket.on('connect', () => {
       socket.write(`${payload}\n`);
     });
@@ -30,6 +32,7 @@ function send(socketPath, payload) {
 
 async function readStdin() {
   let text = '';
+  process.stdin.setEncoding('utf8');
   for await (const chunk of process.stdin) text += chunk;
   return text;
 }
