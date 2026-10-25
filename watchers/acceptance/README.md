@@ -1,8 +1,22 @@
-# 验收机：盘点与触发
+# 验收机：盘点、调度、验收会话与宿主
 
-对应本仓 issue #44。合入后，宿主每分钟用一条只读命令找出「该验收的任务」，并用 GitHub 上的轮次评论认领一轮。状态以 GitHub 为准：本地 `stateDir` 丢了也能重建，不会重复开轮。
+本仓现在有三个 watcher：[`watchers/mivo`](../mivo/README.md)（同仓分支）、
+[`watchers/cindy`](../cindy/README.md)（cross-repo fork）、以及本目录的验收机——它在 GitHub 上按轮次评论
+认领任务、逐条验收、出裁决。三个 watcher 彼此独立，互不 import。
 
-本目录只提供底座：配置、GitHub 读写与写操作出口、轮次记录、看板「验收」「裁决」字段、只读盘点。不做验收、不派发、不起 agent（见 #45、#46）。
+验收机分四层，各自分文档：
+
+| 层 | 位置 | 文档 |
+|---|---|---|
+| 盘点与触发 | `bin/poll.mjs`、`bin/tasks.mjs`、`bin/rounds.mjs` | 本文件 |
+| 调度接口 | `bin/round.mjs`（start/status/abort）、`bin/message.mjs` | [`docs/acceptance-scheduler.md`](../../docs/acceptance-scheduler.md) |
+| 验收会话 | `bin/helper.mjs` 与步骤文档 | [`docs/acceptance-session.md`](../../docs/acceptance-session.md)、[`SESSION.md`](SESSION.md) |
+| 宿主接入、写闸、部署检查 | `host/`、`bin/doctor.mjs` | [`docs/acceptance-operations.md`](../../docs/acceptance-operations.md) |
+
+对应 issue：#44（盘点与触发）、#45（调度接口）、#46（验收会话）、#47（宿主接入、写闸与首跑）。
+
+宿主每分钟用一条只读命令找出「该验收的任务」，并用 GitHub 上的轮次评论认领一轮。状态以 GitHub 为准：
+本地 `stateDir` 丢了也能重建，不会重复开轮。
 
 ## 配置
 
@@ -59,3 +73,25 @@ stdout 是 JSON 数组。该开始的任务：
 - 其它非 0：抛 `WriteRejectedError`（「外发被拒」），不重试，也不改成直接写
 
 没配 `writeCommand` 时直接用 `gh` / `git`，写一律走账号令牌。
+
+## 宿主（#47）
+
+`host/` 是本仓的宿主接入，部署与运维见 [`docs/acceptance-operations.md`](../../docs/acceptance-operations.md)：
+
+| 文件 | 作用 |
+|---|---|
+| `host/loop` | 常驻调度循环：单实例（flock），每分钟跑一拍 `host/tick.mjs` |
+| `host/ensure.sh` | 每小时巡检：心跳不超过 180 秒就不做事，否则拉起循环并写一条提醒 |
+| `host/stop.sh` | 停常驻循环（按心跳里的 pid）；回滚用 `host/rollback.mjs` |
+| `host/tick.mjs` | 一拍调度：沙箱外跑 `poll.mjs` → 卡住先杀进程再 abort → 按空槽起轮次 → 写心跳 |
+| `host/round.mjs` | 一轮验收：内存门、槽/测试锁、认领、写闸 serve、bwrap 里跑 pi |
+| `host/write-gate.mjs` | 写闸：exec / serve / probe 三种用法，所有写动作在沙箱外再查一遍 |
+| `host/gate-client.mjs` | 沙箱里的 `writeCommand`：动作 JSON 经 unix socket 交给写闸 |
+| `host/sandbox.mjs` | bwrap 参数、遮罩名单（从 profile 算）、环境变量白名单 |
+| `host/sandbox-bin/gh` | 沙箱里的 `gh`：只允许 `gh api graphql --input -`，经写闸读 |
+| `host/paths.mjs`、`host/proc.mjs`、`host/probes.mjs` | 状态文件与锁、唯一的子进程出口、部署检查探针 |
+| `bin/doctor.mjs` | 部署检查：缺哪项报哪项，退出码非 0 |
+
+宿主状态都在 `<home>/state/` 下：`write-gate/enabled`（总开关）、`write-gate/ledger.jsonl`（去重账本）、
+`host/heartbeat.json`（心跳）、`host/alerts.jsonl`（提醒，一行一条）、`host/rounds/`（在跑的轮次）。
+提醒只写文件、不调 Slack（发 Slack 归 #61）。

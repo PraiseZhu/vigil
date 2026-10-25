@@ -93,12 +93,12 @@ node watchers/acceptance/bin/helper.mjs <collect|progress|verdict|close|correct|
 `push --repo <owner/repo> --branch acceptance/<总>-<出处>-sc<k> --worktree <目录> [--base origin/main]`：
 
 0. 先把 `--branch` 解析成提交（只认本地 `refs/heads/<branch>`，没有就不推）。扫的、打包的、去重键用的都是这个提交，**不是**当前检出的 HEAD —— 检出停在别的分支也不会漏扫。
-1. 先扫：有 `gitleaks` 就用（退出码 0 = 没扫到，1 = 扫到；别的退出码算扫描失败，不推） `gitleaks git --log-opts=<base>..<分支提交> --redact --report-format json`；没有就用内置规则看 `git diff <base>...<分支提交>` 的**新增行**（私钥头、GitHub 令牌、PAT、Slack 令牌、AWS key、sk- 风格密钥）。
+1. 先扫：内置规则每次都跑，不解析补丁，而是列出 `<base>` 够不到、分支提交新引入的**每个对象**（`git rev-list --objects <分支提交> ^<base>`，合并提交带进来的也在内），用 `git cat-file --batch` 按字节取内容逐个扫（私钥头、GitHub 令牌、PAT、Slack 令牌、AWS key、sk- 风格密钥；含 NUL 的「二进制」文件、提交说明也扫）。本机有 `gitleaks` 再加扫一遍（退出码 0 = 没扫到，1 = 扫到；别的退出码算扫描失败，不推） `gitleaks git --log-opts=<base>..<分支提交> --redact --report-format json`。
 2. 扫到：不推，退出码 `5`，在 `<stateDir>/session/<owner>__<repo>__<号>.json` 记一条「需人工处理」，stdout 只列文件名。
 3. 没扫到：`git bundle create <文件> refs/heads/<branch>` 打包，再用 `git bundle list-heads` 核对包里的提交就是扫过的那个（中途分支被挪就不推），交给写闸的 `branch.push`（`dedupeKey` = `push:<repo>:<branch>:<分支提交 sha>`）；bundle 放在系统临时目录，用完删掉。
 4. 写闸返回 `4` + `reason=secret-found`：同样记「需人工处理」，**不**标「中断」。
 
-本地只跑 `git` 和 `gitleaks`（`bin/localgit.mjs`），环境里剥掉所有令牌和 askpass；git 子命令是**允许名单**：只有 `diff`、`rev-parse`、`bundle create`、`bundle list-heads`，其余（fetch、push、clone、remote、config、checkout……）一律拒绝 —— 推送只经写闸。
+本地只跑 `git` 和 `gitleaks`（`bin/localgit.mjs`），环境里剥掉所有令牌和 askpass；git 子命令是**允许名单**：只有 `rev-parse`、`rev-list`、`cat-file`、`bundle create`、`bundle list-heads`，其余（fetch、push、clone、remote、config、checkout……）一律拒绝 —— 推送只经写闸。
 
 ## 5. 需人工处理
 

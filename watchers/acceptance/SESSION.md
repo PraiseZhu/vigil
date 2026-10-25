@@ -79,9 +79,9 @@ node watchers/acceptance/bin/helper.mjs done    --issue <ref> --round <n>
 - 先按修正标记找已有的修正 PR：有就接着推，不重复开。
 - 从最新 main 开分支、指向 main；分支名 `acceptance/<总 issue 号>-<出处 issue 号>-sc<k>`。
 - 正文写「任务 issue：<ref>」和「Closes <ref>」两行，再加修正标记那一行。
-- 所有仓都先开 Draft；CI 全绿后由 prbot 自己转 Ready。Mivo 也一样，**不设审查机进场门禁**。
+- 所有仓都先开 Draft（`pr.create` 必须带 `draft: true`，不带写闸就拒）；CI 全绿后由 prbot 自己转 Ready。Mivo 也一样，**不设审查机进场门禁**。
 - 转 Ready 就是交接：之后由本地盯梢和审查机判断。PR 开出后看板「验收」写「修正中」。
-- `makecindy/cindy` 从 fork 提。
+- `makecindy/cindy` 从 fork 提：`pr.create` 的 head 写 `<ownerLogin>:<分支>`；其它仓 head 只写分支名，带别的前缀写闸就拒。
 - 没有盯梢的仓转 Ready 后由我在 GitHub 里合并（Slack 消息带「打开 PR」链接）。
 - **转 Ready 后不再推送、不回评论**；**任何情况下都不合并、不 Approve**。
 

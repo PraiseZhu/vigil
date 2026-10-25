@@ -17,7 +17,7 @@ const DISPUTED_MARK = '有争议';
 const PENDING_MARK = '待裁决';
 const ITEM_PATTERN = /([\w.-]+\/[\w.-]+#\d+)\s*SC(\d+)/;
 
-const ISSUE_COMMENTS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
+export const ISSUE_COMMENTS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       comments(last: 100) {

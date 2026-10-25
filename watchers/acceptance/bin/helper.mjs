@@ -20,7 +20,7 @@ const COMMANDS = ['collect', 'progress', 'verdict', 'close', 'correct', 'push', 
 const NEEDS_ROUND = new Set(['progress', 'verdict', 'close', 'correct', 'push', 'board', 'done']);
 const ISSUE_PATTERN = /^([^/\s]+)\/([^#\s]+)#(\d+)$/;
 const ACCEPTANCE_VALUES = new Set(['验收中', '要修', '修正中', '通过']);
-const COMMENTS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
+export const COMMENTS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       body

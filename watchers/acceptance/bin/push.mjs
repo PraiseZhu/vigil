@@ -6,7 +6,7 @@ import path from 'node:path';
 import { WriteRejectedError } from './github.mjs';
 import { createRounds, parseRef } from './rounds.mjs';
 import { repoTier } from './tasks.mjs';
-import { SECRET_PATTERNS } from './redact.mjs';
+import { OBJECT_ID, scanIntroducedObjects } from './secretscan.mjs';
 import { createLocalGit } from './localgit.mjs';
 
 export const BRANCH_PATTERN = /^acceptance\/\d+-\d+-sc\d+$/;
@@ -55,30 +55,6 @@ export function readNeedsHuman(profile, ref, round) {
   return Array.isArray(data.needsHuman) ? data.needsHuman : [];
 }
 
-/** 扫补丁里的新增行：命中就只回文件名，绝不回内容。 */
-function scanDiff(diff) {
-  const files = new Set();
-  let current = null;
-  for (const line of String(diff ?? '').split('\n')) {
-    if (line.startsWith('+++ ')) {
-      const target = line.slice(4).trim();
-      current = target === '/dev/null' ? null : target.replace(/^b\//, '');
-      continue;
-    }
-    if (line.startsWith('--- ') || !current) continue;
-    if (!line.startsWith('+')) continue;
-    const added = line.slice(1);
-    for (const { re } of SECRET_PATTERNS) {
-      re.lastIndex = 0;
-      if (re.test(added)) {
-        files.add(current);
-        break;
-      }
-    }
-  }
-  return [...files];
-}
-
 function readGitleaksReport(file) {
   const raw = readJson(file);
   const findings = Array.isArray(raw) ? raw : [];
@@ -91,34 +67,41 @@ function readGitleaksReport(file) {
 }
 
 /**
- * 推送前扫描：有 gitleaks 就用 gitleaks，没有就用内置规则（只看新增行）。
- * 返回 {found, files, tool}，不含任何密钥内容。
+ * 推送前扫描：内置扫描每次都跑（看 base 够不到、分支提交新引入的每个对象的内容，不解析补丁），
+ * 本机有 gitleaks 再加扫一遍。返回 {found, files, tool}，不含任何密钥内容。
  */
 export async function scanForSecrets({ git, worktree, base, commit }) {
-  if (typeof commit !== 'string' || !/^[0-9a-f]{40,64}$/.test(commit)) {
+  if (typeof commit !== 'string' || !OBJECT_ID.test(commit)) {
     throw new Error('扫密钥需要要推的分支的提交 sha');
   }
+  // base 先解析成提交号（带 ^{commit} 后缀，以 - 开头也成不了选项），后面只用提交号。
+  const resolved = await git.git(['rev-parse', '--verify', '--quiet', `${base}^{commit}`], { cwd: worktree });
+  const baseSha = String(resolved?.stdout || '').trim();
+  if (resolved?.code !== 0 || !OBJECT_ID.test(baseSha)) {
+    throw new Error(`扫密钥前解析 --base 失败：${base}`);
+  }
+  const files = await scanIntroducedObjects({
+    git: (args, options) => git.git(args, { ...options, cwd: worktree }),
+    tip: commit,
+    exclude: [baseSha],
+  });
+  if (files.length) return { found: true, files, tool: 'builtin' };
   if (await git.has('gitleaks')) {
     const reportPath = path.join(os.tmpdir(), `acceptance-gitleaks-${process.pid}-${Date.now()}.json`);
     try {
-      const result = await git.gitleaks({ range: `${base}..${commit}`, reportPath, cwd: worktree });
-      const files = readGitleaksReport(reportPath);
+      const result = await git.gitleaks({ range: `${baseSha}..${commit}`, reportPath, cwd: worktree });
+      const reported = readGitleaksReport(reportPath);
       // gitleaks：0 = 没扫到，1 = 扫到；别的退出码是扫描本身失败，不能当成「干净」放行。
-      if (result?.code === 0 && files.length === 0) return { found: false, files, tool: 'gitleaks' };
-      if (result?.code === 1 || files.length > 0) {
-        return { found: true, files: files.length ? files : ['（gitleaks 没给出文件名）'], tool: 'gitleaks' };
+      if (result?.code === 0 && reported.length === 0) return { found: false, files: reported, tool: 'gitleaks' };
+      if (result?.code === 1 || reported.length > 0) {
+        return { found: true, files: reported.length ? reported : ['（gitleaks 没给出文件名）'], tool: 'gitleaks' };
       }
       throw new Error(`gitleaks 扫描失败（退出码 ${result?.code}），没推`);
     } finally {
       fs.rmSync(reportPath, { force: true });
     }
   }
-  const diff = await git.diff({ base, commit, cwd: worktree });
-  if (diff.code !== 0) {
-    throw new Error(`扫密钥前 diff 失败：${String(diff.stderr || diff.stdout || '').trim() || diff.code}`);
-  }
-  const files = scanDiff(diff.stdout);
-  return { found: files.length > 0, files, tool: 'builtin' };
+  return { found: false, files, tool: 'builtin' };
 }
 
 function requireFlag(flags, name, label) {
