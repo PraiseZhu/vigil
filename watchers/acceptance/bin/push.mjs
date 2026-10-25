@@ -94,11 +94,14 @@ function readGitleaksReport(file) {
  * 推送前扫描：有 gitleaks 就用 gitleaks，没有就用内置规则（只看新增行）。
  * 返回 {found, files, tool}，不含任何密钥内容。
  */
-export async function scanForSecrets({ git, worktree, base }) {
+export async function scanForSecrets({ git, worktree, base, commit }) {
+  if (typeof commit !== 'string' || !/^[0-9a-f]{40,64}$/.test(commit)) {
+    throw new Error('扫密钥需要要推的分支的提交 sha');
+  }
   if (await git.has('gitleaks')) {
     const reportPath = path.join(os.tmpdir(), `acceptance-gitleaks-${process.pid}-${Date.now()}.json`);
     try {
-      const result = await git.gitleaks({ range: `${base}..HEAD`, reportPath, cwd: worktree });
+      const result = await git.gitleaks({ range: `${base}..${commit}`, reportPath, cwd: worktree });
       const files = readGitleaksReport(reportPath);
       // gitleaks：0 = 没扫到，1 = 扫到；别的退出码是扫描本身失败，不能当成「干净」放行。
       if (result?.code === 0 && files.length === 0) return { found: false, files, tool: 'gitleaks' };
@@ -110,7 +113,7 @@ export async function scanForSecrets({ git, worktree, base }) {
       fs.rmSync(reportPath, { force: true });
     }
   }
-  const diff = await git.diff({ base, cwd: worktree });
+  const diff = await git.diff({ base, commit, cwd: worktree });
   if (diff.code !== 0) {
     throw new Error(`扫密钥前 diff 失败：${String(diff.stderr || diff.stdout || '').trim() || diff.code}`);
   }
@@ -140,15 +143,20 @@ export async function runPush({ github, profile, ref, n, flags, now = () => Date
   const base = flags.get('base') || 'origin/main';
   if (typeof base !== 'string' || !BASE_PATTERN.test(base)) throw new Error(`--base 不合法：${base}`);
 
-  const scan = await scanForSecrets({ git, worktree, base });
+  // 扫的、打包的、去重键用的，都是同一个提交：--branch 解析出的 sha，不是当前检出的 HEAD。
+  const resolved = await git.branchSha({ branch, cwd: worktree });
+  const branchSha = String(resolved?.stdout || '').trim();
+  if (resolved?.code !== 0 || !/^[0-9a-f]{40,64}$/.test(branchSha)) {
+    throw new Error(`本地没有分支 ${branch}，没推`);
+  }
+
+  const scan = await scanForSecrets({ git, worktree, base, commit: branchSha });
   if (scan.found) {
     writeNeedsHuman(profile, ref, n, { reason: 'secret-found', files: scan.files });
     stdout.write(`扫到疑似密钥，没推：${scan.files.join(', ')}\n`);
     return 5;
   }
 
-  const head = await git.headSha({ cwd: worktree });
-  const headSha = String(head.stdout || '').trim();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'acceptance-bundle-'));
   const bundlePath = path.join(tmp, 'push.bundle');
   try {
@@ -156,13 +164,22 @@ export async function runPush({ github, profile, ref, n, flags, now = () => Date
     if (bundled.code !== 0 || !fs.existsSync(bundlePath)) {
       throw new Error(`打包失败：${String(bundled.stderr || '').trim() || bundled.code}`);
     }
+    // 扫描和打包之间分支可能被挪：打包的提交必须就是扫过的那个，否则不推。
+    const heads = await git.bundleHeads({ file: bundlePath, cwd: worktree });
+    const packed = String(heads?.stdout || '')
+      .split('\n')
+      .map((line) => line.trim().split(/\s+/))
+      .find(([, refName]) => refName === `refs/heads/${branch}`)?.[0];
+    if (heads?.code !== 0 || packed !== branchSha) {
+      throw new Error(`打包的提交和扫过的提交不一致（分支 ${branch} 被改动），没推`);
+    }
     try {
       await github.write({
         type: 'branch.push',
         repo,
         branch,
         bundlePath,
-        dedupeKey: `push:${repo}:${branch}:${headSha || 'unknown'}`,
+        dedupeKey: `push:${repo}:${branch}:${branchSha}`,
       });
     } catch (error) {
       if (error instanceof WriteRejectedError && error.reason === 'secret-found') {
@@ -175,6 +192,6 @@ export async function runPush({ github, profile, ref, n, flags, now = () => Date
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
-  stdout.write(`${JSON.stringify({ repo, branch, bundle: '已交给写闸', head: headSha })}\n`);
+  stdout.write(`${JSON.stringify({ repo, branch, bundle: '已交给写闸', head: branchSha })}\n`);
   return 0;
 }

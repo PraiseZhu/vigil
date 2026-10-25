@@ -174,8 +174,9 @@ test('SC12 静态：新文件不含真实用户名、绝对家目录路径；只
   for (const name of fs.readdirSync(BIN).filter((entry) => entry.endsWith('.mjs'))) {
     if (name === 'github.mjs' || name === 'localgit.mjs') continue;
     const text = read(path.join(BIN, name));
-    assert.equal(text.includes(childProcess), false, `${name} import child_process`);
-    assert.doesNotMatch(text, /spawn\(|execFile|import\(/, `${name} 起子进程或动态 import`);
+    // 不带 node: 前缀的 import、require 也算：任何位置出现 child_process 都拒绝。
+    assert.doesNotMatch(text, /child_process/, `${name} 引用 child_process`);
+    assert.doesNotMatch(text, /spawn\(|execFile|import\(|require\(/, `${name} 起子进程、动态 import 或 require`);
   }
   // localgit.mjs 是静态 import，不用动态 import 或拼字符串绕开检查。
   const localgit = read(path.join(BIN, 'localgit.mjs'));

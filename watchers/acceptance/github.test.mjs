@@ -315,7 +315,7 @@ test('SC15 除 github.mjs 和 localgit.mjs（#46，只跑本地 git/gitleaks）�
     if (!name.endsWith('.mjs')) continue;
     if (name === 'github.mjs' || name === 'localgit.mjs') continue;
     const src = fs.readFileSync(path.join(bin, name), 'utf8');
-    assert.doesNotMatch(src, /node:child_process/);
+    assert.doesNotMatch(src, /child_process|require\(/, `${name} 引用 child_process 或 require`);
     assert.doesNotMatch(src, /spawn\(/);
     assert.doesNotMatch(src, /execFile/);
   }

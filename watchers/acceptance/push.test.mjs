@@ -48,11 +48,10 @@ async function run(world, profile, argv, { git: gitApi, onWrite } = {}) {
   return { code, out: out.text, err: err.text };
 }
 
-/** 本地 git 只经 localgit 起进程：测试里也不另开一个出口。 */
+/** 测试搭仓用 localgit 的原始执行器（同一个进程出口），环境同样剥掉令牌；localgit.git() 只放扫描和打包用的子命令。 */
 async function localGit(dir) {
-  const api = createLocalGit();
   return async function run(args) {
-    const result = await api.git(args, { cwd: dir });
+    const result = await spawnRun('git', args, { cwd: dir, env: localEnv() });
     if (result.code !== 0) throw new Error(`git ${args.join(' ')} 失败：${result.stderr}`);
     return result.stdout;
   };
@@ -124,7 +123,7 @@ test('SC7 scanForSecrets 只看新增行：删掉密钥不算，报告里只有�
   assert.ok(profile);
   const repo = await makeRepo({ file: 'src/app.mjs', content: "export const ok = 1;\n" });
   const gitApi = localGitWithoutGitleaks();
-  const scan = await scanForSecrets({ git: gitApi, worktree: repo.dir, base: 'main' });
+  const scan = await scanForSecrets({ git: gitApi, worktree: repo.dir, base: 'main', commit: repo.head });
   assert.equal(scan.found, false);
   assert.deepEqual(scan.files, []);
   assert.equal(scan.tool, 'builtin');
@@ -275,13 +274,80 @@ test('SC7 localgit 只跑本地 git/gitleaks：拒绝网络子命令和别的程
     },
     env: localEnv({ PATH: '/usr/bin', GH_TOKEN: 'x', GITHUB_TOKEN: 'y', MY_SECRET: 'z', GIT_ASKPASS: 'a', HOME: 'h' }),
   });
-  for (const sub of ['push', 'fetch', 'clone', 'pull', 'ls-remote']) {
-    await assert.rejects(() => git.git([sub, 'origin']), /不做网络操作/);
+  // 允许名单：不在名单里的子命令（网络命令、改仓库状态的命令）一律拒绝，连进程都不起。
+  for (const sub of ['push', 'fetch', 'clone', 'pull', 'ls-remote', 'remote', 'config', 'checkout', 'status', 'gc']) {
+    await assert.rejects(() => git.git([sub, 'origin']), /只允许本地子命令/);
   }
+  await assert.rejects(() => git.git(['bundle', 'unbundle', 'x']), /只允许 bundle create/);
   await assert.rejects(() => git.git(['-c', 'x=y', 'push']), /子命令/);
-  await git.git(['status']);
+  await git.git(['rev-parse', 'HEAD']);
   assert.equal(calls.length, 1);
   const env = calls[0].env;
   for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'MY_SECRET', 'GIT_ASKPASS']) assert.equal(key in env, false, key);
   assert.equal(env.PATH, '/usr/bin');
+});
+
+test('SC7 回归：--branch 指向带令牌的提交、检出停在干净分支 → 扫的是要推的分支，退出码 5，不打包不推', async () => {
+  const profile = loadProfile();
+  const world = defaultTree();
+  // 令牌按段拼，源码里不出现完整的令牌格式。
+  const fakeToken = ['gh', 'p_', 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8'].join('');
+  const repo = await makeRepo({ file: 'config/creds.txt', content: `token=${fakeToken}\n`, branch: 'acceptance/1-2-sc3' });
+  const git = await localGit(repo.dir);
+  // 检出切到 main 上开的另一条干净分支：HEAD 相对 main 没有任何新增行。
+  await git(['checkout', '-q', 'main']);
+  await git(['checkout', '-q', '-b', 'acceptance/1-2-sc4']);
+
+  const result = await run(world, profile, pushArgs(repo.dir, 'acceptance/1-2-sc3'), { git: localGitWithoutGitleaks() });
+  assert.equal(result.code, 5, result.err);
+  assert.match(result.out, /扫到疑似密钥，没推：config\/creds\.txt/);
+  assert.equal(result.out.includes(fakeToken), false, '不回显令牌');
+  assert.equal(world.writes.filter((action) => action.type === 'branch.push').length, 0);
+});
+
+test('SC7 回归：去重键用 --branch 的提交，不用检出的 HEAD', async () => {
+  const profile = loadProfile();
+  const world = defaultTree();
+  const repo = await makeRepo({ file: 'src/app.mjs', content: 'export const ok = 1;\n', branch: 'acceptance/1-2-sc3' });
+  const git = await localGit(repo.dir);
+  await git(['checkout', '-q', 'main']);
+  const mainHead = (await git(['rev-parse', 'HEAD'])).trim();
+  assert.notEqual(mainHead, repo.head);
+
+  const result = await run(world, profile, pushArgs(repo.dir, 'acceptance/1-2-sc3'), { git: localGitWithoutGitleaks() });
+  assert.equal(result.code, 0, result.err);
+  const push = world.writes.find((action) => action.type === 'branch.push');
+  assert.equal(push.dedupeKey, `push:${REPO}:acceptance/1-2-sc3:${repo.head}`);
+});
+
+test('SC7 有 gitleaks 时扫描范围也是 base..<分支提交>，不是 HEAD', async () => {
+  const profile = loadProfile();
+  const world = defaultTree();
+  const repo = await makeRepo({ file: 'src/app.mjs', content: 'export const ok = 1;\n', branch: 'acceptance/1-2-sc3' });
+  const git = await localGit(repo.dir);
+  await git(['checkout', '-q', 'main']);
+  let logOpts = null;
+  const gitApi = createLocalGit({
+    run: async (cmd, args, opts) => {
+      if (cmd === 'gitleaks' && args[0] === 'version') return { code: 0, stdout: 'v8', stderr: '' };
+      if (cmd === 'gitleaks') {
+        logOpts = args.find((arg) => arg.startsWith('--log-opts='));
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      return spawnRun(cmd, args, opts);
+    },
+  });
+  const result = await run(world, profile, pushArgs(repo.dir, 'acceptance/1-2-sc3'), { git: gitApi });
+  assert.equal(result.code, 0, result.err);
+  assert.equal(logOpts, `--log-opts=main..${repo.head}`);
+});
+
+test('SC7 本地没有 --branch 这条分支 → 不扫不推，退出码 1', async () => {
+  const profile = loadProfile();
+  const world = defaultTree();
+  const repo = await makeRepo();
+  const result = await run(world, profile, pushArgs(repo.dir, 'acceptance/1-9-sc9'), { git: localGitWithoutGitleaks() });
+  assert.equal(result.code, 1);
+  assert.match(result.err, /本地没有分支/);
+  assert.equal(world.writes.length, 0);
 });

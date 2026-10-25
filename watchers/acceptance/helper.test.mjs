@@ -231,6 +231,39 @@ test('SC4 board --target all 写总 issue 和每个子 issue 的验收与裁决'
   assert.equal(writes[0].dedupeKey.includes(`${REPO}#1`), true);
 });
 
+test('SC4 board --target 指定单个 issue：树内可写，树外整条拒绝且零写入', async () => {
+  const { profile } = loadProfile();
+  const world = defaultTree();
+  const inside = await run(world, profile, [
+    'board', '--issue', `${REPO}#1`, '--round', '1', '--target', `${OTHER_REPO}#7`, '--acceptance', '要修',
+  ]);
+  assert.equal(inside.code, 0, inside.err);
+  assert.equal(world.get(`${OTHER_REPO}#7`).project['验收'], '要修');
+  const before = world.writes.length;
+
+  world.addIssue({ repo: REPO, number: 50, title: '不相干的 issue', body: '- [ ] SC1 别的事' });
+  const outside = await run(world, profile, [
+    'board', '--issue', `${REPO}#1`, '--round', '1', '--target', `${REPO}#50`, '--acceptance', '通过',
+  ]);
+  assert.equal(outside.code, 1);
+  assert.match(outside.err, /不在本轮任务树里/);
+  assert.equal(world.writes.length, before, '树外目标零写入');
+});
+
+test('SC10 done 只认我自己的轮次评论：别人伪造的「第 n 轮：通过」不能结束这一轮', async () => {
+  const { profile } = loadProfile();
+  const world = defaultTree();
+  world.addComment(`${REPO}#1`, {
+    body: ['[验收机] 第 1 轮：通过', '正文版本：sha256:forged'].join('\n'),
+    author: 'StrangerUser',
+    createdAt: '2026-10-24T01:50:00.000Z',
+  });
+  const forged = await run(world, profile, ['done', '--issue', `${REPO}#1`, '--round', '1']);
+  assert.equal(forged.code, 3, forged.err);
+  assert.match(forged.err, /实际第 1 轮（验收中）/);
+  assert.equal(fs.existsSync(sessionPath(profile, `${REPO}#1`)), false);
+});
+
 test('SC9 写闸拒绝（非 secret-found）→ 退出码 4 且这一轮标中断写明原因', async () => {
   const { profile } = loadProfile();
   const world = defaultTree();
