@@ -113,11 +113,11 @@
    （`body-version-mismatch`，版本函数和 tasks/rounds 是同一个 `bodyVersion`）。
    轮次评论只认 `ownerLogin` 发的，别人伪造的不算。serve 模式里：`comment.create` 的首行不能像轮次评论
    （`[验收机] 第…`，返回 4 `round-comment-forbidden`）；`issue.edit` 只能把验收项在 `- [ ]` 和 `- [x]` 之间切换，
-   其它字一个都不能改（4 `edit-not-allowed`）；`pr.ready` 只认本轮的修正 PR：head 分支是
+   其它字一个都不能改（4 `edit-not-allowed`）；`pr.ready` 只认本轮的修正 PR：不能是从 fork 来的（`isCrossRepository` 不是 false 就拒），head 分支是
    `acceptance/<总 issue 号>-…`、正文带本轮总 issue 的修正标记（否则 4 `not-in-tree`），再看检查是否全绿。
    exec 模式认领新一轮时，上一轮还在「验收中」就拒绝（4 `round-in-progress`）。
    `dedupeKey` 查重放在仓范围和分档之后：名单外的仓拿账本里已有的 key 也照样被拒。
-8. `branch.push` 在写闸里再扫一遍密钥（`gitleaks`，没有就用内置规则看新增行）：扫到返回 4
+8. `branch.push` 在写闸里再扫一遍密钥（内置规则每次都跑：列出新引入的每个对象、按字节扫内容，合并提交、含 NUL 的文件都算；本机有 `gitleaks` 再加扫）：扫到返回 4
    （`reason=secret-found`，只给文件名），**不推送**，并写一条提醒。写闸先把 bundle 复制进自己的
    临时目录，只扫这份副本里 `--branch` 指向的那个提交，推送的也是这份副本：扫完之后沙箱里的原文件被换掉
    也推不出去。扫描基准由写闸自己定，**不看动作里交来的 `base`**：写闸用固定查询读目标仓默认分支的头提交，

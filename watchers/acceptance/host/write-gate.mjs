@@ -20,7 +20,8 @@ import { COMMENTS_QUERY } from '../bin/helper.mjs';
 import { ISSUE_COMMENTS_QUERY as ROUND_COMMENTS_QUERY } from '../bin/round.mjs';
 import { ISSUE_COMMENTS_QUERY as ROUNDS_COMMENTS_QUERY } from '../bin/rounds.mjs';
 import { repoTier } from '../bin/tasks.mjs';
-import { SECRET_PATTERNS, redact } from '../bin/redact.mjs';
+import { redact } from '../bin/redact.mjs';
+import { scanIntroducedObjects } from '../bin/secretscan.mjs';
 import { acquireLock, appendAlert, hostPaths, releaseLock } from './paths.mjs';
 import { run as procRun } from './proc.mjs';
 
@@ -54,6 +55,7 @@ export const STATUS_QUERY = `query ($owner: String!, $name: String!, $number: In
     pullRequest(number: $number) {
       number
       headRefName
+      isCrossRepository
       body
       commits(last: 1) {
         nodes {
@@ -115,29 +117,6 @@ function onlyCheckboxToggles(before, after) {
 
 function refOf(repo, issue) {
   return `${repo}#${Number(issue)}`;
-}
-
-/** 扫补丁新增行：命中就只回文件名，绝不回内容（和 bin/push.mjs 同一套规则）。 */
-function scanAddedLines(diff) {
-  const files = new Set();
-  let current = null;
-  for (const line of String(diff ?? '').split('\n')) {
-    if (line.startsWith('+++ ')) {
-      const target = line.slice(4).trim();
-      current = target === '/dev/null' ? null : target.replace(/^b\//, '');
-      continue;
-    }
-    if (line.startsWith('--- ') || !current || !line.startsWith('+')) continue;
-    const added = line.slice(1);
-    for (const { re } of SECRET_PATTERNS) {
-      re.lastIndex = 0;
-      if (re.test(added)) {
-        files.add(current);
-        break;
-      }
-    }
-  }
-  return [...files];
 }
 
 function readGitleaksFiles(reportFile) {
@@ -302,6 +281,8 @@ export function createGate({
     });
     const pr = data?.repository?.pullRequest;
     if (!pr) return reject('not-in-tree', `找不到 PR ${action.repo}#${action.pr}`);
+    // 从 fork 来的 PR 一律不认：分支名、正文谁都能照抄，只有本仓里的分支才是验收机推的。
+    if (pr.isCrossRepository !== false) return reject('not-in-tree', 'PR 来自 fork（跨仓），不是验收机推的分支');
     // 只认本轮任务树里的修正 PR：head 分支是 acceptance/<总 issue 号>-…，正文带本轮总 issue 的修正标记。
     const head = String(pr.headRefName || '');
     const match = BRANCH_PATTERN.exec(head.includes(':') ? head.slice(head.indexOf(':') + 1) : head);
@@ -532,6 +513,22 @@ export function createGate({
       // 读不到或不在 bundle 里，就扫这条分支的全部历史（更严，宁可多拦）。沙箱交来的 base 一律不看。
       const base = await defaultHeadInBundle(action.repo, bare, git);
       const range = base ? `${base}..${commit}` : commit;
+      // 内置扫描每次都跑（有没有 gitleaks 都跑）：看的是范围新引入的每个对象的内容，不解析补丁，
+      // 合并提交带进来的文件、含 NUL 的「二进制」文件、像补丁头的行都逃不掉。
+      let found;
+      try {
+        found = await scanIntroducedObjects({
+          git: (args, options) => run('git', args, { env, timeoutMs: 300000, ...options }),
+          gitDir: ['--git-dir', bare],
+          tip: commit,
+          exclude: base ? [base] : [],
+        });
+      } catch (error) {
+        return { problem: fail('scan-failed', firstLine(error?.message)) };
+      }
+      if (found.length) {
+        return { problem: { code: 4, body: { reason: 'secret-found', files: found }, alert: 'secret-found' } };
+      }
       if (await whichCmd('gitleaks')) {
         const reportFile = path.join(tmp, 'gitleaks-report.json');
         const scan = await run(
@@ -551,15 +548,6 @@ export function createGate({
               alert: 'secret-found',
             },
           };
-        }
-      } else {
-        result = await git(['--git-dir', bare, 'log', '-p', '--format=', range]);
-        if (!result || result.code !== 0) {
-          return { problem: fail('scan-failed', `读补丁失败：${firstLine(result?.stderr)}`) };
-        }
-        const files = scanAddedLines(result.stdout);
-        if (files.length) {
-          return { problem: { code: 4, body: { reason: 'secret-found', files }, alert: 'secret-found' } };
         }
       }
       keep = true;

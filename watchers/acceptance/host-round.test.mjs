@@ -56,8 +56,10 @@ function roundFixture({ status } = {}) {
   return { home: base.home, calls, claim, message, runRoundFake, startGateFake };
 }
 
-function hangingPi(calls) {
-  return (options) => {
+/** 一直不退的 pi。ignoreTerm：连 SIGTERM 都不理，只有 SIGKILL 才退。记下收到的信号和是否已退出。 */
+function hangingPi(calls, { ignoreTerm = false } = {}) {
+  const state = { killed: [], exited: false };
+  const spawnPi = (options) => {
     calls.pi.push(options);
     let resolveExit;
     const exit = new Promise((resolve) => {
@@ -67,28 +69,40 @@ function hangingPi(calls) {
       pid: 555001,
       stdin: { write() {}, end() {} },
       kill(signal) {
-        if (signal === 'SIGTERM') resolveExit({ code: 143, signal: 'SIGTERM' });
+        state.killed.push(signal);
+        if (signal === 'SIGKILL' || (signal === 'SIGTERM' && !ignoreTerm)) {
+          state.exited = true;
+          resolveExit({ code: 143, signal });
+        }
       },
       exit,
     };
   };
+  return { spawnPi, state };
 }
 
 test('SC11 认领之后 pi 在 bwrap 里跑；卡住先杀进程再 abort，并写提醒', async () => {
   const fixture = roundFixture({ status: { stalled: true } });
+  const pi = hangingPi(fixture.calls);
+  let abortSawPiRunning = null;
   const code = await runHostRound({
     home: fixture.home,
     issue: ROOT_REF,
     run: async (cmd) => (cmd === 'bwrap' ? { code: 0, stdout: '', stderr: '' } : { code: 1, stdout: '', stderr: 'no' }),
-    runRound: fixture.runRoundFake,
     startGate: fixture.startGateFake,
-    spawnPi: hangingPi(fixture.calls),
+    runRound: async (argv) => {
+      if (argv[0] === 'abort') abortSawPiRunning = !pi.state.exited;
+      return fixture.runRoundFake(argv);
+    },
+    spawnPi: pi.spawnPi,
     meminfoPath: writeMeminfo(),
     statusIntervalMs: 5,
     killGraceMs: 20,
     log: () => {},
   });
   assert.notEqual(code, 0);
+  assert.deepEqual(pi.state.killed, ['SIGTERM'], '卡住先 SIGTERM');
+  assert.equal(abortSawPiRunning, false, 'abort 之前 pi 已经结束');
   assert.equal(fixture.calls.pi.length, 1);
   assert.equal(fixture.calls.pi[0].cmd, 'bwrap');
   const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
@@ -97,6 +111,31 @@ test('SC11 认领之后 pi 在 bwrap 里跑；卡住先杀进程再 abort，并�
   assert.ok(readAlerts(hostPaths(fixture.home)).some((entry) => entry.kind === 'round-stalled'));
   assert.equal(fixture.calls.gate, 1, '写闸 serve 收掉');
   assert.equal(fs.existsSync(hostPaths(fixture.home).roundsDir) && fs.readdirSync(hostPaths(fixture.home).roundsDir).length, 0);
+});
+
+test('SC11 卡住时 pi 不理 SIGTERM：等 killGraceMs 后升级 SIGKILL，退了才 abort', { timeout: 5000 }, async () => {
+  const fixture = roundFixture({ status: { stalled: true } });
+  const pi = hangingPi(fixture.calls, { ignoreTerm: true });
+  let abortSawPiRunning = null;
+  const code = await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: async (cmd) => (cmd === 'bwrap' ? { code: 0, stdout: '', stderr: '' } : { code: 1, stdout: '', stderr: 'no' }),
+    runRound: async (argv) => {
+      if (argv[0] === 'abort') abortSawPiRunning = !pi.state.exited;
+      return fixture.runRoundFake(argv);
+    },
+    startGate: fixture.startGateFake,
+    spawnPi: pi.spawnPi,
+    meminfoPath: writeMeminfo(),
+    statusIntervalMs: 5,
+    killGraceMs: 20,
+    log: () => {},
+  });
+  assert.notEqual(code, 0);
+  assert.deepEqual(pi.state.killed, ['SIGTERM', 'SIGKILL'], 'SIGTERM 不管用就 SIGKILL');
+  assert.equal(abortSawPiRunning, false, 'abort 之前 pi 已经结束');
+  assert.equal(fixture.calls.gate, 1, '写闸 serve 收掉');
 });
 
 test('SC11 pi 跑着时宿主出错（查进度抛异常）：先结束 pi，再 abort、收写闸', async () => {
@@ -166,7 +205,7 @@ test('SC11 认领被写闸拒绝（4）：不跑模型，写一条提醒', async
       return { code: 4, stdout: '', stderr: '写闸拒绝：gate-disabled' };
     },
     startGate: fixture.startGateFake,
-    spawnPi: hangingPi(fixture.calls),
+    spawnPi: hangingPi(fixture.calls).spawnPi,
     meminfoPath: writeMeminfo(),
     log: () => {},
   });

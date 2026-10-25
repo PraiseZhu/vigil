@@ -14,6 +14,7 @@ import { DEFAULT_HEAD_QUERY, STATUS_QUERY, createGate, startGateServer } from '.
 import { hostPaths, readAlerts } from './host/paths.mjs';
 import { run as procRun } from './host/proc.mjs';
 import { defaultTree } from './session.fixture.mjs';
+import { BYPASS_KINDS, BYPASS_LABELS, buildBypassRepo } from './secret-bypass.fixture.mjs';
 import { HANDOFF_REPO, REPO, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 
 const ROOT_REF = `${REPO}#1`;
@@ -39,7 +40,7 @@ const PR_MARKER = `[验收机] 修正 · 总 ${ROOT_REF} · 项 ${REPO}#2 SC1 ·
 
 function gateGithub(
   world,
-  { statusRollup = 'SUCCESS', onWrite, headRefName = 'acceptance/1-2-sc1', prBody = PR_MARKER, defaultHead = null } = {},
+  { statusRollup = 'SUCCESS', onWrite, headRefName = 'acceptance/1-2-sc1', prBody = PR_MARKER, defaultHead = null, crossRepo = false } = {},
 ) {
   return {
     queries: [],
@@ -55,6 +56,7 @@ function gateGithub(
             pullRequest: {
               number: variables.number,
               headRefName,
+              ...(crossRepo === null ? {} : { isCrossRepository: crossRepo }),
               body: prBody,
               commits: {
                 nodes: [{ commit: { statusCheckRollup: statusRollup ? { state: statusRollup } : null } }],
@@ -843,7 +845,7 @@ test('SC9 branch.push 推的是写闸扫过的那份副本：扫完后原 bundle
   // 模拟沙箱：写闸扫完补丁之后、推送之前，把原 bundle 换成别的内容。
   const swappingRun = async (cmd, args, options) => {
     const result = await procRun(cmd, args, options);
-    if (cmd === 'git' && args.includes('log')) fs.writeFileSync(bundlePath, 'swapped-after-scan');
+    if (cmd === 'git' && args.includes('cat-file')) fs.writeFileSync(bundlePath, 'swapped-after-scan');
     return result;
   };
   let pushedBytes = null;
@@ -1117,4 +1119,54 @@ test('SC9 写闸只认 ownerLogin 发的轮次评论：别人伪造的「第 2 �
   const denied = await forgedGate.handle({ type: 'comment.create', repo: REPO, issue: 2, body: '进度', dedupeKey: 'owner-only-denied' });
   assert.equal(denied.code, 4);
   assert.equal(denied.body.reason, 'not-current-round');
+});
+
+for (const kind of Object.keys(BYPASS_KINDS)) {
+  test(`SC9 branch.push 内置扫描绕过拦得住：${BYPASS_LABELS[kind]}`, async () => {
+    const { home, profile } = setupEnvironment();
+    const repo = await buildBypassRepo(kind);
+    // 默认分支头在 bundle 里（只扫新提交）和读不到（扫全部历史）两种都要拦住。
+    for (const defaultHead of [repo.mainSha, null]) {
+      const world = defaultTree();
+      let pushed = false;
+      const github = gateGithub(world, {
+        defaultHead,
+        onWrite: async (action) => {
+          if (action.type === 'branch.push') pushed = true;
+          return { pushed: true };
+        },
+      });
+      const gate = createGate({ home, profile, github, run: procRun, binding: bindingFor(world), which: async () => false });
+      const label = `${kind} / 默认头 ${defaultHead ? '在' : '不在'}`;
+      const outcome = await gate.handle({
+        type: 'branch.push',
+        repo: REPO,
+        branch: repo.branch,
+        bundlePath: repo.bundlePath,
+        dedupeKey: `bypass-${kind}-${defaultHead ? 'base' : 'full'}`,
+      });
+      assert.equal(outcome.code, 4, `${label}: ${JSON.stringify(outcome)}`);
+      assert.equal(outcome.body.reason, 'secret-found', label);
+      assert.deepEqual(outcome.body.files, [repo.file], label);
+      assert.equal(JSON.stringify(outcome).includes('MIIEnotARealKey'), false, `${label}：不回显内容`);
+      assert.equal(pushed, false, `${label}：没推`);
+    }
+  });
+}
+
+test('SC9 pr.ready 不认从 fork 来的 PR（isCrossRepository）：分支名和标记照抄也不行', async () => {
+  const { home, profile } = setupEnvironment();
+  for (const [label, crossRepo] of [
+    ['fork', true],
+    ['字段缺失', null],
+  ]) {
+    const world = defaultTree();
+    const github = gateGithub(world, { crossRepo });
+    const gate = createGate({ home, profile, github, run: procRun, binding: bindingFor(world), which: async () => false });
+    const outcome = await gate.handle({ type: 'pr.ready', repo: REPO, pr: 7, dedupeKey: `ready-fork-${label}` });
+    assert.equal(outcome.code, 4, `${label}: ${JSON.stringify(outcome)}`);
+    assert.equal(outcome.body.reason, 'not-in-tree', label);
+    assert.equal(world.writes.length, 0, label);
+  }
+  assert.match(STATUS_QUERY, /isCrossRepository/);
 });
