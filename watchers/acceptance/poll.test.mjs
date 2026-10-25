@@ -9,6 +9,7 @@ import { poll } from './bin/poll.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { cachePath, createRounds } from './bin/rounds.mjs';
 import { bodyVersion, collectTasks } from './bin/tasks.mjs';
+import { hostPaths, writeRoundProgress } from './host/paths.mjs';
 import {
   OWNER,
   REPO,
@@ -239,8 +240,8 @@ test('SC17 poll 输出卡住的验收中轮次；本地无记录时用评论创�
   assert.equal(again.find((e) => e.stale).lastProgressAt, createdAt);
 });
 
-test('SC17 本地有进度记录时按本地 lastProgressAt 算', async () => {
-  const { home } = writeProfile(tmpDir());
+test('SC17/SC11 卡死按宿主进度算：stateDir 里模型写的 lastProgressAt（哪怕伪造到未来）延不了期，宿主进度文件才延', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
   const createdAt = '2026-10-24T01:00:00.000Z';
   const parent = issueNode({
@@ -259,15 +260,22 @@ test('SC17 本地有进度记录时按本地 lastProgressAt 算', async () => {
   fs.mkdirSync(path.dirname(cachePath(profile, `${REPO}#6`)), { recursive: true });
   fs.writeFileSync(
     cachePath(profile, `${REPO}#6`),
-    JSON.stringify({ round: { round: 2, commentId: 66, lastProgressAt: '2026-10-24T01:20:00.000Z' } }),
+    JSON.stringify({ round: { round: 2, commentId: 66, lastProgressAt: '2099-01-01T00:00:00.000Z' } }),
   );
-  const now = () => Date.parse('2026-10-24T01:40:00.000Z');
-  const entries = await poll({ github, profile, now });
-  const stale = entries.find((e) => e.stale);
-  // 本地 01:20，现在 01:40，未超过 30 分钟，不应标 stale
-  assert.equal(stale, undefined);
+  // 没有宿主进度：按评论创建时间算，31 分钟就是卡死；模型时间只作参考带出来。
+  const forged = await poll({ github, profile, now: () => Date.parse('2026-10-24T01:31:00.000Z') });
+  const stale = forged.find((e) => e.stale);
+  assert.ok(stale, '伪造的模型时间不能让轮次永不过期');
+  assert.equal(stale.lastProgressAt, createdAt);
+  assert.equal(stale.modelProgressAt, '2099-01-01T00:00:00.000Z');
+
+  // 宿主 01:20 看到过活动（写在 <home>/state/host/progress，沙箱写不了）：01:40 不算卡死，01:51 才算。
+  writeRoundProgress(hostPaths(home), { issue: `${REPO}#6`, round: 2, lastActivityAt: '2026-10-24T01:20:00.000Z' });
+  const fresh = await poll({ github, profile, now: () => Date.parse('2026-10-24T01:40:00.000Z') });
+  assert.equal(fresh.find((e) => e.stale), undefined);
   const later = await poll({ github, profile, now: () => Date.parse('2026-10-24T01:51:00.000Z') });
   assert.equal(later.find((e) => e.stale)?.lastProgressAt, '2026-10-24T01:20:00.000Z');
+  assert.equal(later.find((e) => e.stale)?.hostProgressAt, '2026-10-24T01:20:00.000Z');
 });
 
 test('SC4 poll 会列出 watch 档任务', async () => {

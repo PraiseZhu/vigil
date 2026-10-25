@@ -7,7 +7,7 @@ import test, { after } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { hostPaths, readAlerts, tryAcquireLock, releaseLock } from './host/paths.mjs';
-import { runHostRound, readMemAvailable, MEMORY_GATE_BYTES } from './host/round.mjs';
+import { runHostRound, readMemAvailable, MEMORY_GATE_BYTES, SANDBOX_DOWN_ALERT_MS } from './host/round.mjs';
 import {
   ENV_ALLOWLIST,
   INTERNAL_ENV,
@@ -47,6 +47,8 @@ function roundFixture({ hostJson } = {}) {
   const home = base.home;
   if (hostJson !== undefined) writeHostJson(home, hostJson);
   else writeHostJson(home);
+  fs.mkdirSync(hostPaths(home).gateDir, { recursive: true });
+  fs.writeFileSync(hostPaths(home).enabledFile, '1');
   const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
   const calls = { round: [], pi: [], gateStop: 0 };
   const message = '先读 watchers/acceptance/SESSION.md，照里面的步骤做完这一轮验收。';
@@ -60,7 +62,8 @@ function roundFixture({ hostJson } = {}) {
   function runRoundFake(argv) {
     calls.round.push(argv);
     if (argv[0] === 'start') return { code: 0, stdout: `${message}\n${JSON.stringify(claim)}\n`, stderr: '' };
-    if (argv[0] === 'status') return { code: 0, stdout: `${JSON.stringify({ stalled: false })}\n`, stderr: '' };
+    // pi 退出后宿主回读状态：已是终态才算正常收尾（没写裁决的情况在 host-round / round-lifecycle 测）。
+    if (argv[0] === 'status') return { code: 0, stdout: `${JSON.stringify({ round: 1, status: '通过', stalled: false })}\n`, stderr: '' };
     if (argv[0] === 'abort') return { code: 0, stdout: '{}\n', stderr: '' };
     return { code: 1, stdout: '', stderr: `没准备这个命令：${argv.join(' ')}` };
   }
@@ -86,7 +89,9 @@ function roundFixture({ hostJson } = {}) {
     };
   }
 
-  return { base, home, profile, calls, claim, message, runRoundFake, startGateFake, spawnPiFake };
+  const prefetchFake = async () => [];
+
+  return { base, home, profile, calls, claim, message, runRoundFake, startGateFake, spawnPiFake, prefetchFake };
 }
 
 function neverExitSpawnPi(calls) {
@@ -116,6 +121,7 @@ test('SC11 内存门：MemAvailable 不到 3 GiB 就退出 3，不认领', async
     run: async () => ({ code: 0, stdout: '', stderr: '' }),
     runRound: fixture.runRoundFake,
     startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
     spawnPi: fixture.spawnPiFake,
     meminfoPath,
     log: () => {},
@@ -134,6 +140,7 @@ test('SC11 内存门常量是 3 GiB，读不出 meminfo 也按不够处理', asy
     run: async () => ({ code: 0, stdout: '', stderr: '' }),
     runRound: fixture.runRoundFake,
     startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
     spawnPi: fixture.spawnPiFake,
     meminfoPath: path.join(tmpDir(), 'missing-meminfo'),
     log: () => {},
@@ -156,6 +163,7 @@ test('SC11 两个槽都占着 → 退出 3，不认领', async () => {
       run: async () => ({ code: 0, stdout: '', stderr: '' }),
       runRound: fixture.runRoundFake,
       startGate: fixture.startGateFake,
+      prefetch: fixture.prefetchFake,
       spawnPi: fixture.spawnPiFake,
       meminfoPath: writeMeminfo(),
       log: () => {},
@@ -179,6 +187,7 @@ test('SC11 mivo 的仓要占测试锁：锁被占 → 退出 3，槽也放回去
       run: async () => ({ code: 0, stdout: '', stderr: '' }),
       runRound: fixture.runRoundFake,
       startGate: fixture.startGateFake,
+      prefetch: fixture.prefetchFake,
       spawnPi: fixture.spawnPiFake,
       meminfoPath: writeMeminfo(),
       log: () => {},
@@ -191,7 +200,7 @@ test('SC11 mivo 的仓要占测试锁：锁被占 → 退出 3，槽也放回去
   }
 });
 
-test('SC11 bwrap 不在（ENOENT）：不跑模型，abort 成「沙箱起不来」，写提醒，退出非 0', async () => {
+test('SC11 bwrap 不在（ENOENT）：不认领、不跑模型、issue 上不留评论，写一条 sandbox-down 提醒，退出非 0', async () => {
   const fixture = roundFixture();
   const code = await runHostRound({
     home: fixture.home,
@@ -203,28 +212,56 @@ test('SC11 bwrap 不在（ENOENT）：不跑模型，abort 成「沙箱起不来
     },
     runRound: fixture.runRoundFake,
     startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
     spawnPi: fixture.spawnPiFake,
     meminfoPath: writeMeminfo(),
     log: () => {},
   });
   assert.notEqual(code, 0);
   assert.equal(fixture.calls.pi.length, 0, 'bwrap 起不来就不跑模型');
-  const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
-  assert.ok(abort, '这一轮要 abort');
-  const reason = abort[abort.indexOf('--reason') + 1];
-  assert.match(reason, /沙箱起不来/);
+  assert.deepEqual(fixture.calls.round, [], '探针在认领之前：不认领、不 abort');
   const alerts = readAlerts(hostPaths(fixture.home));
-  assert.ok(alerts.some((entry) => entry.kind === 'sandbox-unavailable'), JSON.stringify(alerts));
+  assert.deepEqual(alerts.map((entry) => entry.kind), ['sandbox-down'], JSON.stringify(alerts));
+  assert.equal(fs.existsSync(path.join(hostPaths(fixture.home).slotsDir, 'slot-0')), false, '槽放回去');
 });
 
-test('SC11 bwrap 探针失败：同样不跑模型、abort 并写提醒', async () => {
+test('SC11 bwrap 探针失败：同样不认领；sandbox-down 提醒节流（窗口内只写一条）', async () => {
   const fixture = roundFixture();
+  let clock = Date.parse('2026-10-24T02:00:00.000Z');
+  const once = () =>
+    runHostRound({
+      home: fixture.home,
+      issue: ROOT_REF,
+      run: async () => ({ code: 1, stdout: '', stderr: 'bwrap: failed' }),
+      runRound: fixture.runRoundFake,
+      startGate: fixture.startGateFake,
+      prefetch: fixture.prefetchFake,
+      spawnPi: fixture.spawnPiFake,
+      meminfoPath: writeMeminfo(),
+      now: () => clock,
+      log: () => {},
+    });
+  for (let i = 0; i < 5; i += 1) {
+    assert.notEqual(await once(), 0);
+    clock += 60 * 1000;
+  }
+  assert.equal(fixture.calls.pi.length, 0);
+  assert.deepEqual(fixture.calls.round, [], '一次都没认领');
+  assert.equal(readAlerts(hostPaths(fixture.home)).filter((entry) => entry.kind === 'sandbox-down').length, 1, '五分钟里只写一条');
+  clock += SANDBOX_DOWN_ALERT_MS;
+  await once();
+  assert.equal(readAlerts(hostPaths(fixture.home)).filter((entry) => entry.kind === 'sandbox-down').length, 2, '过了窗口再写一条');
+});
+
+test('SC11 认领之后沙箱参数拼不出来：不跑模型，abort 成「沙箱起不来」，写 sandbox-unavailable', async () => {
+  const fixture = roundFixture({ hostJson: { piCommand: ['pi'], homeAllowDirs: 'not-an-array' } });
   const code = await runHostRound({
     home: fixture.home,
     issue: ROOT_REF,
-    run: async () => ({ code: 1, stdout: '', stderr: 'bwrap: failed' }),
+    run: async (cmd) => (cmd === 'bwrap' ? { code: 0, stdout: '', stderr: '' } : { code: 1, stdout: '', stderr: 'no' }),
     runRound: fixture.runRoundFake,
     startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
     spawnPi: fixture.spawnPiFake,
     meminfoPath: writeMeminfo(),
     log: () => {},
@@ -246,6 +283,7 @@ test('SC11 PI_NO_SANDBOX=1 和 host.json 的 sandbox:false 都关不掉沙箱', 
     run: async (cmd) => (cmd === 'bwrap' ? { code: 0, stdout: '', stderr: '' } : { code: 1, stdout: '', stderr: 'no' }),
     runRound: fixture.runRoundFake,
     startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
     spawnPi: fixture.spawnPiFake,
     meminfoPath: writeMeminfo(),
     statusIntervalMs: 5,
@@ -276,6 +314,7 @@ test('SC11 子进程环境只含白名单（+ 两个内部变量），父进程�
     run: async (cmd) => (cmd === 'bwrap' ? { code: 0, stdout: '', stderr: '' } : { code: 1, stdout: '', stderr: 'no' }),
     runRound: fixture.runRoundFake,
     startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
     spawnPi: fixture.spawnPiFake,
     meminfoPath: writeMeminfo(),
     statusIntervalMs: 5,

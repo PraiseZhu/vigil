@@ -1,11 +1,12 @@
 // #47 SC11 / SC13：host/round 的认领、卡住处理；tick 的 poll 在沙箱外跑、读得到夹具令牌。
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
-import { hostPaths, readAlerts } from './host/paths.mjs';
-import { roundDirFor, roundKey, runHostRound } from './host/round.mjs';
+import { hostPaths, progressFileFor, readAlerts } from './host/paths.mjs';
+import { roundDirFor, roundKey, runHostRound, startGateRelay } from './host/round.mjs';
 import { runTick } from './host/tick.mjs';
 import { run as procRun } from './host/proc.mjs';
 import { OWNER, REPO, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
@@ -27,9 +28,13 @@ function writeMeminfo() {
   return file;
 }
 
-function roundFixture({ status } = {}) {
-  const base = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+function roundFixture({ status, profile = {}, enabled = true } = {}) {
+  const base = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state'), ...profile } });
   writeHostJson(base.home);
+  if (enabled) {
+    fs.mkdirSync(hostPaths(base.home).gateDir, { recursive: true });
+    fs.writeFileSync(hostPaths(base.home).enabledFile, '1');
+  }
   const calls = { round: [], pi: [], gate: 0 };
   const claim = { issue: ROOT_REF, round: 1, commentId: 1001, bodyVersion: `sha256:${'b'.repeat(64)}` };
   const message = '先读 watchers/acceptance/SESSION.md，照里面的步骤做完这一轮验收。';
@@ -38,7 +43,7 @@ function roundFixture({ status } = {}) {
     calls.round.push(argv);
     if (argv[0] === 'start') return { code: 0, stdout: `${message}\n${JSON.stringify(claim)}\n`, stderr: '' };
     if (argv[0] === 'status') {
-      return { code: 0, stdout: `${JSON.stringify(status || { stalled: false })}\n`, stderr: '' };
+      return { code: 0, stdout: `${JSON.stringify(status || { round: 1, status: '验收中', stalled: false })}\n`, stderr: '' };
     }
     return { code: 0, stdout: '{}\n', stderr: '' };
   };
@@ -53,7 +58,14 @@ function roundFixture({ status } = {}) {
     };
   };
 
-  return { home: base.home, calls, claim, message, runRoundFake, startGateFake };
+  // 预取在真实路径测试里（round-lifecycle.test.mjs）测；这里只记下被调过。
+  const prefetchFake = async (options) => {
+    calls.prefetch = (calls.prefetch || 0) + 1;
+    calls.prefetchOptions = options;
+    return [];
+  };
+
+  return { home: base.home, calls, claim, message, runRoundFake, startGateFake, prefetchFake };
 }
 
 /** 一直不退的 pi。ignoreTerm：连 SIGTERM 都不理，只有 SIGKILL 才退。记下收到的信号和是否已退出。 */
@@ -81,8 +93,8 @@ function hangingPi(calls, { ignoreTerm = false } = {}) {
   return { spawnPi, state };
 }
 
-test('SC11 认领之后 pi 在 bwrap 里跑；卡住先杀进程再 abort，并写提醒', async () => {
-  const fixture = roundFixture({ status: { stalled: true } });
+test('SC11 认领之后 pi 在 bwrap 里跑；宿主侧判卡住（status 说没卡也不信）先杀进程再 abort，并写提醒', async () => {
+  const fixture = roundFixture({ status: { round: 1, status: '验收中', stalled: false, lastProgressAt: '2099-01-01T00:00:00.000Z' }, profile: { stallMinutes: 0.001 } });
   const pi = hangingPi(fixture.calls);
   let abortSawPiRunning = null;
   const code = await runHostRound({
@@ -90,6 +102,7 @@ test('SC11 认领之后 pi 在 bwrap 里跑；卡住先杀进程再 abort，并�
     issue: ROOT_REF,
     run: async (cmd) => (cmd === 'bwrap' ? { code: 0, stdout: '', stderr: '' } : { code: 1, stdout: '', stderr: 'no' }),
     startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
     runRound: async (argv) => {
       if (argv[0] === 'abort') abortSawPiRunning = !pi.state.exited;
       return fixture.runRoundFake(argv);
@@ -114,7 +127,7 @@ test('SC11 认领之后 pi 在 bwrap 里跑；卡住先杀进程再 abort，并�
 });
 
 test('SC11 卡住时 pi 不理 SIGTERM：等 killGraceMs 后升级 SIGKILL，退了才 abort', { timeout: 5000 }, async () => {
-  const fixture = roundFixture({ status: { stalled: true } });
+  const fixture = roundFixture({ profile: { stallMinutes: 0.001 } });
   const pi = hangingPi(fixture.calls, { ignoreTerm: true });
   let abortSawPiRunning = null;
   const code = await runHostRound({
@@ -126,6 +139,7 @@ test('SC11 卡住时 pi 不理 SIGTERM：等 killGraceMs 后升级 SIGKILL，退
       return fixture.runRoundFake(argv);
     },
     startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
     spawnPi: pi.spawnPi,
     meminfoPath: writeMeminfo(),
     statusIntervalMs: 5,
@@ -153,6 +167,7 @@ test('SC11 pi 跑着时宿主出错（查进度抛异常）：先结束 pi，再
       if (argv[0] === 'abort') abortSawPiRunning = !exited;
       return fixture.runRoundFake(argv);
     },
+    prefetch: fixture.prefetchFake,
     startGate: async (options) => {
       const gate = await fixture.startGateFake(options);
       return {
@@ -194,12 +209,269 @@ test('SC11 pi 跑着时宿主出错（查进度抛异常）：先结束 pi，再
   assert.equal(fixture.calls.gate, 1);
 });
 
+const BWRAP_OK = async (cmd) => (cmd === 'bwrap' ? { code: 0, stdout: '', stderr: '' } : { code: 1, stdout: '', stderr: 'no' });
+
+/** 起来就退的 pi（退出码可选）。 */
+function exitingPi(calls, code) {
+  return (options) => {
+    calls.pi.push(options);
+    return { pid: 555010, stdin: { write() {}, end() {} }, kill() {}, exit: Promise.resolve({ code }) };
+  };
+}
+
+for (const exitCode of [0, 1]) {
+  test(`SC11 pi 以 ${exitCode} 退出但轮次还是「验收中」：立即 abort（原因写清退出码）+ round-failed 提醒`, async () => {
+    const fixture = roundFixture();
+    const code = await runHostRound({
+      home: fixture.home,
+      issue: ROOT_REF,
+      run: BWRAP_OK,
+      runRound: fixture.runRoundFake,
+      startGate: fixture.startGateFake,
+      prefetch: fixture.prefetchFake,
+      spawnPi: exitingPi(fixture.calls, exitCode),
+      meminfoPath: writeMeminfo(),
+      statusIntervalMs: 60000,
+      log: () => {},
+    });
+    assert.equal(code, 1);
+    const commands = fixture.calls.round.map((argv) => argv[0]);
+    assert.deepEqual(commands, ['start', 'status', 'abort'], '退出后先回读状态，再 abort（不等查进度的间隔）');
+    const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
+    assert.equal(abort[abort.indexOf('--reason') + 1], `pi 退出（code=${exitCode}）但没写裁决`);
+    const alerts = readAlerts(hostPaths(fixture.home));
+    assert.ok(alerts.some((entry) => entry.kind === 'round-failed' && entry.reason === `pi 退出（code=${exitCode}）但没写裁决`), JSON.stringify(alerts));
+    assert.equal(fixture.calls.gate, 1);
+  });
+}
+
+test('SC11 pi 退出时轮次已是终态：正常收尾，不 abort、不写提醒', async () => {
+  const fixture = roundFixture({ status: { round: 1, status: '要修' } });
+  const code = await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: BWRAP_OK,
+    runRound: fixture.runRoundFake,
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    spawnPi: exitingPi(fixture.calls, 0),
+    meminfoPath: writeMeminfo(),
+    log: () => {},
+  });
+  assert.equal(code, 0);
+  assert.equal(fixture.calls.round.some((argv) => argv[0] === 'abort'), false);
+  assert.deepEqual(readAlerts(hostPaths(fixture.home)), []);
+});
+
+test('SC11 裁决写完 pi 不退：宽限 verdictGraceMs 后 SIGTERM，收尾不 abort', { timeout: 5000 }, async () => {
+  const fixture = roundFixture({ status: { round: 1, status: '通过' } });
+  const pi = hangingPi(fixture.calls);
+  const startedAt = Date.now();
+  const code = await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: BWRAP_OK,
+    runRound: fixture.runRoundFake,
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    spawnPi: pi.spawnPi,
+    meminfoPath: writeMeminfo(),
+    statusIntervalMs: 5,
+    verdictGraceMs: 150,
+    killGraceMs: 20,
+    log: () => {},
+  });
+  assert.equal(code, 0);
+  assert.ok(Date.now() - startedAt >= 150, '先宽限');
+  assert.deepEqual(pi.state.killed, ['SIGTERM']);
+  assert.equal(fixture.calls.round.some((argv) => argv[0] === 'abort'), false);
+  assert.equal(fixture.calls.gate, 1);
+});
+
+test('SC11 总时长上限（host.json maxRoundMinutes，宿主墙钟）：到点停 pi、abort、round-timeout', { timeout: 5000 }, async () => {
+  const fixture = roundFixture();
+  fs.writeFileSync(
+    path.join(fixture.home, 'config', 'host.json'),
+    JSON.stringify({ piCommand: ['pi'], maxRoundMinutes: 0.005 }),
+  );
+  const pi = hangingPi(fixture.calls);
+  const startedAt = Date.now();
+  const code = await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: BWRAP_OK,
+    runRound: fixture.runRoundFake,
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    spawnPi: pi.spawnPi,
+    meminfoPath: writeMeminfo(),
+    statusIntervalMs: 5,
+    killGraceMs: 20,
+    log: () => {},
+  });
+  assert.equal(code, 1);
+  assert.ok(Date.now() - startedAt >= 300);
+  assert.deepEqual(pi.state.killed, ['SIGTERM']);
+  const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
+  assert.equal(abort[abort.indexOf('--reason') + 1], '超过总时长上限（0.005 分钟）');
+  assert.ok(readAlerts(hostPaths(fixture.home)).some((entry) => entry.kind === 'round-timeout'));
+});
+
+test('SC11 pi.log 在长就刷新宿主侧进度（写在 <home>/state/host/progress），不判卡住；停了才判', { timeout: 10000 }, async () => {
+  const fixture = roundFixture({ profile: { stallMinutes: 0.003 } });
+  const paths = hostPaths(fixture.home);
+  const progress = progressFileFor(paths, ROOT_REF, 1);
+  assert.ok(progress.startsWith(path.join(fixture.home, 'state', 'host')), '宿主进度在 <home>/state/host 下');
+  const seen = [];
+  let timer;
+  const pi = hangingPi(fixture.calls);
+  const spawnPi = (options) => {
+    const handle = pi.spawnPi(options);
+    let n = 0;
+    // 写 600 毫秒的输出（卡住阈值 180 毫秒），然后不再写。
+    timer = setInterval(() => {
+      n += 1;
+      if (n <= 20) fs.appendFileSync(options.logFile, `line ${n}\n`);
+      try {
+        seen.push(JSON.parse(fs.readFileSync(progress, 'utf8')));
+      } catch {
+        // 还没写。
+      }
+    }, 30);
+    return handle;
+  };
+  const startedAt = Date.now();
+  const code = await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: BWRAP_OK,
+    runRound: fixture.runRoundFake,
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    spawnPi,
+    meminfoPath: writeMeminfo(),
+    statusIntervalMs: 10,
+    killGraceMs: 20,
+    log: () => {},
+  });
+  clearInterval(timer);
+  assert.equal(code, 1);
+  assert.ok(Date.now() - startedAt >= 600 + 180, `卡住判得太早：${Date.now() - startedAt}ms`);
+  assert.ok(seen.length > 0);
+  assert.ok(seen.at(-1).piLogBytes > 0, '宿主记下了 pi.log 的长度');
+  assert.ok(Date.parse(seen.at(-1).lastActivityAt) - startedAt >= 400, '最近活动跟着 pi.log 往后走');
+  const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
+  assert.match(abort[abort.indexOf('--reason') + 1], /卡住：超过 stallMinutes 没有进度/);
+  assert.equal(fs.existsSync(progress), false, '收尾删掉');
+});
+
+test('SC11 写闸总开关关着：不认领、不写 write-rejected 提醒、不跑模型，退出 3', async () => {
+  const fixture = roundFixture({ enabled: false });
+  const code = await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: BWRAP_OK,
+    runRound: fixture.runRoundFake,
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    spawnPi: hangingPi(fixture.calls).spawnPi,
+    meminfoPath: writeMeminfo(),
+    log: () => {},
+  });
+  assert.equal(code, 3);
+  assert.deepEqual(fixture.calls.round, [], '没认领');
+  assert.equal(fixture.calls.pi.length, 0);
+  assert.deepEqual(readAlerts(hostPaths(fixture.home)), []);
+  assert.equal(fs.existsSync(path.join(hostPaths(fixture.home).slotsDir, 'slot-0')), false, '槽放回去');
+});
+
+test('SC11 写闸转发：沙箱那一侧的 socket 原样转给内层写闸，每条连接记一次活动，权限 600', async () => {
+  const dir = tmpDir();
+  const innerPath = path.join(dir, 'inner.sock');
+  const publicPath = path.join(dir, 'public', 'gate.sock');
+  const inner = net.createServer((socket) => {
+    let buffer = '';
+    socket.on('data', (chunk) => {
+      buffer += chunk;
+      if (buffer.includes('\n')) socket.end(`${JSON.stringify({ code: 0, body: { echo: JSON.parse(buffer) } })}\n`);
+    });
+  });
+  await new Promise((resolve) => inner.listen(innerPath, resolve));
+  let requests = 0;
+  const relay = await startGateRelay({ publicPath, innerPath, onRequest: () => (requests += 1) });
+  try {
+    assert.equal(fs.statSync(publicPath).mode & 0o777, 0o600);
+    const ask = (payload) =>
+      new Promise((resolve, reject) => {
+        const socket = net.connect(publicPath);
+        let reply = '';
+        socket.on('connect', () => socket.write(`${JSON.stringify(payload)}\n`));
+        socket.on('data', (chunk) => (reply += chunk));
+        socket.on('end', () => resolve(JSON.parse(reply)));
+        socket.on('error', reject);
+      });
+    assert.deepEqual(await ask({ type: 'probe' }), { code: 0, body: { echo: { type: 'probe' } } });
+    assert.deepEqual(await ask({ type: 'read.graphql' }), { code: 0, body: { echo: { type: 'read.graphql' } } });
+    assert.equal(requests, 2);
+  } finally {
+    await relay.close();
+    await new Promise((resolve) => inner.close(resolve));
+  }
+  assert.equal(fs.existsSync(publicPath), false);
+});
+
+test('SC11 tick：写闸总开关关着 → 验收轮、修正轮都不起，不 abort、不写提醒，心跳记 gate: disabled', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  fs.writeFileSync(
+    path.join(home, 'config', 'host.json'),
+    JSON.stringify({ piCommand: ['pi'], prbot: { piCommand: ['pi'], repos: { [REPO]: { handoff: 'owner' } } } }),
+  );
+  const startedPrbot = [];
+  const started = [];
+  const aborted = [];
+  const poll = [
+    { issue: ROOT_REF, kind: 'standalone', tier: 'auto', fork: false, nextRound: 2, bodyVersion: `sha256:${'c'.repeat(64)}` },
+    { issue: `${REPO}#9`, round: 1, stale: true, lastProgressAt: '2026-10-24T01:00:00.000Z' },
+  ];
+  const heartbeat = await runTick({
+    home,
+    env: { ...process.env },
+    run: async () => ({ code: 0, stdout: JSON.stringify(poll), stderr: '' }),
+    spawnRound: (issue) => {
+      started.push(issue);
+      return 1;
+    },
+    runRound: async (argv) => {
+      aborted.push(argv);
+      return { code: 4, stdout: '', stderr: 'gate-disabled' };
+    },
+    spawnPrbot: (issue) => {
+      startedPrbot.push(issue);
+      return 2;
+    },
+    discoverPrbot: async () => [{ issue: `${REPO}#10` }],
+    checkPrbotStalled: async () => [],
+    cleanupPrbot: () => [],
+    notify: async () => ({ ok: true }),
+    now: () => Date.parse('2026-10-24T02:00:00.000Z'),
+  });
+  assert.equal(heartbeat.gate, 'disabled');
+  assert.deepEqual(startedPrbot, [], '修正轮也不起');
+  assert.equal(heartbeat.lastTick.ok, true);
+  assert.deepEqual(started, []);
+  assert.deepEqual(aborted, []);
+  assert.deepEqual(heartbeat.lastTick.started, []);
+  assert.equal(heartbeat.lastTick.stale[0]?.aborted, false);
+  assert.deepEqual(readAlerts(hostPaths(home)), []);
+});
+
 test('SC11 认领被写闸拒绝（4）：不跑模型，写一条提醒', async () => {
   const fixture = roundFixture();
   const code = await runHostRound({
     home: fixture.home,
     issue: ROOT_REF,
     run: async () => ({ code: 0, stdout: '', stderr: '' }),
+    prefetch: fixture.prefetchFake,
     runRound: async (argv) => {
       fixture.calls.round.push(argv);
       return { code: 4, stdout: '', stderr: '写闸拒绝：gate-disabled' };
@@ -279,6 +551,8 @@ test('SC13 tick 在沙箱外跑 poll（不进 bwrap），poll 读的是夹具令
     profile: { stateDir: path.join(tmpDir(), 'acc-state') },
   });
   const home = base.home;
+  fs.mkdirSync(hostPaths(home).gateDir, { recursive: true });
+  fs.writeFileSync(hostPaths(home).enabledFile, '1');
   const binDir = path.join(home, 'bin');
   const tokenLog = path.join(home, 'gh-token.log');
   writeFakeGh(binDir, tokenLog);
@@ -322,6 +596,7 @@ test('SC13 tick 在沙箱外跑 poll（不进 bwrap），poll 读的是夹具令
   assert.deepEqual(onDisk.lastTick.started.map((entry) => entry.issue), [ROOT_REF]);
   assert.ok(Array.isArray(onDisk.running));
   assert.equal(heartbeat.lastTick.ok, true);
+  assert.equal(heartbeat.gate, 'enabled');
 });
 
 test('SC13 tick 里 poll 出错：心跳记 ok=false + 一条提醒，不抛出', async () => {

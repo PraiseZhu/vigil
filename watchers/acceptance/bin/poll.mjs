@@ -7,6 +7,7 @@ import { createGithub } from './github.mjs';
 import { collectTasks } from './tasks.mjs';
 import { createRounds, latestRound } from './rounds.mjs';
 import { lastFinal, shouldTrigger, stalledRounds } from './trigger.mjs';
+import { hostPaths, readRoundProgress } from '../host/paths.mjs';
 
 function nextRoundNumber(rounds) {
   const max = (rounds || []).reduce((acc, round) => Math.max(acc, round.round), 0);
@@ -27,15 +28,32 @@ export function passedButOpen(task, profile) {
   return { issue: task.ref, passedButOpen: true, round: final.round, url: final.url ?? null };
 }
 
-export async function poll({ github, profile, now = () => Date.now() }) {
-  // 只读本地缓存里的 lastProgressAt；不写缓存、不调 write。
+/** 宿主进度（#47 SC11）：<home>/state/host/progress 下的宿主活动时间；读不到返回 null。 */
+function defaultHostProgress(profile) {
+  let paths = null;
+  try {
+    paths = hostPaths(path.dirname(path.dirname(profile.profilePath)));
+  } catch {
+    return () => null;
+  }
+  return (issue, round) => readRoundProgress(paths, issue, round)?.lastActivityAt || null;
+}
+
+export async function poll({ github, profile, now = () => Date.now(), hostProgress }) {
+  // 只读本地缓存里的 lastProgressAt（模型写的，只作参考）和宿主进度文件；不写缓存、不调 write。
   const roundsApi = createRounds({ github, profile, now });
+  const hostProgressAt = hostProgress || defaultHostProgress(profile);
   const tasks = await collectTasks(github, profile);
   const out = [];
   for (const task of tasks) {
     const latest = latestRound(task.rounds);
     const progressAt = roundsApi.lastProgressAt(task.ref, latest?.round, latest);
-    const stale = stalledRounds(task, { now, profile, lastProgressAt: progressAt });
+    const stale = stalledRounds(task, {
+      now,
+      profile,
+      lastProgressAt: progressAt,
+      hostProgressAt: latest ? hostProgressAt(task.ref, latest.round) : null,
+    });
     if (stale) out.push(stale);
     const decision = shouldTrigger(task, { now, profile });
     if (decision.trigger && task.outOfScope?.length) {

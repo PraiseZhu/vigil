@@ -26,8 +26,11 @@ test('SC1/SC4/SC5 SESSION.md 说清 helper 的每条命令', () => {
 });
 
 test('SC2 SESSION.md 写清验法：检出、清理、逐层跑、证据、人工手测、提炼标准、目标仓规矩', () => {
-  assert.match(session, /worktreeDir/);
   assert.match(session, /检出各仓最新 main/);
+  assert.match(session, /代码已由宿主检出/);
+  assert.match(session, /\*\*只读\*\*/);
+  assert.match(session, /复制到 `TMPDIR`/);
+  assert.match(session, /不要\*\*自己 `git clone`/);
   assert.match(session, /用完清理/);
   assert.match(session, /static/);
   assert.match(session, /unit/);

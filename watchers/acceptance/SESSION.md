@@ -37,7 +37,7 @@ node watchers/acceptance/bin/helper.mjs progress --issue <root> --round <n>
 
 ## 2. 怎么验
 
-- 在 `worktreeDir` 下检出各仓最新 main（`git clone`、`git worktree` 都行，读是安全的），**用完清理**。
+- 代码已由宿主检出：派发消息的「代码」一节列出本轮任务树里每个仓的绝对路径（宿主检出各仓最新 main 的工作树，带 `.git`），**只读**。直接在那里读代码、看 `git log`；需要可写副本（装依赖、跑会写文件的测试）时复制到 `TMPDIR` 再用（`cp -a <路径> "$TMPDIR/"`），用完清理。沙箱里没有凭证，**不要**自己 `git clone`（私有仓克隆不下来），也不要往 `worktreeDir` 里检出。
 - `static`、`unit`、`contract`、`browser-fixture` 逐条跑，每条都留下证据：跑的命令 + 关键输出一行。
 - `cindy-mac`、`cindy-windows`、`paid`、`github-live` 这几种层次**不验**，在裁决里列成「人工手测」；人工手测**不拦关闭**。
 - 勾选框（`- [x]`）只算声称，不算证据：每条都要自己找证据。

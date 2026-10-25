@@ -79,9 +79,28 @@ test('SC3 pi 只在 bwrap 里跑；环境是白名单，PI_NO_SANDBOX 关不掉'
   assert.equal('GITHUB_TOKEN' in modelCall.options.env, false);
   assert.equal('PI_NO_SANDBOX' in modelCall.options.env, false);
   assert.equal(modelCall.options.input, '先写复现测试');
-  assert.ok(modelCall.args.includes(profile.githubTokenFile), '令牌文件在遮罩名单上');
-  const tokenAt = modelCall.args.indexOf(profile.githubTokenFile);
-  assert.deepEqual(modelCall.args.slice(tokenAt - 2, tokenAt + 1), ['--ro-bind', '/dev/null', profile.githubTokenFile]);
+  // 令牌文件要么单独遮成 /dev/null，要么落在宿主 HOME 里（整个 HOME 盖空 tmpfs、没被白名单挂回来，本来就读不到，
+  // buildBwrapArgs 不再给它造挂载点）。临时目录在不在 HOME 里取决于跑测试的环境（TMPDIR），两种都要认。
+  const tokenReal = fs.realpathSync(profile.githubTokenFile);
+  const hostHome = fs.realpathSync(process.env.HOME);
+  const within = (child, parent) => {
+    const rel = path.relative(parent, child);
+    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  };
+  if (within(tokenReal, hostHome)) {
+    const at = modelCall.args.indexOf(hostHome);
+    assert.equal(modelCall.args[at - 1], '--tmpfs', '宿主 HOME 整个盖空 tmpfs');
+    const remounted = [];
+    for (let i = 0; i < modelCall.args.length - 2; i += 1) {
+      if (modelCall.args[i] === '--ro-bind' || modelCall.args[i] === '--bind') remounted.push(modelCall.args[i + 1]);
+    }
+    const exposedBy = remounted.filter((dir) => dir !== '/' && dir !== '/dev/null' && within(tokenReal, dir));
+    assert.deepEqual(exposedBy, [], '令牌文件所在目录没被挂回沙箱');
+  } else {
+    assert.ok(modelCall.args.includes(tokenReal), '令牌文件在遮罩名单上');
+    const tokenAt = modelCall.args.indexOf(tokenReal);
+    assert.deepEqual(modelCall.args.slice(tokenAt - 2, tokenAt + 1), ['--ro-bind', '/dev/null', tokenReal]);
+  }
 });
 
 test('SC3 bwrap 起不来就不跑模型（返回 unavailable）', async () => {

@@ -57,3 +57,22 @@ export function buildDispatchMessage({ issue, kind, round, commentId, bodyVersio
     '- 只按步骤文档做这一轮，不要顺手做别的事。',
   ].join('\n');
 }
+
+/**
+ * 宿主预取的代码（#47 SC11）：host/round.mjs 认领之后把每个仓的 main 检出到本轮目录、只读挂进沙箱，
+ * 再用这个函数把路径接到派发消息后面。路径是沙箱里能直接用的绝对路径（本轮目录），不含令牌、状态目录。
+ * `code` 为 [{repo, path, head}]；空数组原样返回消息。
+ */
+export function appendCodePaths(message, code = []) {
+  if (!Array.isArray(code) || code.length === 0) return message;
+  const lines = ['', '代码（宿主已检出各仓 main，只读）：'];
+  for (const entry of code) {
+    if (typeof entry?.repo !== 'string' || typeof entry?.path !== 'string' || !entry.path.startsWith('/')) {
+      fail('代码路径应为 {repo, path(绝对路径)}');
+    }
+    const head = typeof entry.head === 'string' && /^[0-9a-f]{7,64}$/.test(entry.head) ? `（main @ ${entry.head.slice(0, 12)}）` : '';
+    lines.push(`- ${entry.repo}：${entry.path}${head}`);
+  }
+  lines.push('- 需要可写副本（装依赖、跑会写文件的测试）时复制到 $TMPDIR 再用；沙箱里没有凭证，不要 git clone。');
+  return `${String(message).replace(/\n+$/, '')}\n${lines.join('\n')}`;
+}
