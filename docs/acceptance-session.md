@@ -51,6 +51,14 @@ node watchers/acceptance/bin/helper.mjs <collect|progress|verdict|close|correct|
 
 `collect`（`disputed`）和 #45 的 `round.mjs status --json`（`disputed`）都按这一行认条目：行里必须出现「有争议」，条目用 `owner/repo#n SC<k>` 取。有争议时由调度器另起一次只读裁决运行（模型 `anthropic/claude-opus-5-5`，推理 medium），结论写进下一轮裁决。
 
+### 裁决运行（已实现，`host/adjudicate.mjs`）
+
+- **触发**：最近一次出结论（通过 / 要修）的验收轮评论里有上面这种行（`trigger` 只认 `- 有争议：<owner/repo#n> SC<k>` 开头的行，证据里顺带提到「有争议」不算），宿主还没有这一轮的裁决结果 → `trigger` 判 `awaiting-adjudication`（以前这里判「已是最新」，任务静默卡死），`poll` 报 `adjudicate` 条目，宿主起一次裁决运行。同一任务同一轮只起一次，和验收轮共用槽和内存门。
+- **只读**：和验收轮同一个 bwrap 沙箱，但不给写闸 socket，GitHub 写不了；输入是争议条目、SC 原文、双方理由、相关 PR，代码和验收轮一样由宿主预取、只读挂进去。
+- **结果**：pi 最后一行输出 `{"items":[{"ref":"owner/repo#n","sc":3,"ruling":"成立|不成立","why":"…"}]}`，宿主校验后写进 `<home>/state/host/adjudications/<owner>__<repo>__<号>__<轮次>.json`（宿主状态目录，模型不可写）。
+- **下一轮**：`trigger` 判 `adjudicated` 触发，派发消息里多一节「裁决结果（第 n 轮的有争议条目……）」，逐条写 `- <ref> SC<k>：成立|不成立 · 理由：…`。验收会话按裁决定这些条目：**成立 = 要修**（照第 3 节开修正子 issue），**不成立 = 通过**，证据里引用裁决（例如「按第 n 轮裁决：不成立，<理由>」）；**不再写「有争议」行**。
+- **配置**：host.json `adjudicateCommand`（形如 `piCommand` 的数组，默认文档写法 `["pi","--model","anthropic/claude-opus-5-5","--thinking","medium"]`；没配就不起，写 `adjudicate-not-configured`，一天一次）、`adjudicateMaxMinutes`（默认 30，超时写 `adjudicate-timeout`）；失败最多重试 2 次，用完写 `adjudicate-needs-human`。
+
 ## 2. 通过（SC4）
 
 `close --verified <verified.json>`：

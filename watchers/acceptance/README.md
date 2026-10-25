@@ -83,6 +83,14 @@ stdout 是 JSON 数组。该开始的任务：
 
 这两种 tick 都不起轮次，只往 `alerts.jsonl` 写提醒（`task-out-of-scope` / `passed-but-open`，同一任务 24 小时一次）。
 
+最近一次出结论的轮次里有「有争议」行、宿主还没有这一轮的裁决结果（#46 SC8）时报：
+
+```json
+[{ "issue": "example-owner/example-repo#5", "adjudicate": true, "round": 2, "items": ["example-owner/example-repo#5 SC3"] }]
+```
+
+tick 不起验收轮，而是起一次只读裁决运行（`host/adjudicate.mjs`）；结果出来后这条任务按「该开始」照常报出，派发消息带上裁决结果。
+
 没有任务时输出 `[]`。不加 `--json` 则每条一行。`poll` **不发任何写请求、不写本地缓存、不调模型**。失败时往 stderr 写错误并退出码 1。
 
 ## 写操作出口
@@ -108,6 +116,9 @@ stdout 是 JSON 数组。该开始的任务：
 | `host/tick.mjs` | 一拍调度：沙箱外跑 `poll.mjs` → 卡住先杀进程再 abort → 按空槽起轮次 → 写心跳 |
 | `host/round.mjs` | 一轮验收：内存门、槽/测试锁、总开关与 bwrap 探针（认领前）、认领、预取代码、写闸 serve、bwrap 里跑 pi、按宿主观察到的活动判卡住、总时长上限 |
 | `host/prefetch.mjs` | 认领后替本轮检出任务树里每个仓的 main（宿主镜像 fetch，凭证不进沙箱），只读挂进沙箱 |
+| `host/adjudicate.mjs` | 有争议条目的只读裁决运行：同一组槽和内存门、同一个 bwrap 沙箱但不给写闸 socket，结果写进 `state/host/adjudications/` |
+| `host/adjudication-store.mjs` | 裁决结果的路径与读写、「最近一次裁决里有没有争议」（`bin/tasks.mjs` 也用） |
+| `host/slack-notify.mjs`、`host/slack-blocks.mjs` | Slack 通知（#61）：见 [`docs/acceptance-slack.md`](../../docs/acceptance-slack.md) |
 | `host/write-gate.mjs` | 写闸：exec / serve / probe 三种用法，所有写动作在沙箱外再查一遍 |
 | `host/gate-client.mjs` | 沙箱里的 `writeCommand`：动作 JSON 经 unix socket 交给写闸 |
 | `host/sandbox.mjs` | bwrap 参数（独立网络命名空间、`/run` 盖空、宿主 HOME 默认遮掉、白名单只读挂回）、遮罩名单（从 profile 算）、环境变量白名单（经 spawn 的 env 传，不进命令行） |
@@ -118,5 +129,6 @@ stdout 是 JSON 数组。该开始的任务：
 | `bin/doctor.mjs` | 部署检查：缺哪项报哪项，退出码非 0 |
 
 宿主状态都在 `<home>/state/` 下：`write-gate/enabled`（总开关）、`write-gate/ledger.jsonl`（去重账本）、
-`host/heartbeat.json`（心跳）、`host/alerts.jsonl`（提醒，一行一条）、`host/rounds/`（在跑的轮次）、`host/progress/`（宿主观察到的轮次活动，卡住判定以它为准）。
+`host/heartbeat.json`（心跳）、`host/alerts.jsonl`（提醒，一行一条）、`host/rounds/`（在跑的轮次）、`host/progress/`（宿主观察到的轮次活动，卡住判定以它为准）、
+`host/adjudications/`（裁决结果）。
 提醒只写文件、不调 Slack（发 Slack 归 #61）。

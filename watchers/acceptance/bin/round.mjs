@@ -234,6 +234,7 @@ async function cmdStart({ flags, github, profile, now, stdout, stderr, alert }) 
     round: started.round,
     commentId: started.commentId,
     bodyVersion: started.bodyVersion,
+    adjudication: task.dispute?.adjudication || undefined,
   });
   stdout.write(`${message}\n`);
   stdout.write(

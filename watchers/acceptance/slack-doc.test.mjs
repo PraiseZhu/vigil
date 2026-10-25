@@ -156,3 +156,22 @@ test('SC6 文档与示例：只用占位符，运维文档和验收机 README �
   assert.equal(example.slackChannelId, 'C0123456789');
   assert.equal(example.slackMentionUserId, 'U0123456789');
 });
+
+test('#43/#61 文档：即时提醒与 6 小时去重、失败可见（slack-failed / slackFailing / ensure.sh）、读历史失败不阻塞、每日上限、doctor 检查', () => {
+  assert.match(doc, /同一原因 6 小时内只立即发一次/);
+  for (const kind of ['round-timeout', 'sandbox-down', 'prefetch-failed', 'adjudicate-needs-human', 'slack-failed', 'slack-history-failed']) {
+    assert.ok(doc.includes(`\`${kind}\``), `文档缺 ${kind}`);
+  }
+  assert.match(doc, /slackFailing/);
+  assert.match(doc, /直到下一次有消息发成功才清掉/);
+  assert.match(doc, /ensure\.sh/);
+  assert.match(doc, /slack-failed: since=/);
+  assert.match(doc, /缺了不再卡住发送/);
+  assert.match(doc, /bot 必须\*\*在目标频道里\*\*/);
+  assert.match(doc, /slackDailyCap/);
+  assert.match(doc, /默认 \*\*30\*\*/);
+  assert.match(doc, /摘要算 1 条/);
+  assert.match(doc, /已达上限/);
+  assert.match(doc, /conversations\.info/);
+  assert.match(doc, /\/checks/);
+});

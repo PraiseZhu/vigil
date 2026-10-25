@@ -55,7 +55,14 @@
 
 ## 6. 有争议、待裁决
 
-`status --json` 的 `disputed` 列出本轮评论里带「有争议」的行，`pending` 列出带「待裁决」的行。有争议时，宿主另起一个**只读的裁决 run**（模型按 #46/#47），裁决结果写进下一轮的裁决评论；`abort`/`status` 都不改裁决内容。
+`status --json` 的 `disputed` 列出本轮评论里带「有争议」的行，`pending` 列出带「待裁决」的行。`abort`/`status` 都不改裁决内容。
+
+有争议时宿主另起一个**只读的裁决运行**（**已实现**：`host/adjudicate.mjs`，模型 `anthropic/claude-opus-5-5`、推理 medium，配在 host.json 的 `adjudicateCommand`），裁决结果写进下一轮的裁决评论：
+
+- 最近一次出结论的轮次评论里有 `- 有争议：<owner/repo#n> SC<k> · …` 行、还没有裁决结果时，`trigger` 判 `awaiting-adjudication`，`poll --json` 不报「该开始」，而是报一条 `{"issue": "...", "adjudicate": true, "round": n, "items": ["owner/repo#n SC<k>", ...]}`。这种条目**不要** `round.mjs start`（start 也会以 `3` 退出）。
+- 宿主（`host/tick.mjs`）用剩下的空槽起 `host/adjudicate.mjs run --issue <ref> --round <n> --item "<ref> SC<k>" ...`：过同一个内存门、占同一组槽；同一任务同一轮同时只有一个，出过结果不再起；沙箱里没有写闸 socket，GitHub 写不了。
+- 结果写进宿主状态目录 `<home>/state/host/adjudications/<owner>__<repo>__<号>__<轮次>.json`；之后 `trigger` 判 `adjudicated`，`poll` 照常报「该开始」，`round.mjs start` 的派发消息带上裁决结果。
+- 总时长上限 host.json `adjudicateMaxMinutes`（默认 30），超时先结束进程再写 `adjudicate-timeout`；一共最多跑 3 次，用完写 `adjudicate-needs-human`。没配 `adjudicateCommand` 就不起，写 `adjudicate-not-configured`（一天一次）。
 
 ## 7. 最小调度脚本示例
 
@@ -105,12 +112,12 @@ while IFS= read -r line; do
     || echo "abort 失败：$issue" >&2
 done < "$work/stale.jsonl"
 
-# 该开始的任务：每行一个 issue 引用。
+# 该开始的任务：每行一个 issue 引用。有争议等裁决的条目（adjudicate）不认领，由宿主起裁决运行（第 6 节）。
 node -e '
 const fs = require("node:fs");
 const entries = JSON.parse(fs.readFileSync(process.argv[1], "utf8") || "[]");
 for (const entry of entries) {
-  if (entry && !entry.stale) process.stdout.write(entry.issue + "\n");
+  if (entry && !entry.stale && !entry.adjudicate) process.stdout.write(entry.issue + "\n");
 }
 ' "$work/poll.json" > "$work/refs.txt"
 

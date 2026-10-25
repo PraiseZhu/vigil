@@ -28,8 +28,32 @@ function checkCommentId(commentId) {
   return commentId;
 }
 
+const ITEM_REF_PATTERN = /^[\w.-]+\/[\w.-]+#\d+$/;
+const RULINGS = new Set(['成立', '不成立']);
+
+/**
+ * 宿主只读裁决运行的结果（#46 SC8），可选：`{ round, items: [{ ref, sc, ruling, why }] }`。
+ * 结果文件在宿主状态目录里（沙箱里看不到），所以把内容直接写进消息；理由压成一行、最多 500 字。
+ */
+function adjudicationLines(adjudication) {
+  if (adjudication === undefined || adjudication === null) return [];
+  const { round, items } = adjudication;
+  if (!Number.isInteger(round) || round <= 0) fail('裁决结果的轮次应为正整数');
+  if (!Array.isArray(items) || items.length === 0) fail('裁决结果应至少有一条');
+  const lines = ['', `裁决结果（第 ${round} 轮的有争议条目，宿主只读裁决运行给出）：`];
+  for (const item of items) {
+    if (!item || typeof item.ref !== 'string' || !ITEM_REF_PATTERN.test(item.ref)) fail('裁决结果的 ref 应为 owner/repo#编号');
+    if (!Number.isInteger(item.sc) || item.sc <= 0) fail('裁决结果的 SC 应为正整数');
+    if (!RULINGS.has(item.ruling)) fail('裁决结果只能是「成立」或「不成立」');
+    const why = String(item.why ?? '').replace(/\s+/g, ' ').trim().slice(0, 500);
+    lines.push(`- ${item.ref} SC${item.sc}：${item.ruling}${why ? ` · 理由：${why}` : ''}`);
+  }
+  lines.push(`按裁决定这些条目（${SESSION_DOC} 第 3 节）：成立 = 要修，不成立 = 通过并在证据里引用裁决；不要再标「有争议」。`);
+  return lines;
+}
+
 /** 生成一轮验收的派发消息（中文）。字段不合法直接抛错。 */
-export function buildDispatchMessage({ issue, kind, round, commentId, bodyVersion } = {}) {
+export function buildDispatchMessage({ issue, kind, round, commentId, bodyVersion, adjudication } = {}) {
   if (typeof issue !== 'string' || !ISSUE_PATTERN.test(issue)) {
     fail('issue 应为 owner/repo#编号');
   }
@@ -50,6 +74,7 @@ export function buildDispatchMessage({ issue, kind, round, commentId, bodyVersio
     `轮次评论 id：${comment}`,
     `正文版本：${bodyVersion}`,
     `步骤文档：${SESSION_DOC}`,
+    ...adjudicationLines(adjudication),
     '',
     '规则：',
     `- 每一条写操作都走 node watchers/acceptance/bin/helper.mjs <cmd> --issue ${issue} --round ${round}，不要直接调 gh 或改本地文件。`,

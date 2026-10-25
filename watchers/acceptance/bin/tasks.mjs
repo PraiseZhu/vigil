@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // 盘点：一次 GraphQL 拉开放/关闭 issue，组成我建的任务树，并按名单分档。
 import { bodyVersion, parseRounds } from './rounds.mjs';
+import { taskDispute } from '../host/adjudication-store.mjs';
 
 const ISSUE_FIELDS = `id
         number
@@ -131,8 +132,10 @@ function toTask(issue, profile) {
         .filter((childRepo) => !repoTier(childRepo, profile)),
     ),
   ];
+  const ref = issueRef(repo, issue.number);
+  const rounds = parseRounds(issue.comments?.nodes || [], profile.ownerLogin);
   return {
-    ref: issueRef(repo, issue.number),
+    ref,
     repo,
     number: issue.number,
     kind,
@@ -155,8 +158,10 @@ function toTask(issue, profile) {
       mergedAt: pr.mergedAt || null,
       url: pr.url,
     })),
-    rounds: parseRounds(issue.comments?.nodes || [], profile.ownerLogin),
+    rounds,
     outOfScope,
+    // 最近一次裁决里的「有争议」条目和宿主的裁决结果（#46 SC8）：trigger 据此等裁决、裁决出来后触发下一轮。
+    dispute: taskDispute({ comments: issue.comments?.nodes, rounds, profile, ref }),
   };
 }
 

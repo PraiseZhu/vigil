@@ -205,3 +205,21 @@ test('SC12 静态：新文件不含真实用户名、绝对家目录路径；只
   assert.match(localgit, new RegExp(`^import \\{ spawn \\} from '${childProcess}';$`, 'm'));
   assert.doesNotMatch(localgit, /import\(/);
 });
+
+test('#46 SC8 SESSION.md 写清有裁决结果时怎么做：成立 = 要修，不成立 = 通过并引用裁决，不再标有争议', () => {
+  assert.match(session, /### 有裁决结果时/);
+  assert.match(session, /`成立`：验收方对，这一条\*\*要修\*\*/);
+  assert.match(session, /`不成立`：修正方对，这一条\*\*通过\*\*/);
+  assert.match(session, /证据里引用裁决/);
+  assert.match(session, /不要\*\*再写「有争议」行/);
+});
+
+test('#46 SC8 docs/acceptance-session.md 写清裁决运行已实现：触发、只读、结果位置、下一轮、配置', () => {
+  const doc = fs.readFileSync(path.join(HERE, '..', '..', 'docs', 'acceptance-session.md'), 'utf8');
+  assert.match(doc, /### 裁决运行（已实现，`host\/adjudicate\.mjs`）/);
+  assert.match(doc, /awaiting-adjudication/);
+  assert.match(doc, /state\/host\/adjudications/);
+  assert.match(doc, /adjudicateCommand/);
+  assert.match(doc, /adjudicateMaxMinutes/);
+  assert.match(doc, /adjudicate-needs-human/);
+});

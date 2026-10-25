@@ -13,6 +13,7 @@ import { run as procRun, spawnDetached } from './proc.mjs';
 import { MAX_ROUNDS, TEST_LOCK_PATTERN, readHostConfig } from './round.mjs';
 import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbot.mjs';
 import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
+import { defaultSpawnAdjudicate, scheduleAdjudications } from './adjudicate.mjs';
 
 const SLOTS = ['slot-0', 'slot-1'];
 const KILL_GRACE_MS = 10000;
@@ -78,6 +79,7 @@ function slackHeartbeat(result) {
   };
   if (value.reason) out.reason = String(value.reason);
   if (value.error) out.error = String(value.error);
+  if (Number(value.capped) > 0) out.capped = Number(value.capped);
   return out;
 }
 
@@ -110,6 +112,16 @@ export function remindPollNotices(paths, entries, { now = () => Date.now() } = {
     written.push(appendAlert(paths, { ...alert, now }));
   }
   return written;
+}
+
+/** 上一拍心跳里的 Slack 失败标记（发送重试用完）：这一拍没读到账本时原样留着，直到下一次发送成功才清。 */
+function previousSlackFailing(paths) {
+  try {
+    const previous = JSON.parse(fs.readFileSync(paths.heartbeatFile, 'utf8'));
+    return previous?.slackFailing && typeof previous.slackFailing === 'object' ? previous.slackFailing : null;
+  } catch {
+    return null;
+  }
 }
 
 /** 读轮次登记目录：<roundsDir>/<owner>__<repo>__<issue 号>__<n>.json。坏文件跳过。 */
@@ -223,6 +235,7 @@ export async function runTick({
   spawnRound,
   runRound: runRoundFn,
   spawnPrbot,
+  spawnAdjudicate,
   discoverPrbot,
   checkPrbotStalled,
   cleanupPrbot,
@@ -240,6 +253,7 @@ export async function runTick({
   const abortRound = runRoundFn || defaultAbort({ home, env, now, root: repoRoot });
   const startRound = spawnRound || defaultSpawnRound({ home, env, root: repoRoot });
   const startPrbot = spawnPrbot || defaultSpawnPrbot({ home, env, root: repoRoot });
+  const startAdjudicate = spawnAdjudicate || defaultSpawnAdjudicate({ home, env, root: repoRoot });
 
   const heartbeat = {
     at: new Date(now()).toISOString(),
@@ -392,13 +406,31 @@ export async function runTick({
 
     // 3. 该开始的任务：已在跑的不重开，最多占到空槽数；总开关关着就一个都不起。
     let free = gateEnabled ? Math.max(0, MAX_ROUNDS - liveSlotCount(paths)) : 0;
-    for (const entry of entries.filter((item) => item && !item.stale && !item.outOfScope && !item.passedButOpen)) {
+    for (const entry of entries.filter((item) => item && !item.stale && !item.outOfScope && !item.passedButOpen && !item.adjudicate)) {
       if (free <= 0) break;
       const record = byIssue.get(entry.issue);
       if (record && isAlive(Number(record.pid))) continue;
       const pid = startRound(entry.issue);
       heartbeat.lastTick.started.push({ issue: entry.issue, pid: pid ?? null });
       free -= 1;
+    }
+
+    // 3c. 有争议、等裁决（#46 SC8）：剩下的空槽给只读裁决运行；出错不拖垮这一拍。
+    if (entries.some((item) => item?.adjudicate)) {
+      try {
+        const scheduled = scheduleAdjudications({
+          home,
+          entries,
+          hostConfig: readHostConfig(paths.hostConfig),
+          spawn: startAdjudicate,
+          now,
+          free,
+        });
+        free = scheduled.free;
+        heartbeat.lastTick.adjudicate = { started: scheduled.started, skipped: scheduled.skipped };
+      } catch (error) {
+        heartbeat.lastTick.adjudicateError = String(error?.message || error);
+      }
     }
   } catch (error) {
     heartbeat.lastTick.ok = false;
@@ -417,14 +449,17 @@ export async function runTick({
 
   // 4. Slack 通知（#61）：放在验收调度之后（#70 复审：Slack 卡住不能拖慢验收），这一拍新写的提醒也一起发。
   //    总时长有上限（boundedNotify），整个调用 try/catch：出错只进心跳，绝不影响这一拍。
+  let slackFailing = previousSlackFailing(paths);
   try {
-    heartbeat.slack = slackHeartbeat(
-      await boundedNotify(notify, { home, env: { ...env, ACCEPTANCE_WATCHER_HOME: home }, now, ...notifyOptions }, notifyWaitMs),
-    );
+    const result = await boundedNotify(notify, { home, env: { ...env, ACCEPTANCE_WATCHER_HOME: home }, now, ...notifyOptions }, notifyWaitMs);
+    heartbeat.slack = slackHeartbeat(result);
+    // 读到了账本才知道失败标记的最新状态；没读到（没配、令牌坏、超时）就沿用上一拍的。
+    if (result && typeof result === 'object' && Object.hasOwn(result, 'failing')) slackFailing = result.failing || null;
   } catch (error) {
     // 异常文字不进心跳（万一里面带了请求头之类的东西），只记原因。
     heartbeat.slack = slackHeartbeat({ ok: false, reason: 'notify-error', error: String(error?.name || 'unknown') });
   }
+  if (slackFailing) heartbeat.slackFailing = slackFailing;
 
   try {
     return writeHeartbeat();

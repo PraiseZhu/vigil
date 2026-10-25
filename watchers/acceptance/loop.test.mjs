@@ -169,6 +169,32 @@ test('SC12 ensure.sh：心跳新鲜且 pid 活着 → 什么都不做、不写�
   assert.deepEqual(readAlerts(paths), []);
 });
 
+test('#61 ensure.sh：心跳里有 slackFailing（Slack 发送重试用完）就在输出里报一行，循环正常也报', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const hostCopy = makeHostCopy(home, path.join(home, 'tick.log'));
+  const paths = hostPaths(home);
+  fs.mkdirSync(paths.hostDir, { recursive: true });
+  const nowMs = Date.parse('2026-10-24T02:00:00.000Z');
+  const beat = { at: new Date(nowMs).toISOString(), pid: process.pid, lastTick: { ok: true }, running: [] };
+  fs.writeFileSync(paths.heartbeatFile, JSON.stringify(beat));
+  const clean = await runScript(path.join(hostCopy, 'ensure.sh'), home, { ACCEPTANCE_NOW_MS: String(nowMs) });
+  assert.equal(clean.code, 0, clean.stderr);
+  assert.equal(clean.stdout.includes('slack-failed'), false, '没有失败就不报');
+
+  fs.writeFileSync(
+    paths.heartbeatFile,
+    JSON.stringify({
+      ...beat,
+      slackFailing: { since: '2026-10-24T01:00:00.000Z', lastAt: '2026-10-24T01:40:00.000Z', kind: 'blocked', error: 'http-500 <!channel>', count: 2 },
+    }),
+  );
+  const result = await runScript(path.join(hostCopy, 'ensure.sh'), home, { ACCEPTANCE_NOW_MS: String(nowMs) });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /^slack-failed: since=2026-10-24T01:00:00.000Z last=2026-10-24T01:40:00.000Z kind=blocked error=http-500channel count=2$/m);
+  assert.equal(fs.existsSync(paths.loopLog), false, '循环正常，不拉起');
+  assert.deepEqual(readAlerts(paths), []);
+});
+
 test('SC12 ensure.sh：心跳过期的拉起循环并写一条提醒；连跑两次也只有一个循环', async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');

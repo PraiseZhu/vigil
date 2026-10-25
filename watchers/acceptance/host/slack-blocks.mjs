@@ -106,6 +106,17 @@ function httpUrl(value) {
   return /^https:\/\/github\.com\/[^\s|<>]+$/.test(url) ? url : '';
 }
 
+/**
+ * CI 链接：事件给的 checks.url 只是 PR 页（prbot 给的就是 PR 地址）时改成它的 /checks 页；
+ * 没给就按 PR 链接拼 /checks；都没有就不放链接。
+ */
+export function ciLink(checksUrl, target) {
+  const url = httpUrl(checksUrl);
+  if (url && PR_URL.test(url)) return `${url}/checks`;
+  if (url) return url;
+  return target?.link ? `${target.link}/checks` : '';
+}
+
 function header(text) {
   // plain_text 不解析 mrkdwn，不能转义（否则会原样显示 &lt;），只拆 @。标题本来也只用校验过的字段拼。
   return { type: 'header', text: { type: 'plain_text', text: clip(mute(text), HEADER_LIMIT), emoji: true } };
@@ -164,6 +175,7 @@ export function readyBlocks(notice, profile) {
   const total = checks ? Number(checks.total) : NaN;
   const diff = event.diff && typeof event.diff === 'object' ? event.diff : null;
   const files = diff ? Number(diff.files) || 0 : null;
+  const ci = checks ? ciLink(checks.url, target) : '';
 
   const blocks = [header(title)];
   const fields = fieldsBlock([
@@ -173,8 +185,8 @@ export function readyBlocks(notice, profile) {
     [
       'CI',
       Number.isFinite(total)
-        ? httpUrl(checks.url)
-          ? `<${httpUrl(checks.url)}|CI ${Number(checks.green) || 0}/${total} 绿>`
+        ? ci
+          ? `<${ci}|CI ${Number(checks.green) || 0}/${total} 绿>`
           : `CI ${Number(checks.green) || 0}/${total} 绿`
         : '',
     ],
@@ -242,6 +254,14 @@ const ALERT_TITLES = {
   'loop-restarted': '调度循环被重新拉起',
   'tick-failed': '这一拍出错',
   'prbot-tick-failed': '修正轮这一拍出错',
+  'round-timeout': '轮次超过总时长上限',
+  'sandbox-down': '沙箱起不来',
+  'prefetch-failed': '代码预取失败',
+  'adjudicate-needs-human': '有争议条目裁决不出来，需要人工裁决',
+  'adjudicate-failed': '裁决运行失败（会重试）',
+  'adjudicate-timeout': '裁决运行超时（会重试）',
+  'adjudicate-not-configured': '有争议条目在等裁决，但没配裁决运行',
+  'slack-history-failed': '读不到 Slack 频道历史',
 };
 
 /** `secret-found` 的 reason 形如「…没推：a.js, b.txt」：只取冒号后面的文件名列表。 */
@@ -317,4 +337,12 @@ export function digestBlocks(notices, profile) {
   const blocks = [header(title), section(lines.join('\n') || '（没有内容）')];
   const text = clip(`${title}：${heads.slice(0, 3).join('；')}`, 500);
   return finish({ text, blocks }, profile);
+}
+
+/** 当天碰到每日上限时发的那一条：不 @、不带事件内容。 */
+export function capBlocks(cap, profile) {
+  const count = Number.isInteger(cap) && cap > 0 ? cap : 0;
+  const title = `今天的 Slack 通知已达上限（${count} 条）`;
+  const blocks = [header(title), section('后面的事件不再单独发，攒进明天的第一条摘要；明天零点（本机时间）起重新计数。')];
+  return finish({ text: `${title}｜后面的事件攒进明天的摘要`, blocks }, profile);
 }

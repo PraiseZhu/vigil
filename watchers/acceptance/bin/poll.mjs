@@ -68,6 +68,9 @@ export async function poll({ github, profile, now = () => Date.now(), hostProgre
         nextRound: nextRoundNumber(task.rounds),
         bodyVersion: task.bodyVersion,
       });
+    } else if (decision.reason === 'awaiting-adjudication') {
+      // 有争议、还没有裁决结果：宿主起一次只读裁决运行（host/adjudicate.mjs），不开新一轮。
+      out.push({ issue: task.ref, adjudicate: true, round: decision.dispute.round, items: decision.dispute.items });
     } else if (!stale) {
       const open = passedButOpen(task, profile);
       if (open) out.push(open);
@@ -94,6 +97,8 @@ async function main(argv = process.argv.slice(2)) {
           process.stdout.write(`${entry.issue} 任务树里有名单外的仓，不派发：${entry.outOfScope.join(', ')}\n`);
         } else if (entry.passedButOpen) {
           process.stdout.write(`${entry.issue} 第 ${entry.round} 轮已通过但 issue 还开着\n`);
+        } else if (entry.adjudicate) {
+          process.stdout.write(`${entry.issue} 第 ${entry.round} 轮有争议，等裁决：${entry.items.join('、')}\n`);
         } else {
           process.stdout.write(`${entry.issue} ${entry.kind} 下一轮 ${entry.nextRound} ${entry.bodyVersion}\n`);
         }

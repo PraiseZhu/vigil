@@ -6,16 +6,19 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
-import { appendAlert, hostPaths } from './host/paths.mjs';
+import { appendAlert, hostPaths, readAlerts } from './host/paths.mjs';
 import { appendPrbotEvent } from './host/prbot-events.mjs';
 import { maskList, sandboxEnv } from './host/sandbox.mjs';
 import {
   BLOCKED_ALERT_KINDS,
+  DEFAULT_DAILY_CAP,
   DIGEST_MINUTES,
   RETRY_MINUTES,
+  checkSlackAccess,
   classify,
   eventId,
   notifySlack,
+  readDailyCap,
   readSlackToken,
 } from './host/slack-notify.mjs';
 import { runTick } from './host/tick.mjs';
@@ -146,13 +149,22 @@ test('事件表：每个 type / kind 是立即发、进摘要还是不（含未�
     ['prbot', { type: 'something-new' }, 'skip'],
     ['alerts', { kind: 'secret-found' }, 'blocked'],
     ['alerts', { kind: 'sandbox-unavailable' }, 'blocked'],
-    ['alerts', { kind: 'gate-rejected' }, 'digest'],
-    ['alerts', { kind: 'write-rejected' }, 'digest'],
-    ['alerts', { kind: 'round-stalled' }, 'digest'],
-    ['alerts', { kind: 'round-stale' }, 'digest'],
+    // #43：首次卡住、写闸拒绝、调度循环停摆立即发（notifySlack 里再按 6 小时去重）。
+    ['alerts', { kind: 'gate-rejected' }, 'blocked'],
+    ['alerts', { kind: 'write-rejected' }, 'blocked'],
+    ['alerts', { kind: 'round-stalled' }, 'blocked'],
+    ['alerts', { kind: 'round-stale' }, 'blocked'],
+    ['alerts', { kind: 'loop-restarted' }, 'blocked'],
+    ['alerts', { kind: 'adjudicate-needs-human' }, 'blocked'],
+    ['alerts', { kind: 'round-timeout' }, 'blocked'],
+    ['alerts', { kind: 'sandbox-down' }, 'blocked'],
+    ['alerts', { kind: 'prefetch-failed' }, 'blocked'],
     ['alerts', { kind: 'round-failed' }, 'digest'],
     ['alerts', { kind: 'gate-unavailable' }, 'digest'],
-    ['alerts', { kind: 'loop-restarted' }, 'digest'],
+    ['alerts', { kind: 'adjudicate-failed' }, 'digest'],
+    ['alerts', { kind: 'slack-history-failed' }, 'digest'],
+    // Slack 自己的发送失败不往 Slack 报（免得绕圈）。
+    ['alerts', { kind: 'slack-failed' }, 'skip'],
     ['alerts', { kind: 'tick-failed' }, 'digest'],
     ['alerts', { kind: 'prbot-tick-failed' }, 'digest'],
     ['alerts', { kind: '从未见过的新提醒' }, 'digest'],
@@ -267,18 +279,35 @@ test('删掉账本后靠 conversations.history 的 metadata 不重发（按 curs
   });
 });
 
-test('history 失败这一拍一条都不发，心跳写 ledger-rebuild-failed', async () => {
+test('首次读历史失败：不补发历史、写 slack-history-failed 提醒，账本照常建，从现在起的新事件照发', async () => {
   const { home, profile } = setup();
   const t0 = Date.parse(START_AT);
   prbotEvent(home, { type: 'needs-human', issue: `${REPO}#2`, root: `${REPO}#1`, reason: 'no-change' }, t0);
   await withSlack(
-    (entry) => (entry.path.endsWith('/conversations.history') ? { status: 500, body: { ok: false, error: 'boom' } } : undefined),
+    (entry) =>
+      entry.path.endsWith('/conversations.history') ? { status: 200, body: { ok: false, error: 'missing_scope' } } : undefined,
     async (fake) => {
       const result = await notifySlack({ home, profile, now: () => t0, fetch: fake.fetch, apiBase: fake.apiBase });
       assert.equal(result.ok, false);
       assert.equal(result.reason, 'ledger-rebuild-failed');
-      assert.equal(fake.posts().length, 0, '重建失败就不发');
-      assert.equal(fs.existsSync(ledgerFile(home)), false, '账本不写半截');
+      assert.equal(fake.posts().length, 0, '历史上的事件不补发');
+      const ledger = readLedger(home);
+      assert.ok(ledger.historyFailedAt, '账本照常建，记下读历史失败');
+      const alert = readAlerts(hostPaths(home)).find((entry) => entry.kind === 'slack-history-failed');
+      assert.ok(alert, '写一条 slack-history-failed 提醒');
+      assert.match(alert.reason, /channels:history/);
+      assert.match(alert.reason, /groups:history/);
+      assert.match(alert.reason, /bot 要在频道里/);
+      assert.match(alert.detail, /missing_scope/);
+
+      // 下一拍：不再翻历史；新事件照发，那条提醒进摘要。
+      prbotEvent(home, { type: 'needs-human', issue: `${REPO}#3`, root: `${REPO}#1`, reason: 'no-change' }, t0 + 60000);
+      const next = await notifySlack({ home, profile, now: () => t0 + 60000, fetch: fake.fetch, apiBase: fake.apiBase });
+      assert.equal(next.ok, true, JSON.stringify(next));
+      assert.equal(fake.history().length, 1, '只在没有账本时翻一次');
+      assert.equal(fake.posts().length, 1, '新事件立即发');
+      assert.match(fake.posts()[0].body, /#3/);
+      assert.ok(readLedger(home).pending.some((item) => item.type === 'slack-history-failed'), '提醒进摘要');
     },
   );
 });
@@ -288,7 +317,7 @@ test('history 失败这一拍一条都不发，心跳写 ledger-rebuild-failed',
 test('摘要攒满 60 分钟才发一条，且不 @', async () => {
   const { home, profile } = setup();
   const t0 = Date.parse(START_AT);
-  alertEvent(home, { kind: 'loop-restarted', reason: '心跳过期' }, t0);
+  alertEvent(home, { kind: 'tick-failed', reason: '这一拍出错' }, t0);
   await withSlack(undefined, async (fake) => {
     const send = (ts) => notifySlack({ home, profile, now: () => ts, fetch: fake.fetch, apiBase: fake.apiBase });
 
@@ -298,7 +327,7 @@ test('摘要攒满 60 分钟才发一条，且不 @', async () => {
     assert.equal(first.pending, 1);
     assert.equal(fake.posts().length, 0, '刚进来只攒着');
 
-    alertEvent(home, { kind: 'round-stalled', issue: `${REPO}#3`, reason: '卡住' }, t0 + 30 * 60000);
+    alertEvent(home, { kind: 'round-failed', issue: `${REPO}#3`, reason: '宿主出错' }, t0 + 30 * 60000);
     const second = await send(t0 + 30 * 60000);
     assert.equal(second.pending, 2);
     assert.equal(fake.posts().length, 0, '30 分钟还不到点');
@@ -313,8 +342,8 @@ test('摘要攒满 60 分钟才发一条，且不 @', async () => {
     assert.equal(fake.posts().length, 1, '最多每 60 分钟一条');
     const body = fake.posts()[0].body;
     assert.match(body, /验收机摘要（2 条）/);
-    assert.match(body, /loop-restarted/);
-    assert.match(body, /round-stalled/);
+    assert.match(body, /tick-failed/);
+    assert.match(body, /round-failed/);
     assert.equal(body.includes(`<@${MENTION}>`), false, '摘要不 @');
     assert.deepEqual(readLedger(home).pending, []);
     assert.equal(readLedger(home).digestNextAt, null);
@@ -1169,8 +1198,10 @@ test('round-stalled 也算中断；连续中断按事件时间算：隔 7 小时
     alertEvent(stalled.home, { kind: 'round-stalled', issue: `${REPO}#4`, round: 1, reason: '卡住 1' }, t0);
     alertEvent(stalled.home, { kind: 'round-stalled', issue: `${REPO}#4`, round: 2, reason: '卡住 2' }, t0 + 60000);
     const result = await notifySlack({ home: stalled.home, profile: stalled.profile, now: () => t0 + 120000, fetch: fake.fetch, apiBase: fake.apiBase });
-    assert.equal(result.sent, 1);
-    assert.match(fake.posts()[0].body, /同一任务连续中断/);
+    // 第 1 次卡住立即发（#43），第 2 次合成「同一任务连续中断」。
+    assert.equal(result.sent, 2);
+    assert.match(fake.posts()[0].body, /轮次卡住/);
+    assert.match(fake.posts()[1].body, /同一任务连续中断/);
   });
 
   const apart = setup();
@@ -1182,4 +1213,233 @@ test('round-stalled 也算中断；连续中断按事件时间算：隔 7 小时
     assert.equal(result.digested, 2);
     assert.equal(fake.posts().length, 0);
   });
+});
+
+// ---- #43 / #61 修正：即时提醒、失败可见、读历史失败不阻塞、每日上限、doctor 检查 ----
+
+test('首次卡住 / 写闸拒绝 / 循环停摆立即发（带 @）；同一任务同一原因 6 小时内只发一次，再来进摘要', async () => {
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ledgerFile(home), JSON.stringify({ version: 1, ids: [] }), { mode: 0o600 });
+  await withSlack(undefined, async (fake) => {
+    const send = (ts) => notifySlack({ home, profile, now: () => ts, fetch: fake.fetch, apiBase: fake.apiBase });
+    alertEvent(home, { kind: 'round-stalled', issue: `${REPO}#3`, round: 1, reason: '卡住：超过 stallMinutes 没有进度' }, t0);
+    alertEvent(home, { kind: 'gate-rejected', issue: `${REPO}#3`, round: 1, reason: 'not-in-tree' }, t0);
+    alertEvent(home, { kind: 'write-rejected', issue: `${REPO}#4`, reason: '认领被写闸拒绝' }, t0);
+    alertEvent(home, { kind: 'loop-restarted', reason: 'heartbeat-stale' }, t0);
+    const first = await send(t0);
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.equal(first.sent, 4, '四条都立即发');
+    assert.equal(first.digested, 0);
+    const posted = bodies(fake.posts());
+    assert.ok(posted.every((body) => body.text.startsWith(`<@${MENTION}>`)), '立即发的都 @');
+    assert.ok(posted.some((body) => body.text.includes('轮次卡住')));
+    assert.ok(posted.some((body) => body.text.includes('写闸拒绝了写动作')));
+    assert.ok(posted.some((body) => body.text.includes('调度循环被重新拉起')));
+
+    // 1 小时后同一任务同一原因再来：进摘要，不再 @。别的任务照样立即发。
+    alertEvent(home, { kind: 'gate-rejected', issue: `${REPO}#3`, round: 2, reason: 'not-in-tree' }, t0 + 3600000);
+    alertEvent(home, { kind: 'loop-restarted', reason: 'loop-not-running' }, t0 + 3600000);
+    alertEvent(home, { kind: 'gate-rejected', issue: `${REPO}#5`, round: 1, reason: 'not-in-tree' }, t0 + 3600000);
+    const second = await send(t0 + 3600000);
+    assert.equal(second.sent, 1, '只有 #5 的立即发');
+    assert.equal(second.digested, 2);
+    assert.match(fake.posts()[4].body, /#5/);
+
+    // 7 小时后：窗口过了，又能立即发一次。
+    alertEvent(home, { kind: 'gate-rejected', issue: `${REPO}#3`, round: 3, reason: 'not-in-tree' }, t0 + 7 * 3600000);
+    const third = await send(t0 + 7 * 3600000);
+    assert.ok(third.sent >= 1);
+    assert.ok(bodies(fake.posts()).some((body, index) => index >= 5 && body.text.includes('写闸拒绝了写动作')));
+  });
+});
+
+test('裁决运行重试用完（adjudicate-needs-human）立即发；超时 / 失败进摘要', async () => {
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ledgerFile(home), JSON.stringify({ version: 1, ids: [] }), { mode: 0o600 });
+  alertEvent(home, { kind: 'adjudicate-timeout', issue: `${REPO}#1`, round: 2, reason: '超时' }, t0);
+  alertEvent(home, { kind: 'adjudicate-needs-human', issue: `${REPO}#1`, round: 2, reason: '需要人工裁决' }, t0);
+  await withSlack(undefined, async (fake) => {
+    const result = await notifySlack({ home, profile, now: () => t0, fetch: fake.fetch, apiBase: fake.apiBase });
+    assert.equal(result.sent, 1);
+    assert.equal(result.digested, 1);
+    assert.match(fake.posts()[0].body, /需要人工裁决/);
+  });
+});
+
+test('发送重试用完：写 slack-failed 提醒、账本和返回值带 failing（下一次发成功才清）；slack-failed 自己不往 Slack 发', async () => {
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ledgerFile(home), JSON.stringify({ version: 1, ids: [] }), { mode: 0o600 });
+  prbotEvent(home, { type: 'needs-human', issue: `${REPO}#2`, root: `${REPO}#1`, reason: 'no-change' }, t0);
+  let broken = true;
+  await withSlack(
+    (entry) => (broken && entry.path.endsWith('/chat.postMessage') ? { status: 500, body: { ok: false, error: 'boom' } } : undefined),
+    async (fake) => {
+      const send = (ts) => notifySlack({ home, profile, now: () => ts, fetch: fake.fetch, apiBase: fake.apiBase });
+      let at = t0;
+      let result = await send(at);
+      assert.equal(result.failing, null, '还在重试，不算放弃');
+      for (const minutes of RETRY_MINUTES) {
+        at += minutes * 60000;
+        result = await send(at);
+      }
+      assert.equal(result.failed.length, 1, '第 4 次放弃');
+      assert.ok(result.failing, '返回值带 failing');
+      assert.equal(result.failing.kind, 'blocked');
+      assert.equal(result.failing.error, 'http-500');
+      assert.equal(result.failing.count, 1);
+      assert.equal(readLedger(home).failing.since, new Date(at).toISOString());
+      const alerts = readAlerts(hostPaths(home)).filter((entry) => entry.kind === 'slack-failed');
+      assert.equal(alerts.length, 1, '写一条 slack-failed');
+      assert.equal(JSON.stringify(alerts).includes(TOKEN), false);
+
+      // 下一拍还是坏的：failing 留着；slack-failed 提醒不进 Slack（不发也不进摘要）。
+      const posts = fake.posts().length;
+      result = await send(at + 60000);
+      assert.ok(result.failing, '没发成功之前一直留着');
+      assert.equal(fake.posts().length, posts, 'slack-failed 不往 Slack 发');
+      assert.equal(result.digested, 0);
+
+      // 修好之后一发成功就清掉。
+      broken = false;
+      prbotEvent(home, { type: 'needs-human', issue: `${REPO}#6`, root: `${REPO}#1`, reason: 'no-change' }, at + 120000);
+      result = await send(at + 120000);
+      assert.equal(result.sent, 1);
+      assert.equal(result.failing, null);
+      assert.equal(readLedger(home).failing, null);
+    },
+  );
+});
+
+test('tick：心跳的 slackFailing 持久，notify 没读到账本时沿用上一拍，发成功（failing=null）才清', async () => {
+  const { home } = await tickHome();
+  const failing = { since: '2026-10-24T01:00:00.000Z', lastAt: '2026-10-24T01:30:00.000Z', kind: 'blocked', error: 'http-500', count: 1 };
+  const tick = (result) =>
+    runTick({
+      home,
+      env: { ...process.env },
+      run: POLL_OK,
+      spawnRound: () => 1,
+      runRound: async () => ({ code: 0, stdout: '', stderr: '' }),
+      notify: async () => result,
+      now: () => Date.parse('2026-10-24T02:00:00.000Z'),
+    });
+  let heartbeat = await tick({ ok: false, reason: 'send-failed', sent: 0, failed: [], failing });
+  assert.deepEqual(heartbeat.slackFailing, failing);
+  heartbeat = await tick({ ok: false, reason: 'token-file-mode', sent: 0, failed: [] });
+  assert.deepEqual(heartbeat.slackFailing, failing, '没读到账本：沿用上一拍');
+  assert.deepEqual(JSON.parse(fs.readFileSync(hostPaths(home).heartbeatFile, 'utf8')).slackFailing, failing);
+  heartbeat = await tick({ ok: true, sent: 1, failed: [], failing: null });
+  assert.equal(heartbeat.slackFailing, undefined, '发成功就清');
+  assert.equal(JSON.parse(fs.readFileSync(hostPaths(home).heartbeatFile, 'utf8')).slackFailing, undefined);
+});
+
+test('每日上限（host.json slackDailyCap）：到了只攒进摘要、当天发一条「已达上限」，第二天摘要照发', async () => {
+  const { home, profile } = setup();
+  // 上限按本机日期算：从本机时间中午开始，免得测试里的「两小时后」跨了零点（和时区无关）。
+  const noon = new Date(Date.parse(START_AT) + 36 * 3600000);
+  noon.setHours(12, 0, 0, 0);
+  const t0 = noon.getTime();
+  fs.writeFileSync(path.join(home, 'config', 'host.json'), JSON.stringify({ slackDailyCap: 2 }));
+  fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ledgerFile(home), JSON.stringify({ version: 1, ids: [] }), { mode: 0o600 });
+  for (let i = 0; i < 4; i += 1) {
+    prbotEvent(home, { type: 'needs-human', issue: `${REPO}#${10 + i}`, root: `${REPO}#1`, reason: 'no-change' }, t0 + i);
+  }
+  await withSlack(undefined, async (fake) => {
+    const send = (ts) => notifySlack({ home, profile, now: () => ts, fetch: fake.fetch, apiBase: fake.apiBase });
+    const first = await send(t0 + 1000);
+    assert.equal(first.sent, 2, '只发到上限');
+    assert.equal(first.capped, 2);
+    assert.equal(first.pending, 2, '超出的攒进摘要');
+    const posted = bodies(fake.posts());
+    assert.equal(posted.length, 3, '两条 + 一条「已达上限」');
+    assert.match(posted[2].text, /已达上限（2 条）/);
+    assert.equal(posted[2].text.includes(`<@${MENTION}>`), false, '上限通知不 @');
+    assert.ok(readLedger(home).daily.capNoticeAt);
+
+    // 当天再来事件：还在上限，不发、也不再发「已达上限」；到点的摘要也留到明天。
+    prbotEvent(home, { type: 'needs-human', issue: `${REPO}#20`, root: `${REPO}#1`, reason: 'no-change' }, t0 + 2 * 3600000);
+    const later = await send(t0 + 2 * 3600000);
+    assert.equal(later.sent, 0);
+    assert.equal(later.pending, 3);
+    assert.equal(fake.posts().length, 3, '同一天只发一条「已达上限」');
+
+    // 第二天：计数清零，摘要（算 1 条）发出去。
+    const nextDay = await send(t0 + 26 * 3600000);
+    assert.equal(nextDay.sent, 1);
+    assert.equal(nextDay.pending, 0);
+    assert.match(fake.posts()[3].body, /验收机摘要（3 条）/);
+    assert.equal(readLedger(home).daily.sent, 1);
+  });
+});
+
+test('每日上限默认 30：host.json 没配或不是正整数都按 30', () => {
+  const { home } = setup();
+  assert.equal(DEFAULT_DAILY_CAP, 30);
+  assert.equal(readDailyCap(home), 30);
+  fs.writeFileSync(path.join(home, 'config', 'host.json'), JSON.stringify({ slackDailyCap: 'many' }));
+  assert.equal(readDailyCap(home), 30);
+  fs.writeFileSync(path.join(home, 'config', 'host.json'), JSON.stringify({ slackDailyCap: 5 }));
+  assert.equal(readDailyCap(home), 5);
+});
+
+test('doctor 的 Slack 检查（只读）：auth.test + bot 在频道里；没 channels:read 退到 conversations.history；没配就跳过', async () => {
+  const { profile } = setup();
+  const answer = (map) => (entry) => {
+    for (const [suffix, body] of Object.entries(map)) if (entry.path.endsWith(suffix)) return { status: 200, body };
+    return undefined;
+  };
+  await withSlack(answer({ '/auth.test': { ok: true }, '/conversations.info': { ok: true, channel: { is_member: true } } }), async (fake) => {
+    const result = await checkSlackAccess({ profile, apiBase: fake.apiBase });
+    assert.equal(result.ok, true, result.detail);
+    assert.equal(fake.posts().length, 0, '不发消息');
+    assert.equal(fake.requests[1].query.channel, CHANNEL);
+    assert.equal(fake.requests[0].headers.authorization, `Bearer ${TOKEN}`);
+    assert.equal(JSON.stringify(result).includes(TOKEN), false);
+  });
+  await withSlack(answer({ '/auth.test': { ok: true }, '/conversations.info': { ok: true, channel: { is_member: false } } }), async (fake) => {
+    const result = await checkSlackAccess({ profile, apiBase: fake.apiBase });
+    assert.equal(result.ok, false);
+    assert.match(result.detail, /bot 不在目标频道里/);
+  });
+  await withSlack(
+    answer({
+      '/auth.test': { ok: true },
+      '/conversations.info': { ok: false, error: 'missing_scope' },
+      '/conversations.history': { ok: false, error: 'not_in_channel' },
+    }),
+    async (fake) => {
+      const result = await checkSlackAccess({ profile, apiBase: fake.apiBase });
+      assert.equal(result.ok, false);
+      assert.match(result.detail, /bot 不在目标频道里/);
+      assert.equal(fake.history()[0].query.limit, '1');
+    },
+  );
+  await withSlack(
+    answer({
+      '/auth.test': { ok: true },
+      '/conversations.info': { ok: false, error: 'missing_scope' },
+      '/conversations.history': { ok: false, error: 'missing_scope' },
+    }),
+    async (fake) => {
+      const result = await checkSlackAccess({ profile, apiBase: fake.apiBase });
+      assert.equal(result.ok, false);
+      assert.match(result.detail, /channels:history/);
+    },
+  );
+  await withSlack(answer({ '/auth.test': { ok: false, error: 'invalid_auth' } }), async (fake) => {
+    const result = await checkSlackAccess({ profile, apiBase: fake.apiBase });
+    assert.equal(result.ok, false);
+    assert.match(result.detail, /auth\.test 失败：slack-invalid_auth/);
+    assert.equal(fake.requests.length, 1);
+  });
+  const skipped = await checkSlackAccess({ profile: { ...profile, slackChannelId: undefined } });
+  assert.equal(skipped.ok, true);
+  assert.equal(skipped.skipped, true);
 });
