@@ -1309,6 +1309,8 @@ export async function runPrbotCorrection({
           prompt: buildPrompt(state),
           env,
           run,
+          issue,
+          round: state.round,
         });
         if (result?.unavailable) {
           appendAlert(paths, {

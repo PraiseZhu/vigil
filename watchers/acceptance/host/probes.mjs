@@ -112,11 +112,12 @@ export function createProbes({ profile, env = process.env, run = procRun, hostCo
         roundDir,
         masks,
         binds: [roundDir],
-        env: sandboxEnvironment,
         hostHome: env?.HOME || process.env.HOME,
         homeAllow: defaultHomeAllow({ repoRoot: REPO_ROOT, hostConfig }),
       });
+      // 环境走 spawn 的 env（bwrap 不收 --setenv 了），否则 bwrap 会把 doctor 自己的环境整个传进沙箱。
       const result = await run('bwrap', [...args, '--', process.execPath, reader, targetsFile, outFile], {
+        env: sandboxEnvironment,
         timeoutMs: 60000,
       });
       if (!result || result.code !== 0) {

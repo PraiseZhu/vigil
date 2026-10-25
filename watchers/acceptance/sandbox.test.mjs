@@ -17,6 +17,7 @@ import {
   sandboxEnv,
 } from './host/sandbox.mjs';
 import { run as procRun } from './host/proc.mjs';
+import { EGRESS_BRIDGE, EGRESS_BRIDGE_PORT } from './host/egress-proxy.mjs';
 import { REPO, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -254,7 +255,10 @@ test('SC11 PI_NO_SANDBOX=1 和 host.json 的 sandbox:false 都关不掉沙箱', 
   assert.equal(fixture.calls.pi.length, 1);
   assert.equal(fixture.calls.pi[0].cmd, 'bwrap', '一定是 bwrap 起的');
   const args = fixture.calls.pi[0].args;
-  assert.deepEqual(args.slice(args.indexOf('--') + 1), ['pi', '--model', 'example/model']);
+  // 沙箱里先起出网桥（--unshare-net 之后唯一的出网路），桥再起 piCommand；piCommand 原样接在桥的 `--` 后面。
+  const inside = args.slice(args.indexOf('--') + 1);
+  assert.equal(inside[1], EGRESS_BRIDGE, '沙箱里第一个起的是出网桥');
+  assert.deepEqual(inside.slice(inside.indexOf('--') + 1), ['pi', '--model', 'example/model']);
 });
 
 test('SC11 子进程环境只含白名单（+ 两个内部变量），父进程的假令牌不进去', async () => {
@@ -287,6 +291,12 @@ test('SC11 子进程环境只含白名单（+ 两个内部变量），父进程�
   assert.ok(env.ACCEPTANCE_WATCHER_HOME.startsWith(fixture.calls.pi[0].cwd));
   assert.ok(env.ACCEPTANCE_GATE_SOCKET.startsWith(fixture.calls.pi[0].cwd));
   assert.equal(env.HOME, path.join(fixture.calls.pi[0].cwd, 'home'));
+  // 出网变量是沙箱内部变量：一律指向沙箱 lo 上的出网桥，不是宿主环境里抄来的。
+  for (const key of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']) {
+    assert.equal(env[key], `http://127.0.0.1:${EGRESS_BRIDGE_PORT}`, key);
+  }
+  assert.equal(env.NODE_USE_ENV_PROXY, '1');
+  assert.equal(env.NO_PROXY, 'localhost,127.0.0.1,::1');
 });
 
 test('SC11 遮罩名单从 profile 算：新增 …TokenFile 键和 App 私钥都自动进去', () => {
@@ -365,9 +375,18 @@ test('SC11 buildBwrapArgs：可写绑定在只读根之后、遮罩在最后；�
     roundDir,
     masks: { files: [tokenFile], dirs: [path.join(home, 'state')] },
     binds: [stateDir, worktreeDir],
-    env: { PATH: '/usr/bin', HOME: path.join(roundDir, 'home') },
     hostHome,
   });
+  // 网络：自己的命名空间（--unshare-net），不再 --share-net。
+  assert.ok(args.includes('--unshare-net'));
+  assert.equal(args.includes('--share-net'), false);
+  // 环境变量不进参数（值会出现在 /proc/<pid>/cmdline）。
+  assert.equal(args.includes('--setenv'), false);
+  assert.equal(args.includes('--clearenv'), false);
+  if (fs.existsSync('/run')) {
+    const runAt = args.indexOf(fs.realpathSync('/run'));
+    assert.equal(args[runAt - 1], '--tmpfs', '/run 整个盖空 tmpfs');
+  }
   assert.deepEqual(args.slice(0, 2), ['--die-with-parent', '--new-session']);
   const roBind = args.indexOf('--ro-bind');
   const firstBind = args.indexOf('--bind');
@@ -392,7 +411,6 @@ test('SC11 buildBwrapArgs：可写绑定在只读根之后、遮罩在最后；�
         roundDir,
         masks: { files: [], dirs: [path.join(home, 'state')] },
         binds: [path.join(home, 'state', 'acc-state'), worktreeDir],
-        env: {},
         hostHome,
       }),
     /与宿主状态目录重叠/,
@@ -405,7 +423,6 @@ test('SC11 buildBwrapArgs：可写绑定在只读根之后、遮罩在最后；�
         roundDir,
         masks: { files: [path.join(worktreeDir, 'leak.token')], dirs: [] },
         binds: [worktreeDir],
-        env: {},
         hostHome,
       }),
     /落在可写绑定/,
@@ -478,7 +495,7 @@ test(
     const masks = maskList({ rawProfile, profile, hostConfig: {}, env: { HOME: hostHome }, home });
     const sandboxBin = path.resolve('watchers', 'acceptance', 'host', 'sandbox-bin');
     const env = sandboxEnv({ base: { ...process.env, HOME: hostHome }, roundDir, socketPath, sandboxBin });
-    const args = buildBwrapArgs({ home, profile, roundDir, masks, binds: [stateDir, worktreeDir], env, hostHome });
+    const args = buildBwrapArgs({ home, profile, roundDir, masks, binds: [stateDir, worktreeDir], hostHome });
 
     const targets = [
       tokenFile,
@@ -514,7 +531,7 @@ test(
     const result = await procRun(
       'bwrap',
       [...args, '--', process.execPath, reader, JSON.stringify(targets)],
-      { cwd: roundDir, timeoutMs: 120000 },
+      { env, cwd: roundDir, timeoutMs: 120000 },
     );
     assert.equal(result.code, 0, result.stderr);
     const parsed = JSON.parse(result.stdout);
