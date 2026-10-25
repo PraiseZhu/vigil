@@ -9,11 +9,13 @@ import { runHelper } from './bin/helper.mjs';
 import { tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import {
   CLOCK,
+  CLOCK_BEIJING,
   OWNER,
   OTHER_REPO,
   REPO,
   createFakeGithub,
   defaultTree,
+  fullConclusions,
   writeJsonFile,
 } from './session.fixture.mjs';
 
@@ -66,11 +68,11 @@ test('SC3 verdict 就地改轮次评论：逐条结果、正文版本、放锁�
 
   const file = verdictFile(home, {
     extracted: false,
-    items: [
-      { ref: `${REPO}#2`, sc: 3, result: '通过', evidence: 'node --test 全绿' },
-      { ref: `${REPO}#2`, sc: 4, result: '要修', why: '看板没写', evidence: '假 gh 记录' },
-      { ref: `${REPO}#2`, sc: 5, result: '人工手测', layer: 'cindy-mac' },
-    ],
+    items: fullConclusions({
+      [`${REPO}#2 SC3`]: { evidence: 'node --test 全绿' },
+      [`${REPO}#2 SC4`]: { result: '要修', why: '看板没写', evidence: '假 gh 记录' },
+      [`${REPO}#2 SC5`]: { result: '人工手测', layer: 'cindy-mac', evidence: undefined },
+    }),
   });
   const result = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', file]);
   assert.equal(result.code, 0, result.err);
@@ -84,13 +86,15 @@ test('SC3 verdict 就地改轮次评论：逐条结果、正文版本、放锁�
   const write = writes[0];
   assert.equal(write.type, 'comment.update');
   assert.equal(write.commentId, 1001);
-  assert.equal(write.dedupeKey, `verdict:${REPO}#1:1:要修`);
+  assert.equal(write.dedupeKey, `verdict:${REPO}#1:1:1001:要修`);
 
   const lines = write.body.split('\n');
   assert.equal(lines[0], '[验收机] 第 1 轮：要修');
   assert.equal(lines[1], `正文版本：${bodyVersion(world.get(`${REPO}#1`).body)}`);
   assert.match(lines[2], /^开始：2026-10-24T01:00:00\.000Z$/);
-  assert.match(lines[3], /^完成：2026-10-24T02:00:00\.000Z$/);
+  // 完成时间写北京时间（#43 决策），带 +08:00，Date.parse 照样认。
+  assert.equal(lines[3], `完成：${CLOCK_BEIJING}`);
+  assert.equal(Date.parse(lines[3].slice('完成：'.length)), Date.parse(CLOCK));
   assert.ok(write.body.includes(`- 通过：${REPO}#2 SC3 · 证据：node --test 全绿`));
   assert.ok(write.body.includes(`- 要修：${REPO}#2 SC4 · 原因：看板没写 · 证据：假 gh 记录`));
   assert.ok(write.body.includes(`- 人工手测：${REPO}#2 SC5（cindy-mac）`));
@@ -104,10 +108,9 @@ test('SC3 逐条结果里有「要修」或「有争议」→ 要修；人工手
   const world = defaultTree();
 
   const disputed = verdictFile(home, {
-    items: [
-      { ref: `${REPO}#2`, sc: 3, result: '通过', evidence: 'ok' },
-      { ref: `${REPO}#2`, sc: 4, result: '有争议', sides: { acceptance: '没证据', correction: '测过了' } },
-    ],
+    items: fullConclusions({
+      [`${REPO}#2 SC4`]: { result: '有争议', sides: { acceptance: '没证据', correction: '测过了' } },
+    }),
   });
   const first = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', disputed]);
   assert.equal(first.code, 0, first.err);
@@ -118,10 +121,7 @@ test('SC3 逐条结果里有「要修」或「有争议」→ 要修；人工手
   // 换一轮，全部通过（人工手测不拦）。
   const world2 = defaultTree({ roundNumber: 2, roundStatus: '验收中' });
   const passFile = verdictFile(home, {
-    items: [
-      { ref: `${REPO}#2`, sc: 3, result: '通过', evidence: 'ok' },
-      { ref: `${REPO}#2`, sc: 5, result: '人工手测', layer: 'paid' },
-    ],
+    items: fullConclusions({ [`${REPO}#2 SC5`]: { result: '人工手测', layer: 'paid' } }),
   });
   const second = await run(world2, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '2', '--file', passFile]);
   assert.equal(second.code, 0, second.err);
@@ -131,7 +131,7 @@ test('SC3 逐条结果里有「要修」或「有争议」→ 要修；人工手
 test('SC3 --status 与逐条结果不一致 → 退出码 1，不写', async () => {
   const { profile, home } = loadProfile();
   const world = defaultTree();
-  const file = verdictFile(home, { items: [{ ref: `${REPO}#2`, sc: 3, result: '要修', why: 'x' }] });
+  const file = verdictFile(home, { items: fullConclusions({ [`${REPO}#2 SC3`]: { result: '要修', why: 'x' } }) });
   const result = await run(world, profile, [
     'verdict',
     '--issue',
@@ -207,17 +207,19 @@ test('SC3 关闭勾选后按改后的正文记版本，trigger 不会因此重�
 
 test('SC11 裁决正文脱敏：不写状态目录、令牌、运行 id；首行是 [验收机]', async () => {
   const { profile, home } = loadProfile();
-  const world = defaultTree();
+  // 子 issue 没有验收项：任务树里只有总 issue 的 SC1 / SC2 要结论，裁决里不会提到跨仓子 issue。
+  const world = defaultTree({ childBody: '', otherBody: '' });
   const fakeHome = ['', 'home', 'someone', 'project'].join('/');
   const token = `ghp_${'x'.repeat(36)}`;
   const file = verdictFile(home, {
     items: [
       {
-        ref: `${REPO}#2`,
-        sc: 3,
+        ref: `${REPO}#1`,
+        sc: 1,
         result: '通过',
         evidence: `在 ${profile.stateDir}/worktrees 下跑过 ${token} ${fakeHome} run-id: 12345`,
       },
+      { ref: `${REPO}#1`, sc: 2, result: '通过', evidence: 'ok' },
     ],
   });
   const result = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', file]);

@@ -110,7 +110,9 @@ test('SC5 rounds.start 发第 n 轮验收中评论并记下正文版本', async 
   assert.match(created.body.split('\n')[0], /\[验收机\] 第 3 轮：验收中/);
   assert.match(created.body, new RegExp(`正文版本：${bodyVersion(body)}`));
   assert.equal(writes[0].type, 'comment.create');
-  assert.equal(writes[0].dedupeKey, `round-start:${REPO}#1:3`);
+  // 去重键带开始时间（北京时间）：同号再认领（旧评论被删后）不会命中旧账本记录。
+  assert.equal(writes[0].dedupeKey, `round-start:${REPO}#1:3:2026-10-24T10:00:00+08:00`);
+  assert.match(created.body, /^开始：2026-10-24T10:00:00\+08:00$/m);
 });
 
 test('SC5 rounds.finish 把评论就地改成通过、要修或中断', async () => {
@@ -165,7 +167,7 @@ test('SC7 progress 与 done 先过认领检查再写本地状态；缺本地记�
   const rounds = createRounds({ github, profile, now: () => Date.parse('2026-10-24T01:10:00.000Z') });
   assert.equal(rounds.lastProgressAt(`${REPO}#1`, 1, parseRounds([existing], OWNER)[0]), '2026-10-24T01:00:00.000Z');
   const stamp = await rounds.progress(`${REPO}#1`, 1);
-  assert.equal(stamp, '2026-10-24T01:10:00.000Z');
+  assert.equal(stamp, '2026-10-24T09:10:00+08:00');
   assert.equal(rounds.lastProgressAt(`${REPO}#1`, 1, parseRounds([existing], OWNER)[0]), stamp);
   const doneAt = await rounds.done(`${REPO}#1`, 1);
   const cache = JSON.parse(fs.readFileSync(cachePath(profile, `${REPO}#1`), 'utf8'));

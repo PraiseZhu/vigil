@@ -5,13 +5,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadAcceptanceProfile } from './profile.mjs';
-import { createGithub, WriteBusyError, WriteRejectedError } from './github.mjs';
-import { createRounds, latestRound, parseRef, parseRounds, RoundError } from './rounds.mjs';
+import { createGithub, WriteBusyError, WriteFailedError, WriteRejectedError } from './github.mjs';
+import { beijingIso, createRounds, latestRound, parseRef, parseRounds, RoundError } from './rounds.mjs';
 import { setAcceptanceFields } from './board.mjs';
 import { collectTree } from './collect.mjs';
 import { runClose } from './close.mjs';
 import { runCorrect } from './correct.mjs';
-import { runPush, sessionPath, writeNeedsHuman } from './push.mjs';
+import { runPush, secretFiles, sessionPath, writeNeedsHuman } from './push.mjs';
 import { runVerdict } from './verdict.mjs';
 
 export const EXIT = Object.freeze({ OK: 0, FAIL: 1, CLAIM: 3, REJECTED: 4, SECRET: 5 });
@@ -197,7 +197,7 @@ async function cmdDone({ github, profile, ref, n, now, stdout, stderr }) {
   } catch {
     existing = {};
   }
-  const merged = { ...existing, round: n, doneAt: new Date(now()).toISOString() };
+  const merged = { ...existing, round: n, doneAt: beijingIso(now()) };
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(merged, null, 2));
@@ -273,11 +273,12 @@ export async function runHelper(argv, options = {}) {
       if (error.reason === 'secret-found') {
         // 写闸在沙箱外扫到密钥：按 SC7 记「需人工处理」，不标中断（push 自己也会记，这里去重）。
         try {
-          writeNeedsHuman(profile, ref, n, { reason: 'secret-found', files: [] });
+          writeNeedsHuman(profile, ref, n, { reason: 'secret-found', files: secretFiles(error) });
         } catch {
           // 记不下来也要停手：退出码 4 本身就是停手信号。
         }
-      } else {
+      } else if (error.reason !== 'verdict-only') {
+        // verdict-only（只出裁决的 issue 上的关单 / 勾选 / 修正 / 推送）不标中断：这一轮照常写裁决再 done。
         await bestEffortInterrupt({
           github,
           profile,
@@ -291,6 +292,18 @@ export async function runHelper(argv, options = {}) {
     }
     if (error instanceof WriteBusyError) {
       await bestEffortInterrupt({ github, profile, now, ref, n, reason: '写闸忙' });
+      return code;
+    }
+    if (error instanceof WriteFailedError) {
+      // 写闸退出码 1（其他失败）：退出码 1，同样尽力标中断，免得这一轮挂到卡死才被收掉。
+      await bestEffortInterrupt({
+        github,
+        profile,
+        now,
+        ref,
+        n,
+        reason: `写操作失败：${error.reason ?? error.exitCode ?? '未给原因'}`,
+      });
       return code;
     }
     return code;

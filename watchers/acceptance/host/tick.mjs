@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { loadAcceptanceProfile } from '../bin/profile.mjs';
 import { createGithub } from '../bin/github.mjs';
 import { runRound as runRoundCommand } from '../bin/round.mjs';
-import { appendAlert, hostPaths, isAlive, readLockPayload } from './paths.mjs';
+import { appendAlert, hostPaths, isAlive, readAlerts, readLockPayload } from './paths.mjs';
 import { run as procRun, spawnDetached } from './proc.mjs';
 import { MAX_ROUNDS, readHostConfig } from './round.mjs';
 import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbot.mjs';
@@ -79,6 +79,37 @@ function slackHeartbeat(result) {
   if (value.reason) out.reason = String(value.reason);
   if (value.error) out.error = String(value.error);
   return out;
+}
+
+/** poll 报的 outOfScope / passedButOpen 提醒节流：同一任务同一种提醒 24 小时只写一次。 */
+export const POLL_NOTICE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * poll 报的两种「不派发、只提醒」条目（#46 / #47 首跑）：任务树里有名单外的仓（outOfScope）、
+ * 最新裁决是通过但 issue 还开着（passedButOpen）。按 alerts.jsonl 里已有的同类提醒节流。返回这一拍新写的。
+ */
+export function remindPollNotices(paths, entries, { now = () => Date.now() } = {}) {
+  const notices = (entries || []).filter((item) => item && !item.stale && (item.outOfScope || item.passedButOpen));
+  if (!notices.length) return [];
+  const recent = readAlerts(paths);
+  const written = [];
+  for (const entry of notices) {
+    const kind = entry.outOfScope ? 'task-out-of-scope' : 'passed-but-open';
+    const seen = recent.some(
+      (alert) => alert.kind === kind && alert.issue === entry.issue && now() - Date.parse(alert.ts || 0) < POLL_NOTICE_WINDOW_MS,
+    );
+    if (seen) continue;
+    const alert = entry.outOfScope
+      ? {
+          kind,
+          issue: entry.issue,
+          reason: '任务树里有不在任何名单里的仓，不派发',
+          detail: (entry.outOfScope || []).join(', '),
+        }
+      : { kind, issue: entry.issue, round: entry.round, reason: '最新裁决是通过，issue 还开着（关单没走完）', detail: entry.url || undefined };
+    written.push(appendAlert(paths, { ...alert, now }));
+  }
+  return written;
 }
 
 /** 读轮次登记目录：<roundsDir>/<owner>__<repo>__<issue 号>__<n>.json。坏文件跳过。 */
@@ -327,9 +358,16 @@ export async function runTick({
       }
     }
 
+    // 2b. 不派发、只提醒的条目（outOfScope / passedButOpen）：写提醒（节流），出错不拖垮这一拍。
+    try {
+      remindPollNotices(paths, entries, { now });
+    } catch (error) {
+      heartbeat.lastTick.noticeError = String(error?.message || error);
+    }
+
     // 3. 该开始的任务：已在跑的不重开，最多占到空槽数。
     let free = Math.max(0, MAX_ROUNDS - liveSlotCount(paths));
-    for (const entry of entries.filter((item) => item && !item.stale)) {
+    for (const entry of entries.filter((item) => item && !item.stale && !item.outOfScope && !item.passedButOpen)) {
       if (free <= 0) break;
       const record = byIssue.get(entry.issue);
       if (record && isAlive(Number(record.pid))) continue;

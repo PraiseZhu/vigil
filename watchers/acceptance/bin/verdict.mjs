@@ -3,8 +3,9 @@
 // 只在最后一步写：写完这一轮就结束了，后面的写命令都会被认领检查拒绝。
 import fs from 'node:fs';
 import path from 'node:path';
-import { bodyVersion, cachePath, createRounds, lockPath, parseRef, readIssueCache } from './rounds.mjs';
-import { fetchIssueBody } from './collect.mjs';
+import { beijingIso, bodyVersion, cachePath, createRounds, lockPath, parseRef, readIssueCache } from './rounds.mjs';
+import { collectTree, fetchIssueBody } from './collect.mjs';
+import { isVerdictOnly } from './profile.mjs';
 import { redact } from './redact.mjs';
 import { readNeedsHuman } from './push.mjs';
 
@@ -67,6 +68,7 @@ export function formatVerdictBody({
   items = [],
   extracted = false,
   needsHuman = [],
+  verdictOnly = false,
   profile,
 } = {}) {
   const lines = [
@@ -86,10 +88,42 @@ export function formatVerdictBody({
     lines.push('## 需人工处理');
     lines.push(...human);
   }
+  if (verdictOnly) {
+    lines.push('');
+    lines.push(VERDICT_ONLY_LINE);
+  }
   return lines.join('\n');
 }
 
+/** 只出裁决的 issue（profile 的 verdictOnlyIssues）：验收机不关单，裁决里写明由人复核。 */
+export const VERDICT_ONLY_LINE = '本 issue 由人工复核后关闭。';
+
+function conclusionKey(ref, sc) {
+  return `${String(ref).toLowerCase()} SC${Number(sc)}`;
+}
+
+/**
+ * 任务树里每条 SC 都要有一条结论（通过 / 要修 / 人工手测 / 有争议）：返回缺结论的条目（`owner/repo#n SC<k>`）。
+ * 树是 collect 收到的那棵（总 issue、子 issue、挂着的修正子 issue）。
+ */
+export function missingConclusions(tree, items = []) {
+  const have = new Set(items.map((item) => conclusionKey(item.ref, item.sc)));
+  const missing = [];
+  const seen = new Set();
+  for (const issue of tree?.issues || []) {
+    for (const item of issue.items || []) {
+      const key = conclusionKey(item.source || issue.ref, item.sc);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!have.has(key)) missing.push(`${item.source || issue.ref} SC${item.sc}`);
+    }
+  }
+  return missing;
+}
+
 export function deriveStatus(items = [], needsHuman = []) {
+  // 一条结论都没有就不能判通过（以前空 items 会落到「通过」）。
+  if (!items.length) throw new Error('裁决没有任何逐条结论，不能判通过：items 至少要有一条');
   if (needsHuman.length) return '要修';
   if (items.some((item) => item.result === '要修' || item.result === '有争议')) return '要修';
   return '通过';
@@ -126,6 +160,13 @@ export async function runVerdict({ github, profile, ref, n, file, statusFlag, no
   const current = await rounds.check(ref, n);
   const payload = readVerdictFile(file);
   const items = payload.items;
+  if (!items.length) throw new Error('裁决文件的 items 是空的：任务树里每条 SC 都要有一条结论，空的不能判通过');
+  // 写之前核对：collect 收到的任务树里每条 SC 都有结论，缺了就整条拒绝（退出码 1），什么都不写。
+  const tree = await collectTree({ github, profile, ref });
+  const missing = missingConclusions(tree, items);
+  if (missing.length) {
+    throw new Error(`裁决缺结论（通过 / 要修 / 人工手测 / 有争议），没写：${missing.join('、')}`);
+  }
   const needsHuman = readNeedsHuman(profile, ref, n);
   const derived = deriveStatus(items, needsHuman);
   if (statusFlag !== undefined && statusFlag !== derived) {
@@ -143,18 +184,20 @@ export async function runVerdict({ github, profile, ref, n, file, statusFlag, no
     round: n,
     status,
     bodyVersion: version,
-    startedAt: current.startedAt || new Date(now()).toISOString(),
-    finishedAt: new Date(now()).toISOString(),
+    startedAt: current.startedAt || beijingIso(now()),
+    finishedAt: beijingIso(now()),
     items,
     extracted: Boolean(payload.extracted),
     needsHuman,
+    verdictOnly: Boolean(tree.root.verdictOnly) || isVerdictOnly(profile, ref),
     profile,
   });
 
   const { repo } = parseRef(ref);
   const updated = await github.write({
     type: 'comment.update',
-    dedupeKey: `verdict:${ref}:${n}:${status}`,
+    // 带评论 id：同号的轮次（旧评论被删后重新认领）不会命中上一条评论的账本记录。
+    dedupeKey: `verdict:${ref}:${n}:${current.commentId}:${status}`,
     repo,
     commentId: current.commentId,
     body,
@@ -175,7 +218,7 @@ export async function runVerdict({ github, profile, ref, n, file, statusFlag, no
           ...(cache.round || {}),
           round: n,
           commentId: current.commentId,
-          finishedAt: new Date(now()).toISOString(),
+          finishedAt: beijingIso(now()),
         },
         lastVerdict: status,
       },

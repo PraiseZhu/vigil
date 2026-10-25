@@ -3,6 +3,7 @@
 // 只读：本文件不发任何写请求。
 import { bodyVersion, parseRef } from './rounds.mjs';
 import { repoTier } from './tasks.mjs';
+import { isVerdictOnly } from './profile.mjs';
 
 export const MANUAL_LAYERS = Object.freeze(['cindy-mac', 'cindy-windows', 'paid', 'github-live']);
 
@@ -273,6 +274,8 @@ export async function collectTree({ github, profile, ref }) {
       bodyVersion: bodyVersion(issue.body),
       tier: ranked.tier,
       fork: Boolean(ranked.fork),
+      // 只出裁决（profile 的 verdictOnlyIssues）：不关、不勾、不开修正、不推送，最后一步只写裁决。
+      verdictOnly: isVerdictOnly(profile, rootRef),
     },
     issues,
     corrections,

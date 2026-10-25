@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOME_ENV = 'ACCEPTANCE_WATCHER_HOME';
 const REPO_PATTERN = /^[^/]+\/([^/]+|\*)$/;
+const ISSUE_REF_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/;
 
 export class ProfileError extends Error {
   constructor(message) {
@@ -105,6 +106,37 @@ function requireRepoList(raw, key, file, fallback) {
     }
   }
   return [...raw[key]];
+}
+
+/** 显式 issue 名单（`owner/repo#号`），不收通配；没配返回 []。 */
+function optionalIssueList(raw, key, file) {
+  if (!Object.hasOwn(raw, key) || raw[key] === undefined || raw[key] === null) return [];
+  if (!Array.isArray(raw[key])) throw invalid(key, file, '应为字符串数组');
+  for (const item of raw[key]) {
+    if (typeof item !== 'string' || !ISSUE_REF_PATTERN.test(item)) {
+      throw invalid(key, file, `每项应为 owner/repo#号（不收通配）：${item}`);
+    }
+  }
+  return [...raw[key]];
+}
+
+/**
+ * verdictOnlyIssues（可选）：只出裁决的 issue（比如验收机自己的总 issue，#43 决策「结论由人或 opus(high) 复核后才关」）。
+ * 照常验收、发轮次评论、写看板和裁决，但不关、不勾、不开修正、不推送；helper 和写闸两边都拒。
+ */
+export function isVerdictOnly(profile, ref) {
+  const key = String(ref || '').toLowerCase();
+  if (!key) return false;
+  return (profile?.verdictOnlyIssues || []).some((item) => String(item).toLowerCase() === key);
+}
+
+/** helper 的 close / correct / push 遇到只出裁决的 issue 一律拒绝（退出码 1），原因写清楚。 */
+export function assertNotVerdictOnly(profile, ref, command) {
+  if (!isVerdictOnly(profile, ref)) return;
+  throw new Error(
+    `${ref} 在 verdictOnlyIssues 里（只出裁决）：${command} 不做——不关、不勾、不开修正、不推送，` +
+      '最后一步只写 verdict（裁决会写明「本 issue 由人工复核后关闭」）',
+  );
 }
 
 /**
@@ -234,6 +266,7 @@ export function loadAcceptanceProfile(env = process.env) {
   const forkRepos = requireRepoList(raw, 'forkRepos', file, ['makecindy/cindy']);
   const watchRepos = requireRepoList(raw, 'watchRepos', file, []);
   const forkTargets = parseForkTargets(raw, file, { ownerLogin, forkRepos });
+  const verdictOnlyIssues = optionalIssueList(raw, 'verdictOnlyIssues', file);
 
   let stallMinutes = 30;
   if (Object.hasOwn(raw, 'stallMinutes') && raw.stallMinutes !== undefined && raw.stallMinutes !== null) {
@@ -281,6 +314,7 @@ export function loadAcceptanceProfile(env = process.env) {
     forkRepos: Object.freeze(forkRepos),
     forkTargets: Object.freeze(forkTargets),
     watchRepos: Object.freeze(watchRepos),
+    verdictOnlyIssues: Object.freeze(verdictOnlyIssues),
     stallMinutes,
     writeCommand: writeCommand ? Object.freeze(writeCommand) : undefined,
     appConfigPath,

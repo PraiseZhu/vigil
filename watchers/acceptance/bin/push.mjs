@@ -8,6 +8,7 @@ import { createRounds, parseRef } from './rounds.mjs';
 import { repoTier } from './tasks.mjs';
 import { OBJECT_ID, scanIntroducedObjects } from './secretscan.mjs';
 import { createLocalGit } from './localgit.mjs';
+import { assertNotVerdictOnly } from './profile.mjs';
 
 export const BRANCH_PATTERN = /^acceptance\/\d+-\d+-sc\d+$/;
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -104,6 +105,12 @@ export async function scanForSecrets({ git, worktree, base, commit }) {
   return { found: false, files, tool: 'builtin' };
 }
 
+/** 写闸扫到密钥时回的文件名（只有文件名，没有内容）；拿不到就是空数组。 */
+export function secretFiles(error) {
+  const files = Array.isArray(error?.files) ? error.files : [];
+  return files.filter((file) => typeof file === 'string' && file);
+}
+
 function requireFlag(flags, name, label) {
   const value = flags.get(name);
   if (typeof value !== 'string' || !value) throw new Error(`push 需要 --${name} <${label}>`);
@@ -117,6 +124,7 @@ export async function runPush({ github, profile, ref, n, flags, now = () => Date
   const ranked = repoTier(rootRepo, profile);
   if (ranked?.tier === 'watch') throw new Error('watch 档只出裁决、写看板');
   if (!ranked) throw new Error(`${rootRepo} 不在任何名单里`);
+  assertNotVerdictOnly(profile, ref, 'push');
   const git = injected || createLocalGit();
   const repo = requireFlag(flags, 'repo', 'owner/repo');
   if (!REPO_PATTERN.test(repo)) throw new Error(`--repo 不合法：${repo}`);
@@ -167,7 +175,7 @@ export async function runPush({ github, profile, ref, n, flags, now = () => Date
     } catch (error) {
       if (error instanceof WriteRejectedError && error.reason === 'secret-found') {
         // 写闸在沙箱外又扫了一遍：按 SC7 记「需人工处理」，这一轮不标中断。
-        writeNeedsHuman(profile, ref, n, { reason: 'secret-found', files: [] });
+        writeNeedsHuman(profile, ref, n, { reason: 'secret-found', files: secretFiles(error) });
       }
       throw error;
     }

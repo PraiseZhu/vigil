@@ -57,8 +57,10 @@ test('SC6 SESSION.md 写清修正 PR 的全部规则', () => {
   assert.match(session, /先按修正标记找已有的修正 PR/);
   assert.match(session, /从最新 main 开分支、指向 main/);
   assert.match(session, /acceptance\/<总 issue 号>-<出处 issue 号>-sc<k>/);
-  assert.match(session, /「任务 issue：<ref>」/);
-  assert.match(session, /Closes <ref>/);
+  // <root> 是总 issue、<item> 是出处 issue：修正 PR 第一行链总 issue，不写 Closes 总 issue。
+  assert.match(session, /「任务 issue：<root>」/);
+  assert.doesNotMatch(session, /「Closes <ref>」|「Closes <root>」/);
+  assert.doesNotMatch(session, /<ref>/, 'SESSION.md 不再用含糊的 <ref>');
   assert.match(session, /先开 Draft/);
   assert.match(session, /CI 全绿后由 prbot 自己转 Ready/);
   assert.match(session, /Mivo 也一样/);
@@ -102,6 +104,23 @@ test('SC7/SC10/SC11 SESSION.md 写清扫描、进度、done、脱敏和退出码
   }
   // watch 档只出裁决、写看板。
   assert.match(session, /watch 档只出裁决、写看板/);
+});
+
+test('SESSION.md 区分总 issue 与出处 issue、写清 verdict.json 结构和覆盖率、验收轮不推送、只出裁决', () => {
+  assert.match(session, /`<root>`：\*\*总 issue\*\*/);
+  assert.match(session, /`<item>`：某条验收项的\*\*出处 issue\*\*/);
+  assert.match(session, /--item "<item> SC<k>"/);
+  assert.match(session, /### 裁决文件 verdict\.json/);
+  assert.match(session, /"result": "通过"/);
+  assert.match(session, /每条 SC 都要有一条结论/);
+  assert.match(session, /`items` 为空也拒绝/);
+  assert.match(session, /验收轮不改代码、不推送、不开 PR/);
+  assert.match(session, /这一轮不要调 `helper\.mjs push`/);
+  assert.match(session, /verdictOnly/);
+  assert.match(session, /最后一步只写裁决/);
+  assert.match(session, /本 issue 由人工复核后关闭/);
+  assert.match(session, /勾选 → 看板/);
+  assert.match(session, /reason=verdict-only/);
 });
 
 test('SC2/SC6 SESSION.md 只依赖命令行，不提非命令行工具', () => {

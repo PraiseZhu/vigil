@@ -6,10 +6,13 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
-  BOARD_ITEM_QUERY,
+  ACCEPTANCE_OPTIONS,
+  BOARD_ACCESS_QUERY,
   PROJECT_QUERY,
   REPO_QUERY,
   VIEWER_QUERY,
+  checkMaskConfig,
+  probeAction,
   runDoctor,
 } from './bin/doctor.mjs';
 import { hostPaths } from './host/paths.mjs';
@@ -36,34 +39,32 @@ function makeFixture({ heartbeat, writeCommand = true } = {}) {
   return { ...base, paths, exampleToken, profileEnv: { ACCEPTANCE_WATCHER_HOME: base.home } };
 }
 
-function makeGithub({ viewer = OWNER, project = true, forkPermission = 'WRITE', boardItem = true } = {}) {
+function boardAccess({ project = true, canUpdate = true, fields } = {}) {
+  if (!project) return { user: { projectV2: null } };
+  const nodes = fields || [
+    {
+      __typename: 'ProjectV2SingleSelectField',
+      name: '验收',
+      dataType: 'SINGLE_SELECT',
+      options: ACCEPTANCE_OPTIONS.map((name) => ({ name })),
+    },
+    { __typename: 'ProjectV2Field', name: '裁决', dataType: 'TEXT' },
+  ];
+  return { user: { projectV2: { id: 'PVT_1', viewerCanUpdate: canUpdate, fields: { nodes } } } };
+}
+
+function makeGithub({ viewer = OWNER, project = true, forkPermission = 'WRITE', canUpdate = true, fields, ownerGraphql = true } = {}) {
   const writes = [];
-  return {
+  const ownerQueries = [];
+  const github = {
     writes,
+    ownerQueries,
     async graphql(query, variables = {}) {
       if (query === VIEWER_QUERY) return { viewer: { login: viewer } };
       if (query === PROJECT_QUERY) return { user: { projectV2: project ? { id: 'PVT_1', title: '看板' } : null } };
-      if (query === BOARD_ITEM_QUERY) {
-        return {
-          user: { projectV2: project ? { id: 'PVT_1' } : null },
-          repository: {
-            issue: {
-              id: 'I_1',
-              projectItems: {
-                nodes: boardItem
-                  ? [
-                      {
-                        id: 'PVTI_1',
-                        isArchived: false,
-                        project: { id: 'PVT_1' },
-                        fieldValueByName: { text: 'https://example.invalid/verdict' },
-                      },
-                    ]
-                  : [],
-              },
-            },
-          },
-        };
+      if (query === BOARD_ACCESS_QUERY) {
+        if (ownerGraphql) throw new Error('看板写回要用账号令牌查（ownerGraphql），不该走读令牌');
+        return boardAccess({ project, canUpdate, fields });
       }
       if (query === REPO_QUERY) {
         const repo = `${variables.owner}/${variables.name}`;
@@ -77,12 +78,24 @@ function makeGithub({ viewer = OWNER, project = true, forkPermission = 'WRITE', 
       return { itemId: 'PVTI_1' };
     },
   };
+  if (ownerGraphql) {
+    github.ownerGraphql = async (query, variables = {}) => {
+      ownerQueries.push({ query, variables });
+      if (query === BOARD_ACCESS_QUERY) return boardAccess({ project, canUpdate, fields });
+      throw new Error(`假 gh 不认识的账号令牌查询：${query.slice(0, 40)}`);
+    };
+  }
+  return github;
 }
 
 function makeProbes({ gh = '/usr/bin/gh', writeProbe = { code: 0 }, outsideProbe = { code: 4 }, mask = { ok: true, detail: '遮住了' } } = {}) {
   return {
     which: (cmd) => (cmd === 'gh' ? gh : cmd === 'git' ? '/usr/bin/git' : null),
-    runWriteCommand: async (action) => (action.repo ? outsideProbe : writeProbe),
+    actions: [],
+    async runWriteCommand(action) {
+      this.actions.push(action);
+      return action.repo ? outsideProbe : writeProbe;
+    },
     sandboxMask: async () => mask,
   };
 }
@@ -99,7 +112,6 @@ test('SC1/SC10 全部就绪：exit 0，逐项都标 ok', async () => {
     probes: makeProbes(),
     github,
     now: () => NOW,
-    boardItem: `${REPO}#1`,
   });
   assert.equal(result.ok, true, JSON.stringify(result.checks, null, 2));
   for (const check of result.checks) assert.equal(check.ok, true, `${check.name}：${check.detail}`);
@@ -107,8 +119,11 @@ test('SC1/SC10 全部就绪：exit 0，逐项都标 ok', async () => {
   for (const name of ['node 版本', 'gh 在 PATH 上', 'git 在 PATH 上', '令牌账号', '仓可读', '写闸探针', '看板', '看板写回', 'fork 推送', '常驻循环', '令牌文件', 'bwrap 遮罩']) {
     assert.ok(names.includes(name), `少了检查项 ${name}`);
   }
-  assert.equal(github.writes.length, 1, '看板写回只写一次');
-  assert.deepEqual(github.writes[0].fields, { 裁决: 'https://example.invalid/verdict' });
+  // doctor 不对 GitHub 做任何真实写入：看板写回只读判断（账号令牌查 viewerCanUpdate 和字段）。
+  assert.equal(github.writes.length, 0, 'doctor 不写 GitHub');
+  assert.equal(github.ownerQueries.length, 1);
+  assert.equal(github.ownerQueries[0].query, BOARD_ACCESS_QUERY);
+  assert.deepEqual(github.ownerQueries[0].variables, { login: OWNER, projectNumber: 7 });
 });
 
 test('SC1 缺哪项报哪项：gh / 令牌账号 / 仓可读 / 看板 / fork 推送 / 常驻循环 / 令牌文件 / bwrap 遮罩', async () => {
@@ -124,7 +139,6 @@ test('SC1 缺哪项报哪项：gh / 令牌账号 / 仓可读 / 看板 / fork 推
     }),
     github: makeGithub({ viewer: 'ExampleOther', project: false, forkPermission: 'READ' }),
     now: () => NOW,
-    boardItem: `${REPO}#1`,
   });
   assert.equal(result.ok, false);
   const failed = result.checks.filter((check) => !check.ok).map((check) => check.name);
@@ -142,7 +156,6 @@ test('SC1 仓读不到 → 「仓可读」报出来并点名', async () => {
     probes: makeProbes(),
     github,
     now: () => NOW,
-    boardItem: `${REPO}#1`,
   });
   const readable = checkOf(result, '仓可读');
   assert.equal(readable.ok, false);
@@ -156,7 +169,6 @@ test('SC1 写闸总开关关着（探针 4）算通过并写明状态；没配 w
     probes: makeProbes({ writeProbe: { code: 4 }, outsideProbe: { code: 4 } }),
     github: makeGithub(),
     now: () => NOW,
-    boardItem: `${REPO}#1`,
   });
   assert.equal(checkOf(result, '写闸探针').ok, true);
   assert.match(checkOf(result, '写闸探针').detail, /关着/);
@@ -168,39 +180,112 @@ test('SC1 写闸总开关关着（探针 4）算通过并写明状态；没配 w
     probes: makeProbes(),
     github: makeGithub(),
     now: () => NOW,
-    boardItem: `${REPO}#1`,
   });
   assert.equal(checkOf(noProbe, '写闸探针').ok, true);
   assert.match(checkOf(noProbe, '写闸探针').detail, /没有配 writeCommand/);
 });
 
-test('SC10 没有 --board-item → 「看板写回」失败并说明需要它', async () => {
+test('SC10 看板写回是只读判断：没写权限 / 缺字段 / 缺选项 / 裁决是单选 → 失败并点名，零写入', async () => {
   const fixture = makeFixture();
-  const result = await runDoctor({
+  const cases = [
+    [{ canUpdate: false }, /没有写权限/],
+    [{ fields: [{ __typename: 'ProjectV2Field', name: '裁决', dataType: 'TEXT' }] }, /没有「验收」字段/],
+    [
+      {
+        fields: [
+          { __typename: 'ProjectV2SingleSelectField', name: '验收', dataType: 'SINGLE_SELECT', options: [{ name: '通过' }] },
+          { __typename: 'ProjectV2Field', name: '裁决', dataType: 'TEXT' },
+        ],
+      },
+      /缺选项：验收中、要修、修正中/,
+    ],
+    [
+      {
+        fields: [
+          { __typename: 'ProjectV2SingleSelectField', name: '验收', dataType: 'SINGLE_SELECT', options: ACCEPTANCE_OPTIONS.map((name) => ({ name })) },
+          { __typename: 'ProjectV2SingleSelectField', name: '裁决', dataType: 'SINGLE_SELECT', options: [] },
+        ],
+      },
+      /必须是文本/,
+    ],
+    [{ project: false }, /读不到看板 #7/],
+  ];
+  for (const [options, pattern] of cases) {
+    const github = makeGithub(options);
+    const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github, now: () => NOW });
+    const check = checkOf(result, '看板写回');
+    assert.equal(check.ok, false, JSON.stringify(options));
+    assert.match(check.detail, pattern);
+    assert.equal(github.writes.length, 0);
+  }
+});
+
+test('SC10 看板写回：注入的 github 没有 ownerGraphql 时退回读令牌查；写闸探针从不交 project.field.set', async () => {
+  const fixture = makeFixture();
+  const github = makeGithub({ ownerGraphql: false });
+  const probes = makeProbes();
+  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes, github, now: () => NOW });
+  assert.equal(checkOf(result, '看板写回').ok, true, checkOf(result, '看板写回').detail);
+  assert.equal(github.writes.length, 0);
+  assert.ok(probes.actions.length >= 2);
+  for (const action of probes.actions) assert.equal(action.type, 'probe', '经 writeCommand 只交探针');
+});
+
+test('#47 探针动作：每次 dedupeKey 都不同（带随机数），带 probe 标记', async () => {
+  const fixture = makeFixture();
+  const probes = makeProbes();
+  await runDoctor({ profileEnv: fixture.profileEnv, probes, github: makeGithub(), now: () => NOW });
+  await runDoctor({ profileEnv: fixture.profileEnv, probes, github: makeGithub(), now: () => NOW });
+  const keys = probes.actions.map((action) => action.dedupeKey);
+  assert.equal(keys.length, 4);
+  assert.equal(new Set(keys).size, 4, keys.join(','));
+  for (const action of probes.actions) {
+    assert.equal(action.probe, true);
+    assert.match(action.dedupeKey, /^doctor-probe:[0-9a-f-]{36}$/);
+  }
+  assert.notEqual(probeAction().dedupeKey, probeAction().dedupeKey);
+});
+
+test('#47 bwrap 遮罩：host.json 的 credentialDirs / homeAllowDirs 不存在或与可写绑定重叠 → 失败；正常 → 通过', async () => {
+  const fixture = makeFixture();
+  const profile = JSON.parse(fs.readFileSync(path.join(fixture.home, 'config', 'profile.json'), 'utf8'));
+  const credential = tmpDir('acc-cred-');
+  const allow = tmpDir('acc-allow-');
+
+  const good = await runDoctor({
     profileEnv: fixture.profileEnv,
     probes: makeProbes(),
     github: makeGithub(),
     now: () => NOW,
+    hostConfig: { credentialDirs: [credential], homeAllowDirs: [allow] },
   });
-  const check = checkOf(result, '看板写回');
-  assert.equal(check.ok, false);
-  assert.match(check.detail, /--board-item/);
-  assert.equal(result.ok, false);
-});
+  assert.equal(checkOf(good, 'bwrap 遮罩').ok, true, checkOf(good, 'bwrap 遮罩').detail);
 
-test('SC10 看板条目不在看板上 → 「看板写回」失败，不写', async () => {
-  const fixture = makeFixture();
-  const github = makeGithub({ boardItem: false });
-  const result = await runDoctor({
+  const missing = path.join(credential, 'not-there');
+  const overlapping = path.join(profile.stateDir, 'creds');
+  fs.mkdirSync(overlapping, { recursive: true });
+  const bad = await runDoctor({
     profileEnv: fixture.profileEnv,
     probes: makeProbes(),
-    github,
+    github: makeGithub(),
     now: () => NOW,
-    boardItem: `${REPO}#1`,
+    hostConfig: { credentialDirs: [missing, overlapping], homeAllowDirs: [profile.worktreeDir] },
   });
-  assert.equal(checkOf(result, '看板写回').ok, false);
-  assert.match(checkOf(result, '看板写回').detail, /不在看板上/);
-  assert.equal(github.writes.length, 0);
+  const check = checkOf(bad, 'bwrap 遮罩');
+  assert.equal(check.ok, false);
+  assert.match(check.detail, /credentialDirs\[0\] 不存在/);
+  assert.match(check.detail, /credentialDirs\[1\] 与可写绑定（stateDir）重叠/);
+  assert.match(check.detail, /homeAllowDirs\[0\] 与可写绑定（worktreeDir）重叠/);
+  assert.equal(check.detail.includes(missing), false, '路径不回显');
+
+  // 不传 hostConfig 时读 <home>/config/host.json。
+  fs.writeFileSync(path.join(fixture.home, 'config', 'host.json'), JSON.stringify({ credentialDirs: [missing] }));
+  const fromFile = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW });
+  assert.equal(checkOf(fromFile, 'bwrap 遮罩').ok, false);
+  assert.match(checkOf(fromFile, 'bwrap 遮罩').detail, /credentialDirs\[0\] 不存在/);
+
+  assert.deepEqual(checkMaskConfig({ hostConfig: {}, profile }), []);
+  assert.deepEqual(checkMaskConfig({ hostConfig: { credentialDirs: 'x' }, profile }), ['host.json 的 credentialDirs 应为绝对路径数组']);
 });
 
 test('SC1 配置缺失：只报一条「配置」，不回落任何默认配置', async () => {
@@ -258,7 +343,7 @@ test('SC1 fork 推送按 forkTargets 查对照的 fork 仓（名字和上游不�
     }
     return inner(query, variables);
   };
-  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github, now: () => NOW, boardItem: `${REPO}#1` });
+  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github, now: () => NOW });
   const fork = checkOf(result, 'fork 推送');
   assert.equal(fork.ok, true, fork.detail);
   assert.ok(asked.includes(`${OWNER}/cindy-fork`), asked.join(','));

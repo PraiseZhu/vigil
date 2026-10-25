@@ -94,7 +94,7 @@ LLM 网关的 host 取 pi 的 `models.json` 里 `baseUrl` 的主机名；`git cl
 `writeCommand = ["node", "host/gate-client.mjs", "--socket", "<roundDir>/gate/gate.sock"]`：
 一条动作 JSON 从标准输入进沙箱里的 client，经 unix socket 交给**沙箱外**的写闸。
 
-宿主这边的 `profile.json` 里把 `writeCommand` 指到写闸的 exec 用法（`doctor` 的探测和看板写回走它）：
+宿主这边的 `profile.json` 里把 `writeCommand` 指到写闸的 exec 用法（`doctor` 的探测走它；看板写回是只读判断，不走它）：
 
 ```json
 "writeCommand": ["node", "<repo>/watchers/acceptance/host/write-gate.mjs", "exec", "--home", "<home>"]
@@ -239,7 +239,7 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 2. **跑部署检查**：
 
    ```sh
-   ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/bin/doctor.mjs --board-item <owner/repo#n>
+   ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/bin/doctor.mjs
    ```
 
    逐项 `✓`/`✗`，缺哪项改哪项；全 `✓` 才继续。检查项见第 8 节。
@@ -303,10 +303,12 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 - `仓可读`：`autoRepos`/`forkRepos`/`watchRepos` 里每个具体仓都读得到。
 - `写闸探针`：配了 `writeCommand` 就用一条不改任何东西的探测动作确认它当场回结果——总开关开着
   返回 0，关着返回 4（两种都算正常，报出是哪种）；意外退出码算失败。
-- `写闸探针（仓外）`：名单外的仓必须返回 4。
+- `写闸探针（仓外）`：名单外的仓必须返回 4。探针动作带 `probe` 标记和随机 `dedupeKey`；写闸对探针只记日志（stderr），
+  不写 `gate-rejected` 提醒（不进 Slack 摘要）、不记账本。
 - `看板`：能读 `projectV2(projectNumber)`。
-- `看板写回`：需要 `--board-item <owner/repo#n>`；读该条目的「裁决」原值再写回同一个值，缺这个
-  参数就报失败。
+- `看板写回`：只读判断，不写 GitHub、不经写闸——用账号令牌查看板的 `viewerCanUpdate`，再看「验收」
+  （单选，含 验收中 / 要修 / 修正中 / 通过）和「裁决」（文本）两个字段在不在。`--board-item` 不再需要。
+  （以前是读一条条目的「裁决」原值再经 writeCommand 写回，但写闸 exec 只放行认领和中断，恒返回 4。）
 - `fork 推送`：`forkRepos` 里每个仓对应的 fork 都存在且 `viewerPermission` 是
   `ADMIN`/`MAINTAIN`/`WRITE`。fork 默认是 `ownerLogin` 名下同名的仓；名字不同就在 profile 里写
   `"forkTargets": {"<上游 owner/repo>": "<ownerLogin>/<fork 名>"}`（键必须在 `forkRepos` 里，fork 必须在
@@ -314,7 +316,8 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 - `常驻循环`：心跳里的 pid 活着且心跳不超过 3 分钟。
 - `令牌文件`：`…TokenFile` / App 私钥文件全部通过 600、属主当前用户、非空检查。
 - `bwrap 遮罩`：在 bwrap 里跑一个读文件的小脚本，名单上的文件和凭证目录必须一个都读不到；
-  bwrap 不可用算失败。
+  bwrap 不可用算失败。遮罩名单按 `<home>/config/host.json` 算（`credentialDirs` 也遮），并且先查
+  `credentialDirs` / `homeAllowDirs` 每一项都存在、不与可写绑定（`stateDir`、`worktreeDir`）互相包含。
 
 ## 9. 组织仓的开关
 

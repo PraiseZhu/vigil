@@ -10,7 +10,7 @@ import { readNeedsHuman, scanForSecrets } from './bin/push.mjs';
 import { scanIntroducedObjects } from './bin/secretscan.mjs';
 import { WriteRejectedError } from './bin/github.mjs';
 import { HANDOFF_REPO, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
-import { REPO, createFakeGithub, createWorld, defaultTree } from './session.fixture.mjs';
+import { REPO, createFakeGithub, createWorld, defaultTree, fullConclusions } from './session.fixture.mjs';
 import { BYPASS_KINDS, BYPASS_LABELS, buildBypassRepo } from './secret-bypass.fixture.mjs';
 
 // 假私钥头按行拼，源码里不会出现完整的私钥头。
@@ -224,7 +224,7 @@ test('SC7 写闸返回 secret-found：退出码 4、不标中断，裁决里写�
   const verdictPath = path.join(dirOf(profile), 'verdict.json');
   fs.writeFileSync(
     verdictPath,
-    JSON.stringify({ items: [{ ref: `${REPO}#1`, sc: 1, result: '通过', evidence: '真跑过' }] }),
+    JSON.stringify({ items: fullConclusions({ [`${REPO}#1 SC1`]: { evidence: '真跑过' } }) }),
   );
   const verdict = await run(world, profile, [
     'verdict',
