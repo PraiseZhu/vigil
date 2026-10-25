@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { hostPaths, readAlerts } from './host/paths.mjs';
-import { runHostRound } from './host/round.mjs';
+import { roundDirFor, roundKey, runHostRound } from './host/round.mjs';
 import { runTick } from './host/tick.mjs';
 import { run as procRun } from './host/proc.mjs';
 import { OWNER, REPO, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
@@ -340,4 +340,14 @@ test('SC13 tick 里 poll 出错：心跳记 ok=false + 一条提醒，不抛出'
   assert.ok(readAlerts(hostPaths(home)).some((entry) => entry.kind === 'tick-failed'));
   const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
   assert.ok(profile.ownerLogin);
+});
+
+test('SC11 同一个仓两个总 issue 的同号轮次：roundDir、登记文件名各不相同（不会共用 socket、互相覆盖 pi.log）', () => {
+  const paths = hostPaths(tmpDir());
+  const first = `${REPO}#1`;
+  const second = `${REPO}#2`;
+  assert.notEqual(roundKey(first, 1), roundKey(second, 1));
+  assert.notEqual(roundDirFor(paths, first, 1), roundDirFor(paths, second, 1));
+  assert.notEqual(roundDirFor(paths, first, 1), roundDirFor(paths, first, 2));
+  assert.match(path.basename(roundDirFor(paths, second, 1)), /__2__1$/);
 });
