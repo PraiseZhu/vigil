@@ -81,7 +81,7 @@ function slackHeartbeat(result) {
   return out;
 }
 
-/** 读轮次登记目录：<roundsDir>/<owner>__<repo>__<n>.json。坏文件跳过。 */
+/** 读轮次登记目录：<roundsDir>/<owner>__<repo>__<issue 号>__<n>.json。坏文件跳过。 */
 export function readRegistry(paths) {
   let names = [];
   try {

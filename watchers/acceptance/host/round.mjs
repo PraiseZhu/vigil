@@ -78,9 +78,17 @@ export function acquireSlot(paths, now = () => Date.now()) {
   return null;
 }
 
+/**
+ * 一轮在宿主上的名字：<owner>__<repo>__<issue 号>__<轮次>。必须带 issue 号——同一个仓的两个总 issue
+ * 各自的第 1 轮会同时跑（两个槽），不带号就共用 roundDir、写闸 socket 和登记文件，pi.log 也互相覆盖。
+ */
+export function roundKey(issue, round) {
+  const { owner, name, number } = parseRef(issue);
+  return `${owner}__${name}__${number}__${round}`;
+}
+
 export function roundDirFor(paths, issue, round) {
-  const { owner, name } = parseRef(issue);
-  return path.join(paths.roundRunDir, `${owner}__${name}__${round}`);
+  return path.join(paths.roundRunDir, roundKey(issue, round));
 }
 
 function writeJsonAtomic(file, data) {
@@ -342,8 +350,7 @@ export async function runHostRound({
     const claim = parseClaim(claimed.stdout);
 
     // 4. 轮次登记
-    const key = `${parseRef(issue).owner}__${parseRef(issue).name}__${claim.round}`;
-    registryFile = path.join(paths.roundsDir, `${key}.json`);
+    registryFile = path.join(paths.roundsDir, `${roundKey(issue, claim.round)}.json`);
     writeJsonAtomic(registryFile, {
       issue,
       round: claim.round,
