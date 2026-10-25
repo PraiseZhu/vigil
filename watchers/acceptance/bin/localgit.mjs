@@ -4,22 +4,9 @@
 import { spawn } from 'node:child_process';
 
 const ALLOWED = new Set(['git', 'gitleaks']);
-const NETWORK_SUBCOMMANDS = new Set([
-  'fetch',
-  'push',
-  'pull',
-  'clone',
-  'ls-remote',
-  'remote',
-  'submodule',
-  'archive',
-  'request-pull',
-  'svn',
-  'daemon',
-  'update-server-info',
-  'send-pack',
-  'receive-pack',
-]);
+// 允许名单：只放推送前扫描和打包真正用到的本地子命令；其余（含 fetch、push、clone、remote 等网络命令）一律拒绝。
+const ALLOWED_SUBCOMMANDS = new Set(['diff', 'rev-parse', 'bundle']);
+const ALLOWED_BUNDLE_ACTIONS = new Set(['create', 'list-heads']);
 const ENV_DENY = /(TOKEN|SECRET|PASSWORD|ASKPASS|CREDENTIAL)/i;
 const ENV_DENY_EXACT = new Set([
   'GIT_CONFIG_COUNT',
@@ -91,7 +78,10 @@ export function createLocalGit({ run = spawnRun, env = localEnv() } = {}) {
     if (!Array.isArray(args) || !args.length) throw new Error('git 需要参数');
     const sub = args[0];
     if (sub.startsWith('-')) throw new Error(`git 的第一个参数必须是子命令：${sub}`);
-    if (NETWORK_SUBCOMMANDS.has(sub)) throw new Error(`localgit 不做网络操作：${sub}`);
+    if (!ALLOWED_SUBCOMMANDS.has(sub)) throw new Error(`localgit 只允许本地子命令 diff / rev-parse / bundle，收到：${sub}`);
+    if (sub === 'bundle' && !ALLOWED_BUNDLE_ACTIONS.has(args[1])) {
+      throw new Error(`localgit 只允许 bundle create / list-heads，收到：bundle ${args[1]}`);
+    }
     return call('git', args, options);
   }
 
@@ -106,19 +96,27 @@ export function createLocalGit({ run = spawnRun, env = localEnv() } = {}) {
     }
   }
 
-  /** base...HEAD 的零上下文补丁，只看新增行。 */
-  async function diff({ base, cwd }) {
-    return git(['diff', '--unified=0', `${safeRange(base)}...HEAD`], { cwd: safePath(cwd, 'worktree') });
+  /** base...<commit> 的零上下文补丁，只看新增行。commit 是要推的分支解析出的提交，不是 HEAD。 */
+  async function diff({ base, commit, cwd }) {
+    return git(['diff', '--unified=0', `${safeRange(base)}...${safeRange(commit)}`], { cwd: safePath(cwd, 'worktree') });
   }
 
-  async function headSha({ cwd }) {
-    return git(['rev-parse', 'HEAD'], { cwd: safePath(cwd, 'worktree') });
+  /** 分支解析成提交 sha（只认本地分支 refs/heads/<branch>）。 */
+  async function branchSha({ branch, cwd }) {
+    return git(['rev-parse', '--verify', '--quiet', `refs/heads/${safeRange(branch)}^{commit}`], {
+      cwd: safePath(cwd, 'worktree'),
+    });
   }
 
   async function createBundle({ branch, file, cwd }) {
-    return git(['bundle', 'create', safePath(file, 'bundle 路径'), safePath(branch, '分支名')], {
+    return git(['bundle', 'create', safePath(file, 'bundle 路径'), `refs/heads/${safeRange(branch)}`], {
       cwd: safePath(cwd, 'worktree'),
     });
+  }
+
+  /** bundle 里各个 ref 指向的提交，用来核对打包的正是扫过的那个提交。 */
+  async function bundleHeads({ file, cwd }) {
+    return git(['bundle', 'list-heads', safePath(file, 'bundle 路径')], { cwd: safePath(cwd, 'worktree') });
   }
 
   /** gitleaks 本地扫描：报告写到 reportPath，返回进程结果。 */
@@ -138,5 +136,5 @@ export function createLocalGit({ run = spawnRun, env = localEnv() } = {}) {
     );
   }
 
-  return { git, has, diff, headSha, createBundle, gitleaks };
+  return { git, has, diff, branchSha, createBundle, bundleHeads, gitleaks };
 }

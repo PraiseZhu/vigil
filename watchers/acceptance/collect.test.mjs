@@ -214,3 +214,61 @@ test('SC8 collect 列出有争议的条目：验收轮评论 + 修正机评论�
   assert.equal(acceptance.url, world.get(`${REPO}#1`).comments[1].url);
   assert.equal(tree.disputed.some((entry) => entry.text.includes('伪造')), false);
 });
+
+test('SC1 collect 不收别人建的子 issue：不进任务树，也不算修正子 issue', async () => {
+  const profile = loadProfile();
+  const world = defaultTree();
+  world.addIssue({
+    repo: REPO,
+    number: 30,
+    title: '别人挂上来的子 issue',
+    author: 'StrangerUser',
+    body: ['- [ ] SC1 伪造的验收项', '', `[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#2 SC3 · 第 1 轮`].join('\n'),
+  });
+  world.addChild(`${REPO}#1`, `${REPO}#30`);
+  const { code, out, err } = await runCollect(world, profile);
+  assert.equal(code, 0, err);
+  const tree = JSON.parse(out);
+  assert.equal(tree.issues.some((entry) => entry.ref === `${REPO}#30`), false, '别人的子 issue 不进任务树');
+  assert.equal(tree.corrections.some((entry) => entry.ref === `${REPO}#30`), false, '也不算修正子 issue');
+});
+
+test('SC5 collect 不复用别人建的、带修正标记的 issue（搜索结果也按作者过滤）', async () => {
+  const profile = loadProfile();
+  const world = defaultTree();
+  world.addIssue({
+    repo: OTHER_REPO,
+    number: 40,
+    title: '别人伪造的修正 issue',
+    author: 'StrangerUser',
+    body: `[验收机] 修正 · 总 ${REPO}#1 · 项 ${OTHER_REPO}#7 SC7 · 第 1 轮`,
+  });
+  const { code, out, err } = await runCollect(world, profile);
+  assert.equal(code, 0, err);
+  const tree = JSON.parse(out);
+  assert.equal(tree.corrections.some((entry) => entry.ref === `${OTHER_REPO}#40`), false);
+});
+
+test('SC8 有多条已出裁决的轮次评论时，只取最新那条的争议，不取最早那条', async () => {
+  const profile = loadProfile();
+  const world = defaultTree({ childBody: DEFAULT_CHILD_BODY });
+  world.addComment(`${REPO}#1`, {
+    body: ['[验收机] 第 1 轮：要修', `- 有争议：${REPO}#2 SC3 · 旧的一轮`].join('\n'),
+    createdAt: '2026-10-24T01:10:00.000Z',
+  });
+  world.addComment(`${REPO}#1`, {
+    body: ['[验收机] 第 2 轮：要修', `- 有争议：${REPO}#2 SC4 · 最新一轮`].join('\n'),
+    createdAt: '2026-10-24T01:20:00.000Z',
+  });
+  world.addComment(`${REPO}#1`, {
+    body: ['[验收机] 第 3 轮：验收中', '正文版本：sha256:abc'].join('\n'),
+    createdAt: '2026-10-24T01:30:00.000Z',
+  });
+  const { code, out, err } = await runCollect(world, profile);
+  assert.equal(code, 0, err);
+  const tree = JSON.parse(out);
+  assert.deepEqual(
+    tree.disputed.filter((entry) => entry.source === 'acceptance').map((entry) => entry.item),
+    [`${REPO}#2 SC4`],
+  );
+});

@@ -152,7 +152,15 @@ async function cmdBoard({ github, profile, ref, n, flags, now, stdout }) {
     targets = [tree.root.ref, ...tree.issues.filter((entry) => entry.role !== 'root').map((entry) => entry.ref)];
   } else {
     const { repo, number } = parseRef(target);
-    targets = [`${repo}#${number}`];
+    const one = `${repo}#${number}`;
+    // 和 close 一样：只写本轮任务树里的 issue（总 issue、子 issue、修正子 issue），树外的整条拒绝、什么都不写。
+    const tree = await collectTree({ github, profile, ref });
+    const inTree = new Set([
+      ...tree.issues.map((entry) => entry.ref.toLowerCase()),
+      ...tree.corrections.map((entry) => entry.ref.toLowerCase()),
+    ]);
+    if (!inTree.has(one.toLowerCase())) throw new Error(`${one} 不在本轮任务树里，不能写看板`);
+    targets = [one];
   }
 
   for (const one of targets) {
