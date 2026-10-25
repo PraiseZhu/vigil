@@ -108,6 +108,39 @@ function requireRepoList(raw, key, file, fallback) {
 }
 
 /**
+ * forkTargets（可选）：上游仓 → fork 仓的对照，例如 {"upstream-owner/app": "ExampleUser/app-fork"}。
+ * 键必须是 forkRepos 里写明的具体仓；值必须在 ownerLogin 名下（fork 只推到自己名下，写闸规则不放宽）。
+ * 没写的上游仓照旧用 ownerLogin 名下同名的仓。
+ */
+function parseForkTargets(raw, file, { ownerLogin, forkRepos }) {
+  if (!Object.hasOwn(raw, 'forkTargets') || raw.forkTargets === undefined || raw.forkTargets === null) return {};
+  const value = raw.forkTargets;
+  if (typeof value !== 'object' || Array.isArray(value)) throw invalid('forkTargets', file, '应为「上游仓 → fork 仓」的对象');
+  const out = {};
+  for (const [upstream, target] of Object.entries(value)) {
+    if (!REPO_PATTERN.test(upstream) || upstream.endsWith('/*')) throw invalid('forkTargets', file, `键应为具体的 owner/repo：${upstream}`);
+    if (!forkRepos.some((item) => item.toLowerCase() === upstream.toLowerCase())) {
+      throw invalid('forkTargets', file, `${upstream} 不在 forkRepos 里`);
+    }
+    if (typeof target !== 'string' || !REPO_PATTERN.test(target) || target.endsWith('/*')) {
+      throw invalid('forkTargets', file, `${upstream} 的 fork 应为具体的 owner/repo`);
+    }
+    if (target.split('/')[0].toLowerCase() !== ownerLogin.toLowerCase()) {
+      throw invalid('forkTargets', file, `${upstream} 的 fork 必须在 ${ownerLogin} 名下`);
+    }
+    out[upstream.toLowerCase()] = target;
+  }
+  return out;
+}
+
+/** 上游仓对应的 fork 仓：forkTargets 里写了就用它，否则是 ownerLogin 名下同名的仓。 */
+export function forkTargetFor(profile, upstreamRepo) {
+  const mapped = profile?.forkTargets?.[String(upstreamRepo).toLowerCase()];
+  if (mapped) return mapped;
+  return `${profile.ownerLogin}/${String(upstreamRepo).split('/')[1]}`;
+}
+
+/**
  * 校验密钥文件（只看文件元数据，不读内容）：存在、普通文件、属主是当前用户、权限正好是 600、非空。
  * 错误信息只点名键和原因，绝不带出文件内容。令牌内容只由真正用它的模块读（GitHub 令牌：github.mjs）。
  */
@@ -200,6 +233,7 @@ export function loadAcceptanceProfile(env = process.env) {
   const autoRepos = requireRepoList(raw, 'autoRepos', file, [`${ownerLogin}/*`]);
   const forkRepos = requireRepoList(raw, 'forkRepos', file, ['makecindy/cindy']);
   const watchRepos = requireRepoList(raw, 'watchRepos', file, []);
+  const forkTargets = parseForkTargets(raw, file, { ownerLogin, forkRepos });
 
   let stallMinutes = 30;
   if (Object.hasOwn(raw, 'stallMinutes') && raw.stallMinutes !== undefined && raw.stallMinutes !== null) {
@@ -245,6 +279,7 @@ export function loadAcceptanceProfile(env = process.env) {
     githubTokenFile,
     autoRepos: Object.freeze(autoRepos),
     forkRepos: Object.freeze(forkRepos),
+    forkTargets: Object.freeze(forkTargets),
     watchRepos: Object.freeze(watchRepos),
     stallMinutes,
     writeCommand: writeCommand ? Object.freeze(writeCommand) : undefined,

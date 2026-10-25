@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { checkSecretFile, loadAcceptanceProfile, tokenFiles, watcherHome } from './profile.mjs';
+import { checkSecretFile, forkTargetFor, loadAcceptanceProfile, tokenFiles, watcherHome } from './profile.mjs';
 import { createGithub } from './github.mjs';
 import { parseRef } from './rounds.mjs';
 import { hostPaths, isAlive } from '../host/paths.mjs';
@@ -229,12 +229,14 @@ export async function runDoctor({
   for (const pattern of profile.forkRepos || []) {
     const name = String(pattern).split('/')[1];
     if (!name || name === '*') continue;
+    const target = forkTargetFor(profile, pattern);
+    const [owner, targetName] = target.split('/');
     try {
-      const data = await api.graphql(REPO_QUERY, { owner: profile.ownerLogin, name });
+      const data = await api.graphql(REPO_QUERY, { owner, name: targetName });
       const permission = data?.repository?.viewerPermission;
-      if (!FORK_PERMISSIONS.has(String(permission))) forkProblems.push(`${profile.ownerLogin}/${name}`);
+      if (!FORK_PERMISSIONS.has(String(permission))) forkProblems.push(target);
     } catch {
-      forkProblems.push(`${profile.ownerLogin}/${name}`);
+      forkProblems.push(target);
     }
   }
   add(
