@@ -399,6 +399,32 @@ function includeOpenThreadFeedback(fresh, observed) {
   return feedback;
 }
 
+// A bot review thread can be delivered to a round that blocks, and that round can then be superseded by one
+// dispatched for newer feedback only. The cursor says "delivered", no ledger entry judges it, and no reopen path
+// reads the superseded task again, so the thread stays open and holds the review check for good (2026-10-24: a
+// Greptile P1 open for 14 h). Once no task is running, hand such a thread back, once per content stamp and head.
+// Threads the current blocked task holds are left to the blocked-task reopen paths; member threads are left to the person.
+const ORPHAN_THREAD_SOURCES = new Set(['greptile', 'mivo-review']);
+function orphanedBotThreads({ previous, observed, cursorBase, paths, head }) {
+  const active = previous.activeTask;
+  if (active?.dispatchId && !['blocked', 'complete', 'legacy-complete'].includes(active.status)) return [];
+  const held = new Set(active?.status === 'blocked'
+    ? (readDispatchTask(paths, active.dispatchId).feedback ?? []).map((item) => item?.key) : []);
+  const closing = new Set((previous.pendingThreadClose ?? []).map((item) => item?.threadId));
+  const ledger = previous.feedbackLedger ?? {};
+  const handedBack = previous.orphanRedelivery ?? {};
+  const orphans = [];
+  for (const item of observed) {
+    if (!ORPHAN_THREAD_SOURCES.has(item.source) || !item.threadId || item.actionable === false || item.deferred === true) continue;
+    const key = `${item.source}:${item.nativeId}`;
+    const stamp = cursorBase[key];
+    if (typeof stamp !== 'string' || held.has(key) || closing.has(item.threadId)) continue;
+    if (ledger[key]?.stamp === stamp || handedBack[key] === `${stamp}@${head}`) continue;
+    orphans.push({ ...item, key });
+  }
+  return orphans;
+}
+
 export function planSession({ pr, existing, date, task }) {
   const nodeId = pr.id;
   if (!nodeId) throw new Error('PR nodeid required');
@@ -2110,7 +2136,11 @@ export function* processPr({
   const cursorBase = previous.wasDraft === true && !authorPushed
     ? coveredCursor(previous.feedbackCursor, previous.feedbackLedger) : (previous.feedbackCursor || {});
   const observedAll = [...observed, ...doctor.items.map(item=>withCategory(item,{headSha:pr.headRefOid}))];
-  const { fresh: rawFresh, cursor } = newFeedback(cursorBase, observedAll);
+  const { fresh: newFresh, cursor } = newFeedback(cursorBase, observedAll);
+  const newKeys = new Set(newFresh.map((item) => item.key));
+  const orphans = orphanedBotThreads({ previous, observed, cursorBase, paths, head: pr.headRefOid })
+    .filter((item) => !newKeys.has(item.key));
+  const rawFresh = [...newFresh, ...orphans];
   // Green CI/review does not finish a newly confirmed local product failure.
   // Keep the existing owner's recovery alive until its repair result completes.
   if (rawFresh.some(item=>item.source==='lifeline-doctor' && item.repairPolicy.canChangeCode)
@@ -2478,6 +2508,11 @@ export function* processPr({
           receipt: { ...receipt, dispatch_id: receipt?.dispatch_id ?? pending.dispatchId },
           now, cursor, collected, fresh, paths });
         previous = yield* notifyDispatchConflictOnce({ previous: state.prs[key], key, paths, now, dryRun, dispatchFn, remaining, pr });
+        const handedBack = orphans.filter((item) => bound.bound === true && fresh.some((row) => row.key === item.key));
+        if (handedBack.length) {
+          previous = { ...previous, orphanRedelivery: { ...(previous.orphanRedelivery ?? {}),
+            ...Object.fromEntries(handedBack.map((item) => [item.key, `${cursorBase[item.key]}@${pr.headRefOid}`])) } };
+        }
         state.prs[key] = previous;
         dispatch = { attempted: true, ...bound };
       } catch (error) {

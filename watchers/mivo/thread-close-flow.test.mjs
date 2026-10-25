@@ -65,6 +65,10 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
     nodeId: pr.id, number: pr.number, sessionId: 'sample-session', headRefName: pr.headRefName, title: 'sample', headRefOid: head,
     eligibilityInitialized: true, eligibility: 'active', admissionVerified: true, admissionEpoch: pr.releaseEpoch, handoff: handoffReceipt(pr),
     feedbackCursor: feedback.cursor, pollFingerprint: 'old',
+    // The unrelated open thread was delivered and judged by an earlier round; without that judgement it would be
+    // an orphaned bot thread and handed back on its own.
+    ...(unrelated ? { feedbackLedger: Object.fromEntries(Object.entries(feedback.cursor).filter(([key]) => key.includes('PRRT_other'))
+      .map(([key, stamp]) => [key, { stamp, disposition: 'no-change', resultHead: head, dispatchId: 'earlier-task' }])) } : {}),
     activeTask: { dispatchId: task.dispatchId, head, status: waiting ? 'waiting-ci' : 'accepted', evidenceVersion: 2 },
     ...(legacyIntent ? { blockedNotices: { legacy: { kind: 'product-intent', commentAt: now, labelAt: now, dispatchId: task.dispatchId, attempts: 1 } } } : {}),
   }));
