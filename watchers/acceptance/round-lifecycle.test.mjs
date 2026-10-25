@@ -14,7 +14,7 @@ import { ROOT_REF, createRoundWorld, roundComments, writeMeminfo } from './round
 import { OTHER_REPO, REPO } from './fake-gh.fixture.mjs';
 
 const bwrapAvailable = await probeBwrap(procRun);
-const skip = bwrapAvailable ? false : 'bwrap 不可用（bwrap --ro-bind / / true 起不来），跳过真沙箱测试';
+const skip = bwrapAvailable ? false : 'bwrap 不可用（探针起不来），跳过真沙箱测试';
 
 /** pi：读完派发消息，对消息里列出的每个代码目录试读、试写，结果打一行 JSON 到 stdout（进 pi.log），再按 exitCode 退出。 */
 function probingPi(exitCode) {

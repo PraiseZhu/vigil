@@ -316,7 +316,12 @@ export function defaultHomeAllow({ repoRoot, hostConfig, execPath = process.exec
 /** bwrap 在不在、能不能挂命名空间：只跑一条不发散的命令。 */
 export async function probeBwrap(run) {
   try {
-    const result = await run('bwrap', ['--ro-bind', '/', '/', 'true'], { timeoutMs: 15000 });
+    // 用验收轮实际要的命名空间探：只跑 `--ro-bind / / true` 在嵌套沙箱里也能过，真起轮次时却起不来。
+    const result = await run(
+      'bwrap',
+      ['--unshare-user', '--unshare-pid', '--unshare-net', '--die-with-parent', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', 'true'],
+      { timeoutMs: 15000 },
+    );
     return Boolean(result && result.code === 0);
   } catch {
     return false;

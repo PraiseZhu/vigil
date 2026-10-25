@@ -6,6 +6,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { assertSocketPath } from './egress-proxy.mjs';
 import { isVerdictOnly, loadAcceptanceProfile, watcherHome } from '../bin/profile.mjs';
 import { createGithub, WRITE_TYPES } from '../bin/github.mjs';
 import { bodyVersion, latestRound, parseRef, parseRounds } from '../bin/rounds.mjs';
@@ -1003,11 +1004,18 @@ export async function startGateServer({ gate, socketPath } = {}) {
   const server = net.createServer((socket) => {
     chain = chain.then(() => respond(socket)).catch(() => {});
   });
+  // 路径超过 107 字节 libuv 会悄悄截断：先查长度，chmod 失败也先关掉服务再抛错，不留一个挂着的进程。
+  assertSocketPath(socketPath);
   await new Promise((resolve, rejectListen) => {
     server.once('error', rejectListen);
     server.listen(socketPath, resolve);
   });
-  fs.chmodSync(socketPath, 0o600);
+  try {
+    fs.chmodSync(socketPath, 0o600);
+  } catch (error) {
+    await new Promise((resolve) => server.close(() => resolve()));
+    throw error;
+  }
 
   return {
     socketPath,

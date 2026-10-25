@@ -10,6 +10,7 @@ import { buildBwrapArgs, defaultHomeAllow, probeBwrap } from './host/sandbox.mjs
 import { run as procRun } from './host/proc.mjs';
 import { tmpDir } from './fake-gh.fixture.mjs';
 
+import { READONLY_SKIP, fixtureDirWritable } from './real-sandbox.fixture.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
 
@@ -73,7 +74,7 @@ test('CI 上 bwrap 必须可用（真沙箱 contract 不许被跳过）', { skip
 
 test(
   '真 bwrap 默认遮 HOME：.claude.json、.content-workflow.env 和不在白名单上的文件都读不到，白名单只读，pi 照样能起',
-  { skip: bwrapAvailable ? false : 'bwrap 不可用（bwrap --ro-bind / / true 起不来），跳过真沙箱测试' },
+  { skip: !bwrapAvailable ? 'bwrap 不可用（探针起不来），跳过真沙箱测试' : fixtureDirWritable(HERE) ? false : READONLY_SKIP },
   async () => {
     // 夹具放在 /tmp 之外：沙箱自带 --tmpfs /tmp，放在 /tmp 里测不出 HOME 遮罩。
     const outside = fs.mkdtempSync(path.join(HERE, '.sandbox-home-real-test-'));
