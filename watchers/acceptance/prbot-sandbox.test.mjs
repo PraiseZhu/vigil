@@ -16,6 +16,7 @@ import {
 } from './host/prbot-sandbox.mjs';
 import { REPO, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 
+import { READONLY_SKIP, fixtureDirWritable } from './real-sandbox.fixture.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const bwrapAvailable = await probeBwrap(procRun);
 
@@ -37,7 +38,7 @@ function recordingRun({ bwrapCode = 0, bwrapThrows = false, stdout = '' } = {}) 
       error.code = 'ENOENT';
       throw error;
     }
-    if (cmd === 'bwrap' && args.length <= 4) return { code: bwrapAvailable ? 0 : 1, stdout: '', stderr: '' };
+    if (cmd === 'bwrap' && args.at(-1) === 'true' && !args.includes('--')) return { code: bwrapAvailable ? 0 : 1, stdout: '', stderr: '' };
     return { code: bwrapCode, stdout, stderr: bwrapCode === 0 ? '' : 'failed' };
   }
   run.calls = calls;
@@ -169,7 +170,7 @@ test('SC4 预检：环境只有 8 个白名单变量（没有 LLM key / 令牌�
 
 test(
   'SC4 真 bwrap 预检：环境里没有令牌变量，GitHub / Slack 令牌、App 私钥、gh hosts 都读不到（夹具在 /tmp 之外）',
-  { skip: bwrapAvailable ? false : 'bwrap 不可用（bwrap --ro-bind / / true 起不来），跳过真沙箱预检 contract' },
+  { skip: !bwrapAvailable ? 'bwrap 不可用（探针起不来），跳过真沙箱预检 contract' : fixtureDirWritable(HERE) ? false : READONLY_SKIP },
   async () => {
     const outside = fs.mkdtempSync(path.join(HERE, '.prbot-sandbox-real-test-'));
     after(() => fs.rmSync(outside, { recursive: true, force: true }));

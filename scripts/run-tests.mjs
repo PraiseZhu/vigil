@@ -11,10 +11,13 @@ const STEPS = [
   ['node', ['--env-file=watchers/cindy/test.env', '--test', 'watchers/cindy/*.test.mjs']],
   ['python3', ['-B', 'watchers/cindy/cindy-watch-script.test.py']],
   ['python3', ['-B', 'watchers/mivo/mivo-watch-script.test.py']],
-  ['node', ['--env-file=watchers/acceptance/test.env', '--test', 'watchers/acceptance/*.test.mjs']],
+  ['node', ['--env-file=watchers/acceptance/test.env', '--test', '--test-timeout=120000', 'watchers/acceptance/*.test.mjs']],
 ];
 
-const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vigil-test-run-'));
+// 测试里会在临时目录下建 unix socket（写闸、出网代理），路径上限 107 字节：TMPDIR 很长时（比如验收轮沙箱里
+// TMPDIR 在轮次目录下）就改用 /tmp，免得 socket 路径超长。
+const baseTmp = os.tmpdir().length > 40 && fs.existsSync('/tmp') ? '/tmp' : os.tmpdir();
+const runDir = fs.mkdtempSync(path.join(baseTmp, 'vigil-test-run-'));
 let cleaned = false;
 function cleanup() {
   if (cleaned) return;

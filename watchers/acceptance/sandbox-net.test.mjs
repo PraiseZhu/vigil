@@ -25,9 +25,12 @@ import {
   startEgressProxy,
   startRoundEgress,
   throttledDenied,
+  MAX_SOCKET_PATH_BYTES,
+  assertSocketPath,
 } from './host/egress-proxy.mjs';
 import { REPO, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 
+import { READONLY_SKIP, fixtureDirWritable } from './real-sandbox.fixture.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 /** 白名单变量的哨兵值：任何一个出现在 bwrap 参数里都算泄漏。 */
@@ -298,7 +301,7 @@ test('密钥不进 argv：验收轮、修正轮 pi、预检拼出来的 bwrap �
 
 // —— 真的 bwrap ——
 const bwrapAvailable = await probeBwrap(procRun);
-const SKIP = bwrapAvailable ? false : 'bwrap 不可用（bwrap --ro-bind / / true 起不来），跳过真沙箱网络测试';
+const SKIP = !bwrapAvailable ? 'bwrap 不可用（探针起不来），跳过真沙箱网络测试' : fixtureDirWritable(HERE) ? false : READONLY_SKIP;
 
 test('CI 上 bwrap 必须可用（真沙箱网络 contract 不许被跳过）', { skip: process.env.CI ? false : '本地不是 CI' }, () => {
   assert.equal(bwrapAvailable, true);
@@ -481,4 +484,13 @@ test('真 bwrap：白名单变量的值不在 bwrap 进程的 /proc/<pid>/cmdlin
   const code = await exited;
   assert.equal(code, 0);
   assert.equal(stdout, SENTINELS.LLM_PROXY_API_KEY);
+});
+
+test('unix socket 路径超过 107 字节：出网代理直接抛错，不在截断后的路径上挂着（不再卡死整轮）', async () => {
+  const deep = path.join(tmpDir(), 'x'.repeat(60), 'y'.repeat(60));
+  const socketPath = path.join(deep, 'egress.sock');
+  assert.ok(Buffer.byteLength(socketPath) > MAX_SOCKET_PATH_BYTES);
+  assert.throws(() => assertSocketPath(socketPath), /路径太长/);
+  await assert.rejects(startEgressProxy({ socketPath, allow: [] }), /路径太长/);
+  assertSocketPath(path.join(tmpDir(), 'ok.sock'));
 });

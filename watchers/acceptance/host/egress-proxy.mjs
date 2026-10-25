@@ -24,6 +24,16 @@ export const EGRESS_LIMITS = Object.freeze({
   connectTimeoutMs: 15000,
 });
 
+/** unix socket 路径（sun_path）最多 107 字节；超了不起，抛错。 */
+export const MAX_SOCKET_PATH_BYTES = 107;
+
+export function assertSocketPath(socketPath) {
+  const bytes = Buffer.byteLength(String(socketPath || ''));
+  if (bytes > MAX_SOCKET_PATH_BYTES) {
+    throw new Error(`unix socket 路径太长（${bytes} 字节，上限 ${MAX_SOCKET_PATH_BYTES}）：${socketPath}`);
+  }
+}
+
 /** 沙箱里那座桥监听的端口（沙箱自己的 lo 上，和宿主不是一个网络命名空间）。 */
 export const EGRESS_BRIDGE_PORT = 3128;
 
@@ -265,6 +275,9 @@ export async function startEgressProxy({
     client.on('data', onData);
   });
 
+  // unix socket 路径上限 107 字节：超了 libuv 会悄悄截断、在别的路径上 listen 成功，随后 chmod 原路径失败，
+  // 服务却还挂着、进程退不出去（整轮卡死）。所以先查长度，起不来就直接抛错（调用方按「沙箱起不来」收尾）。
+  assertSocketPath(socketPath);
   fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
   fs.rmSync(socketPath, { force: true });
   await new Promise((resolve, reject) => {
@@ -274,7 +287,12 @@ export async function startEgressProxy({
       resolve();
     });
   });
-  fs.chmodSync(socketPath, 0o600);
+  try {
+    fs.chmodSync(socketPath, 0o600);
+  } catch (error) {
+    await new Promise((resolve) => server.close(() => resolve()));
+    throw error;
+  }
 
   return {
     socketPath,

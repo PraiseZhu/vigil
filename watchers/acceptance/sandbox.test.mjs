@@ -20,6 +20,7 @@ import { run as procRun } from './host/proc.mjs';
 import { EGRESS_BRIDGE, EGRESS_BRIDGE_PORT } from './host/egress-proxy.mjs';
 import { REPO, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 
+import { READONLY_SKIP, fixtureDirWritable } from './real-sandbox.fixture.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 const ROOT_REF = `${REPO}#1`;
@@ -473,7 +474,7 @@ const bwrapAvailable = await probeBwrap(procRun);
 
 test(
   'SC11 真 bwrap：令牌文件、App 私钥、凭证目录都读不到，roundDir 还能写',
-  { skip: bwrapAvailable ? false : 'bwrap 不可用（bwrap --ro-bind / / true 起不来），跳过真沙箱测试' },
+  { skip: !bwrapAvailable ? 'bwrap 不可用（探针起不来），跳过真沙箱测试' : fixtureDirWritable(HERE) ? false : READONLY_SKIP },
   async () => {
     // 假凭证一律放在 /tmp 之外：沙箱自带 --tmpfs /tmp，放在 /tmp 里的文件不靠遮罩也读不到，测不出遮罩。
     const outside = fs.mkdtempSync(path.join(HERE, '.sandbox-real-test-'));
