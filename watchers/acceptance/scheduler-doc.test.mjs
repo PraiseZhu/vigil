@@ -314,12 +314,12 @@ test('SC8 静态：新文件不含真实用户名、绝对家目录路径，只�
   }
   const message = fs.readFileSync(path.join(BIN, 'message.mjs'), 'utf8');
   const round = fs.readFileSync(path.join(BIN, 'round.mjs'), 'utf8');
-  assert.doesNotMatch(message, /node:child_process|spawn\(|execFile/);
-  assert.doesNotMatch(round, /node:child_process|spawn\(|execFile/);
+  assert.doesNotMatch(message, /child_process|require\(|spawn\(|execFile/);
+  assert.doesNotMatch(round, /child_process|require\(|spawn\(|execFile/);
   for (const name of fs.readdirSync(BIN)) {
-    if (!name.endsWith('.mjs') || name === 'github.mjs') continue;
+    if (!name.endsWith('.mjs') || name === 'github.mjs' || name === 'localgit.mjs') continue;
     const source = fs.readFileSync(path.join(BIN, name), 'utf8');
-    assert.doesNotMatch(source, /node:child_process/);
+    assert.doesNotMatch(source, /child_process|require\(/, `${name} 引用 child_process 或 require`);
     assert.doesNotMatch(source, /spawn\(/);
     assert.doesNotMatch(source, /execFile/);
   }

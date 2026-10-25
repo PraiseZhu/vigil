@@ -1,0 +1,125 @@
+# 验收会话：裁决、修正与写操作
+
+对应本仓 issue #46。`watchers/acceptance/SESSION.md` 是给 pi 读的步骤；本文件写清格式和规则，方便人查、也方便 #60（修正轮）、#61（通知）对接。
+
+命令一律是：
+
+```sh
+node watchers/acceptance/bin/helper.mjs <collect|progress|verdict|close|correct|push|board|done> \
+  --issue <总 issue，owner/repo#号> --round <n> [...]
+```
+
+`--issue` 永远是**总 issue**（独立任务就是它自己）；`--round` 除 `collect` 外都必填。所有写操作都经 `bin/github.mjs` 的 `write()`，没配 `writeCommand` 就直接写，配了就整段交给写闸。
+
+## 1. 裁决
+
+`verdict --file <verdict.json>` 把**本轮的轮次评论就地改掉**（不新发评论）：
+
+```
+[验收机] 第 n 轮：通过|要修
+正文版本：sha256:…（总 issue 正文「现在」的版本）
+开始：<原有轮次评论里的开始时间>
+完成：<结束时间>
+
+## 逐条结果
+- 通过：owner/repo#12 SC3 · 证据：…
+- 要修：owner/repo#12 SC4 · 原因：… · 证据：…
+- 人工手测：owner/repo#12 SC5（cindy-mac）
+- 有争议：owner/repo#12 SC6 · 验收方：… · 修正方：…
+
+## 需人工处理
+- 扫到疑似密钥，没推：path/a, path/b
+```
+
+- `verdict.json`：`{"extracted": false, "items":[{"ref":"owner/repo#n","sc":3,"text":"…","result":"通过|要修|人工手测|有争议","evidence":"…","why":"…","layer":"cindy-mac","sides":{"acceptance":"…","correction":"…"}}]}`。
+- `extracted: true` 表示任务本来没写验收标准，标准是验收机从正文和关联 PR 提炼的；裁决里会多一行说明。
+- 状态推导：任一条「要修」或「有争议」→ 要修；本轮有「需人工处理」记录 → 要修；否则通过。人工手测**不拦**通过。
+- `--status 通过|要修` 可选；写错（和逐条结果不一致）直接退出码 `1`。
+- 正文版本按**改完之后**的正文算：验收机自己勾选或关 issue 改了正文，就用改后的版本，`trigger` 不会因此重验。
+- 写完放锁、更新缓存（`lastVerdict`）。**不调 `rounds.finish`**：那会保留旧的正文版本行。
+
+### 有争议的行格式
+
+`- 有争议：<owner/repo#n> SC<k> · 验收方：… · 修正方：…`
+
+`collect`（`disputed`）和 #45 的 `round.mjs status --json`（`disputed`）都按这一行认条目：行里必须出现「有争议」，条目用 `owner/repo#n SC<k>` 取。有争议时由调度器另起一次只读裁决运行（模型 `anthropic/claude-opus-5-5`，推理 medium），结论写进下一轮裁决。
+
+## 2. 通过（SC4）
+
+`close --verified <verified.json>`：
+
+1. 在列出的 issue（子 issue 或总 issue 自己，只限本轮任务树；清单里有树外的 issue 就整条拒绝、什么都不写）里，把验证过的 `- [ ] SC<k>` 改成 `- [x] SC<k>`；人工手测项在行尾补「 人工手测」。只有正文真的变了才写 `issue.edit`。
+2. `issue.close` 关总 issue（`reason=completed`）。
+3. `board --target all --acceptance 通过`：总 issue 和每个子 issue 都写「验收」= 通过、「裁决」= 本轮评论链接。
+
+`verified.json`：`{"items":[{"ref":"owner/repo#n","sc":3}],"manual":[{"ref":"…","sc":5}]}`。
+
+## 3. 要修（SC5）
+
+`correct --item "<owner/repo#n> SC<k>" --why <原因> [--title <标题>]`：
+
+1. 先按「总 issue + 验收项」找**开着的**修正子 issue（挂着的子 issue 和搜索到的都算）：有就复用，不再开。
+2. 没有才新开，正文按下面的模板，并带上修正标记。
+3. 独立 issue 已经关了：先 `issue.reopen` 重开，再挂修正子 issue。
+4. 非 fork 档：新 issue 开在**原属验收项的仓**里，再 `subissue.add` 挂到同一个总 issue 下；原来的子 issue **不重开**。
+5. fork 档（`makecindy/cindy`）：开在总 issue 所在的仓里，正文第一行链回原 issue，**不** `subissue.add`。
+6. 看板：「验收」= 要修（总 issue 和新建的修正子 issue）。
+
+### 修正子 issue 模板
+
+```md
+原 issue：<总 issue 链接>            ← 只有 fork 档有这一行
+
+> 修正子 issue · 总 issue <owner/repo#n> · 原属 <owner/repo#n>
+## 没过的验收项
+<原验收项原文（含验证层次）>
+## 没过的原因
+<脱敏后的原因>
+## 验收标准
+- [ ] SC1 <原验收项原文（含验证层次）>
+
+[验收机] 修正 · 总 <owner/repo#n> · 项 <owner/repo#n> SC<k> · 第 n 轮
+```
+
+### 修正标记与复用
+
+- 修正子 issue 和修正 PR 的正文都带一行：
+  `[验收机] 修正 · 总 <owner/repo#n> · 项 <owner/repo#n> SC<k> · 第 n 轮`
+- 开之前先按「总 issue + 验收项」找开着的修正子 issue 和修正 PR，有就复用，不重复开。上一轮中断留下的修正子 issue 会被直接接手。
+- 修正 PR 的分支名：`acceptance/<总 issue 号>-<出处 issue 号>-sc<k>`。
+
+## 4. 推送（SC7）
+
+`push --repo <owner/repo> --branch acceptance/<总>-<出处>-sc<k> --worktree <目录> [--base origin/main]`：
+
+0. 先把 `--branch` 解析成提交（只认本地 `refs/heads/<branch>`，没有就不推）。扫的、打包的、去重键用的都是这个提交，**不是**当前检出的 HEAD —— 检出停在别的分支也不会漏扫。
+1. 先扫：有 `gitleaks` 就用（退出码 0 = 没扫到，1 = 扫到；别的退出码算扫描失败，不推） `gitleaks git --log-opts=<base>..<分支提交> --redact --report-format json`；没有就用内置规则看 `git diff <base>...<分支提交>` 的**新增行**（私钥头、GitHub 令牌、PAT、Slack 令牌、AWS key、sk- 风格密钥）。
+2. 扫到：不推，退出码 `5`，在 `<stateDir>/session/<owner>__<repo>__<号>.json` 记一条「需人工处理」，stdout 只列文件名。
+3. 没扫到：`git bundle create <文件> refs/heads/<branch>` 打包，再用 `git bundle list-heads` 核对包里的提交就是扫过的那个（中途分支被挪就不推），交给写闸的 `branch.push`（`dedupeKey` = `push:<repo>:<branch>:<分支提交 sha>`）；bundle 放在系统临时目录，用完删掉。
+4. 写闸返回 `4` + `reason=secret-found`：同样记「需人工处理」，**不**标「中断」。
+
+本地只跑 `git` 和 `gitleaks`（`bin/localgit.mjs`），环境里剥掉所有令牌和 askpass；git 子命令是**允许名单**：只有 `diff`、`rev-parse`、`bundle create`、`bundle list-heads`，其余（fetch、push、clone、remote、config、checkout……）一律拒绝 —— 推送只经写闸。
+
+## 5. 需人工处理
+
+记录在 `<stateDir>/session/<owner>__<repo>__<号>.json`（按总 issue 和轮次存）：`{"round":n,"needsHuman":[{"reason":"secret-found","files":["path/a"]}]}`。裁决里的「## 需人工处理」只列文件名，不列密钥内容；同一轮再记一条就往后追加。写闸返回 `secret-found` 时拿不到文件名，裁决里写「扫到疑似密钥，没推（写闸在沙箱外扫到）」。
+
+## 6. 脱敏（SC11）
+
+写进 GitHub 的自由文本都过 `redact(text, profile)`：本机绝对路径（`/home`、`/Users`、`/tmp`、`/var`、`/root`、Windows 盘符）、`stateDir` / `worktreeDir` / 家目录前缀、令牌格式、`Bearer …`、整段私钥、`run-id: …` 一律换成「（已隐去）」。评论开头一律「[验收机]」。
+
+## 7. 顺序
+
+`close` / `correct` / `board` / `push` 都要在 `verdict` **之前**做完：`verdict` 一写，轮次评论就变成通过/要修，之后任何写命令都会被认领检查拒绝（退出码 `3`）。`done` 是最后一步，只能在裁决之后跑。
+
+## 8. 退出码
+
+| 退出码 | 含义 | 处理 |
+|---|---|---|
+| `0` | 成功 | 继续 |
+| `1` | 其他失败（参数、配置、未知错误；watch 档跑了不许的命令也在这里） | 读 stderr，不自动重试同一轮 |
+| `3` | 认领检查没过（`RoundError` NOT_CURRENT / NOT_FOUND）：消息里写清期望轮次和实际轮次 | 停手，这一轮不是你的 |
+| `4` | 写闸拒绝 | 停手；非 `secret-found` 会把这一轮标「中断」并写原因（`写闸拒绝：<reason>`）；`secret-found` 走「需人工处理」，不标中断 |
+| `5` | 本地扫到疑似密钥（只有 `push`），什么都没推 | 不要重试推送；照常写裁决（自动带「需人工处理」，结论要修）再 `done` |
+
+写闸忙（`75`）由 `github.mjs` 内部重试，重试用完抛 `WriteBusyError`，helper 退出码 `1` 并尽力把这一轮标「中断」，原因写「写闸忙」。

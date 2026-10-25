@@ -309,13 +309,13 @@ test('SC10 条目不在看板上则 addProjectV2ItemById', async () => {
   assert.ok(mutations.includes('update'));
 });
 
-test('SC15 除 github.mjs 外 bin 下没有 spawn/execFile/child_process', () => {
+test('SC15 除 github.mjs 和 localgit.mjs（#46，只跑本地 git/gitleaks）外 bin 下没有 spawn/execFile/child_process', () => {
   const bin = path.join(path.dirname(new URL(import.meta.url).pathname), 'bin');
   for (const name of fs.readdirSync(bin)) {
     if (!name.endsWith('.mjs')) continue;
-    if (name === 'github.mjs') continue;
+    if (name === 'github.mjs' || name === 'localgit.mjs') continue;
     const src = fs.readFileSync(path.join(bin, name), 'utf8');
-    assert.doesNotMatch(src, /node:child_process/);
+    assert.doesNotMatch(src, /child_process|require\(/, `${name} 引用 child_process 或 require`);
     assert.doesNotMatch(src, /spawn\(/);
     assert.doesNotMatch(src, /execFile/);
   }
