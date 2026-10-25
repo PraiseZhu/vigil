@@ -9,7 +9,7 @@ import { loadAcceptanceProfile } from '../bin/profile.mjs';
 import { createGithub } from '../bin/github.mjs';
 import { runRound as runRoundCommand } from '../bin/round.mjs';
 import { appendAlert, hostPaths, isAlive, readAlerts, readLockPayload } from './paths.mjs';
-import { run as procRun, spawnDetached } from './proc.mjs';
+import { run as procRun, spawnBackground } from './proc.mjs';
 import { MAX_ROUNDS, TEST_LOCK_PATTERN, readHostConfig } from './round.mjs';
 import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbot.mjs';
 import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
@@ -196,7 +196,7 @@ function defaultSpawnPrbot({ home, env, root }) {
   return (issue) => {
     const logFd = fs.openSync(path.join(hostPaths(home).hostDir, 'prbot.log'), 'a');
     try {
-      const child = spawnDetached(
+      const child = spawnBackground(
         process.execPath,
         [path.join(root, 'watchers', 'acceptance', 'host', 'prbot.mjs'), 'run', '--issue', issue],
         { env: { ...env, ACCEPTANCE_WATCHER_HOME: home }, cwd: home, stdio: ['ignore', logFd, logFd] },
@@ -212,7 +212,7 @@ function defaultSpawnRound({ home, env, root }) {
   return (issue) => {
     const logFd = fs.openSync(path.join(hostPaths(home).hostDir, 'rounds.log'), 'a');
     try {
-      const child = spawnDetached(
+      const child = spawnBackground(
         process.execPath,
         [path.join(root, 'watchers', 'acceptance', 'host', 'round.mjs'), '--issue', issue],
         { env: { ...env, ACCEPTANCE_WATCHER_HOME: home }, cwd: home, stdio: ['ignore', logFd, logFd] },

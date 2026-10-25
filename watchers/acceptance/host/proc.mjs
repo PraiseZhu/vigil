@@ -72,3 +72,13 @@ export function spawnDetached(cmd, args, { env, cwd, stdio = ['ignore', 'ignore'
     detached: true,
   });
 }
+
+/**
+ * 起一个后台进程并放手：detached + unref。只 detached 不 unref 时，父进程的事件循环仍然挂着这个子进程，
+ * 要等它退出才能退——tick 起一轮验收（最长 2 小时）就会被卡住，整个常驻循环停拍、心跳不更新。
+ */
+export function spawnBackground(cmd, args, options = {}) {
+  const child = spawnDetached(cmd, args, options);
+  child.unref();
+  return child;
+}
