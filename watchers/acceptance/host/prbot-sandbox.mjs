@@ -3,7 +3,11 @@
 // 复用 #47 的 sandbox.mjs：遮罩名单（maskList）、参数拼装（buildBwrapArgs）、探测（probeBwrap）。
 import fs from 'node:fs';
 import path from 'node:path';
-import { buildBwrapArgs, maskList, probeBwrap, sandboxEnv } from './sandbox.mjs';
+import { fileURLToPath } from 'node:url';
+import { buildBwrapArgs, defaultHomeAllow, maskList, probeBwrap, sandboxEnv } from './sandbox.mjs';
+
+/** 代码仓根目录：沙箱里要跑仓里的 helper，HOME 被默认遮掉时要把它挂回来。 */
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
 /** 预检子进程的环境白名单：比 pi 少 LLM_PROXY_API_KEY，也不带两个沙箱内部变量。 */
 export const PREFLIGHT_ENV_ALLOWLIST = Object.freeze([
@@ -83,6 +87,8 @@ export function buildPrbotSandbox({
     masks,
     binds: [worktree, roundDir],
     env: sandboxEnvironment,
+    hostHome: env.HOME || process.env.HOME,
+    homeAllow: defaultHomeAllow({ repoRoot: REPO_ROOT, hostConfig }),
   });
   return { args, env: sandboxEnvironment, masks };
 }

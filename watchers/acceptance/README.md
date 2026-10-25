@@ -92,7 +92,7 @@ stdout 是 JSON 数组。该开始的任务：
 | `host/round.mjs` | 一轮验收：内存门、槽/测试锁、认领、写闸 serve、bwrap 里跑 pi |
 | `host/write-gate.mjs` | 写闸：exec / serve / probe 三种用法，所有写动作在沙箱外再查一遍 |
 | `host/gate-client.mjs` | 沙箱里的 `writeCommand`：动作 JSON 经 unix socket 交给写闸 |
-| `host/sandbox.mjs` | bwrap 参数、遮罩名单（从 profile 算）、环境变量白名单 |
+| `host/sandbox.mjs` | bwrap 参数（宿主 HOME 默认遮掉、白名单只读挂回）、遮罩名单（从 profile 算）、环境变量白名单 |
 | `host/sandbox-bin/gh` | 沙箱里的 `gh`：只允许 `gh api graphql --input -`，经写闸读 |
 | `host/paths.mjs`、`host/proc.mjs`、`host/probes.mjs` | 状态文件与锁、唯一的子进程出口、部署检查探针 |
 | `bin/doctor.mjs` | 部署检查：缺哪项报哪项，退出码非 0 |

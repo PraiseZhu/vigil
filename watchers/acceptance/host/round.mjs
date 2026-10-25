@@ -10,7 +10,7 @@ import { createGithub } from '../bin/github.mjs';
 import { runRound as runRoundCommand } from '../bin/round.mjs';
 import { parseRef } from '../bin/rounds.mjs';
 import { appendAlert, hostPaths, releaseLock, tryAcquireLock } from './paths.mjs';
-import { buildBwrapArgs, maskList, prepareSandboxProfile, probeBwrap, sandboxEnv } from './sandbox.mjs';
+import { buildBwrapArgs, defaultHomeAllow, maskList, prepareSandboxProfile, probeBwrap, sandboxEnv } from './sandbox.mjs';
 import { run as procRun, spawnDetached, spawnProcess } from './proc.mjs';
 
 /** 内存门：MemAvailable 低于 3 GiB 就不认领、不跑模型。常量，不可配。 */
@@ -408,6 +408,8 @@ export async function runHostRound({
         masks,
         binds: [profile.stateDir, profile.worktreeDir],
         env: sandboxEnvironment,
+        hostHome: env.HOME || process.env.HOME,
+        homeAllow: defaultHomeAllow({ repoRoot: root, hostConfig: settings }),
       });
 
       // 7. 起 pi（一定在 bwrap 里），派发消息从标准输入喂进去。
