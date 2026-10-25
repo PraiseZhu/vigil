@@ -17,8 +17,31 @@ export const ENV_ALLOWLIST = Object.freeze([
   'NODE_OPTIONS',
 ]);
 
-/** 沙箱内部用的两个变量：都指向沙箱内的路径，不是宿主的。 */
-export const INTERNAL_ENV = Object.freeze(['ACCEPTANCE_WATCHER_HOME', 'ACCEPTANCE_GATE_SOCKET']);
+/**
+ * 沙箱里的出网变量：都指向沙箱自己 lo 上的出网桥（host/sandbox-bin/egress-bridge.mjs），由 sandboxEnv 自己填，
+ * 不从宿主环境抄（宿主上的同名变量不在白名单里，进不来）。NODE_USE_ENV_PROXY=1 让 node 的 fetch / https 认这几个变量。
+ */
+export const EGRESS_ENV = Object.freeze([
+  'HTTPS_PROXY',
+  'https_proxy',
+  'HTTP_PROXY',
+  'http_proxy',
+  'NO_PROXY',
+  'no_proxy',
+  'NODE_USE_ENV_PROXY',
+]);
+
+/** 沙箱内部用的变量：两个指向沙箱内路径的（不是宿主的），加上出网变量。 */
+export const INTERNAL_ENV = Object.freeze(['ACCEPTANCE_WATCHER_HOME', 'ACCEPTANCE_GATE_SOCKET', ...EGRESS_ENV]);
+
+/**
+ * 系统级固定遮罩（代码里写死，host.json 关不掉，只能用 credentialDirs 追加）：
+ * - /run 整个换成空 tmpfs：宿主的各种 unix socket（docker、ssh-agent 转发、容器运行时、各种 rpc）都在这下面；
+ * - /opt 下沙箱运行环境自己的目录（存在才遮）。
+ * 抽象 unix socket、127.0.0.1 上的端口靠 --unshare-net 隔开，不靠遮罩。
+ */
+export const SYSTEM_TMPFS_DIRS = Object.freeze(['/run']);
+export const SYSTEM_MASK_DIRS = Object.freeze(['/opt/sand', '/opt/sand-managed']);
 
 /** 密钥文件键直接用 bin/profile.mjs 的约定（以 TokenFile / PrivateKeyFile 结尾，或正好是 privateKeyFile），不另写一份。 */
 const KEY_PATTERN = TOKEN_FILE_KEY;
@@ -147,12 +170,19 @@ function resolveHomeAllow(hostHomeReal, homeAllow, maskDirs) {
 }
 
 /**
- * 拼 bwrap 参数。顺序：只读根 → 设备/proc/tmp → 宿主 HOME 盖空 tmpfs → HOME 白名单只读挂回
- * → 可写绑定 → 遮罩（最后挂，遮罩一定赢）→ 干净环境。
+ * 拼 bwrap 参数。顺序：新网络命名空间 + 只读根 → 设备/proc/tmp → /run 盖空 tmpfs → 宿主 HOME 盖空 tmpfs
+ * → HOME 白名单只读挂回 → 可写绑定 → 遮罩（最后挂，遮罩一定赢；含 /opt 下的系统固定遮罩）。
+ * 参数里没有任何环境变量（不用 --clearenv / --setenv）：环境由调用方经 spawn 的 env 交给 bwrap 进程。
  * 宿主状态目录和可写绑定相互包含、或遮罩文件落在可写绑定里，一律抛错（fail-closed）。
  * hostHome 必填：没有它就没法默认遮掉 HOME，直接抛错，不退回只遮名单的老做法。
  */
-export function buildBwrapArgs({ home, profile, roundDir, masks, binds, env, hostHome, homeAllow } = {}) {
+export function buildBwrapArgs(options = {}) {
+  const { home, profile, roundDir, masks, binds, hostHome, homeAllow } = options;
+  // 环境变量不再进 bwrap 的参数（--setenv 的值会出现在 /proc/<pid>/cmdline，ps 看得见 LLM key）：
+  // 调用方把 sandboxEnv() 的结果作为 spawn 的 env 交给 bwrap 进程本身，bwrap 不加 --clearenv，子进程原样继承。
+  if (Object.prototype.hasOwnProperty.call(options, 'env')) {
+    throw new Error('buildBwrapArgs 不收 env：环境变量走 spawn 的 env 选项，不进 bwrap 参数');
+  }
   if (typeof roundDir !== 'string' || !path.isAbsolute(roundDir)) {
     throw new Error('沙箱需要绝对路径的 roundDir');
   }
@@ -164,6 +194,17 @@ export function buildBwrapArgs({ home, profile, roundDir, masks, binds, env, hos
   if (hostHomeReal === path.parse(hostHomeReal).root) throw new Error('宿主 HOME 不能是根目录');
   const maskFiles = (masks?.files || []).filter((file) => typeof file === 'string' && path.isAbsolute(file));
   const maskDirs = (masks?.dirs || []).filter((dir) => typeof dir === 'string' && path.isAbsolute(dir));
+  for (const dir of SYSTEM_MASK_DIRS) {
+    const real = realExisting(dir);
+    if (real && fs.statSync(real).isDirectory() && !maskDirs.includes(real)) maskDirs.push(real);
+  }
+  const systemTmpfs = [];
+  for (const dir of SYSTEM_TMPFS_DIRS) {
+    const real = realExisting(dir);
+    if (real && real !== path.parse(real).root && fs.statSync(real).isDirectory() && !systemTmpfs.includes(real)) {
+      systemTmpfs.push(real);
+    }
+  }
   const bindList = (binds || []).filter((dir) => typeof dir === 'string' && dir);
   for (const bind of bindList) {
     if (!path.isAbsolute(bind)) throw new Error(`沙箱绑定目录必须是绝对路径：${bind}`);
@@ -208,7 +249,9 @@ export function buildBwrapArgs({ home, profile, roundDir, masks, binds, env, hos
     '--unshare-pid',
     '--unshare-ipc',
     '--unshare-uts',
-    '--share-net',
+    // 自己的网络命名空间：只有 lo。宿主 127.0.0.1 上的端口、抽象 unix socket（X11 等）都连不到；
+    // 出网只剩挂进来的出网代理 socket（host/egress-proxy.mjs，按 host.json 的 egressAllow 放行）。
+    '--unshare-net',
     '--ro-bind',
     '/',
     '/',
@@ -218,21 +261,19 @@ export function buildBwrapArgs({ home, profile, roundDir, masks, binds, env, hos
     '/proc',
     '--tmpfs',
     '/tmp',
-    '--tmpfs',
-    hostHomeReal,
   ];
+  // /run 先盖空 tmpfs（在 HOME 和可写绑定之前：万一绑定落在 /run 下面，后挂的绑定照样生效）。
+  for (const dir of systemTmpfs) args.push('--tmpfs', dir);
+  args.push('--tmpfs', hostHomeReal);
   for (const dir of allowList) args.push('--ro-bind', dir, dir);
   for (const bind of bindList) args.push('--bind', bind, bind);
   // HOME 里没挂回来的遮罩目标本来就在空 tmpfs 下面、读不到；再挂一次反而要在 tmpfs 里造挂载点，跳过。
+  // /run 下面同理（整个已是空 tmpfs）。
+  const hidden = [hostHomeReal, ...systemTmpfs];
   const reachable = (target) =>
-    !isInside(target, hostHomeReal) || [...allowList, ...bindList].some((dir) => isInside(target, dir));
+    !hidden.some((dir) => isInside(target, dir)) || [...allowList, ...bindList].some((dir) => isInside(target, dir));
   for (const dir of maskDirs) if (reachable(dir)) args.push('--tmpfs', dir);
   for (const file of maskFiles) if (reachable(file)) args.push('--ro-bind', '/dev/null', file);
-  args.push('--clearenv');
-  for (const [key, value] of Object.entries(env || {})) {
-    if (value === undefined || value === null) continue;
-    args.push('--setenv', String(key), String(value));
-  }
   return args;
 }
 
@@ -265,12 +306,17 @@ export async function probeBwrap(run) {
   }
 }
 
-/** 沙箱内的 pi 环境：白名单 + 沙箱内的 HOME/TMPDIR/哨兵目录 + 两个内部变量。 */
+/**
+ * 沙箱内的 pi 环境：白名单 + 沙箱内的 HOME/TMPDIR/哨兵目录 + 内部变量。
+ * egressPort 给了（且 internal 里有出网变量）才填出网变量：全部指向沙箱 lo 上的出网桥，NO_PROXY 只含环回。
+ * 这份环境就是 spawn bwrap 时的 env（bwrap 原样传给子进程），不进 bwrap 参数。
+ */
 export function sandboxEnv({
   base = process.env,
   roundDir,
   socketPath,
   sandboxBin,
+  egressPort,
   allowlist = ENV_ALLOWLIST,
   internal = INTERNAL_ENV,
 } = {}) {
@@ -289,6 +335,20 @@ export function sandboxEnv({
   env.PATH = pathParts.length ? pathParts.join(path.delimiter) : '/usr/bin:/bin';
   if (internal.includes('ACCEPTANCE_WATCHER_HOME')) env.ACCEPTANCE_WATCHER_HOME = path.join(roundDir, 'home-acc');
   if (internal.includes('ACCEPTANCE_GATE_SOCKET') && socketPath) env.ACCEPTANCE_GATE_SOCKET = socketPath;
+  if (egressPort !== undefined && egressPort !== null) {
+    if (!Number.isInteger(egressPort) || egressPort < 1 || egressPort > 65535) throw new Error('sandboxEnv 的 egressPort 不对');
+    const proxy = `http://127.0.0.1:${egressPort}`;
+    const values = {
+      HTTPS_PROXY: proxy,
+      https_proxy: proxy,
+      HTTP_PROXY: proxy,
+      http_proxy: proxy,
+      NO_PROXY: 'localhost,127.0.0.1,::1',
+      no_proxy: 'localhost,127.0.0.1,::1',
+      NODE_USE_ENV_PROXY: '1',
+    };
+    for (const key of EGRESS_ENV) if (internal.includes(key)) env[key] = values[key];
+  }
   return env;
 }
 

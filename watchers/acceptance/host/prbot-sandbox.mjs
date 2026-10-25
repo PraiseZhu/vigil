@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildBwrapArgs, defaultHomeAllow, maskList, probeBwrap, sandboxEnv } from './sandbox.mjs';
+import { EGRESS_BRIDGE_PORT, bridgeCommand, startRoundEgress } from './egress-proxy.mjs';
 
 /** 代码仓根目录：沙箱里要跑仓里的 helper，HOME 被默认遮掉时要把它挂回来。 */
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -47,7 +48,11 @@ function prepareDirs(roundDir) {
   }
 }
 
-/** 拼一次沙箱参数。pi 和预检用同一个函数，区别只在环境和命令。 */
+/**
+ * 拼一次沙箱参数。pi 和预检用同一个函数，区别只在环境和命令。
+ * 两种都在自己的网络命名空间里（--unshare-net）：pi 的环境带出网变量（指向沙箱里的出网桥），
+ * 预检不带、也不起出网代理——预检沙箱完全不出网。返回的 env 是 spawn bwrap 的 env，不进 bwrap 参数。
+ */
 export function buildPrbotSandbox({
   home,
   profile,
@@ -72,7 +77,7 @@ export function buildPrbotSandbox({
     home,
   });
   const sandboxEnvironment = model
-    ? sandboxEnv({ base: env, roundDir, socketPath, sandboxBin })
+    ? sandboxEnv({ base: env, roundDir, socketPath, sandboxBin, egressPort: EGRESS_BRIDGE_PORT })
     : sandboxEnv({
         base: env,
         roundDir,
@@ -86,7 +91,6 @@ export function buildPrbotSandbox({
     roundDir,
     masks,
     binds: [worktree, roundDir],
-    env: sandboxEnvironment,
     hostHome: env.HOME || process.env.HOME,
     homeAllow: defaultHomeAllow({ repoRoot: REPO_ROOT, hostConfig }),
   });
@@ -114,6 +118,9 @@ export async function runPiInSandbox({
   rawProfile,
   timeoutMs = 60 * 60 * 1000,
   sandboxBin,
+  issue,
+  round,
+  startEgress = startRoundEgress,
 } = {}) {
   if (typeof run !== 'function') throw new Error('runPiInSandbox 需要 run');
   if (!Array.isArray(piCommand) || piCommand.length === 0) throw new Error('runPiInSandbox 需要 piCommand');
@@ -130,12 +137,28 @@ export async function runPiInSandbox({
     model: true,
     sandboxBin,
   });
-  const result = await run('bwrap', [...sandbox.args, '--', ...piCommand], {
-    env: sandbox.env,
-    cwd: worktree,
-    input: prompt ?? '',
-    timeoutMs,
-  });
+  // 出网代理随这次 pi 起停；起不来就不跑模型（和 bwrap 不可用一样处理）。
+  let egress;
+  try {
+    egress = await startEgress({ home, hostConfig, roundDir, issue, round, profile });
+  } catch (error) {
+    return { ok: false, unavailable: true, reason: `出网代理起不来：${String(error?.message || error)}` };
+  }
+  let result;
+  try {
+    result = await run('bwrap', [...sandbox.args, '--', ...bridgeCommand({ socketPath: egress.socketPath }), ...piCommand], {
+      env: sandbox.env,
+      cwd: worktree,
+      input: prompt ?? '',
+      timeoutMs,
+    });
+  } finally {
+    try {
+      await egress.stop();
+    } catch {
+      // 收尾失败不影响结果。
+    }
+  }
   if (!result || result.code !== 0) {
     return {
       ok: false,

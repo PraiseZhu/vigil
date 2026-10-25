@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 一轮验收（#47 SC11）：起 pi 的唯一入口。
-// 顺序：内存门 → 槽/测试锁 → 认领（经写闸 exec）→ 起写闸 serve → bwrap → 跑 pi → 收尾。
+// 顺序：内存门 → 槽/测试锁 → 认领（经写闸 exec）→ 起写闸 serve → bwrap 参数 + 出网代理 → 跑 pi → 收尾。
 // bwrap 起不来就不跑模型，这一轮 abort 成「中断」并写提醒；没有任何开关能绕过沙箱。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,6 +11,7 @@ import { runRound as runRoundCommand } from '../bin/round.mjs';
 import { parseRef } from '../bin/rounds.mjs';
 import { appendAlert, hostPaths, releaseLock, tryAcquireLock } from './paths.mjs';
 import { buildBwrapArgs, defaultHomeAllow, maskList, prepareSandboxProfile, probeBwrap, sandboxEnv } from './sandbox.mjs';
+import { EGRESS_BRIDGE_PORT, bridgeCommand, startRoundEgress } from './egress-proxy.mjs';
 import { run as procRun, spawnDetached, spawnProcess } from './proc.mjs';
 
 /** 内存门：MemAvailable 低于 3 GiB 就不认领、不跑模型。常量，不可配。 */
@@ -242,6 +243,7 @@ export async function runHostRound({
   spawnPi = defaultSpawnPi,
   runRound: runRoundFn,
   startGate = defaultStartGate,
+  startEgress = startRoundEgress,
   now = () => Date.now(),
   meminfoPath = '/proc/meminfo',
   statusIntervalMs = STATUS_INTERVAL_MS,
@@ -312,6 +314,7 @@ export async function runHostRound({
 
   let roundDir = null;
   let gateServer = null;
+  let egressServer = null;
   let registryFile = null;
   // pi 一旦起来，离开只有三条路：正常退出、卡住、出错。卡住和出错两条都先 stopPi() 再 abort，
   // 所以收写闸（finally）之前 pi 一定已经结束。
@@ -407,23 +410,25 @@ export async function runHostRound({
         home,
       });
       const sandboxBin = path.join(root, 'watchers', 'acceptance', 'host', 'sandbox-bin');
-      const sandboxEnvironment = sandboxEnv({ base: env, roundDir, socketPath, sandboxBin });
+      // 环境只走 spawn 的 env（bwrap 原样传给 pi），不进 bwrap 参数：LLM key 不出现在 cmdline 里。
+      const sandboxEnvironment = sandboxEnv({ base: env, roundDir, socketPath, sandboxBin, egressPort: EGRESS_BRIDGE_PORT });
       const bwrapArgs = buildBwrapArgs({
         home,
         profile,
         roundDir,
         masks,
         binds: [profile.stateDir, profile.worktreeDir],
-        env: sandboxEnvironment,
         hostHome: env.HOME || process.env.HOME,
         homeAllow: defaultHomeAllow({ repoRoot: root, hostConfig: settings }),
       });
+      // 出网代理：沙箱没有宿主网络，只经这个 socket 按 egressAllow 出网。起不来就不跑模型。
+      egressServer = await startEgress({ home, hostConfig: settings, roundDir, issue, round: claim.round, profile, now });
 
-      // 7. 起 pi（一定在 bwrap 里），派发消息从标准输入喂进去。
+      // 7. 起 pi（一定在 bwrap 里，先起出网桥再起 pi），派发消息从标准输入喂进去。
       sandboxReady = true;
       pi = spawnPi({
         cmd: 'bwrap',
-        args: [...bwrapArgs, '--', ...piCommand],
+        args: [...bwrapArgs, '--', ...bridgeCommand({ socketPath: egressServer.socketPath }), ...piCommand],
         env: sandboxEnvironment,
         cwd: roundDir,
         logFile: path.join(roundDir, 'pi.log'),
@@ -485,6 +490,13 @@ export async function runHostRound({
     if (gateServer) {
       try {
         await gateServer.stop();
+      } catch {
+        // 收尾失败不影响结果。
+      }
+    }
+    if (egressServer) {
+      try {
+        await egressServer.stop();
       } catch {
         // 收尾失败不影响结果。
       }

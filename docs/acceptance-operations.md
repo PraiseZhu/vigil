@@ -29,9 +29,15 @@
 {
   "piCommand": ["pi", "--model", "<model id>", "--thinking", "max"],
   "credentialDirs": ["<可选：额外要遮罩的绝对目录>"],
-  "homeAllowDirs": ["<可选：沙箱里要只读看到的 HOME 内目录，比如 pi 的安装目录、pi 配置副本目录>"]
+  "homeAllowDirs": ["<可选：沙箱里要只读看到的 HOME 内目录，比如 pi 的安装目录、pi 配置副本目录>"],
+  "egressAllow": ["github.com:443", "codeload.github.com:443", "<LLM 网关 host>:443"]
 }
 ```
+
+`egressAllow` 是沙箱**唯一**能出网的名单（见第 4 节「网络」）：只写 `host:port`（小写，不认通配、不认 URL），
+LLM 网关的 host 取 pi 的 `models.json` 里 `baseUrl` 的主机名；`git clone https://github.com/<公开仓>`
+要 `github.com:443` 和 `codeload.github.com:443`。**不配就是空名单，pi 连不上模型网关，这一轮跑不起来。**
+写错（通配、URL、缺端口）整轮直接起不来，不会悄悄放宽。
 
 未知键一律忽略；写 `"sandbox": false` 或 `"noSandbox": true` **没有任何作用**——沙箱只有一条路。
 
@@ -165,8 +171,34 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 - **没有任何环境变量或配置项能关掉沙箱**（`PI_NO_SANDBOX`、`ACCEPTANCE_NO_SANDBOX`、`host.json` 的
   `sandbox`/`noSandbox` 都无效）：代码里根本没有「不套 bwrap 跑 pi」这条路径。
 - 只传白名单环境变量：`PATH`、`HOME`、`LANG`、`TZ`、`TERM`、`TMPDIR`、`LLM_PROXY_API_KEY`、
-  `NODE_OPTIONS`，外加两个沙箱内部变量（`ACCEPTANCE_WATCHER_HOME`、`ACCEPTANCE_GATE_SOCKET`，
-  都指向沙箱内的路径）。`HOME` 和 `TMPDIR` 每轮新开。
+  `NODE_OPTIONS`，外加沙箱内部变量（`ACCEPTANCE_WATCHER_HOME`、`ACCEPTANCE_GATE_SOCKET`，
+  都指向沙箱内的路径；出网变量见下面「网络」）。`HOME` 和 `TMPDIR` 每轮新开。
+- **环境变量不进 bwrap 的命令行**：不用 `--clearenv` + `--setenv KEY VALUE`（值会出现在 bwrap 的
+  `/proc/<pid>/cmdline` 里，`ps` 就能看到 `LLM_PROXY_API_KEY`），而是把白名单环境作为 spawn 的 `env`
+  交给 bwrap 进程本身，bwrap 原样传给沙箱里的命令。验收轮（`host/round.mjs`）、修正轮的 pi 和预检
+  （`host/prbot-sandbox.mjs`）、`doctor` 的遮罩探针都这样起；`buildBwrapArgs` 再收到 `env` 直接报错。
+- **网络**：bwrap 用 `--unshare-net`，沙箱有自己的网络命名空间，里面只有 `lo`。宿主 `127.0.0.1` 上的
+  所有端口（比如无鉴权的 Docker Engine API、VNC、adb、各种本地 daemon）和**抽象 unix socket**
+  （比如 `Xvfb -ac` 的 `@/tmp/.X11-unix/X1`，抽象 socket 跟着网络命名空间走，遮文件遮不住）一律连不到。
+  唯一的出网路：
+  - 宿主侧的出网代理 `host/egress-proxy.mjs`，随轮次起停，监听轮次目录里的
+    `egress/egress.sock`（权限 600，和写闸 socket 一样跟着 `roundDir` 挂进沙箱）。它**只认 HTTP CONNECT**，
+    目标 `host:port` 必须在 `host.json` 的 `egressAllow` 里，别的一律 403；明文 HTTP 转发一律 405；
+    域名在宿主侧解析，解析到环回 / `0.0.0.0` / 链路本地（含 `169.254.169.254`）的哪怕写进名单也拒绝；
+    同时最多 32 条隧道、单条最长 30 分钟、请求头 10 秒 / 8 KiB 封顶。被拒时写提醒 `egress-denied`
+    （同一目标一轮只记一条，一轮最多 5 条）。代理起不来就不跑模型（「沙箱起不来」）。
+  - 沙箱里的出网桥 `host/sandbox-bin/egress-bridge.mjs`：pi 的命令前面先起它，在沙箱自己的
+    `127.0.0.1:3128` 上听，把 TCP 流原样转进那个 socket，再起 `piCommand`（标准输入、退出码原样）。
+  - 沙箱内部的出网变量（不从宿主环境抄，宿主上的同名变量不在白名单里）：`HTTPS_PROXY` / `https_proxy` /
+    `HTTP_PROXY` / `http_proxy` 都是 `http://127.0.0.1:3128`，`NO_PROXY` / `no_proxy` 只含环回，
+    `NODE_USE_ENV_PROXY=1`（node 22.21+ / 24 的 `fetch` 和 `https` 认这几个变量；会在 `pi.log` 里打一行
+    `UNDICI-EHPA` 实验特性警告，无害）。沙箱里没有 DNS，也不需要：CONNECT 带的是主机名，git / curl / node
+    都交给代理解析。
+  - 修正轮的预检、打包、`handoffNew` 沙箱**完全不出网**：同样 `--unshare-net`，不起代理、不带出网变量。
+    目标仓的推送前检查要是需要联网（装依赖之类），得先在宿主上准备好。
+- **系统固定遮罩**（代码里写死，`host.json` 关不掉，只能用 `credentialDirs` 追加）：`/run` 整个换成空
+  tmpfs（宿主的 `docker.sock`、`ssh-auth.sock` 转发、容器运行时、各种 rpc socket、凭证代理都在下面；
+  pi、node、git 都不依赖 `/run`），`/opt/sand`、`/opt/sand-managed` 存在就盖空目录。
 - 遮罩名单**从 profile 算**，不写死文件名：profile 里每个以 `TokenFile` 结尾、`PrivateKeyFile`
   结尾或正好是 `privateKeyFile` 的键（递归算，含 `githubTokenFile`、`slackBotTokenFile`）、
   App 配置里的 `privateKeyFile`，一律 `/dev/null`；`$HOME` 下的凭证目录（`.config/gh`、`.ssh`、
@@ -197,7 +229,7 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 - **验收结论不发通知**：通过/要修、中断都只在 GitHub 的轮次评论和看板里。
 
 常见 `kind`：`loop-restarted`、`tick-failed`、`round-stale`、`round-stalled`、`sandbox-unavailable`、
-`gate-unavailable`、`gate-rejected`、`secret-found`、`write-rejected`。
+`gate-unavailable`、`gate-rejected`、`secret-found`、`write-rejected`、`egress-denied`。
 
 ## 6. 上线顺序
 
@@ -297,6 +329,8 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 | 心跳不更新 | `state/host/heartbeat.json` 的 `at`/`lastTick.error` | 跑 `ensure.sh`；还不行看 `loop.log`，`stop.sh` 后重起 |
 | 轮次一直「验收中」 | `round.mjs status --issue <ref> --json` 的 `stalled` | 等调度先杀进程再 abort；要手动就 `abort --reason` |
 | 所有写都被拒 | `alerts.jsonl` 的 `gate-rejected` | 看 `reason`：`gate-disabled` → 建开关文件；`not-current-round` → 轮次已结束 |
-| `sandbox-unavailable` | `pi.log`、`gate.log` | `bwrap --ro-bind / / true` 跑一下；参数拼错看 detail |
+| `sandbox-unavailable` | `pi.log`、`gate.log` | `bwrap --ro-bind / / true` 跑一下；参数拼错看 detail（含 `egressAllow` 写法不对） |
+| `egress-denied` | 提醒里的 `reason`（被拒的 `host:port`）和 `detail`（`not-allowed` / `not-connect` / `blocked-address`） | 该放行就把 `host:port` 加进 `host.json` 的 `egressAllow`；不该放行的说明模型在往外连别处，看 `pi.log` |
+| pi 连不上模型网关 | `pi.log`、`alerts.jsonl` 的 `egress-denied` | `egressAllow` 里要有 `models.json` 的 `baseUrl` 主机名 `:443` |
 | `secret-found` | 提醒里的 `reason`（只有文件名） | 按 #46 SC7 记「需人工处理」，别自己推 |
 | `tick-failed` | `heartbeat.lastTick.error` | 多半是 `poll.mjs` 或配置报错，跑一次 `poll.mjs --json` 看 |

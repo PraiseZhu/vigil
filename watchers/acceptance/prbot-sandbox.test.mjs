@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { INTERNAL_ENV, probeBwrap } from './host/sandbox.mjs';
 import { run as procRun } from './host/proc.mjs';
+import { EGRESS_BRIDGE } from './host/egress-proxy.mjs';
 import {
   PI_ENV_ALLOWLIST,
   PREFLIGHT_ENV_ALLOWLIST,
@@ -67,7 +68,10 @@ test('SC3 pi 只在 bwrap 里跑；环境是白名单，PI_NO_SANDBOX 关不掉'
   assert.equal(result.ok, true, JSON.stringify(result));
   const modelCall = run.calls.find((call) => call.cmd === 'bwrap' && call.args.includes('--'));
   assert.ok(modelCall, '一定经 bwrap 起 pi');
-  assert.deepEqual(modelCall.args.slice(modelCall.args.indexOf('--') + 1), ['pi', '--model', 'example/model']);
+  // 沙箱里先起出网桥，再由桥起 piCommand（原样接在桥的 `--` 后面）。
+  const inside = modelCall.args.slice(modelCall.args.indexOf('--') + 1);
+  assert.equal(inside[1], EGRESS_BRIDGE, '沙箱里第一个起的是出网桥');
+  assert.deepEqual(inside.slice(inside.indexOf('--') + 1), ['pi', '--model', 'example/model']);
   for (const key of Object.keys(modelCall.options.env)) {
     assert.ok([...PI_ENV_ALLOWLIST, ...INTERNAL_ENV].includes(key), `pi 环境里混进了 ${key}`);
   }

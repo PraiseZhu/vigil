@@ -15,7 +15,7 @@ const REPO_ROOT = path.resolve(HERE, '..', '..');
 
 function baseArgs(extra = {}) {
   const roundDir = tmpDir();
-  return { profile: {}, roundDir, masks: { files: [], dirs: [] }, binds: [], env: {}, ...extra };
+  return { profile: {}, roundDir, masks: { files: [], dirs: [] }, binds: [], ...extra };
 }
 
 test('默认遮 HOME：不给宿主 HOME 就拒绝拼参数，不退回只遮名单', () => {
@@ -127,7 +127,6 @@ test(
       roundDir,
       masks: { files: [], dirs: [] },
       binds: [stateDir, worktreeDir],
-      env,
       hostHome,
       homeAllow: defaultHomeAllow({ repoRoot: REPO_ROOT, hostConfig: { homeAllowDirs: [path.join(hostHome, 'tools'), piAgent] } }),
     });
@@ -158,7 +157,7 @@ test(
     const probe = await procRun(
       'bwrap',
       [...args, '--', process.execPath, reader, JSON.stringify([[...hidden, hiddenDir], hostHome, path.join(piAgent, 'new.json')])],
-      { cwd: roundDir, timeoutMs: 120000 },
+      { env, cwd: roundDir, timeoutMs: 120000 },
     );
     assert.equal(probe.code, 0, probe.stderr);
     const seen = JSON.parse(probe.stdout);
@@ -182,6 +181,7 @@ test(
       'example/model',
     ];
     const piRun = await procRun('bwrap', [...args, '--', ...piCommand], {
+      env,
       cwd: roundDir,
       input: 'dispatch-message\n',
       timeoutMs: 120000,
