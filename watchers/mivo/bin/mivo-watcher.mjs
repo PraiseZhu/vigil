@@ -23,6 +23,7 @@ import { PARSER_VERSION, canonicalRuntime, runtimeSha256 } from './mivo-validati
 import { enqueueNotice } from './notify.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
 import { triageText } from './mivo-ci-triage.mjs';
+import { collectMivoCiSteps } from './mivo-ci.mjs';
 
 // 目标仓库在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
 export const REPO = requireConfig('targetRepo', {
@@ -1116,10 +1117,64 @@ export function scriptNoChangePolicy(pr, fresh) {
   return policy;
 }
 
-// Head refs of machine-generated PRs that another loop already owns end to end.
+// Head refs of machine-generated PRs. They never get a repair session: the daily changelog PR only rewrites
+// public/changelog.json, so a session would only "fix" unrelated tests. The loop that opens it does not watch CI
+// either ("开 PR 即成功,不轮询 CI、不合并"), so a red required check sat there until someone noticed (2026-10-25, #1278:
+// a Windows depositPort timeout). Here the watcher only re-runs the failed Actions jobs once per head and run, and
+// tells the person if the checks are still red after that.
 export const EXCLUDED_HEAD_PREFIXES = ['chore/changelog-'];
 export function isExcludedHead(headRefName) {
   return EXCLUDED_HEAD_PREFIXES.some((prefix) => String(headRefName ?? '').startsWith(prefix));
+}
+
+// Decides what to do for an excluded-head PR from its CI result and what was already done on this head.
+// state: { head, reruns: [{ runId, attempt }], notified } — kept per PR, reset when the head moves.
+export function planExcludedHeadCi({ ci, state, headRefOid }) {
+  const current = state?.head === headRefOid ? state : { head: headRefOid, reruns: [], notified: false };
+  if (ci?.status !== 'failed') return { state: current, rerun: [], notify: false, status: ci?.status ?? 'unknown' };
+  const failed = (ci.required ?? []).filter((rule) => rule.status === 'failed');
+  const runs = new Map();
+  for (const rule of failed) {
+    const runId = rule.evidence?.runId;
+    if (runId == null) continue;
+    const attempt = Number(rule.evidence?.attempt ?? 1);
+    if (!runs.has(String(runId)) || attempt > runs.get(String(runId))) runs.set(String(runId), attempt);
+  }
+  const done = new Map(current.reruns.map((entry) => [String(entry.runId), Number(entry.attempt ?? 1)]));
+  const rerun = [...runs].filter(([runId]) => !done.has(runId)).map(([runId, attempt]) => ({ runId, attempt }));
+  // Still red after our re-run: a failed check now reports a later attempt than the one we re-ran. A failed check
+  // without an Actions run (or with a run we never re-ran yet) is handled by the re-run first.
+  const stillRed = runs.size > 0 && rerun.length === 0 && [...runs].every(([runId, attempt]) => attempt > done.get(runId));
+  const noRun = failed.length > 0 && runs.size === 0;
+  return { state: current, rerun, notify: !current.notified && (stillRed || noRun), status: 'failed', failed: failed.map((rule) => rule.context) };
+}
+
+export function* superviseExcludedHead({ pr, key, paths, now, ghFn, dryRun, collectCi = collectMivoCiSteps }) {
+  const view = JSON.parse(yield () => ghFn(['pr', 'view', String(pr.number), '--repo', REPO, '--json', 'id,number,headRefOid,baseRefOid,state,isDraft,url']));
+  if (view.isDraft === true || view.state !== 'OPEN') return { reason: 'excluded-head', ciStatus: null };
+  const ci = yield* collectCi({ pr: { ...view, repo: REPO }, ghFn });
+  const previous = readPr(paths.home, key) || { nodeId: key, number: pr.number };
+  const plan = planExcludedHeadCi({ ci, state: previous.excludedHead, headRefOid: view.headRefOid });
+  const state = { ...plan.state, reruns: [...plan.state.reruns] };
+  const reran = [];
+  const rerunErrors = [];
+  for (const { runId, attempt } of plan.rerun) {
+    if (dryRun) { reran.push(runId); continue; }
+    try {
+      yield () => ghFn(['api', '--method', 'POST', `repos/${REPO}/actions/runs/${runId}/rerun-failed-jobs`]);
+      state.reruns.push({ runId, attempt, at: now });
+      reran.push(runId);
+    } catch (error) {
+      // e.g. the run is still in progress (another job of it has not finished): try again next round
+      rerunErrors.push({ runId, error: String(error?.message ?? error).slice(0, 200) });
+    }
+  }
+  if (plan.notify) {
+    queueHumanNotice(paths.home, { kind: 'excluded-head-ci-red', number: pr.number, url: view.url ?? pr.url, head: view.headRefOid, checks: plan.failed }, dryRun);
+    state.notified = true;
+  }
+  if (!dryRun) writePr(paths.home, key, { ...previous, number: pr.number, headRefOid: view.headRefOid, headRefName: pr.headRefName, excludedHead: state, lastSeenAt: now });
+  return { reason: 'excluded-head', ciStatus: plan.status, ...(reran.length ? { reran } : {}), ...(rerunErrors.length ? { rerunErrors } : {}), ...(plan.notify ? { notified: true } : {}) };
 }
 
 // 一个修复会话只归一个 PR:deploy.mjs 的会话身份检查和 mivo-ownership 都按 sessionId 找归属。
@@ -2806,7 +2861,15 @@ function* discoverOnePr(pr, ctx) {
     return done();
   }
   if (isExcludedHead(pr.headRefName)) {
-    report.push({ number: pr.number, nodeId: pr.id, dispatch: { attempted: false, reason: 'excluded-head' } });
+    let excluded = { reason: 'excluded-head' };
+    const lock = acquireLock(paths.home, `pr-${key}`);
+    if (lock.held) excluded = { reason: 'excluded-head', ciStatus: null, skipped: 'pr-lock-held' };
+    else {
+      try { excluded = yield* superviseExcludedHead({ pr, key, paths, now, ghFn, dryRun }); }
+      catch (error) { excluded = { reason: 'excluded-head', ciStatus: 'unknown', error: String(error?.message ?? error).slice(0, 200) }; }
+      finally { lock.release(); }
+    }
+    report.push({ number: pr.number, nodeId: pr.id, dispatch: { attempted: false, ...excluded } });
     return done();
   }
   let prLock = acquireLock(paths.home, `pr-${key}`);

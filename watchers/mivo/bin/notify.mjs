@@ -105,6 +105,7 @@ export function noticeId(event = {}) {
   if (event.kind === 'merge-ready') return `merge-ready:${number}:${event.head ?? ''}`;
   if (event.kind === 'keel-unavailable') return `keel-unavailable:${number}:${event.day ?? ''}`;
   if (event.kind === 'blocked-escalate') return `escalate:${number}:${event.head ?? ''}:${event.cause ?? event.blockedKind ?? ''}`;
+  if (event.kind === 'excluded-head-ci-red') return `excluded-head-ci-red:${number}:${event.head ?? ''}`;
   return `${event.kind}:${number}`;
 }
 
@@ -152,6 +153,10 @@ export function formatNoticeText(events = []) {
     }
     if (event.kind === 'keel-unavailable') {
       return `PR #${number}${url} 有待修复的反馈，但 Keel 台账读不到（${event.cause ?? 'ledger unreadable'}），本轮没有派发修复会话、没有扣轮次。请检查 keelLedgerRoot / keelNamespace 配置或 Keel 安装；恢复后盯梢会自动继续。`;
+    }
+    if (event.kind === 'excluded-head-ci-red') {
+      const checks = Array.isArray(event.checks) && event.checks.length ? `（${event.checks.join('、')}）` : '';
+      return `PR #${number}${url} 是机器生成的 PR（如每日更新日志），必需检查${checks}在自动重跑一次失败的 job 后仍然是红的。盯梢不会为这类 PR 派修复会话，请打开链接看失败原因。`;
     }
     if (event.kind === 'blocked-escalate') {
       return `PR #${number}${url} 同一原因再次卡住（${event.cause ?? event.blockedKind ?? 'blocked'}），盯梢不再原样重投。请查看原因并处理。`;

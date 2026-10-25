@@ -547,16 +547,21 @@ test('guide and successor messages forbid every schedule operation', () => {
   assert.doesNotMatch(successor, /第 0 步/);
 });
 
-test('changelog bot PRs are skipped before any lock, collect or dispatch', (t) => {
+test('changelog bot PRs never collect repair feedback or dispatch; CI that cannot be read is reported, not acted on', (t) => {
   const { paths } = homeOf(t);
   const { result, collected } = discover(paths, {
     prs: [{ ...listed, headRefName: 'chore/changelog-20261002' }],
     collect: collectFail,
     dispatchFn: () => { throw new Error('should not dispatch'); },
+    ghExtra: (args) => (args[0] === 'pr' && args[1] === 'view'
+      ? JSON.stringify({ id: nodeId, number: 790, headRefOid: HEAD, baseRefOid: BASE, state: 'OPEN', isDraft: false, url: 'https://example.test/pr/790' })
+      : undefined),
   });
   assert.equal(collected, 0);
+  assert.equal(result.prs[0].dispatch.attempted, false);
   assert.equal(result.prs[0].dispatch.reason, 'excluded-head');
-  assert.equal(readPr(paths.home, nodeId), null);
+  assert.equal(result.prs[0].dispatch.ciStatus, 'unknown');
+  assert.equal(result.prs[0].dispatch.reran, undefined);
 });
 
 test('discover closedown for ledger PR missing from open list is done by the script', (t) => {
