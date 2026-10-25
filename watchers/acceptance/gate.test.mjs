@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
-import { bodyVersion } from './bin/rounds.mjs';
+import { bodyVersion, createRounds } from './bin/rounds.mjs';
 import { ROOT_QUERY, SEARCH_QUERY } from './bin/collect.mjs';
 import { localEnv, spawnRun } from './bin/localgit.mjs';
 import { DEFAULT_HEAD_QUERY, PR_READY_QUERY, createGate, startGateServer } from './host/write-gate.mjs';
@@ -1380,4 +1380,30 @@ test('SC9 branch.push 扫描本身出错（rev-list / cat-file 失败）：fail 
     assert.equal(outcome.body.reason, 'scan-failed', broken);
     assert.equal(pushed, false, `${broken}：扫描出错不推`);
   }
+});
+
+test('SC9 宿主 round.mjs abort 真走写闸 exec：rounds.finish 交的动作带 issue，写闸放行，评论改成「中断」', async () => {
+  const { home, profile } = setupEnvironment();
+  const world = defaultTree();
+  const gate = createGate({ home, profile, github: gateGithub(world), run: procRun, which: async () => false });
+  const rejections = [];
+  // 和 bin/github.mjs 的 write 一样：写闸非 0 就当外发被拒抛出。
+  const github = {
+    graphql: (query, variables) => world.graphql({ query, variables }),
+    async write(action) {
+      const outcome = await gate.handle(action);
+      if (outcome.code !== 0) {
+        rejections.push(outcome.body);
+        throw new Error(`外发被拒：${outcome.body.reason}`);
+      }
+      return outcome.body;
+    },
+  };
+  const rounds = createRounds({ github, profile, now: () => Date.parse('2026-10-24T03:00:00.000Z') });
+  const result = await rounds.finish(ROOT_REF, 1, '中断', { reason: '手动停用' });
+  assert.deepEqual(rejections, [], JSON.stringify(rejections));
+  assert.equal(result.status, '中断');
+  const comment = world.get(ROOT_REF).comments.find((entry) => entry.body.startsWith('[验收机] 第 1 轮'));
+  assert.match(comment.body, /^\[验收机\] 第 1 轮：中断/);
+  assert.match(comment.body, /手动停用/);
 });

@@ -351,7 +351,7 @@ export function createRounds({ github, profile, now = () => Date.now() }) {
       throw new RoundError(`非法结束状态：${status}`, 'BAD_STATUS');
     }
     const current = await check(ref, n);
-    const { repo } = parseRef(ref);
+    const { repo, number } = parseRef(ref);
     const issue = await readIssue(github, ref);
     const comment = commentsOf(issue).find((item) => item.databaseId === current.commentId);
     const finishedAt = nowIso(now);
@@ -360,6 +360,8 @@ export function createRounds({ github, profile, now = () => Date.now() }) {
       type: 'comment.update',
       dedupeKey: `round-finish:${ref}:${n}:${status}`,
       repo,
+      // 宿主侧 abort 走写闸 exec 模式：没有本轮绑定，写闸靠 repo + issue 找到轮次，缺了就拒。
+      issue: number,
       commentId: current.commentId,
       body,
     });
