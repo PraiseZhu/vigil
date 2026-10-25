@@ -70,7 +70,7 @@ export class WriteFailedError extends Error {
   }
 }
 
-function defaultRun(cmd, args, { env, input, timeoutMs } = {}) {
+export function defaultRun(cmd, args, { env, input, timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
     // 超时就杀掉（取镜像这种可能卡很久的命令才传 timeoutMs）。
@@ -78,6 +78,11 @@ function defaultRun(cmd, args, { env, input, timeoutMs } = {}) {
     child.on('close', () => timer && clearTimeout(timer));
     let stdout = '';
     let stderr = '';
+    // 按 UTF-8 流式解码：输出大于一个管道块（约 64 KiB）时，多字节字符可能被切在两块之间，
+    // 逐块 `+=` 会把它拼成乱码（比如正文里的「。」变成两个 U+FFFD），正文版本随之变掉，
+    // 已验过的总 issue 每拍都被误判「正文变了」。setEncoding 交给 StringDecoder 跨块拼好。
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
       stdout += chunk;
     });

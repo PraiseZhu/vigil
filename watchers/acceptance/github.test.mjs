@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { createGithub, WRITE_TYPES, WriteBusyError, WriteRejectedError } from './bin/github.mjs';
+import { createGithub, defaultRun, WRITE_TYPES, WriteBusyError, WriteRejectedError } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { setAcceptanceFields } from './bin/board.mjs';
 import { REPO, createFakeRun, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
@@ -339,4 +339,13 @@ test('安全 branch.push 的 bundlePath 必须是绝对路径，不会被 git �
     );
   }
   assert.equal(run.calls.length, 0, '参数不合法时不应调 git');
+});
+
+test('默认执行器按 UTF-8 流式解码：大输出里跨块的多字节字符不变乱码（#43 正文版本每拍误判「变了」）', async () => {
+  // 20 万个「。」（每个 3 字节，约 600 KiB）必然跨过管道块边界；逐块 `+=` 会在边界处拼出 U+FFFD。
+  const script = "process.stdout.write('。'.repeat(200000))";
+  const result = await defaultRun(process.execPath, ['-e', script], { env: process.env });
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout.includes('\uFFFD'), false);
+  assert.equal(result.stdout, '。'.repeat(200000));
 });
