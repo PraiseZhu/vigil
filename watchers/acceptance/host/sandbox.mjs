@@ -3,6 +3,7 @@
 // 遮罩名单从 profile 算出来（所有 …TokenFile / …PrivateKeyFile 键 + App 私钥），不写死文件名。
 import fs from 'node:fs';
 import path from 'node:path';
+import { TOKEN_FILE_KEY } from '../bin/profile.mjs';
 
 /** 传进沙箱的环境变量白名单；别的（含任何令牌）一律不传。 */
 export const ENV_ALLOWLIST = Object.freeze([
@@ -19,8 +20,8 @@ export const ENV_ALLOWLIST = Object.freeze([
 /** 沙箱内部用的两个变量：都指向沙箱内的路径，不是宿主的。 */
 export const INTERNAL_ENV = Object.freeze(['ACCEPTANCE_WATCHER_HOME', 'ACCEPTANCE_GATE_SOCKET']);
 
-/** 密钥文件键的约定和 bin/profile.mjs 一致：以 TokenFile / PrivateKeyFile 结尾，或正好是 privateKeyFile。 */
-const KEY_PATTERN = /(TokenFile|PrivateKeyFile|^privateKeyFile)$/;
+/** 密钥文件键直接用 bin/profile.mjs 的约定（以 TokenFile / PrivateKeyFile 结尾，或正好是 privateKeyFile），不另写一份。 */
+const KEY_PATTERN = TOKEN_FILE_KEY;
 
 const HOME_CRED_DIRS = Object.freeze([
   '.config/gh',
@@ -54,41 +55,68 @@ function collectKeyFiles(value, out, depth = 0) {
  *   App 配置里的 privateKeyFile，以及 HOME 下的 .git-credentials / .netrc（存在才遮）。
  * - dirs：HOME 下的凭证目录（存在才遮）、host.json 的 credentialDirs、宿主状态目录 <home>/state。
  */
+/**
+ * 把要遮的路径落到真实路径上：bwrap 不能挂到符号链接上（会直接起不来），
+ * 而且只遮链接本身、真实文件照样能从原路径读到。所以一律遮 realpath。
+ * 不存在的路径没有内容可读，跳过（否则 bwrap 在只读根上建不出挂载点，整轮起不来）。
+ */
+function realExisting(file) {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return null;
+  }
+}
+
 export function maskList({ rawProfile, profile, hostConfig, env = process.env, home } = {}) {
-  const files = new Set();
-  collectKeyFiles(rawProfile || {}, files);
+  const wanted = new Set();
+  collectKeyFiles(rawProfile || {}, wanted);
   if (profile?.appConfigPath) {
+    // App 配置本身也遮（里面可能有安装信息），再加上它指向的私钥。
+    wanted.add(profile.appConfigPath);
     try {
       const appConfig = JSON.parse(fs.readFileSync(profile.appConfigPath, 'utf8'));
       if (typeof appConfig?.privateKeyFile === 'string' && appConfig.privateKeyFile) {
-        files.add(appConfig.privateKeyFile);
+        wanted.add(appConfig.privateKeyFile);
       }
     } catch {
       // App 配置读不出是部署检查的事；这里不因此放行任何文件。
     }
   }
   for (const file of [profile?.githubTokenFile, profile?.slackBotTokenFile, profile?.appPrivateKeyFile]) {
-    if (typeof file === 'string' && file) files.add(file);
+    if (typeof file === 'string' && file) wanted.add(file);
   }
 
-  const dirs = new Set();
+  const wantedDirs = new Set();
   const userHome = env?.HOME;
   if (typeof userHome === 'string' && userHome) {
-    for (const rel of HOME_CRED_DIRS) {
-      const dir = path.join(userHome, rel);
-      if (fs.existsSync(dir)) dirs.add(dir);
-    }
-    for (const rel of HOME_CRED_FILES) {
-      const file = path.join(userHome, rel);
-      if (fs.existsSync(file)) files.add(file);
-    }
+    for (const rel of HOME_CRED_DIRS) wantedDirs.add(path.join(userHome, rel));
+    for (const rel of HOME_CRED_FILES) wanted.add(path.join(userHome, rel));
   }
   for (const dir of hostConfig?.credentialDirs || []) {
-    if (typeof dir === 'string' && path.isAbsolute(dir)) dirs.add(dir);
+    if (typeof dir === 'string' && path.isAbsolute(dir)) wantedDirs.add(dir);
   }
   if (typeof home === 'string' && path.isAbsolute(home)) {
     // 宿主状态目录（写闸开关、账本、提醒、轮次登记）对模型完全不可见。
-    dirs.add(path.join(home, 'state'));
+    const stateRoot = path.join(home, 'state');
+    fs.mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
+    wantedDirs.add(stateRoot);
+  }
+
+  const files = new Set();
+  const dirs = new Set();
+  for (const file of wanted) {
+    if (typeof file !== 'string' || !path.isAbsolute(file)) continue;
+    const real = realExisting(file);
+    if (!real) continue;
+    if (fs.statSync(real).isDirectory()) dirs.add(real);
+    else files.add(real);
+  }
+  for (const dir of wantedDirs) {
+    const real = realExisting(dir);
+    if (!real) continue;
+    if (fs.statSync(real).isDirectory()) dirs.add(real);
+    else files.add(real);
   }
   return { files: [...files], dirs: [...dirs] };
 }

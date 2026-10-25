@@ -245,8 +245,9 @@ export function createGate({
       return reject('query-not-allowed', '只接受登记过的只读查询，自己写的 GraphQL 一律不执行');
     }
     const variables = action.variables && typeof action.variables === 'object' ? action.variables : {};
-    if (variables.owner != null || variables.name != null) {
-      if (!scopeOf(`${variables.owner}/${variables.name}`)) {
+    if (query !== SEARCH_QUERY || variables.owner != null || variables.name != null) {
+      // 除了修正搜索，每条登记查询都按 owner/name 定位仓：缺了或不在名单里一律拒绝。
+      if (typeof variables.owner !== 'string' || typeof variables.name !== 'string' || !scopeOf(`${variables.owner}/${variables.name}`)) {
         return reject('repo-not-allowed', `${variables.owner}/${variables.name} 不在配置的名单里`);
       }
     }
@@ -407,59 +408,84 @@ export function createGate({
     return null;
   }
 
-  /** branch.push 执行前在写闸里再扫一遍密钥：扫到就 4，绝不推送。 */
+  /**
+   * branch.push 执行前在写闸里再扫一遍密钥：扫到就 4，绝不推送。
+   * 规则和 bin/push.mjs（#65 修复后）一致：扫的、推的是同一个提交 —— bundle 里 refs/heads/<branch> 指向的那个。
+   * bundle 先复制进写闸自己的临时目录（沙箱看不到宿主 /tmp），扫这份副本、也推这份副本：
+   * 沙箱在「扫完」和「推送」之间换掉原文件也没用。
+   * 返回 {problem} 表示拒绝；{bundleCopy, cleanup} 表示放行，推送要用 bundleCopy。
+   */
   async function scanBundle(action) {
     const { bundlePath, branch } = action;
-    if (typeof bundlePath !== 'string' || !path.isAbsolute(bundlePath) || !fs.existsSync(bundlePath)) {
-      return reject('bad-bundle', 'branch.push 的 bundlePath 必须是存在的绝对路径');
+    if (typeof bundlePath !== 'string' || !path.isAbsolute(bundlePath)) {
+      return { problem: reject('bad-bundle', 'branch.push 的 bundlePath 必须是存在的绝对路径') };
     }
-    if (typeof branch !== 'string' || !branch) return reject('bad-bundle', 'branch.push 缺少分支名');
+    if (typeof branch !== 'string' || !BRANCH_PATTERN.test(branch)) {
+      return { problem: reject('bad-bundle', 'branch.push 缺少合法的分支名') };
+    }
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'acceptance-gate-scan-'));
-    const env = scanEnv();
-    const git = (args) => run('git', args, { env, timeoutMs: 120000 });
+    const cleanup = () => fs.rmSync(tmp, { recursive: true, force: true });
+    const bundleCopy = path.join(tmp, 'push.bundle');
+    const bare = path.join(tmp, 'repo.git');
+    let keep = false;
     try {
-      let result = await git(['init', '--bare', tmp]);
-      if (!result || result.code !== 0) {
-        return fail('scan-failed', `扫密钥前建临时仓失败：${firstLine(result?.stderr)}`);
+      try {
+        const stat = fs.lstatSync(bundlePath);
+        if (!stat.isFile()) throw new Error('不是普通文件');
+        fs.copyFileSync(bundlePath, bundleCopy);
+      } catch {
+        return { problem: reject('bad-bundle', 'branch.push 的 bundlePath 必须是存在的普通文件') };
       }
-      result = await git(['--git-dir', tmp, 'fetch', bundlePath, `refs/heads/${branch}:refs/heads/${branch}`]);
+      const env = scanEnv();
+      const git = (args) => run('git', args, { env, timeoutMs: 120000 });
+      let result = await git(['init', '-q', '--bare', bare]);
       if (!result || result.code !== 0) {
-        return reject('bad-bundle', `bundle 里没有分支 ${branch}`);
+        return { problem: fail('scan-failed', `扫密钥前建临时仓失败：${firstLine(result?.stderr)}`) };
       }
-      result = await git(['--git-dir', tmp, 'rev-list', '--count', `refs/heads/${branch}`]);
+      result = await git(['--git-dir', bare, 'fetch', '-q', bundleCopy, `refs/heads/${branch}:refs/heads/${branch}`]);
       if (!result || result.code !== 0) {
-        return fail('scan-failed', `列提交失败：${firstLine(result?.stderr)}`);
+        return { problem: reject('bad-bundle', `bundle 里没有分支 ${branch}`) };
       }
+      result = await git(['--git-dir', bare, 'rev-parse', '--verify', `refs/heads/${branch}^{commit}`]);
+      const commit = String(result?.stdout || '').trim();
+      if (!result || result.code !== 0 || !/^[0-9a-f]{40,64}$/.test(commit)) {
+        return { problem: fail('scan-failed', `解析分支提交失败：${firstLine(result?.stderr)}`) };
+      }
+      const range = action.base ? `${action.base}..${commit}` : commit;
       if (await whichCmd('gitleaks')) {
         const reportFile = path.join(tmp, 'gitleaks-report.json');
         const scan = await run(
           'gitleaks',
-          ['git', '--redact', '--report-format', 'json', '--report-path', reportFile, tmp],
+          ['git', `--log-opts=${range}`, '--redact', '--report-format', 'json', '--report-path', reportFile, bare],
           { env, timeoutMs: 300000 },
         );
-        if (scan && scan.code === 0) return null;
-        if (scan && scan.code === 1) {
+        if (!scan || (scan.code !== 0 && scan.code !== 1)) {
+          return { problem: fail('scan-failed', `gitleaks 退出码 ${scan?.code ?? '未知'}`) };
+        }
+        if (scan.code === 1) {
           const files = readGitleaksFiles(reportFile);
           return {
-            code: 4,
-            body: { reason: 'secret-found', files: files.length ? files : ['（gitleaks 没给出文件名）'] },
-            alert: 'secret-found',
+            problem: {
+              code: 4,
+              body: { reason: 'secret-found', files: files.length ? files : ['（gitleaks 没给出文件名）'] },
+              alert: 'secret-found',
+            },
           };
         }
-        return fail('scan-failed', `gitleaks 退出码 ${scan?.code ?? '未知'}`);
+      } else {
+        result = await git(['--git-dir', bare, 'log', '-p', '--format=', range]);
+        if (!result || result.code !== 0) {
+          return { problem: fail('scan-failed', `读补丁失败：${firstLine(result?.stderr)}`) };
+        }
+        const files = scanAddedLines(result.stdout);
+        if (files.length) {
+          return { problem: { code: 4, body: { reason: 'secret-found', files }, alert: 'secret-found' } };
+        }
       }
-      const range = action.base ? `${action.base}..refs/heads/${branch}` : `refs/heads/${branch}`;
-      result = await git(['--git-dir', tmp, 'log', '-p', '--format=', range]);
-      if (!result || result.code !== 0) {
-        return fail('scan-failed', `读补丁失败：${firstLine(result?.stderr)}`);
-      }
-      const files = scanAddedLines(result.stdout);
-      if (files.length) {
-        return { code: 4, body: { reason: 'secret-found', files }, alert: 'secret-found' };
-      }
-      return null;
+      keep = true;
+      return { bundleCopy, cleanup };
     } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      if (!keep) cleanup();
     }
   }
 
@@ -515,17 +541,23 @@ export function createGate({
       // 9. 绑定本轮
       const bindingProblem = binding ? await checkBoundWrite(action) : await checkExecWrite(action);
       if (bindingProblem) return bindingProblem;
-      // 10. 推送前在写闸里扫密钥
+      // 10. 推送前在写闸里扫密钥；推的是扫过的那份副本
+      let toWrite = action;
+      let cleanupBundle = null;
       if (action.type === 'branch.push') {
         const scan = await scanBundle(action);
-        if (scan) return scan;
+        if (scan.problem) return scan.problem;
+        cleanupBundle = scan.cleanup;
+        toWrite = { ...action, bundlePath: scan.bundleCopy };
       }
       // 11. 执行
       let result;
       try {
-        result = await github.write(action);
+        result = await github.write(toWrite);
       } catch (error) {
         return fail('write-failed', redact(error?.message || String(error), profile));
+      } finally {
+        if (cleanupBundle) cleanupBundle();
       }
       appendLedger({
         dedupeKey: action.dedupeKey,

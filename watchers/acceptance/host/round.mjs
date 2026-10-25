@@ -305,6 +305,31 @@ export async function runHostRound({
   let roundDir = null;
   let gateServer = null;
   let registryFile = null;
+  // pi 一旦起来，不管从哪条路离开（卡住、出错、异常），收尾前都要确认它已经结束：
+  // 不能让模型在写闸收掉之后还在跑。
+  let pi = null;
+  let piExited = false;
+  async function stopPi() {
+    if (!pi || piExited) return;
+    try {
+      pi.kill('SIGTERM');
+    } catch {
+      // 已经退了。
+    }
+    const raced = await Promise.race([
+      Promise.resolve(pi.exit).then(() => 'exited'),
+      sleep(killGraceMs).then(() => 'timeout'),
+    ]);
+    if (raced === 'timeout') {
+      try {
+        pi.kill('SIGKILL');
+      } catch {
+        // 已经退了。
+      }
+      await Promise.resolve(pi.exit);
+    }
+    piExited = true;
+  }
   try {
     // 3. 认领（经写闸 exec）：退出码照抄；4 还要写一条提醒。
     const claimed = await callRound(['start', '--issue', issue]);
@@ -358,7 +383,7 @@ export async function runHostRound({
     }
 
     // 6. 沙箱：bwrap 不在、或参数拼不出来，就不跑模型。
-    let pi;
+    let sandboxReady = false;
     try {
       const bwrapOk = await probeBwrap(run);
       if (!bwrapOk) throw new Error('bwrap 不可用（命令不在或起不来）');
@@ -386,6 +411,7 @@ export async function runHostRound({
       });
 
       // 7. 起 pi（一定在 bwrap 里），派发消息从标准输入喂进去。
+      sandboxReady = true;
       pi = spawnPi({
         cmd: 'bwrap',
         args: [...bwrapArgs, '--', ...piCommand],
@@ -410,6 +436,7 @@ export async function runHostRound({
       let finished = false;
       const exited = Promise.resolve(pi.exit).then((result) => {
         finished = true;
+        piExited = true;
         return result;
       });
 
@@ -420,23 +447,7 @@ export async function runHostRound({
         const status = parseJsonLastLine(statusText.stdout);
         if (!status || !status.stalled) continue;
         // 卡住：先结束进程，等它退出，再 abort。
-        try {
-          pi.kill('SIGTERM');
-        } catch {
-          // 已经退了。
-        }
-        const raced = await Promise.race([
-          Promise.resolve(pi.exit).then(() => 'exited'),
-          sleep(killGraceMs).then(() => 'timeout'),
-        ]);
-        if (raced === 'timeout') {
-          try {
-            pi.kill('SIGKILL');
-          } catch {
-            // 已经退了。
-          }
-          await Promise.resolve(pi.exit);
-        }
+        await stopPi();
         const reason = `卡住：超过 stallMinutes 没有进度`;
         await callRound(['abort', '--issue', issue, '--round', String(claim.round), '--reason', reason]);
         appendAlert(paths, { kind: 'round-stalled', issue, round: claim.round, reason, now, profile });
@@ -447,18 +458,22 @@ export async function runHostRound({
       return result?.code === 0 ? 0 : 1;
     } catch (error) {
       const detail = String(error?.message || error);
-      await callRound(['abort', '--issue', issue, '--round', String(claim.round), '--reason', `沙箱起不来：${detail}`]);
+      // 先停模型再 abort；pi 已经起来过就不是「沙箱起不来」，而是这一轮跑的时候出错。
+      await stopPi();
+      const reason = sandboxReady ? `宿主出错：${detail}` : `沙箱起不来：${detail}`;
+      await callRound(['abort', '--issue', issue, '--round', String(claim.round), '--reason', reason]);
       appendAlert(paths, {
-        kind: 'sandbox-unavailable',
+        kind: sandboxReady ? 'round-failed' : 'sandbox-unavailable',
         issue,
         round: claim.round,
-        reason: `沙箱起不来：${detail}`,
+        reason,
         now,
         profile,
       });
       return 1;
     }
   } finally {
+    await stopPi();
     if (gateServer) {
       try {
         await gateServer.stop();

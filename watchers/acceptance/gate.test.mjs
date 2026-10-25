@@ -9,7 +9,7 @@ import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion } from './bin/rounds.mjs';
 import { ROOT_QUERY, SEARCH_QUERY } from './bin/collect.mjs';
-import { createLocalGit, spawnRun } from './bin/localgit.mjs';
+import { localEnv, spawnRun } from './bin/localgit.mjs';
 import { STATUS_QUERY, createGate, startGateServer } from './host/write-gate.mjs';
 import { hostPaths, readAlerts } from './host/paths.mjs';
 import { run as procRun } from './host/proc.mjs';
@@ -168,6 +168,11 @@ test('SC9 读或写配置名单外的仓 → 4 repo-not-allowed；自己写的 G
       variables: { q: 'is:issue anything I want' },
     });
     assert.equal(freeSearch.code, 4);
+
+    // 按仓定位的登记查询不带 owner/name：不能当成「不用查名单」放过去。
+    const unscoped = await send(socketPath, { type: 'read.graphql', query: ROOT_QUERY, variables: { number: 1 } });
+    assert.equal(unscoped.code, 4);
+    assert.equal(unscoped.body.reason, 'repo-not-allowed');
     assert.equal(freeSearch.body.reason, 'search-not-allowed');
 
     const allowedSearch = await send(socketPath, {
@@ -286,6 +291,86 @@ test('SC9 目标不在本轮任务树 → 4 not-in-tree', async () => {
   assert.equal(outcome.code, 4);
   assert.equal(outcome.body.reason, 'not-in-tree');
   assert.equal(world.writes.length, 0);
+});
+
+test('SC9 修正 issue / 挂子 issue / 看板：标记不对、挂错总 issue、看板不是配置那块 → 4；对的放行', async () => {
+  const { home, profile } = setupEnvironment();
+  const world = defaultTree();
+  const gate = createGate({ home, profile, github: gateGithub(world), run: procRun, binding: bindingFor(world), which: async () => false });
+  const marker = (root) => `[验收机] 修正 · 总 ${root} · 项 ${REPO}#2 SC1 · 第 1 轮`;
+
+  const noMarker = await gate.handle({ type: 'issue.create', repo: REPO, title: '修', body: '没标记', dedupeKey: 'c-1' });
+  assert.equal(noMarker.code, 4);
+  assert.equal(noMarker.body.reason, 'not-in-tree');
+  const otherRoot = await gate.handle({
+    type: 'issue.create',
+    repo: REPO,
+    title: '修',
+    body: marker(`${REPO}#9`),
+    dedupeKey: 'c-2',
+  });
+  assert.equal(otherRoot.code, 4);
+  assert.equal(otherRoot.body.reason, 'not-in-tree');
+  assert.equal(world.writes.length, 0);
+
+  const created = await gate.handle({ type: 'issue.create', repo: REPO, title: '修', body: marker(ROOT_REF), dedupeKey: 'c-3' });
+  assert.equal(created.code, 0);
+  const newNumber = created.body.issue;
+
+  const wrongParent = await gate.handle({
+    type: 'subissue.add',
+    repo: REPO,
+    issue: 2,
+    subRepo: REPO,
+    subIssue: newNumber,
+    dedupeKey: 's-1',
+  });
+  assert.equal(wrongParent.code, 4);
+  assert.equal(wrongParent.body.reason, 'not-in-tree');
+  const attached = await gate.handle({
+    type: 'subissue.add',
+    repo: REPO,
+    issue: 1,
+    subRepo: REPO,
+    subIssue: newNumber,
+    dedupeKey: 's-2',
+  });
+  assert.equal(attached.code, 0);
+
+  const otherProject = await gate.handle({
+    type: 'project.field.set',
+    repo: REPO,
+    issue: 2,
+    projectNumber: profile.projectNumber + 1,
+    fields: { Status: 'Done' },
+    dedupeKey: 'p-1',
+  });
+  assert.equal(otherProject.code, 4);
+  assert.equal(otherProject.body.reason, 'project-not-allowed');
+  const otherOwner = await gate.handle({
+    type: 'project.field.set',
+    repo: REPO,
+    issue: 2,
+    ownerLogin: 'someone-else',
+    fields: { Status: 'Done' },
+    dedupeKey: 'p-2',
+  });
+  assert.equal(otherOwner.code, 4);
+  assert.equal(otherOwner.body.reason, 'project-not-allowed');
+  const ownProject = await gate.handle({
+    type: 'project.field.set',
+    repo: REPO,
+    issue: 2,
+    projectNumber: profile.projectNumber,
+    fields: { Status: 'Done' },
+    dedupeKey: 'p-3',
+  });
+  assert.equal(ownProject.code, 0);
+});
+
+test('SC9 静态：写闸放行的类型里没有 pr.merge', async () => {
+  const source = fs.readFileSync(path.join(HERE_HOST, 'write-gate.mjs'), 'utf8');
+  assert.doesNotMatch(source, /pr\.merge/);
 });
 
 test('SC9 裁决评论的正文版本不对 → 4 body-version-mismatch；版本对 → 放行', async () => {
@@ -509,9 +594,8 @@ test('SC9 bundle 里有假私钥头 → 4 secret-found，只列文件名，假 g
   const world = defaultTree();
 
   const repoDir = fs.mkdtempSync(path.join(tmpDir(), 'acceptance-gate-repo-'));
-  const git = createLocalGit();
   const gitRun = async (args, cwd = repoDir) => {
-    const result = await git.git(args, { cwd });
+    const result = await spawnRun('git', args, { cwd, env: localEnv() });
     if (result.code !== 0) throw new Error(`git ${args.join(' ')} 失败：${result.stderr}`);
     return result.stdout;
   };
@@ -570,9 +654,8 @@ test('SC9 干净 bundle → branch.push 交给 github.write 执行并记账', as
   const { home, profile, paths } = setupEnvironment();
   const world = defaultTree();
   const repoDir = fs.mkdtempSync(path.join(tmpDir(), 'acceptance-gate-clean-'));
-  const git = createLocalGit();
   const gitRun = async (args, cwd = repoDir) => {
-    const result = await git.git(args, { cwd });
+    const result = await spawnRun('git', args, { cwd, env: localEnv() });
     if (result.code !== 0) throw new Error(`git ${args.join(' ')} 失败：${result.stderr}`);
     return result.stdout;
   };
@@ -698,4 +781,85 @@ test('SC11 沙箱的 gh：只放行 gh api graphql --input -，其余一律拒�
   } finally {
     await server.close();
   }
+});
+
+test('SC9 branch.push 推的是写闸扫过的那份副本：扫完后原 bundle 被换掉也推不出去', async () => {
+  const { home, profile } = setupEnvironment();
+  const world = defaultTree();
+  const repoDir = fs.mkdtempSync(path.join(tmpDir(), 'acceptance-gate-swap-'));
+  const gitRun = async (args) => {
+    const result = await spawnRun('git', args, { cwd: repoDir, env: localEnv() });
+    if (result.code !== 0) throw new Error(`git ${args.join(' ')} 失败：${result.stderr}`);
+    return result.stdout;
+  };
+  await gitRun(['init', '-q', '-b', 'main']);
+  await gitRun(['config', 'user.name', 'ExampleUser']);
+  await gitRun(['config', 'user.email', 'example@example.test']);
+  const branch = 'acceptance/1-2-sc3';
+  await gitRun(['checkout', '-q', '-b', branch]);
+  fs.writeFileSync(path.join(repoDir, 'app.mjs'), 'export const ok = 1;\n');
+  await gitRun(['add', 'app.mjs']);
+  await gitRun(['commit', '-q', '-m', 'ok']);
+  const bundlePath = path.join(repoDir, 'push.bundle');
+  await gitRun(['bundle', 'create', bundlePath, branch]);
+  const scanned = fs.readFileSync(bundlePath);
+
+  // 模拟沙箱：写闸扫完补丁之后、推送之前，把原 bundle 换成别的内容。
+  const swappingRun = async (cmd, args, options) => {
+    const result = await procRun(cmd, args, options);
+    if (cmd === 'git' && args.includes('log')) fs.writeFileSync(bundlePath, 'swapped-after-scan');
+    return result;
+  };
+  let pushedBytes = null;
+  let pushedPath = null;
+  const github = gateGithub(world, {
+    onWrite: async (action) => {
+      if (action.type !== 'branch.push') return undefined;
+      pushedPath = action.bundlePath;
+      pushedBytes = fs.readFileSync(action.bundlePath);
+      return { pushed: true };
+    },
+  });
+  const gate = createGate({ home, profile, github, run: swappingRun, binding: bindingFor(world), which: async () => false });
+  const outcome = await gate.handle({ type: 'branch.push', repo: REPO, branch, bundlePath, dedupeKey: 'push-swap' });
+  assert.equal(outcome.code, 0, JSON.stringify(outcome));
+  assert.notEqual(pushedPath, bundlePath, '推送用写闸自己的副本，不用沙箱给的路径');
+  assert.ok(pushedBytes && pushedBytes.equals(scanned), '推出去的就是扫过的那份');
+  assert.equal(fs.existsSync(pushedPath), false, '副本用完就删');
+});
+
+test('SC9 branch.push 有 gitleaks 时只扫 bundle 里该分支的提交（--log-opts=<提交>）', async () => {
+  const { home, profile } = setupEnvironment();
+  const world = defaultTree();
+  const repoDir = fs.mkdtempSync(path.join(tmpDir(), 'acceptance-gate-leaks-'));
+  const gitRun = async (args) => {
+    const result = await spawnRun('git', args, { cwd: repoDir, env: localEnv() });
+    if (result.code !== 0) throw new Error(`git ${args.join(' ')} 失败：${result.stderr}`);
+    return result.stdout;
+  };
+  await gitRun(['init', '-q', '-b', 'main']);
+  await gitRun(['config', 'user.name', 'ExampleUser']);
+  await gitRun(['config', 'user.email', 'example@example.test']);
+  const branch = 'acceptance/1-2-sc3';
+  await gitRun(['checkout', '-q', '-b', branch]);
+  fs.writeFileSync(path.join(repoDir, 'app.mjs'), 'export const ok = 1;\n');
+  await gitRun(['add', 'app.mjs']);
+  await gitRun(['commit', '-q', '-m', 'ok']);
+  const head = (await gitRun(['rev-parse', 'HEAD'])).trim();
+  const bundlePath = path.join(repoDir, 'push.bundle');
+  await gitRun(['bundle', 'create', bundlePath, branch]);
+  let leaksArgs = null;
+  const run = async (cmd, args, options) => {
+    if (cmd === 'gitleaks') {
+      leaksArgs = args;
+      return { code: 1, stdout: '', stderr: '' };
+    }
+    return procRun(cmd, args, options);
+  };
+  const gate = createGate({ home, profile, github: gateGithub(world), run, binding: bindingFor(world), which: async () => true });
+  const outcome = await gate.handle({ type: 'branch.push', repo: REPO, branch, bundlePath, dedupeKey: 'push-leaks' });
+  assert.equal(outcome.code, 4);
+  assert.equal(outcome.body.reason, 'secret-found');
+  assert.ok(leaksArgs.includes(`--log-opts=${head}`), JSON.stringify(leaksArgs));
+  assert.equal(world.writes.filter((entry) => entry.type === 'branch.push').length, 0);
 });

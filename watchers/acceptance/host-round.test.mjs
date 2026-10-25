@@ -99,6 +99,59 @@ test('SC11 认领之后 pi 在 bwrap 里跑；卡住先杀进程再 abort，并�
   assert.equal(fs.existsSync(hostPaths(fixture.home).roundsDir) && fs.readdirSync(hostPaths(fixture.home).roundsDir).length, 0);
 });
 
+test('SC11 pi 跑着时宿主出错（查进度抛异常）：先结束 pi，再 abort、收写闸', async () => {
+  const fixture = roundFixture();
+  const killed = [];
+  let exited = false;
+  const code = await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: async (cmd) => (cmd === 'bwrap' ? { code: 0, stdout: '', stderr: '' } : { code: 1, stdout: '', stderr: 'no' }),
+    runRound: async (argv) => {
+      fixture.calls.round.push(argv);
+      if (argv[0] === 'status') throw new Error('查进度失败');
+      return fixture.runRoundFake(argv);
+    },
+    startGate: async (options) => {
+      const gate = await fixture.startGateFake(options);
+      return {
+        async stop() {
+          assert.equal(exited, true, '写闸收掉之前 pi 必须已经结束');
+          await gate.stop();
+        },
+      };
+    },
+    spawnPi: (options) => {
+      fixture.calls.pi.push(options);
+      let resolveExit;
+      const exit = new Promise((resolve) => {
+        resolveExit = resolve;
+      });
+      return {
+        pid: 555002,
+        stdin: { write() {}, end() {} },
+        kill(signal) {
+          killed.push(signal);
+          if (signal === 'SIGTERM') {
+            exited = true;
+            resolveExit({ code: 143, signal });
+          }
+        },
+        exit,
+      };
+    },
+    meminfoPath: writeMeminfo(),
+    statusIntervalMs: 5,
+    killGraceMs: 20,
+    log: () => {},
+  });
+  assert.equal(code, 1);
+  assert.deepEqual(killed, ['SIGTERM'], 'pi 被结束');
+  const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
+  assert.match(abort[abort.indexOf('--reason') + 1], /宿主出错：查进度失败/);
+  assert.equal(fixture.calls.gate, 1);
+});
+
 test('SC11 认领被写闸拒绝（4）：不跑模型，写一条提醒', async () => {
   const fixture = roundFixture();
   const code = await runHostRound({

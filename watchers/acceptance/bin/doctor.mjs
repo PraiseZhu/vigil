@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 部署检查（#47 SC1 / SC10）：缺哪项报哪项，退出码非 0；配置缺失不回落任何默认值。
-// 本文件不碰 child_process、不起进程：要跑进程的探测一律注入（正式用时来自 host/probes.mjs）。
+// 本文件不碰子进程模块、不起进程：要跑进程的探测一律注入（正式用时来自 host/probes.mjs）。
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

@@ -3,7 +3,8 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import test from 'node:test';
+import test, { after } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { hostPaths, readAlerts, tryAcquireLock, releaseLock } from './host/paths.mjs';
 import { runHostRound, readMemAvailable, MEMORY_GATE_BYTES } from './host/round.mjs';
@@ -17,6 +18,8 @@ import {
 } from './host/sandbox.mjs';
 import { run as procRun } from './host/proc.mjs';
 import { REPO, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 const ROOT_REF = `${REPO}#1`;
 
@@ -395,23 +398,35 @@ test(
   'SC11 真 bwrap：令牌文件、App 私钥、凭证目录都读不到，roundDir 还能写',
   { skip: bwrapAvailable ? false : 'bwrap 不可用（bwrap --ro-bind / / true 起不来），跳过真沙箱测试' },
   async () => {
-    const hostHome = tmpDir();
+    // 假凭证一律放在 /tmp 之外：沙箱自带 --tmpfs /tmp，放在 /tmp 里的文件不靠遮罩也读不到，测不出遮罩。
+    const outside = fs.mkdtempSync(path.join(HERE, '.sandbox-real-test-'));
+    after(() => fs.rmSync(outside, { recursive: true, force: true }));
+    const place = (name) => {
+      const dir = path.join(outside, name);
+      fs.mkdirSync(dir, { recursive: true });
+      return dir;
+    };
+    const hostHome = place('host-home');
     fs.mkdirSync(path.join(hostHome, '.ssh'), { recursive: true });
     const sshSecret = path.join(hostHome, '.ssh', 'id_example');
     fs.writeFileSync(sshSecret, 'fake-ssh-key-content-not-real');
 
-    const home = tmpDir();
-    const stateDir = path.join(tmpDir(), 'acc-state');
-    const worktreeDir = path.join(tmpDir(), 'acc-worktree');
-    fs.mkdirSync(stateDir, { recursive: true });
-    fs.mkdirSync(worktreeDir, { recursive: true });
+    const home = place('watcher-home');
+    const stateDir = place('acc-state');
+    const worktreeDir = place('acc-worktree');
     const tokenContent = 'fake-github-token-content-not-real';
     const slackContent = 'fake-slack-token-content-not-real';
     const keyContent = 'fake-app-private-key-content-not-real';
-    const tokenFile = writeSecret(path.join(tmpDir(), 'secrets', 'github.token'), tokenContent);
-    const slackFile = writeSecret(path.join(tmpDir(), 'secrets', 'slack.token'), slackContent);
-    const privateKeyFile = writeSecret(path.join(tmpDir(), 'secrets', 'app.pem'), keyContent);
-    const appConfigPath = path.join(tmpDir(), 'app.json');
+    const linkedContent = 'fake-linked-token-content-not-real';
+    const secrets = place('secrets');
+    const tokenFile = writeSecret(path.join(secrets, 'github.token'), tokenContent);
+    const slackFile = writeSecret(path.join(secrets, 'slack.token'), slackContent);
+    const privateKeyFile = writeSecret(path.join(secrets, 'app.pem'), keyContent);
+    // profile 里配的是符号链接：遮罩要落到真实文件上，从两条路径都读不到。
+    const linkedReal = writeSecret(path.join(place('real-store'), 'example.token'), linkedContent);
+    const linkedPath = path.join(secrets, 'example-link.token');
+    fs.symlinkSync(linkedReal, linkedPath);
+    const appConfigPath = path.join(secrets, 'app.json');
     fs.writeFileSync(appConfigPath, JSON.stringify({ appId: '1', installationId: '2', privateKeyFile }));
     fs.chmodSync(appConfigPath, 0o600);
     fs.mkdirSync(path.join(home, 'config'), { recursive: true });
@@ -425,6 +440,7 @@ test(
         startAt: '2026-01-01T00:00:00.000Z',
         githubTokenFile: tokenFile,
         slackBotTokenFile: slackFile,
+        exampleTokenFile: linkedPath,
         appConfigPath,
         autoRepos: ['ExampleUser/*'],
       }),
@@ -434,7 +450,7 @@ test(
 
     const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
     const rawProfile = JSON.parse(fs.readFileSync(path.join(home, 'config', 'profile.json'), 'utf8'));
-    const roundDir = tmpDir('acceptance-real-sandbox-');
+    const roundDir = place('round');
     fs.mkdirSync(path.join(roundDir, 'home'), { recursive: true });
     fs.mkdirSync(path.join(roundDir, 'tmp'), { recursive: true });
     const socketPath = path.join(roundDir, 'gate.sock');
@@ -443,7 +459,18 @@ test(
     const env = sandboxEnv({ base: { ...process.env, HOME: hostHome }, roundDir, socketPath, sandboxBin });
     const args = buildBwrapArgs({ home, profile, roundDir, masks, binds: [stateDir, worktreeDir], env });
 
-    const targets = [tokenFile, slackFile, privateKeyFile, sshSecret, path.join(hostHome, '.ssh')];
+    const targets = [
+      tokenFile,
+      slackFile,
+      privateKeyFile,
+      linkedPath,
+      linkedReal,
+      appConfigPath,
+      sshSecret,
+      path.join(hostHome, '.ssh'),
+      path.join(home, 'state', 'write-gate', 'enabled'),
+      path.join(home, 'state'),
+    ];
     const reader = path.join(roundDir, 'reader.mjs');
     fs.writeFileSync(
       reader,
@@ -471,7 +498,7 @@ test(
     assert.equal(result.code, 0, result.stderr);
     const parsed = JSON.parse(result.stdout);
     assert.deepEqual(parsed.readable, [], '沙箱里一个凭证都不该读到');
-    for (const content of [tokenContent, slackContent, keyContent, 'fake-ssh-key-content-not-real']) {
+    for (const content of [tokenContent, slackContent, keyContent, linkedContent, 'fake-ssh-key-content-not-real']) {
       assert.equal(result.stdout.includes(content), false, '不回显假凭证内容');
     }
     assert.equal(fs.readFileSync(path.join(roundDir, 'written-inside-round-dir.txt'), 'utf8'), 'ok');

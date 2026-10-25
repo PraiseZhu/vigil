@@ -112,7 +112,9 @@
    目标不在本轮任务树返回 4（`not-in-tree`）；裁决评论里的正文版本和当前正文不一致返回 4
    （`body-version-mismatch`，版本函数和 tasks/rounds 是同一个 `bodyVersion`）。
 8. `branch.push` 在写闸里再扫一遍密钥（`gitleaks`，没有就用内置规则看新增行）：扫到返回 4
-   （`reason=secret-found`，只给文件名），**不推送**，并写一条提醒。
+   （`reason=secret-found`，只给文件名），**不推送**，并写一条提醒。写闸先把 bundle 复制进自己的
+   临时目录，只扫这份副本里 `--branch` 指向的那个提交（有 base 就扫 `base..提交`，和 `push.mjs`
+   同一条规则），推送的也是这份副本：扫完之后沙箱里的原文件被换掉也推不出去。
 9. 执行成功才记账本（`ledger.jsonl`），返回 0。
 
 退出码：`0` 成功；`4` 拒绝（不重试，这一轮标「中断」，`secret-found` 记「需人工处理」）；
@@ -122,6 +124,8 @@
 
 `host/round.mjs` 是**唯一**起 pi 的入口，pi 一定在 `bwrap` 里：
 
+- pi 起来之后宿主出错（查进度失败等）：先结束 pi（SIGTERM，宽限期后 SIGKILL），再 `abort`
+  （原因「宿主出错：…」，提醒 `round-failed`），最后才收写闸。
 - bwrap 不在、探针失败、参数拼不出来 → 不跑模型，这一轮 `abort` 成「中断」（原因「沙箱起不来：…」），
   并写一条提醒（`sandbox-unavailable`）。
 - **没有任何环境变量或配置项能关掉沙箱**（`PI_NO_SANDBOX`、`ACCEPTANCE_NO_SANDBOX`、`host.json` 的
@@ -134,7 +138,9 @@
   App 配置里的 `privateKeyFile`，一律 `/dev/null`；`$HOME` 下的凭证目录（`.config/gh`、`.ssh`、
   `.gnupg`、`.aws`、`.config/gcloud`、`.docker`、`.kube`、`.config/git`）用空目录盖住，
   `.git-credentials`、`.netrc` 换成 `/dev/null`，外加 `host.json` 的 `credentialDirs` 和宿主状态目录
-  `<home>/state`（模型看不到写闸开关、账本、提醒）。
+  `<home>/state`（模型看不到写闸开关、账本、提醒）。`appConfigPath` 指向的 App 配置文件本身也遮住。
+  每条路径先解析成真实路径再遮（经符号链接指过去的令牌文件，链接和真实文件都读不到）；
+  名单上不存在的路径跳过（bwrap 不能在只读根里新建挂载点）。
 - 沙箱里的 `gh` 是 `host/sandbox-bin/gh`：只认 `gh api graphql --input -`，转成只读动作交给写闸；
   其它调用直接报「沙箱里只允许经写闸读」。它不看 `GH_TOKEN`。
 - 沙箱里的 watcher home 是 profile 的副本：`writeCommand` 换成 `gate-client.mjs`，
