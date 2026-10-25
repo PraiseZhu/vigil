@@ -10,7 +10,8 @@ import { createGithub } from '../bin/github.mjs';
 import { runRound as runRoundCommand } from '../bin/round.mjs';
 import { appendAlert, hostPaths, isAlive, readLockPayload } from './paths.mjs';
 import { run as procRun, spawnDetached } from './proc.mjs';
-import { MAX_ROUNDS } from './round.mjs';
+import { MAX_ROUNDS, readHostConfig } from './round.mjs';
+import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbot.mjs';
 
 const SLOTS = ['slot-0', 'slot-1'];
 const KILL_GRACE_MS = 10000;
@@ -103,6 +104,22 @@ function defaultAbort({ home, env, now, root }) {
   };
 }
 
+function defaultSpawnPrbot({ home, env, root }) {
+  return (issue) => {
+    const logFd = fs.openSync(path.join(hostPaths(home).hostDir, 'prbot.log'), 'a');
+    try {
+      const child = spawnDetached(
+        process.execPath,
+        [path.join(root, 'watchers', 'acceptance', 'host', 'prbot.mjs'), 'run', '--issue', issue],
+        { env: { ...env, ACCEPTANCE_WATCHER_HOME: home }, cwd: home, stdio: ['ignore', logFd, logFd] },
+      );
+      return child.pid;
+    } finally {
+      fs.closeSync(logFd);
+    }
+  };
+}
+
 function defaultSpawnRound({ home, env, root }) {
   return (issue) => {
     const logFd = fs.openSync(path.join(hostPaths(home).hostDir, 'rounds.log'), 'a');
@@ -129,6 +146,10 @@ export async function runTick({
   run = procRun,
   spawnRound,
   runRound: runRoundFn,
+  spawnPrbot,
+  discoverPrbot,
+  checkPrbotStalled,
+  cleanupPrbot,
   now = () => Date.now(),
   sleep = defaultSleep,
   root,
@@ -139,6 +160,7 @@ export async function runTick({
   const paths = hostPaths(home);
   const abortRound = runRoundFn || defaultAbort({ home, env, now, root: repoRoot });
   const startRound = spawnRound || defaultSpawnRound({ home, env, root: repoRoot });
+  const startPrbot = spawnPrbot || defaultSpawnPrbot({ home, env, root: repoRoot });
 
   const heartbeat = {
     at: new Date(now()).toISOString(),
@@ -215,6 +237,46 @@ export async function runTick({
         now,
       });
       heartbeat.lastTick.stale.push({ issue: entry.issue, round: entry.round, reason });
+    }
+
+
+    // 3b. 修正轮（#60）：只在 host.json 配了 prbot 时跑，失败不拖垮验收拍。
+    let prbotSettings = null;
+    try {
+      const settings = readHostConfig(paths.hostConfig);
+      if (settings.prbot) prbotSettings = settings;
+    } catch (error) {
+      heartbeat.lastTick.prbotError = String(error?.message || error);
+    }
+    if (prbotSettings) {
+      heartbeat.lastTick.prbotStarted = [];
+      heartbeat.lastTick.prbotStalled = [];
+      heartbeat.lastTick.prbotCleaned = [];
+      try {
+        const prbotProfile = loadAcceptanceProfile({ ...env, ACCEPTANCE_WATCHER_HOME: home });
+        const prbotGithub = createGithub({ profile: { ...prbotProfile, writeCommand: undefined }, run });
+        const discover = discoverPrbot || ((options) => discoverCorrections({ ...options, github: prbotGithub, profile: prbotProfile }));
+        const found = await discover({ now, home });
+        for (const entry of found || []) {
+          const lockFile = path.join(paths.prbotLocksDir, `${entry.issue.replace(/[^\w.-]+/g, '__')}.lock`);
+          const held = readLockPayload(lockFile);
+          if (held && isAlive(Number(held.pid))) continue;
+          const pid = startPrbot(entry.issue);
+          heartbeat.lastTick.prbotStarted.push({ issue: entry.issue, pid: pid ?? null });
+        }
+        const checkStalled = checkPrbotStalled || ((options) => checkReadyStalled({ ...options, github: prbotGithub, profile: prbotProfile }));
+        const stalled = await checkStalled({ home, now, reviewCheckPattern: prbotSettings.reviewCheckPattern });
+        heartbeat.lastTick.prbotStalled = (stalled || []).map((entry) => ({ issue: entry.issue, pr: entry.pr }));
+        const clean = cleanupPrbot || ((options) => cleanupWorktrees({ ...options, profile: prbotProfile }));
+        heartbeat.lastTick.prbotCleaned = clean({ home }) || [];
+      } catch (error) {
+        heartbeat.lastTick.prbotError = String(error?.message || error);
+        try {
+          appendAlert(paths, { kind: 'prbot-tick-failed', reason: '修正轮这一拍出错', detail: String(error?.message || error), now });
+        } catch {
+          // 提醒写不下去就只留心跳。
+        }
+      }
     }
 
     // 3. 该开始的任务：已在跑的不重开，最多占到空槽数。

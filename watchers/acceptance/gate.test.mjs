@@ -10,7 +10,7 @@ import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion } from './bin/rounds.mjs';
 import { ROOT_QUERY, SEARCH_QUERY } from './bin/collect.mjs';
 import { localEnv, spawnRun } from './bin/localgit.mjs';
-import { STATUS_QUERY, createGate, startGateServer } from './host/write-gate.mjs';
+import { PR_READY_QUERY, createGate, startGateServer } from './host/write-gate.mjs';
 import { hostPaths, readAlerts } from './host/paths.mjs';
 import { run as procRun } from './host/proc.mjs';
 import { defaultTree } from './session.fixture.mjs';
@@ -35,16 +35,38 @@ function setupEnvironment({ enabled = true } = {}) {
   return { home, profile, paths };
 }
 
-function gateGithub(world, { statusRollup = 'SUCCESS', onWrite } = {}) {
+function gateGithub(world, { statusRollup = 'SUCCESS', isDraft = true, headRefOid = 'f'.repeat(40), onWrite } = {}) {
   return {
     async graphql(query, variables) {
-      if (query === STATUS_QUERY) {
+      if (query === PR_READY_QUERY) {
+        const run =
+          statusRollup == null
+            ? []
+            : [
+                {
+                  name: 'test',
+                  status: statusRollup === 'PENDING' ? 'IN_PROGRESS' : 'COMPLETED',
+                  conclusion: statusRollup === 'PENDING' ? null : statusRollup,
+                  databaseId: 1,
+                  checkSuite: { workflowRun: { databaseId: 9 } },
+                },
+              ];
         return {
           repository: {
             pullRequest: {
               number: variables.number,
+              isDraft,
+              headRefName: `acceptance/1-2-sc3`,
+              headRefOid,
               commits: {
-                nodes: [{ commit: { statusCheckRollup: statusRollup ? { state: statusRollup } : null } }],
+                nodes: [
+                  {
+                    commit: {
+                      checkSuites: { nodes: [{ status: 'COMPLETED', conclusion: statusRollup, checkRuns: { nodes: run } }] },
+                      statusCheckRollup: { contexts: { nodes: [] } },
+                    },
+                  },
+                ],
               },
             },
           },
@@ -115,7 +137,7 @@ test('SC9 总开关关着：读、写、探测全部 4 gate-disabled', async () 
   assert.equal(world.writes.length, 0);
 });
 
-test('SC9 类型不在白名单（含 pr.merge）→ 4 not-allowed；pr.update-branch / ci.rerun → 4 not-implemented', async () => {
+test('SC9 类型不在白名单（含 pr.merge）→ 4 not-allowed；pr.update-branch / ci.rerun 在验收轮绑定下也不认', async () => {
   const { home, profile } = setupEnvironment();
   const world = defaultTree();
   const gate = createGate({ home, profile, github: gateGithub(world), run: procRun, binding: bindingFor(world), which: async () => false });
@@ -127,7 +149,7 @@ test('SC9 类型不在白名单（含 pr.merge）→ 4 not-allowed；pr.update-b
   for (const type of ['pr.update-branch', 'ci.rerun']) {
     const outcome = await gate.handle({ type, repo: REPO, pr: 12, dedupeKey: type });
     assert.equal(outcome.code, 4, type);
-    assert.equal(outcome.body.reason, 'not-implemented', type);
+    assert.equal(outcome.body.reason, 'not-allowed', type);
   }
   assert.equal(world.writes.length, 0);
 });
@@ -477,9 +499,10 @@ test('SC9 缺 dedupeKey 的写动作 → 4 missing-dedupe-key', async () => {
   assert.equal(outcome.body.reason, 'missing-dedupe-key');
 });
 
-test('SC9 pr.ready 检查没绿 → 4 checks-not-green；全绿 → 放行', async () => {
+test('SC8 pr.ready 检查没绿 / head 变了 / 不是 Draft → 4 ready-precondition；全绿 → 放行', async () => {
   const { home, profile } = setupEnvironment();
   const world = defaultTree();
+  const headSha = 'f'.repeat(40);
   for (const [state, expected] of [
     ['FAILURE', 4],
     ['PENDING', 4],
@@ -502,11 +525,41 @@ test('SC9 pr.ready 检查没绿 → 4 checks-not-green；全绿 → 放行', asy
       type: 'pr.ready',
       repo: REPO,
       pr: 12,
+      headSha,
       dedupeKey: `ready-${state ?? 'null'}`,
     });
     assert.equal(outcome.code, expected, `${state}: ${JSON.stringify(outcome)}`);
-    if (expected === 4) assert.equal(outcome.body.reason, 'checks-not-green');
+    if (expected === 4) assert.equal(outcome.body.reason, 'ready-precondition');
   }
+
+  const notDraft = createGate({
+    home,
+    profile,
+    github: gateGithub(world, {
+      isDraft: false,
+      onWrite: (action) => (action.type === 'pr.ready' ? { pr: action.pr, repo: action.repo } : undefined),
+    }),
+    run: procRun,
+    binding: bindingFor(world),
+    which: async () => false,
+  });
+  const notDraftOutcome = await notDraft.handle({ type: 'pr.ready', repo: REPO, pr: 12, headSha, dedupeKey: 'ready-not-draft' });
+  assert.equal(notDraftOutcome.body.reason, 'ready-precondition');
+
+  const moved = createGate({
+    home,
+    profile,
+    github: gateGithub(world, {
+      headRefOid: 'a'.repeat(40),
+      onWrite: (action) => (action.type === 'pr.ready' ? { pr: action.pr, repo: action.repo } : undefined),
+    }),
+    run: procRun,
+    binding: bindingFor(world),
+    which: async () => false,
+  });
+  const movedOutcome = await moved.handle({ type: 'pr.ready', repo: REPO, pr: 12, headSha, dedupeKey: 'ready-moved' });
+  assert.equal(movedOutcome.body.reason, 'ready-precondition');
+  assert.match(movedOutcome.body.detail, /head 已变化/);
 });
 
 test('SC9 分支名不合规（总 issue 号不对）→ 4 not-in-tree', async () => {

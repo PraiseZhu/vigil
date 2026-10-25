@@ -32,7 +32,10 @@ export const WRITE_TYPES = Object.freeze([
   'pr.ready',
 ]);
 
-const WRITE_TYPE_SET = new Set(WRITE_TYPES);
+/** #60 的两个写闸动作：不放进 #44 的 11 类里，但同样经 write() 执行。 */
+export const GATE_ACTION_WRITE_TYPES = Object.freeze(['pr.update-branch', 'ci.rerun']);
+
+const WRITE_TYPE_SET = new Set([...WRITE_TYPES, ...GATE_ACTION_WRITE_TYPES]);
 const BOARD_FIELDS = new Set(['验收', '裁决']);
 
 export class WriteBusyError extends Error {
@@ -377,6 +380,29 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
     }
   }
 
+  async function fetchBranch({ repo, branch = 'main', dir, depth = 50 } = {}) {
+    const token = getOwnerToken();
+    if (typeof repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || repo.startsWith('-')) {
+      throw new Error(`fetchBranch 的仓名不合法：${repo}`);
+    }
+    if (typeof branch !== 'string' || !/^[A-Za-z0-9._/][A-Za-z0-9._/-]*$/.test(branch) || branch.includes('..')) {
+      throw new Error(`fetchBranch 的分支名不合法：${branch}`);
+    }
+    if (typeof dir !== 'string' || !path.isAbsolute(dir)) throw new Error('fetchBranch 需要绝对路径的 dir');
+    const env = gitEnv(token);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    let result = await runCmd('git', ['init', '-q', dir], { env });
+    if (result.code !== 0) failFrom(result, token);
+    // 令牌只在 GIT_CONFIG_* extraheader 里（gitEnv）；URL / argv / 配置里都不带。
+    result = await runCmd(
+      'git',
+      ['-C', dir, 'fetch', `--depth=${Number(depth)}`, `https://github.com/${repo}.git`, `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
+      { env },
+    );
+    if (result.code !== 0) failFrom(result, token);
+    return { dir, repo, branch };
+  }
+
   async function directWrite(action) {
     switch (action.type) {
       case 'comment.create': {
@@ -439,6 +465,16 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
         if (result.code !== 0) failFrom(result, token);
         return { pr: action.pr, repo: action.repo };
       }
+      case 'pr.update-branch': {
+        const data = await ghApi('PUT', `repos/${action.repo}/pulls/${action.pr}/update-branch`, {
+          expected_head_sha: action.expectedHeadSha,
+        });
+        return { pr: action.pr, repo: action.repo, message: data.message, url: data.html_url };
+      }
+      case 'ci.rerun': {
+        await ghApi('POST', `repos/${action.repo}/actions/runs/${action.runId}/rerun-failed-jobs`);
+        return { pr: action.pr, repo: action.repo, runId: action.runId };
+      }
       default:
         throw new Error(`未知写操作类型：${action.type}`);
     }
@@ -482,5 +518,5 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
     return directWrite(prepared);
   }
 
-  return { graphql, write, profile };
+  return { graphql, write, fetchBranch, profile };
 }

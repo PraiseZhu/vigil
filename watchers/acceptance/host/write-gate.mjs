@@ -23,13 +23,188 @@ import { repoTier } from '../bin/tasks.mjs';
 import { SECRET_PATTERNS, redact } from '../bin/redact.mjs';
 import { acquireLock, appendAlert, hostPaths, releaseLock } from './paths.mjs';
 import { run as procRun } from './proc.mjs';
+import * as prUpdateBranchAction from './gate-actions/pr-update-branch.mjs';
+import * as ciRerunAction from './gate-actions/ci-rerun.mjs';
 
 /** 执行锁最多等 30 秒；等不到回 75（忙），什么都不执行。 */
 export const GATE_LOCK_WAIT_MS = 30000;
 
-const NOT_IMPLEMENTED_TYPES = new Set(['pr.update-branch', 'ci.rerun']);
-const ALLOWED_TYPES = new Set([...WRITE_TYPES, 'read.graphql', 'probe']);
+const GATE_ACTIONS = new Map([
+  [prUpdateBranchAction.type, prUpdateBranchAction],
+  [ciRerunAction.type, ciRerunAction],
+]);
+const GATE_ACTION_TYPES = [...GATE_ACTIONS.keys()];
+const ALLOWED_TYPES = new Set([...WRITE_TYPES, ...GATE_ACTION_TYPES, 'read.graphql', 'probe']);
 const WATCH_ALLOWED_TYPES = new Set(['comment.create', 'comment.update', 'project.field.set', 'read.graphql']);
+const ACCEPTANCE_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：验收中$/;
+const VERDICT_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(通过|要修)/;
+const ABORT_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：中断/;
+const CORRECTION_CLAIM_LINE = /^\[修正机\] 第 (\d+) 轮：修正中$/;
+const CORRECTION_STATUS_LINE = /^\[修正机\] 第 (\d+) 轮：(修正中|Draft 已开|等 CI|再修 \d+\/2|已 Ready|需人工处理|中断)$/;
+const CORRECTION_TERMINAL = new Set(['已 Ready', '需人工处理', '中断']);
+const BRANCH_PATTERN = /^acceptance\/(\d+)-(\d+)-sc(\d+)$/;
+const GREEN_CHECKS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
+
+/** pr.ready 由写闸自己查检查状态（SC8）：一条固定查询，不是调用方交来的 query。 */
+export const PR_READY_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      url
+      isDraft
+      headRefName
+      headRefOid
+      commits(last: 1) {
+        nodes {
+          commit {
+            checkSuites(first: 50) {
+              nodes {
+                status
+                conclusion
+                checkRuns(first: 100) {
+                  nodes {
+                    name
+                    status
+                    conclusion
+                    databaseId
+                    checkSuite { workflowRun { databaseId } }
+                  }
+                }
+              }
+            }
+            statusCheckRollup {
+              contexts(first: 100) {
+                nodes {
+                  __typename
+                  ... on StatusContext { context state targetUrl }
+                  ... on CheckRun { name status conclusion databaseId }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+/** 只看 PR 的头：写闸动作（更新分支 / 重跑 / 转 Ready）先核对分支名。 */
+export const PR_HEAD_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      url
+      isDraft
+      headRefName
+      headRefOid
+      mergeStateStatus
+      changedFiles
+      additions
+      deletions
+    }
+  }
+}`;
+
+/** 修正轮盯 CI 用的固定查询：head、Draft、落后状态、检查名 / 结论 / workflow run id。 */
+export const PR_STATUS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      url
+      isDraft
+      headRefName
+      headRefOid
+      mergeStateStatus
+      changedFiles
+      additions
+      deletions
+      commits(last: 1) {
+        nodes {
+          commit {
+            checkSuites(first: 50) {
+              nodes {
+                status
+                conclusion
+                workflowRun { databaseId }
+                checkRuns(first: 100) {
+                  nodes {
+                    name
+                    status
+                    conclusion
+                    databaseId
+                    checkSuite { workflowRun { databaseId } }
+                  }
+                }
+              }
+            }
+            statusCheckRollup {
+              contexts(first: 100) {
+                nodes {
+                  __typename
+                  ... on StatusContext { context state targetUrl }
+                  ... on CheckRun { name status conclusion databaseId }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+/** 按分支 / 标记找已有修正 PR，避免重复开第二个。 */
+export const PR_BY_BRANCH_QUERY = `query ($owner: String!, $name: String!, $head: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(first: 10, states: OPEN, headRefName: $head) {
+      nodes { number url isDraft headRefName headRefOid body }
+    }
+  }
+}`;
+
+/** ready-stalled 用：PR 上的 review、review comment、check run。 */
+export const READY_ACTIVITY_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      url
+      headRefOid
+      reviews(first: 100) { nodes { createdAt author { login } } }
+      comments(first: 100) { nodes { createdAt author { login } body } }
+      commits(last: 1) {
+        nodes {
+          commit {
+            checkSuites(first: 50) {
+              nodes { checkRuns(first: 100) { nodes { name status conclusion completedAt } } }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+/** main 分支上同名检查：用来判断「红不是这次改动引起的」。 */
+export const MAIN_CHECKS_QUERY = `query ($owner: String!, $name: String!, $branch: String!) {
+  repository(owner: $owner, name: $name) {
+    ref(qualifiedName: $branch) {
+      target {
+        ... on Commit {
+          oid
+          checkSuites(first: 50) {
+            nodes { checkRuns(first: 100) { nodes { name status conclusion } } }
+          }
+          statusCheckRollup {
+            contexts(first: 100) {
+              nodes { __typename ... on StatusContext { context state targetUrl } }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
 /** 只认这几个登记过的只读查询，绝不执行调用方自己写的 GraphQL 文本。 */
 const READ_QUERIES = new Set([
   ROOT_QUERY,
@@ -38,29 +213,13 @@ const READ_QUERIES = new Set([
   COMMENTS_QUERY,
   ROUND_COMMENTS_QUERY,
   ROUNDS_COMMENTS_QUERY,
+  PR_READY_QUERY,
+  PR_HEAD_QUERY,
+  PR_STATUS_QUERY,
+  PR_BY_BRANCH_QUERY,
+  READY_ACTIVITY_QUERY,
+  MAIN_CHECKS_QUERY,
 ]);
-
-const ACCEPTANCE_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：验收中$/;
-const VERDICT_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(通过|要修)/;
-const ABORT_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：中断/;
-const BRANCH_PATTERN = /^acceptance\/(\d+)-(\d+)-sc(\d+)$/;
-const GREEN_CHECKS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
-
-/** pr.ready 由写闸自己查检查状态：一条固定查询，不是调用方交来的 query。 */
-export const STATUS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) {
-      number
-      commits(last: 1) {
-        nodes {
-          commit {
-            statusCheckRollup { state }
-          }
-        }
-      }
-    }
-  }
-}`;
 
 const reject = (reason, detail) =>
   detail === undefined ? { code: 4, body: { reason } } : { code: 4, body: { reason, detail } };
@@ -228,7 +387,7 @@ export function createGate({
   }
 
   function searchAllowed(q) {
-    if (!binding) return false;
+    if (!binding || !binding.root) return false;
     const phrase = `"[验收机] 修正 · 总 ${binding.root}" in:body is:issue`;
     if (typeof q !== 'string') return false;
     if (q === phrase) return true;
@@ -259,23 +418,224 @@ export function createGate({
     return { code: 0, body: { data: data ?? {} } };
   }
 
-  async function checkPrChecks(action) {
+  async function checkPrReady(action) {
     const [owner, name] = String(action.repo || '').split('/');
-    const data = await github.graphql(STATUS_QUERY, {
+    const data = await github.graphql(PR_READY_QUERY, {
       owner,
       name,
       number: Number(action.pr),
     });
-    const nodes = data?.repository?.pullRequest?.commits?.nodes || [];
-    const state = nodes.at(-1)?.commit?.statusCheckRollup?.state;
-    if (!GREEN_CHECKS.has(String(state))) {
-      return reject('checks-not-green', `PR 检查状态：${state || '未知'}`);
+    const pr = data?.repository?.pullRequest;
+    if (!pr) return reject('ready-precondition', '找不到 PR 或读不到头');
+    if (!pr.isDraft) return reject('ready-precondition', 'PR 已经不是 Draft');
+    if (String(pr.headRefOid || '') !== String(action.headSha || '')) {
+      return reject('ready-precondition', `head 已变化：动作里是 ${action.headSha || '(空)'}，PR 上是 ${pr.headRefOid || '(空)'}`);
+    }
+    const checks = flattenChecks(pr);
+    if (checks.total === 0) return reject('ready-precondition', 'head 上没有任何检查');
+    if (!checks.green) {
+      const bad = checks.bad.slice(0, 5).join(', ');
+      return reject('ready-precondition', `检查还没全绿：${bad || '未知'}`);
     }
     return null;
   }
 
-  /** serve 模式：只认本轮、只认本轮任务树。返回 null 表示放行。 */
+  function flattenChecks(pr) {
+    const commit = (pr?.commits?.nodes || []).at(-1)?.commit || {};
+    const runs = [];
+    for (const suite of commit.checkSuites?.nodes || []) {
+      for (const run of suite?.checkRuns?.nodes || []) runs.push(run);
+    }
+    const contexts = (commit.statusCheckRollup?.contexts?.nodes || []).filter(
+      (node) => node?.__typename === 'StatusContext' || node?.context,
+    );
+    const bad = [];
+    for (const run of runs) {
+      if (String(run?.status) !== 'COMPLETED' || !GREEN_CHECKS.has(String(run?.conclusion))) {
+        bad.push(`${run?.name || run?.databaseId || 'check'}=${run?.status || '?'}/${run?.conclusion || '?'}`);
+      }
+    }
+    for (const context of contexts) {
+      if (String(context?.state) !== 'SUCCESS') {
+        bad.push(`${context?.context || 'status'}=${context?.state || '?'}`);
+      }
+    }
+    return { total: runs.length + contexts.length, green: bad.length === 0, bad, runs, contexts };
+  }
+
+  function parseCorrectionRounds(comments, ownerLogin) {
+    const owner = String(ownerLogin || '').toLowerCase();
+    const rounds = [];
+    for (const comment of comments || []) {
+      if (String(comment?.author?.login || '').toLowerCase() !== owner) continue;
+      const first = firstLine(comment.body);
+      const match = CORRECTION_STATUS_LINE.exec(first);
+      if (!match) continue;
+      rounds.push({
+        round: Number(match[1]),
+        status: match[2],
+        commentId: comment.databaseId,
+        createdAt: comment.createdAt,
+        url: comment.url,
+      });
+    }
+    rounds.sort((a, b) => {
+      const ta = Date.parse(a.createdAt || 0) || 0;
+      const tb = Date.parse(b.createdAt || 0) || 0;
+      if (ta !== tb) return ta - tb;
+      return (a.commentId || 0) - (b.commentId || 0);
+    });
+    return rounds;
+  }
+
+  function correctionBranch(marker) {
+    const root = parseRef(marker.root).number;
+    const item = parseRef(marker.item).number;
+    return `acceptance/${root}-${item}-sc${marker.sc}`;
+  }
+
+  function allowedCorrectionRepos(marker, tree) {
+    const repos = new Set([
+      parseRef(binding.issue).repo,
+      parseRef(marker.item).repo,
+      parseRef(marker.root).repo,
+      tree.root.ref.split('#')[0],
+    ]);
+    if (tree.root.fork) {
+      for (const repo of profile.forkRepos || []) {
+        if (!repo.includes('*')) repos.add(repo);
+      }
+    }
+    return repos;
+  }
+
+  async function correctionContext() {
+    const issueState = await readIssueState(binding.issue);
+    if (!issueState) return null;
+    const marker = parseMarker(issueState.issue.body);
+    if (!marker) return null;
+    const rootState = await readIssueState(marker.root);
+    if (!rootState) return null;
+    const tree = await collectTree({ github, profile, ref: marker.root });
+    const entry = tree.corrections.find(
+      (correction) => String(correction.ref).toLowerCase() === String(binding.issue).toLowerCase(),
+    );
+    if (!entry || entry.state !== 'open') return null;
+    const rounds = parseCorrectionRounds(issueState.issue.comments?.nodes || [], profile.ownerLogin);
+    const latest = rounds.at(-1) || null;
+    const latestRoot = latestRound(parseRounds(rootState.issue.comments?.nodes || [], profile.ownerLogin));
+    return { issueState, marker, rootState, tree, entry, rounds, latest, latestRoot };
+  }
+
+  /** 修正轮绑定（#60）：认领 / 改同一条轮次评论 / 推分支 / 开 Draft / 盯 CI / 转 Ready。 */
+  async function checkCorrectionWrite(action) {
+    const context = await correctionContext();
+    if (!context) return reject('not-current-round', `找不到打开着的修正子 issue ${binding.issue}`);
+    const { marker, tree, rounds, latest, latestRoot } = context;
+    if (!latestRoot || latestRoot.status !== '要修') {
+      return reject('verdict-not-fix', `总 issue 最新轮次不是「要修」：${latestRoot ? latestRoot.status : '没有轮次'}`);
+    }
+    if (tree.root.tier !== 'auto') return reject('tier-not-allowed', '修正轮只认 auto / fork 档');
+    const correctionRepo = parseRef(binding.issue).repo;
+    const correctionScope = scopeOf(correctionRepo);
+    if (!correctionScope || correctionScope.tier !== 'auto') {
+      return reject('tier-not-allowed', `${correctionRepo} 不是 auto / fork 档`);
+    }
+
+    const maxRound = rounds.reduce((acc, round) => Math.max(acc, round.round), 0);
+    if (binding.commentId == null) {
+      if (action.type !== 'comment.create') return reject('not-current-round', '认领只能新建一条轮次评论');
+      if (refOf(action.repo, action.issue) !== binding.issue) {
+        return reject('not-current-round', '认领只能发在修正子 issue 上');
+      }
+      const match = CORRECTION_CLAIM_LINE.exec(firstLine(action.body));
+      if (!match) return reject('not-current-round', '认领首行必须是「[修正机] 第 m 轮：修正中」');
+      const m = Number(match[1]);
+      if (m !== Number(binding.round) || m !== maxRound + 1 || m > 2) {
+        return reject('not-current-round', `期望第 ${Math.min(maxRound + 1, 2)} 轮，收到第 ${m} 轮`);
+      }
+      return null;
+    }
+
+    if (
+      !latest ||
+      latest.round !== Number(binding.round) ||
+      Number(latest.commentId) !== Number(binding.commentId) ||
+      CORRECTION_TERMINAL.has(latest.status)
+    ) {
+      const actual = latest ? `第 ${latest.round} 轮（${latest.status}）` : '还没有修正轮';
+      return reject('not-current-round', `期望第 ${binding.round} 轮（进行中），实际${actual}`);
+    }
+
+    const branch = correctionBranch(marker);
+    const allowedRepos = allowedCorrectionRepos(marker, tree);
+
+    switch (action.type) {
+      case 'comment.update': {
+        if (Number(action.commentId) !== Number(binding.commentId)) return reject('not-allowed', '只能改本轮那条修正轮评论');
+        const match = CORRECTION_STATUS_LINE.exec(firstLine(action.body));
+        if (!match || Number(match[1]) !== Number(binding.round)) {
+          return reject('not-allowed', '修正轮评论首行必须是已知状态');
+        }
+        return null;
+      }
+      case 'branch.push': {
+        if (action.branch !== branch) return reject('not-allowed', `只能推 ${branch}`);
+        if (!allowedRepos.has(action.repo)) return reject('not-allowed', `${action.repo} 不是这个修正轮的仓`);
+        return null;
+      }
+      case 'pr.create': {
+        const head = String(action.head || '');
+        const headBranch = head.includes(':') ? head.slice(head.indexOf(':') + 1) : head;
+        if (headBranch !== branch) return reject('not-allowed', `PR 的 head 必须是 ${branch}`);
+        if (action.draft !== true) return reject('not-allowed', '修正 PR 一律先开 Draft');
+        const prMarker = parseMarker(action.body);
+        if (
+          !prMarker ||
+          prMarker.root !== marker.root ||
+          prMarker.item !== marker.item ||
+          prMarker.sc !== marker.sc ||
+          prMarker.round !== marker.round
+        ) {
+          return reject('not-allowed', 'PR 正文缺少同一个修正标记');
+        }
+        if (!allowedRepos.has(action.repo)) return reject('not-allowed', `${action.repo} 不是这个修正轮的仓`);
+        return null;
+      }
+      case 'pr.ready':
+      case 'pr.update-branch':
+      case 'ci.rerun': {
+        if (!allowedRepos.has(action.repo)) return reject('not-allowed', `${action.repo} 不是这个修正轮的仓`);
+        const [owner, name] = String(action.repo || '').split('/');
+        const data = await github.graphql(PR_HEAD_QUERY, { owner, name, number: Number(action.pr) });
+        const pr = data?.repository?.pullRequest;
+        if (!pr) return reject('not-allowed', '找不到 PR');
+        if (pr.headRefName !== branch) {
+          return reject('not-allowed', `PR 的 head 分支是 ${pr.headRefName || '(空)'}，不是 ${branch}`);
+        }
+        if (action.type === 'pr.ready') return checkPrReady(action);
+        const module = GATE_ACTIONS.get(action.type);
+        const verdict = module.check(action, { tier: correctionScope.tier });
+        if (!verdict.ok) return reject(verdict.reason, `${action.type} 不满足条件`);
+        const expected = action.expectedHeadSha || action.headSha;
+        if (expected && String(expected) !== String(pr.headRefOid || '')) {
+          return reject('head-moved', `动作里的 head ${expected} 和 PR 上的 ${pr.headRefOid || '(空)'} 不一致`);
+        }
+        return null;
+      }
+      default:
+        return reject('not-allowed', `修正轮不认 ${action.type}`);
+    }
+  }
+
+  /** serve 模式：按绑定类型分派。返回 null 表示放行。 */
   async function checkBoundWrite(action) {
+    if (binding.kind === 'correction') return checkCorrectionWrite(action);
+    return checkAcceptanceWrite(action);
+  }
+
+  /** 验收轮绑定：只认本轮、只认本轮任务树。返回 null 表示放行。 */
+  async function checkAcceptanceWrite(action) {
     const state = await readIssueState(binding.root);
     if (!state) return reject('not-current-round', `找不到绑定的总 issue ${binding.root}`);
     const { latest } = state;
@@ -357,7 +717,7 @@ export function createGate({
         return null;
       }
       case 'pr.ready':
-        return checkPrChecks(action);
+        return checkPrReady(action);
       default:
         return reject('not-allowed', `serve 模式不认 ${action.type}`);
     }
@@ -495,7 +855,6 @@ export function createGate({
       return reject('bad-action');
     }
     // 2. 类型白名单
-    if (NOT_IMPLEMENTED_TYPES.has(action.type)) return reject('not-implemented');
     if (!ALLOWED_TYPES.has(action.type)) return reject('not-allowed');
     // 3. 总开关：关着时读、写、探测全部拒绝
     if (!fs.existsSync(paths.enabledFile)) return reject('gate-disabled');
@@ -543,6 +902,9 @@ export function createGate({
       if (bindingProblem) return bindingProblem;
       // 10. 推送前在写闸里扫密钥；推的是扫过的那份副本
       let toWrite = action;
+      if (GATE_ACTIONS.has(action.type)) {
+        toWrite = { ...GATE_ACTIONS.get(action.type).toWrite(action), dedupeKey: action.dedupeKey };
+      }
       let cleanupBundle = null;
       if (action.type === 'branch.push') {
         const scan = await scanBundle(action);
@@ -606,9 +968,14 @@ export function createGate({
     return { code: outcome.code, body: outcome.body };
   }
 
-  /** serve 模式启动时先算一次任务树（算不出就起不来，fail-closed）。 */
+  /** serve 模式启动时先算一次上下文（算不出就起不来，fail-closed）。 */
   async function start() {
-    if (binding) await loadTree();
+    if (binding?.kind === 'correction') {
+      const context = await correctionContext();
+      if (!context) throw new Error(`修正轮绑定算不出：${binding.issue}`);
+    } else if (binding) {
+      await loadTree();
+    }
     return { paths };
   }
 
@@ -717,8 +1084,13 @@ async function main(argv) {
     const issue = flags.get('issue');
     const round = Number(flags.get('round'));
     const commentId = flags.get('comment-id');
-    if (!socketPath || !issue || !Number.isInteger(round) || commentId == null) {
-      process.stderr.write('serve 需要 --socket <路径> --issue <owner/repo#n> --round <n> --comment-id <id>\n');
+    const kind = flags.get('kind') || 'acceptance';
+    const needsComment = kind !== 'correction';
+    if (!socketPath || !issue || !Number.isInteger(round) || (needsComment && commentId == null)) {
+      process.stderr.write(
+        'serve 需要 --socket <路径> --issue <owner/repo#n> --round <n> ' +
+          '[--comment-id <id>] [--kind acceptance|correction]\n',
+      );
       process.exitCode = 1;
       return;
     }
@@ -728,7 +1100,10 @@ async function main(argv) {
       profile,
       github: createGithub({ profile: { ...profile, writeCommand: undefined }, run }),
       run,
-      binding: { root: issue, round, commentId },
+      binding:
+        kind === 'correction'
+          ? { kind: 'correction', issue, round, commentId: commentId ?? null }
+          : { root: issue, round, commentId },
     });
     await gate.start();
     const server = await startGateServer({ gate, socketPath });
