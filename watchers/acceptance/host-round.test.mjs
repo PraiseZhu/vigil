@@ -103,6 +103,7 @@ test('SC11 pi 跑着时宿主出错（查进度抛异常）：先结束 pi，再
   const fixture = roundFixture();
   const killed = [];
   let exited = false;
+  let abortSawPiRunning = null;
   const code = await runHostRound({
     home: fixture.home,
     issue: ROOT_REF,
@@ -110,6 +111,7 @@ test('SC11 pi 跑着时宿主出错（查进度抛异常）：先结束 pi，再
     runRound: async (argv) => {
       fixture.calls.round.push(argv);
       if (argv[0] === 'status') throw new Error('查进度失败');
+      if (argv[0] === 'abort') abortSawPiRunning = !exited;
       return fixture.runRoundFake(argv);
     },
     startGate: async (options) => {
@@ -147,6 +149,7 @@ test('SC11 pi 跑着时宿主出错（查进度抛异常）：先结束 pi，再
   });
   assert.equal(code, 1);
   assert.deepEqual(killed, ['SIGTERM'], 'pi 被结束');
+  assert.equal(abortSawPiRunning, false, 'abort 之前 pi 已经结束');
   const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
   assert.match(abort[abort.indexOf('--reason') + 1], /宿主出错：查进度失败/);
   assert.equal(fixture.calls.gate, 1);

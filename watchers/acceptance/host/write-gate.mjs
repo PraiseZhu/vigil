@@ -43,6 +43,8 @@ const READ_QUERIES = new Set([
 const ACCEPTANCE_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：验收中$/;
 const VERDICT_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(通过|要修)/;
 const ABORT_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：中断/;
+const ROUND_FIRST_LINE = /^\s*\[验收机\]\s*第/;
+const CHECKBOX_LINE = /^(\s*[-*]\s+\[)[ xX](\].*)$/;
 const BRANCH_PATTERN = /^acceptance\/(\d+)-(\d+)-sc(\d+)$/;
 const GREEN_CHECKS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
 
@@ -51,6 +53,8 @@ export const STATUS_QUERY = `query ($owner: String!, $name: String!, $number: In
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       number
+      headRefName
+      body
       commits(last: 1) {
         nodes {
           commit {
@@ -61,6 +65,21 @@ export const STATUS_QUERY = `query ($owner: String!, $name: String!, $number: In
     }
   }
 }`;
+
+/**
+ * branch.push 扫密钥的基准：写闸自己去 GitHub 读目标仓默认分支的头提交，绝不用沙箱交来的 base。
+ * 一条固定查询，不是调用方交来的 query。
+ */
+export const DEFAULT_HEAD_QUERY = `query ($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef {
+      name
+      target { oid }
+    }
+  }
+}`;
+
+const COMMIT_OID = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 
 const reject = (reason, detail) =>
   detail === undefined ? { code: 4, body: { reason } } : { code: 4, body: { reason, detail } };
@@ -77,6 +96,21 @@ function versionLine(body) {
     .split('\n')
     .find((entry) => entry.startsWith('正文版本：'));
   return line ? line.slice('正文版本：'.length).trim() : null;
+}
+
+/** 新正文和旧正文逐行比：只有复选框里的空格 / x 可以不同，行数和其它字一个都不能变。 */
+function onlyCheckboxToggles(before, after) {
+  if (typeof after !== 'string') return false;
+  const oldLines = String(before ?? '').split('\n');
+  const newLines = after.split('\n');
+  if (oldLines.length !== newLines.length) return false;
+  for (let i = 0; i < oldLines.length; i += 1) {
+    if (oldLines[i] === newLines[i]) continue;
+    const a = CHECKBOX_LINE.exec(oldLines[i]);
+    const b = CHECKBOX_LINE.exec(newLines[i]);
+    if (!a || !b || a[1] !== b[1] || a[2] !== b[2]) return false;
+  }
+  return true;
 }
 
 function refOf(repo, issue) {
@@ -259,14 +293,26 @@ export function createGate({
     return { code: 0, body: { data: data ?? {} } };
   }
 
-  async function checkPrChecks(action) {
+  async function checkPrChecks(action, { number, root }) {
     const [owner, name] = String(action.repo || '').split('/');
     const data = await github.graphql(STATUS_QUERY, {
       owner,
       name,
       number: Number(action.pr),
     });
-    const nodes = data?.repository?.pullRequest?.commits?.nodes || [];
+    const pr = data?.repository?.pullRequest;
+    if (!pr) return reject('not-in-tree', `找不到 PR ${action.repo}#${action.pr}`);
+    // 只认本轮任务树里的修正 PR：head 分支是 acceptance/<总 issue 号>-…，正文带本轮总 issue 的修正标记。
+    const head = String(pr.headRefName || '');
+    const match = BRANCH_PATTERN.exec(head.includes(':') ? head.slice(head.indexOf(':') + 1) : head);
+    if (!match || Number(match[1]) !== number) {
+      return reject('not-in-tree', `PR 的 head 分支必须是 acceptance/${number}-<出处>-sc<k>`);
+    }
+    const marker = parseMarker(pr.body);
+    if (!marker || marker.root !== root) {
+      return reject('not-in-tree', 'PR 正文缺少本轮总 issue 的修正标记');
+    }
+    const nodes = pr.commits?.nodes || [];
     const state = nodes.at(-1)?.commit?.statusCheckRollup?.state;
     if (!GREEN_CHECKS.has(String(state))) {
       return reject('checks-not-green', `PR 检查状态：${state || '未知'}`);
@@ -305,6 +351,10 @@ export function createGate({
         return null;
       }
       case 'comment.create':
+        if (ROUND_FIRST_LINE.test(firstLine(action.body))) {
+          return reject('round-comment-forbidden', '轮次评论只能由宿主认领和改本轮那一条，不能另发');
+        }
+      // falls through
       case 'issue.edit':
       case 'issue.close':
       case 'issue.reopen':
@@ -312,6 +362,14 @@ export function createGate({
         const target = refOf(action.repo, action.issue);
         if (!treeRefs.has(target)) {
           return reject('not-in-tree', `${target} 不在本轮任务树`);
+        }
+        if (action.type === 'issue.edit') {
+          // 只许勾选或取消验收项（- [ ] ↔ - [x]），不许改正文的任何其它字。
+          const current = target === binding.root ? state : await readIssueState(target);
+          if (!current) return reject('not-in-tree', `找不到 ${target}`);
+          if (!onlyCheckboxToggles(current.issue.body, action.body)) {
+            return reject('edit-not-allowed', 'issue.edit 只能勾选或取消验收项，不能改正文其它内容');
+          }
         }
         return null;
       }
@@ -357,7 +415,7 @@ export function createGate({
         return null;
       }
       case 'pr.ready':
-        return checkPrChecks(action);
+        return checkPrChecks(action, { number, root: binding.root });
       default:
         return reject('not-allowed', `serve 模式不认 ${action.type}`);
     }
@@ -379,6 +437,9 @@ export function createGate({
       const match = ACCEPTANCE_FIRST_LINE.exec(firstLine(action.body));
       if (!match) {
         return reject('needs-round-binding', '执行模式只认「[验收机] 第 n 轮：验收中」的认领评论');
+      }
+      if (state.latest && state.latest.status === '验收中') {
+        return reject('round-in-progress', `第 ${state.latest.round} 轮还在验收中，不能再认领新一轮`);
       }
       const maxRound = state.rounds.reduce((acc, entry) => Math.max(acc, entry.round), 0);
       const n = Number(match[1]);
@@ -415,6 +476,22 @@ export function createGate({
    * 沙箱在「扫完」和「推送」之间换掉原文件也没用。
    * 返回 {problem} 表示拒绝；{bundleCopy, cleanup} 表示放行，推送要用 bundleCopy。
    */
+  async function defaultHeadInBundle(repo, bare, git) {
+    const [owner, name] = String(repo || '').split('/');
+    if (!owner || !name) return null;
+    let oid;
+    try {
+      const data = await github.graphql(DEFAULT_HEAD_QUERY, { owner, name });
+      oid = data?.repository?.defaultBranchRef?.target?.oid;
+    } catch {
+      return null;
+    }
+    if (typeof oid !== 'string' || !COMMIT_OID.test(oid)) return null;
+    const result = await git(['--git-dir', bare, 'rev-parse', '--verify', '--quiet', `${oid}^{commit}`]);
+    if (!result || result.code !== 0 || String(result.stdout || '').trim() !== oid) return null;
+    return oid;
+  }
+
   async function scanBundle(action) {
     const { bundlePath, branch } = action;
     if (typeof bundlePath !== 'string' || !path.isAbsolute(bundlePath)) {
@@ -451,7 +528,10 @@ export function createGate({
       if (!result || result.code !== 0 || !/^[0-9a-f]{40,64}$/.test(commit)) {
         return { problem: fail('scan-failed', `解析分支提交失败：${firstLine(result?.stderr)}`) };
       }
-      const range = action.base ? `${action.base}..${commit}` : commit;
+      // 基准由写闸自己定：目标仓默认分支的头提交在 bundle 里，就只扫它之后的新提交；
+      // 读不到或不在 bundle 里，就扫这条分支的全部历史（更严，宁可多拦）。沙箱交来的 base 一律不看。
+      const base = await defaultHeadInBundle(action.repo, bare, git);
+      const range = base ? `${base}..${commit}` : commit;
       if (await whichCmd('gitleaks')) {
         const reportFile = path.join(tmp, 'gitleaks-report.json');
         const scan = await run(
@@ -511,9 +591,6 @@ export function createGate({
     const ledger = readLedger();
     if (!ledger) return fail('ledger-corrupt', '账本里有读不出的行，先修账本');
     if (typeof action.dedupeKey !== 'string' || !action.dedupeKey) return reject('missing-dedupe-key');
-    const seen = ledger.find((entry) => entry.dedupeKey === action.dedupeKey);
-    if (seen) return { code: 0, body: seen.result ?? {} };
-
     // 5. 仓范围
     const scope = scopeOf(action.repo);
     if (!scope) return reject('repo-not-allowed', `${action.repo ?? '(空)'} 不在配置的名单里`);
@@ -533,6 +610,10 @@ export function createGate({
     if (scope.tier === 'watch' && !WATCH_ALLOWED_TYPES.has(action.type)) {
       return reject('tier-not-allowed', `watch 档不写 ${action.type}`);
     }
+
+    // 账本查重放在仓范围、分档之后：名单外的仓、档位不许的动作，哪怕账本里有同名 key 也照样拒绝。
+    const seen = ledger.find((entry) => entry.dedupeKey === action.dedupeKey);
+    if (seen) return { code: 0, body: seen.result ?? {} };
 
     // 8. 执行锁：同一时间只执行一条写动作；30 秒拿不到就回 75，什么都不执行
     const gotLock = await acquireLock(paths.execLock, { now, waitMs: lockWaitMs, sleep });

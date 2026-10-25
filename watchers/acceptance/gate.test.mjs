@@ -10,7 +10,7 @@ import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion } from './bin/rounds.mjs';
 import { ROOT_QUERY, SEARCH_QUERY } from './bin/collect.mjs';
 import { localEnv, spawnRun } from './bin/localgit.mjs';
-import { STATUS_QUERY, createGate, startGateServer } from './host/write-gate.mjs';
+import { DEFAULT_HEAD_QUERY, STATUS_QUERY, createGate, startGateServer } from './host/write-gate.mjs';
 import { hostPaths, readAlerts } from './host/paths.mjs';
 import { run as procRun } from './host/proc.mjs';
 import { defaultTree } from './session.fixture.mjs';
@@ -35,14 +35,27 @@ function setupEnvironment({ enabled = true } = {}) {
   return { home, profile, paths };
 }
 
-function gateGithub(world, { statusRollup = 'SUCCESS', onWrite } = {}) {
+const PR_MARKER = `[验收机] 修正 · 总 ${ROOT_REF} · 项 ${REPO}#2 SC1 · 第 1 轮`;
+
+function gateGithub(
+  world,
+  { statusRollup = 'SUCCESS', onWrite, headRefName = 'acceptance/1-2-sc1', prBody = PR_MARKER, defaultHead = null } = {},
+) {
   return {
+    queries: [],
     async graphql(query, variables) {
+      this.queries.push({ query, variables });
+      if (query === DEFAULT_HEAD_QUERY) {
+        if (defaultHead instanceof Error) throw defaultHead;
+        return { repository: { defaultBranchRef: defaultHead ? { name: 'main', target: { oid: defaultHead } } : null } };
+      }
       if (query === STATUS_QUERY) {
         return {
           repository: {
             pullRequest: {
               number: variables.number,
+              headRefName,
+              body: prBody,
               commits: {
                 nodes: [{ commit: { statusCheckRollup: statusRollup ? { state: statusRollup } : null } }],
               },
@@ -526,9 +539,32 @@ test('SC9 分支名不合规（总 issue 号不对）→ 4 not-in-tree', async (
 
 test('SC9 exec 模式：本轮认领可写，乱发的评论一律 4 needs-round-binding', async () => {
   const { home, profile } = setupEnvironment();
-  const world = defaultTree();
+  const busyWorld = defaultTree();
+  const busyGate = createGate({ home, profile, github: gateGithub(busyWorld), run: procRun, which: async () => false });
+  const busy = await busyGate.handle({
+    type: 'comment.create',
+    repo: REPO,
+    issue: 1,
+    dedupeKey: 'claim-while-busy',
+    body: [`[验收机] 第 2 轮：验收中`, `正文版本：${bodyVersion(busyWorld.get(ROOT_REF).body)}`].join('\n'),
+  });
+  assert.equal(busy.code, 4, '上一轮还在验收中，不能认领新一轮');
+  assert.equal(busy.body.reason, 'round-in-progress');
+  assert.equal(busyWorld.writes.length, 0);
+
+  const world = defaultTree({ roundStatus: '要修' });
   const gate = createGate({ home, profile, github: gateGithub(world), run: procRun, which: async () => false });
   const version = bodyVersion(world.get(ROOT_REF).body);
+
+  const skippedEarly = await gate.handle({
+    type: 'comment.create',
+    repo: REPO,
+    issue: 1,
+    dedupeKey: 'claim-3-early',
+    body: [`[验收机] 第 3 轮：验收中`, `正文版本：${version}`].join('\n'),
+  });
+  assert.equal(skippedEarly.code, 4, '跳号认领');
+  assert.equal(skippedEarly.body.reason, 'needs-round-binding');
 
   const claim = await gate.handle({
     type: 'comment.create',
@@ -549,7 +585,7 @@ test('SC9 exec 模式：本轮认领可写，乱发的评论一律 4 needs-round
     body: [`[验收机] 第 4 轮：验收中`, `正文版本：${version}`].join('\n'),
   });
   assert.equal(skipped.code, 4);
-  assert.equal(skipped.body.reason, 'needs-round-binding');
+  assert.equal(skipped.body.reason, 'round-in-progress');
 
   const strayUpdate = await random.handle({
     type: 'comment.update',
@@ -862,4 +898,223 @@ test('SC9 branch.push 有 gitleaks 时只扫 bundle 里该分支的提交（--lo
   assert.equal(outcome.body.reason, 'secret-found');
   assert.ok(leaksArgs.includes(`--log-opts=${head}`), JSON.stringify(leaksArgs));
   assert.equal(world.writes.filter((entry) => entry.type === 'branch.push').length, 0);
+});
+
+/** 建一个仓：main 上一个提交（可选带假私钥），分支上再一个提交（可选带假私钥），打成 bundle。 */
+async function buildBundleRepo({ leakOnMain = false, leakOnBranch = false } = {}) {
+  const repoDir = fs.mkdtempSync(path.join(tmpDir(), 'acceptance-gate-base-'));
+  const gitRun = async (args) => {
+    const result = await spawnRun('git', args, { cwd: repoDir, env: localEnv() });
+    if (result.code !== 0) throw new Error(`git ${args.join(' ')} 失败：${result.stderr}`);
+    return result.stdout;
+  };
+  await gitRun(['init', '-q', '-b', 'main']);
+  await gitRun(['config', 'user.name', 'ExampleUser']);
+  await gitRun(['config', 'user.email', 'example@example.test']);
+  fs.writeFileSync(path.join(repoDir, 'main.txt'), leakOnMain ? `${FAKE_KEY}\n` : 'main\n');
+  await gitRun(['add', 'main.txt']);
+  await gitRun(['commit', '-q', '-m', 'main']);
+  const mainSha = (await gitRun(['rev-parse', 'HEAD'])).trim();
+  const branch = 'acceptance/1-2-sc3';
+  await gitRun(['checkout', '-q', '-b', branch]);
+  fs.writeFileSync(path.join(repoDir, 'branch.txt'), leakOnBranch ? `${FAKE_KEY}\n` : 'fix\n');
+  await gitRun(['add', 'branch.txt']);
+  await gitRun(['commit', '-q', '-m', 'fix']);
+  const tip = (await gitRun(['rev-parse', 'HEAD'])).trim();
+  const bundlePath = path.join(repoDir, 'push.bundle');
+  await gitRun(['bundle', 'create', bundlePath, branch]);
+  return { repoDir, branch, bundlePath, mainSha, tip };
+}
+
+test('SC9 branch.push 不信沙箱交来的 base：base=分支头、base=--output=…、base 不是祖先，都照样扫出密钥', async () => {
+  const { home, profile } = setupEnvironment();
+  const { repoDir, branch, bundlePath, tip } = await buildBundleRepo({ leakOnBranch: true });
+  const outputProbe = path.join(repoDir, 'gate-output-probe.txt');
+  for (const [label, base] of [
+    ['分支头', tip],
+    ['选项注入', `--output=${outputProbe}`],
+    ['不是祖先', 'f'.repeat(40)],
+  ]) {
+    for (const hasGitleaks of [false, true]) {
+      const world = defaultTree();
+      const calls = [];
+      const run = async (cmd, args, options) => {
+        calls.push({ cmd, args });
+        if (cmd === 'gitleaks') {
+          // 假 gitleaks：只要扫的范围里有分支提交就报密钥。
+          const range = args.find((arg) => arg.startsWith('--log-opts=')).slice('--log-opts='.length);
+          return { code: range.endsWith(tip) && !range.startsWith(`${tip}..`) ? 1 : 0, stdout: '', stderr: '' };
+        }
+        return procRun(cmd, args, options);
+      };
+      const gate = createGate({
+        home,
+        profile,
+        github: gateGithub(world),
+        run,
+        binding: bindingFor(world),
+        which: async () => hasGitleaks,
+      });
+      const outcome = await gate.handle({
+        type: 'branch.push',
+        repo: REPO,
+        branch,
+        base,
+        bundlePath,
+        dedupeKey: `push-base-${label}-${hasGitleaks}`,
+      });
+      assert.equal(outcome.code, 4, `${label}/${hasGitleaks}: ${JSON.stringify(outcome)}`);
+      assert.equal(outcome.body.reason, 'secret-found', `${label}/${hasGitleaks}`);
+      assert.equal(world.writes.length, 0, `${label}/${hasGitleaks}：没推送`);
+      assert.equal(fs.existsSync(outputProbe), false, `${label}/${hasGitleaks}：base 不能当成 git 选项`);
+      assert.equal(
+        base !== tip && calls.some((call) => call.args.some((arg) => String(arg).includes(String(base)))),
+        false,
+        `${label}/${hasGitleaks}：沙箱交来的 base 不进任何命令`,
+      );
+    }
+  }
+});
+
+test('SC9 branch.push 的基准由写闸自己读默认分支头：在 bundle 里就只扫新提交，读不到或不在 bundle 里就扫全部历史', async () => {
+  const { home, profile } = setupEnvironment();
+  // main 历史里有假私钥、分支新提交干净：默认分支头在 bundle 里 → 只扫新提交 → 放行。
+  const old = await buildBundleRepo({ leakOnMain: true });
+  const gitArgs = [];
+  const recordingRun = (cmd, args, options) => {
+    gitArgs.push(...args.map(String));
+    return procRun(cmd, args, options);
+  };
+  const pushOf = (repo, world, defaultHead, key) => {
+    const gate = createGate({
+      home,
+      profile,
+      github: gateGithub(world, { defaultHead }),
+      run: recordingRun,
+      binding: bindingFor(world),
+      which: async () => false,
+    });
+    return gate.handle({ type: 'branch.push', repo: REPO, branch: repo.branch, bundlePath: repo.bundlePath, dedupeKey: key });
+  };
+  let world = defaultTree();
+  const clean = await pushOf(old, world, old.mainSha, 'push-head-in-bundle');
+  assert.equal(clean.code, 0, JSON.stringify(clean));
+  assert.equal(world.writes.filter((entry) => entry.type === 'branch.push').length, 1);
+
+  for (const [label, head] of [
+    ['读不到', null],
+    ['查询出错', new Error('网络不通')],
+    ['不在 bundle 里', 'e'.repeat(40)],
+    ['不是提交号', `--output=${path.join(old.repoDir, 'x')}`],
+  ]) {
+    world = defaultTree();
+    const outcome = await pushOf(old, world, head, `push-head-${label}`);
+    assert.equal(outcome.code, 4, `${label}: ${JSON.stringify(outcome)}`);
+    assert.equal(outcome.body.reason, 'secret-found', label);
+    assert.deepEqual(outcome.body.files, ['main.txt'], label);
+    assert.equal(world.writes.length, 0, label);
+  }
+  assert.equal(gitArgs.some((arg) => arg.includes('--output')), false, '读回来的默认分支头不是提交号，就不进任何 git 命令');
+
+  // 新提交里有假私钥：默认分支头在 bundle 里也照样扫出来。
+  const fresh = await buildBundleRepo({ leakOnBranch: true });
+  world = defaultTree();
+  const leak = await pushOf(fresh, world, fresh.mainSha, 'push-head-new-leak');
+  assert.equal(leak.code, 4);
+  assert.deepEqual(leak.body.files, ['branch.txt']);
+});
+
+test('SC9 pr.ready 只认本轮任务树里的修正 PR：head 分支和修正标记都要对上', async () => {
+  const { home, profile } = setupEnvironment();
+  for (const [label, options] of [
+    ['无关分支', { headRefName: 'feature/unrelated' }],
+    ['别的总 issue 的分支', { headRefName: 'acceptance/999-2-sc1' }],
+    ['正文没标记', { prBody: '随便一个 PR' }],
+    ['标记是别的总 issue', { prBody: `[验收机] 修正 · 总 ${REPO}#999 · 项 ${REPO}#2 SC1 · 第 1 轮` }],
+  ]) {
+    const world = defaultTree();
+    const gate = createGate({
+      home,
+      profile,
+      github: gateGithub(world, options),
+      run: procRun,
+      binding: bindingFor(world),
+      which: async () => false,
+    });
+    const outcome = await gate.handle({ type: 'pr.ready', repo: REPO, pr: 999, dedupeKey: `ready-tree-${label}` });
+    assert.equal(outcome.code, 4, `${label}: ${JSON.stringify(outcome)}`);
+    assert.equal(outcome.body.reason, 'not-in-tree', label);
+    assert.equal(world.writes.length, 0, label);
+  }
+});
+
+test('SC9 serve 模式不许另发轮次评论；issue.edit 只能勾选验收项', async () => {
+  const { home, profile } = setupEnvironment();
+  const world = defaultTree();
+  const gate = createGate({ home, profile, github: gateGithub(world), run: procRun, binding: bindingFor(world), which: async () => false });
+  for (const body of ['[验收机] 第 1 轮：通过', '[验收机] 第 9 轮：验收中', '  [验收机]  第 2 轮：要修']) {
+    const outcome = await gate.handle({ type: 'comment.create', repo: REPO, issue: 2, body, dedupeKey: `fake-round-${body}` });
+    assert.equal(outcome.code, 4, body);
+    assert.equal(outcome.body.reason, 'round-comment-forbidden', body);
+  }
+  const plain = await gate.handle({ type: 'comment.create', repo: REPO, issue: 2, body: '进度：在跑测试', dedupeKey: 'plain-comment' });
+  assert.equal(plain.code, 0, JSON.stringify(plain));
+
+  const childBody = world.get(`${REPO}#2`).body;
+  const toggled = childBody.replace('- [ ]', '- [x]');
+  assert.notEqual(toggled, childBody, '夹具要有可勾的验收项');
+  for (const [label, body] of [
+    ['整段重写', '- [x] SC1 全部通过'],
+    ['勾选同时改字', toggled.replace(/(- \[x\][^\n]*)/, '$1 改过')],
+    ['加一行', `${toggled}\n- [x] SC9 新加的`],
+    ['不是字符串', undefined],
+  ]) {
+    const outcome = await gate.handle({ type: 'issue.edit', repo: REPO, issue: 2, body, dedupeKey: `edit-${label}` });
+    assert.equal(outcome.code, 4, label);
+    assert.equal(outcome.body.reason, 'edit-not-allowed', label);
+  }
+  assert.equal(world.get(`${REPO}#2`).body, childBody, '被拒的编辑没写进去');
+  const ok = await gate.handle({ type: 'issue.edit', repo: REPO, issue: 2, body: toggled, dedupeKey: 'edit-toggle' });
+  assert.equal(ok.code, 0, JSON.stringify(ok));
+  assert.equal(world.get(`${REPO}#2`).body, toggled);
+});
+
+test('SC9 账本查重在仓范围之后：名单外的仓拿账本里已有的 key 也照样 4', async () => {
+  const { home, profile, paths } = setupEnvironment();
+  const world = defaultTree();
+  fs.mkdirSync(path.dirname(paths.ledgerFile), { recursive: true });
+  fs.writeFileSync(
+    paths.ledgerFile,
+    `${JSON.stringify({ dedupeKey: 'shared-key', type: 'comment.create', result: { commentId: 1 } })}\n`,
+  );
+  const gate = createGate({ home, profile, github: gateGithub(world), run: procRun, binding: bindingFor(world), which: async () => false });
+  const outside = await gate.handle({ type: 'comment.create', repo: 'stranger/elsewhere', issue: 1, body: 'x', dedupeKey: 'shared-key' });
+  assert.equal(outside.code, 4);
+  assert.equal(outside.body.reason, 'repo-not-allowed');
+});
+
+test('SC9 写闸只认 ownerLogin 发的轮次评论：别人伪造的「第 2 轮：验收中」不算当前轮次', async () => {
+  const { home, profile } = setupEnvironment();
+  const world = defaultTree();
+  world.addComment(ROOT_REF, {
+    body: [`[验收机] 第 2 轮：验收中`, `正文版本：${bodyVersion(world.get(ROOT_REF).body)}`].join('\n'),
+    author: { login: 'someone-else' },
+  });
+  // 绑定第 1 轮：伪造的第 2 轮不算，写操作照常放行。
+  const gate = createGate({ home, profile, github: gateGithub(world), run: procRun, binding: bindingFor(world), which: async () => false });
+  const ok = await gate.handle({ type: 'comment.create', repo: REPO, issue: 2, body: '进度', dedupeKey: 'owner-only-ok' });
+  assert.equal(ok.code, 0, JSON.stringify(ok));
+  // 冒充第 2 轮绑定：不是我发的，4 not-current-round。
+  const forged = world.get(ROOT_REF).comments.at(-1);
+  const forgedGate = createGate({
+    home,
+    profile,
+    github: gateGithub(world),
+    run: procRun,
+    binding: { root: ROOT_REF, round: 2, commentId: forged.databaseId },
+    which: async () => false,
+  });
+  const denied = await forgedGate.handle({ type: 'comment.create', repo: REPO, issue: 2, body: '进度', dedupeKey: 'owner-only-denied' });
+  assert.equal(denied.code, 4);
+  assert.equal(denied.body.reason, 'not-current-round');
 });

@@ -70,22 +70,12 @@ function realExisting(file) {
 
 export function maskList({ rawProfile, profile, hostConfig, env = process.env, home } = {}) {
   const wanted = new Set();
+  // 两处来源，同一套键名规则：原始 profile JSON（新增的 …TokenFile 键不用改代码就生效）
+  // 和加载后的 profile（App 配置里的私钥由 profile.mjs 读成 appPrivateKeyFile，这里不再自己读一遍）。
   collectKeyFiles(rawProfile || {}, wanted);
-  if (profile?.appConfigPath) {
-    // App 配置本身也遮（里面可能有安装信息），再加上它指向的私钥。
-    wanted.add(profile.appConfigPath);
-    try {
-      const appConfig = JSON.parse(fs.readFileSync(profile.appConfigPath, 'utf8'));
-      if (typeof appConfig?.privateKeyFile === 'string' && appConfig.privateKeyFile) {
-        wanted.add(appConfig.privateKeyFile);
-      }
-    } catch {
-      // App 配置读不出是部署检查的事；这里不因此放行任何文件。
-    }
-  }
-  for (const file of [profile?.githubTokenFile, profile?.slackBotTokenFile, profile?.appPrivateKeyFile]) {
-    if (typeof file === 'string' && file) wanted.add(file);
-  }
+  collectKeyFiles(profile || {}, wanted);
+  // App 配置文件本身也遮（里面有安装信息和私钥路径）。
+  if (typeof profile?.appConfigPath === 'string' && profile.appConfigPath) wanted.add(profile.appConfigPath);
 
   const wantedDirs = new Set();
   const userHome = env?.HOME;
