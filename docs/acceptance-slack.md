@@ -27,8 +27,12 @@
 - **只有 `watchers/acceptance/host/slack-notify.mjs` 读这个文件**。它用
   `O_RDONLY | O_NOFOLLOW` 打开（符号链接直接拒绝），再 `fstat` 检查普通文件、属主、600、非空；
   任一不满足就不发，心跳里写 `token-file-unreadable` / `token-file-mode` / `token-file-empty` 这类原因。
-  注意：profile 加载（#47 的 `bin/profile.mjs`）本身就检查这个文件是 600，所以运行前权限就不对时，
-  加载 profile 先失败（心跳是 `profile-error`，整台验收机都停）；`token-file-*` 只在运行中文件被改坏时出现。
+  权限不对（不是 600）时**根本不读**令牌内容：只打开拿 fd 做 `fstat`，检查不过就关掉。
+- 令牌文件坏了（权限不对、属主不对、符号链接、空文件、不存在、读不到）**只跳过通知，不让整台验收机停**：
+  这一拍的验收调度照常跑，心跳 `slack.reason` 写上面的 `token-file-*` 原因。为此对 #47 的 profile 加载器
+  （`bin/profile.mjs`）做了一处小改动：`slackBotTokenFile` 只校验是绝对路径，不再调 `checkSecretFile`
+  （那会抛错，profile 加载失败整台机就停）。`githubTokenFile`、App 私钥的检查一字不改；`doctor` 照样把
+  坏掉的 Slack 令牌文件报出来；沙箱遮罩不看权限，文件在就遮。
 - **不读环境变量**：设了 `ACCEPTANCE_SLACK_BOT_TOKEN` 或 `SLACK_BOT_TOKEN` 也不会用。
 - 令牌只出现在 HTTP 的 `Authorization: Bearer` 头里：**不进请求 body、不进日志、不进心跳、不进账本、
   不进异常信息**。本模块也不起子进程，所以令牌不会出现在任何子进程环境里。

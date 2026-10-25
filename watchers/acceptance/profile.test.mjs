@@ -120,38 +120,39 @@ test('profile token-file 权限 600 被接受', () => {
   assert.equal(profile.stallMinutes, 30);
 });
 
-test('profile slackBotTokenFile 存在时一并校验', () => {
-  const home = tmpDir();
-  const raw = baseProfile(home);
-  raw.slackBotTokenFile = path.join(home, 'secrets', 'slack.token');
-  writeSecret(raw.slackBotTokenFile, 'slack-token');
-  fs.chmodSync(raw.slackBotTokenFile, 0o644);
-  writeJson(path.join(home, 'config', 'profile.json'), raw);
-  assert.throws(
-    () => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }),
-    /slackBotTokenFile/,
-  );
-});
-
-test('profile 令牌从不从环境变量读取', () => {
-  const home = tmpDir();
-  const raw = baseProfile(home);
-  delete raw.githubTokenFile;
-  writeJson(path.join(home, 'config', 'profile.json'), raw);
-  const env = {
-    ACCEPTANCE_WATCHER_HOME: home,
-    GH_TOKEN: 'from-env-should-not-count',
-    GITHUB_TOKEN: 'from-env-should-not-count',
+test('profile slackBotTokenFile 权限不对 / 读不到 / 不存在都不让 profile 加载失败（只记路径，不读不查）', () => {
+  // #61 复审：Slack 令牌文件坏了只跳过通知（slack-notify 在心跳里写原因），不能让整台验收机停。
+  const cases = {
+    mode644: (file) => fs.chmodSync(file, 0o644),
+    mode000: (file) => fs.chmodSync(file, 0o000),
+    missing: (file) => fs.rmSync(file),
+    directory: (file) => {
+      fs.rmSync(file);
+      fs.mkdirSync(file);
+    },
   };
-  assert.throws(() => loadAcceptanceProfile(env), /githubTokenFile/);
-});
-
-test('profile 错误类型的 autoRepos 不静默回退', () => {
+  for (const [name, spoil] of Object.entries(cases)) {
+    const home = tmpDir();
+    const raw = baseProfile(home);
+    raw.slackBotTokenFile = path.join(home, 'secrets', 'slack.token');
+    writeSecret(raw.slackBotTokenFile, 'slack-token');
+    spoil(raw.slackBotTokenFile);
+    writeJson(path.join(home, 'config', 'profile.json'), raw);
+    const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+    assert.equal(profile.slackBotTokenFile, raw.slackBotTokenFile, name);
+  }
+  // 路径本身仍然要是绝对路径。
   const home = tmpDir();
   const raw = baseProfile(home);
-  raw.autoRepos = 'ExampleUser/*';
+  raw.slackBotTokenFile = 'secrets/slack.token';
   writeJson(path.join(home, 'config', 'profile.json'), raw);
-  assert.throws(() => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }), /autoRepos/);
+  assert.throws(() => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }), /slackBotTokenFile/);
+  // GitHub 令牌文件照旧：644 直接拒绝（#47 的逻辑不变）。
+  const gh = tmpDir();
+  const ghRaw = baseProfile(gh);
+  fs.chmodSync(ghRaw.githubTokenFile, 0o644);
+  writeJson(path.join(gh, 'config', 'profile.json'), ghRaw);
+  assert.throws(() => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: gh }), /githubTokenFile/);
 });
 
 test('checkSecretFile 空文件被拒绝且不带出内容', () => {

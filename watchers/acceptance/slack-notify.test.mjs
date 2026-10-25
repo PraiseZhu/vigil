@@ -690,8 +690,8 @@ test('ok:false（HTTP 200）也算失败：不进账本的成功列表，按 1 �
 // ---- tick 接线 ----
 
 async function tickHome() {
-  const { home, profile } = setup();
-  return { home, profile };
+  const { home, profile, tokenFile } = setup();
+  return { home, profile, tokenFile };
 }
 
 const POLL_OK = async () => ({ code: 0, stdout: '[]', stderr: '' });
@@ -778,6 +778,76 @@ test('runTick 用真 notify：心跳里的 slack 就是这一拍的发送结果�
   assert.equal(heartbeat.slack.ok, false);
   assert.equal(heartbeat.slack.reason, 'not-configured');
   assert.equal(heartbeat.lastTick.ok, true);
+});
+
+test('令牌文件权限不对 / 读不到：整台机照常跑这一拍，跳过通知，心跳记原因，令牌一个字节都不读', async () => {
+  const t0 = Date.parse(START_AT);
+  const cases = {
+    mode644: { spoil: (file) => fs.chmodSync(file, 0o644), reasons: ['token-file-mode'] },
+    mode640: { spoil: (file) => fs.chmodSync(file, 0o640), reasons: ['token-file-mode'] },
+    // root 下 000 也打得开，这时靠权限检查拦住；普通用户下 open 就失败。两种都不读内容。
+    mode000: { spoil: (file) => fs.chmodSync(file, 0o000), reasons: ['token-file-mode', 'token-file-unreadable'] },
+    missing: { spoil: (file) => fs.rmSync(file), reasons: ['token-file-unreadable'] },
+  };
+  for (const [name, { spoil, reasons }] of Object.entries(cases)) {
+    const { home, tokenFile } = await tickHome();
+    spoil(tokenFile);
+    prbotEvent(home, { type: 'needs-human', issue: `${REPO}#2`, root: `${REPO}#1`, reason: 'no-change' }, t0);
+    // 记下打开令牌文件得到的 fd，确认之后既没有 readFileSync 也没有 readSync 碰过它。
+    const tokenFds = new Set();
+    const reads = [];
+    const realOpen = fs.openSync;
+    const realReadFile = fs.readFileSync;
+    const realRead = fs.readSync;
+    fs.openSync = function (file, ...rest) {
+      const fd = realOpen.call(this, file, ...rest);
+      if (String(file) === tokenFile) tokenFds.add(fd);
+      return fd;
+    };
+    fs.readFileSync = function (file, ...rest) {
+      if (String(file) === tokenFile || tokenFds.has(file)) reads.push(['readFileSync', file]);
+      return realReadFile.call(this, file, ...rest);
+    };
+    fs.readSync = function (fd, ...rest) {
+      if (tokenFds.has(fd)) reads.push(['readSync', fd]);
+      return realRead.call(this, fd, ...rest);
+    };
+    try {
+      await withSlack(undefined, async (fake) => {
+        let spawned = 0;
+        const heartbeat = await runTick({
+          home,
+          env: { ...process.env },
+          run: POLL_OK,
+          spawnRound: () => {
+            spawned += 1;
+            return 1;
+          },
+          runRound: async () => ({ code: 0, stdout: '', stderr: '' }),
+          now: () => t0,
+          notifyOptions: { fetch: fake.fetch, apiBase: fake.apiBase },
+        });
+        assert.equal(heartbeat.lastTick.ok, true, `${name}：这一拍照常跑完 ${JSON.stringify(heartbeat.lastTick)}`);
+        assert.equal(heartbeat.slack.ok, false, name);
+        assert.ok(reasons.includes(heartbeat.slack.reason), `${name}：${heartbeat.slack.reason}`);
+        assert.equal(fake.requests.length, 0, `${name}：一条 Slack 请求都不发`);
+        const stored = JSON.parse(realReadFile(hostPaths(home).heartbeatFile, 'utf8'));
+        assert.equal(stored.slack.reason, heartbeat.slack.reason, `${name}：原因写进心跳文件`);
+        assert.equal(JSON.stringify(stored).includes(TOKEN), false);
+        assert.equal(spawned, 0, 'POLL_OK 没有待验收的条目');
+      });
+    } finally {
+      fs.openSync = realOpen;
+      fs.readFileSync = realReadFile;
+      fs.readSync = realRead;
+      try {
+        fs.chmodSync(tokenFile, 0o600);
+      } catch {
+        // 已经删了。
+      }
+    }
+    assert.deepEqual(reads, [], `${name}：令牌文件没被读`);
+  }
 });
 
 // ---- 沙箱遮罩契约 ----
