@@ -233,6 +233,46 @@ test('profile 没配 slackBotTokenFile 时照常加载（#44 不用 Slack）', (
   assert.deepEqual(tokenFiles(profile).map((entry) => entry.key), ['githubTokenFile']);
 });
 
+test('#61 profile 可选 slackChannelId / slackMentionUserId：合法值原样带出，没配就是 undefined', () => {
+  const home = tmpDir();
+  const raw = baseProfile(home);
+  raw.slackChannelId = 'C0123456789';
+  raw.slackMentionUserId = 'U0123456789';
+  writeJson(path.join(home, 'config', 'profile.json'), raw);
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  assert.equal(profile.slackChannelId, 'C0123456789');
+  assert.equal(profile.slackMentionUserId, 'U0123456789');
+
+  const plain = tmpDir();
+  writeJson(path.join(plain, 'config', 'profile.json'), baseProfile(plain));
+  const empty = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: plain });
+  assert.equal(empty.slackChannelId, undefined);
+  assert.equal(empty.slackMentionUserId, undefined);
+});
+
+test('#61 profile 的 Slack id 只做格式校验：形状不对就报错并点名键', () => {
+  for (const [key, value] of [
+    ['slackChannelId', 'not-a-channel'],
+    ['slackChannelId', 'general'],
+    ['slackMentionUserId', 'u0123456789'],
+    ['slackMentionUserId', '@example'],
+  ]) {
+    const home = tmpDir();
+    const raw = baseProfile(home);
+    raw[key] = value;
+    writeJson(path.join(home, 'config', 'profile.json'), raw);
+    assert.throws(
+      () => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }),
+      (error) => {
+        assert.equal(error.code, 'PROFILE_INVALID');
+        assert.match(error.message, new RegExp(key));
+        return true;
+      },
+      `${key}=${value}`,
+    );
+  }
+});
+
 test('profile tokenFiles 也列出 App 私钥文件（宿主沙箱一并遮罩）', () => {
   const home = tmpDir();
   const raw = baseProfile(home);

@@ -12,6 +12,7 @@ import { appendAlert, hostPaths, isAlive, readLockPayload } from './paths.mjs';
 import { run as procRun, spawnDetached } from './proc.mjs';
 import { MAX_ROUNDS, readHostConfig } from './round.mjs';
 import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbot.mjs';
+import { notifySlack } from './slack-notify.mjs';
 
 const SLOTS = ['slot-0', 'slot-1'];
 const KILL_GRACE_MS = 10000;
@@ -34,6 +35,21 @@ function writeJsonAtomic(file, data) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, file);
+}
+
+/** Slack 通知的结果（#61）统一成心跳里的形状，缺字段补 0 / 空数组。 */
+function slackHeartbeat(result) {
+  const value = result && typeof result === 'object' ? result : {};
+  const out = {
+    ok: value.ok === true,
+    sent: Number(value.sent) || 0,
+    digested: Number(value.digested) || 0,
+    pending: Number(value.pending) || 0,
+    failed: Array.isArray(value.failed) ? value.failed : [],
+  };
+  if (value.reason) out.reason = String(value.reason);
+  if (value.error) out.error = String(value.error);
+  return out;
 }
 
 /** 读轮次登记目录：<roundsDir>/<owner>__<repo>__<n>.json。坏文件跳过。 */
@@ -154,6 +170,8 @@ export async function runTick({
   sleep = defaultSleep,
   root,
   killGraceMs = KILL_GRACE_MS,
+  notify = notifySlack,
+  notifyOptions = {},
 } = {}) {
   if (typeof home !== 'string' || !path.isAbsolute(home)) throw new Error('runTick 需要绝对路径的 home');
   const repoRoot = root || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -168,6 +186,16 @@ export async function runTick({
     lastTick: { ok: true, started: [], stale: [], error: null },
     running: [],
   };
+
+  // 0. Slack 通知（#61）：每拍一开始先发，放在 poll 之前——ensure.sh 刚把循环拉起来时先把积压的补上。
+  //    整个调用 try/catch：出错只进心跳，绝不影响这一拍。
+  try {
+    heartbeat.slack = slackHeartbeat(
+      await notify({ home, env: { ...env, ACCEPTANCE_WATCHER_HOME: home }, now, ...notifyOptions }),
+    );
+  } catch (error) {
+    heartbeat.slack = slackHeartbeat({ ok: false, reason: 'notify-error', error: String(error?.message || error) });
+  }
 
   function writeHeartbeat() {
     const registry = readRegistry(paths);

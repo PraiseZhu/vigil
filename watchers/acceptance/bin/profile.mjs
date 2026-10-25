@@ -81,6 +81,17 @@ function optionalAbsolute(raw, key, file) {
   return raw[key];
 }
 
+/** 可选字符串键，只做格式校验（#61 的 Slack 频道 / @ 用户 id）；没配返回 undefined。 */
+function optionalPattern(raw, key, file, pattern, hint) {
+  if (!Object.hasOwn(raw, key) || raw[key] === undefined || raw[key] === null) {
+    return undefined;
+  }
+  if (typeof raw[key] !== 'string' || !pattern.test(raw[key])) {
+    throw invalid(key, file, hint);
+  }
+  return raw[key];
+}
+
 function requireRepoList(raw, key, file, fallback) {
   if (!Object.hasOwn(raw, key) || raw[key] === undefined || raw[key] === null) {
     return fallback;
@@ -219,6 +230,10 @@ export function loadAcceptanceProfile(env = process.env) {
   const slackBotTokenFile = optionalAbsolute(raw, 'slackBotTokenFile', file);
   if (slackBotTokenFile) checkSecretFile(slackBotTokenFile, 'slackBotTokenFile');
 
+  // #61：Slack 频道 id 和可选的 @ 用户 id，都只做格式校验，代码里不写死任何频道。
+  const slackChannelId = optionalPattern(raw, 'slackChannelId', file, /^[CG][A-Z0-9]+$/, '应以 C 或 G 开头，只含大写字母和数字');
+  const slackMentionUserId = optionalPattern(raw, 'slackMentionUserId', file, /^U[A-Z0-9]+$/, '应以 U 开头，只含大写字母和数字');
+
   return Object.freeze({
     ownerLogin,
     projectNumber,
@@ -234,6 +249,8 @@ export function loadAcceptanceProfile(env = process.env) {
     appConfigPath,
     appPrivateKeyFile,
     slackBotTokenFile,
+    slackChannelId,
+    slackMentionUserId,
     profilePath: file,
   });
 }

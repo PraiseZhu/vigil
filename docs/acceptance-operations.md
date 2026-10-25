@@ -8,6 +8,7 @@
 
 - [`docs/acceptance-scheduler.md`](acceptance-scheduler.md)：调度命令的调用顺序与退出码（#45）。
 - [`docs/acceptance-session.md`](acceptance-session.md) 与 [`watchers/acceptance/SESSION.md`](../watchers/acceptance/SESSION.md)：验收会话的步骤与裁决格式（#46）。
+- [`docs/acceptance-slack.md`](acceptance-slack.md)：Slack 通知（Jasper、令牌、事件表、摘要与去重）（#61）。
 - [`watchers/acceptance/README.md`](../watchers/acceptance/README.md)：配置、盘点、写操作出口。
 
 ## 1. 宿主接入清单
@@ -168,7 +169,8 @@ watch 档仍然返回 4（`reason=tier-not-allowed`）。
 **不调 Slack。**
 
 - 发 Slack 归 #61：Slack app 显示为 Jasper，发到 `#praise-automation-dashboard`；
-  修正 PR 已 Ready 的消息只带「打开 PR」链接。
+  修正 PR 已 Ready 的消息只带「打开 PR」链接。怎么配频道、令牌、哪些事件立即发、哪些进摘要，
+  见 [`docs/acceptance-slack.md`](acceptance-slack.md)。
 - **验收结论不发通知**：通过/要修、中断都只在 GitHub 的轮次评论和看板里。
 
 常见 `kind`：`loop-restarted`、`tick-failed`、`round-stale`、`round-stalled`、`sandbox-unavailable`、
