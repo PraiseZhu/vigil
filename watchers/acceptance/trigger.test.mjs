@@ -229,4 +229,29 @@ test('SC17 stalledRounds 超过 stallMinutes 才标 stale', () => {
   assert.equal(stale.issue, `${REPO}#1`);
 });
 
+test('SC11 stalledRounds 以宿主时间为准：stateDir 里伪造的 lastProgressAt 延不了期，宿主活动才延', () => {
+  const task = parentTask({
+    rounds: [{ round: 2, status: '验收中', createdAt: '2026-10-24T01:00:00.000Z', commentId: 22 }],
+  });
+  const profile = { startAt: START_AT, stallMinutes: 30 };
+  // 模型把缓存里的进度写到了未来：照样按评论创建时间算，31 分钟后判卡死。
+  const forged = stalledRounds(task, {
+    now: nowAt('2026-10-24T01:31:00.000Z'),
+    profile,
+    lastProgressAt: '2099-01-01T00:00:00.000Z',
+  });
+  assert.equal(forged?.stale, true);
+  assert.equal(forged.lastProgressAt, '2026-10-24T01:00:00.000Z');
+  assert.equal(forged.modelProgressAt, '2099-01-01T00:00:00.000Z', '模型时间只作参考带出来');
+  // 宿主 01:20 看到过活动：01:31 还不算卡死，01:51 才算。
+  const hostProgressAt = '2026-10-24T01:20:00.000Z';
+  assert.equal(stalledRounds(task, { now: nowAt('2026-10-24T01:31:00.000Z'), profile, hostProgressAt }), null);
+  const later = stalledRounds(task, { now: nowAt('2026-10-24T01:51:00.000Z'), profile, hostProgressAt });
+  assert.equal(later.stale, true);
+  assert.equal(later.lastProgressAt, hostProgressAt);
+  // 宿主时间不会把轮次延到未来（按 now 截断）。
+  const future = stalledRounds(task, { now: nowAt('2026-10-24T01:31:00.000Z'), profile, hostProgressAt: '2099-01-01T00:00:00.000Z' });
+  assert.equal(future, null);
+});
+
 void OWNER;

@@ -215,6 +215,9 @@ test('密钥不进 argv：验收轮、修正轮 pi、预检拼出来的 bwrap �
   const base = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   fs.mkdirSync(path.join(base.home, 'config'), { recursive: true });
   fs.writeFileSync(path.join(base.home, 'config', 'host.json'), JSON.stringify({ piCommand: ['pi', '--model', 'example/model'] }));
+  // 写闸总开关开着才认领（#47 SC11：关着时宿主不认领）。
+  fs.mkdirSync(path.join(base.home, 'state', 'write-gate'), { recursive: true });
+  fs.writeFileSync(path.join(base.home, 'state', 'write-gate', 'enabled'), '1');
   const meminfo = path.join(tmpDir(), 'meminfo');
   fs.writeFileSync(meminfo, `MemAvailable: ${8 * 1024 * 1024} kB\n`);
   const spawned = [];
@@ -227,7 +230,8 @@ test('密钥不进 argv：验收轮、修正轮 pi、预检拼出来的 bwrap �
     runRound: (argv) =>
       argv[0] === 'start'
         ? { code: 0, stdout: `派发消息\n${JSON.stringify(claim)}\n`, stderr: '' }
-        : { code: 0, stdout: `${JSON.stringify({ stalled: false })}\n`, stderr: '' },
+        : { code: 0, stdout: `${JSON.stringify({ round: 1, status: '通过', stalled: false })}\n`, stderr: '' },
+    prefetch: async () => [],
     startGate: async ({ socketPath }) => {
       fs.mkdirSync(path.dirname(socketPath), { recursive: true });
       fs.writeFileSync(socketPath, '');

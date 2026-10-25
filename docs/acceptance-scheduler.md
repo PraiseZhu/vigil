@@ -9,6 +9,8 @@
 3. `node watchers/acceptance/bin/round.mjs start --issue <owner/repo#n>`：认领一轮，拿到派发消息。
 4. 用 pi（模型见 #46/#47）跑这条消息；消息从标准输入交给 agent。
 5. 跑的过程中定期 `node watchers/acceptance/bin/round.mjs status --issue <owner/repo#n> --json` 看有没有卡住。卡住时**先结束进程再 abort**：先 kill 掉 agent 进程，等它退出，再 `round.mjs abort`。
+   本仓的宿主（`host/round.mjs`，#47）不信 `status` 的 `stalled`：那是按 `stateDir` 里模型写的 `lastProgressAt` 算的，
+   而 `stateDir` 对沙箱可写、能伪造。宿主自己的卡住判定见第 5 节。
 
 `start` 的标准输出：先打印派发消息，**最后一行**是 JSON（`issue`、`round`、`commentId`、`bodyVersion`）。宿主把除最后一行以外的内容当消息，把最后一行当轮次信息。
 
@@ -37,11 +39,19 @@
 
 ## 5. 卡死的轮次（#44 SC17）
 
-`poll --json` 里带 `stale: true` 的条目表示最新一轮停在「验收中」且超过 `stallMinutes` 没有进度：
+`poll --json` 里带 `stale: true` 的条目表示最新一轮停在「验收中」且超过 `stallMinutes` 没有进度。
+
+「进度」以**宿主观察到的活动**为准（#47 SC11）：宿主跑一轮时盯着 pi 的输出（`pi.log` 在长）和本轮写闸 socket
+上的请求，有活动就把时间写进 `<home>/state/host/progress/<owner>__<repo>__<issue 号>__<轮次>.json`（`<home>/state`
+对沙箱整个遮住，模型写不了）。`poll` 的起算点取轮次评论的创建时间和这个宿主时间里较晚的那个；
+`stateDir` 缓存里模型经 `helper progress` 写的 `lastProgressAt` **只作参考**（输出里的 `modelProgressAt`），
+伪造到未来也延不了期。`helper progress` 本身要经写闸读一次轮次，所以照常写进度仍然算宿主看到的活动。
+输出里的 `lastProgressAt` 是实际用来判定的时间，`hostProgressAt` 是宿主进度文件里的原值（没有就是 `null`）。
 
 - 宿主**没有**这一轮的活进程：直接 `round.mjs abort --reason "卡死：进程不在"`。
 - 宿主**有**活进程：先 kill 进程、等它退出，再 `round.mjs abort`。
 - `abort` 会把轮次评论改成「中断」并写上原因、释放锁；这一轮之后的重开仍由 `poll` 的退避决定。
+- 写闸总开关关着时宿主不 abort（abort 也是写，必被拒），也不起新轮次，只在心跳里记 `gate: disabled`。
 
 ## 6. 有争议、待裁决
 
@@ -162,3 +172,7 @@ done < "$work/refs.txt"
 脚本里没有 `set -e`：单条命令失败只跳过这一条，不拖垮整分钟的调度。循环里的命令都显式 `< /dev/null`，避免它们读走 `while read` 的任务列表。
 
 agent 正常退出后，如果它没把轮次评论改成终态，这一轮会停在「验收中」，超过 `stallMinutes` 没有进度后 `poll` 会把它报成卡死，由第 5 节处理。
+本仓的宿主（`host/round.mjs`）不等这一步：agent 一退（任何退出码）就回读本轮状态，还是第 n 轮「验收中」就当场
+`abort`（原因「pi 退出（code=…）但没写裁决」）并写提醒 `round-failed`；裁决写完 agent 却不退，宽限 2 分钟后先
+SIGTERM 再 SIGKILL；从认领算起超过 `host.json` 的 `maxRoundMinutes`（默认 120）就停掉 agent、`abort`
+（原因「超过总时长上限（N 分钟）」）并写提醒 `round-timeout`。见 [`acceptance-operations.md`](acceptance-operations.md) 第 4 节。

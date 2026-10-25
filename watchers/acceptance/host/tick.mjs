@@ -259,6 +259,10 @@ export async function runTick({
 
   try {
     fs.mkdirSync(paths.hostDir, { recursive: true, mode: 0o700 });
+    // 写闸总开关（#47 SC11）：关着时不起新轮次、不 abort（abort 也是写，必被拒），只在心跳里记一笔，
+    // 不写 write-rejected 提醒（只读期每拍都会碰到，写提醒就是刷屏）。
+    const gateEnabled = fs.existsSync(paths.enabledFile);
+    heartbeat.gate = gateEnabled ? 'enabled' : 'disabled';
     const poll = await run('node', [path.join(repoRoot, 'watchers', 'acceptance', 'bin', 'poll.mjs'), '--json'], {
       env: { ...env, ACCEPTANCE_WATCHER_HOME: home },
       timeoutMs: 120000,
@@ -277,7 +281,7 @@ export async function runTick({
     const registry = readRegistry(paths);
     const byIssue = new Map(registry.map((entry) => [entry.issue, entry]));
 
-    // 2. 卡住的轮次：有活进程先杀，等它退出，再 abort。
+    // 2. 卡住的轮次（poll 按宿主侧进度时间判定）：有活进程先杀，等它退出，再 abort。
     for (const entry of entries.filter((item) => item?.stale)) {
       const record = byIssue.get(entry.issue);
       const piPid = Number(record?.piPid);
@@ -297,6 +301,10 @@ export async function runTick({
           await waitGone(piPid, 2000, sleep);
         }
         reason = '卡死：已结束进程';
+      }
+      if (!gateEnabled) {
+        heartbeat.lastTick.stale.push({ issue: entry.issue, round: entry.round, reason, aborted: false });
+        continue;
       }
       const aborted = await abortRound([
         'abort',
@@ -381,8 +389,8 @@ export async function runTick({
       heartbeat.lastTick.noticeError = String(error?.message || error);
     }
 
-    // 3. 该开始的任务：已在跑的不重开，最多占到空槽数。
-    let free = Math.max(0, MAX_ROUNDS - liveSlotCount(paths));
+    // 3. 该开始的任务：已在跑的不重开，最多占到空槽数；总开关关着就一个都不起。
+    let free = gateEnabled ? Math.max(0, MAX_ROUNDS - liveSlotCount(paths)) : 0;
     for (const entry of entries.filter((item) => item && !item.stale && !item.outOfScope && !item.passedButOpen)) {
       if (free <= 0) break;
       const record = byIssue.get(entry.issue);

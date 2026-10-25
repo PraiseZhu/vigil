@@ -177,7 +177,7 @@ function resolveHomeAllow(hostHomeReal, homeAllow, maskDirs) {
  * hostHome 必填：没有它就没法默认遮掉 HOME，直接抛错，不退回只遮名单的老做法。
  */
 export function buildBwrapArgs(options = {}) {
-  const { home, profile, roundDir, masks, binds, hostHome, homeAllow } = options;
+  const { home, profile, roundDir, masks, binds, hostHome, homeAllow, readOnlyBinds } = options;
   // 环境变量不再进 bwrap 的参数（--setenv 的值会出现在 /proc/<pid>/cmdline，ps 看得见 LLM key）：
   // 调用方把 sandboxEnv() 的结果作为 spawn 的 env 交给 bwrap 进程本身，bwrap 不加 --clearenv，子进程原样继承。
   if (Object.prototype.hasOwnProperty.call(options, 'env')) {
@@ -241,6 +241,22 @@ export function buildBwrapArgs(options = {}) {
   }
 
   const allowList = resolveHomeAllow(hostHomeReal, homeAllow, maskDirs);
+  // 只读挂载（宿主预取的代码，#47 SC11）：挂在可写绑定之后，所以落在 roundDir 里也是只读；遮罩仍然最后挂。
+  const readOnlyList = [];
+  for (const entry of readOnlyBinds || []) {
+    if (typeof entry !== 'string' || !path.isAbsolute(entry)) throw new Error(`只读挂载必须是绝对路径：${entry}`);
+    const real = realExisting(entry);
+    if (!real) throw new Error(`只读挂载不存在：${entry}`);
+    for (const maskDir of maskDirs) {
+      if (isInside(real, maskDir) || isInside(maskDir, real)) {
+        throw new Error(`沙箱拒绝：只读挂载 ${entry} 与遮罩目录 ${maskDir} 重叠`);
+      }
+    }
+    for (const maskFile of maskFiles) {
+      if (isInside(maskFile, real)) throw new Error(`沙箱拒绝：遮罩文件 ${maskFile} 落在只读挂载 ${entry} 里`);
+    }
+    if (!readOnlyList.includes(real)) readOnlyList.push(real);
+  }
 
   const args = [
     '--die-with-parent',
@@ -267,6 +283,7 @@ export function buildBwrapArgs(options = {}) {
   args.push('--tmpfs', hostHomeReal);
   for (const dir of allowList) args.push('--ro-bind', dir, dir);
   for (const bind of bindList) args.push('--bind', bind, bind);
+  for (const dir of readOnlyList) args.push('--ro-bind', dir, dir);
   // HOME 里没挂回来的遮罩目标本来就在空 tmpfs 下面、读不到；再挂一次反而要在 tmpfs 里造挂载点，跳过。
   // /run 下面同理（整个已是空 tmpfs）。
   const hidden = [hostHomeReal, ...systemTmpfs];

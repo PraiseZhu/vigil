@@ -20,7 +20,8 @@
 | 资源门 | `host/round.mjs` | 认领**之前**过内存门（MemAvailable ≥ 3 GiB）和测试锁（mivo 同时只跑一轮）；最多 2 轮同时跑 |
 | 写闸 | `host/write-gate.mjs` | 所有写动作在沙箱外再查一遍，以它为准（见第 3 节） |
 | 模型 | `host/round.mjs` + `<home>/config/host.json` | pi 用 **DeepSeek V4.1 Flash**，推理 **max**；有争议条目的裁决运行用 `anthropic/claude-opus-5-5`，推理 **medium** |
-| 卡住 | `host/tick.mjs`、`host/round.mjs` | `round.mjs status` 报卡住时**先结束进程，再 `round.mjs abort`** |
+| 卡住 | `host/tick.mjs`、`host/round.mjs` | 按**宿主观察到的活动**判卡住（见第 4 节「轮次生命周期」）；卡住时**先结束进程，再 `round.mjs abort`** |
+| 代码 | `host/prefetch.mjs` | 认领之后、起 pi 之前，宿主把本轮任务树里每个仓的 main 检出好，只读挂进沙箱（见第 4 节） |
 | 提醒 | `state/host/alerts.jsonl` | 本 issue 只**发现**并写文件，不调 Slack（见第 7 节） |
 
 `<home>/config/host.json` 至少要有 `piCommand`（消息从标准输入喂给它）：
@@ -30,7 +31,8 @@
   "piCommand": ["pi", "--model", "<model id>", "--thinking", "max"],
   "credentialDirs": ["<可选：额外要遮罩的绝对目录>"],
   "homeAllowDirs": ["<可选：沙箱里要只读看到的 HOME 内目录，比如 pi 的安装目录、pi 配置副本目录>"],
-  "egressAllow": ["github.com:443", "codeload.github.com:443", "<LLM 网关 host>:443"]
+  "egressAllow": ["github.com:443", "codeload.github.com:443", "<LLM 网关 host>:443"],
+  "maxRoundMinutes": 120
 }
 ```
 
@@ -38,6 +40,8 @@
 LLM 网关的 host 取 pi 的 `models.json` 里 `baseUrl` 的主机名；`git clone https://github.com/<公开仓>`
 要 `github.com:443` 和 `codeload.github.com:443`。**不配就是空名单，pi 连不上模型网关，这一轮跑不起来。**
 写错（通配、URL、缺端口）整轮直接起不来，不会悄悄放宽。
+
+`maxRoundMinutes` 可选：一轮的总时长上限（分钟，宿主墙钟，从认领算起），缺了或不是正数按 120。
 
 未知键一律忽略；写 `"sandbox": false` 或 `"noSandbox": true` **没有任何作用**——沙箱只有一条路。
 
@@ -164,9 +168,13 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 
 `host/round.mjs` 是**唯一**起 pi 的入口，pi 一定在 `bwrap` 里：
 
+- 认领之前先看写闸总开关、再跑 bwrap 探针：总开关关着就不认领、**不写**提醒（只读期每拍都会碰到，
+  写提醒就是刷屏），心跳里记 `gate: disabled`；探针不过就不认领（issue 上不会多一对「验收中 → 中断」评论），
+  写一条 `sandbox-down` 提醒，一小时内只写一条。
+
 - pi 起来之后宿主出错（查进度失败等）：先结束 pi（SIGTERM，宽限期后 SIGKILL），再 `abort`
   （原因「宿主出错：…」，提醒 `round-failed`），最后才收写闸。
-- bwrap 不在、探针失败、参数拼不出来 → 不跑模型，这一轮 `abort` 成「中断」（原因「沙箱起不来：…」），
+- 认领之后沙箱参数拼不出来 → 不跑模型，这一轮 `abort` 成「中断」（原因「沙箱起不来：…」），
   并写一条提醒（`sandbox-unavailable`）。
 - **没有任何环境变量或配置项能关掉沙箱**（`PI_NO_SANDBOX`、`ACCEPTANCE_NO_SANDBOX`、`host.json` 的
   `sandbox`/`noSandbox` 都无效）：代码里根本没有「不套 bwrap 跑 pi」这条路径。
@@ -217,6 +225,33 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 - `profile.stateDir` 或 `worktreeDir` 与 `<home>/state` 相互包含、或遮罩文件落在可写绑定里、
   可写绑定是宿主 `HOME` 本身或它的上级，直接拒绝（起不来）。
 
+### 代码预取（私有 / internal 仓）
+
+沙箱里没有凭证，组织的 internal 仓在沙箱里 `git clone` 不下来。所以认领之后、起 pi 之前，宿主替这一轮准备代码：
+
+- 仓的范围：本轮任务树（总 issue、子 issue、修正 issue、关联 PR）涉及的仓，只取分档名单里的，最多 8 个；公开仓也走这条路。
+- 带令牌的 fetch 只在宿主自己的镜像里跑，复用修正轮的那一套：镜像在 `<home>/state/prbot/mirrors/acceptance__<owner>__<repo>`
+  （`<home>/state` 对沙箱遮住），目录检查、`github.fetchBranch`（令牌只在 `extraheader` 里、钩子 / 代理 / 凭据助手全关、
+  只许 https、10 分钟超时、2 GiB 上限）都和修正轮一样。同一个镜像同时只取一份（`state/host/locks/mirror-*.lock`）。
+- 宿主从镜像把 main 检出到 `<roundDir>/code/<owner>__<repo>`（新建目录、带 `.git`，配置里没有令牌），
+  以 `--ro-bind` 挂进沙箱（挂在可写绑定之后，所以落在可写的 `roundDir` 里也是只读）。
+- 派发消息末尾的「代码」一节写明每个仓的绝对路径；`SESSION.md` 让 pi 直接读，要可写副本就复制到 `TMPDIR`。
+- 任何一个仓取不下来：这一轮 `abort`（原因「代码预取失败：…」），写提醒 `prefetch-failed`，不起 pi。
+- 轮次收尾时 `roundDir` 里除 `pi.log` 外都清掉（含检出的代码）；镜像留着，下一轮只是增量取。
+
+### 轮次生命周期
+
+- **卡住**以宿主观察到的活动为准：宿主每个查进度的间隔看一次 `pi.log` 有没有长，并经一层转发 socket 数本轮写闸请求
+  （沙箱里看到的 `<roundDir>/gate/gate.sock` 是宿主这一层，原样转给 `state/host/gates/` 下的写闸 serve，放行与否仍只由写闸决定）。
+  有活动就刷新 `state/host/progress/<owner>__<repo>__<issue 号>__<轮次>.json`。超过 `stallMinutes` 没有活动：先结束 pi，
+  再 `abort`（原因「卡住：超过 stallMinutes 没有进度」），提醒 `round-stalled`。`stateDir` 里模型写的 `lastProgressAt`
+  只作参考，延不了期；tick 的卡死判定（`poll` 的 `stale`）用的也是这份宿主时间。
+- **pi 退出**（任何退出码）：立即回读本轮状态。还是第 n 轮「验收中」→ `abort`（原因「pi 退出（code=…）但没写裁决」），
+  提醒 `round-failed`；已是终态 → 正常收尾。
+- **裁决写完 pi 不退**：宽限 2 分钟后先 SIGTERM、再 SIGKILL，收尾，不改裁决。
+- **总时长上限**：从认领算起超过 `maxRoundMinutes`（默认 120）→ 停 pi、`abort`（原因「超过总时长上限（N 分钟）」），
+  提醒 `round-timeout`。pi 一直有输出也逃不过这一条。
+
 ## 5. 提醒与通知的分工
 
 本 issue 的提醒只**发现**：调度循环停摆、轮次卡住或卡死、写闸拒绝、扫到密钥、沙箱起不来，
@@ -228,8 +263,8 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
   见 [`docs/acceptance-slack.md`](acceptance-slack.md)。
 - **验收结论不发通知**：通过/要修、中断都只在 GitHub 的轮次评论和看板里。
 
-常见 `kind`：`loop-restarted`、`tick-failed`、`round-stale`、`round-stalled`、`sandbox-unavailable`、
-`gate-unavailable`、`gate-rejected`、`secret-found`、`write-rejected`、`egress-denied`。
+常见 `kind`：`loop-restarted`、`tick-failed`、`round-stale`、`round-stalled`、`round-failed`、`round-timeout`、
+`prefetch-failed`、`sandbox-down`、`sandbox-unavailable`、`gate-unavailable`、`gate-rejected`、`secret-found`、`write-rejected`、`egress-denied`。
 
 ## 6. 上线顺序
 
@@ -259,7 +294,7 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
    ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/round.mjs --issue <owner/repo#n>
    ```
 
-   写闸总开关关着时这一轮会被拒（`write-rejected`），看提醒和日志确认链路通。
+   写闸总开关关着时这一轮不认领、直接退出 3（不写提醒）；心跳里是 `gate: disabled`。
 6. **打开总开关，让常驻循环每分钟调度**：
 
    ```sh
@@ -330,7 +365,9 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 | 现象 | 先看 | 处理 |
 |---|---|---|
 | 心跳不更新 | `state/host/heartbeat.json` 的 `at`/`lastTick.error` | 跑 `ensure.sh`；还不行看 `loop.log`，`stop.sh` 后重起 |
-| 轮次一直「验收中」 | `round.mjs status --issue <ref> --json` 的 `stalled` | 等调度先杀进程再 abort；要手动就 `abort --reason` |
+| 轮次一直「验收中」 | `state/host/progress/` 里这一轮的 `lastActivityAt`（`round.mjs status` 的 `stalled` 按模型写的时间算，只作参考） | 等调度先杀进程再 abort；要手动就 `abort --reason` |
+| `prefetch-failed` | 提醒的 `reason`（哪个仓）、`state/prbot/mirrors/acceptance__*` | 多半是令牌看不到这个仓或网络问题；`doctor` 的「仓可读」先过 |
+| `sandbox-down` | `bwrap --ro-bind / / true` | 修好 bwrap 之前不会认领；提醒一小时一条 |
 | 所有写都被拒 | `alerts.jsonl` 的 `gate-rejected` | 看 `reason`：`gate-disabled` → 建开关文件；`not-current-round` → 轮次已结束 |
 | `sandbox-unavailable` | `pi.log`、`gate.log` | `bwrap --ro-bind / / true` 跑一下；参数拼错看 detail（含 `egressAllow` 写法不对） |
 | `egress-denied` | 提醒里的 `reason`（被拒的 `host:port`）和 `detail`（`not-allowed` / `not-connect` / `blocked-address`） | 该放行就把 `host:port` 加进 `host.json` 的 `egressAllow`；不该放行的说明模型在往外连别处，看 `pi.log` |

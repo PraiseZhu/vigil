@@ -70,18 +70,35 @@ export function shouldTrigger(task, { now, profile }) {
   return { trigger: false, reason: 'up-to-date' };
 }
 
-export function stalledRounds(task, { now, profile, lastProgressAt }) {
+/**
+ * 卡死判定（#47 SC11）：以宿主观察到的活动为准。
+ * - `hostProgressAt`：宿主写在 <home>/state/host/progress 下的最近活动时间（pi 输出增长、本轮写闸请求），
+ *   沙箱看不到也写不了那个目录。
+ * - `lastProgressAt`：模型经 helper progress 写进 stateDir 缓存的时间。stateDir 对沙箱可写、能被伪造，
+ *   **只作参考，不能把轮次往后延**：起算点取轮次评论的创建时间和宿主时间里较晚的那个。
+ * 宿主时间晚于 now（不该发生）按 now 算，不让它把轮次延到未来。
+ */
+export function stalledRounds(task, { now, profile, hostProgressAt, lastProgressAt } = {}) {
   const latest = latestRound(task.rounds);
   if (!latest || latest.status !== '验收中') return null;
-  const progressAt = lastProgressAt || latest.createdAt;
-  if (!progressAt) return null;
+  const nowMs = now();
+  let effective = null;
+  for (const stamp of [latest.createdAt, hostProgressAt]) {
+    const ms = Date.parse(stamp || '');
+    if (!Number.isFinite(ms)) continue;
+    const clamped = Math.min(ms, nowMs);
+    if (effective === null || clamped > effective) effective = clamped;
+  }
+  if (effective === null) return null;
   const stallMs = (profile.stallMinutes ?? 30) * 60 * 1000;
-  if (now() - Date.parse(progressAt) <= stallMs) return null;
+  if (nowMs - effective <= stallMs) return null;
   return {
     issue: task.ref,
     round: latest.round,
     stale: true,
-    lastProgressAt: progressAt,
+    lastProgressAt: new Date(effective).toISOString(),
+    hostProgressAt: hostProgressAt || null,
+    modelProgressAt: lastProgressAt || null,
     commentId: latest.commentId,
   };
 }

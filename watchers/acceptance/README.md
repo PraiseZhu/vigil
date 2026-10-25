@@ -106,7 +106,8 @@ stdout 是 JSON 数组。该开始的任务：
 | `host/ensure.sh` | 每小时巡检：心跳不超过 180 秒就不做事，否则拉起循环并写一条提醒 |
 | `host/stop.sh` | 停常驻循环（按心跳里的 pid）；回滚用 `host/rollback.mjs` |
 | `host/tick.mjs` | 一拍调度：沙箱外跑 `poll.mjs` → 卡住先杀进程再 abort → 按空槽起轮次 → 写心跳 |
-| `host/round.mjs` | 一轮验收：内存门、槽/测试锁、认领、写闸 serve、bwrap 里跑 pi |
+| `host/round.mjs` | 一轮验收：内存门、槽/测试锁、总开关与 bwrap 探针（认领前）、认领、预取代码、写闸 serve、bwrap 里跑 pi、按宿主观察到的活动判卡住、总时长上限 |
+| `host/prefetch.mjs` | 认领后替本轮检出任务树里每个仓的 main（宿主镜像 fetch，凭证不进沙箱），只读挂进沙箱 |
 | `host/write-gate.mjs` | 写闸：exec / serve / probe 三种用法，所有写动作在沙箱外再查一遍 |
 | `host/gate-client.mjs` | 沙箱里的 `writeCommand`：动作 JSON 经 unix socket 交给写闸 |
 | `host/sandbox.mjs` | bwrap 参数（独立网络命名空间、`/run` 盖空、宿主 HOME 默认遮掉、白名单只读挂回）、遮罩名单（从 profile 算）、环境变量白名单（经 spawn 的 env 传，不进命令行） |
@@ -117,5 +118,5 @@ stdout 是 JSON 数组。该开始的任务：
 | `bin/doctor.mjs` | 部署检查：缺哪项报哪项，退出码非 0 |
 
 宿主状态都在 `<home>/state/` 下：`write-gate/enabled`（总开关）、`write-gate/ledger.jsonl`（去重账本）、
-`host/heartbeat.json`（心跳）、`host/alerts.jsonl`（提醒，一行一条）、`host/rounds/`（在跑的轮次）。
+`host/heartbeat.json`（心跳）、`host/alerts.jsonl`（提醒，一行一条）、`host/rounds/`（在跑的轮次）、`host/progress/`（宿主观察到的轮次活动，卡住判定以它为准）。
 提醒只写文件、不调 Slack（发 Slack 归 #61）。

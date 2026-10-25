@@ -27,6 +27,12 @@ export function hostPaths(home) {
     heartbeatFile: path.join(hostDir, 'heartbeat.json'),
     loopLock: path.join(hostDir, 'loop.lock'),
     roundsDir: path.join(hostDir, 'rounds'),
+    // 宿主观察到的轮次活动（#47 SC11）：在 <home>/state 下，沙箱被遮住，模型写不了。
+    progressDir: path.join(hostDir, 'progress'),
+    // 写闸 serve 的内层 socket（按槽位命名，路径短）：沙箱只看得到宿主转发的那个 socket。
+    gateSocketsDir: path.join(hostDir, 'gates'),
+    sandboxDownFile: path.join(hostDir, 'sandbox-down.json'),
+    locksDir: path.join(hostDir, 'locks'),
     slotsDir: path.join(hostDir, 'slots'),
     testLock: path.join(hostDir, 'locks', 'mivo-test.lock'),
     prbotDir,
@@ -38,6 +44,43 @@ export function hostPaths(home) {
     loopLog: path.join(hostDir, 'loop.log'),
     roundRunDir: path.join(home, 'run'),
   };
+}
+
+function progressKey(issue, round) {
+  const match = /^([^/\s]+)\/([^#\s]+)#(\d+)$/.exec(String(issue || ''));
+  if (!match || !Number.isInteger(Number(round)) || Number(round) <= 0) return null;
+  return `${match[1]}__${match[2]}__${match[3]}__${Number(round)}`;
+}
+
+/** 一轮的宿主进度文件：<home>/state/host/progress/<owner>__<repo>__<issue 号>__<轮次>.json。 */
+export function progressFileFor(paths, issue, round) {
+  const key = progressKey(issue, round);
+  return key ? path.join(paths.progressDir, `${key}.json`) : null;
+}
+
+/** 写宿主进度（原子替换）。`lastActivityAt` 是宿主最近一次看到 pi 输出增长或写闸请求的时间。 */
+export function writeRoundProgress(paths, entry) {
+  const file = progressFileFor(paths, entry?.issue, entry?.round);
+  if (!file) throw new Error('writeRoundProgress 需要 issue 和轮次');
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(entry, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return file;
+}
+
+/** 读宿主进度；没有、坏了、轮次对不上都返回 null（调用方回落到轮次评论的创建时间）。 */
+export function readRoundProgress(paths, issue, round) {
+  const file = progressFileFor(paths, issue, round);
+  if (!file) return null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Number(parsed.round) !== Number(round)) return null;
+    if (!Number.isFinite(Date.parse(parsed.lastActivityAt || ''))) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 /** 进程还活着吗。EPERM 表示进程在、只是不是我的，也算活。 */
