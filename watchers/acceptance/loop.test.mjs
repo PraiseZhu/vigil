@@ -51,6 +51,7 @@ function makeHostCopy(home, tickLog) {
   fs.writeFileSync(
     path.join(dir, 'tick.mjs'),
     `#!/usr/bin/env node
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 const home = process.env.ACCEPTANCE_WATCHER_HOME;
@@ -61,6 +62,13 @@ fs.writeFileSync(
   path.join(stateHost, 'heartbeat.json'),
   JSON.stringify({ at: new Date().toISOString(), pid: process.ppid, lastTick: { ok: true, started: [], stale: [] }, running: [] }),
 );
+// 测试开关：模拟 tick 拉起的长轮次（脱离出去、比 loop 活得久），把 pid 记到 rounds.log。
+const roundSeconds = Number(process.env.FAKE_ROUND_SECONDS || 0);
+if (roundSeconds > 0) {
+  const round = spawn('sleep', [String(roundSeconds)], { detached: true, stdio: 'ignore' });
+  fs.appendFileSync(${JSON.stringify(tickLog)} + '.rounds', round.pid + '\\n');
+  round.unref();
+}
 setTimeout(() => process.exit(0), 3000);
 `,
   );
@@ -206,6 +214,40 @@ test('SC12 ensure.sh：心跳过期的拉起循环并写一条提醒；连跑两
 
   for (const line of tickLines(tickLog)) killQuiet(Number(line.split(':')[1]));
   for (const pid of new Set(tickLines(tickLog).map((line) => line.split(':')[0]))) killQuiet(Number(pid));
+});
+
+test('SC12 停掉 loop 后，残留的子进程（在跑的轮次、sleep）不占单实例锁：ensure.sh 马上能拉起新循环', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const tickLog = path.join(home, 'tick.log');
+  knownTickLogs.add(tickLog);
+  const hostCopy = makeHostCopy(home, tickLog);
+  const paths = hostPaths(home);
+  const roundsLog = `${tickLog}.rounds`;
+  const roundPids = () => tickLines(roundsLog).map(Number);
+  try {
+    // 用 ensure.sh 起（和部署一样是 setsid 起的），假 tick 每拍拉起一个活 30 秒的「轮次」。
+    const first = await runScript(path.join(hostCopy, 'ensure.sh'), home, { FAKE_ROUND_SECONDS: '30' });
+    assert.equal(first.code, 0, first.stderr);
+    assert.ok(await waitFor(() => roundPids().length >= 1), '假 tick 要拉起一个轮次');
+    const firstLoop = Number(tickLines(tickLog)[0].split(':')[0]);
+
+    // 照 stop.sh 的做法停：只杀心跳里的 loop pid。轮次和 tick 都还活着。
+    const stopped = await runScript(path.join(hostCopy, 'stop.sh'), home);
+    assert.equal(stopped.code, 0, stopped.stderr);
+    assert.ok(await waitFor(() => !isAlive(firstLoop), 3000), 'loop 要真的退出');
+    assert.ok(isAlive(roundPids()[0]), '前提：轮次还在跑');
+
+    const again = await runScript(path.join(hostCopy, 'ensure.sh'), home);
+    assert.equal(again.code, 0, again.stderr);
+    assert.ok(
+      await waitFor(() => new Set(tickLines(tickLog).map((line) => line.split(':')[0])).size >= 2, 2500),
+      `轮次还在跑时新循环也要起得来；loop.log：${fs.existsSync(paths.loopLog) ? fs.readFileSync(paths.loopLog, 'utf8') : ''}`,
+    );
+  } finally {
+    for (const pid of roundPids()) killQuiet(pid);
+    for (const line of tickLines(tickLog)) killQuiet(Number(line.split(':')[1]));
+    for (const pid of new Set(tickLines(tickLog).map((line) => line.split(':')[0]))) killQuiet(Number(pid));
+  }
 });
 
 test('SC12 tick 写心跳：时间、pid、上一拍结果、在跑的轮次', async () => {
