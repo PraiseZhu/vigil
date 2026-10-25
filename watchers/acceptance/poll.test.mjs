@@ -309,3 +309,54 @@ test('SC16 静态：夹具用占位名，源码不含真实令牌头', () => {
 
 void collectTasks;
 void createRounds;
+
+// ---- 伪造轮次评论（盘点、触发、退避、卡死判断这几条路径）----
+const STRANGER = 'SomeStranger';
+
+function strangerPoll(comments, { now = '2026-10-24T03:04:00.000Z' } = {}) {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const parent = issueNode({
+    number: 1,
+    body: 'p',
+    comments,
+    subIssues: [childNode({ number: 2, state: 'CLOSED', closedAt: '2026-10-20T00:00:00.000Z' })],
+  });
+  const run = createFakeRun({ onGraphql: () => inventoryData({ open: [parent] }) });
+  const github = createGithub({ profile, run });
+  return poll({ github, profile, now: () => Date.parse(now) });
+}
+
+test('安全 别人伪造的「通过」不压住触发，伪造的超大轮次号不改下一轮编号', async () => {
+  const out = await strangerPoll([
+    roundComment({
+      round: 424242,
+      status: '通过',
+      author: STRANGER,
+      bodyVersion: bodyVersion('p'),
+      finishedAt: '2026-10-24T03:00:00.000Z',
+    }),
+  ]);
+  const entry = out.find((e) => e.issue === `${REPO}#1` && !e.stale);
+  assert.ok(entry, '伪造的通过不应压住触发');
+  assert.equal(entry.nextRound, 1);
+});
+
+test('安全 别人伪造的「验收中」不产生卡死轮次，也不挡触发', async () => {
+  const out = await strangerPoll([
+    roundComment({ round: 5, status: '验收中', author: STRANGER, createdAt: '2026-10-23T00:00:00.000Z' }),
+  ]);
+  assert.equal(out.filter((e) => e.stale).length, 0);
+  assert.equal(out.filter((e) => !e.stale && e.issue === `${REPO}#1`).length, 1);
+});
+
+test('安全 别人伪造的「中断」不触发退避', async () => {
+  const out = await strangerPoll([
+    roundComment({ round: 1, status: '要修', bodyVersion: 'sha256:old', finishedAt: '2026-10-22T00:00:00.000Z', createdAt: '2026-10-22T00:00:00.000Z' }),
+    roundComment({ round: 2, status: '中断', author: STRANGER, finishedAt: '2026-10-24T02:00:00.000Z', createdAt: '2026-10-24T01:50:00.000Z', databaseId: 2222 }),
+    roundComment({ round: 3, status: '中断', author: STRANGER, finishedAt: '2026-10-24T03:00:00.000Z', createdAt: '2026-10-24T02:50:00.000Z', databaseId: 3333 }),
+  ]);
+  const entry = out.find((e) => e.issue === `${REPO}#1` && !e.stale);
+  assert.ok(entry, '伪造的中断不应让任务进退避');
+  assert.equal(entry.nextRound, 2);
+});

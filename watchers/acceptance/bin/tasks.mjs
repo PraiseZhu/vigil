@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 // 盘点：一次 GraphQL 拉开放/关闭 issue，组成我建的任务树，并按名单分档。
-import crypto from 'node:crypto';
-import { parseRounds } from './rounds.mjs';
+import { bodyVersion, parseRounds } from './rounds.mjs';
 
 const ISSUE_FIELDS = `id
         number
@@ -84,16 +83,8 @@ export function repoTier(repo, profile) {
   return null;
 }
 
-/** 正文版本：每行去掉行尾空白，再去掉末尾空行，再 sha256。 */
-export function bodyVersion(body) {
-  const text = body == null ? '' : String(body);
-  const normalized = text
-    .split('\n')
-    .map((line) => line.replace(/[ \t\r]+$/g, ''))
-    .join('\n')
-    .replace(/\n+$/g, '');
-  return `sha256:${crypto.createHash('sha256').update(normalized, 'utf8').digest('hex')}`;
-}
+export { bodyVersion };
+
 
 function loginOf(author) {
   return String(author?.login || '');
@@ -156,7 +147,7 @@ function toTask(issue, profile) {
       mergedAt: pr.mergedAt || null,
       url: pr.url,
     })),
-    rounds: parseRounds(issue.comments?.nodes || []),
+    rounds: parseRounds(issue.comments?.nodes || [], profile.ownerLogin),
   };
 }
 

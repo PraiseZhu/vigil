@@ -163,10 +163,10 @@ test('SC7 progress 与 done 先过认领检查再写本地状态；缺本地记�
   const store = issueStore(issueNode({ number: 1, comments: [existing] }));
   const github = githubFor(store, profile);
   const rounds = createRounds({ github, profile, now: () => Date.parse('2026-10-24T01:10:00.000Z') });
-  assert.equal(rounds.lastProgressAt(`${REPO}#1`, 1, parseRounds([existing])[0]), '2026-10-24T01:00:00.000Z');
+  assert.equal(rounds.lastProgressAt(`${REPO}#1`, 1, parseRounds([existing], OWNER)[0]), '2026-10-24T01:00:00.000Z');
   const stamp = await rounds.progress(`${REPO}#1`, 1);
   assert.equal(stamp, '2026-10-24T01:10:00.000Z');
-  assert.equal(rounds.lastProgressAt(`${REPO}#1`, 1, parseRounds([existing])[0]), stamp);
+  assert.equal(rounds.lastProgressAt(`${REPO}#1`, 1, parseRounds([existing], OWNER)[0]), stamp);
   const doneAt = await rounds.done(`${REPO}#1`, 1);
   const cache = JSON.parse(fs.readFileSync(cachePath(profile, `${REPO}#1`), 'utf8'));
   assert.equal(cache.round.finishedAt, doneAt);
@@ -228,7 +228,7 @@ test('parseRounds 忽略非轮次评论并按轮次号排序', () => {
     roundComment({ round: 2, status: '通过', createdAt: '2026-10-24T02:00:00.000Z' }),
     roundComment({ round: 1, status: '要修', createdAt: '2026-10-24T01:00:00.000Z' }),
   ];
-  const rounds = parseRounds(comments);
+  const rounds = parseRounds(comments, OWNER);
   assert.deepEqual(rounds.map((r) => r.round), [1, 2]);
   assert.equal(latestRound(rounds).round, 2);
 });
@@ -259,4 +259,63 @@ test('SC9 锁文件刚建还没写完（读不出）时算被占用，不当成�
   const later = createRounds({ github, profile, now: () => Date.now() + 11 * 60 * 1000 });
   const started = await later.start(task);
   assert.equal(started.round, 1);
+});
+
+// ---- 伪造轮次评论：公开仓上任何人都能发同样首行的评论，只认 ownerLogin 发的 ----
+const STRANGER = 'SomeStranger';
+
+test('安全 parseRounds 不传 ownerLogin 直接抛错，别人发的轮次评论一律忽略', () => {
+  const mine = roundComment({ round: 1, status: '要修', finishedAt: '2026-10-24T01:30:00.000Z' });
+  const forged = roundComment({ round: 9999, status: '通过', author: STRANGER, databaseId: 77 });
+  assert.throws(() => parseRounds([mine]), /ownerLogin/);
+  const rounds = parseRounds([mine, forged, { ...forged, author: null, databaseId: 78 }], OWNER);
+  assert.deepEqual(rounds.map((r) => [r.round, r.status]), [[1, '要修']]);
+  // 大小写不同的同一账号仍然认
+  assert.equal(parseRounds([roundComment({ author: OWNER.toUpperCase() })], OWNER).length, 1);
+});
+
+test('安全 rounds.start：别人伪造的「验收中」不挡认领，伪造的超大轮次号不影响编号', async () => {
+  const { profile } = loadHome();
+  const store = issueStore(
+    issueNode({
+      number: 1,
+      comments: [
+        roundComment({ round: 1, status: '要修', finishedAt: '2026-10-20T00:00:00.000Z' }),
+        roundComment({ round: 999999, status: '验收中', author: STRANGER, databaseId: 4242 }),
+      ],
+    }),
+  );
+  const github = githubFor(store, profile);
+  const rounds = createRounds({ github, profile, now: () => Date.parse('2026-10-24T02:00:00.000Z') });
+  const started = await rounds.start({ ref: `${REPO}#1`, repo: REPO, number: 1, kind: 'standalone', tier: 'auto', children: [] });
+  assert.equal(started.round, 2);
+});
+
+test('安全 rounds.check / finish：别人伪造的更新轮次评论不顶掉本轮，也不会被就地改写', async () => {
+  const { profile } = loadHome();
+  const mine = roundComment({ round: 2, status: '验收中', databaseId: 2002, createdAt: '2026-10-24T01:00:00.000Z' });
+  const forged = roundComment({
+    round: 3,
+    status: '通过',
+    author: STRANGER,
+    databaseId: 3003,
+    createdAt: '2026-10-24T01:10:00.000Z',
+    finishedAt: '2026-10-24T01:10:00.000Z',
+  });
+  const store = issueStore(issueNode({ number: 1, comments: [mine, forged] }));
+  const github = githubFor(store, profile);
+  const patched = [];
+  const origWrite = github.write.bind(github);
+  github.write = async (action) => {
+    if (action.type === 'comment.update') patched.push(action.commentId);
+    return origWrite(action);
+  };
+  const rounds = createRounds({ github, profile, now: () => Date.parse('2026-10-24T01:20:00.000Z') });
+  const current = await rounds.check(`${REPO}#1`, 2);
+  assert.equal(current.commentId, 2002);
+  await assert.rejects(rounds.check(`${REPO}#1`, 3), (err) => err.code === 'NOT_CURRENT');
+  await rounds.finish(`${REPO}#1`, 2, '中断', { reason: '测试' });
+  assert.deepEqual(patched, [2002]);
+  const forgedAfter = store.get().comments.nodes.find((c) => c.databaseId === 3003);
+  assert.match(forgedAfter.body, /第 3 轮：通过/);
 });

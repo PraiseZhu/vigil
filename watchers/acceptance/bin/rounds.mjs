@@ -85,10 +85,19 @@ function lineValue(body, label) {
   return match ? match.slice(label.length + 1).trim() : null;
 }
 
-/** 解析轮次评论，按轮次号升序。 */
-export function parseRounds(comments) {
+/**
+ * 解析轮次评论，按轮次号升序。
+ * 只认 ownerLogin 发的评论：公开仓上任何人都能发同样首行的评论，别人的一律当普通评论忽略。
+ * 不传 ownerLogin 直接抛错（宁可停，不可误认）。
+ */
+export function parseRounds(comments, ownerLogin) {
+  if (typeof ownerLogin !== 'string' || !ownerLogin) {
+    throw new Error('parseRounds 需要 ownerLogin：只认我自己发的轮次评论');
+  }
+  const owner = ownerLogin.toLowerCase();
   const rounds = [];
   for (const comment of comments || []) {
+    if (String(comment?.author?.login || '').toLowerCase() !== owner) continue;
     const first = String(comment.body || '').split('\n')[0] || '';
     const match = FIRST_LINE.exec(first);
     if (!match) continue;
@@ -244,7 +253,7 @@ function maxRound(rounds) {
 export function createRounds({ github, profile, now = () => Date.now() }) {
   async function loadIssueState(ref, { write = true } = {}) {
     const issue = await readIssue(github, ref);
-    const rounds = parseRounds(commentsOf(issue));
+    const rounds = parseRounds(commentsOf(issue), profile.ownerLogin);
     const latest = latestRound(rounds);
     const cache = readIssueCache(profile, ref);
     if (write && latest) {
@@ -263,7 +272,7 @@ export function createRounds({ github, profile, now = () => Date.now() }) {
     const ref = task.ref;
     const file = lockPath(profile, ref);
     const existing = await readIssue(github, ref);
-    const existingRounds = parseRounds(commentsOf(existing));
+    const existingRounds = parseRounds(commentsOf(existing), profile.ownerLogin);
     if (fs.existsSync(file)) {
       if (!lockStale(readJson(file), existingRounds, now, file)) {
         throw new RoundError(`任务 ${ref} 已锁定`, 'LOCKED');
@@ -276,7 +285,7 @@ export function createRounds({ github, profile, now = () => Date.now() }) {
     }
     try {
       const fresh = await readIssue(github, ref);
-      const rounds = parseRounds(commentsOf(fresh));
+      const rounds = parseRounds(commentsOf(fresh), profile.ownerLogin);
       const latest = latestRound(rounds);
       if (latest?.status === '验收中') {
         releaseLock(file);

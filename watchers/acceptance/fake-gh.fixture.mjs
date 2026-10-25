@@ -59,6 +59,7 @@ export function roundComment({
   databaseId = 1000 + round,
   id = `IC_R${round}`,
   url = `https://github.com/${REPO}/issues/1#issuecomment-${1000 + round}`,
+  author = OWNER,
 } = {}) {
   const lines = [`[验收机] 第 ${round} 轮：${status}`, `正文版本：${bodyVersion}`, `开始：${startedAt}`];
   if (finishedAt) lines.push(`完成：${finishedAt}`);
@@ -74,7 +75,7 @@ export function roundComment({
     createdAt,
     updatedAt,
     url,
-    author: { login: 'acceptance-bot' },
+    author: { login: author },
   };
 }
 

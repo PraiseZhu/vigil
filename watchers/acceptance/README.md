@@ -8,7 +8,9 @@
 
 拷一份 [`config/examples/acceptance.profile.example.json`](../../config/examples/acceptance.profile.example.json) 到 watcher home 下的 `config/profile.json`。home 解析：环境变量 `ACCEPTANCE_WATCHER_HOME` > `bin/` 的上一级。**配置键和令牌都不从环境变量读**，缺必填项直接报错。
 
-令牌文件约定：profile 只存路径、不读令牌内容（只看存在、属主、权限正好 600、非空）；GitHub 令牌只在 `bin/github.mjs` 真正发请求时才读。以后新增的令牌键名一律以 `TokenFile` 结尾，`tokenFiles(profile)` 会列出全部，方便宿主沙箱统一遮罩。
+令牌文件约定：profile 只存路径、不读令牌内容（只看存在、属主、权限正好 600、非空）；GitHub 令牌只在 `bin/github.mjs` 真正发请求时才读。以后新增的令牌键名一律以 `TokenFile` 结尾，`tokenFiles(profile)` 会列出全部（连同 App 私钥文件 `appPrivateKeyFile`），方便宿主沙箱统一遮罩。
+
+轮次评论只认 `ownerLogin` 自己发的：公开仓上任何人都能发首行同样的评论，别人发的一律当普通评论忽略（不算认领、不算裁决、不算中断、不参与编号）。
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
