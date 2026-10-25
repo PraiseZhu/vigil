@@ -162,3 +162,103 @@ test('secret-found 文件名里带半角冒号也整段保留；CI 链接只认 
     assert.match(body, /CI 3\/3 绿/);
   }
 });
+
+// ---- #70 复审：通知栏文字（text）和 blocks / 摘要里，事件来的文字都不能变成 @ 或链接 ----
+
+const HOSTILE = '<!channel> <!here> <!subteam^S0BAD> <@U0BADBAD1> <https://evil.example/|打开 PR> @channel @here @everyone';
+const FILES = '<!channel>.txt, @here.js, <https://evil.example/|打开 PR>.md';
+
+/** 每一处会被 Slack 当 mrkdwn 解析的字符串里都不能出现真的提醒 / 链接，裸 @channel 也要拆开。 */
+function assertNoPing(payload, label) {
+  const mrkdwn = [payload.text];
+  const plain = [];
+  const walk = (value) => {
+    if (Array.isArray(value)) return value.forEach(walk);
+    if (!value || typeof value !== 'object') return;
+    if (value.type === 'mrkdwn' && typeof value.text === 'string') mrkdwn.push(value.text);
+    if (value.type === 'plain_text' && typeof value.text === 'string') plain.push(value.text);
+    Object.values(value).forEach(walk);
+  };
+  walk(payload.blocks);
+  for (const text of mrkdwn) {
+    assert.equal(/<[!@]/.test(text), false, `${label}：mrkdwn 里有 <! 或 <@：${text}`);
+    assert.equal(text.includes('<https://evil'), false, `${label}：伪造链接：${text}`);
+    assert.equal(/@(channel|here|everyone)/.test(text), false, `${label}：裸 @ 提醒：${text}`);
+  }
+  for (const text of plain) {
+    assert.equal(/@(channel|here|everyone)/.test(text), false, `${label}：plain_text 里裸 @：${text}`);
+    assert.equal(text.includes('evil'), false, `${label}：标题里有事件原文：${text}`);
+  }
+  // 通知栏文字只用校验过的字段拼：事件原文（原因 / 文件名 / 标题）一个字都不进，连转义后的也没有。
+  for (const word of ['evil', 'channel', 'here.js', 'subteam', 'U0BADBAD1', 'everyone', '伪造标题']) {
+    assert.equal(payload.text.includes(word), false, `${label}：通知栏文字带了事件原文「${word}」：${payload.text}`);
+  }
+}
+
+test('#70 复审：secret-found 的文件名（模型能起成 <!channel>）只进转义过的 blocks，不进通知栏文字', () => {
+  const payload = alertBlocks({ source: 'alerts', kind: 'secret-found', issue: `${REPO}#2`, reason: `branch.push 扫到疑似密钥，没推：${FILES}` });
+  assertNoPing(payload, 'secret-found');
+  assert.match(payload.text, /^扫到疑似密钥，没有推送：example-owner\/example-repo#2｜3 个文件/);
+  assert.match(textOf(payload.blocks), /&lt;!channel&gt;\.txt/, '文件名在 blocks 里还能看到（转义后）');
+});
+
+test('#70 复审：提醒的原因 / 细节 / 伪造 issue 名 / 伪造类型都不进通知栏文字，blocks 里转义', () => {
+  const cases = {
+    reason: { kind: 'gate-rejected', issue: `${REPO}#2`, reason: HOSTILE },
+    detail: { type: 'needs-human', source: 'prbot', issue: `${REPO}#2`, reason: 'no-change', detail: HOSTILE },
+    issueTitle: { type: 'needs-human', source: 'prbot', issue: `${HOSTILE} 伪造标题`, root: `${HOSTILE} 伪造标题`, reason: HOSTILE },
+    badType: { type: '<!channel>', source: 'prbot', issue: `${REPO}#2`, reason: HOSTILE },
+    windowKinds: { kind: 'interrupted-repeat', issue: `${REPO}#2`, windowCount: 2, windowKinds: [HOSTILE], reason: HOSTILE },
+    forgedPr: { kind: 'round-failed', repo: 'evil>|x/y', pr: 3, prUrl: 'https://evil.example/pull/3', issue: HOSTILE, reason: HOSTILE },
+  };
+  for (const [label, event] of Object.entries(cases)) {
+    const payload = alertBlocks(event);
+    assertNoPing(payload, label);
+  }
+  assert.match(textOf(alertBlocks(cases.issueTitle).blocks), /&lt;!channel&gt; .*伪造标题/, '伪造的 issue 名在 blocks 里转义后给出');
+  assert.match(alertBlocks(cases.badType).text, /^验收机提醒：alert/, '不合规的类型当没有');
+});
+
+test('#70 复审：Ready / ready-stalled 缺 repo 或 PR 号时，标题退回合规的 ref，不用事件原文', () => {
+  const variants = {
+    noRepo: { repo: undefined, prUrl: undefined, issue: `${HOSTILE} 伪造标题`, root: `${HOSTILE} 伪造标题` },
+    noPr: { pr: undefined, prUrl: undefined, issue: `${HOSTILE} 伪造标题`, root: `${HOSTILE} 伪造标题` },
+    neither: { repo: undefined, pr: undefined, prUrl: undefined, issue: HOSTILE, root: HOSTILE, readyAt: HOSTILE },
+  };
+  for (const [label, overrides] of Object.entries(variants)) {
+    for (const handoff of ['owner', 'watcher']) {
+      const ready = readyBlocks(readyEvent({ ...overrides, handoff }));
+      assertNoPing(ready, `ready ${label} ${handoff}`);
+      assert.match(ready.text, /^修正 PR 已 Ready：修正 PR｜/, `ready ${label}`);
+    }
+    const stalled = stalledBlocks(readyEvent({ type: 'ready-stalled', readyAt: HOSTILE, ...overrides }));
+    assertNoPing(stalled, `stalled ${label}`);
+    assert.match(stalled.text, /^修正 PR 转 Ready 24 小时没人接：修正 PR｜/, `stalled ${label}`);
+  }
+  // 缺 PR 号但 issue 是合规的 ref：标题用它。
+  const fallback = readyBlocks(readyEvent({ pr: undefined, prUrl: undefined }));
+  assert.match(fallback.text, /^修正 PR 已 Ready：example-owner\/example-repo#2｜/);
+});
+
+test('#70 复审：摘要的 blocks 转义、通知栏文字只有类型和合规的 ref', () => {
+  const payload = digestBlocks([
+    { source: 'alerts', kind: 'gate-rejected', issue: `${REPO}#2`, reason: HOSTILE },
+    { source: 'prbot', type: '<!here>', issue: `${HOSTILE} 伪造标题`, reason: HOSTILE },
+    { source: 'alerts', kind: 'secret-found', issue: `${REPO}#3`, reason: `没推：${FILES}` },
+  ]);
+  assertNoPing(payload, 'digest');
+  assert.match(payload.text, /^验收机摘要（3 条）：gate-rejected example-owner\/example-repo#2；alert；secret-found example-owner\/example-repo#3$/);
+});
+
+test('#70 复审：打开 PR 的链接要 repo 和 PR 号都对得上，任一不对就自己拼', () => {
+  const own = `https://github.com/${REPO}/pull/12`;
+  assert.equal(prLink(readyEvent()).link, own, '都对得上用事件里的');
+  // 只有仓库不对（PR 号一样）。
+  const otherRepo = prLink(readyEvent({ prUrl: 'https://github.com/other-owner/other-repo/pull/12' }));
+  assert.equal(otherRepo.link, own, '仓库不对 → 自己拼');
+  // 只有 PR 号不对（仓库一样）。
+  const otherPr = prLink(readyEvent({ prUrl: `https://github.com/${REPO}/pull/99` }));
+  assert.equal(otherPr.link, own, 'PR 号不对 → 自己拼');
+  const button = buttons(readyBlocks(readyEvent({ prUrl: `https://github.com/${REPO}/pull/99` })))[0];
+  assert.equal(button.url, own);
+});

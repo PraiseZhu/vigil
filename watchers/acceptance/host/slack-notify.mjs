@@ -46,6 +46,12 @@ const MAX_HISTORY_PAGES = 20;
 /** 单次请求最多等这么久：Slack 卡住不能把整拍（以及验收）拖住。 */
 export const REQUEST_TIMEOUT_MS = 15000;
 
+/**
+ * 一次 notifySlack 总共最多花多久（#70 复审）。每个请求的超时取「15 秒」和「预算还剩多少」里小的那个；
+ * 预算用完就停：没发的重试留到下拍、新事件不记成已处理（下拍重新收）、摘要留着，心跳写 notify-budget-exhausted。
+ */
+export const NOTIFY_BUDGET_MS = 30000;
+
 /** 事件 id：`sha256(来源名 + "\n" + 原始行文本)` 前 16 位十六进制。 */
 export function eventId(source, line) {
   return crypto.createHash('sha256').update(`${source}\n${line}`, 'utf8').digest('hex').slice(0, 16);
@@ -341,6 +347,7 @@ async function rebuildFromHistory(ctx, startAtMs) {
   const ids = new Set();
   let cursor = '';
   for (let page = 0; page < MAX_HISTORY_PAGES; page += 1) {
+    if (ctx.remaining && ctx.remaining() <= 0) return { ok: false };
     const query = {
       channel: ctx.channel,
       oldest: String(Math.floor(startAtMs / 1000)),
@@ -413,8 +420,12 @@ export async function notifySlack({
   fetch: fetchImpl = globalThis.fetch,
   apiBase = SLACK_API_BASE,
   requestTimeoutMs = REQUEST_TIMEOUT_MS,
+  budgetMs = NOTIFY_BUDGET_MS,
+  clock = () => performance.now(),
 } = {}) {
-  const summary = { ok: true, sent: 0, digested: 0, pending: 0, failed: [] };
+  const summary = { ok: true, sent: 0, digested: 0, pending: 0, deferred: 0, failed: [] };
+  const deadline = clock() + budgetMs;
+  const remaining = () => deadline - clock();
   const fail = (reason, extra = {}) => ({ ...summary, ok: false, reason, ...extra });
 
   if (typeof home !== 'string' || !path.isAbsolute(home)) return fail('bad-home');
@@ -440,7 +451,17 @@ export async function notifySlack({
   const startAtMs = Date.parse(prof.startAt ?? '');
   if (!Number.isFinite(startAtMs)) return fail('profile-error');
 
-  const ctx = { base: apiBase, token: token.token, channel, fetch: fetchImpl, timeoutMs: requestTimeoutMs };
+  const ctx = {
+    base: apiBase,
+    token: token.token,
+    channel,
+    fetch: fetchImpl,
+    // 每个请求的超时随预算缩短；预算没了 remaining() 是 0，下面不会再发。
+    get timeoutMs() {
+      return Math.max(1, Math.ceil(Math.min(requestTimeoutMs, remaining())));
+    },
+    remaining,
+  };
 
   let ledger = readLedger(home);
   if (!ledger.exists || ledger.broken) {
@@ -474,6 +495,12 @@ export async function notifySlack({
       retryQueue.push(entry);
       continue;
     }
+    if (remaining() <= 0) {
+      // 预算用完：原样留到下拍，不算一次失败。
+      retryQueue.push(entry);
+      summary.deferred += 1;
+      continue;
+    }
     const result = await postMessage(ctx, entry.payload || {});
     if (result.ok) {
       summary.sent += 1;
@@ -489,6 +516,11 @@ export async function notifySlack({
   // 2. 新事件。
   for (const notice of collectCandidates({ home, startAtMs })) {
     if (sentIds.has(notice.id)) continue;
+    if (remaining() <= 0) {
+      // 预算用完：不记成已处理、不动中断窗口，下拍重新收。
+      summary.deferred += 1;
+      continue;
+    }
     let kind = classify(notice.source, notice.event);
     if (kind === 'skip') {
       sentIds.add(notice.id);
@@ -541,7 +573,9 @@ export async function notifySlack({
   } else {
     const dueAt = Date.parse(digestNextAt);
     const due = Number.isFinite(dueAt) ? dueAt : nowMs;
-    if (nowMs >= due) {
+    if (nowMs >= due && remaining() <= 0) {
+      summary.deferred += 1;
+    } else if (nowMs >= due) {
       const payload = digestBlocks(pending, prof);
       payload.ids = pending.map((item) => item.id);
       const result = await postMessage(ctx, payload);
@@ -585,6 +619,9 @@ export async function notifySlack({
   if (anyFailure) {
     summary.ok = false;
     summary.reason = reason || 'send-failed';
+  } else if (summary.deferred > 0) {
+    summary.ok = false;
+    summary.reason = 'notify-budget-exhausted';
   }
   return summary;
 }

@@ -6,7 +6,7 @@
   "description": "Vigil: 三个独立的自动化工具（mivo-watcher / cindy-watcher / acceptance-watcher）的开源版本。",
   "license": "MIT",
   "scripts": {
-    "test": "node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs && node --env-file=watchers/cindy/test.env --test watchers/cindy/*.test.mjs && python3 -B watchers/cindy/cindy-watch-script.test.py && python3 -B watchers/mivo/mivo-watch-script.test.py && node --env-file=watchers/acceptance/test.env --test watchers/acceptance/*.test.mjs",
+    "test": "node scripts/run-tests.mjs",
     "check:sanitized": "node scripts/check-sanitized.mjs"
   }
 }

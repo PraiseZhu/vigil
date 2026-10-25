@@ -93,6 +93,17 @@ test('SC6 文档：去重（事件 id、metadata、删账本重建、重建失�
   assert.match(doc, /slack\.reason|`slack`/);
 });
 
+test('#70 复审文档：text 只用校验过的字段、@ 拆开、通知总时长有上限、放在验收调度之后', () => {
+  assert.match(doc, /只用校验过的字段拼/);
+  assert.match(doc, /零宽字符/);
+  assert.match(doc, /<!subteam/);
+  assert.match(doc, /NOTIFY_BUDGET_MS/);
+  assert.match(doc, /notify-budget-exhausted/);
+  assert.match(doc, /notify-timeout/);
+  assert.match(doc, /notify-busy/);
+  assert.match(doc, /验收调度\*\*之后\*\*/);
+});
+
 test('SC6 文档：第一步只有「打开 PR」；以后合并按钮的条件与伪造风险都写明', () => {
   assert.match(doc, /打开 PR/);
   assert.match(doc, /Mac mini/);

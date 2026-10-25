@@ -13,6 +13,7 @@ import {
 
 const STANDARD = '## 分级(示例)\n\n| 等级 | 定义 | 处理 |\n|---|---|---|\n| P2 一般缺陷 | 含误导性的测试 | 报 |\n';
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-severity-'));
+test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 const file = path.join(dir, 'severity.md');
 fs.writeFileSync(file, STANDARD);
 const versionOf = (raw) => createHash('sha256').update(raw).digest('hex').slice(0, 12);

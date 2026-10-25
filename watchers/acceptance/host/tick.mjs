@@ -12,10 +12,38 @@ import { appendAlert, hostPaths, isAlive, readLockPayload } from './paths.mjs';
 import { run as procRun, spawnDetached } from './proc.mjs';
 import { MAX_ROUNDS, readHostConfig } from './round.mjs';
 import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbot.mjs';
-import { notifySlack } from './slack-notify.mjs';
+import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
 
 const SLOTS = ['slot-0', 'slot-1'];
 const KILL_GRACE_MS = 10000;
+
+/**
+ * Slack 通知这一拍最多等多久（#70 复审）。slack-notify 自己有 NOTIFY_BUDGET_MS 的总预算、到点就停；
+ * 这里再兜一层：超过 NOTIFY_WAIT_MS 不等了，心跳写 notify-timeout。上一拍的通知还没结束时这一拍不再起新的
+ * （notify-busy），免得两份同时写账本、重发。
+ */
+export const NOTIFY_WAIT_MS = NOTIFY_BUDGET_MS + 5000;
+let inflightNotify = null;
+
+async function boundedNotify(fn, options, waitMs) {
+  if (inflightNotify) return { ok: false, reason: 'notify-busy' };
+  const pending = Promise.resolve().then(() => fn(options));
+  inflightNotify = pending;
+  pending
+    .finally(() => {
+      if (inflightNotify === pending) inflightNotify = null;
+    })
+    .catch(() => {});
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, reason: 'notify-timeout' }), waitMs);
+  });
+  try {
+    return await Promise.race([pending, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function sink() {
   return {
@@ -45,6 +73,7 @@ function slackHeartbeat(result) {
     sent: Number(value.sent) || 0,
     digested: Number(value.digested) || 0,
     pending: Number(value.pending) || 0,
+    deferred: Number(value.deferred) || 0,
     failed: Array.isArray(value.failed) ? value.failed : [],
   };
   if (value.reason) out.reason = String(value.reason);
@@ -172,6 +201,7 @@ export async function runTick({
   killGraceMs = KILL_GRACE_MS,
   notify = notifySlack,
   notifyOptions = {},
+  notifyWaitMs = NOTIFY_WAIT_MS,
 } = {}) {
   if (typeof home !== 'string' || !path.isAbsolute(home)) throw new Error('runTick 需要绝对路径的 home');
   const repoRoot = root || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -186,17 +216,6 @@ export async function runTick({
     lastTick: { ok: true, started: [], stale: [], error: null },
     running: [],
   };
-
-  // 0. Slack 通知（#61）：每拍一开始先发，放在 poll 之前——ensure.sh 刚把循环拉起来时先把积压的补上。
-  //    整个调用 try/catch：出错只进心跳，绝不影响这一拍。
-  try {
-    heartbeat.slack = slackHeartbeat(
-      await notify({ home, env: { ...env, ACCEPTANCE_WATCHER_HOME: home }, now, ...notifyOptions }),
-    );
-  } catch (error) {
-    // 异常文字不进心跳（万一里面带了请求头之类的东西），只记原因。
-    heartbeat.slack = slackHeartbeat({ ok: false, reason: 'notify-error', error: String(error?.name || 'unknown') });
-  }
 
   function writeHeartbeat() {
     const registry = readRegistry(paths);
@@ -331,6 +350,17 @@ export async function runTick({
     } catch {
       // 提醒也写不下去就只留心跳。
     }
+  }
+
+  // 4. Slack 通知（#61）：放在验收调度之后（#70 复审：Slack 卡住不能拖慢验收），这一拍新写的提醒也一起发。
+  //    总时长有上限（boundedNotify），整个调用 try/catch：出错只进心跳，绝不影响这一拍。
+  try {
+    heartbeat.slack = slackHeartbeat(
+      await boundedNotify(notify, { home, env: { ...env, ACCEPTANCE_WATCHER_HOME: home }, now, ...notifyOptions }, notifyWaitMs),
+    );
+  } catch (error) {
+    // 异常文字不进心跳（万一里面带了请求头之类的东西），只记原因。
+    heartbeat.slack = slackHeartbeat({ ok: false, reason: 'notify-error', error: String(error?.name || 'unknown') });
   }
 
   try {

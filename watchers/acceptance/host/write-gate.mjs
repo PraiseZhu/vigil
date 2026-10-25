@@ -62,6 +62,7 @@ export const PR_READY_QUERY = `query ($owner: String!, $name: String!, $number: 
       isDraft
       headRefName
       headRefOid
+      baseRefName
       isCrossRepository
       headRepository { nameWithOwner }
       body
@@ -349,6 +350,8 @@ export function createGate({
     if (!marker || marker.root !== root) {
       return reject('not-in-tree', 'PR 正文缺少本轮总 issue 的修正标记');
     }
+    // #70 复审：验收轮和修正轮一样，base 只能是 main。
+    if (pr.baseRefName !== 'main') return reject('not-allowed', 'PR 的 base 只能是 main');
     if (!pr.isDraft) return reject('ready-precondition', 'PR 已经不是 Draft');
     if (String(pr.headRefOid || '') !== String(action.headSha || '')) {
       return reject('ready-precondition', `head 已变化：动作里是 ${action.headSha || '(空)'}，PR 上是 ${pr.headRefOid || '(空)'}`);

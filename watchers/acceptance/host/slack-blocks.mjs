@@ -24,7 +24,29 @@ function str(value) {
  * 只转 Slack 要求的三个字符（& < >）。
  */
 export function esc(value) {
-  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return mute(String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+}
+
+/**
+ * 再把裸的 @ 拆开（@ 后面插一个零宽字符）：`@channel` / `@here` / `@everyone` / `@某人` 即使 Slack 开了
+ * link_names 也不会被当成提醒。`<!here>` / `<!subteam^…>` / `<@U…>` 这类尖括号写法靠上面转义 `<>` 已经失效。
+ */
+const ZWSP = '\u200b';
+function mute(value) {
+  return String(value ?? '').replace(/@/g, `@${ZWSP}`);
+}
+
+/** 事件类型只认小写字母、数字和连字符，别的当没有（类型会进标题和通知栏文字）。 */
+const TYPE_NAME = /^[a-z0-9-]{1,40}$/;
+function safeType(value) {
+  const type = str(value);
+  return TYPE_NAME.test(type) ? type : '';
+}
+
+/** `owner/repo#n` 只有仓库名合规、编号是正整数才认，否则当没有（ref 会进标题和通知栏文字）。 */
+function safeRef(value) {
+  const ref = splitRef(value);
+  return ref && REPO_NAME.test(ref.repo) && Number.isInteger(ref.number) && ref.number > 0 ? `${ref.repo}#${ref.number}` : '';
 }
 
 /** 仓库名只认 owner/repo（GitHub 允许的字符），别的一律当没有。 */
@@ -85,7 +107,8 @@ function httpUrl(value) {
 }
 
 function header(text) {
-  return { type: 'header', text: { type: 'plain_text', text: clip(text, HEADER_LIMIT), emoji: true } };
+  // plain_text 不解析 mrkdwn，不能转义（否则会原样显示 &lt;），只拆 @。标题本来也只用校验过的字段拼。
+  return { type: 'header', text: { type: 'plain_text', text: clip(mute(text), HEADER_LIMIT), emoji: true } };
 }
 
 function section(text) {
@@ -109,9 +132,14 @@ function deepRedact(value, profile) {
   return value;
 }
 
+/**
+ * `text` 是手机锁屏 / 通知栏看到的那一行，Slack 也按 mrkdwn 解析。它只用校验过的字段拼（常量标题、合规的
+ * `owner/repo#n`、合规的 PR 链接、数字），事件里的原因 / 文件名 / issue 标题一律不进；拼完整行再转义一次兜底，
+ * 所以这里不会有任何 `<…>` 链接或提醒。@ 提醒（profile 里配的用户 id）在 slack-notify 里、这一步之后才加。
+ */
 function finish(payload, profile) {
   return {
-    text: redact(String(payload.text ?? ''), profile),
+    text: esc(redact(String(payload.text ?? ''), profile)),
     blocks: deepRedact(payload.blocks || [], profile),
   };
 }
@@ -119,7 +147,7 @@ function finish(payload, profile) {
 /** Ready 消息里的 `repo#pr`：repo/pr 都在就用它们，否则退回事件里的 ref。 */
 function readyName(event, target) {
   if (target.repo && target.pr) return `${target.repo}#${target.pr}`;
-  return str(event.issue) || str(event.root) || '修正 PR';
+  return safeRef(event.issue) || safeRef(event.root) || '修正 PR';
 }
 
 /**
@@ -195,7 +223,8 @@ export function stalledBlocks(notice, profile) {
   const sha = head7(event.headSha);
   if (sha) lines.push(`head：${sha}`);
   const blocks = [header(title), section(lines.join('\n'))];
-  return finish({ text: [title, ...lines].join('｜'), blocks }, profile);
+  // 通知栏文字只用标题、固定说明和合规的 PR 链接；readyAt 这类事件原文只进 blocks。
+  return finish({ text: [title, lines[0], target.link ? `PR：${target.link}` : ''].filter(Boolean).join('｜'), blocks }, profile);
 }
 
 const ALERT_TITLES = {
@@ -229,16 +258,19 @@ function secretFileList(reason) {
  */
 export function alertBlocks(notice, profile) {
   const event = view(notice);
-  const type = str(event.type) || str(event.kind) || 'alert';
-  const issue = str(event.issue);
+  const type = safeType(event.type) || safeType(event.kind) || 'alert';
+  const issue = safeRef(event.issue);
   const base = ALERT_TITLES[type] || `验收机提醒：${type}`;
   const title = issue ? `${base}：${issue}` : base;
+  const rawIssue = str(event.issue);
 
   const blocks = [header(title)];
   if (type === 'secret-found') {
     const files = secretFileList(event.reason);
     blocks.push(section(`文件名：${esc(files) || '（提醒里没给文件名）'}`));
-    return finish({ text: `${title}｜文件名：${files}`, blocks }, profile);
+    // 文件名可能是模型起的（比如就叫 `<!channel>`），只进转义过的 blocks，不进通知栏文字。
+    const count = files ? files.split(',').filter((name) => name.trim()).length : 0;
+    return finish({ text: `${title}｜${count} 个文件，文件名见消息`, blocks }, profile);
   }
 
   const lines = [];
@@ -255,10 +287,12 @@ export function alertBlocks(notice, profile) {
   if (target.link) lines.push(`PR：${target.link}`);
   const sha = head7(event.headSha);
   if (sha) lines.push(`head：${sha}`);
-  if (str(event.root) && str(event.root) !== issue) lines.push(`任务 issue：${esc(str(event.root))}`);
+  if (rawIssue && !issue) lines.push(`issue：${esc(rawIssue)}`);
+  if (str(event.root) && str(event.root) !== rawIssue) lines.push(`任务 issue：${esc(str(event.root))}`);
   if (lines.length) blocks.push(section(lines.join('\n')));
 
-  return finish({ text: `${title}${str(event.reason) ? `｜${str(event.reason)}` : ''}`, blocks }, profile);
+  // 原因只进 blocks（转义过）；通知栏文字只有标题和合规的 PR 链接。
+  return finish({ text: `${title}${target.link ? `｜${target.link}` : ''}`, blocks }, profile);
 }
 
 /**
@@ -267,17 +301,20 @@ export function alertBlocks(notice, profile) {
 export function digestBlocks(notices, profile) {
   const items = Array.isArray(notices) ? notices.filter(Boolean) : [];
   const lines = [];
+  const heads = [];
   for (const item of items.slice(0, 40)) {
     const data = view(item);
-    const type = str(data.type) || 'alert';
+    const type = safeType(data.type) || safeType(data.kind) || 'alert';
     const issue = str(data.issue);
     const reason = clip(str(data.reason), 140);
     const head = [type, issue].filter(Boolean).join(' ');
     lines.push(`· ${esc(head)}${reason ? `：${esc(reason)}` : ''}`);
+    // 通知栏文字只用类型和合规的 ref。
+    heads.push([type, safeRef(data.issue)].filter(Boolean).join(' '));
   }
   if (items.length > 40) lines.push(`…还有 ${items.length - 40} 条`);
   const title = `验收机摘要（${items.length} 条）`;
   const blocks = [header(title), section(lines.join('\n') || '（没有内容）')];
-  const text = clip(`${title}：${lines.slice(0, 3).join('；')}`, 500);
+  const text = clip(`${title}：${heads.slice(0, 3).join('；')}`, 500);
   return finish({ text, blocks }, profile);
 }

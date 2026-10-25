@@ -696,28 +696,35 @@ async function tickHome() {
 
 const POLL_OK = async () => ({ code: 0, stdout: '[]', stderr: '' });
 
-test('runTick 每拍一开始调 notify，结果写进 heartbeat.slack（文件里也有）', async () => {
+test('runTick 在验收调度之后调 notify，结果写进 heartbeat.slack（文件里也有）', async () => {
   const { home } = await tickHome();
   const calls = [];
+  const order = [];
   const heartbeat = await runTick({
     home,
     env: { ...process.env },
-    run: POLL_OK,
+    run: async (...args) => {
+      order.push('poll');
+      return POLL_OK(...args);
+    },
     spawnRound: () => 1,
     runRound: async () => ({ code: 0, stdout: '', stderr: '' }),
     notify: async (options) => {
       calls.push(options);
+      order.push('notify');
       return { ok: true, sent: 2, digested: 1, pending: 3, failed: [{ id: 'abc', kind: 'blocked', error: 'http-500' }] };
     },
     now: () => Date.parse('2026-10-24T02:00:00.000Z'),
   });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].home, home, 'notify 拿到 home');
+  assert.deepEqual(order, ['poll', 'notify'], '验收调度先跑，Slack 后发');
   assert.deepEqual(heartbeat.slack, {
     ok: true,
     sent: 2,
     digested: 1,
     pending: 3,
+    deferred: 0,
     failed: [{ id: 'abc', kind: 'blocked', error: 'http-500' }],
   });
   const onDisk = JSON.parse(fs.readFileSync(hostPaths(home).heartbeatFile, 'utf8'));
@@ -848,6 +855,170 @@ test('令牌文件权限不对 / 读不到：整台机照常跑这一拍，跳�
     }
     assert.deepEqual(reads, [], `${name}：令牌文件没被读`);
   }
+});
+
+test('#70 复审：Slack 卡死时这一拍按上限返回（notify-timeout），上一拍的还没完就不再起（notify-busy）', async () => {
+  const { home } = await tickHome();
+  let release;
+  const hung = new Promise((resolve) => {
+    release = resolve;
+  });
+  let calls = 0;
+  const notify = () => {
+    calls += 1;
+    return hung;
+  };
+  const tick = () =>
+    runTick({
+      home,
+      env: { ...process.env },
+      run: POLL_OK,
+      spawnRound: () => 1,
+      runRound: async () => ({ code: 0, stdout: '', stderr: '' }),
+      notify,
+      notifyWaitMs: 100,
+      now: () => Date.parse('2026-10-24T02:00:00.000Z'),
+    });
+  try {
+    const startedAt = Date.now();
+    const first = await tick();
+    assert.ok(Date.now() - startedAt < 3000, '不等卡死的 Slack');
+    assert.equal(first.slack.reason, 'notify-timeout');
+    assert.equal(first.lastTick.ok, true);
+    const onDisk = JSON.parse(fs.readFileSync(hostPaths(home).heartbeatFile, 'utf8'));
+    assert.equal(onDisk.slack.reason, 'notify-timeout', '心跳文件照常写');
+    const second = await tick();
+    assert.equal(second.slack.reason, 'notify-busy');
+    assert.equal(calls, 1, '上一拍的通知没结束，不再起第二份');
+  } finally {
+    release({ ok: true, sent: 0, digested: 0, pending: 0, failed: [] });
+  }
+  await hung;
+  await new Promise((resolve) => setImmediate(resolve));
+  const third = await tick();
+  assert.equal(calls, 2, '上一份结束后照常发');
+  assert.equal(third.slack.ok, true);
+});
+
+test('#70 复审：notifySlack 有总预算：用完就停，没发的新事件下拍再发、不算已处理', async () => {
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ledgerFile(home), JSON.stringify({ version: 1, ids: [] }), { mode: 0o600 });
+  for (const n of [2, 3, 4]) prbotEvent(home, { type: 'needs-human', issue: `${REPO}#${n}`, root: `${REPO}#1`, reason: 'no-change' }, t0 + n);
+  // 假时钟：每个请求花 20 秒；预算 30 秒 → 发两条，第三条留到下拍。
+  let fakeNow = 0;
+  const posted = [];
+  const slowFetch = async (url, init) => {
+    posted.push(JSON.parse(init.body).text);
+    fakeNow += 20000;
+    return { status: 200, json: async () => ({ ok: true, ts: String(posted.length) }) };
+  };
+  const first = await notifySlack({ home, profile, now: () => t0, fetch: slowFetch, clock: () => fakeNow, budgetMs: 30000 });
+  assert.equal(first.sent, 2);
+  assert.equal(first.deferred, 1);
+  assert.equal(first.ok, false);
+  assert.equal(first.reason, 'notify-budget-exhausted');
+  assert.equal(readLedger(home).ids.length, 2, '留到下拍的那条不记成已处理');
+  fakeNow = 0;
+  const second = await notifySlack({ home, profile, now: () => t0, fetch: slowFetch, clock: () => fakeNow, budgetMs: 30000 });
+  assert.equal(second.sent, 1);
+  assert.equal(second.deferred, 0);
+  assert.equal(second.ok, true);
+  assert.equal(posted.length, 3, '三条各发一次');
+  assert.equal(new Set(posted).size, 3);
+});
+
+test('#70 复审：每个请求的超时随预算缩短：Slack 不回话时按预算返回，而不是等满 15 秒', async () => {
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ledgerFile(home), JSON.stringify({ version: 1, ids: [] }), { mode: 0o600 });
+  for (const n of [2, 3]) prbotEvent(home, { type: 'needs-human', issue: `${REPO}#${n}`, root: `${REPO}#1`, reason: 'x' }, t0 + n);
+  const sockets = new Set();
+  const server = http.createServer(() => {
+    // 故意一直不回。
+  });
+  server.on('connection', (socket) => sockets.add(socket));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const startedAt = Date.now();
+    const result = await notifySlack({
+      home,
+      profile,
+      now: () => t0,
+      apiBase: `http://127.0.0.1:${server.address().port}/api/`,
+      requestTimeoutMs: 15000,
+      budgetMs: 300,
+    });
+    const took = Date.now() - startedAt;
+    assert.ok(took < 3000, `按预算返回（用了 ${took} ms）`);
+    assert.equal(result.ok, false);
+    assert.equal(result.deferred, 1, '第二条没时间发，留到下拍');
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('#70 复审：预算一开始就没了：到期的重试、到点的摘要都原样留着，账本坏了也不去翻频道历史', async () => {
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  const past = new Date(t0 - 60000).toISOString();
+  const retryEntry = {
+    id: 'retry-1',
+    kind: 'blocked',
+    payload: { text: '旧提醒', blocks: [], ids: ['retry-1'] },
+    attempts: 1,
+    nextAttemptAt: past,
+  };
+  const pendingItem = { id: 'digest-1', source: 'alerts', type: 'interrupted', kind: 'digest', issue: `${REPO}#2` };
+  fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(
+    ledgerFile(home),
+    JSON.stringify({ version: 1, ids: [], pending: [pendingItem], digestNextAt: past, retry: [retryEntry] }),
+    { mode: 0o600 },
+  );
+  let calls = 0;
+  const countingFetch = async () => {
+    calls += 1;
+    return { status: 200, json: async () => ({ ok: true, ts: '1', messages: [] }) };
+  };
+  const result = await notifySlack({ home, profile, now: () => t0, fetch: countingFetch, clock: () => 0, budgetMs: 0 });
+  assert.equal(calls, 0, '一条都不发');
+  assert.equal(result.deferred, 2, '重试一条 + 摘要一条');
+  assert.equal(result.reason, 'notify-budget-exhausted');
+  const ledger = readLedger(home);
+  assert.deepEqual(ledger.retry, [retryEntry], '重试原样留着，次数不加');
+  assert.deepEqual(ledger.pending, [pendingItem], '摘要原样留着');
+  assert.equal(ledger.digestNextAt, past);
+
+  // 账本没了要翻频道历史重建：预算没了就不翻（也不发），下拍再说。
+  fs.rmSync(ledgerFile(home));
+  const rebuilt = await notifySlack({ home, profile, now: () => t0, fetch: countingFetch, clock: () => 0, budgetMs: 0 });
+  assert.equal(calls, 0, '不翻历史');
+  assert.equal(rebuilt.reason, 'ledger-rebuild-failed');
+  assert.equal(fs.existsSync(ledgerFile(home)), false);
+});
+
+test('#70 复审：令牌文件属主不是当前用户就不读、不发（token-file-owner）', async () => {
+  const { home, profile, tokenFile } = setup();
+  const t0 = Date.parse(START_AT);
+  prbotEvent(home, { type: 'needs-human', issue: `${REPO}#2`, root: `${REPO}#1`, reason: 'x' }, t0);
+  const realGetuid = process.getuid;
+  // 测试里没法 chown（不是 root），改成让「当前用户」变成另一个 uid：文件属主就对不上了。
+  process.getuid = () => fs.statSync(tokenFile).uid + 1;
+  try {
+    assert.deepEqual(readSlackToken(tokenFile), { ok: false, reason: 'token-file-owner' });
+    await withSlack(undefined, async (fake) => {
+      const result = await notifySlack({ home, profile, now: () => t0, fetch: fake.fetch, apiBase: fake.apiBase });
+      assert.equal(result.reason, 'token-file-owner');
+      assert.equal(fake.requests.length, 0);
+    });
+  } finally {
+    process.getuid = realGetuid;
+  }
+  assert.equal(readSlackToken(tokenFile).ok, true, '属主对上就能读');
 });
 
 // ---- 沙箱遮罩契约 ----

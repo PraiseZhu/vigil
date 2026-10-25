@@ -9,8 +9,57 @@ export const OTHER_REPO = 'example-owner/other-repo';
 export const HANDOFF_REPO = 'example-org/handoff-repo';
 export const START_AT = '2026-01-01T00:00:00.000Z';
 
+/**
+ * 测试用的临时目录：建在 os.tmpdir() 下，进程退出时统一删掉（#70 复审：以前每跑一次全量测试在 /tmp 留下
+ * 七百多个目录，把盒子的 inode 用满了）。node --test 每个文件一个子进程，所以每个文件跑完就清干净。
+ * 有的测试会把目录改成 000 / 只读，删之前先把权限放开。
+ */
+const createdTmpDirs = new Set();
+function removeTree(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return;
+  } catch {
+    // 权限被测试改过：放开再删。
+  }
+  const walk = (target) => {
+    let stat;
+    try {
+      stat = fs.lstatSync(target);
+    } catch {
+      return;
+    }
+    if (!stat.isDirectory()) return;
+    try {
+      fs.chmodSync(target, 0o700);
+    } catch {
+      // 不是我们的就算了。
+    }
+    let names = [];
+    try {
+      names = fs.readdirSync(target);
+    } catch {
+      return;
+    }
+    for (const name of names) walk(path.join(target, name));
+  };
+  walk(dir);
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // 实在删不掉就留着，不让测试进程因为清理失败而报错。
+  }
+}
+export function cleanupTmpDirs() {
+  for (const dir of createdTmpDirs) removeTree(dir);
+  createdTmpDirs.clear();
+}
+process.on('exit', cleanupTmpDirs);
+
 export function tmpDir(prefix = 'acceptance-test-') {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  createdTmpDirs.add(dir);
+  return dir;
 }
 
 export function writeSecret(file, content = 'test-token-not-real') {

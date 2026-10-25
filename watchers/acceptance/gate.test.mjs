@@ -49,6 +49,7 @@ function gateGithub(
     prBody = PR_MARKER,
     defaultHead = null,
     crossRepo = false,
+    baseRefName = 'main',
   } = {},
 ) {
   return {
@@ -79,6 +80,7 @@ function gateGithub(
               isDraft,
               headRefName,
               headRefOid,
+              ...(baseRefName === null ? {} : { baseRefName }),
               ...(crossRepo === null ? {} : { isCrossRepository: crossRepo }),
               body: prBody,
               commits: {
@@ -1232,6 +1234,43 @@ test('SC9 pr.ready 不认从 fork 来的 PR（isCrossRepository）：分支名�
   assert.match(PR_READY_QUERY, /isCrossRepository/);
 });
 
+test('#70 复审：验收轮 pr.ready 也查 base：PR 的 base 不是 main（或查不到）就 not-allowed，不转 Ready', async () => {
+  const { home, profile } = setupEnvironment();
+  const headSha = 'f'.repeat(40);
+  for (const [label, baseRefName, expected] of [
+    ['release', 'release', 'not-allowed'],
+    ['main2', 'main2', 'not-allowed'],
+    ['缺字段', null, 'not-allowed'],
+    ['main', 'main', null],
+  ]) {
+    const world = defaultTree();
+    const writes = [];
+    const gate = createGate({
+      home,
+      profile,
+      github: gateGithub(world, {
+        baseRefName,
+        onWrite: (action) => {
+          writes.push(action);
+          return action.type === 'pr.ready' ? { pr: action.pr, repo: action.repo } : undefined;
+        },
+      }),
+      run: procRun,
+      binding: bindingFor(world),
+      which: async () => false,
+    });
+    const outcome = await gate.handle({ type: 'pr.ready', repo: REPO, pr: 12, headSha, dedupeKey: `ready-base-${label}` });
+    if (expected) {
+      assert.equal(outcome.code, 4, `${label}: ${JSON.stringify(outcome)}`);
+      assert.equal(outcome.body.reason, expected, label);
+      assert.equal(writes.length, 0, label);
+    } else {
+      assert.equal(outcome.code, 0, `${label}: ${JSON.stringify(outcome)}`);
+    }
+  }
+  assert.match(PR_READY_QUERY, /baseRefName/);
+});
+
 test('SC9 pr.create：必须 draft: true；base 只能是 main；非 fork 档 head 不许带前缀；fork 档 head 必须是 ownerLogin:分支', async () => {
   const { home, profile } = setupEnvironment();
   const prBody = `任务 issue：${ROOT_REF}\n\n${PR_MARKER}`;
@@ -1245,6 +1284,12 @@ test('SC9 pr.create：必须 draft: true；base 只能是 main；非 fork 档 he
     ['fork 别人前缀', { repo: 'makecindy/cindy', head: 'stranger:acceptance/1-2-sc1', draft: true }, 'not-in-tree'],
     ['fork 空前缀', { repo: 'makecindy/cindy', head: ':acceptance/1-2-sc1', draft: true }, 'not-in-tree'],
     ['base 不是 main', { repo: REPO, head: 'acceptance/1-2-sc1', draft: true, base: 'release' }, 'not-allowed'],
+    // #70 复审：标记里只有 root 不同（项 / SC / 轮都一样）也要拒。
+    [
+      '标记只有 root 不同',
+      { repo: REPO, head: 'acceptance/1-2-sc1', draft: true, body: `任务 issue：${ROOT_REF}\n\n${PR_MARKER.replace(`总 ${ROOT_REF}`, `总 ${REPO}#999`)}` },
+      'not-in-tree',
+    ],
     ['非 fork 对的', { repo: REPO, head: 'acceptance/1-2-sc1', draft: true }, null],
     ['fork 对的', { repo: 'makecindy/cindy', head: `${profile.ownerLogin}:acceptance/1-2-sc1`, draft: true }, null],
   ];
