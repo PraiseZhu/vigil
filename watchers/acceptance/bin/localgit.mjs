@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 
 const ALLOWED = new Set(['git', 'gitleaks']);
 // 允许名单：只放推送前扫描和打包真正用到的本地子命令；其余（含 fetch、push、clone、remote 等网络命令）一律拒绝。
-const ALLOWED_SUBCOMMANDS = new Set(['diff', 'rev-parse', 'bundle']);
+const ALLOWED_SUBCOMMANDS = new Set(['rev-parse', 'rev-list', 'cat-file', 'bundle']);
 const ALLOWED_BUNDLE_ACTIONS = new Set(['create', 'list-heads']);
 const ENV_DENY = /(TOKEN|SECRET|PASSWORD|ASKPASS|CREDENTIAL)/i;
 const ENV_DENY_EXACT = new Set([
@@ -34,20 +34,22 @@ export function localEnv(base = process.env) {
 }
 
 /** 默认的进程执行器：测试注入自己的 run 就不走这里。 */
-export async function spawnRun(cmd, args, { cwd, env, input } = {}) {
+export async function spawnRun(cmd, args, { cwd, env, input, raw = false } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
-    let stdout = '';
+    // raw：stdout 按字节原样收（cat-file --batch 要按字节数切），不按 UTF-8 拼成字符串。
+    const outChunks = [];
     let stderr = '';
     child.stdout.on('data', (chunk) => {
-      stdout += chunk;
+      outChunks.push(Buffer.from(chunk));
     });
+    const collected = () => (raw ? Buffer.concat(outChunks) : Buffer.concat(outChunks).toString('utf8'));
     child.stderr.on('data', (chunk) => {
       stderr += chunk;
     });
     child.on('error', reject);
     child.on('close', (code) => {
-      resolve({ code: code ?? 1, stdout, stderr });
+      resolve({ code: code ?? 1, stdout: collected(), stderr });
     });
     if (input != null) child.stdin.write(input);
     child.stdin.end();
@@ -78,7 +80,7 @@ export function createLocalGit({ run = spawnRun, env = localEnv() } = {}) {
     if (!Array.isArray(args) || !args.length) throw new Error('git 需要参数');
     const sub = args[0];
     if (sub.startsWith('-')) throw new Error(`git 的第一个参数必须是子命令：${sub}`);
-    if (!ALLOWED_SUBCOMMANDS.has(sub)) throw new Error(`localgit 只允许本地子命令 diff / rev-parse / bundle，收到：${sub}`);
+    if (!ALLOWED_SUBCOMMANDS.has(sub)) throw new Error(`localgit 只允许本地子命令 rev-parse / rev-list / cat-file / bundle，收到：${sub}`);
     if (sub === 'bundle' && !ALLOWED_BUNDLE_ACTIONS.has(args[1])) {
       throw new Error(`localgit 只允许 bundle create / list-heads，收到：bundle ${args[1]}`);
     }
@@ -94,11 +96,6 @@ export function createLocalGit({ run = spawnRun, env = localEnv() } = {}) {
     } catch {
       return false;
     }
-  }
-
-  /** base...<commit> 的零上下文补丁，只看新增行。commit 是要推的分支解析出的提交，不是 HEAD。 */
-  async function diff({ base, commit, cwd }) {
-    return git(['diff', '--unified=0', `${safeRange(base)}...${safeRange(commit)}`], { cwd: safePath(cwd, 'worktree') });
   }
 
   /** 分支解析成提交 sha（只认本地分支 refs/heads/<branch>）。 */
@@ -136,5 +133,5 @@ export function createLocalGit({ run = spawnRun, env = localEnv() } = {}) {
     );
   }
 
-  return { git, has, diff, branchSha, createBundle, bundleHeads, gitleaks };
+  return { git, has, branchSha, createBundle, bundleHeads, gitleaks };
 }

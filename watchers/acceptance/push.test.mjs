@@ -7,9 +7,11 @@ import { bodyVersion } from './bin/rounds.mjs';
 import { runHelper } from './bin/helper.mjs';
 import { createLocalGit, localEnv, spawnRun } from './bin/localgit.mjs';
 import { readNeedsHuman, scanForSecrets } from './bin/push.mjs';
+import { scanIntroducedObjects } from './bin/secretscan.mjs';
 import { WriteRejectedError } from './bin/github.mjs';
 import { HANDOFF_REPO, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import { REPO, createFakeGithub, createWorld, defaultTree } from './session.fixture.mjs';
+import { BYPASS_KINDS, BYPASS_LABELS, buildBypassRepo } from './secret-bypass.fixture.mjs';
 
 // 假私钥头按行拼，源码里不会出现完整的私钥头。
 const FAKE_KEY = [
@@ -339,7 +341,7 @@ test('SC7 有 gitleaks 时扫描范围也是 base..<分支提交>，不是 HEAD'
   });
   const result = await run(world, profile, pushArgs(repo.dir, 'acceptance/1-2-sc3'), { git: gitApi });
   assert.equal(result.code, 0, result.err);
-  assert.equal(logOpts, `--log-opts=main..${repo.head}`);
+  assert.equal(logOpts, `--log-opts=${(await git(['rev-parse', 'main'])).trim()}..${repo.head}`, '--base 先解析成提交号再交给 gitleaks');
 });
 
 test('SC7 本地没有 --branch 这条分支 → 不扫不推，退出码 1', async () => {
@@ -350,4 +352,42 @@ test('SC7 本地没有 --branch 这条分支 → 不扫不推，退出码 1', as
   assert.equal(result.code, 1);
   assert.match(result.err, /本地没有分支/);
   assert.equal(world.writes.length, 0);
+});
+
+for (const kind of Object.keys(BYPASS_KINDS)) {
+  test(`SC7 内置扫描绕过拦得住：${BYPASS_LABELS[kind]}（退出码 5，不打包不推）`, async () => {
+    const profile = loadProfile();
+    const world = defaultTree();
+    const repo = await buildBypassRepo(kind);
+    const result = await run(world, profile, pushArgs(repo.repoDir, repo.branch), { git: localGitWithoutGitleaks() });
+    assert.equal(result.code, 5, `${kind}: ${result.err}`);
+    assert.match(result.out, new RegExp(`扫到疑似密钥，没推：${repo.file.replace(/[./]/g, '\\$&')}`), kind);
+    assert.equal(result.out.includes('MIIEnotARealKey'), false, `${kind}：不回显内容`);
+    assert.equal(world.writes.filter((action) => action.type === 'branch.push').length, 0, kind);
+  });
+}
+
+test('SC7 --base 以 - 开头也只当版本名：解析不出提交就不推，不当 git 选项', async () => {
+  const repo = await makeRepo({ file: 'src/app.mjs', content: 'export const ok = 1;\n' });
+  for (const base of ['--all', '-h', 'no-such-branch']) {
+    await assert.rejects(
+      () => scanForSecrets({ git: localGitWithoutGitleaks(), worktree: repo.dir, base, commit: repo.head }),
+      /解析 --base 失败/,
+      base,
+    );
+  }
+});
+
+test('SC7 内置扫描读对象失败（cat-file 报 missing / 输出不全）就报错，不当成干净', async () => {
+  const tip = 'a'.repeat(40);
+  const listing = { code: 0, stdout: `${tip}\n${'b'.repeat(40)} src/app.mjs\n`, stderr: '' };
+  const single = { code: 0, stdout: `${tip}\n`, stderr: '' };
+  for (const [label, list, batchOut] of [
+    ['缺对象', listing, `${tip} missing\n${'b'.repeat(40)} missing\n`],
+    ['少一个', listing, `${tip} commit 3\nabc\n`],
+    ['最后一个内容截断', single, `${tip} commit 30\nabc`],
+  ]) {
+    const git = async (args) => (args.includes('rev-list') ? list : { code: 0, stdout: Buffer.from(batchOut), stderr: '' });
+    await assert.rejects(() => scanIntroducedObjects({ git, tip }), /扫密钥时/, label);
+  }
 });

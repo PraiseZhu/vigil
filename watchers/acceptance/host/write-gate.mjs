@@ -20,7 +20,8 @@ import { COMMENTS_QUERY } from '../bin/helper.mjs';
 import { ISSUE_COMMENTS_QUERY as ROUND_COMMENTS_QUERY } from '../bin/round.mjs';
 import { ISSUE_COMMENTS_QUERY as ROUNDS_COMMENTS_QUERY } from '../bin/rounds.mjs';
 import { repoTier } from '../bin/tasks.mjs';
-import { SECRET_PATTERNS, redact } from '../bin/redact.mjs';
+import { redact } from '../bin/redact.mjs';
+import { scanIntroducedObjects } from '../bin/secretscan.mjs';
 import { acquireLock, appendAlert, hostPaths, releaseLock } from './paths.mjs';
 import { run as procRun } from './proc.mjs';
 import * as prUpdateBranchAction from './gate-actions/pr-update-branch.mjs';
@@ -54,6 +55,8 @@ export const PR_READY_QUERY = `query ($owner: String!, $name: String!, $number: 
       isDraft
       headRefName
       headRefOid
+      isCrossRepository
+      body
       commits(last: 1) {
         nodes {
           commit {
@@ -221,6 +224,24 @@ const READ_QUERIES = new Set([
   MAIN_CHECKS_QUERY,
 ]);
 
+const ROUND_FIRST_LINE = /^\s*\[验收机\]\s*第/;
+const CHECKBOX_LINE = /^(\s*[-*]\s+\[)[ xX](\].*)$/;
+
+/**
+ * branch.push 扫密钥的基准：写闸自己去 GitHub 读目标仓默认分支的头提交，绝不用沙箱交来的 base。
+ * 一条固定查询，不是调用方交来的 query。
+ */
+export const DEFAULT_HEAD_QUERY = `query ($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef {
+      name
+      target { oid }
+    }
+  }
+}`;
+
+const COMMIT_OID = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
+
 const reject = (reason, detail) =>
   detail === undefined ? { code: 4, body: { reason } } : { code: 4, body: { reason, detail } };
 
@@ -238,31 +259,23 @@ function versionLine(body) {
   return line ? line.slice('正文版本：'.length).trim() : null;
 }
 
-function refOf(repo, issue) {
-  return `${repo}#${Number(issue)}`;
+/** 新正文和旧正文逐行比：只有复选框里的空格 / x 可以不同，行数和其它字一个都不能变。 */
+function onlyCheckboxToggles(before, after) {
+  if (typeof after !== 'string') return false;
+  const oldLines = String(before ?? '').split('\n');
+  const newLines = after.split('\n');
+  if (oldLines.length !== newLines.length) return false;
+  for (let i = 0; i < oldLines.length; i += 1) {
+    if (oldLines[i] === newLines[i]) continue;
+    const a = CHECKBOX_LINE.exec(oldLines[i]);
+    const b = CHECKBOX_LINE.exec(newLines[i]);
+    if (!a || !b || a[1] !== b[1] || a[2] !== b[2]) return false;
+  }
+  return true;
 }
 
-/** 扫补丁新增行：命中就只回文件名，绝不回内容（和 bin/push.mjs 同一套规则）。 */
-function scanAddedLines(diff) {
-  const files = new Set();
-  let current = null;
-  for (const line of String(diff ?? '').split('\n')) {
-    if (line.startsWith('+++ ')) {
-      const target = line.slice(4).trim();
-      current = target === '/dev/null' ? null : target.replace(/^b\//, '');
-      continue;
-    }
-    if (line.startsWith('--- ') || !current || !line.startsWith('+')) continue;
-    const added = line.slice(1);
-    for (const { re } of SECRET_PATTERNS) {
-      re.lastIndex = 0;
-      if (re.test(added)) {
-        files.add(current);
-        break;
-      }
-    }
-  }
-  return [...files];
+function refOf(repo, issue) {
+  return `${repo}#${Number(issue)}`;
 }
 
 function readGitleaksFiles(reportFile) {
@@ -418,7 +431,7 @@ export function createGate({
     return { code: 0, body: { data: data ?? {} } };
   }
 
-  async function checkPrReady(action) {
+  async function checkPrReady(action, { number, root }) {
     const [owner, name] = String(action.repo || '').split('/');
     const data = await github.graphql(PR_READY_QUERY, {
       owner,
@@ -426,7 +439,19 @@ export function createGate({
       number: Number(action.pr),
     });
     const pr = data?.repository?.pullRequest;
-    if (!pr) return reject('ready-precondition', '找不到 PR 或读不到头');
+    if (!pr) return reject('not-in-tree', `找不到 PR ${action.repo}#${action.pr}`);
+    // 从 fork 来的 PR 一律不认：分支名、正文谁都能照抄，只有本仓里的分支才是验收机推的。
+    if (pr.isCrossRepository !== false) return reject('not-in-tree', 'PR 来自 fork（跨仓），不是验收机推的分支');
+    // 只认本轮任务树里的修正 PR：head 分支是 acceptance/<总 issue 号>-…，正文带本轮总 issue 的修正标记。
+    const head = String(pr.headRefName || '');
+    const match = BRANCH_PATTERN.exec(head.includes(':') ? head.slice(head.indexOf(':') + 1) : head);
+    if (!match || Number(match[1]) !== number) {
+      return reject('not-in-tree', `PR 的 head 分支必须是 acceptance/${number}-<出处>-sc<k>`);
+    }
+    const marker = parseMarker(pr.body);
+    if (!marker || marker.root !== root) {
+      return reject('not-in-tree', 'PR 正文缺少本轮总 issue 的修正标记');
+    }
     if (!pr.isDraft) return reject('ready-precondition', 'PR 已经不是 Draft');
     if (String(pr.headRefOid || '') !== String(action.headSha || '')) {
       return reject('ready-precondition', `head 已变化：动作里是 ${action.headSha || '(空)'}，PR 上是 ${pr.headRefOid || '(空)'}`);
@@ -665,6 +690,10 @@ export function createGate({
         return null;
       }
       case 'comment.create':
+        if (ROUND_FIRST_LINE.test(firstLine(action.body))) {
+          return reject('round-comment-forbidden', '轮次评论只能由宿主认领和改本轮那一条，不能另发');
+        }
+      // falls through
       case 'issue.edit':
       case 'issue.close':
       case 'issue.reopen':
@@ -672,6 +701,14 @@ export function createGate({
         const target = refOf(action.repo, action.issue);
         if (!treeRefs.has(target)) {
           return reject('not-in-tree', `${target} 不在本轮任务树`);
+        }
+        if (action.type === 'issue.edit') {
+          // 只许勾选或取消验收项（- [ ] ↔ - [x]），不许改正文的任何其它字。
+          const current = target === binding.root ? state : await readIssueState(target);
+          if (!current) return reject('not-in-tree', `找不到 ${target}`);
+          if (!onlyCheckboxToggles(current.issue.body, action.body)) {
+            return reject('edit-not-allowed', 'issue.edit 只能勾选或取消验收项，不能改正文其它内容');
+          }
         }
         return null;
       }
@@ -717,7 +754,7 @@ export function createGate({
         return null;
       }
       case 'pr.ready':
-        return checkPrReady(action);
+        return checkPrReady(action, { number, root: binding.root });
       default:
         return reject('not-allowed', `serve 模式不认 ${action.type}`);
     }
@@ -739,6 +776,9 @@ export function createGate({
       const match = ACCEPTANCE_FIRST_LINE.exec(firstLine(action.body));
       if (!match) {
         return reject('needs-round-binding', '执行模式只认「[验收机] 第 n 轮：验收中」的认领评论');
+      }
+      if (state.latest && state.latest.status === '验收中') {
+        return reject('round-in-progress', `第 ${state.latest.round} 轮还在验收中，不能再认领新一轮`);
       }
       const maxRound = state.rounds.reduce((acc, entry) => Math.max(acc, entry.round), 0);
       const n = Number(match[1]);
@@ -775,6 +815,22 @@ export function createGate({
    * 沙箱在「扫完」和「推送」之间换掉原文件也没用。
    * 返回 {problem} 表示拒绝；{bundleCopy, cleanup} 表示放行，推送要用 bundleCopy。
    */
+  async function defaultHeadInBundle(repo, bare, git) {
+    const [owner, name] = String(repo || '').split('/');
+    if (!owner || !name) return null;
+    let oid;
+    try {
+      const data = await github.graphql(DEFAULT_HEAD_QUERY, { owner, name });
+      oid = data?.repository?.defaultBranchRef?.target?.oid;
+    } catch {
+      return null;
+    }
+    if (typeof oid !== 'string' || !COMMIT_OID.test(oid)) return null;
+    const result = await git(['--git-dir', bare, 'rev-parse', '--verify', '--quiet', `${oid}^{commit}`]);
+    if (!result || result.code !== 0 || String(result.stdout || '').trim() !== oid) return null;
+    return oid;
+  }
+
   async function scanBundle(action) {
     const { bundlePath, branch } = action;
     if (typeof bundlePath !== 'string' || !path.isAbsolute(bundlePath)) {
@@ -811,7 +867,26 @@ export function createGate({
       if (!result || result.code !== 0 || !/^[0-9a-f]{40,64}$/.test(commit)) {
         return { problem: fail('scan-failed', `解析分支提交失败：${firstLine(result?.stderr)}`) };
       }
-      const range = action.base ? `${action.base}..${commit}` : commit;
+      // 基准由写闸自己定：目标仓默认分支的头提交在 bundle 里，就只扫它之后的新提交；
+      // 读不到或不在 bundle 里，就扫这条分支的全部历史（更严，宁可多拦）。沙箱交来的 base 一律不看。
+      const base = await defaultHeadInBundle(action.repo, bare, git);
+      const range = base ? `${base}..${commit}` : commit;
+      // 内置扫描每次都跑（有没有 gitleaks 都跑）：看的是范围新引入的每个对象的内容，不解析补丁，
+      // 合并提交带进来的文件、含 NUL 的「二进制」文件、像补丁头的行都逃不掉。
+      let found;
+      try {
+        found = await scanIntroducedObjects({
+          git: (args, options) => run('git', args, { env, timeoutMs: 300000, ...options }),
+          gitDir: ['--git-dir', bare],
+          tip: commit,
+          exclude: base ? [base] : [],
+        });
+      } catch (error) {
+        return { problem: fail('scan-failed', firstLine(error?.message)) };
+      }
+      if (found.length) {
+        return { problem: { code: 4, body: { reason: 'secret-found', files: found }, alert: 'secret-found' } };
+      }
       if (await whichCmd('gitleaks')) {
         const reportFile = path.join(tmp, 'gitleaks-report.json');
         const scan = await run(
@@ -831,15 +906,6 @@ export function createGate({
               alert: 'secret-found',
             },
           };
-        }
-      } else {
-        result = await git(['--git-dir', bare, 'log', '-p', '--format=', range]);
-        if (!result || result.code !== 0) {
-          return { problem: fail('scan-failed', `读补丁失败：${firstLine(result?.stderr)}`) };
-        }
-        const files = scanAddedLines(result.stdout);
-        if (files.length) {
-          return { problem: { code: 4, body: { reason: 'secret-found', files }, alert: 'secret-found' } };
         }
       }
       keep = true;
@@ -870,9 +936,6 @@ export function createGate({
     const ledger = readLedger();
     if (!ledger) return fail('ledger-corrupt', '账本里有读不出的行，先修账本');
     if (typeof action.dedupeKey !== 'string' || !action.dedupeKey) return reject('missing-dedupe-key');
-    const seen = ledger.find((entry) => entry.dedupeKey === action.dedupeKey);
-    if (seen) return { code: 0, body: seen.result ?? {} };
-
     // 5. 仓范围
     const scope = scopeOf(action.repo);
     if (!scope) return reject('repo-not-allowed', `${action.repo ?? '(空)'} 不在配置的名单里`);
@@ -892,6 +955,10 @@ export function createGate({
     if (scope.tier === 'watch' && !WATCH_ALLOWED_TYPES.has(action.type)) {
       return reject('tier-not-allowed', `watch 档不写 ${action.type}`);
     }
+
+    // 账本查重放在仓范围、分档之后：名单外的仓、档位不许的动作，哪怕账本里有同名 key 也照样拒绝。
+    const seen = ledger.find((entry) => entry.dedupeKey === action.dedupeKey);
+    if (seen) return { code: 0, body: seen.result ?? {} };
 
     // 8. 执行锁：同一时间只执行一条写动作；30 秒拿不到就回 75，什么都不执行
     const gotLock = await acquireLock(paths.execLock, { now, waitMs: lockWaitMs, sleep });

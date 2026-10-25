@@ -305,8 +305,8 @@ export async function runHostRound({
   let roundDir = null;
   let gateServer = null;
   let registryFile = null;
-  // pi 一旦起来，不管从哪条路离开（卡住、出错、异常），收尾前都要确认它已经结束：
-  // 不能让模型在写闸收掉之后还在跑。
+  // pi 一旦起来，离开只有三条路：正常退出、卡住、出错。卡住和出错两条都先 stopPi() 再 abort，
+  // 所以收写闸（finally）之前 pi 一定已经结束。
   let pi = null;
   let piExited = false;
   async function stopPi() {
@@ -473,7 +473,6 @@ export async function runHostRound({
       return 1;
     }
   } finally {
-    await stopPi();
     if (gateServer) {
       try {
         await gateServer.stop();

@@ -7,14 +7,15 @@ import { spawn } from 'node:child_process';
  * 跑一条命令，等它结束：{code, stdout, stderr}。
  * timeoutMs 到了先 SIGTERM，2 秒后还在就 SIGKILL。
  */
-export function run(cmd, args, { env, input, cwd, timeoutMs } = {}) {
+export function run(cmd, args, { env, input, raw = false, cwd, timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, Array.isArray(args) ? args : [], {
       env,
       cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    let stdout = '';
+    // raw：stdout 按字节原样收（cat-file --batch 要按字节数切），不按 UTF-8 拼成字符串。
+    const outChunks = [];
     let stderr = '';
     let timer;
     let killed = false;
@@ -31,22 +32,23 @@ export function run(cmd, args, { env, input, cwd, timeoutMs } = {}) {
       timer.unref?.();
     }
     child.stdout.on('data', (chunk) => {
-      stdout += chunk;
+      outChunks.push(Buffer.from(chunk));
     });
+    const collected = () => (raw ? Buffer.concat(outChunks) : Buffer.concat(outChunks).toString('utf8'));
     child.stderr.on('data', (chunk) => {
       stderr += chunk;
     });
     child.on('error', (error) => {
       stop();
       if (killed) {
-        resolve({ code: 124, stdout, stderr: `${stderr}${error.message}` });
+        resolve({ code: 124, stdout: collected(), stderr: `${stderr}${error.message}` });
         return;
       }
       reject(error);
     });
     child.on('close', (code, signal) => {
       stop();
-      resolve({ code: code ?? (signal ? 124 : 1), stdout, stderr, signal: signal || undefined });
+      resolve({ code: code ?? (signal ? 124 : 1), stdout: collected(), stderr, signal: signal || undefined });
     });
     if (input != null) child.stdin.write(input);
     child.stdin.end();
