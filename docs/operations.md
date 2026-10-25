@@ -135,6 +135,15 @@ node watchers/<mivo|cindy>/deploy.mjs apply --plan <file>
 - Cindy(fork 场景,你可能没有打标签权限):在 watcher home 的 `config/optout.json` 里加入
   PR 号,或让 PR 作者本人发一条正文恰为 `/cindy-watch off` 的 issue comment。
 
+## 6. 机器生成的 PR（Mivo 每日更新日志）
+
+分支名以 `chore/changelog-` 开头的 PR 由每日更新日志工作流生成，只改 `public/changelog.json`。这个工作流开完 PR 就结束，不看 CI、不合并。盯梢对它的处理和普通 PR 不同：
+
+- 不派修复会话：改动只有数据文件，会话只能去「修」与它无关的测试。
+- 必需检查变红时，对每个失败检查所在的 Actions run 调一次 `rerun-failed-jobs`；同一个 head、同一个 run 只重跑一次。只等上游的门（如 `pr-ci-freshness`）在上游没跑完时按分诊暂缓，不计入。
+- 重跑后的新一轮尝试仍然红，或失败的必需检查不是 Actions（没法重跑），就通知一次（通知类型 `excluded-head-ci-red`，按 PR 号和 head 去重）。
+- PR 被下一天的更新覆盖（head 变化）后重新计算。状态记在该 PR 条目的 `excludedHead` 字段。
+
 ## 7. 本地 validate 的并发、日志与收据
 
 两个 watcher 的 `validate` 由异步命令执行，证据都在 watcher home 的 `state/validations/` 下：
