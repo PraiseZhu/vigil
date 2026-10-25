@@ -56,8 +56,23 @@ export function cleanupTmpDirs() {
 }
 process.on('exit', cleanupTmpDirs);
 
+/**
+ * 临时目录的父目录：测试会在下面建 unix socket（写闸、出网代理），路径上限 107 字节。TMPDIR 很长时
+ * （比如验收轮的 pi 在自己的沙箱里直接 `node --test`，TMPDIR 在轮次目录下）改用 /tmp，免得 socket 路径超长。
+ */
+export function tmpBase() {
+  const base = os.tmpdir();
+  if (base.length <= 30) return base;
+  try {
+    fs.accessSync('/tmp', fs.constants.W_OK);
+    return '/tmp';
+  } catch {
+    return base;
+  }
+}
+
 export function tmpDir(prefix = 'acceptance-test-') {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = fs.mkdtempSync(path.join(tmpBase(), prefix));
   createdTmpDirs.add(dir);
   return dir;
 }

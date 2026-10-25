@@ -6,11 +6,12 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { tmpBase } from './fake-gh.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 test('tmpDir 夹具建的目录在进程退出时删掉，权限被改成 000 / 只读的也删得掉', () => {
-  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'acceptance-cleanup-check-'));
+  const parent = fs.mkdtempSync(path.join(tmpBase(), 'acc-clean-'));
   try {
     const fixture = pathToFileURL(path.join(HERE, 'fake-gh.fixture.mjs')).href;
     const script = `
