@@ -123,6 +123,7 @@ test('SC3 逐条结果里有「要修」或「有争议」→ 要修；人工手
   const passFile = verdictFile(home, {
     items: fullConclusions({ [`${REPO}#2 SC5`]: { result: '人工手测', layer: 'paid' } }),
   });
+  world2.get(`${REPO}#1`).state = 'closed';
   const second = await run(world2, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '2', '--file', passFile]);
   assert.equal(second.code, 0, second.err);
   assert.equal(JSON.parse(second.out).status, '通过');
@@ -222,6 +223,7 @@ test('SC11 裁决正文脱敏：不写状态目录、令牌、运行 id；首行
       { ref: `${REPO}#1`, sc: 2, result: '通过', evidence: 'ok' },
     ],
   });
+  world.get(`${REPO}#1`).state = 'closed';
   const result = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', file]);
   assert.equal(result.code, 0, result.err);
   const body = writesOf(world, 'comment.update')[0].body;
@@ -269,4 +271,20 @@ test('SC11 redact 单元：绝对路径、令牌、私钥、Bearer、运行 id �
   assert.ok(out.includes(REDACTED));
   assert.equal(redact('', profile), '');
   assert.equal(redact(null, profile), '');
+});
+
+test('「通过」之前总 issue 必须已关：还开着 → 退出码 1、不写裁决（免得留下通过但没关、以后也不再验）', async () => {
+  const { profile, home } = loadProfile();
+  const world = defaultTree();
+  const file = verdictFile(home, { items: fullConclusions() });
+  const open = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', file]);
+  assert.equal(open.code, 1);
+  assert.match(open.err, /判「通过」之前要先 close/);
+  assert.equal(writesOf(world, 'comment.update').length, 0);
+
+  // 「要修」不受影响：总 issue 本来就不关。
+  const fix = verdictFile(home, { items: fullConclusions({ [`${REPO}#2 SC4`]: { result: '要修', why: '缺测试' } }) });
+  const needsFix = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', fix]);
+  assert.equal(needsFix.code, 0, needsFix.err);
+  assert.match(writesOf(world, 'comment.update')[0].body.split('\n')[0], /第 1 轮：要修/);
 });

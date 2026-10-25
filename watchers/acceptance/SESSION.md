@@ -64,6 +64,8 @@ node watchers/acceptance/bin/helper.mjs done    --issue <root> --round <n>
 
 `close` 自己按 **勾选 → 看板（总 issue 和每个子 issue 写「通过」）→ 关总 issue** 的顺序做：看板写失败就停在关单之前，issue 还开着，不会「关了但看板没写」。
 
+`verdict` 判「通过」时会回读总 issue：还开着就拒绝（退出码 1），说明 `close` 没做完——不要跳过 `close` 直接写裁决。
+
 只出裁决的任务（`root.verdictOnly`）不跑 `close`：直接 `verdict` 再 `done`（要写看板就先 `board --target all --acceptance 通过`）。
 
 ### 裁决文件 verdict.json

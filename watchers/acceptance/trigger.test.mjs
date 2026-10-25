@@ -255,3 +255,19 @@ test('SC11 stalledRounds 以宿主时间为准：stateDir 里伪造的 lastProgr
 });
 
 void OWNER;
+
+test('通过但没关：同一份正文只通过过一次 → 再触发一轮收尾；通过两次还没关 → 不再触发；verdictOnly / watch / 已关 不触发', () => {
+  const body = 'parent body';
+  const version = bodyVersion(body);
+  const pass = (round, finishedAt) => ({ round, status: '通过', bodyVersion: version, createdAt: finishedAt, finishedAt });
+  const profile = { startAt: START_AT };
+  const now = nowAt('2026-10-24T00:00:00.000Z');
+  const once = parentTask({ rounds: [pass(1, '2026-10-23T00:00:00.000Z')] });
+  assert.deepEqual(shouldTrigger(once, { now, profile }), { trigger: true, reason: 'passed-but-open' });
+  const twice = parentTask({ rounds: [pass(1, '2026-10-22T00:00:00.000Z'), pass(2, '2026-10-23T00:00:00.000Z')] });
+  assert.equal(shouldTrigger(twice, { now, profile }).trigger, false);
+  const verdictOnly = { ...profile, verdictOnlyIssues: [once.ref] };
+  assert.equal(shouldTrigger(once, { now, profile: verdictOnly }).trigger, false);
+  assert.equal(shouldTrigger({ ...once, tier: 'watch' }, { now, profile }).trigger, false);
+  assert.equal(shouldTrigger({ ...once, state: 'closed', closedAt: '2026-10-23T01:00:00.000Z' }, { now, profile }).trigger, false);
+});

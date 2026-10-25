@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // 触发与退避：纯函数，now 由调用方注入。
+import { isVerdictOnly } from './profile.mjs';
 import { latestRound } from './rounds.mjs';
 
 export const BACKOFF_MINUTES = Object.freeze([0, 5, 15, 60]);
@@ -37,6 +38,18 @@ function childOpen(child) {
   return child.state !== 'closed' && child.state !== 'CLOSED';
 }
 
+/**
+ * 最新裁决「通过」、issue 却还开着（不在 verdictOnlyIssues、不是 watch 档）：关单那一步没走完。
+ * 重跑一轮把收尾（勾选、看板、关单）做完；同一份正文最多重跑一次，再不关就只留 passedButOpen 提醒给人。
+ */
+function passedButOpenRetry(task, f, profile) {
+  if (f?.status !== '通过' || task.state !== 'open' || task.tier === 'watch') return null;
+  if (isVerdictOnly(profile, task.ref)) return null;
+  const passes = (task.rounds || []).filter((round) => round.status === '通过' && round.bodyVersion === f.bodyVersion);
+  if (passes.length >= 2) return null;
+  return { trigger: true, reason: 'passed-but-open' };
+}
+
 export function shouldTrigger(task, { now, profile }) {
   if (!task?.tier) return { trigger: false, reason: 'no-tier' };
   if (task.closedAt && Date.parse(task.closedAt) < Date.parse(profile.startAt)) {
@@ -57,7 +70,7 @@ export function shouldTrigger(task, { now, profile }) {
     if ((task.children || []).some((child) => child.closedAt && f.finishedAt && Date.parse(child.closedAt) > Date.parse(f.finishedAt))) {
       return { trigger: true, reason: 'children-closed-after-verdict' };
     }
-    return { trigger: false, reason: 'up-to-date' };
+    return passedButOpenRetry(task, f, profile) || { trigger: false, reason: 'up-to-date' };
   }
 
   const merged = (task.linkedPrs || []).filter((pr) => pr.mergedAt);
@@ -67,7 +80,7 @@ export function shouldTrigger(task, { now, profile }) {
     return { trigger: true, reason: 'pr-merged-after-verdict' };
   }
   if (f.bodyVersion !== task.bodyVersion) return { trigger: true, reason: 'body-changed' };
-  return { trigger: false, reason: 'up-to-date' };
+  return passedButOpenRetry(task, f, profile) || { trigger: false, reason: 'up-to-date' };
 }
 
 /**

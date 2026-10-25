@@ -401,6 +401,7 @@ test('verdict 覆盖率：任务树里有 SC 没结论 → 退出码 1、点名�
     extracted: true,
     items: [{ ref: ROOT_REF, sc: 1, result: '通过', evidence: 'ok' }],
   });
+  bare.get(ROOT_REF).state = 'closed';
   const ok = await helper(createFakeGithub(bare), profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', extracted]);
   assert.equal(ok.code, 0, ok.err);
 });
@@ -654,7 +655,7 @@ test('poll：任务树里有名单外的仓 → 不派发，报 outOfScope；名
 });
 
 test('poll：最新裁决是通过、issue 还开着 → passedButOpen；verdictOnly / watch 档 / 已关 都不报', async () => {
-  const build = ({ repo = REPO, state = 'open' } = {}) => {
+  const build = ({ repo = REPO, state = 'open', passes = 2 } = {}) => {
     const world = createWorld({ now });
     const body = '独立任务';
     world.addIssue({
@@ -665,6 +666,12 @@ test('poll：最新裁决是通过、issue 还开着 → passedButOpen；verdict
       closedAt: state === 'closed' ? '2026-10-23T00:00:00.000Z' : null,
       prs: [{ number: 3, url: `https://github.com/${repo}/pull/3`, mergedAt: '2026-10-20T00:00:00.000Z' }],
     });
+    if (passes >= 2) {
+      world.addComment(`${repo}#1`, {
+        ...roundComment({ round: 1, status: '通过', bodyVersion: bodyVersion(body), finishedAt: '2026-10-22T00:00:00.000Z' }),
+        url: `https://github.com/${repo}/issues/1#issuecomment-1001`,
+      });
+    }
     world.addComment(`${repo}#1`, {
       ...roundComment({ round: 2, status: '通过', bodyVersion: bodyVersion(body), finishedAt: '2026-10-23T00:00:00.000Z' }),
       url: `https://github.com/${repo}/issues/1#issuecomment-1002`,
@@ -672,6 +679,13 @@ test('poll：最新裁决是通过、issue 还开着 → passedButOpen；verdict
     return world;
   };
   const { profile } = setup();
+  // 只通过过一次、没关：重跑一轮把收尾做完（trigger: passed-but-open），poll 派发它。
+  const once = await poll({ github: pollGithub(build({ passes: 1 }), profile), profile, now });
+  assert.equal(once.length, 1);
+  assert.equal(once[0].issue, ROOT_REF);
+  assert.equal(once[0].passedButOpen, undefined);
+  assert.equal(once[0].nextRound, 3);
+  // 同一份正文已经重跑过（通过两次）还没关：不再派发，只报 passedButOpen 给人。
   const open = await poll({ github: pollGithub(build(), profile), profile, now });
   assert.deepEqual(open, [
     { issue: ROOT_REF, passedButOpen: true, round: 2, url: `https://github.com/${REPO}/issues/1#issuecomment-1002` },

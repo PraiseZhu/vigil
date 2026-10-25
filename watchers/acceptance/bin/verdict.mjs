@@ -179,6 +179,11 @@ export async function runVerdict({ github, profile, ref, n, file, statusFlag, no
 
   // 正文版本按「现在」的正文算：验收机自己改了正文（勾选、关 issue），就用改后的版本。
   const fresh = await fetchIssueBody(github, ref);
+  const verdictOnly = Boolean(tree.root.verdictOnly) || isVerdictOnly(profile, ref);
+  // 「通过」必须先 close（SESSION.md §4）：总 issue 还开着就不写裁决（退出码 1），免得留下「通过但没关」、以后也不再验。
+  if (status === '通过' && !verdictOnly && tree.root.tier !== 'watch' && fresh.state === 'open') {
+    throw new Error(`判「通过」之前要先 close：${ref} 还开着，裁决不写（先跑 helper close，再写 verdict）`);
+  }
   const version = bodyVersion(fresh.body);
   const body = formatVerdictBody({
     round: n,
@@ -189,7 +194,7 @@ export async function runVerdict({ github, profile, ref, n, file, statusFlag, no
     items,
     extracted: Boolean(payload.extracted),
     needsHuman,
-    verdictOnly: Boolean(tree.root.verdictOnly) || isVerdictOnly(profile, ref),
+    verdictOnly,
     profile,
   });
 
