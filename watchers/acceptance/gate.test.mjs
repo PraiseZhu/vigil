@@ -1232,7 +1232,7 @@ test('SC9 pr.ready 不认从 fork 来的 PR（isCrossRepository）：分支名�
   assert.match(PR_READY_QUERY, /isCrossRepository/);
 });
 
-test('SC9 pr.create：必须 draft: true；非 fork 档 head 不许带前缀；fork 档 head 必须是 ownerLogin:分支', async () => {
+test('SC9 pr.create：必须 draft: true；base 只能是 main；非 fork 档 head 不许带前缀；fork 档 head 必须是 ownerLogin:分支', async () => {
   const { home, profile } = setupEnvironment();
   const prBody = `任务 issue：${ROOT_REF}\n\n${PR_MARKER}`;
   const cases = [
@@ -1244,6 +1244,7 @@ test('SC9 pr.create：必须 draft: true；非 fork 档 head 不许带前缀；f
     ['fork 没前缀', { repo: 'makecindy/cindy', head: 'acceptance/1-2-sc1', draft: true }, 'not-in-tree'],
     ['fork 别人前缀', { repo: 'makecindy/cindy', head: 'stranger:acceptance/1-2-sc1', draft: true }, 'not-in-tree'],
     ['fork 空前缀', { repo: 'makecindy/cindy', head: ':acceptance/1-2-sc1', draft: true }, 'not-in-tree'],
+    ['base 不是 main', { repo: REPO, head: 'acceptance/1-2-sc1', draft: true, base: 'release' }, 'not-allowed'],
     ['非 fork 对的', { repo: REPO, head: 'acceptance/1-2-sc1', draft: true }, null],
     ['fork 对的', { repo: 'makecindy/cindy', head: `${profile.ownerLogin}:acceptance/1-2-sc1`, draft: true }, null],
   ];

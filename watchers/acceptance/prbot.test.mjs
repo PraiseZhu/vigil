@@ -18,6 +18,7 @@ import {
   correctionBranch,
   discoverCorrections,
   matchesForbidden,
+  mirrorPathFor,
   parseCorrectionRounds,
   pollDraft,
   prbotStatePath,
@@ -376,9 +377,14 @@ test('SC11 清理：只回收带 prbot .acc-owned.json、且这一修正轮已�
     path.join(paths.prbotLocksDir, 'example-owner__example-repo__10.lock'),
     JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }),
   );
+  // 宿主镜像在 <home>/state/prbot/mirrors/<工作树名>：跟着工作树一起回收，没收尾的不动。
+  for (const key of ['done', 'active']) fs.mkdirSync(mirrorPathFor(home, dirs[key]), { recursive: true });
   const removed = cleanupWorktrees({ home, profile });
   assert.deepEqual(removed, [dirs.done]);
   for (const key of ['active', 'unfinished', 'foreign', 'noMarker']) assert.equal(fs.existsSync(dirs[key]), true, key);
+  assert.equal(fs.existsSync(mirrorPathFor(home, dirs.done)), false, '收尾的镜像删了');
+  assert.equal(fs.existsSync(mirrorPathFor(home, dirs.active)), true, '还在跑的镜像不动');
+  assert.ok(mirrorPathFor(home, dirs.done).startsWith(path.join(home, 'state', 'prbot', 'mirrors') + path.sep));
 });
 
 test('SC1/SC2/SC5/SC11 一次完整跑通：认领 → 评估 → 修复 → Draft → 等 CI → Ready，评论就地改、事件按接口写', async () => {
@@ -644,6 +650,8 @@ async function runOnce({
       hostRuns.push({ cmd, args });
       if (args.includes('diff')) return { code: 0, stdout: diff, stderr: '' };
       if (args.includes('status')) return { code: 0, stdout: dirty, stderr: '' };
+      // 宿主在镜像里打 main.bundle：假装打出一个文件。
+      if (args.includes('bundle') && args.includes('create')) fs.writeFileSync(args[args.indexOf('create') + 1], 'fake main bundle');
       return { code: 0, stdout: '', stderr: '' };
     },
     statusProvider: async () => statuses[Math.min(polls++, statuses.length - 1)],
@@ -700,7 +708,9 @@ test('SC7 冲突：pi 先取回最新 main 再合（prepareWorktree refresh + �
   // 最新 main 由宿主取进镜像；导进工作树这一步在沙箱里跑，而且只在解决冲突那一次。
   assert.equal(sandboxed.length, 1);
   assert.deepEqual(sandboxed[0][0].slice(0, 3), ['git', 'fetch', '-q']);
-  assert.match(sandboxed[0][0][3], /mirror$/);
+  // 沙箱只拿到复制进轮次目录的 main.bundle，看不见宿主镜像本身。
+  assert.match(sandboxed[0][0][3], /[/]run[/]prbot[/][^/]+-r1-main[/]main\.bundle$/);
+  assert.doesNotMatch(sandboxed[0][0][3], /mirror/);
   assert.equal(sandboxed[0][0][4], '+refs/remotes/origin/main:refs/remotes/origin/main');
   assert.equal(piCalls.length, 2);
   assert.equal(piCalls[0].refresh, false);
@@ -801,56 +811,7 @@ test('SC4 handoffNew 生成的交接文件：add / commit 在沙箱里跑，宿�
   assert.equal(result.actions.filter((action) => action.type === 'branch.push').length, 2);
 });
 
-test('SC5 准备工作树：从 PR 所在的上游仓取 main（fork 模式也一样），归属标记不进提交，宿主 git 关钩子', async () => {
-  const worktreeDir = tmpDir();
-  const fetches = [];
-  const fetchDirs = [];
-  const runs = [];
-  const github = {
-    async fetchBranch({ repo, branch, dir, depth }) {
-      fetches.push({ repo, branch });
-      fetchDirs.push({ dir, depth });
-      fs.mkdirSync(path.join(dir, '.git', 'info'), { recursive: true });
-    },
-  };
-  const run = async (cmd, args, options) => {
-    runs.push({ cmd, args, env: options?.env });
-    return { code: 0, stdout: '', stderr: '' };
-  };
-  const state = { issue: `${REPO}#2`, root: `${REPO}#1`, round: 1, branch: 'acceptance/1-2-sc3', prRepo: 'makecindy/cindy', pushRepo: `${OWNER}/cindy` };
-  const profile = { worktreeDir, ownerLogin: 'ExampleUser' };
-  process.env.EXAMPLE_FAKE_TOKEN = 'fake-not-a-token';
-  let first;
-  try {
-    first = await defaultPrepareWorktree({ github, state, profile, run });
-  } finally {
-    delete process.env.EXAMPLE_FAKE_TOKEN;
-  }
-  assert.equal(first.reused, false);
-  assert.deepEqual(fetches, [{ repo: 'makecindy/cindy', branch: 'main' }]);
-  assert.match(fs.readFileSync(path.join(first.worktree, '.git', 'info', 'exclude'), 'utf8'), /^\/\.acc-owned\.json$/m);
-  assert.ok(runs.length >= 3);
-  for (const entry of runs) {
-    assert.equal(entry.cmd, 'git');
-    assert.deepEqual(entry.args.slice(0, HOST_GIT_HARDENING.length), HOST_GIT_HARDENING);
-    assert.ok(entry.env, '宿主 git 带收窄过的环境');
-    assert.equal(Object.keys(entry.env).some((key) => /TOKEN/i.test(key)), false);
-  }
-  assert.ok(runs.some((entry) => entry.args.includes('user.email') && entry.args.includes('ExampleUser@users.noreply.github.com')));
-
-  const again = await defaultPrepareWorktree({ github, state, profile, run });
-  assert.equal(again.reused, true);
-  assert.equal(fetches.length, 1, '复用不重取');
-  await defaultPrepareWorktree({ github, state, profile, run, refresh: true });
-  assert.deepEqual(fetches.at(-1), { repo: 'makecindy/cindy', branch: 'main' });
-  assert.equal(fetches.length, 2, '解决冲突前重取 main');
-  // 带令牌的 fetch 只进宿主镜像（工作树同级的 .mirror/），从不在 pi 写过的工作树里跑。
-  for (const { dir, depth } of fetchDirs) {
-    assert.equal(dir, path.join(path.dirname(first.worktree), '.mirror', path.basename(first.worktree)));
-    assert.equal(depth, 0);
-  }
-  assert.equal(again.mirror, fetchDirs[0].dir);
-});
+// SC5 准备工作树（镜像位置、沙箱里建工作树、复用 / 重取、fork 上游）见 prbot-mirror.test.mjs。
 
 // ---- #68 第三轮复审：宿主绝不在 pi 写过的工作树里跑（带令牌的）git ----
 
@@ -915,6 +876,7 @@ async function hostileSetup({ forbiddenPaths } = {}) {
       fs.copyFileSync(evil, path.join(hooks, name));
       fs.chmodSync(path.join(hooks, name), 0o755);
     }
+    // 旧镜像位置（#68 第四轮复审前）：模型想把宿主对它的 fetch 改道到自己的程序。
     const mirror = path.join(path.dirname(dir), '.mirror', path.basename(dir));
     fs.appendFileSync(
       path.join(dir, '.git', 'config'),
@@ -1036,10 +998,9 @@ test('SC3/SC5 pi 植入钩子 + 恶意 .git/config + 挪 origin/main：宿主上
   }
   // 对照：要是宿主像以前那样在工作树里 fetch，植入的东西真的会在宿主上跑（说明上面的「没留痕」不是假象）。
   const dir = setup.worktree();
-  const mirror = path.join(path.dirname(dir), '.mirror', path.basename(dir));
   const env = { ...sandboxEnv() };
   delete env.IN_SANDBOX;
-  await spawnRun('git', ['-C', dir, 'fetch', '-q', mirror, '+refs/remotes/origin/main:refs/remotes/origin/main'], { env });
+  await spawnRun('git', ['-C', dir, 'fetch', '-q', dir, '+HEAD:refs/remotes/origin/control'], { env });
   assert.ok(fs.readdirSync(setup.marks).length > 0, '对照组：宿主在工作树里跑 git 会触发植入的钩子 / 配置');
 });
 
@@ -1060,6 +1021,28 @@ test('SC3 bundle 头只用纯 JS 读：只认自带全部对象的 bundle，有�
   assert.equal(bundleHead(Buffer.from(`# v2 git bundle\n-${'b'.repeat(40)} base\n${sha} refs/heads/b\n\nPACK`), 'b'), null);
   assert.equal(bundleHead(Buffer.from(`not a bundle\n${sha} refs/heads/b\n\n`), 'b'), null);
   assert.equal(bundleHead(Buffer.from(`# v2 git bundle\n${sha} refs/heads/b`), 'b'), null);
+});
+
+test('SC3 沙箱产出的 push.bundle 超过大小上限（512 MiB）：宿主不读、不推，bundle-failed', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const result = await runOnce({
+    world,
+    preflightRunner: async ({ commands, roundDir }) => {
+      if (commands[0][1] === 'bundle') {
+        const file = path.join(roundDir, 'push.bundle');
+        fs.writeFileSync(file, `# v2 git bundle\n${'a'.repeat(40)} refs/heads/acceptance/1-2-sc3\n\n`);
+        // 稀疏文件：不真占盘，大小超过上限。
+        fs.truncateSync(file, 512 * 1024 ** 2 + 1);
+      }
+      return { ok: true, runs: [] };
+    },
+    overrides: { bundleFactory: undefined },
+  });
+  assert.equal(result.code, 1);
+  assert.equal(result.actions.some((action) => action.type === 'branch.push'), false);
+  const state = JSON.parse(fs.readFileSync(prbotStatePath(result.paths, CORRECTION_REF), 'utf8'));
+  assert.equal(state.failureReason, 'bundle-failed');
 });
 
 test('SC3 沙箱把 push.bundle 换成指向宿主文件的符号链接：宿主不跟链接、不推，bundle-failed', async () => {

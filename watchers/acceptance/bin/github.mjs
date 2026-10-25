@@ -56,9 +56,12 @@ export class WriteRejectedError extends Error {
   }
 }
 
-function defaultRun(cmd, args, { env, input } = {}) {
+function defaultRun(cmd, args, { env, input, timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    // 超时就杀掉（取镜像这种可能卡很久的命令才传 timeoutMs）。
+    const timer = Number(timeoutMs) > 0 ? setTimeout(() => child.kill('SIGKILL'), Number(timeoutMs)) : null;
+    child.on('close', () => timer && clearTimeout(timer));
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => {
@@ -74,6 +77,82 @@ function defaultRun(cmd, args, { env, input } = {}) {
     if (input != null) child.stdin.write(input);
     child.stdin.end();
   });
+}
+
+/** 取镜像的超时（10 分钟）和磁盘上限（2 GiB）。常量，不可配。 */
+export const FETCH_TIMEOUT_MS = 10 * 60 * 1000;
+export const MIRROR_MAX_BYTES = 2 * 1024 ** 3;
+
+/**
+ * 宿主镜像上的 git：不读系统 / 全局配置，钩子、fsmonitor、代理、凭据助手全关，协议只许 https。
+ * 仓里的配置由 assertMirrorIntact 逐字节比对固定内容（MIRROR_CONFIG），所以仓级配置也改不了行为。
+ */
+export const MIRROR_GIT_HARDENING = Object.freeze([
+  '-c', 'core.hooksPath=/dev/null',
+  '-c', 'core.fsmonitor=false',
+  '-c', 'core.sshCommand=false',
+  '-c', 'credential.helper=',
+  '-c', 'http.proxy=',
+  '-c', 'protocol.allow=never',
+  '-c', 'protocol.https.allow=always',
+]);
+const MIRROR_ENV = Object.freeze({ GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0' });
+export const MIRROR_CONFIG = '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n';
+
+function mirrorBaseEnv() {
+  return { ...baseEnv(), ...MIRROR_ENV };
+}
+
+/** 宿主自己建的目录：真目录（不是符号链接）、属主是当前用户、组和其他人没有任何权限。 */
+export function assertHostOwnedDir(dir) {
+  let st;
+  try {
+    st = fs.lstatSync(dir);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    fs.mkdirSync(dir, { mode: 0o700 });
+    st = fs.lstatSync(dir);
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`mirror-tampered：不是宿主自己的目录（符号链接或不是目录）：${path.basename(dir)}`);
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) throw new Error('mirror-tampered：目录属主不是宿主用户');
+  if ((st.mode & 0o077) !== 0) throw new Error('mirror-tampered：目录权限不是 700');
+}
+
+/** 镜像仓没被动过：.git 是真目录，配置和固定内容逐字节相同，没有 commondir / alternates，顶层没有符号链接。 */
+export function assertMirrorIntact(dir) {
+  const gitDir = path.join(dir, '.git');
+  const st = fs.lstatSync(gitDir);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error('mirror-tampered：.git 不是目录');
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) throw new Error('mirror-tampered：.git 属主不是宿主用户');
+  for (const entry of fs.readdirSync(gitDir, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) throw new Error(`mirror-tampered：.git/${entry.name} 是符号链接`);
+  }
+  for (const rel of ['commondir', 'gitdir', path.join('objects', 'info', 'alternates'), path.join('objects', 'info', 'http-alternates')]) {
+    if (fs.existsSync(path.join(gitDir, rel))) throw new Error(`mirror-tampered：有 ${rel}`);
+  }
+  const fd = fs.openSync(path.join(gitDir, 'config'), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  let text;
+  try {
+    text = fs.readFileSync(fd, 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (text !== MIRROR_CONFIG) throw new Error('mirror-tampered：.git/config 被改过');
+}
+
+/** 目录占多少字节（不跟符号链接）。 */
+function dirSize(dir) {
+  let total = 0;
+  const stack = [dir];
+  while (stack.length) {
+    const current = stack.pop();
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) stack.push(full);
+      else if (entry.isFile()) total += fs.lstatSync(full).size;
+    }
+  }
+  return total;
 }
 
 function defaultSleep(ms) {
@@ -381,7 +460,6 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
   }
 
   async function fetchBranch({ repo, branch = 'main', dir, depth = 50 } = {}) {
-    const token = getOwnerToken();
     if (typeof repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || repo.startsWith('-')) {
       throw new Error(`fetchBranch 的仓名不合法：${repo}`);
     }
@@ -389,25 +467,43 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
       throw new Error(`fetchBranch 的分支名不合法：${branch}`);
     }
     if (typeof dir !== 'string' || !path.isAbsolute(dir)) throw new Error('fetchBranch 需要绝对路径的 dir');
-    const env = gitEnv(token);
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    let result = await runCmd('git', ['init', '-q', dir], { env });
-    if (result.code !== 0) failFrom(result, token);
+    // 先查目录再读令牌：目录不是宿主自己的（符号链接、别人的、权限放开、.git 被动过）就不带令牌跑任何 git。
+    const gitDir = path.join(dir, '.git');
+    assertHostOwnedDir(dir);
+    if (!fs.existsSync(gitDir)) {
+      const init = await runCmd('git', [...MIRROR_GIT_HARDENING, 'init', '-q', '--bare', gitDir], { env: mirrorBaseEnv() });
+      if (init.code !== 0) throw new Error('fetchBranch：建镜像仓失败');
+      if (!fs.existsSync(gitDir)) throw new Error('fetchBranch：建镜像仓失败');
+      // 配置换成固定内容；以后每次取之前逐字节比对，被改过就拒绝（mirror-tampered）。
+      fs.writeFileSync(path.join(gitDir, 'config'), MIRROR_CONFIG, { mode: 0o600 });
+    }
+    assertMirrorIntact(dir);
+    const token = getOwnerToken();
+    const env = { ...gitEnv(token), ...MIRROR_ENV };
     // 令牌只在 GIT_CONFIG_* extraheader 里（gitEnv）；URL / argv / 配置里都不带。
-    result = await runCmd(
+    // --git-dir 指定宿主自己的镜像，钩子 / fsmonitor / 代理 / 凭据助手全关，只许 https。
+    const result = await runCmd(
       'git',
       [
-        '-C',
-        dir,
+        ...MIRROR_GIT_HARDENING,
+        '--git-dir',
+        gitDir,
         'fetch',
+        '-q',
+        '--no-tags',
         // depth: 0 = 全量历史（修正轮要能打出自带全部对象的 bundle）。
         ...(Number(depth) > 0 ? [`--depth=${Number(depth)}`] : []),
         `https://github.com/${repo}.git`,
         `+refs/heads/${branch}:refs/remotes/origin/${branch}`,
       ],
-      { env },
+      { env, timeoutMs: FETCH_TIMEOUT_MS },
     );
     if (result.code !== 0) failFrom(result, token);
+    // 磁盘上限：镜像超过上限就删掉、报错，不让一个大仓把盘写满。
+    if (dirSize(dir) > MIRROR_MAX_BYTES) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      throw new Error('mirror-too-large：镜像超过磁盘上限，已删除');
+    }
     return { dir, repo, branch };
   }
 

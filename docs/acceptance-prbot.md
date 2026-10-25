@@ -20,7 +20,7 @@
 | 8 转 Ready | 写闸执行 `pr.ready` 前复核：仍是 Draft、head 和动作里的 SHA 一致、head 上至少 1 条检查且全部完成、全绿 | 任意一条不满足 → 4 `reason=ready-precondition`，保持 Draft 继续盯 |
 | 9 Ready 之后 | 按 `handoff` 交接；写一条 `ready` 事件；转 Ready 后不再推送、不回 PR 评论、不调 `mivo-handoff.mjs` | watcher 档满 24 小时没人接 → 一条 `ready-stalled` 事件 |
 | 10 合并 | **永远不做**。没有 `pr.merge`、不 Approve；合并由我在 GitHub 里点 | — |
-| 11 清理 | 只回收 `profile.worktreeDir/prbot/*` 里带 prbot 的 `.acc-owned.json`、且那一轮已经收尾（状态文件是终态或已进入下一轮）、没有活着的进程拿着锁的工作树 | 没有标记 / 还在跑 / 还没收尾的一概不动 |
+| 11 清理 | 只回收 `profile.worktreeDir/prbot/*` 里带 prbot 的 `.acc-owned.json`、且那一轮已经收尾（状态文件是终态或已进入下一轮）、没有活着的进程拿着锁的工作树；连同它在 `<home>/state/prbot/mirrors/` 下的宿主镜像一起删 | 没有标记 / 还在跑 / 还没收尾的一概不动 |
 
 ## 上限
 
@@ -115,13 +115,24 @@ Draft 已开、每次 CI 结果、再修开始、每轮进度**不发** Slack；
 pi 写过的工作树不可信：它的 `.git/config`、钩子、`origin/main` 都可能被改过。规则是
 **沙箱跑过之后，宿主再也不在工作树里跑任何 git**：
 
-- 带令牌的 `fetch` 只在宿主自己的镜像仓里跑（`profile.worktreeDir/prbot/.mirror/<工作树名>`，不在任何沙箱可写绑定里；
-  取全量历史，打出来的 bundle 才能在写闸的空仓里单独导入）。
-- 新工作树从镜像本地取 main、建分支、写提交身份：这时它是全新的、沙箱还没碰过，宿主 git 带
-  `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c diff.external= -c core.pager=cat`，环境没有令牌。
-- 解决冲突前：宿主把最新 main 取进镜像，再在沙箱里 `git fetch <镜像> origin/main` 导进工作树。
+- 带令牌的 `fetch` 只在宿主自己的镜像仓里跑：`<home>/state/prbot/mirrors/<工作树名>`。`<home>/state` 对所有沙箱都被遮住，
+  验收轮沙箱（可写挂整个 `worktreeDir`）和修正轮沙箱都看不见、写不了。以前放在 `worktreeDir/prbot/.mirror/`，
+  #68 第四轮复审复现过：验收轮的模型在那里预埋 `reference-transaction` 钩子，宿主带令牌的 fetch 跑了它，钩子拿到了
+  AUTHORIZATION 头（假令牌）。现在的防线：
+  - 镜像目录从 `<home>/state` 一路往下必须是宿主自己的：真目录、不是符号链接、属主是宿主用户；`mirrors/` 和镜像本身 700。
+    不是就拒绝（`mirror-tampered`），不去「修」。镜像根也不能和 `stateDir` / `worktreeDir` 重叠。
+  - `fetchBranch` 自己加固：`--git-dir <镜像>/.git`、`-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand=false
+    -c credential.helper= -c http.proxy= -c protocol.allow=never -c protocol.https.allow=always`，环境
+    `GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null`。镜像建好后 `.git/config` 换成固定内容，以后每次带令牌取之前
+    逐字节比对；`.git` 顶层有符号链接、有 `commondir` / `objects/info/alternates` 也拒绝。检查在读令牌之前。
+  - 取 10 分钟超时；镜像超过 2 GiB 就删掉、报 `mirror-too-large`。仍取全量历史（打出来的 bundle 才能在写闸的空仓里单独导入）。
+- 宿主**一次都不**在工作树里跑 git（包括全新的工作树：验收轮的模型可以预先在 `worktreeDir` 里建好同名目录和恶意 `.git/config`）。
+  新工作树：宿主以「不递归、已存在就报错」建目录，把镜像的 `origin/main` 打成 `main.bundle` 复制进一个全新的轮次目录，
+  再在预检沙箱里 `git init`、从 bundle 取 main、建分支、写提交身份、把 `.acc-owned.json` 加进 `.git/info/exclude`。
+  复用已有工作树要求镜像目录里有宿主自己记的 `owned.json`（沙箱伪造得了工作树里的标记，伪造不了这个）；工作树是符号链接就拒绝。
+- 解决冲突前：宿主把最新 main 取进镜像，打成 `main.bundle` 复制进全新的轮次目录，再在沙箱里从这份 bundle 导进工作树；沙箱看不见镜像本身。
 - 打包（`git bundle create`）、`handoffNew` 之后的 `status` / `add` / `commit` 都在预检沙箱里跑。宿主只用纯 JS 读
-  bundle 头（不跟符号链接，只认自带全部对象的 bundle），复制进自己的临时目录。
+  bundle 头（不跟符号链接，只认自带全部对象的 bundle，超过 512 MiB 不读），复制进自己的临时目录。
 - 改动 / 禁改路径检查对着**真正要推的那个 bundle**做（预检之后、推之前），在镜像里导入 bundle、
   和宿主自己取的 `origin/main` 比；镜像上的 git 不读全局 / 系统配置。读不出 → `diff-failed`，打包失败 → `bundle-failed`，
   导入 main 失败 → `main-import-failed`。
@@ -134,6 +145,11 @@ pi 写过的工作树不可信：它的 `.git/config`、钩子、`origin/main` �
 - `pr.update-branch`：`PUT /repos/{o}/{r}/pulls/{n}/update-branch`，带 `expected_head_sha`。
 - `ci.rerun`：`POST /repos/{o}/{r}/actions/runs/{id}/rerun-failed-jobs`；写闸先查这个 PR 当前 head 的检查，run id 不在里面就拒（`not-allowed`）。
 - 两者只给 auto / fork 档；watch 档返回 4 `tier-not-allowed`。仍然要有修正轮绑定、账本、执行锁。
+- 更新分支 / 重跑 / 转 Ready 都先查 PR 头：head 分支名必须是本轮分支、base 必须是 `main`；更新分支 / 重跑还要求
+  head 所在仓是同一个仓（fork 模式是 `<ownerLogin>/<仓名>`），别人 fork 里的同名分支一律 `not-allowed`（转 Ready 的 head 仓由 `pr.ready` 复核）。
+- `pr.create` 的 `base` 只能是 `main`（不写就是 main），修正轮和验收轮都一样。
+- 写闸核心 `write-gate.mjs` 只做接线：修正轮的检查都在 `host/prbot-gate-check.mjs`；
+  核心里唯一新增的判断是验收轮 `pr.create` 的 base 检查（两行），因为验收轮的 `pr.create` 检查本来就在核心里，挪出去改动更大。
 - `pr.ready` 的检查复核（`PR_READY_QUERY`）在写闸里做；以前 #47 的 `checks-not-green` 换成
   `ready-precondition`。
 - 登记过的只读查询新增：PR 状态、PR 头、按分支找 PR、Ready 后的 review / review comment / check run、
@@ -145,7 +161,9 @@ pi 写过的工作树不可信：它的 `.git/config`、钩子、`origin/main` �
 以下必须在有真 GitHub、真 bwrap、真 pi 模型的机器上再确认（单测只覆盖夹具）：
 
 - 真 GitHub 的 Draft PR、`update-branch`、`rerun-failed-jobs` 退出码和权限。
-- `github.mjs` 的 `fetchBranch` 用账号令牌拉真仓（令牌只在 `GIT_CONFIG_*` extraheader，不进 argv / URL / 日志）。
+- `github.mjs` 的 `fetchBranch` 用账号令牌拉真仓（令牌只在 `GIT_CONFIG_*` extraheader，不进 argv / URL / 日志），
+  加固参数（`protocol.allow=never` 等）下真 https 能取；全量历史的真实耗时 / 体积是否在 10 分钟 / 2 GiB 之内。
+- 真 bwrap 里从 `main.bundle` 建工作树（`git init` / `fetch` / `checkout` / `sh -c` 追加 exclude）。
 - 真 pi 模型按 prompt 先写复现测试、再最小修复，并 `commit -s`。
 - 目标仓 `.githooks/pre-push` 的真实耗时和输出。
 - fork 仓（例如 `makecindy/cindy`）的推送 / PR head 写法，以及真 GitHub 返回的 `isCrossRepository` / `headRepository`。

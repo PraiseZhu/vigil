@@ -7,7 +7,7 @@ export const CORRECTION_CLAIM_LINE = /^\[修正机\] 第 (\d+) 轮：修正中$/
 export const CORRECTION_STATUS_LINE = /^\[修正机\] 第 (\d+) 轮：(修正中|Draft 已开|等 CI|再修 \d+\/2|已 Ready|需人工处理|中断)$/;
 export const CORRECTION_TERMINAL = new Set(['已 Ready', '需人工处理', '中断']);
 
-/** 只看 PR 的头：写闸动作（更新分支 / 重跑 / 转 Ready）先核对分支名。 */
+/** 只看 PR 的头：写闸动作（更新分支 / 重跑 / 转 Ready）先核对分支名、head 所在仓和 base。 */
 export const PR_HEAD_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
@@ -16,6 +16,9 @@ export const PR_HEAD_QUERY = `query ($owner: String!, $name: String!, $number: I
       isDraft
       headRefName
       headRefOid
+      headRepository { nameWithOwner }
+      isCrossRepository
+      baseRefName
       mergeStateStatus
       changedFiles
       additions
@@ -295,6 +298,8 @@ export function createCorrectionCheck({ github, profile, binding, scopeOf, readI
           return reject('not-allowed', 'PR 正文缺少同一个修正标记');
         }
         if (!allowedRepos.has(action.repo)) return reject('not-allowed', `${action.repo} 不是这个修正轮的仓`);
+        // base 只能是 main（不写就是 main）：不能把修正 PR 开到别的分支上。
+        if ((action.base ?? 'main') !== 'main') return reject('not-allowed', 'PR 的 base 只能是 main');
         return null;
       }
       case 'pr.ready':
@@ -308,13 +313,21 @@ export function createCorrectionCheck({ github, profile, binding, scopeOf, readI
         if (pr.headRefName !== branch) {
           return reject('not-allowed', `PR 的 head 分支是 ${pr.headRefName || '(空)'}，不是 ${branch}`);
         }
+        if (pr.baseRefName !== 'main') return reject('not-allowed', 'PR 的 base 不是 main');
         if (action.type === 'pr.ready') {
+          // 转 Ready 的 head 仓（同仓 / 我自己的 fork）由 checkPrReady 核对（不对就 not-in-tree）。
           const forkRepo = correctionForkRepo(marker, tree);
           return checkPrReady(action, {
             number: parseRef(marker.root).number,
             root: marker.root,
             forkRepos: forkRepo ? [forkRepo] : [],
           });
+        }
+        // 更新分支 / 重跑：head 所在仓也要对 —— 非 fork 是同一个仓，fork 模式只能是我自己的 fork（别人 fork 里的同名分支不算）。
+        const headRepo = String(pr.headRepository?.nameWithOwner || '').toLowerCase();
+        const wantHeadRepo = String(correctionForkRepo(marker, tree) || action.repo).toLowerCase();
+        if (headRepo !== wantHeadRepo) {
+          return reject('not-allowed', `PR 的 head 在 ${pr.headRepository?.nameWithOwner || '(空)'}，不是 ${wantHeadRepo}`);
         }
         const module = gateActions.get(action.type);
         const verdict = module.check(action, { tier: correctionScope.tier });

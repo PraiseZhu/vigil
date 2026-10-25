@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadAcceptanceProfile } from '../bin/profile.mjs';
-import { createGithub } from '../bin/github.mjs';
+import { assertHostOwnedDir, createGithub } from '../bin/github.mjs';
 import { ISSUE_BODY_QUERY, collectTree, parseMarker } from '../bin/collect.mjs';
 import { bodyVersion, latestRound, parseRef, parseRounds, ISSUE_COMMENTS_QUERY as ROUND_COMMENTS_QUERY } from '../bin/rounds.mjs';
 import { collectTasks, repoTier } from '../bin/tasks.mjs';
@@ -482,9 +482,7 @@ function buildPrompt(state) {
 
 /**
  * 宿主上的 git 一律带这几项：关掉钩子、fsmonitor、外部 diff 和分页器。
- * 注意：hostGit 只用在**全新、沙箱还没碰过**的工作树上（建分支、写提交身份）；
- * 沙箱跑过之后，宿主再也不在工作树里跑任何 git —— 打包、导入 main、看改动都在沙箱里跑，
- * 或者在宿主自己的镜像仓（mirrorGit）里对着复制出来的 bundle 跑。
+ * 宿主只在自己的镜像仓（mirrorGit）里跑 git；工作树里的 git（建仓、导 main、建分支、打包、看改动）全在沙箱里跑。
  */
 export const HOST_GIT_HARDENING = Object.freeze([
   '-c', 'core.hooksPath=/dev/null',
@@ -493,16 +491,71 @@ export const HOST_GIT_HARDENING = Object.freeze([
   '-c', 'core.pager=cat',
 ]);
 
-export function hostGit(run, worktree, args) {
-  return run('git', [...HOST_GIT_HARDENING, '-C', worktree, ...args], { env: localEnv(process.env) });
+/** 单个 bundle 的大小上限（512 MiB）：沙箱产出的 bundle 超过就不读、不推。 */
+export const BUNDLE_MAX_BYTES = 512 * 1024 ** 2;
+
+/**
+ * 宿主自己的 main 镜像都放在 <home>/state/prbot/mirrors/ 下：
+ * <home>/state 对所有沙箱都被遮住（maskList），验收轮和修正轮的沙箱都看不见、写不了；
+ * 不放在 worktreeDir 下（验收轮沙箱把整个 worktreeDir 可写挂给模型，#68 第四轮复审复现过在那里预埋钩子偷令牌）。
+ */
+export function mirrorRootFor(home) {
+  if (typeof home !== 'string' || !path.isAbsolute(home)) throw new Error('mirrorRootFor 需要绝对路径的 home');
+  return path.join(home, 'state', 'prbot', 'mirrors');
+}
+
+export function mirrorPathFor(home, worktree) {
+  return path.join(mirrorRootFor(home), path.basename(worktree));
+}
+
+function isInsidePath(child, parent) {
+  const rel = path.relative(parent, child);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function realOrSelf(dir) {
+  try {
+    return fs.realpathSync(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
+/** 已有目录只查不改：真目录、不是符号链接、属主是宿主用户、组和其他人不可写。 */
+function assertHostParent(dir) {
+  const st = fs.lstatSync(dir);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`mirror-tampered：${path.basename(dir)} 不是宿主自己的目录`);
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) throw new Error('mirror-tampered：目录属主不是宿主用户');
+  if ((st.mode & 0o022) !== 0) throw new Error('mirror-tampered：目录组或其他人可写');
 }
 
 /**
- * 宿主自己的 main 镜像：和工作树同级的 .mirror/ 下，从不挂进沙箱的可写绑定。
- * 带令牌的 fetch 只在这里跑（pi 改不了它的 .git/config 和钩子）。
+ * 准备镜像目录：从 <home>/state 一路往下每一层都得是宿主自己的；
+ * mirrors/ 和镜像本身由宿主以 700 建，已存在的要求 700、不是符号链接、属主是宿主（不是就拒绝，不「修」）。
+ * 镜像根也不能落在任何沙箱的可写绑定（stateDir / worktreeDir）里。
  */
-export function mirrorPathFor(worktree) {
-  return path.join(path.dirname(worktree), '.mirror', path.basename(worktree));
+export function ensureMirrorDir({ home, profile, worktree }) {
+  const stateRoot = path.join(home, 'state');
+  fs.mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
+  assertHostParent(stateRoot);
+  const prbotRoot = path.join(stateRoot, 'prbot');
+  try {
+    fs.mkdirSync(prbotRoot, { mode: 0o700 });
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+  }
+  assertHostParent(prbotRoot);
+  const root = mirrorRootFor(home);
+  assertHostOwnedDir(root);
+  const realRoot = realOrSelf(root);
+  for (const writable of [profile?.stateDir, profile?.worktreeDir]) {
+    if (typeof writable !== 'string' || !writable) continue;
+    const real = realOrSelf(writable);
+    if (isInsidePath(realRoot, real) || isInsidePath(real, realRoot)) throw new Error('mirror-tampered：镜像目录和沙箱可写目录重叠');
+  }
+  const mirror = mirrorPathFor(home, worktree);
+  assertHostOwnedDir(mirror);
+  return mirror;
 }
 
 /** 在宿主镜像仓里跑 git：不读全局 / 系统配置，环境里没有令牌，钩子和 fsmonitor 关掉。 */
@@ -511,47 +564,107 @@ export function mirrorGit(run, mirror, args) {
   return run('git', [...HOST_GIT_HARDENING, '--git-dir', path.join(mirror, '.git'), ...args], { env });
 }
 
-export async function defaultPrepareWorktree({ github, state, profile, run, refresh = false }) {
+/**
+ * 把镜像里的 origin/main 打成 bundle（宿主在镜像里打、先放宿主临时目录），
+ * 再以「不覆盖」方式复制进一个全新的沙箱轮次目录。沙箱只从这份副本取 main，看不见镜像本身。
+ */
+export async function stageMainBundle({ run, mirror, roundDir }) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'prbot-main-'));
+  try {
+    const hostBundle = path.join(tmp, 'main.bundle');
+    const made = await mirrorGit(run, mirror, ['bundle', 'create', hostBundle, 'refs/remotes/origin/main']);
+    if (made?.code !== 0) throw new Error('从镜像打 main 失败');
+    fs.rmSync(roundDir, { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(roundDir), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(roundDir, { mode: 0o700 });
+    const inside = path.join(roundDir, 'main.bundle');
+    fs.copyFileSync(hostBundle, inside, fs.constants.COPYFILE_EXCL);
+    return inside;
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/** 宿主自己记的「这个工作树是我建的」：放在镜像目录里（沙箱写不了），工作树里的 .acc-owned.json 只是给清理看的。 */
+function ownedRecordPath(mirror) {
+  return path.join(mirror, 'owned.json');
+}
+
+function writeExclusive(file, text) {
+  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  try {
+    fs.writeFileSync(fd, text);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+export async function defaultPrepareWorktree({ github, state, profile, run, refresh = false, home, preflight, hostConfig, env = process.env, roundRunDir }) {
+  if (typeof home !== 'string' || !path.isAbsolute(home)) throw new Error('defaultPrepareWorktree 需要绝对路径的 home');
   const { owner, name, number } = parseRef(state.issue);
   const root = path.join(profile.worktreeDir, 'prbot');
   const worktree = path.join(root, `${owner}__${name}__${number}-r${state.round}`);
   const marker = path.join(worktree, '.acc-owned.json');
   // 起点永远是目标仓（PR 开在哪个仓）的 main；fork 模式只是推到 fork。
   const upstream = state.prRepo || parseRef(state.root || state.issue).repo;
-  fs.mkdirSync(root, { recursive: true });
   if (typeof github.fetchBranch !== 'function') throw new Error('github 没有 fetchBranch');
-  const mirror = mirrorPathFor(worktree);
-  fs.mkdirSync(path.dirname(mirror), { recursive: true, mode: 0o700 });
-  if (fs.existsSync(worktree)) {
-    if (!fs.existsSync(marker)) throw new Error('工作树已存在但没有 .acc-owned.json，拒绝覆盖');
-    // 解决冲突前把最新 main 取进宿主镜像（带令牌的 git 绝不在 pi 写过的工作树里跑）；
-    // 再由修正轮在沙箱里把镜像的 origin/main 导进工作树。
-    if (refresh || !fs.existsSync(mirror)) await github.fetchBranch({ repo: upstream, branch: 'main', dir: mirror, depth: 0 });
+  const mirror = ensureMirrorDir({ home, profile, worktree });
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  const rootStat = fs.lstatSync(root);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) throw new Error('工作树根目录不是真目录，拒绝');
+  let existing = null;
+  try {
+    existing = fs.lstatSync(worktree);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  if (existing) {
+    if (existing.isSymbolicLink() || !existing.isDirectory()) throw new Error('工作树是符号链接或不是目录，拒绝');
+    // 只认宿主自己记过的工作树：沙箱能伪造工作树里的 .acc-owned.json，伪造不了镜像目录里的记录。
+    if (!fs.existsSync(ownedRecordPath(mirror)) || !fs.existsSync(marker)) throw new Error('工作树已存在但不是宿主建的，拒绝覆盖');
+    // 解决冲突前把最新 main 取进宿主镜像（带令牌的 git 只在宿主镜像里跑）；
+    // 再由修正轮把 main 打成 bundle、在沙箱里导进工作树。
+    if (refresh || !fs.existsSync(path.join(mirror, '.git'))) await github.fetchBranch({ repo: upstream, branch: 'main', dir: mirror, depth: 0 });
     return { worktree, mirror, reused: true };
   }
   // 取全量历史：工作树打出来的 bundle 要能在写闸的空仓里单独导入（浅克隆打的 bundle 缺父提交）。
   await github.fetchBranch({ repo: upstream, branch: 'main', dir: mirror, depth: 0 });
-  // 工作树是全新的、沙箱还没碰过：只有这时在宿主上对它跑 git（不带令牌，从本机镜像取）。
-  fs.mkdirSync(worktree, { recursive: true, mode: 0o700 });
-  const init = await hostGit(run, worktree, ['init', '-q']);
-  if (init?.code !== 0) throw new Error('建工作树失败');
-  const imported = await hostGit(run, worktree, ['fetch', '-q', mirror, '+refs/remotes/origin/main:refs/remotes/origin/main']);
-  if (imported?.code !== 0) throw new Error('从镜像取 main 失败');
-  const checkout = await hostGit(run, worktree, ['checkout', '-q', '-B', state.branch, 'origin/main']);
-  if (checkout?.code !== 0) throw new Error('建修正分支失败');
-  // pi 在沙箱里 git commit -s：沙箱里的 HOME 是空的，提交身份写进这个工作树自己的配置。
-  const login = String(profile.ownerLogin || 'acceptance-bot');
-  await hostGit(run, worktree, ['config', 'user.name', login]);
-  await hostGit(run, worktree, ['config', 'user.email', `${login}@users.noreply.github.com`]);
-  fs.writeFileSync(
+  if (typeof preflight !== 'function') throw new Error('defaultPrepareWorktree 需要沙箱预检（preflight）');
+  // 工作树目录由宿主新建（不是递归建：已存在就报错），归属标记以「独占新建、不跟链接」写。
+  fs.mkdirSync(worktree, { mode: 0o700 });
+  fs.rmSync(ownedRecordPath(mirror), { force: true });
+  writeExclusive(ownedRecordPath(mirror), JSON.stringify({ worktree, issue: state.issue, round: state.round }));
+  writeExclusive(
     marker,
     JSON.stringify({ kind: 'prbot', issue: state.issue, round: state.round, createdAt: new Date().toISOString() }, null, 2),
-    { mode: 0o600 },
   );
-  // 归属标记不进提交：pi 的 git add -A 也带不走它。
-  const exclude = path.join(worktree, '.git', 'info', 'exclude');
-  fs.mkdirSync(path.dirname(exclude), { recursive: true });
-  fs.appendFileSync(exclude, '\n/.acc-owned.json\n');
+  const roundDir = path.join(roundRunDir || hostPaths(home).roundRunDir, 'prbot', `${stateKey(state.issue)}-r${state.round}-init`);
+  const bundle = await stageMainBundle({ run, mirror, roundDir });
+  // 宿主不在工作树里跑任何 git：建仓、导 main、建分支、写提交身份、把归属标记加进 exclude，都在沙箱里跑。
+  // pi 在沙箱里 git commit -s：沙箱里的 HOME 是空的，提交身份写进这个工作树自己的配置。
+  const login = String(profile.ownerLogin || 'acceptance-bot');
+  if (!/^[A-Za-z0-9-]+$/.test(login)) throw new Error('ownerLogin 不合法');
+  const made = await preflight({
+    home,
+    profile,
+    hostConfig,
+    roundDir,
+    worktree,
+    commands: [
+      ['git', 'init', '-q'],
+      ['git', 'fetch', '-q', bundle, '+refs/remotes/origin/main:refs/remotes/origin/main'],
+      ['git', 'checkout', '-q', '-B', String(state.branch), 'origin/main'],
+      ['git', 'config', 'user.name', login],
+      ['git', 'config', 'user.email', `${login}@users.noreply.github.com`],
+      // 归属标记不进提交：pi 的 git add -A 也带不走它。
+      ['sh', '-c', 'printf "\n/.acc-owned.json\n" >> .git/info/exclude'],
+    ],
+    env,
+    run,
+  });
+  fs.rmSync(roundDir, { recursive: true, force: true });
+  if (made?.unavailable) throw new Error('沙箱起不来：不建工作树');
+  if (!made?.ok) throw new Error('在沙箱里建工作树失败');
   return { worktree, mirror, reused: false };
 }
 
@@ -602,7 +715,9 @@ async function sandboxBundle({ state, worktree, roundDir, preflight, home, profi
   let data;
   const fd = fs.openSync(inside, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
-    if (!fs.fstatSync(fd).isFile()) throw new Error('bundle 不是普通文件');
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new Error('bundle 不是普通文件');
+    if (st.size > BUNDLE_MAX_BYTES) throw new Error('bundle 超过大小上限');
     data = fs.readFileSync(fd);
   } finally {
     fs.closeSync(fd);
@@ -791,7 +906,7 @@ export function cleanupWorktrees({ home, profile, fsImpl = fs } = {}) {
     if (!finished) continue;
     try {
       fsImpl.rmSync(dir, { recursive: true, force: true });
-      fsImpl.rmSync(mirrorPathFor(dir), { recursive: true, force: true });
+      fsImpl.rmSync(mirrorPathFor(home, dir), { recursive: true, force: true });
       removed.push(dir);
     } catch {
       // 删不掉就留着，下一次再清理。
@@ -1121,7 +1236,17 @@ export async function runPrbotCorrection({
         }
         let work = null;
         try {
-          work = prepareWorktree({ github: gateGithub, state, profile: acceptanceProfile, run, refresh: Boolean(state.mergeMain) });
+          work = prepareWorktree({
+            github: gateGithub,
+            state,
+            profile: acceptanceProfile,
+            run,
+            refresh: Boolean(state.mergeMain),
+            home,
+            preflight,
+            hostConfig: settings,
+            env,
+          });
           if (work && typeof work.then === 'function') work = await work;
         } catch (error) {
           state.worktreeError = String(error?.message || error);
@@ -1132,17 +1257,27 @@ export async function runPrbotCorrection({
         state.worktree = work.worktree;
         state.mirror = work.mirror;
         if (state.mergeMain) {
-          // 解决冲突：宿主已把最新 main 取进镜像；导进工作树这一步在沙箱里跑（工作树的 .git 是 pi 写过的）。
-          const imported = await preflight({
-            home,
-            profile: acceptanceProfile,
-            hostConfig: settings,
-            roundDir: path.join(paths.roundRunDir, 'prbot', `${stateKey(issue)}-r${state.round}-main`),
-            worktree: state.worktree,
-            commands: [['git', 'fetch', '-q', String(state.mirror), '+refs/remotes/origin/main:refs/remotes/origin/main']],
-            env,
-            run,
-          });
+          // 解决冲突：宿主已把最新 main 取进镜像，再打成 bundle 复制进全新的轮次目录；
+          // 导进工作树这一步在沙箱里跑（工作树的 .git 是 pi 写过的），沙箱看不见镜像本身。
+          const mainRoundDir = path.join(paths.roundRunDir, 'prbot', `${stateKey(issue)}-r${state.round}-main`);
+          let mainBundle = null;
+          try {
+            mainBundle = await stageMainBundle({ run, mirror: String(state.mirror), roundDir: mainRoundDir });
+          } catch {
+            mainBundle = null;
+          }
+          const imported = mainBundle
+            ? await preflight({
+                home,
+                profile: acceptanceProfile,
+                hostConfig: settings,
+                roundDir: mainRoundDir,
+                worktree: state.worktree,
+                commands: [['git', 'fetch', '-q', mainBundle, '+refs/remotes/origin/main:refs/remotes/origin/main']],
+                env,
+                run,
+              })
+            : { ok: false };
           if (imported?.unavailable) {
             appendAlert(paths, {
               kind: 'sandbox-unavailable',
