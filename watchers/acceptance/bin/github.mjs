@@ -396,7 +396,15 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
     // 令牌只在 GIT_CONFIG_* extraheader 里（gitEnv）；URL / argv / 配置里都不带。
     result = await runCmd(
       'git',
-      ['-C', dir, 'fetch', `--depth=${Number(depth)}`, `https://github.com/${repo}.git`, `+refs/heads/${branch}:refs/remotes/origin/${branch}`],
+      [
+        '-C',
+        dir,
+        'fetch',
+        // depth: 0 = 全量历史（修正轮要能打出自带全部对象的 bundle）。
+        ...(Number(depth) > 0 ? [`--depth=${Number(depth)}`] : []),
+        `https://github.com/${repo}.git`,
+        `+refs/heads/${branch}:refs/remotes/origin/${branch}`,
+      ],
       { env },
     );
     if (result.code !== 0) failFrom(result, token);
