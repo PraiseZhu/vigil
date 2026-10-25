@@ -592,3 +592,9 @@ test('SC11 真 bwrap 不可用时 probeBwrap 返回 false（不抛错）', async
   });
   assert.equal(missing, false);
 });
+
+test('sandboxEnv 固定关掉 npm 更新检查（不然每轮都去连 registry、被出网代理拒、刷 egress-denied）', () => {
+  const env = sandboxEnv({ base: { PATH: '/usr/bin' }, roundDir: path.join(tmpDir(), 'round') });
+  assert.equal(env.NPM_CONFIG_UPDATE_NOTIFIER, 'false');
+  assert.equal(env.NO_UPDATE_NOTIFIER, '1');
+});
