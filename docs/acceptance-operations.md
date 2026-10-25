@@ -268,8 +268,10 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 - `看板`：能读 `projectV2(projectNumber)`。
 - `看板写回`：需要 `--board-item <owner/repo#n>`；读该条目的「裁决」原值再写回同一个值，缺这个
   参数就报失败。
-- `fork 推送`：`forkRepos` 里每个仓在 `ownerLogin` 名下都存在且 `viewerPermission` 是
-  `ADMIN`/`MAINTAIN`/`WRITE`。
+- `fork 推送`：`forkRepos` 里每个仓对应的 fork 都存在且 `viewerPermission` 是
+  `ADMIN`/`MAINTAIN`/`WRITE`。fork 默认是 `ownerLogin` 名下同名的仓；名字不同就在 profile 里写
+  `"forkTargets": {"<上游 owner/repo>": "<ownerLogin>/<fork 名>"}`（键必须在 `forkRepos` 里，fork 必须在
+  `ownerLogin` 名下）。修正轮推分支、写闸核对 PR head 用的都是同一个对照。
 - `常驻循环`：心跳里的 pid 活着且心跳不超过 3 分钟。
 - `令牌文件`：`…TokenFile` / App 私钥文件全部通过 600、属主当前用户、非空检查。
 - `bwrap 遮罩`：在 bwrap 里跑一个读文件的小脚本，名单上的文件和凭证目录必须一个都读不到；

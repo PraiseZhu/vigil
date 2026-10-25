@@ -6,6 +6,7 @@ import {
   loadAcceptanceProfile,
   ProfileError,
   checkSecretFile,
+  forkTargetFor,
   tokenFiles,
 } from './bin/profile.mjs';
 import { OWNER, tmpDir, writeSecret } from './fake-gh.fixture.mjs';
@@ -289,4 +290,45 @@ test('profile tokenFiles 也列出 App 私钥文件（宿主沙箱一并遮罩�
     ['appPrivateKeyFile', 'githubTokenFile'],
   );
   assert.ok(!JSON.stringify(profile).includes('fake-pem-not-real'));
+});
+
+test('forkTargets：上游仓对应自己名下的 fork（名字可以不同），没写的照旧用同名仓', () => {
+  const home = tmpDir();
+  const raw = {
+    ...baseProfile(home),
+    forkRepos: ['makecindy/cindy', 'example-org/other'],
+    forkTargets: { 'makecindy/cindy': `${OWNER}/cindy-fork` },
+  };
+  writeJson(path.join(home, 'config', 'profile.json'), raw);
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  assert.equal(forkTargetFor(profile, 'makecindy/cindy'), `${OWNER}/cindy-fork`);
+  assert.equal(forkTargetFor(profile, 'MakeCindy/Cindy'), `${OWNER}/cindy-fork`, '仓名不分大小写');
+  assert.equal(forkTargetFor(profile, 'example-org/other'), `${OWNER}/other`);
+
+  const plain = { ...baseProfile(tmpDir()) };
+  const plainHome = path.dirname(path.dirname(plain.githubTokenFile));
+  writeJson(path.join(plainHome, 'config', 'profile.json'), plain);
+  const loaded = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: plainHome });
+  assert.deepEqual({ ...loaded.forkTargets }, {});
+  assert.equal(forkTargetFor(loaded, 'makecindy/cindy'), `${OWNER}/cindy`);
+});
+
+test('forkTargets：键不在 forkRepos、fork 不在 ownerLogin 名下、写通配符、不是对象，都直接报错', () => {
+  const cases = [
+    [{ 'example-org/not-listed': `${OWNER}/x` }, /不在 forkRepos 里/],
+    [{ 'makecindy/cindy': 'StrangerUser/cindy-fork' }, /必须在 ExampleUser 名下/],
+    [{ 'makecindy/*': `${OWNER}/x` }, /具体的 owner\/repo/],
+    [{ 'makecindy/cindy': `${OWNER}/*` }, /具体的 owner\/repo/],
+    [['makecindy/cindy'], /对象/],
+  ];
+  for (const [forkTargets, pattern] of cases) {
+    const home = tmpDir();
+    writeJson(path.join(home, 'config', 'profile.json'), { ...baseProfile(home), forkRepos: ['makecindy/cindy'], forkTargets });
+    assert.throws(() => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }), (err) => {
+      assert.ok(err instanceof ProfileError);
+      assert.match(err.message, /forkTargets/);
+      assert.match(err.message, pattern);
+      return true;
+    }, JSON.stringify(forkTargets));
+  }
 });

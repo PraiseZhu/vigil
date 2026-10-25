@@ -551,6 +551,17 @@ test('SC5 fork 模式：只推 ownerLogin 名下的 fork；pr.ready 只认从这
     ownerLogin: profile.ownerLogin,
   });
   assert.equal(forkRepo, `${OWNER}/cindy`);
+  // forkTargets 写了对照就推到对照的 fork（名字可以和上游不同）。
+  assert.equal(
+    correctionPushRepo({
+      issue: correction.ref,
+      marker: { root: `${FORK_UPSTREAM}#1` },
+      fork: true,
+      ownerLogin: profile.ownerLogin,
+      forkTargets: { [FORK_UPSTREAM]: `${OWNER}/cindy-fork` },
+    }),
+    `${OWNER}/cindy-fork`,
+  );
 
   let prHead = { isCrossRepository: true, headRepository: { nameWithOwner: forkRepo }, body: marker };
   const written = [];

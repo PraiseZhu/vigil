@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadAcceptanceProfile } from '../bin/profile.mjs';
+import { forkTargetFor, loadAcceptanceProfile } from '../bin/profile.mjs';
 import { assertHostOwnedDir, createGithub } from '../bin/github.mjs';
 import { ISSUE_BODY_QUERY, collectTree, parseMarker } from '../bin/collect.mjs';
 import { bodyVersion, latestRound, parseRef, parseRounds, ISSUE_COMMENTS_QUERY as ROUND_COMMENTS_QUERY } from '../bin/rounds.mjs';
@@ -927,16 +927,16 @@ export function correctionPrBody(state, marker) {
 }
 
 /** 推到哪个仓：fork 模式推到 ownerLogin 名下同名的 fork，PR 开在上游（总 issue 所在仓）。 */
-export function correctionPushRepo({ issue, marker, fork, ownerLogin }) {
-  if (fork) return `${ownerLogin}/${parseRef(marker.root).name}`;
+export function correctionPushRepo({ issue, marker, fork, ownerLogin, forkTargets }) {
+  if (fork) return forkTargetFor({ ownerLogin, forkTargets }, parseRef(marker.root).repo);
   return parseRef(issue).repo;
 }
 
-function makeState({ issue, marker, rootTree, ownerLogin }) {
+function makeState({ issue, marker, rootTree, ownerLogin, forkTargets }) {
   const nowIso = new Date().toISOString();
   const correctionRepo = parseRef(issue).repo;
   const rootRepo = parseRef(marker.root).repo;
-  const pushRepo = correctionPushRepo({ issue, marker, fork: rootTree?.root?.fork, ownerLogin });
+  const pushRepo = correctionPushRepo({ issue, marker, fork: rootTree?.root?.fork, ownerLogin, forkTargets });
   return {
     issue,
     root: marker.root,
@@ -1081,7 +1081,7 @@ export async function runPrbotCorrection({
       state = null;
     }
     if (!state || !state.startedAt) {
-      state = makeState({ issue, marker, rootTree: tree, ownerLogin: acceptanceProfile.ownerLogin });
+      state = makeState({ issue, marker, rootTree: tree, ownerLogin: acceptanceProfile.ownerLogin, forkTargets: acceptanceProfile.forkTargets });
     } else if (!state.startedAt) {
       state.startedAt = new Date(now()).toISOString();
     }

@@ -239,3 +239,28 @@ test('SC1 CLI：配置缺失时打印一行 ✗ 并以 1 退出（假的 home，
   assert.equal(lines.length, 1);
   assert.match(lines[0], /^✗ 配置：/);
 });
+
+test('SC1 fork 推送按 forkTargets 查对照的 fork 仓（名字和上游不同）', async () => {
+  const fixture = makeFixture();
+  const file = path.join(fixture.home, 'config', 'profile.json');
+  const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+  raw.forkRepos = ['makecindy/cindy'];
+  raw.forkTargets = { 'makecindy/cindy': `${OWNER}/cindy-fork` };
+  fs.writeFileSync(file, JSON.stringify(raw, null, 2));
+  const asked = [];
+  const github = makeGithub({ forkPermission: 'READ' });
+  const inner = github.graphql.bind(github);
+  github.graphql = async (query, variables = {}) => {
+    if (query === REPO_QUERY && variables.owner === OWNER) {
+      asked.push(`${variables.owner}/${variables.name}`);
+      const writable = variables.name === 'cindy-fork';
+      return { repository: { nameWithOwner: `${variables.owner}/${variables.name}`, viewerPermission: writable ? 'WRITE' : 'READ' } };
+    }
+    return inner(query, variables);
+  };
+  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github, now: () => NOW, boardItem: `${REPO}#1` });
+  const fork = checkOf(result, 'fork 推送');
+  assert.equal(fork.ok, true, fork.detail);
+  assert.ok(asked.includes(`${OWNER}/cindy-fork`), asked.join(','));
+  assert.ok(!asked.includes(`${OWNER}/cindy`), '不该再查同名仓');
+});

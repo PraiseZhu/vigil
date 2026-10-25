@@ -2,6 +2,7 @@
 // 从 write-gate.mjs 拆出来，写闸核心只接线；这里只读 GitHub，不写任何东西。
 import { collectTree, parseMarker } from '../bin/collect.mjs';
 import { latestRound, parseRef, parseRounds } from '../bin/rounds.mjs';
+import { forkTargetFor } from '../bin/profile.mjs';
 
 export const CORRECTION_CLAIM_LINE = /^\[修正机\] 第 (\d+) 轮：修正中$/;
 export const CORRECTION_STATUS_LINE = /^\[修正机\] 第 (\d+) 轮：(修正中|Draft 已开|等 CI|再修 \d+\/2|已 Ready|需人工处理|中断)$/;
@@ -183,10 +184,10 @@ export function createCorrectionCheck({ github, profile, binding, scopeOf, readI
     return repos;
   }
 
-  /** fork 模式：上游仓在 forkRepos 里，推送 / PR head 在 ownerLogin 名下同名的 fork 仓。 */
+  /** fork 模式：上游仓在 forkRepos 里，推送 / PR head 在 fork 仓（forkTargets 对照，默认 ownerLogin 名下同名）。 */
   function correctionForkRepo(marker, tree) {
     if (!tree.root.fork) return null;
-    return `${profile.ownerLogin}/${parseRef(marker.root).name}`;
+    return forkTargetFor(profile, parseRef(marker.root).repo);
   }
 
   async function correctionContext() {
