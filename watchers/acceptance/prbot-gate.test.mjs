@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
-import { createGithub } from './bin/github.mjs';
+import { MIRROR_GIT_HARDENING, createGithub } from './bin/github.mjs';
 import {
   PR_HEAD_QUERY,
   PR_READY_QUERY,
@@ -42,6 +42,9 @@ function correctionGithub(world, { prHead, onWrite } = {}) {
     isDraft: true,
     headRefName: BRANCH,
     headRefOid: HEAD,
+    headRepository: { nameWithOwner: REPO },
+    isCrossRepository: false,
+    baseRefName: 'main',
     mergeStateStatus: 'CLEAN',
     changedFiles: 1,
     additions: 2,
@@ -443,6 +446,7 @@ test('SC6 github 出口：update-branch / rerun 走 REST；fetchBranch 的令牌
     },
     onGit: (args, { env }) => {
       gitCalls.push({ args, env });
+      if (args.includes('init')) fs.mkdirSync(args.at(-1), { recursive: true });
       return { code: 0, stdout: '', stderr: '' };
     },
   });
@@ -460,9 +464,16 @@ test('SC6 github 出口：update-branch / rerun 走 REST；fetchBranch 的令牌
   assert.ok(gitCalls.length >= 2);
   for (const call of gitCalls) {
     assert.equal(call.args.join(' ').includes(token), false, '令牌不进 argv');
-    assert.equal(call.env.GIT_CONFIG_VALUE_0.includes(token), false, 'extraheader 里不是明文令牌');
+    assert.equal(String(call.env.GIT_CONFIG_VALUE_0 || '').includes(token), false, 'extraheader 里不是明文令牌');
     assert.equal(call.env.GH_TOKEN, undefined);
+    // 宿主镜像上的 git：钩子关掉、不读系统 / 全局配置、--git-dir 指向镜像。
+    assert.deepEqual(call.args.slice(0, MIRROR_GIT_HARDENING.length), MIRROR_GIT_HARDENING);
+    assert.equal(call.env.GIT_CONFIG_NOSYSTEM, '1');
+    assert.equal(call.env.GIT_CONFIG_GLOBAL, '/dev/null');
   }
+  const fetchCall = gitCalls.find((call) => call.args.includes('fetch'));
+  assert.equal(fetchCall.args[fetchCall.args.indexOf('--git-dir') + 1], path.join(dir, '.git'));
+  assert.ok(MIRROR_GIT_HARDENING.includes('core.hooksPath=/dev/null'));
   // 默认浅取 50；depth: 0 = 全量（修正轮的宿主镜像用它）。
   assert.ok(gitCalls.some((call) => call.args.includes('fetch') && call.args.includes('--depth=50')));
   gitCalls.length = 0;
@@ -553,6 +564,7 @@ test('SC5 fork 模式：只推 ownerLogin 名下的 fork；pr.ready 只认从这
               isDraft: true,
               headRefName: BRANCH,
               headRefOid: HEAD,
+              baseRefName: 'main',
               commits: {
                 nodes: [
                   {
@@ -625,6 +637,19 @@ test('SC5 fork 模式：只推 ownerLogin 名下的 fork；pr.ready 只认从这
   const own = await forkPr(`${OWNER}:${BRANCH}`, 'fork-pr-own');
   assert.equal(own.code, 0, JSON.stringify(own));
   assert.deepEqual(written.map((action) => action.type), ['pr.ready', 'pr.create']);
+
+  // 更新分支 / 重跑：head 必须在我自己的 fork；上游仓里、别人 fork 里的同名分支都不认（#68 复审）。
+  const update = (key) =>
+    gate.handle({ type: 'pr.update-branch', repo: FORK_UPSTREAM, pr: 5, expectedHeadSha: HEAD, dedupeKey: key });
+  for (const headRepo of [FORK_UPSTREAM, 'StrangerUser/cindy']) {
+    prHead = { isCrossRepository: headRepo !== FORK_UPSTREAM, headRepository: { nameWithOwner: headRepo }, mergeStateStatus: 'BEHIND', body: marker };
+    const outcome = await update(`fork-update-${headRepo}`);
+    assert.equal(outcome.code, 4, headRepo);
+    assert.equal(outcome.body.reason, 'not-allowed', headRepo);
+  }
+  prHead = { isCrossRepository: true, headRepository: { nameWithOwner: forkRepo }, mergeStateStatus: 'BEHIND', body: marker };
+  const mine = await update('fork-update-own');
+  assert.equal(mine.code, 0, JSON.stringify(mine));
 });
 
 test('SC5 prbot 自己拼的修正 PR 正文过得了真写闸：标记照抄修正子 issue（验收轮号，不是修正轮号）', async () => {

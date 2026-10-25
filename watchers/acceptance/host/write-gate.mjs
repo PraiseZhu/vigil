@@ -507,6 +507,8 @@ export function createGate({
         if (!marker || marker.root !== binding.root) {
           return reject('not-in-tree', 'PR 正文缺少本轮总 issue 的修正标记');
         }
+        // #68 复审：base 只能是 main（不写就是 main）。
+        if ((action.base ?? 'main') !== 'main') return reject('not-allowed', 'PR 的 base 只能是 main');
         return null;
       }
       case 'pr.ready':
