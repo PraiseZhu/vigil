@@ -9,6 +9,7 @@ import { checkSecretFile, forkTargetFor, loadAcceptanceProfile, tokenFiles, watc
 import { createGithub } from './github.mjs';
 import { hostPaths, isAlive } from '../host/paths.mjs';
 import { createProbes } from '../host/probes.mjs';
+import { handoffFor, preflightCommands, repoConfig } from '../host/prbot-config.mjs';
 
 /** 令牌账号 == ownerLogin 用这条。 */
 export const VIEWER_QUERY = `query {
@@ -315,6 +316,40 @@ export async function runDoctor({
     forkProblems.length === 0,
     forkProblems.length > 0 ? `推不了：${forkProblems.join(', ')}` : 'fork 有写权限',
   );
+
+  // 修正轮（#60）：host.json 配了 prbot 就查交接方式（必须显式写 owner / watcher，没写的仓修正轮不认领）和预检格式。
+  let host = hostConfig;
+  let hostProblem = null;
+  if (host === undefined) {
+    try {
+      host = fs.existsSync(paths.hostConfig) ? JSON.parse(fs.readFileSync(paths.hostConfig, 'utf8')) : {};
+    } catch (error) {
+      host = null;
+      hostProblem = `host.json 读不出：${firstLine(error?.message)}`;
+    }
+  }
+  if (hostProblem) {
+    add('修正轮交接配置', false, hostProblem);
+  } else if (host?.prbot) {
+    const repos = host.prbot.repos && typeof host.prbot.repos === 'object' && !Array.isArray(host.prbot.repos) ? host.prbot.repos : {};
+    const problems = [];
+    for (const repo of Object.keys(repos)) {
+      if (!handoffFor(host, repo)) problems.push(`${repo} 的 handoff 没写成 owner / watcher`);
+      if (preflightCommands(repoConfig(host, repo)) === null) problems.push(`${repo} 的 preflight 格式不对（每项是字符串或字符串数组）`);
+    }
+    // 名单里写明的具体仓（通配列不出来）都要有交接方式：没写的仓修正轮不认领、只报一次需人工处理。
+    const named = [...new Set([...(profile.autoRepos || []), ...(profile.forkRepos || [])])].filter((repo) => !String(repo).endsWith('/*'));
+    for (const repo of named) {
+      if (!handoffFor(host, repo) && !problems.some((entry) => entry.startsWith(`${repo} `))) problems.push(`${repo} 没在 prbot.repos 里写 handoff`);
+    }
+    add(
+      '修正轮交接配置',
+      problems.length === 0,
+      problems.length > 0
+        ? problems.join('；')
+        : `检查了 ${Object.keys(repos).length} 个仓（通配名单里的仓要在 prbot.repos 里逐个写明 handoff）`,
+    );
+  }
 
   try {
     const heartbeat = JSON.parse(fs.readFileSync(paths.heartbeatFile, 'utf8'));

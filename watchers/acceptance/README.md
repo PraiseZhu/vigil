@@ -37,6 +37,7 @@
 | `githubTokenFile` | 是 | 账号令牌文件（绝对路径，权限必须是 600） |
 | `autoRepos` | 否 | 全自动仓，支持 `owner/*`；默认 `` `${ownerLogin}/*` `` |
 | `forkRepos` | 否 | 也算全自动，默认 `["makecindy/cindy"]` |
+| `forkTargets` | 否 | 上游仓 → fork 仓的对照，例如 `{"makecindy/cindy": "<ownerLogin>/cindy-fork"}`；键必须是 `forkRepos` 里的具体仓，值必须在 `ownerLogin` 名下。没写的上游仓用 `<ownerLogin>/<上游仓名>`。默认 `{}` |
 | `watchRepos` | 否 | watch 档仓，默认 `[]` |
 | `verdictOnlyIssues` | 否 | 只出裁决的 issue（显式名单，形如 `["owner/repo#43"]`，不收通配），默认 `[]`：照常验收、写看板和裁决，但不关、不勾、不开修正、不推送，由人复核后关（见 [`docs/acceptance-session.md`](../../docs/acceptance-session.md)） |
 | `stallMinutes` | 否 | 卡住判定阈值，默认 30 |

@@ -269,7 +269,7 @@ test('SC5 修正轮只允许这条分支的 Draft PR；别的分支 / 非 Draft 
     base: 'main',
     draft: true,
     title: '修正',
-    body: [`任务 issue：${REPO}#1`, CORRECTION_MARKER].join('\n'),
+    body: [`任务 issue：${REPO}#1`, 'Closes #9', CORRECTION_MARKER].join('\n'),
     dedupeKey: 'pr-ok',
   });
   assert.equal(draft.code, 0, JSON.stringify(draft));
@@ -637,7 +637,8 @@ test('SC5 fork 模式：只推 ownerLogin 名下的 fork；pr.ready 只认从这
       base: 'main',
       draft: true,
       title: '修正',
-      body: [`任务 issue：${FORK_UPSTREAM}#1`, marker].join('\n'),
+      // fork 档：修正子 issue 开在上游仓、PR 也开在上游 —— 同仓写法 Closes #n，合并进上游 main 时关掉。
+      body: [`任务 issue：${FORK_UPSTREAM}#1`, 'Closes #9', marker].join('\n'),
       dedupeKey: key,
     });
   for (const bad of [BRANCH, `StrangerUser:${BRANCH}`, `:${BRANCH}`]) {
@@ -669,10 +670,13 @@ test('SC5 prbot 自己拼的修正 PR 正文过得了真写闸：标记照抄修
     onWrite: (action) => (action.type.startsWith('comment.') ? undefined : { pr: 12, url: `https://example.invalid/${REPO}/pull/12` }),
   });
   const gate = await claimedGate({ home, profile, world, github });
-  const state = { root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 2 };
+  const state = { issue: `${REPO}#9`, prRepo: REPO, root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 2 };
   const marker = { root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1 };
   const body = correctionPrBody(state, marker);
   assert.equal(body.split('\n')[0], `任务 issue：${REPO}#1`);
+  assert.equal(body.split('\n')[1], 'Closes #9', '修正 PR 合并后关掉修正子 issue（trigger 才会再验）');
+  // 跨仓（修正子 issue 和 PR 不在同一个仓）写全名。
+  assert.equal(correctionPrBody({ ...state, prRepo: 'example-owner/other-repo' }, marker).split('\n')[1], `Closes ${REPO}#9`);
   const created = await gate.handle({
     type: 'pr.create',
     repo: REPO,
@@ -684,4 +688,105 @@ test('SC5 prbot 自己拼的修正 PR 正文过得了真写闸：标记照抄修
     dedupeKey: 'pr-from-prbot',
   });
   assert.equal(created.code, 0, JSON.stringify(created));
+});
+
+test('#60 修正 github 出口：branch.push 带租约只对 acceptance/ 分支生效（--force-with-lease=<分支>:<上次已知 head>），不带就不强推', async () => {
+  const { home, profile } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const gitCalls = [];
+  const run = createFakeRun({
+    onGit: (args) => {
+      gitCalls.push(args);
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  });
+  const github = createGithub({ profile, run });
+  const bundlePath = path.join(tmpDir(), 'push.bundle');
+  fs.writeFileSync(bundlePath, 'x');
+  const pushArgs = () => gitCalls.find((args) => args.includes('push'));
+
+  await github.write({ type: 'branch.push', repo: REPO, branch: BRANCH, bundlePath, dedupeKey: 'plain' });
+  assert.equal(pushArgs().some((arg) => String(arg).startsWith('--force')), false, '不带租约就是普通推送');
+  assert.equal(pushArgs().includes('+refs/heads/' + BRANCH), false);
+
+  gitCalls.length = 0;
+  await github.write({ type: 'branch.push', repo: REPO, branch: BRANCH, bundlePath, forceWithLease: HEAD, dedupeKey: 'lease' });
+  assert.ok(pushArgs().includes(`--force-with-lease=refs/heads/${BRANCH}:${HEAD}`));
+  gitCalls.length = 0;
+  await github.write({ type: 'branch.push', repo: REPO, branch: BRANCH, bundlePath, forceWithLease: '', dedupeKey: 'lease-empty' });
+  assert.ok(pushArgs().includes(`--force-with-lease=refs/heads/${BRANCH}:`), '空租约 = 远端必须还没有这条分支');
+
+  // 别的分支、乱写的租约：一条 git 都不跑就拒。
+  gitCalls.length = 0;
+  await assert.rejects(github.write({ type: 'branch.push', repo: REPO, branch: 'main', bundlePath, forceWithLease: HEAD, dedupeKey: 'main' }), /acceptance\//);
+  await assert.rejects(github.write({ type: 'branch.push', repo: REPO, branch: BRANCH, bundlePath, forceWithLease: 'HEAD~1', dedupeKey: 'bad' }), /SHA/);
+  assert.equal(gitCalls.length, 0);
+  assert.ok(home);
+});
+
+test('#60 修正 pr.ready：fork 仓名大小写不同也认；workflow 还在排队（suite 有了、run 还没有）不算全绿', async () => {
+  const FORK_UPSTREAM = 'makecindy/cindy';
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  fs.mkdirSync(hostPaths(home).gateDir, { recursive: true });
+  fs.writeFileSync(hostPaths(home).enabledFile, '1');
+  const world = defaultTree({ roundStatus: '要修', rootRepo: FORK_UPSTREAM });
+  const marker = `[验收机] 修正 · 总 ${FORK_UPSTREAM}#1 · 项 ${FORK_UPSTREAM}#2 SC3 · 第 1 轮`;
+  const correction = world.addIssue({ repo: FORK_UPSTREAM, number: 9, title: '修正', body: marker });
+  world.addChild(`${FORK_UPSTREAM}#1`, correction.ref);
+  const green = { checkRuns: { nodes: [{ name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS' }] } };
+  let suites = [green];
+  const written = [];
+  const github = {
+    async graphql(query, variables) {
+      if (query === PR_HEAD_QUERY || query === PR_READY_QUERY || query === PR_STATUS_QUERY) {
+        return {
+          repository: {
+            pullRequest: {
+              number: variables.number,
+              isDraft: true,
+              headRefName: BRANCH,
+              headRefOid: HEAD,
+              baseRefName: 'main',
+              isCrossRepository: true,
+              // GitHub 返回的大小写和配置里的不一样。
+              headRepository: { nameWithOwner: `${OWNER.toLowerCase()}/Cindy` },
+              body: marker,
+              commits: { nodes: [{ commit: { checkSuites: { nodes: suites }, statusCheckRollup: { contexts: { nodes: [] } } } }] },
+            },
+          },
+        };
+      }
+      return world.graphql({ query, variables });
+    },
+    async write(action) {
+      if (action.type.startsWith('comment.')) return world.write(action);
+      written.push(action);
+      return { ok: true };
+    },
+  };
+  const claim = await makeGate({ home, profile, github, binding: { kind: 'correction', issue: correction.ref, round: 1, commentId: null } }).handle({
+    type: 'comment.create',
+    repo: FORK_UPSTREAM,
+    issue: 9,
+    body: '[修正机] 第 1 轮：修正中',
+    dedupeKey: 'claim',
+  });
+  assert.equal(claim.code, 0, JSON.stringify(claim));
+  const gate = makeGate({ home, profile, github, binding: { kind: 'correction', issue: correction.ref, round: 1, commentId: claim.body.commentId } });
+
+  // 另一个 workflow 已经排上队，但一个 job 都还没出来：只看 check run 会当成全绿。
+  suites = [green, { status: 'QUEUED', conclusion: null, workflowRun: { databaseId: 91 }, checkRuns: { nodes: [] } }];
+  const queued = await gate.handle({ type: 'pr.ready', repo: FORK_UPSTREAM, pr: 5, headSha: HEAD, dedupeKey: 'ready-queued' });
+  assert.equal(queued.code, 4);
+  assert.equal(queued.body.reason, 'ready-precondition');
+  assert.match(queued.body.detail, /workflow 91=QUEUED/);
+  // workflow 起不来（没有 job 就失败了）也不算绿。
+  suites = [green, { status: 'COMPLETED', conclusion: 'STARTUP_FAILURE', workflowRun: { databaseId: 92 }, checkRuns: { nodes: [] } }];
+  const broken = await gate.handle({ type: 'pr.ready', repo: FORK_UPSTREAM, pr: 5, headSha: HEAD, dedupeKey: 'ready-broken' });
+  assert.equal(broken.body.reason, 'ready-precondition');
+  // 别的 App 自动建、永远不出 run 的 suite（没有 workflowRun）不挡。
+  suites = [green, { status: 'QUEUED', conclusion: null, workflowRun: null, checkRuns: { nodes: [] } }];
+  const ready = await gate.handle({ type: 'pr.ready', repo: FORK_UPSTREAM, pr: 5, headSha: HEAD, dedupeKey: 'ready-ok' });
+  assert.equal(ready.code, 0, JSON.stringify(ready));
+  assert.deepEqual(written.map((action) => action.type), ['pr.ready']);
 });

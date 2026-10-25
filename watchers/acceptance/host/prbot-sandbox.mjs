@@ -215,9 +215,11 @@ export async function runPreflightInSandbox({
     sandboxBin,
   });
   const runs = [];
-  for (const command of commands) {
+  for (const entry of commands) {
+    // host.json 里一条命令可以写成字符串（只有程序本身，如 ".githooks/pre-push"）或 argv 数组。
+    const command = typeof entry === 'string' && entry ? [entry] : entry;
     if (!Array.isArray(command) || command.length === 0 || command.some((item) => typeof item !== 'string')) {
-      throw new Error('预检命令应为非空字符串数组的数组');
+      throw new Error('预检命令应为非空字符串，或非空字符串数组');
     }
     const result = await run('bwrap', [...sandbox.args, '--', ...command], {
       env: sandbox.env,

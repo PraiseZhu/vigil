@@ -451,7 +451,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
 
   async function pushBranch(action) {
     const token = getOwnerToken();
-    const { repo, branch, bundlePath } = action;
+    const { repo, branch, bundlePath, forceWithLease } = action;
     // 参数会进 git 命令行：bundle 必须是绝对路径（不可能以 - 开头被当成选项），分支和仓名只收安全字符。
     if (typeof bundlePath !== 'string' || !path.isAbsolute(bundlePath)) {
       throw new Error('branch.push 的 bundlePath 必须是绝对路径');
@@ -461,6 +461,16 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
     }
     if (typeof repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || repo.startsWith('-')) {
       throw new Error(`branch.push 的仓名不合法：${repo}`);
+    }
+    // 只有修正分支（acceptance/…）可以带租约强推：租约是上次已知的远端 head（空串 = 远端必须还没有这条分支）。
+    // 其它分支、或者租约不是提交 SHA，一律拒绝；不带租约就是普通推送，绝不强推。
+    const lease = [];
+    if (forceWithLease !== undefined) {
+      if (!branch.startsWith('acceptance/')) throw new Error('branch.push 只有 acceptance/ 修正分支能带租约强推');
+      if (typeof forceWithLease !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})?$/.test(forceWithLease)) {
+        throw new Error('branch.push 的 forceWithLease 必须是提交 SHA 或空串');
+      }
+      lease.push(`--force-with-lease=refs/heads/${branch}:${forceWithLease}`);
     }
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'acceptance-push-'));
     const env = gitEnv(token);
@@ -475,7 +485,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
       if (result.code !== 0) failFrom(result, token);
       result = await runCmd(
         'git',
-        ['--git-dir', tmp, 'push', `https://github.com/${repo}.git`, `refs/heads/${branch}:refs/heads/${branch}`],
+        ['--git-dir', tmp, 'push', ...lease, `https://github.com/${repo}.git`, `refs/heads/${branch}:refs/heads/${branch}`],
         { env },
       );
       if (result.code !== 0) failFrom(result, token);

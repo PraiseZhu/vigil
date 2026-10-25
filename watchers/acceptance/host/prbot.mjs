@@ -3,6 +3,7 @@
 // 1 发现 → 2 评估 → 3 修复 → 4 本地预检 → 5 提交和建 Draft → 6 盯 Draft CI
 // → 7 自动再修 → 8 转 Ready → 9 Ready 之后 → 10 合并（永远不做）→ 11 清理。
 // 所有写操作都经 host/write-gate.mjs；这里不直接调 gh、不直接 push。
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,14 +11,16 @@ import { fileURLToPath } from 'node:url';
 import { forkTargetFor, loadAcceptanceProfile } from '../bin/profile.mjs';
 import { assertHostOwnedDir, createGithub } from '../bin/github.mjs';
 import { ISSUE_BODY_QUERY, collectTree, parseMarker } from '../bin/collect.mjs';
-import { bodyVersion, latestRound, parseRef, parseRounds, ISSUE_COMMENTS_QUERY as ROUND_COMMENTS_QUERY } from '../bin/rounds.mjs';
+import { beijingIso as roundsBeijingIso, bodyVersion, latestRound, parseRef, parseRounds, ISSUE_COMMENTS_QUERY as ROUND_COMMENTS_QUERY } from '../bin/rounds.mjs';
 import { collectTasks, repoTier } from '../bin/tasks.mjs';
 import { redact } from '../bin/redact.mjs';
 import { appendAlert, hostPaths, isAlive, readLockPayload, releaseLock, tryAcquireLock } from './paths.mjs';
 import { appendPrbotEvent } from './prbot-events.mjs';
 import { localEnv } from '../bin/localgit.mjs';
 import { run as procRun } from './proc.mjs';
-import { MEMORY_GATE_BYTES, acquireSlot, readHostConfig, readMemAvailable } from './round.mjs';
+import { MEMORY_GATE_BYTES, TEST_LOCK_PATTERN, acquireSlot, readHostConfig, readMemAvailable } from './round.mjs';
+import { CORRECTION_BOARD_VALUE, closesLine } from './prbot-gate-check.mjs';
+import { HANDOFF_VALUES, handoffFor, preflightCommands, repoConfig } from './prbot-config.mjs';
 import {
   createGate,
   MAIN_CHECKS_QUERY,
@@ -40,6 +43,35 @@ export const WATCH_INTERVAL_MS = 2 * 60 * 1000;
 const CORRECTION_STATUS_LINE = /^\[修正机\] 第 (\d+) 轮：(修正中|Draft 已开|等 CI|再修 \d+\/2|已 Ready|需人工处理|中断)$/;
 const CORRECTION_TERMINAL = new Set(['已 Ready', '需人工处理', '中断']);
 const KNOWN_STATUS = new Set(['修正中', 'Draft 已开', '等 CI', '已 Ready', '需人工处理', '中断']);
+/** 远端修正分支的 head（推送租约、要不要接着它建工作树）：宿主直接读，不经沙箱。 */
+const BRANCH_HEAD_QUERY = `query ($owner: String!, $name: String!, $branch: String!) {
+  repository(owner: $owner, name: $name) {
+    ref(qualifiedName: $branch) { target { oid } }
+  }
+}`;
+const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+/** 每次开跑都清掉的「这一拍的」标志：条件消失了（写闸重开、PAUSED 删了、写闸不忙了）就不能再挡着。 */
+const TRANSIENT_FLAGS = ['gateCode', 'gateReason', 'gateDisabled', 'gateBusyExhausted', 'interruptedExhausted', 'paused'];
+
+/**
+ * 北京时间（+08:00）的 ISO-8601（和 bin/rounds.mjs 同一个函数）。修正轮写的时间（状态文件、轮次评论、事件）都用它；
+ * 读的时候一律 Date.parse，旧的 UTC「…Z」格式照样认。
+ */
+export function beijingIso(ms = Date.now()) {
+  return roundsBeijingIso(Number.isFinite(Number(ms)) ? Number(ms) : Date.now());
+}
+
+/**
+ * 修正轮写动作的 dedupeKey：带修正子 issue、轮次号和认领评论 id。同一轮次号重放（例如认领评论被删后重新认领）
+ * 不会从写闸账本里拿回上一次的旧结果。
+ */
+function roundKey(state, tail) {
+  return `prbot:${state.issue}:r${state.round}:c${state.claimCommentId ?? '-'}:${tail}`;
+}
+
+function sameRepo(a, b) {
+  return String(a || '').toLowerCase() === String(b || '').toLowerCase();
+}
 
 function sink() {
   return {
@@ -127,9 +159,13 @@ export function matchesForbidden(file, patterns = []) {
 /** 停止条件（SC12）：纯函数，测试直接喂状态。 */
 export function stopReason(state, { now = () => Date.now() } = {}) {
   if (state?.ready) return { stop: true, reason: 'ready', needsHuman: false };
+  // 写闸总开关关着（只读运行）：这一拍安静停手，不写评论、不发事件；开闸后下一拍接着跑。
+  if (state?.gateDisabled) return { stop: true, reason: 'gate-disabled', needsHuman: false, quiet: true };
   if (state?.failureReason) return { stop: true, reason: state.failureReason, needsHuman: true };
   if (state?.gateCode === 4) return { stop: true, reason: 'gate-rejected', needsHuman: true };
-  if (state?.interruptedExhausted) return { stop: true, reason: 'interrupted-exhausted', needsHuman: false };
+  // 写闸忙（75）重试用完、GitHub 写失败退避用完：都记「中断」，不是「需人工处理」。
+  if (state?.gateBusyExhausted) return { stop: true, reason: 'gate-busy', needsHuman: false, interrupted: true };
+  if (state?.interruptedExhausted) return { stop: true, reason: 'interrupted-exhausted', needsHuman: false, interrupted: true };
   if (state?.correctionRound > MAX_CORRECTION_ROUNDS) return { stop: true, reason: 'limit-correction-rounds', needsHuman: true };
   if (state?.piIterations > MAX_PI_ITERATIONS) return { stop: true, reason: 'limit-pi-iterations', needsHuman: true };
   if (state?.rework > MAX_REWORK) return { stop: true, reason: 'limit-rework', needsHuman: true };
@@ -148,8 +184,86 @@ export function stopReason(state, { now = () => Date.now() } = {}) {
   return { stop: false, reason: null, needsHuman: false };
 }
 
-export async function discoverCorrections({ github, profile, now = () => Date.now() } = {}) {
+/** needs-human / interrupted-exhausted 的去重记录：同一修正子 issue、同一修正轮、同一原因只发一次（每条都会进 Slack）。 */
+function notifiedPath(paths, issue) {
+  return path.join(paths.prbotDir, 'notified', `${stateKey(issue)}.json`);
+}
+
+function readNotified(paths, issue) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(notifiedPath(paths, issue), 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function notifyKey(type, round, reason) {
+  return `${type}:r${round ?? '-'}:${reason || '-'}`;
+}
+
+export function alreadyNotified(paths, issue, key) {
+  return Object.hasOwn(readNotified(paths, issue), key);
+}
+
+/** 追加一条修正轮事件；时间写北京时间。 */
+function emitEvent(paths, event, { now = () => Date.now(), profile } = {}) {
+  return appendPrbotEvent(paths, { ...event, at: beijingIso(now()) }, { now, profile });
+}
+
+/** 同一 key 只追加一次；返回这次有没有真的追加。 */
+function notifyOnce(paths, event, { round, now = () => Date.now(), profile } = {}) {
+  const key = notifyKey(event.type, round, event.reason);
+  const seen = readNotified(paths, event.issue);
+  if (Object.hasOwn(seen, key)) return false;
+  emitEvent(paths, event, { now, profile });
+  seen[key] = beijingIso(now());
+  const file = notifiedPath(paths, event.issue);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(seen, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return true;
+}
+
+/**
+ * 开跑前的只读检查（不占槽、不拿锁、不写任何东西）：发现阶段和修正轮进程共用。
+ * 返回 action：
+ * - 'idle'：没事做（找不到修正子 issue / 标记；上一修正轮已收尾、总 issue 之后没有更新的「要修」）；
+ * - 'limit'：两轮用完又来了新的「要修」→ 需人工处理（只发一次）；
+ * - 'unconfigured'：host.json 没给这个仓显式配交接方式 → 不认领，需人工处理（只发一次）；
+ * - 'run'：该跑。
+ */
+export async function correctionPrecheck({ github, profile, issue, hostConfig }) {
+  const correction = await readComments(github, issue);
+  if (!correction) return { action: 'idle', reason: 'missing' };
+  const marker = parseMarker(correction.body);
+  if (!marker || marker.root == null) return { action: 'idle', reason: 'no-marker' };
+  const correctionRounds = parseCorrectionRounds(correction.comments?.nodes || [], profile.ownerLogin);
+  const latest = correctionRounds.at(-1) || null;
+  let fresh = false;
+  if (latest && CORRECTION_TERMINAL.has(latest.status)) {
+    // 上一修正轮已收尾：只有总 issue 在它之后又出了一次「要修」裁决，才开下一修正轮。
+    const rootNow = await readIssueState(github, marker.root, profile.ownerLogin);
+    const verdict = latestRound(rootNow?.rounds || []);
+    const verdictAt = Date.parse(verdict?.createdAt || '') || 0;
+    const roundAt = Date.parse(latest.createdAt || '') || 0;
+    if (!verdict || verdict.status !== '要修' || verdictAt <= roundAt) return { action: 'idle', reason: 'finished', marker, correction, correctionRounds, latest };
+    fresh = true;
+  }
+  const inProgress = Boolean(latest && !CORRECTION_TERMINAL.has(latest.status));
+  const round = inProgress ? latest.round : correctionRounds.reduce((acc, entry) => Math.max(acc, entry.round), 0) + 1;
+  const base = { marker, correction, correctionRounds, latest, fresh, inProgress, round };
+  if (!inProgress && round > MAX_CORRECTION_ROUNDS) return { ...base, action: 'limit', reason: 'limit-correction-rounds' };
+  if (!inProgress && !handoffFor(hostConfig, parseRef(issue).repo)) return { ...base, action: 'unconfigured', reason: 'handoff-unconfigured' };
+  return { ...base, action: 'run' };
+}
+
+export async function discoverCorrections({ github, profile, now = () => Date.now(), home, hostConfig } = {}) {
   const out = [];
+  const paths = typeof home === 'string' && path.isAbsolute(home) ? hostPaths(home) : null;
+  // PAUSED 在：这一拍一个修正轮都不起（起了也是马上停）。
+  if (paths && fs.existsSync(path.join(paths.prbotDir, 'PAUSED'))) return out;
   const tasks = await collectTasks(github, profile);
   for (const task of tasks) {
     if (task.tier !== 'auto') continue;
@@ -168,13 +282,24 @@ export async function discoverCorrections({ github, profile, now = () => Date.no
       const correctionRepo = parseRef(correction.ref).repo;
       const scope = repoTier(correctionRepo, profile);
       if (!scope || scope.tier !== 'auto') continue;
+      // 已经收尾、或者要报的「需人工处理」已经报过的修正：不再每分钟起一个进程（它会先占槽再发现没事做）。
+      if (hostConfig !== undefined) {
+        let pre;
+        try {
+          pre = await correctionPrecheck({ github, profile, issue: correction.ref, hostConfig });
+        } catch {
+          continue;
+        }
+        if (pre.action === 'idle') continue;
+        if ((pre.action === 'limit' || pre.action === 'unconfigured') && paths && alreadyNotified(paths, correction.ref, notifyKey('needs-human', pre.round, pre.reason))) continue;
+      }
       out.push({
         issue: correction.ref,
         root: marker.root,
         item: marker.item,
         sc: marker.sc,
         url: correction.url,
-        at: new Date(now()).toISOString(),
+        at: beijingIso(now()),
       });
     }
   }
@@ -184,17 +309,29 @@ export async function discoverCorrections({ github, profile, now = () => Date.no
 function flattenStatus(status) {
   const commit = (status?.commits?.nodes || []).at(-1)?.commit || status?.commit || {};
   const runs = [];
+  const failures = [];
+  const pending = [];
+  let suitesWithoutRuns = 0;
   for (const suite of commit.checkSuites?.nodes || []) {
-    for (const run of suite?.checkRuns?.nodes || []) {
+    const suiteRuns = suite?.checkRuns?.nodes || [];
+    for (const run of suiteRuns) {
       runs.push({ ...run, runId: run?.checkSuite?.workflowRun?.databaseId ?? suite?.workflowRun?.databaseId ?? null });
+    }
+    // workflow 已经排上、job 还没出来（check suite 有了、check run 一条没有）：和写闸 pr.ready 一样按 suite 自己的状态算。
+    const workflowId = suite?.workflowRun?.databaseId;
+    if (suiteRuns.length === 0 && workflowId != null) {
+      suitesWithoutRuns += 1;
+      const name = `workflow ${workflowId}`;
+      if (String(suite.status) !== 'COMPLETED') pending.push(name);
+      else if (!['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(suite.conclusion))) {
+        failures.push({ name, conclusion: String(suite.conclusion || '?'), runId: workflowId });
+      }
     }
   }
   const contexts = (commit.statusCheckRollup?.contexts?.nodes || []).filter(
     (node) => node?.__typename === 'StatusContext' || node?.context,
   );
   // 还在跑的（排队 / 进行中 / 等待）只算 pending，不算失败：没跑完就重跑或再修，是空转的源头之一。
-  const failures = [];
-  const pending = [];
   for (const run of runs) {
     const name = run.name || String(run.databaseId || 'check');
     if (String(run.status) !== 'COMPLETED') {
@@ -209,7 +346,7 @@ function flattenStatus(status) {
     if (state === 'PENDING' || state === 'EXPECTED') pending.push(context.context || 'status');
     else failures.push({ name: context.context || 'status', conclusion: state || '?', runId: null });
   }
-  return { runs, contexts, failures, pending, total: runs.length + contexts.length };
+  return { runs, contexts, failures, pending, total: runs.length + contexts.length + suitesWithoutRuns };
 }
 
 function failureFingerprint(failures, headSha) {
@@ -247,7 +384,7 @@ export async function pollDraft({
   const head = status?.headRefOid || state?.pr?.headSha || null;
   if (state.watchHead !== head) {
     state.watchHead = head;
-    state.watchStartedAt = new Date(now()).toISOString();
+    state.watchStartedAt = beijingIso(now());
     state.failureSeen = [];
     state.rerunFingerprints = [];
   }
@@ -279,6 +416,9 @@ export async function pollDraft({
     state.conflictFixedHead = head;
     return { action: 'resolve-conflict' };
   }
+
+  // 重跑 / 再修 / 更新分支都等全部检查结束：还有排队 / 在跑的就只等（和文档一致）。
+  if (checks.pending.length) return { action: 'wait' };
 
   if (checks.failures.length) {
     state.failureSeen = Array.isArray(state.failureSeen) ? state.failureSeen : [];
@@ -315,8 +455,6 @@ export async function pollDraft({
     return { action: 'refix', fingerprint };
   }
 
-  if (checks.pending.length) return { action: 'wait' };
-
   if (behind) {
     if ((state.conflict || 0) >= MAX_CONFLICT) {
       state.conflict = MAX_CONFLICT + 1;
@@ -339,7 +477,10 @@ async function readIssueState(github, ref, ownerLogin) {
   const data = await github.graphql(ROUND_COMMENTS_QUERY, { owner, name, number });
   const issue = data?.repository?.issue;
   if (!issue) return null;
-  return { issue, rounds: parseRounds(issue.comments?.nodes || [], ownerLogin) };
+  // parseRounds 不带正文：评估要从最新裁决里取「要修」条目和原因，按评论 id 补回去。
+  const bodies = new Map((issue.comments?.nodes || []).map((comment) => [comment.databaseId, comment.body]));
+  const rounds = parseRounds(issue.comments?.nodes || [], ownerLogin).map((round) => ({ ...round, body: bodies.get(round.commentId) ?? '' }));
+  return { issue, rounds };
 }
 
 async function readComments(github, ref) {
@@ -348,12 +489,32 @@ async function readComments(github, ref) {
   return data?.repository?.issue || null;
 }
 
+/** 裁决行 SC 号后面那段（「· 原因：…」）：有争议时当「验收方」的说法。 */
+function verdictWhy(rest) {
+  const parts = String(rest || '')
+    .split('·')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const reason = parts.find((part) => /^原因[:：]/.test(part));
+  return (reason ? reason.replace(/^原因[:：]\s*/, '') : parts.join(' / ')).trim();
+}
+
+/** 单行写法：- 有争议：<owner/repo#n> SC<k> · 验收方：… · 修正方：…（collect / round status 按这一行认条目）。 */
+export function disputeLine(item) {
+  const clean = (text) =>
+    redact(String(text || ''))
+      .replace(/\s+/g, ' ')
+      .replace(/·/g, '/')
+      .trim();
+  return `- 有争议：${item.ref} SC${item.sc} · 验收方：${clean(item.acceptance) || '裁决是要修'} · 修正方：${clean(item.reason) || '（没写理由）'}`;
+}
+
 function parseVerdictItems(body) {
   const items = [];
   const re = /^\s*-\s*要修：([\w.-]+\/[\w.-]+#\d+)\s+SC(\d+)(.*)$/;
   for (const line of String(body || '').split('\n')) {
     const match = re.exec(line);
-    if (match) items.push({ ref: match[1], sc: Number(match[2]), text: line.trim() });
+    if (match) items.push({ ref: match[1], sc: Number(match[2]), text: line.trim(), why: verdictWhy(match[3]) });
   }
   return items;
 }
@@ -373,8 +534,8 @@ function formatRoundComment(state, status, extra = {}) {
     for (const item of state.mustFix) lines.push(`- ${item.ref} SC${item.sc}`);
   }
   if (state.disputes?.length) {
-    lines.push('## 有争议');
-    for (const item of state.disputes) lines.push(`- ${item.ref} SC${item.sc}：${redact(item.reason || '')}`);
+    lines.push('## 争议条目');
+    for (const item of state.disputes) lines.push(disputeLine(item));
   }
   if (state.manual?.length) {
     lines.push('## 人工手测（不修）');
@@ -398,7 +559,8 @@ async function updateComment({ gate, state, status, note, sleep, now }) {
   const body = formatRoundComment(state, status, { note });
   const action = {
     type: 'comment.update',
-    dedupeKey: `prbot:${state.issue}:r${state.round}:comment:${state.commentSeq}`,
+    // 带上正文摘要：本地状态丢了、commentSeq 从头数时，新内容不会撞上账本里的旧结果被吞掉。
+    dedupeKey: roundKey(state, `comment:${state.commentSeq}:${crypto.createHash('sha256').update(body).digest('hex').slice(0, 16)}`),
     repo: parseRef(state.issue).repo,
     issue: parseRef(state.issue).number,
     commentId: state.claimCommentId,
@@ -429,15 +591,31 @@ async function gateWrite(gate, action, { state, sleep, now = () => Date.now() } 
       delay *= 2;
       continue;
     }
-    if (outcome.code === 1) state.interruptedExhausted = true;
-    if (outcome.code === 4) state.gateCode = 4;
+    markWriteFailure(state, outcome);
     return outcome;
+  }
+}
+
+/** 一次写没成：按原因记标志。总开关关着 → 安静停；75 用完 → 中断（写闸忙）；1 用完 → 中断；4 → 需人工处理。 */
+function markWriteFailure(state, outcome) {
+  if (!state || !outcome || outcome.code === 0) return;
+  if (outcome.body?.reason === 'gate-disabled') state.gateDisabled = true;
+  else if (outcome.code === 75) state.gateBusyExhausted = true;
+  else if (outcome.code === 1) state.interruptedExhausted = true;
+  else {
+    state.gateCode = 4;
+    state.gateReason = outcome.body?.reason || null;
   }
 }
 
 async function gateRead(gate, query, variables) {
   const outcome = await gate.handle({ type: 'read.graphql', query, variables });
-  if (outcome.code !== 0) throw new Error(`写闸拒绝读：${outcome.body?.reason || outcome.code}`);
+  if (outcome.code !== 0) {
+    const error = new Error(`写闸拒绝读：${outcome.body?.reason || outcome.code}`);
+    error.reason = outcome.body?.reason || null;
+    error.code = outcome.code;
+    throw error;
+  }
   return outcome.body?.data || {};
 }
 
@@ -568,11 +746,11 @@ export function mirrorGit(run, mirror, args) {
  * 把镜像里的 origin/main 打成 bundle（宿主在镜像里打、先放宿主临时目录），
  * 再以「不覆盖」方式复制进一个全新的沙箱轮次目录。沙箱只从这份副本取 main，看不见镜像本身。
  */
-export async function stageMainBundle({ run, mirror, roundDir }) {
+export async function stageMainBundle({ run, mirror, roundDir, refs = ['refs/remotes/origin/main'] }) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'prbot-main-'));
   try {
     const hostBundle = path.join(tmp, 'main.bundle');
-    const made = await mirrorGit(run, mirror, ['bundle', 'create', hostBundle, 'refs/remotes/origin/main']);
+    const made = await mirrorGit(run, mirror, ['bundle', 'create', hostBundle, ...refs]);
     if (made?.code !== 0) throw new Error('从镜像打 main 失败');
     fs.rmSync(roundDir, { recursive: true, force: true });
     fs.mkdirSync(path.dirname(roundDir), { recursive: true, mode: 0o700 });
@@ -599,14 +777,39 @@ function writeExclusive(file, text) {
   }
 }
 
-export async function defaultPrepareWorktree({ github, state, profile, run, refresh = false, home, preflight, hostConfig, env = process.env, roundRunDir }) {
+/** 宿主镜像里某个远端引用指向的提交（读不出就 null）。 */
+async function mirrorRef(run, mirror, ref) {
+  const result = await mirrorGit(run, mirror, ['rev-parse', '--verify', '-q', `${ref}^{commit}`]);
+  const sha = String(result?.stdout || '').trim();
+  return result?.code === 0 && SHA_PATTERN.test(sha) ? sha : null;
+}
+
+function assertBranchName(branch) {
+  if (!/^acceptance\/[A-Za-z0-9._-]+$/.test(String(branch)) || String(branch).includes('..')) throw new Error(`分支名不合法：${branch}`);
+}
+
+export async function defaultPrepareWorktree({
+  github,
+  state,
+  profile,
+  run,
+  refresh = false,
+  home,
+  preflight,
+  hostConfig,
+  env = process.env,
+  roundRunDir,
+  remoteBranch,
+  now = () => Date.now(),
+}) {
   if (typeof home !== 'string' || !path.isAbsolute(home)) throw new Error('defaultPrepareWorktree 需要绝对路径的 home');
   const { owner, name, number } = parseRef(state.issue);
   const root = path.join(profile.worktreeDir, 'prbot');
   const worktree = path.join(root, `${owner}__${name}__${number}-r${state.round}`);
   const marker = path.join(worktree, '.acc-owned.json');
-  // 起点永远是目标仓（PR 开在哪个仓）的 main；fork 模式只是推到 fork。
+  // 起点是目标仓（PR 开在哪个仓）的 main；fork 模式只是推到 fork。远端修正分支还有开着的 PR 就接着它的 head。
   const upstream = state.prRepo || parseRef(state.root || state.issue).repo;
+  const pushRepo = state.pushRepo || upstream;
   if (typeof github.fetchBranch !== 'function') throw new Error('github 没有 fetchBranch');
   const mirror = ensureMirrorDir({ home, profile, worktree });
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -618,6 +821,11 @@ export async function defaultPrepareWorktree({ github, state, profile, run, refr
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
   }
+  // 远端修正分支现在的 head：推送租约要用（--force-with-lease=<分支>:<上次已知 head>）。没有 remoteBranch 就当远端没有这条分支。
+  const remote = typeof remoteBranch === 'function' ? (await remoteBranch({ state })) || {} : {};
+  const remoteHead = SHA_PATTERN.test(String(remote.head || '')) ? String(remote.head) : null;
+  if (remoteHead) assertBranchName(state.branch);
+  const roundBase = roundRunDir || hostPaths(home).roundRunDir;
   if (existing) {
     if (existing.isSymbolicLink() || !existing.isDirectory()) throw new Error('工作树是符号链接或不是目录，拒绝');
     // 只认宿主自己记过的工作树：沙箱能伪造工作树里的 .acc-owned.json，伪造不了镜像目录里的记录。
@@ -625,10 +833,44 @@ export async function defaultPrepareWorktree({ github, state, profile, run, refr
     // 解决冲突前把最新 main 取进宿主镜像（带令牌的 git 只在宿主镜像里跑）；
     // 再由修正轮把 main 打成 bundle、在沙箱里导进工作树。
     if (refresh || !fs.existsSync(path.join(mirror, '.git'))) await github.fetchBranch({ repo: upstream, branch: 'main', dir: mirror, depth: 0 });
-    return { worktree, mirror, reused: true };
+    let known = remoteHead || '';
+    if (remoteHead && remoteHead !== state.remoteHead) {
+      // 远端分支被挪过（例如 pr.update-branch 把 main 合了进去）：取进镜像、在沙箱里快进工作树，再修，推送就是快进。
+      if (typeof preflight !== 'function') throw new Error('defaultPrepareWorktree 需要沙箱预检（preflight）');
+      await github.fetchBranch({ repo: pushRepo, branch: state.branch, dir: mirror, depth: 0 });
+      known = (await mirrorRef(run, mirror, `refs/remotes/origin/${state.branch}`)) || remoteHead;
+      const roundDir = path.join(roundBase, 'prbot', `${stateKey(state.issue)}-r${state.round}-sync`);
+      const bundle = await stageMainBundle({ run, mirror, roundDir, refs: [`refs/remotes/origin/${state.branch}`] });
+      const synced = await preflight({
+        home,
+        profile,
+        hostConfig,
+        roundDir,
+        worktree,
+        commands: [
+          ['git', 'fetch', '-q', bundle, `+refs/remotes/origin/${state.branch}:refs/remotes/origin/${state.branch}`],
+          // 已经包含远端 head 就不动；否则只许快进。分叉了（有人在远端改过）就停，不覆盖别人的提交。
+          ['sh', '-c', 'git merge-base --is-ancestor "refs/remotes/origin/$1" HEAD || git merge --ff-only -q "refs/remotes/origin/$1"', 'sync', state.branch],
+        ],
+        env,
+        run,
+      });
+      fs.rmSync(roundDir, { recursive: true, force: true });
+      if (synced?.unavailable) throw new Error('沙箱起不来：不同步远端修正分支');
+      if (!synced?.ok) throw new Error('branch-diverged：远端修正分支和工作树分叉了，不覆盖');
+    }
+    return { worktree, mirror, reused: true, remoteHead: known };
   }
   // 取全量历史：工作树打出来的 bundle 要能在写闸的空仓里单独导入（浅克隆打的 bundle 缺父提交）。
   await github.fetchBranch({ repo: upstream, branch: 'main', dir: mirror, depth: 0 });
+  // 远端已有这条修正分支、PR 还开着（同一 PR 上再修、update-branch 之后、第 2 轮沿用 PR）：接着远端 head 建，推送是快进。
+  // 分支还在但没有开着的 PR（已合并 / 已关）：从最新 main 重建，推送时用租约覆盖旧 head，不会撞 non-fast-forward。
+  const resume = Boolean(remoteHead && remote.openPr);
+  let known = remoteHead || '';
+  if (resume) {
+    await github.fetchBranch({ repo: pushRepo, branch: state.branch, dir: mirror, depth: 0 });
+    known = (await mirrorRef(run, mirror, `refs/remotes/origin/${state.branch}`)) || remoteHead;
+  }
   if (typeof preflight !== 'function') throw new Error('defaultPrepareWorktree 需要沙箱预检（preflight）');
   // 工作树目录由宿主新建（不是递归建：已存在就报错），归属标记以「独占新建、不跟链接」写。
   fs.mkdirSync(worktree, { mode: 0o700 });
@@ -636,10 +878,11 @@ export async function defaultPrepareWorktree({ github, state, profile, run, refr
   writeExclusive(ownedRecordPath(mirror), JSON.stringify({ worktree, issue: state.issue, round: state.round }));
   writeExclusive(
     marker,
-    JSON.stringify({ kind: 'prbot', issue: state.issue, round: state.round, createdAt: new Date().toISOString() }, null, 2),
+    JSON.stringify({ kind: 'prbot', issue: state.issue, round: state.round, createdAt: beijingIso(now()) }, null, 2),
   );
-  const roundDir = path.join(roundRunDir || hostPaths(home).roundRunDir, 'prbot', `${stateKey(state.issue)}-r${state.round}-init`);
-  const bundle = await stageMainBundle({ run, mirror, roundDir });
+  const roundDir = path.join(roundBase, 'prbot', `${stateKey(state.issue)}-r${state.round}-init`);
+  const refs = ['refs/remotes/origin/main', ...(resume ? [`refs/remotes/origin/${state.branch}`] : [])];
+  const bundle = await stageMainBundle({ run, mirror, roundDir, refs });
   // 宿主不在工作树里跑任何 git：建仓、导 main、建分支、写提交身份、把归属标记加进 exclude，都在沙箱里跑。
   // pi 在沙箱里 git commit -s：沙箱里的 HOME 是空的，提交身份写进这个工作树自己的配置。
   const login = String(profile.ownerLogin || 'acceptance-bot');
@@ -653,7 +896,8 @@ export async function defaultPrepareWorktree({ github, state, profile, run, refr
     commands: [
       ['git', 'init', '-q'],
       ['git', 'fetch', '-q', bundle, '+refs/remotes/origin/main:refs/remotes/origin/main'],
-      ['git', 'checkout', '-q', '-B', String(state.branch), 'origin/main'],
+      ...(resume ? [['git', 'fetch', '-q', bundle, `+refs/remotes/origin/${state.branch}:refs/remotes/origin/${state.branch}`]] : []),
+      ['git', 'checkout', '-q', '-B', String(state.branch), resume ? `refs/remotes/origin/${state.branch}` : 'origin/main'],
       ['git', 'config', 'user.name', login],
       ['git', 'config', 'user.email', `${login}@users.noreply.github.com`],
       // 归属标记不进提交：pi 的 git add -A 也带不走它。
@@ -665,7 +909,7 @@ export async function defaultPrepareWorktree({ github, state, profile, run, refr
   fs.rmSync(roundDir, { recursive: true, force: true });
   if (made?.unavailable) throw new Error('沙箱起不来：不建工作树');
   if (!made?.ok) throw new Error('在沙箱里建工作树失败');
-  return { worktree, mirror, reused: false };
+  return { worktree, mirror, reused: false, remoteHead: known, resumed: resume };
 }
 
 /**
@@ -753,13 +997,7 @@ async function bundleFiles({ run, mirror, bundle, state }) {
     .filter(Boolean);
 }
 
-function repoConfig(hostConfig, repo) {
-  return hostConfig?.prbot?.repos?.[repo] || {};
-}
-
-function handoffFor(hostConfig, repo) {
-  return repoConfig(hostConfig, repo).handoff === 'watcher' ? 'watcher' : 'owner';
-}
+export { HANDOFF_VALUES, handoffFor, preflightCommands };
 
 function piCommandFor(hostConfig) {
   const command = hostConfig?.prbot?.piCommand || hostConfig?.piCommand;
@@ -787,6 +1025,8 @@ function writeReadyState(paths, state) {
         readyAt: state.readyAt,
         handoff: state.handoff,
         stalledAt: null,
+        pickedUpAt: null,
+        closedAt: null,
       },
       null,
       2,
@@ -809,7 +1049,17 @@ function compileReviewPattern(patternSource) {
   return new RegExp(text, 'i');
 }
 
-/** 24 小时没人接（SC10）：只对 handoff=watcher 的 PR 追加一次 ready-stalled。 */
+function isHumanActor(author) {
+  if (!author) return false;
+  if (author.__typename === 'Bot') return false;
+  return !/\[bot\]$/i.test(String(author.login || ''));
+}
+
+/**
+ * 24 小时没人接（SC10）：只对 handoff=watcher 的 PR 追加一次 ready-stalled。
+ * 活动只算转 Ready 之后、不是机器人的 review / 评论，和名字匹配 reviewCheckPattern 的 check run；
+ * 有过活动（pickedUpAt）或 PR 已合并 / 已关（closedAt）就记下来，以后不再查。
+ */
 export async function checkReadyStalled({ home, profile, github, now = () => Date.now(), reviewCheckPattern } = {}) {
   const paths = hostPaths(home);
   let names = [];
@@ -830,7 +1080,7 @@ export async function checkReadyStalled({ home, profile, github, now = () => Dat
     } catch {
       continue;
     }
-    if (entry.handoff !== 'watcher' || entry.stalledAt) continue;
+    if (entry.handoff !== 'watcher' || entry.stalledAt || entry.pickedUpAt || entry.closedAt) continue;
     const readyAt = Date.parse(entry.readyAt || 0);
     if (!Number.isFinite(readyAt) || now() - readyAt < READY_STALL_MS) continue;
     const { owner, name: repoName } = parseRef(`${entry.repo}#${entry.pr}`);
@@ -841,8 +1091,16 @@ export async function checkReadyStalled({ home, profile, github, now = () => Dat
     });
     const pr = data?.repository?.pullRequest;
     if (!pr) continue;
-    const reviews = pr.reviews?.nodes || [];
-    const comments = pr.comments?.nodes || [];
+    const save = () => fs.writeFileSync(file, JSON.stringify(entry, null, 2), { mode: 0o600 });
+    const prState = String(pr.state || '').toUpperCase();
+    if (prState === 'MERGED' || prState === 'CLOSED') {
+      entry.closedAt = beijingIso(now());
+      save();
+      continue;
+    }
+    const afterReady = (node) => (Date.parse(node?.createdAt || '') || 0) >= readyAt;
+    const reviews = (pr.reviews?.nodes || []).filter((node) => isHumanActor(node?.author) && afterReady(node));
+    const comments = (pr.comments?.nodes || []).filter((node) => isHumanActor(node?.author) && afterReady(node));
     const checks = [];
     for (const suite of pr.commits?.nodes?.at(-1)?.commit?.checkSuites?.nodes || []) {
       for (const run of suite?.checkRuns?.nodes || []) {
@@ -850,8 +1108,12 @@ export async function checkReadyStalled({ home, profile, github, now = () => Dat
       }
     }
     const activity = reviews.length > 0 || comments.length > 0 || checks.length > 0;
-    if (activity) continue;
-    appendPrbotEvent(
+    if (activity) {
+      entry.pickedUpAt = beijingIso(now());
+      save();
+      continue;
+    }
+    emitEvent(
       paths,
       {
         type: 'ready-stalled',
@@ -866,8 +1128,8 @@ export async function checkReadyStalled({ home, profile, github, now = () => Dat
       },
       { now, profile },
     );
-    entry.stalledAt = new Date(now()).toISOString();
-    fs.writeFileSync(file, JSON.stringify(entry, null, 2), { mode: 0o600 });
+    entry.stalledAt = beijingIso(now());
+    save();
     out.push(entry);
   }
   return out;
@@ -915,10 +1177,16 @@ export function cleanupWorktrees({ home, profile, fsImpl = fs } = {}) {
   return removed;
 }
 
-/** 修正 PR 正文：首行链任务 issue；修正标记原样照抄修正子 issue 的（轮次是验收轮，不是修正轮）。 */
+/**
+ * 修正 PR 正文：首行链任务 issue；第二行「Closes <修正子 issue>」（合并后 GitHub 关掉修正子 issue，trigger 才会再验）；
+ * 修正标记原样照抄修正子 issue 的（轮次是验收轮，不是修正轮）。
+ */
 export function correctionPrBody(state, marker) {
+  const prRepo = state.prRepo || parseRef(state.issue || state.root).repo;
+  const lines = [`任务 issue：${state.root}`];
+  if (state.issue) lines.push(closesLine(state.issue, prRepo));
   return [
-    `任务 issue：${state.root}`,
+    ...lines,
     '',
     `> 修正 PR · 原属 ${state.item} SC${state.sc} · 修正轮第 ${state.round} 轮`,
     '',
@@ -932,8 +1200,8 @@ export function correctionPushRepo({ issue, marker, fork, ownerLogin, forkTarget
   return parseRef(issue).repo;
 }
 
-function makeState({ issue, marker, rootTree, ownerLogin, forkTargets }) {
-  const nowIso = new Date().toISOString();
+function makeState({ issue, marker, rootTree, ownerLogin, forkTargets, now = () => Date.now() }) {
+  const nowIso = beijingIso(now());
   const correctionRepo = parseRef(issue).repo;
   const rootRepo = parseRef(marker.root).repo;
   const pushRepo = correctionPushRepo({ issue, marker, fork: rootTree?.root?.fork, ownerLogin, forkTargets });
@@ -965,7 +1233,7 @@ function makeState({ issue, marker, rootTree, ownerLogin, forkTargets }) {
     manual: [],
     failureSeen: [],
     rerunFingerprints: [],
-    handoff: 'owner',
+    handoff: null,
   };
 }
 
@@ -999,6 +1267,43 @@ export async function runPrbotCorrection({
   const settings = hostConfig || readHostConfig(paths.hostConfig);
   const acceptanceProfile = profile || loadAcceptanceProfile({ ...env, ACCEPTANCE_WATCHER_HOME: home });
   const gateGithub = github || createGithub({ profile: { ...acceptanceProfile, writeCommand: undefined }, run });
+  const pausedFile = path.join(paths.prbotDir, 'PAUSED');
+  const eventOptions = { now, profile: acceptanceProfile };
+
+  // 0. 开跑前的只读检查：不占槽、不拿锁。没事做 / 要报的需人工处理已报过，就不挤掉验收轮的槽。
+  if (fs.existsSync(pausedFile)) return 3;
+  let pre;
+  try {
+    pre = await correctionPrecheck({ github: gateGithub, profile: acceptanceProfile, issue, hostConfig: settings });
+  } catch (error) {
+    // 读 GitHub 失败：这一拍不跑，下一拍再试（不让进程因为未捕获的异常崩掉）。
+    log(`开跑前读不到 GitHub：${redact(String(error?.message || error), acceptanceProfile)}`);
+    return 1;
+  }
+  if (pre.action === 'idle') return pre.reason === 'finished' ? 0 : 1;
+  const { marker, correctionRounds } = pre;
+  const latestCorrection = pre.latest;
+  if (pre.action === 'limit' || pre.action === 'unconfigured') {
+    // 不认领：GitHub 上什么都不写（修正轮绑定只认第 1、2 轮的认领）。需人工处理同一原因只报一次。
+    notifyOnce(
+      paths,
+      {
+        type: 'needs-human',
+        issue,
+        root: marker.root,
+        item: marker.item,
+        sc: [marker.sc],
+        repo: parseRef(issue).repo,
+        reason: pre.reason,
+        detail:
+          pre.action === 'limit'
+            ? `同一修正子 issue 最多 ${MAX_CORRECTION_ROUNDS} 个修正轮，已用完`
+            : `host.json 的 prbot.repos["${parseRef(issue).repo}"].handoff 没有显式配置（owner / watcher）`,
+      },
+      { round: pre.round, ...eventOptions },
+    );
+    return 1;
+  }
 
   // 和验收轮共用的内存门与 2 个槽（SC1）。
   const available = readMemAvailable(meminfoPath);
@@ -1007,6 +1312,13 @@ export async function runPrbotCorrection({
   if (!tryAcquireLock(lockFile, { now })) return 3;
   const slot = acquireSlot(paths, now);
   if (!slot) {
+    releaseLock(lockFile);
+    return 3;
+  }
+  // Mivo 测试锁（#43：mivo 同时最多 1 轮，验收轮 + 修正轮合计）：和验收轮同一判定（仓名以 mivo 开头），整轮持有。
+  const needTestLock = [parseRef(issue).repo, parseRef(marker.root).repo].some((repo) => TEST_LOCK_PATTERN.test(repo.split('/')[1] || ''));
+  if (needTestLock && !tryAcquireLock(paths.testLock, { now })) {
+    releaseLock(slot.file);
     releaseLock(lockFile);
     return 3;
   }
@@ -1050,24 +1362,41 @@ export async function runPrbotCorrection({
   };
   const gateFor = (binding) =>
     makeGate ? makeGate({ binding, ...context }) : createGate({ home, profile: acceptanceProfile, github: gateGithub, run, binding });
+  // 远端修正分支：head（推送租约）和有没有从我们推的仓开着的 PR（要不要接着它建工作树）。宿主直接读。
+  const remoteBranch = async ({ state: current }) => {
+    const [pushOwner, pushName] = String(current.pushRepo || current.prRepo).split('/');
+    const refData = await gateGithub.graphql(BRANCH_HEAD_QUERY, { owner: pushOwner, name: pushName, branch: `refs/heads/${current.branch}` });
+    const head = refData?.repository?.ref?.target?.oid;
+    if (!SHA_PATTERN.test(String(head || ''))) return { head: null, openPr: false };
+    const [prOwner, prName] = String(current.prRepo).split('/');
+    const prs = await gateGithub.graphql(PR_BY_BRANCH_QUERY, { owner: prOwner, name: prName, head: current.branch });
+    const openPr = (prs?.repository?.pullRequests?.nodes || []).some((node) =>
+      sameRepo(node?.headRepository?.nameWithOwner, current.pushRepo || current.prRepo),
+    );
+    return { head, openPr };
+  };
+  // 推修正分支：知道远端 head（或知道远端还没有这条分支）就带租约，pr.update-branch 之后、旧分支上都不会撞 non-fast-forward。
+  const pushAction = (state, bundle, tag) => {
+    const action = {
+      type: 'branch.push',
+      dedupeKey: roundKey(state, `${tag}:${bundle.headSha}:${typeof state.remoteHead === 'string' ? state.remoteHead || 'new' : '-'}`),
+      repo: state.pushRepo,
+      branch: state.branch,
+      bundlePath: bundle.bundlePath,
+    };
+    if (typeof state.remoteHead === 'string') action.forceWithLease = state.remoteHead;
+    return action;
+  };
+  const notifyStop = (state, type, reason, extra = {}) =>
+    notifyOnce(
+      paths,
+      { type, issue, root: state.root, item: state.item, sc: [state.sc], repo: state.repo, reason, pr: state.pr?.number, prUrl: state.pr?.url, ...extra },
+      { round: state.round, ...eventOptions },
+    );
 
   let state = null;
   try {
-    const correction = await readComments(gateGithub, issue);
-    if (!correction) return 1;
-    const marker = parseMarker(correction.body);
-    if (!marker || marker.root == null) return 1;
-    const correctionRounds = parseCorrectionRounds(correction.comments?.nodes || [], acceptanceProfile.ownerLogin);
-    const latestCorrection = correctionRounds.at(-1) || null;
-    if (latestCorrection && CORRECTION_TERMINAL.has(latestCorrection.status)) {
-      // 上一修正轮已收尾：只有总 issue 在它之后又出了一次「要修」裁决，才开下一修正轮。
-      const rootNow = await readIssueState(gateGithub, marker.root, acceptanceProfile.ownerLogin);
-      const verdict = latestRound(rootNow?.rounds || []);
-      const verdictAt = Date.parse(verdict?.createdAt || '') || 0;
-      const roundAt = Date.parse(latestCorrection.createdAt || '') || 0;
-      if (!verdict || verdict.status !== '要修' || verdictAt <= roundAt) return 0;
-      fs.rmSync(prbotStatePath(paths, issue), { force: true });
-    }
+    if (pre.fresh) fs.rmSync(prbotStatePath(paths, issue), { force: true });
 
     let tree;
     try {
@@ -1081,21 +1410,16 @@ export async function runPrbotCorrection({
       state = null;
     }
     if (!state || !state.startedAt) {
-      state = makeState({ issue, marker, rootTree: tree, ownerLogin: acceptanceProfile.ownerLogin, forkTargets: acceptanceProfile.forkTargets });
-    } else if (!state.startedAt) {
-      state.startedAt = new Date(now()).toISOString();
+      state = makeState({ issue, marker, rootTree: tree, ownerLogin: acceptanceProfile.ownerLogin, forkTargets: acceptanceProfile.forkTargets, now });
     }
+    // 上一拍留下的写闸 / PAUSED 标志：条件消失了就不能再挡着（不然重开写闸后一认领就「需人工处理」）。
+    for (const key of TRANSIENT_FLAGS) delete state[key];
     state.repo = parseRef(issue).repo;
     state.rootRepo = parseRef(marker.root).repo;
     state.prRepo = state.prRepo || state.rootRepo;
     state.branch = correctionBranch(marker);
     state.handoff = handoffFor(settings, state.repo);
     state.verdict = null;
-    const pausedFile = path.join(paths.prbotDir, 'PAUSED');
-    if (fs.existsSync(pausedFile)) {
-      state.paused = true;
-      return 1;
-    }
 
     // 1. 认领 / 加载已有修正轮。
     // 进行中的修正轮（哪怕本地状态丢了）一律接手同一条评论，不再认领新一轮。
@@ -1105,122 +1429,97 @@ export async function runPrbotCorrection({
     }
     if (!state.claimCommentId) {
       const next = correctionRounds.reduce((acc, round) => Math.max(acc, round.round), 0) + 1;
-      if (next > MAX_CORRECTION_ROUNDS) {
-        state.correctionRound = next;
-        state.stage = 'stop';
-      } else {
-        state.round = next;
-        const claimGate = gateFor({ kind: 'correction', issue, round: next, commentId: null });
-        const claim = await gateWrite(
-          claimGate,
-          {
-            type: 'comment.create',
-            dedupeKey: `prbot:${issue}:r${next}:claim`,
-            repo: state.repo,
-            issue: parseRef(issue).number,
-            body: formatRoundComment(state, '修正中'),
-          },
-          { state, sleep, now },
-        );
-        if (claim.code !== 0) {
-          state.gateCode = claim.code;
-          state.stage = 'stop';
-        } else {
-          state.claimCommentId = claim.body?.commentId;
-          state.steps.push('认领：发出「[修正机] 第 m 轮：修正中」');
-          appendPrbotEvent(paths, { type: 'claimed', issue, root: state.root, item: state.item, sc: [state.sc], repo: state.repo }, { now, profile });
-          state.stage = 'assess';
-          saveState(paths, state);
-        }
+      state.round = next;
+      state.startedAt = beijingIso(now());
+      const claimGate = gateFor({ kind: 'correction', issue, round: next, commentId: null });
+      const scratch = {};
+      const claim = await gateWrite(
+        claimGate,
+        {
+          type: 'comment.create',
+          // 认领带本次开始时间：同一轮次号再认领（上一条认领评论被删了）不会拿回账本里的旧评论 id。
+          dedupeKey: `prbot:${issue}:r${next}:s${Date.parse(state.startedAt)}:claim`,
+          repo: state.repo,
+          issue: parseRef(issue).number,
+          body: formatRoundComment(state, '修正中'),
+        },
+        { state: scratch, sleep, now },
+      );
+      if (claim.code !== 0) {
+        // 认领没成：GitHub 上什么都没写，这一修正轮还没开始。不留状态（下一拍重来），不发需人工处理
+        // （写闸自己记了提醒；总开关关着时是只读运行，什么都不报）。
+        state = null;
+        if (scratch.gateDisabled || scratch.gateBusyExhausted) return 3;
+        return claim.code === 4 ? 4 : 1;
       }
+      state.claimCommentId = claim.body?.commentId;
+      state.steps.push('认领：发出「[修正机] 第 m 轮：修正中」');
+      emitEvent(paths, { type: 'claimed', issue, root: state.root, item: state.item, sc: [state.sc], repo: state.repo }, eventOptions);
+      state.stage = 'assess';
+      saveState(paths, state);
     }
 
-    let gate = state.claimCommentId
-      ? gateFor({ kind: 'correction', issue, round: state.round, commentId: state.claimCommentId })
-      : null;
+    let gate = gateFor({ kind: 'correction', issue, round: state.round, commentId: state.claimCommentId });
 
     // 2–9. 状态机。
+    try {
     for (let tick = 0; tick < 500; tick += 1) {
       if (fs.existsSync(pausedFile)) state.paused = true;
-      state.updatedAt = new Date(now()).toISOString();
+      state.updatedAt = beijingIso(now());
       saveState(paths, state);
       const stop = stopReason(state, { now });
+      if (!stop.stop && state.stage === 'stop') {
+        // 走到 stop 却没有具体原因：照实报（以前一律写成 correction-rounds）。
+        state.failureReason = state.stopNote || 'stopped';
+        continue;
+      }
       if (stop.stop) {
-        if (state.paused === true && !stop.needsHuman) {
-          return 1;
-        }
-        if (stop.reason === 'interrupted-exhausted') {
+        if (stop.quiet) return 3;
+        if (stop.interrupted) {
+          const busy = stop.reason === 'gate-busy';
           state.status = '中断';
-          if (gate) {
-            try {
-              await updateComment({ gate, state, status: '中断', note: 'GitHub 连续失败 5 次，退避用完', sleep, now });
-            } catch {
-              // 评论写不下去也要停手。
-            }
+          try {
+            await updateComment({ gate, state, status: '中断', note: busy ? '写闸忙，重试用完' : 'GitHub 连续失败 5 次，退避用完', sleep, now });
+          } catch {
+            // 评论写不下去也要停手。
           }
-          appendPrbotEvent(
-            paths,
-            { type: 'interrupted-exhausted', issue, root: state.root, item: state.item, sc: [state.sc], repo: state.repo, reason: 'write-failed', pr: state.pr?.number, prUrl: state.pr?.url },
-            { now, profile },
-          );
+          notifyStop(state, 'interrupted-exhausted', busy ? 'gate-busy' : 'write-failed');
           return 1;
         }
         if (stop.needsHuman) {
           state.status = '需人工处理';
-          if (gate) {
-            try {
-              await updateComment({ gate, state, status: '需人工处理', note: `停止原因：${stop.reason}`, sleep, now });
-            } catch {
-              // 评论写不下去也要停手。
-            }
+          try {
+            await updateComment({ gate, state, status: '需人工处理', note: `停止原因：${stop.reason}`, sleep, now });
+          } catch {
+            // 评论写不下去也要停手。
           }
-          appendPrbotEvent(
-            paths,
-            {
-              type: 'needs-human',
-              issue,
-              root: state.root,
-              item: state.item,
-              sc: [state.sc],
-              repo: state.repo,
-              reason: stop.reason,
-              detail: state.mainRed ? JSON.stringify(state.mainRed) : state.stopNote,
-              pr: state.pr?.number,
-              prUrl: state.pr?.url,
-            },
-            { now, profile },
-          );
+          // 评论没写上（写闸忙 / 关着）：下一拍还会再写评论，但需人工处理同一原因只报一次。
+          notifyStop(state, 'needs-human', stop.reason, {
+            detail: state.mainRed ? JSON.stringify(state.mainRed) : state.stopNote || state.gateReason || state.worktreeError || undefined,
+          });
           return 1;
         }
         return 0;
       }
 
-      if (state.stage === 'stop') {
-        state.status = '需人工处理';
-        if (gate) await updateComment({ gate, state, status: '需人工处理', note: '修正轮次已用完', sleep, now });
-        appendPrbotEvent(paths, { type: 'needs-human', issue, root: state.root, item: state.item, sc: [state.sc], repo: state.repo, reason: 'correction-rounds' }, { now, profile });
-        return 1;
-      }
-
       if (state.stage === 'assess') {
         const root = await readIssueState(gateGithub, state.root, acceptanceProfile.ownerLogin);
         const latest = latestRound(root?.rounds || []);
-        state.verdict = latest?.status || null;
+        state.verdict = latest?.status || '没有裁决';
         if (!latest || latest.status !== '要修') {
           state.stage = 'stop';
           continue;
         }
-        let items = parseVerdictItems(latest.body);
-        if (!items.length) items = [{ ref: state.item, sc: state.sc }];
-        const sameItem = items.filter((item) => item.ref === state.item);
-        const must = (sameItem.length ? sameItem : items).filter((item) => item.sc === state.sc || !sameItem.length);
+        // 只取这个修正子 issue 自己那一条（同一出处、同一 SC）；裁决里没列就按修正标记来。
+        let must = parseVerdictItems(latest.body).filter((item) => item.ref === state.item && item.sc === state.sc);
+        if (!must.length) must = [{ ref: state.item, sc: state.sc, why: '' }];
         const treeItems = tree.issues.flatMap((entry) => entry.items);
         state.mustFix = [];
         state.manual = [];
         for (const item of must) {
           const found = treeItems.find((entry) => entry.source === item.ref && entry.sc === item.sc);
           if (found?.manual) state.manual.push({ ref: item.ref, sc: item.sc });
-          else state.mustFix.push({ ref: item.ref, sc: item.sc });
+          else state.mustFix.push({ ref: item.ref, sc: item.sc, why: item.why || '' });
         }
         if (!state.mustFix.length) state.mustFix = [{ ref: state.item, sc: state.sc }];
         state.steps.push('评估：从最新裁决取出必修项；人工手测不修');
@@ -1246,6 +1545,8 @@ export async function runPrbotCorrection({
             preflight,
             hostConfig: settings,
             env,
+            remoteBranch,
+            now,
           });
           if (work && typeof work.then === 'function') work = await work;
         } catch (error) {
@@ -1256,6 +1557,8 @@ export async function runPrbotCorrection({
         }
         state.worktree = work.worktree;
         state.mirror = work.mirror;
+        // 远端修正分支的 head（推送租约）：工作树接着它建 / 快进到它；远端没有这条分支就是空串。
+        if (typeof work.remoteHead === 'string') state.remoteHead = work.remoteHead;
         if (state.mergeMain) {
           // 解决冲突：宿主已把最新 main 取进镜像，再打成 bundle 复制进全新的轮次目录；
           // 导进工作树这一步在沙箱里跑（工作树的 .git 是 pi 写过的），沙箱看不见镜像本身。
@@ -1327,12 +1630,21 @@ export async function runPrbotCorrection({
         }
         if (!result?.ok) {
           state.steps.push(`修复：第 ${state.piIterations} 次 pi 没有正常结束`);
-          if ((state.piIterations || 0) >= MAX_PI_ITERATIONS) state.stage = 'stop';
+          if ((state.piIterations || 0) >= MAX_PI_ITERATIONS) {
+            state.failureReason = 'limit-pi-iterations';
+            state.stage = 'stop';
+          }
           continue;
         }
         const notes = readNotes(roundDir, result.stdout);
         if (notes.disputes.length) {
-          state.disputes.push(...notes.disputes);
+          // 单行写进轮次评论：带上验收方（裁决里的原因）和修正方（pi 的理由）。
+          state.disputes.push(
+            ...notes.disputes.map((item) => ({
+              ...item,
+              acceptance: state.mustFix.find((entry) => entry.ref === item.ref && entry.sc === item.sc)?.why || '',
+            })),
+          );
           const disputed = new Set(notes.disputes.map((item) => `${item.ref} SC${item.sc}`));
           state.mustFix = state.mustFix.filter((item) => !disputed.has(`${item.ref} SC${item.sc}`));
           state.steps.push('评估：有争议的条目不修，写进轮次评论');
@@ -1345,20 +1657,20 @@ export async function runPrbotCorrection({
       }
 
       if (state.stage === 'preflight') {
-        const config = repoConfig(settings, state.repo);
-        const commands = config.preflight || [];
+        const commands = preflightCommands(repoConfig(settings, state.repo));
+        if (commands === null) {
+          // 配置写错了：fail-closed，报一次需人工处理，不是每拍崩。
+          state.failureReason = 'preflight-config-invalid';
+          state.stage = 'stop';
+          continue;
+        }
         if (!commands.length) {
           state.preflightNote = '没有配置预检，跳过';
           state.stage = 'draft';
           continue;
         }
         const roundDir = path.join(paths.roundRunDir, 'prbot', `${stateKey(issue)}-r${state.round}-preflight`);
-        const testLock = config.testLock ? paths.testLock : null;
-        if (testLock && !tryAcquireLock(testLock, { now })) {
-          state.stage = 'preflight';
-          await sleep(30 * 1000);
-          continue;
-        }
+        // Mivo 测试锁整轮都拿着（开跑时拿的），这里不再单独拿。
         let result;
         try {
           result = await preflight({
@@ -1371,8 +1683,11 @@ export async function runPrbotCorrection({
             env,
             run,
           });
-        } finally {
-          if (testLock) releaseLock(testLock);
+        } catch (error) {
+          state.stopNote = redact(String(error?.message || error), acceptanceProfile);
+          state.failureReason = 'preflight-error';
+          state.stage = 'stop';
+          continue;
         }
         if (result?.unavailable) {
           appendAlert(paths, {
@@ -1415,28 +1730,20 @@ export async function runPrbotCorrection({
             state.stage = 'stop';
             continue;
           }
-          const pushed = await gateWrite(
-            gate,
-            {
-              type: 'branch.push',
-              dedupeKey: `prbot:${issue}:r${state.round}:push:${bundle.headSha}`,
-              repo: state.pushRepo,
-              branch: state.branch,
-              bundlePath: bundle.bundlePath,
-            },
-            { state, sleep, now },
-          );
+          const pushed = await gateWrite(gate, pushAction(state, bundle, 'push'), { state, sleep, now });
           if (pushed.code === 4 && pushed.body?.reason === 'secret-found') {
+            delete state.gateCode;
+            delete state.gateReason;
             state.secretFiles = pushed.body.files || [];
             state.stage = 'stop';
             continue;
           }
           if (pushed.code !== 0) {
-            state.gateCode = pushed.code;
-            if (pushed.code === 1) state.interruptedExhausted = true;
+            markWriteFailure(state, pushed);
             state.stage = 'stop';
             continue;
           }
+          state.remoteHead = bundle.headSha;
           const [owner, name] = state.prRepo.split('/');
           // 这一修正轮已经开过 PR（再修 / 解决冲突后的重推）：直接沿用，不再查也不再开。
           let pr = state.pr?.number ? { number: state.pr.number, url: state.pr.url } : null;
@@ -1453,7 +1760,7 @@ export async function runPrbotCorrection({
               gate,
               {
                 type: 'pr.create',
-                dedupeKey: `prbot:${issue}:r${state.round}:pr:${bundle.headSha}`,
+                dedupeKey: roundKey(state, `pr:${bundle.headSha}`),
                 repo: state.prRepo,
                 head,
                 base: 'main',
@@ -1464,8 +1771,7 @@ export async function runPrbotCorrection({
               { state, sleep, now },
             );
             if (created.code !== 0) {
-              state.gateCode = created.code;
-              if (created.code === 1) state.interruptedExhausted = true;
+              markWriteFailure(state, created);
               state.stage = 'stop';
               continue;
             }
@@ -1478,7 +1784,7 @@ export async function runPrbotCorrection({
             url: pr.url,
             headSha: bundle.headSha,
             isDraft: true,
-            draftOpenedAt: state.pr?.draftOpenedAt || new Date(now()).toISOString(),
+            draftOpenedAt: state.pr?.draftOpenedAt || beijingIso(now()),
           };
 
           const handoffNew = repoConfig(settings, state.repo).handoffNew;
@@ -1562,22 +1868,13 @@ export async function runPrbotCorrection({
                   state.stage = 'stop';
                   continue;
                 }
-                const pushedAgain = await gateWrite(
-                  gate,
-                  {
-                    type: 'branch.push',
-                    dedupeKey: `prbot:${issue}:r${state.round}:handoff:${next.headSha}`,
-                    repo: state.pushRepo,
-                    branch: state.branch,
-                    bundlePath: next.bundlePath,
-                  },
-                  { state, sleep, now },
-                );
+                const pushedAgain = await gateWrite(gate, pushAction(state, next, 'handoff'), { state, sleep, now });
                 if (pushedAgain.code !== 0) {
-                  state.gateCode = pushedAgain.code;
+                  markWriteFailure(state, pushedAgain);
                   state.stage = 'stop';
                   continue;
                 }
+                state.remoteHead = next.headSha;
                 state.pr.headSha = next.headSha;
                 state.steps.push('Draft：补交接文件后重新打包推送');
               } finally {
@@ -1591,7 +1888,7 @@ export async function runPrbotCorrection({
             state.steps.push('再修：重新打包推到同一个 PR');
             state.status = '等 CI';
             await updateComment({ gate, state, status: '等 CI', sleep, now });
-            state.watchStartedAt = new Date(now()).toISOString();
+            state.watchStartedAt = beijingIso(now());
             state.watchHead = state.pr.headSha;
             state.stage = 'watch';
             continue;
@@ -1600,7 +1897,25 @@ export async function runPrbotCorrection({
           state.steps.push('Draft：经写闸推分支、开 Draft PR');
           state.status = 'Draft 已开';
           await updateComment({ gate, state, status: 'Draft 已开', sleep, now });
-          appendPrbotEvent(
+          // 看板（#46 SC6）：修正 PR 开出后，修正子 issue 和它的总 issue 的「验收」写「修正中」。写不上不拦修正轮。
+          for (const ref of [issue, state.root]) {
+            const target = parseRef(ref);
+            const board = await gateWrite(
+              gate,
+              {
+                type: 'project.field.set',
+                dedupeKey: roundKey(state, `board:${ref}`),
+                repo: target.repo,
+                issue: target.number,
+                ownerLogin: acceptanceProfile.ownerLogin,
+                projectNumber: acceptanceProfile.projectNumber,
+                fields: { 验收: CORRECTION_BOARD_VALUE },
+              },
+              { state: {}, sleep, now },
+            );
+            if (board.code !== 0) state.steps.push(`看板：${ref} 没写上「${CORRECTION_BOARD_VALUE}」（${board.body?.reason || board.code}）`);
+          }
+          emitEvent(
             paths,
             {
               type: 'draft-opened',
@@ -1613,11 +1928,11 @@ export async function runPrbotCorrection({
               prUrl: state.pr.url,
               headSha: state.pr.headSha,
             },
-            { now, profile },
+            eventOptions,
           );
           state.status = '等 CI';
           await updateComment({ gate, state, status: '等 CI', sleep, now });
-          state.watchStartedAt = new Date(now()).toISOString();
+          state.watchStartedAt = beijingIso(now());
           state.watchHead = state.pr.headSha;
           state.stage = 'watch';
           continue;
@@ -1649,12 +1964,13 @@ export async function runPrbotCorrection({
         if (typeof statusProvider === 'function') status = await statusProvider({ state, gate, now });
         else status = (await gateRead(gate, PR_STATUS_QUERY, { owner: state.prRepo.split('/')[0], name: state.prRepo.split('/')[1], number: state.pr.number })).repository?.pullRequest;
         if (!status) {
+          state.failureReason = 'pr-missing';
           state.stage = 'stop';
           continue;
         }
         if (status.headRefOid && status.headRefOid !== state.pr?.headSha) {
           state.pr = { ...state.pr, headSha: status.headRefOid };
-          state.watchStartedAt = new Date(now()).toISOString();
+          state.watchStartedAt = beijingIso(now());
         }
         let mainChecks = null;
         if (typeof mainChecksProvider === 'function') {
@@ -1674,7 +1990,7 @@ export async function runPrbotCorrection({
             gate,
             {
               type: 'ci.rerun',
-              dedupeKey: `prbot:${issue}:r${state.round}:rerun:${decision.fingerprint}`,
+              dedupeKey: roundKey(state, `rerun:${decision.fingerprint}`),
               repo: state.prRepo,
               pr: state.pr.number,
               runId: decision.runId,
@@ -1683,7 +1999,7 @@ export async function runPrbotCorrection({
             { state, sleep, now },
           );
           if (rerun.code !== 0) {
-            state.gateCode = rerun.code;
+            markWriteFailure(state, rerun);
             state.stage = 'stop';
           } else {
             state.steps.push('盯 CI：第一次失败先重跑一次失败 job');
@@ -1697,7 +2013,7 @@ export async function runPrbotCorrection({
             gate,
             {
               type: 'pr.update-branch',
-              dedupeKey: `prbot:${issue}:r${state.round}:update:${state.pr.headSha}:${state.conflict}`,
+              dedupeKey: roundKey(state, `update:${state.pr.headSha}:${state.conflict}`),
               repo: state.prRepo,
               pr: state.pr.number,
               expectedHeadSha: state.pr.headSha,
@@ -1706,7 +2022,7 @@ export async function runPrbotCorrection({
             { state, sleep, now },
           );
           if (updated.code !== 0) {
-            state.gateCode = updated.code;
+            markWriteFailure(state, updated);
             state.stage = 'stop';
           } else {
             state.steps.push(`盯 CI：落后 main，更新分支（第 ${state.conflict} 次）`);
@@ -1746,11 +2062,18 @@ export async function runPrbotCorrection({
       }
 
       if (state.stage === 'ready') {
+        // 交接方式没在 host.json 显式配置：不转 Ready（写一次需人工处理）。
+        state.handoff = handoffFor(settings, state.repo);
+        if (!state.handoff) {
+          state.failureReason = 'handoff-unconfigured';
+          state.stage = 'stop';
+          continue;
+        }
         const ready = await gateWrite(
           gate,
           {
             type: 'pr.ready',
-            dedupeKey: `prbot:${issue}:r${state.round}:ready:${state.pr.headSha}`,
+            dedupeKey: roundKey(state, `ready:${state.pr.headSha}`),
             repo: state.prRepo,
             pr: state.pr.number,
             headSha: state.pr.headSha,
@@ -1763,17 +2086,16 @@ export async function runPrbotCorrection({
           continue;
         }
         if (ready.code !== 0) {
-          state.gateCode = ready.code;
+          markWriteFailure(state, ready);
           state.stage = 'stop';
           continue;
         }
         state.ready = true;
-        state.readyAt = new Date(now()).toISOString();
-        state.handoff = handoffFor(settings, state.repo);
+        state.readyAt = beijingIso(now());
         state.steps.push('Ready：检查全绿，转 Ready');
         state.status = '已 Ready';
         await updateComment({ gate, state, status: '已 Ready', sleep, now });
-        appendPrbotEvent(
+        emitEvent(
           paths,
           {
             type: 'ready',
@@ -1789,23 +2111,31 @@ export async function runPrbotCorrection({
             diff: state.diff || { files: 0, additions: 0, deletions: 0 },
             handoff: state.handoff,
           },
-          { now, profile },
+          eventOptions,
         );
         if (state.handoff === 'watcher') writeReadyState(paths, state);
         saveState(paths, state);
         return 0;
       }
     }
+    } catch (error) {
+      // 不让一个异常把进程每拍弄崩：总开关关着就安静停；别的报一次需人工处理（同一原因不重复），下一拍再试。
+      if (error?.reason === 'gate-disabled') return 3;
+      state.lastError = redact(String(error?.message || error), acceptanceProfile);
+      notifyStop(state, 'needs-human', 'internal-error', { detail: state.lastError });
+      return 1;
+    }
     return 1;
   } finally {
     if (state?.issue) {
       try {
-        state.updatedAt = new Date(now()).toISOString();
+        state.updatedAt = beijingIso(now());
         saveState(paths, state);
       } catch {
         // 状态写不下去不影响放锁。
       }
     }
+    if (needTestLock) releaseLock(paths.testLock);
     releaseLock(slot.file);
     releaseLock(lockFile);
   }
@@ -1826,7 +2156,12 @@ async function main(argv) {
     process.exitCode = 1;
     return;
   }
-  process.exitCode = await runPrbotCorrection({ home, issue, env: process.env });
+  try {
+    process.exitCode = await runPrbotCorrection({ home, issue, env: process.env });
+  } catch (error) {
+    process.stderr.write(`修正轮出错：${redact(String(error?.message || error))}\n`);
+    process.exitCode = 1;
+  }
 }
 
 const invoked = process.argv[1] ? path.resolve(process.argv[1]) : '';

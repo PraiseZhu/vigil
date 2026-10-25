@@ -23,7 +23,7 @@ export const STATUS_INTERVAL_MS = 60000;
 /** 卡住后先 SIGTERM，等这么久还没退再 SIGKILL。 */
 export const KILL_GRACE_MS = 10000;
 /** mivo 的仓名（`/` 后面那段）以 mivo 开头就占测试锁。 */
-const TEST_LOCK_PATTERN = /^mivo/i;
+export const TEST_LOCK_PATTERN = /^mivo/i;
 const ISSUE_PATTERN = /^([^/\s]+)\/([^#\s]+)#(\d+)$/;
 
 function sink() {

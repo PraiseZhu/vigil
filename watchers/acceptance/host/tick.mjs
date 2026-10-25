@@ -10,7 +10,7 @@ import { createGithub } from '../bin/github.mjs';
 import { runRound as runRoundCommand } from '../bin/round.mjs';
 import { appendAlert, hostPaths, isAlive, readAlerts, readLockPayload } from './paths.mjs';
 import { run as procRun, spawnDetached } from './proc.mjs';
-import { MAX_ROUNDS, readHostConfig } from './round.mjs';
+import { MAX_ROUNDS, TEST_LOCK_PATTERN, readHostConfig } from './round.mjs';
 import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbot.mjs';
 import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
 
@@ -334,12 +334,28 @@ export async function runTick({
       try {
         const prbotProfile = loadAcceptanceProfile({ ...env, ACCEPTANCE_WATCHER_HOME: home });
         const prbotGithub = createGithub({ profile: { ...prbotProfile, writeCommand: undefined }, run });
-        const discover = discoverPrbot || ((options) => discoverCorrections({ ...options, github: prbotGithub, profile: prbotProfile }));
+        const discover =
+          discoverPrbot || ((options) => discoverCorrections({ ...options, github: prbotGithub, profile: prbotProfile, hostConfig: prbotSettings }));
         const found = await discover({ now, home });
+        // 修正轮和验收轮共用 2 个槽：先给这一拍该开始的验收轮留位（测试锁被占、起不来的 mivo 验收轮不算），剩下的才给修正轮。
+        const testLockHeld = (() => {
+          const held = readLockPayload(paths.testLock);
+          return Boolean(held && isAlive(Number(held.pid)));
+        })();
+        const pendingAcceptance = entries.filter((item) => {
+          if (!item || item.stale) return false;
+          const record = byIssue.get(item.issue);
+          if (record && isAlive(Number(record.pid))) return false;
+          const repoName = String(item.issue || '').split('#')[0].split('/')[1] || '';
+          return !(testLockHeld && TEST_LOCK_PATTERN.test(repoName));
+        }).length;
+        let prbotFree = Math.max(0, MAX_ROUNDS - liveSlotCount(paths) - pendingAcceptance);
         for (const entry of found || []) {
           const lockFile = path.join(paths.prbotLocksDir, `${entry.issue.replace(/[^\w.-]+/g, '__')}.lock`);
           const held = readLockPayload(lockFile);
           if (held && isAlive(Number(held.pid))) continue;
+          if (prbotFree <= 0) break;
+          prbotFree -= 1;
           const pid = startPrbot(entry.issue);
           heartbeat.lastTick.prbotStarted.push({ issue: entry.issue, pid: pid ?? null });
         }
