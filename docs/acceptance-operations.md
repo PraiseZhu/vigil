@@ -34,6 +34,20 @@
 
 未知键一律忽略；写 `"sandbox": false` 或 `"noSandbox": true` **没有任何作用**——沙箱只有一条路。
 
+部署时踩过的两点：
+
+- 沙箱里的 `HOME` 是每轮新建的空目录，pi 读不到宿主上的模型配置；配置目录又是只读的，pi 起来要
+  在里面建锁文件会直接报 `EROFS`。做法是把**不含密钥**的模型配置（只引用 `$LLM_PROXY_API_KEY`
+  这类环境变量）另放一份，`piCommand` 先拷进沙箱的 `HOME` 再起 pi：
+
+  ```json
+  "piCommand": ["sh", "-c", "mkdir -p \"$HOME/.pi/agent\" && cp <配置副本目录>/models.json <配置副本目录>/settings.json \"$HOME/.pi/agent/\" && exec pi \"$@\"", "pi", "--model", "<model id>", "--thinking", "max", "--no-session"]
+  ```
+
+- 内置遮罩只认常见的凭证目录（`.ssh`、`.config/gh` 等）。盒子上别的工具自己的密钥目录、浏览器
+  配置、其它 agent 的数据目录，要逐个写进 `credentialDirs`；写完用 `doctor` 的「bwrap 遮罩」和
+  在沙箱里 `ls` 一遍确认读不到。
+
 ### 模型
 
 - 验收轮：pi 用 DeepSeek V4.1 Flash，推理 max（写进 `piCommand`）。
