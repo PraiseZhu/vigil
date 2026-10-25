@@ -151,17 +151,38 @@ function versionLine(body) {
   return line ? line.slice('正文版本：'.length).trim() : null;
 }
 
-/** 新正文和旧正文逐行比：只有复选框里的空格 / x 可以不同，行数和其它字一个都不能变。 */
+// close 给人工手测项行尾补的标记（与 bin/close.mjs 的 MANUAL_SUFFIX 一致）。
+const MANUAL_SUFFIX = ' 人工手测';
+// 验收项行：`- [ ] SCk …`、`- SCk …`、`- [x] **SCk** …`（与 bin/close.mjs 的 SC_LINE 同形）。
+const SC_ITEM_LINE = /^\s*[-*]\s*(?:\[\s*[xX ]\s*\])?\s*(?:\*\*)?SC\d+\b/;
+
+function sameExceptCheckbox(before, after) {
+  if (before === after) return true;
+  const a = CHECKBOX_LINE.exec(before);
+  const b = CHECKBOX_LINE.exec(after);
+  return Boolean(a && b && a[1] === b[1] && a[2] === b[2]);
+}
+
+/** 一行允许的改动：勾选 / 取消；或在验收项行尾补一次「 人工手测」（可同时勾选）。 */
+function allowedLineEdit(before, after) {
+  if (sameExceptCheckbox(before, after)) return true;
+  if (!SC_ITEM_LINE.test(before) || !after.endsWith(MANUAL_SUFFIX)) return false;
+  const trimmed = before.trimEnd();
+  if (trimmed.endsWith(MANUAL_SUFFIX.trim())) return false;
+  return sameExceptCheckbox(trimmed, after.slice(0, -MANUAL_SUFFIX.length));
+}
+
+/**
+ * 新正文和旧正文逐行比：只有复选框里的空格 / x 可以不同，验收项行尾可补一次「 人工手测」；
+ * 行数和其它字一个都不能变。
+ */
 function onlyCheckboxToggles(before, after) {
   if (typeof after !== 'string') return false;
   const oldLines = String(before ?? '').split('\n');
   const newLines = after.split('\n');
   if (oldLines.length !== newLines.length) return false;
   for (let i = 0; i < oldLines.length; i += 1) {
-    if (oldLines[i] === newLines[i]) continue;
-    const a = CHECKBOX_LINE.exec(oldLines[i]);
-    const b = CHECKBOX_LINE.exec(newLines[i]);
-    if (!a || !b || a[1] !== b[1] || a[2] !== b[2]) return false;
+    if (!allowedLineEdit(oldLines[i], newLines[i])) return false;
   }
   return true;
 }
@@ -450,11 +471,11 @@ export function createGate({
           return reject('not-in-tree', `${target} 不在本轮任务树`);
         }
         if (action.type === 'issue.edit') {
-          // 只许勾选或取消验收项（- [ ] ↔ - [x]），不许改正文的任何其它字。
+          // 只许勾选或取消验收项（- [ ] ↔ - [x]）、给验收项行尾补「 人工手测」，不许改正文的任何其它字。
           const current = target === binding.root ? state : await readIssueState(target);
           if (!current) return reject('not-in-tree', `找不到 ${target}`);
           if (!onlyCheckboxToggles(current.issue.body, action.body)) {
-            return reject('edit-not-allowed', 'issue.edit 只能勾选或取消验收项，不能改正文其它内容');
+            return reject('edit-not-allowed', 'issue.edit 只能勾选或取消验收项、给验收项补「人工手测」，不能改正文其它内容');
           }
         }
         return null;
