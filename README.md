@@ -3,17 +3,21 @@
 Vigil is a small collection of PR-watching tools: pollers that notice new review feedback, CI
 failures, or merge conflicts on your own pull requests and turn them into structured repair
 tasks for a human or an agent to act on. They never merge, auto-merge, delete branches, or act
-as a maintainer's approval on your behalf. See [`watchers/mivo`](watchers/mivo/README.md) and
-[`watchers/cindy`](watchers/cindy/README.md) for the two included variants.
+as a maintainer's approval on your behalf. See [`watchers/mivo`](watchers/mivo/README.md),
+[`watchers/cindy`](watchers/cindy/README.md) and [`watchers/acceptance`](watchers/acceptance/README.md)
+for the three included variants.
 
 ---
 
-Vigil 收录两个独立的 PR 自动化盯梢工具,从内部私有仓库里剥离出来、sanitize(脱敏)后发布:
+Vigil 收录三个独立的自动化工具,从内部私有仓库里剥离出来、sanitize(脱敏)后发布:
 
 - **[`watchers/mivo`](watchers/mivo/README.md)** —— 同仓分支场景:你对目标仓库有写权限,
   PR 的 head 和 base 在同一个仓库。
 - **[`watchers/cindy`](watchers/cindy/README.md)** —— cross-repo fork 场景:PR 的 head 在
   你自己的 fork 上,base 是一个你没有写权限的上游仓库(默认目标是公开仓库 `makecindy/cindy`)。
+- **[`watchers/acceptance`](watchers/acceptance/README.md)** —— 验收机:在 GitHub 上用轮次评论认领
+  任务、逐条验收、出裁决;宿主循环、写闸和 bwrap 沙箱在 `watchers/acceptance/host/`,运维见
+  [`docs/acceptance-operations.md`](docs/acceptance-operations.md)。
 
 两者负责**发现**(轮询 PR、判断是否有新的待处理反馈)和**修复动作的具体执行**(clone/
 worktree/push/清理),但它们**不是可以配进任意 cron 的无状态脚本**——discover 模式是专门
@@ -36,12 +40,13 @@ worktree/push/清理),但它们**不是可以配进任意 cron 的无状态脚�
 
 ```sh
 npm install   # 本项目无第三方依赖,这一步只是确认 Node 版本
-npm test      # 跑全部测试(mivo + cindy 两套 Node 测试 + 两份 Python 测试)
+npm test      # 跑全部测试(mivo + cindy + acceptance 三套 Node 测试 + 两份 Python 测试)
 ```
 
 每个 watcher 的具体配置(`profile.mjs` 的 fail-closed 机制)、CLI 用法、测试方式见各自的
 README:[`watchers/mivo/README.md`](watchers/mivo/README.md)、
-[`watchers/cindy/README.md`](watchers/cindy/README.md)。
+[`watchers/cindy/README.md`](watchers/cindy/README.md)、
+[`watchers/acceptance/README.md`](watchers/acceptance/README.md)。
 
 ## 配置
 

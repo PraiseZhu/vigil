@@ -6,7 +6,7 @@ import path from 'node:path';
 
 const FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(验收中|通过|要修|中断)/;
 const LOCK_STALE_MS = 10 * 60 * 1000;
-const ISSUE_COMMENTS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
+export const ISSUE_COMMENTS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       body

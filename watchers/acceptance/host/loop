@@ -1,0 +1,13 @@
+#!/bin/sh
+# 常驻调度循环（#47 SC12）：单实例，每拍跑一次 tick.mjs。
+# 第二个实例拿不到 flock 就退出 0，不跑 tick。
+# ACCEPTANCE_TICK_SECONDS 只给测试用（正式部署用默认 60）。
+set -u
+HOME_DIR="${ACCEPTANCE_WATCHER_HOME:?需要 ACCEPTANCE_WATCHER_HOME}"
+mkdir -p "$HOME_DIR/state/host"
+exec 9>"$HOME_DIR/state/host/loop.lock"
+flock -n 9 || { echo "loop 已在跑" >&2; exit 0; }
+while :; do
+  node "$(dirname "$0")/tick.mjs"
+  sleep "${ACCEPTANCE_TICK_SECONDS:-60}"
+done
