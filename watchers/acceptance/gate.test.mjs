@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion, createRounds } from './bin/rounds.mjs';
+import { applyTicks } from './bin/close.mjs';
 import { ROOT_QUERY, SEARCH_QUERY } from './bin/collect.mjs';
 import { localEnv, spawnRun } from './bin/localgit.mjs';
 import { DEFAULT_HEAD_QUERY, PR_READY_QUERY, createGate, startGateServer } from './host/write-gate.mjs';
@@ -1177,6 +1178,58 @@ test('SC9 serve 模式不许另发轮次评论；issue.edit 只能勾选验收�
   const ok = await gate.handle({ type: 'issue.edit', repo: REPO, issue: 2, body: toggled, dedupeKey: 'edit-toggle' });
   assert.equal(ok.code, 0, JSON.stringify(ok));
   assert.equal(world.get(`${REPO}#2`).body, toggled);
+});
+
+test('SC9 issue.edit 放行 close 的人工手测行尾标记，别的追加照拒', async () => {
+  const { home, profile } = setupEnvironment();
+  const world = defaultTree();
+  const gate = createGate({ home, profile, github: gateGithub(world), run: procRun, binding: bindingFor(world), which: async () => false });
+  const childBody = world.get(`${REPO}#2`).body;
+  const lines = childBody.split('\n');
+  const idx = lines.findIndex((line) => /^\s*[-*]\s+\[ \]\s*SC\d+/.test(line));
+  assert.ok(idx >= 0, '夹具要有未勾的验收项');
+  const withLine = (line) => lines.map((entry, i) => (i === idx ? line : entry)).join('\n');
+  const original = lines[idx];
+
+  for (const [label, body] of [
+    ['补两次', withLine(`${original} 人工手测 人工手测`)],
+    ['后缀换字', withLine(`${original} 人工手测过`)],
+    ['后缀前改字', withLine(`${original} 改过 人工手测`)],
+    ['非验收项行补后缀', lines.map((entry, i) => (i !== idx && entry.trim() && !/SC\d/.test(entry) ? `${entry} 人工手测` : entry)).join('\n')],
+  ]) {
+    if (body === childBody) continue;
+    const outcome = await gate.handle({ type: 'issue.edit', repo: REPO, issue: 2, body, dedupeKey: `manual-${label}` });
+    assert.equal(outcome.code, 4, label);
+    assert.equal(outcome.body.reason, 'edit-not-allowed', label);
+  }
+  assert.equal(world.get(`${REPO}#2`).body, childBody, '被拒的编辑没写进去');
+
+  // 和 bin/close.mjs 的 applyTicks 同形：只补后缀；或勾选同时补后缀。
+  const marked = withLine(`${original.trimEnd()} 人工手测`);
+  const ok = await gate.handle({ type: 'issue.edit', repo: REPO, issue: 2, body: marked, dedupeKey: 'manual-mark' });
+  assert.equal(ok.code, 0, JSON.stringify(ok));
+  assert.equal(world.get(`${REPO}#2`).body, marked);
+
+  const ticked = withLine(`${original.trimEnd().replace('[ ]', '[x]')} 人工手测`);
+  const both = await gate.handle({ type: 'issue.edit', repo: REPO, issue: 2, body: ticked, dedupeKey: 'manual-tick' });
+  assert.equal(both.code, 0, JSON.stringify(both));
+
+  // 已有标记的行不能再补。
+  const again = await gate.handle({ type: 'issue.edit', repo: REPO, issue: 2, body: withLine(`${original.trimEnd().replace('[ ]', '[x]')} 人工手测 人工手测`), dedupeKey: 'manual-again' });
+  assert.equal(again.code, 4, JSON.stringify(again));
+});
+
+test('SC9 close 的 applyTicks 产物过得了写闸的正文检查', async () => {
+  const { home, profile } = setupEnvironment();
+  const world = defaultTree();
+  const gate = createGate({ home, profile, github: gateGithub(world), run: procRun, binding: bindingFor(world), which: async () => false });
+  const childBody = world.get(`${REPO}#2`).body;
+  const scs = [...childBody.matchAll(/^\s*[-*]\s*\[ \]\s*SC(\d+)/gm)].map((m) => Number(m[1]));
+  assert.ok(scs.length >= 1, '夹具要有未勾的验收项');
+  const { body, changed } = applyTicks(childBody, { verified: scs, manual: [scs.at(-1)] });
+  assert.ok(changed);
+  const outcome = await gate.handle({ type: 'issue.edit', repo: REPO, issue: 2, body, dedupeKey: 'apply-ticks' });
+  assert.equal(outcome.code, 0, JSON.stringify(outcome));
 });
 
 test('SC9 账本查重在仓范围之后：名单外的仓拿账本里已有的 key 也照样 4', async () => {
