@@ -90,6 +90,8 @@
 `branch.push`、`pr.create`、`pr.ready`，以及 `read.graphql`、`probe`。
 `pr.update-branch`、`ci.rerun` 现在返回 4（`reason=not-implemented`，归 #60）；
 不加 `pr.merge`：写闸对白名单外的类型一律返回 4（`reason=not-allowed`），合并先由我在 GitHub 里点。
+`pr.create` 必须带 `draft: true`（否则 4 `not-allowed`），转 Ready 只能走 `pr.ready` 的 CI 复核；head 在非 fork 档只写分支名，
+fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`。
 
 按档限制：
 

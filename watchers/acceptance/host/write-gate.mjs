@@ -383,8 +383,20 @@ export function createGate({
         return null;
       }
       case 'pr.create': {
+        // 修正 PR 一律先开 Draft：转 Ready 只能走 pr.ready 的 CI 全绿复核。
+        if (action.draft !== true) return reject('not-allowed', 'pr.create 必须带 draft: true');
         const head = String(action.head || '');
-        const branch = head.includes(':') ? head.slice(head.indexOf(':') + 1) : head;
+        const colon = head.indexOf(':');
+        const headOwner = colon >= 0 ? head.slice(0, colon) : null;
+        const branch = colon >= 0 ? head.slice(colon + 1) : head;
+        // head 的属主：非 fork 档不许带前缀（分支就在目标仓）；fork 档必须正好是 ownerLogin 的 fork。
+        if (scopeOf(action.repo)?.fork) {
+          if (headOwner === null || headOwner.toLowerCase() !== String(profile.ownerLogin || '').toLowerCase()) {
+            return reject('not-in-tree', `fork 档 PR 的 head 必须是 ${profile.ownerLogin}:<分支>`);
+          }
+        } else if (headOwner !== null) {
+          return reject('not-in-tree', 'PR 的 head 不能带别的仓的前缀');
+        }
         const match = BRANCH_PATTERN.exec(branch);
         if (!match || Number(match[1]) !== number) {
           return reject('not-in-tree', `PR 的 head 分支必须是 acceptance/${number}-<出处>-sc<k>`);

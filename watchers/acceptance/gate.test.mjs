@@ -1170,3 +1170,72 @@ test('SC9 pr.ready 不认从 fork 来的 PR（isCrossRepository）：分支名�
   }
   assert.match(STATUS_QUERY, /isCrossRepository/);
 });
+
+test('SC9 pr.create：必须 draft: true；非 fork 档 head 不许带前缀；fork 档 head 必须是 ownerLogin:分支', async () => {
+  const { home, profile } = setupEnvironment();
+  const prBody = `任务 issue：${ROOT_REF}\n\n${PR_MARKER}`;
+  const cases = [
+    ['draft 缺省', { repo: REPO, head: 'acceptance/1-2-sc1' }, 'not-allowed'],
+    ['draft:false', { repo: REPO, head: 'acceptance/1-2-sc1', draft: false }, 'not-allowed'],
+    ['draft:"true"', { repo: REPO, head: 'acceptance/1-2-sc1', draft: 'true' }, 'not-allowed'],
+    ['非 fork 带别人前缀', { repo: REPO, head: 'stranger:acceptance/1-2-sc1', draft: true }, 'not-in-tree'],
+    ['非 fork 带自己前缀', { repo: REPO, head: `${profile.ownerLogin}:acceptance/1-2-sc1`, draft: true }, 'not-in-tree'],
+    ['fork 没前缀', { repo: 'makecindy/cindy', head: 'acceptance/1-2-sc1', draft: true }, 'not-in-tree'],
+    ['fork 别人前缀', { repo: 'makecindy/cindy', head: 'stranger:acceptance/1-2-sc1', draft: true }, 'not-in-tree'],
+    ['fork 空前缀', { repo: 'makecindy/cindy', head: ':acceptance/1-2-sc1', draft: true }, 'not-in-tree'],
+    ['非 fork 对的', { repo: REPO, head: 'acceptance/1-2-sc1', draft: true }, null],
+    ['fork 对的', { repo: 'makecindy/cindy', head: `${profile.ownerLogin}:acceptance/1-2-sc1`, draft: true }, null],
+  ];
+  for (const [label, fields, reason] of cases) {
+    const world = defaultTree();
+    const writes = [];
+    const github = gateGithub(world, {
+      onWrite: (action) => {
+        writes.push(action);
+        return action.type === 'pr.create' ? { pr: 12, url: 'https://example.invalid/pull/12' } : undefined;
+      },
+    });
+    const gate = createGate({ home, profile, github, run: procRun, binding: bindingFor(world), which: async () => false });
+    const outcome = await gate.handle({ type: 'pr.create', base: 'main', title: 't', body: prBody, dedupeKey: `create-${label}`, ...fields });
+    if (reason) {
+      assert.equal(outcome.code, 4, `${label}: ${JSON.stringify(outcome)}`);
+      assert.equal(outcome.body.reason, reason, label);
+      assert.equal(writes.length, 0, `${label}：拒了就什么都没执行`);
+    } else {
+      assert.equal(outcome.code, 0, `${label}: ${JSON.stringify(outcome)}`);
+      assert.equal(writes.length, 1, label);
+      assert.equal(writes[0].draft, true, label);
+    }
+  }
+});
+
+test('SC9 branch.push 扫描本身出错（rev-list / cat-file 失败）：fail closed，scan-failed，不推', async () => {
+  const { home, profile } = setupEnvironment();
+  const repo = await buildBypassRepo('header');
+  for (const broken of ['rev-list', 'cat-file']) {
+    const world = defaultTree();
+    let pushed = false;
+    const github = gateGithub(world, {
+      defaultHead: repo.mainSha,
+      onWrite: async (action) => {
+        if (action.type === 'branch.push') pushed = true;
+        return { pushed: true };
+      },
+    });
+    const run = (cmd, args, options) =>
+      cmd === 'git' && args.includes(broken)
+        ? Promise.resolve({ code: 128, stdout: '', stderr: `fatal: ${broken} broke` })
+        : procRun(cmd, args, options);
+    const gate = createGate({ home, profile, github, run, binding: bindingFor(world), which: async () => false });
+    const outcome = await gate.handle({
+      type: 'branch.push',
+      repo: REPO,
+      branch: repo.branch,
+      bundlePath: repo.bundlePath,
+      dedupeKey: `scan-broken-${broken}`,
+    });
+    assert.notEqual(outcome.code, 0, `${broken}: ${JSON.stringify(outcome)}`);
+    assert.equal(outcome.body.reason, 'scan-failed', broken);
+    assert.equal(pushed, false, `${broken}：扫描出错不推`);
+  }
+});
