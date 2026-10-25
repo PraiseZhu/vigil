@@ -73,6 +73,7 @@ export const PR_READY_QUERY = `query ($owner: String!, $name: String!, $number: 
               nodes {
                 status
                 conclusion
+                workflowRun { databaseId }
                 checkRuns(first: 100) {
                   nodes {
                     name
@@ -393,8 +394,8 @@ export function createGate({
     // 从 fork 来的 PR 一律不认：分支名、正文谁都能照抄，只有本仓里的分支才是验收机推的。
     if (pr.isCrossRepository !== false) {
       // 唯一例外：fork 模式的修正 PR，head 仓必须是配置里写死的 fork 仓（不认通配）。
-      const headRepo = String(pr.headRepository?.nameWithOwner || '');
-      if (pr.isCrossRepository !== true || !headRepo || !forkRepos.includes(headRepo)) {
+      const headRepo = String(pr.headRepository?.nameWithOwner || '').toLowerCase();
+      if (pr.isCrossRepository !== true || !headRepo || !forkRepos.some((repo) => String(repo).toLowerCase() === headRepo)) {
         return reject('not-in-tree', 'PR 来自 fork（跨仓），不是验收机推的分支');
       }
     }
@@ -426,13 +427,24 @@ export function createGate({
   function flattenChecks(pr) {
     const commit = (pr?.commits?.nodes || []).at(-1)?.commit || {};
     const runs = [];
+    const bad = [];
+    let suitesWithoutRuns = 0;
     for (const suite of commit.checkSuites?.nodes || []) {
-      for (const run of suite?.checkRuns?.nodes || []) runs.push(run);
+      const suiteRuns = suite?.checkRuns?.nodes || [];
+      for (const run of suiteRuns) runs.push(run);
+      // Actions 的 workflow 还在排队（或起不来）时 check suite 已经有了、check run 还一条没有：
+      // 只看 check run 会把它漏掉，当成「全绿」转 Ready。带 workflowRun 的 suite 没有 run 时按 suite 自己的状态算。
+      // 不带 workflowRun 的 suite（别的 App 自动建、可能永远不出 run）不算，免得永远等不到全绿。
+      if (suiteRuns.length === 0 && suite?.workflowRun?.databaseId != null) {
+        suitesWithoutRuns += 1;
+        if (String(suite.status) !== 'COMPLETED' || !GREEN_CHECKS.has(String(suite.conclusion))) {
+          bad.push(`workflow ${suite.workflowRun.databaseId}=${suite.status || '?'}/${suite.conclusion || '?'}`);
+        }
+      }
     }
     const contexts = (commit.statusCheckRollup?.contexts?.nodes || []).filter(
       (node) => node?.__typename === 'StatusContext' || node?.context,
     );
-    const bad = [];
     for (const run of runs) {
       if (String(run?.status) !== 'COMPLETED' || !GREEN_CHECKS.has(String(run?.conclusion))) {
         bad.push(`${run?.name || run?.databaseId || 'check'}=${run?.status || '?'}/${run?.conclusion || '?'}`);
@@ -443,7 +455,7 @@ export function createGate({
         bad.push(`${context?.context || 'status'}=${context?.state || '?'}`);
       }
     }
-    return { total: runs.length + contexts.length, green: bad.length === 0, bad, runs, contexts };
+    return { total: runs.length + contexts.length + suitesWithoutRuns, green: bad.length === 0, bad, runs, contexts };
   }
 
   // 修正轮绑定（#60）的检查在 prbot-gate-check.mjs：这里只接线，写闸核心流程不变。
@@ -546,6 +558,8 @@ export function createGate({
         if (!match || Number(match[1]) !== number) {
           return reject('not-in-tree', `分支名必须是 acceptance/${number}-<出处>-sc<k>`);
         }
+        // 强推（带租约）只给修正轮绑定、只限本轮修正分支（prbot-gate-check.mjs）；验收轮一律不许。
+        if (action.forceWithLease !== undefined || action.force !== undefined) return reject('not-allowed', '验收轮不许强推');
         return null;
       }
       case 'pr.create': {

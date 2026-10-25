@@ -9,6 +9,7 @@ import { bodyVersion } from './bin/rounds.mjs';
 import { PR_HEAD_QUERY, PR_READY_QUERY, PR_STATUS_QUERY, createGate } from './host/write-gate.mjs';
 import { hostPaths } from './host/paths.mjs';
 import { defaultTree } from './session.fixture.mjs';
+import { spawnRun } from './bin/localgit.mjs';
 import {
   HANDOFF_REPO,
   OTHER_REPO,
@@ -49,7 +50,10 @@ function setup({
   const marker = markerFor(rootRepo);
   const correction = world.addIssue({ repo: correctionRepo, number: correctionNumber, title: '修正', body: marker });
   world.addChild(`${rootRepo}#1`, correction.ref);
-  return { home, profile, paths, world, correction, marker, rootRef: `${rootRepo}#1`, correctionRef: correction.ref };
+  // 修正 PR 正文（PR 开在 rootRepo）：修正子 issue 同仓写 Closes #n，跨仓写 Closes owner/repo#n，再加修正标记。
+  const closes = correctionRepo === rootRepo ? `Closes #${correction.number}` : `Closes ${correction.ref}`;
+  const prBody = [`任务 issue：${rootRepo}#1`, closes, '', marker].join('\n');
+  return { home, profile, paths, world, correction, marker, prBody, rootRef: `${rootRepo}#1`, correctionRef: correction.ref };
 }
 
 /** 标准假 PR：本仓、main、非跨仓、队首检查全绿。 */
@@ -481,13 +485,14 @@ test('守卫 10 not-allowed：pr.create 正文必须带同一个修正标记（r
     ['sc 不同', `[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#2 SC4 · 第 1 轮`],
     ['round 不同', `[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#2 SC3 · 第 2 轮`],
   ]) {
-    const outcome = await create(body, `pr-marker-${label}`);
+    // 每条都带对的 Closes 行：拒绝只能来自修正标记。
+    const outcome = await create(`Closes #9\n${body}`, `pr-marker-${label}`);
     assert.equal(outcome.code, 4, label);
     assert.equal(outcome.body.reason, 'not-allowed', label);
   }
 
   // 对照：只把正文换成同一个修正标记。
-  const ok = await create(s.marker, 'pr-marker-right');
+  const ok = await create(s.prBody, 'pr-marker-right');
   assert.equal(ok.code, 0, JSON.stringify(ok));
 });
 
@@ -510,7 +515,7 @@ test('守卫 11 not-allowed：pr.create 不能开在别的仓', async () => {
       base: 'main',
       draft: true,
       title: '修正',
-      body: s.marker,
+      body: s.prBody,
       dedupeKey,
     });
 
@@ -611,7 +616,7 @@ test('守卫 14 not-allowed：pr.create 的 base 只能是 main；已开 PR 的 
   const s = setup();
   const gate = gateFor(s, claimedRound(s), { onWrite: (action) => (action.type.startsWith('comment.') ? undefined : { pr: 12, url: `https://example.invalid/${REPO}/pull/12` }) });
   const create = (base, key) =>
-    gate.handle({ type: 'pr.create', repo: REPO, head: BRANCH, ...(base === undefined ? {} : { base }), draft: true, title: '修正', body: s.marker, dedupeKey: key });
+    gate.handle({ type: 'pr.create', repo: REPO, head: BRANCH, ...(base === undefined ? {} : { base }), draft: true, title: '修正', body: s.prBody, dedupeKey: key });
   for (const base of ['release', 'main2', '']) {
     const outcome = await create(base, `base-${base || 'empty'}`);
     assert.equal(outcome.code, 4, base);
@@ -635,4 +640,136 @@ test('守卫 14 not-allowed：pr.create 的 base 只能是 main；已开 PR 的 
     const ok = await gateFor(good, claimedRound(good), { pr: prFor(REPO, { body: good.marker }), onWrite }).handle({ ...action, dedupeKey: `pr-base-ok-${action.type}` });
     assert.equal(ok.code, 0, `${action.type}: ${JSON.stringify(ok)}`);
   }
+});
+
+test('守卫 15 not-allowed：pr.create 正文必须带「Closes <修正子 issue>」（同仓 #n，跨仓 owner/repo#n）', async () => {
+  const s = setup();
+  const gate = gateFor(s, claimedRound(s), { onWrite: (action) => (action.type.startsWith('comment.') ? undefined : { pr: 12, url: `https://example.invalid/${REPO}/pull/12` }) });
+  const create = (body, key) => gate.handle({ type: 'pr.create', repo: REPO, head: BRANCH, base: 'main', draft: true, title: '修正', body, dedupeKey: key });
+  for (const [label, closes] of [
+    ['没有 Closes', ''],
+    ['关的是别的 issue', 'Closes #10'],
+    ['关的是总 issue', 'Closes #1'],
+    ['同仓却写了别的仓', `Closes ${OTHER_REPO}#9`],
+    ['写在句子里', `顺便 Closes #9 一下`],
+  ]) {
+    const outcome = await create([`任务 issue：${REPO}#1`, closes, s.marker].join('\n'), `closes-${label}`);
+    assert.equal(outcome.code, 4, label);
+    assert.equal(outcome.body.reason, 'not-allowed', label);
+    assert.match(outcome.body.detail, /Closes #9/, label);
+  }
+  // 对照：只补上正确的 Closes 行。
+  const ok = await create(s.prBody, 'closes-ok');
+  assert.equal(ok.code, 0, JSON.stringify(ok));
+
+  // 跨仓：修正子 issue 在 OTHER_REPO#21，PR 开在 REPO —— 要写 Closes owner/repo#n，写 #21 不认。
+  const cross = setup({ profile: { autoRepos: [...AUTO_REPOS, OTHER_REPO] }, correctionRepo: OTHER_REPO, correctionNumber: 21 });
+  const crossRound = addCorrectionRound(cross.world, cross.correctionRef, { round: 1, status: '修正中', createdAt: '2026-10-24T02:00:00.000Z' });
+  const crossGate = gateFor(cross, { kind: 'correction', issue: cross.correctionRef, round: 1, commentId: crossRound.databaseId }, {
+    onWrite: (action) => (action.type.startsWith('comment.') ? undefined : { pr: 12, url: `https://example.invalid/${REPO}/pull/12` }),
+  });
+  const crossCreate = (closes, key) =>
+    crossGate.handle({ type: 'pr.create', repo: REPO, head: BRANCH, base: 'main', draft: true, title: '修正', body: [closes, cross.marker].join('\n'), dedupeKey: key });
+  const short = await crossCreate('Closes #21', 'cross-short');
+  assert.equal(short.code, 4);
+  assert.equal(short.body.reason, 'not-allowed');
+  const full = await crossCreate(`Closes ${OTHER_REPO}#21`, 'cross-full');
+  assert.equal(full.code, 0, JSON.stringify(full));
+});
+
+test('守卫 16 not-allowed：branch.push 只认带租约的强推（只限本轮修正分支）；裸 force、乱写的租约、验收轮的强推都拒', async () => {
+  const s = setup();
+  // 真 git 打一个真 bundle：合法的动作要一路走到 github.write（扫密钥也真跑）。
+  const repoDir = path.join(tmpDir(), 'src');
+  const env = { PATH: process.env.PATH, HOME: tmpDir(), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+  const git = async (args) => {
+    const result = await spawnRun('git', args, { env });
+    assert.equal(result.code, 0, `git ${args.join(' ')}: ${result.stderr}`);
+  };
+  await git(['init', '-q', '-b', BRANCH, repoDir]);
+  fs.writeFileSync(path.join(repoDir, 'app.mjs'), 'export const x = 1;\n');
+  await git(['-C', repoDir, 'add', '-A']);
+  await git(['-C', repoDir, '-c', 'user.name=u', '-c', 'user.email=u@example.invalid', 'commit', '-q', '-m', 'fix']);
+  const bundle = path.join(tmpDir(), 'push.bundle');
+  await git(['-C', repoDir, 'bundle', 'create', bundle, `refs/heads/${BRANCH}`]);
+  const written = [];
+  const gate = gateFor(s, claimedRound(s), {
+    onWrite: (action) => {
+      if (action.type.startsWith('comment.')) return undefined;
+      written.push(action);
+      return { repo: action.repo, branch: action.branch };
+    },
+    run: (cmd, args, options = {}) => spawnRun(cmd, args, options),
+  });
+  const push = (extra, key) => gate.handle({ type: 'branch.push', repo: REPO, branch: BRANCH, bundlePath: bundle, dedupeKey: key, ...extra });
+  for (const [label, extra] of [
+    ['裸 force', { force: true }],
+    ['租约不是 SHA', { forceWithLease: 'main' }],
+    ['租约是数字', { forceWithLease: 1 }],
+  ]) {
+    const outcome = await push(extra, `lease-${label}`);
+    assert.equal(outcome.code, 4, label);
+    assert.equal(outcome.body.reason, 'not-allowed', label);
+  }
+  assert.equal(written.length, 0);
+  // 对照：合法的租约（上次已知 head / 空串 = 远端还没有这条分支）放行，租约原样交给 github.write。
+  for (const lease of [HEAD, '']) {
+    const outcome = await push({ forceWithLease: lease }, `lease-ok-${lease || 'empty'}`);
+    assert.equal(outcome.code, 0, JSON.stringify(outcome));
+  }
+  assert.deepEqual(written.map((action) => action.forceWithLease), [HEAD, '']);
+  // 别的分支带租约：分支检查先拒。
+  const other = await push({ branch: 'acceptance/1-2-sc4', forceWithLease: HEAD }, 'lease-other-branch');
+  assert.equal(other.body.reason, 'not-allowed');
+
+  // 验收轮绑定：强推一律拒。
+  const acceptanceSetup = setup({ roundStatus: '验收中' });
+  const latest = acceptanceSetup.world.requireIssue(`${REPO}#1`).comments.at(-1);
+  const acceptanceGate = makeGate({
+    home: acceptanceSetup.home,
+    profile: acceptanceSetup.profile,
+    github: fakeGithub(acceptanceSetup.world, { onWrite: (action) => ({ repo: action.repo, branch: action.branch }) }),
+    binding: { root: `${REPO}#1`, round: 1, commentId: latest.databaseId },
+    run: (cmd, args, options = {}) => spawnRun(cmd, args, options),
+  });
+  for (const extra of [{ forceWithLease: HEAD }, { forceWithLease: '' }, { force: true }]) {
+    const outcome = await acceptanceGate.handle({ type: 'branch.push', repo: REPO, branch: BRANCH, bundlePath: bundle, dedupeKey: `acc-force-${JSON.stringify(extra)}`, ...extra });
+    assert.equal(outcome.code, 4);
+    assert.equal(outcome.body.reason, 'not-allowed', JSON.stringify(extra));
+  }
+  const plain = await acceptanceGate.handle({ type: 'branch.push', repo: REPO, branch: BRANCH, bundlePath: bundle, dedupeKey: 'acc-plain' });
+  assert.equal(plain.code, 0, `对照：验收轮普通推送照样放行 ${JSON.stringify(plain)}`);
+});
+
+test('守卫 17 not-allowed：project.field.set 只写「验收 = 修正中」，只写本轮修正子 issue 和它的总 issue', async () => {
+  const s = setup();
+  const written = [];
+  const gate = gateFor(s, claimedRound(s), {
+    onWrite: (action) => {
+      if (action.type.startsWith('comment.')) return undefined;
+      written.push(action);
+      return { itemId: 'PVTI_x' };
+    },
+  });
+  const set = (issue, fields, key, extra = {}) =>
+    gate.handle({ type: 'project.field.set', repo: REPO, issue, fields, dedupeKey: key, ownerLogin: OWNER, projectNumber: s.profile.projectNumber, ...extra });
+  for (const [label, issue, fields] of [
+    ['别的 issue', 2, { 验收: '修正中' }],
+    ['写通过', 9, { 验收: '通过' }],
+    ['写裁决', 9, { 裁决: 'x' }],
+    ['多写一个字段', 9, { 验收: '修正中', 裁决: 'x' }],
+    ['空字段', 9, {}],
+  ]) {
+    const outcome = await set(issue, fields, `board-${label}`);
+    assert.equal(outcome.code, 4, label);
+    assert.equal(outcome.body.reason, 'not-allowed', label);
+  }
+  assert.equal(written.length, 0);
+  // 对照：修正子 issue 和总 issue 写「修正中」放行。
+  assert.equal((await set(9, { 验收: '修正中' }, 'board-correction')).code, 0);
+  assert.equal((await set(1, { 验收: '修正中' }, 'board-root')).code, 0);
+  assert.deepEqual(written.map((action) => action.issue), [9, 1]);
+  // 别人的看板照样被核心拒（project-not-allowed）。
+  const foreign = await set(9, { 验收: '修正中' }, 'board-foreign', { ownerLogin: 'StrangerUser' });
+  assert.equal(foreign.body.reason, 'project-not-allowed');
 });

@@ -7,6 +7,19 @@ import { forkTargetFor } from '../bin/profile.mjs';
 export const CORRECTION_CLAIM_LINE = /^\[修正机\] 第 (\d+) 轮：修正中$/;
 export const CORRECTION_STATUS_LINE = /^\[修正机\] 第 (\d+) 轮：(修正中|Draft 已开|等 CI|再修 \d+\/2|已 Ready|需人工处理|中断)$/;
 export const CORRECTION_TERMINAL = new Set(['已 Ready', '需人工处理', '中断']);
+/** 修正轮能写的唯一看板值：PR 开出后，修正子 issue 和它的总 issue 的「验收」= 修正中（#46 SC6）。 */
+export const CORRECTION_BOARD_VALUE = '修正中';
+const LEASE_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})?$/;
+
+/**
+ * 修正 PR 正文里关修正子 issue 的那一行：同仓写 `Closes #n`，跨仓写 `Closes owner/repo#n`。
+ * PR 合并进 main（默认分支）时 GitHub 按这一行关掉修正子 issue；fork 档的修正子 issue 开在上游仓（PR 也开在上游），同样是同仓写法。
+ */
+export function closesLine(correctionRef, prRepo) {
+  const { repo, number } = parseRef(correctionRef);
+  const same = String(repo).toLowerCase() === String(prRepo || '').toLowerCase();
+  return `Closes ${same ? `#${number}` : `${repo}#${number}`}`;
+}
 
 /** 只看 PR 的头：写闸动作（更新分支 / 重跑 / 转 Ready）先核对分支名、head 所在仓和 base。 */
 export const PR_HEAD_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
@@ -92,8 +105,9 @@ export const READY_ACTIVITY_QUERY = `query ($owner: String!, $name: String!, $nu
       number
       url
       headRefOid
-      reviews(first: 100) { nodes { createdAt author { login } } }
-      comments(first: 100) { nodes { createdAt author { login } body } }
+      state
+      reviews(first: 100) { nodes { createdAt author { __typename login } } }
+      comments(first: 100) { nodes { createdAt author { __typename login } body } }
       commits(last: 1) {
         nodes {
           commit {
@@ -271,6 +285,23 @@ export function createCorrectionCheck({ github, profile, binding, scopeOf, readI
         if (!allowedRepos.has(action.repo)) return reject('not-allowed', `${action.repo} 不是这个修正轮的仓`);
         const forkRepo = correctionForkRepo(marker, tree);
         if (forkRepo && action.repo !== forkRepo) return reject('not-allowed', `fork 模式只推到 ${forkRepo}`);
+        // 只认带租约的强推（--force-with-lease=<本轮分支>:<上次已知 head>）；裸 force 一律不认。
+        if (action.force !== undefined) return reject('not-allowed', '修正轮只能带租约强推，不能裸 force');
+        if (action.forceWithLease !== undefined && (typeof action.forceWithLease !== 'string' || !LEASE_PATTERN.test(action.forceWithLease))) {
+          return reject('not-allowed', 'forceWithLease 必须是提交 SHA 或空串');
+        }
+        return null;
+      }
+      case 'project.field.set': {
+        // 只放行「验收 = 修正中」，只写本轮修正子 issue 和它的总 issue 的看板条目。
+        const target = refOf(action.repo, action.issue).toLowerCase();
+        const targets = new Set([String(binding.issue).toLowerCase(), String(marker.root).toLowerCase()]);
+        if (!targets.has(target)) return reject('not-allowed', `看板只能写 ${binding.issue} 和 ${marker.root}`);
+        const fields = action.fields && typeof action.fields === 'object' && !Array.isArray(action.fields) ? action.fields : {};
+        const keys = Object.keys(fields);
+        if (keys.length !== 1 || keys[0] !== '验收' || fields['验收'] !== CORRECTION_BOARD_VALUE) {
+          return reject('not-allowed', `修正轮只能把看板「验收」写成「${CORRECTION_BOARD_VALUE}」`);
+        }
         return null;
       }
       case 'pr.create': {
@@ -297,6 +328,11 @@ export function createCorrectionCheck({ github, profile, binding, scopeOf, readI
           prMarker.round !== marker.round
         ) {
           return reject('not-allowed', 'PR 正文缺少同一个修正标记');
+        }
+        // 正文必须带关修正子 issue 的那一行：不然合并后修正子 issue 不关，trigger 一直等它，再验永远不触发。
+        const closes = closesLine(binding.issue, action.repo);
+        if (!String(action.body || '').split('\n').some((line) => line.trim() === closes)) {
+          return reject('not-allowed', `PR 正文缺少「${closes}」`);
         }
         if (!allowedRepos.has(action.repo)) return reject('not-allowed', `${action.repo} 不是这个修正轮的仓`);
         // base 只能是 main（不写就是 main）：不能把修正 PR 开到别的分支上。

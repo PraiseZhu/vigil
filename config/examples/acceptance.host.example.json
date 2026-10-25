@@ -7,8 +7,7 @@
     "repos": {
       "example-owner/example-repo": {
         "handoff": "watcher",
-        "preflight": [".githooks/pre-push"],
-        "testLock": true,
+        "preflight": [".githooks/pre-push", ["npm", "test"]],
         "handoffNew": ["node", "scripts/new.mjs", "--pr", "{pr}"],
         "forbiddenPaths": [".github/workflows/**"]
       },

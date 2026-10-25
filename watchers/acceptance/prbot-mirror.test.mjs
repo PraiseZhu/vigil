@@ -268,3 +268,65 @@ test('SC5 镜像超过磁盘上限：取完就删、mirror-too-large', async () 
   assert.equal(fs.existsSync(mirror), false, '超限的镜像删掉了');
   assertNoLeak(w);
 });
+
+/** 在本地上游仓里给修正分支加一个提交（模拟远端已有的修正分支）。parent 默认是 main。 */
+async function commitOnBranch(up, branch, { from = 'main', file = 'fix.mjs', text = 'export const y = 1;\n' } = {}) {
+  await git(['-C', up, 'checkout', '-q', '-B', branch, from]);
+  fs.writeFileSync(path.join(up, file), text);
+  await git(['-C', up, 'add', '-A']);
+  await git(['-C', up, '-c', 'user.name=u', '-c', 'user.email=u@example.invalid', 'commit', '-q', '-m', `on ${branch}`]);
+  const head = await git(['-C', up, 'rev-parse', 'HEAD']);
+  await git(['-C', up, 'checkout', '-q', 'main']);
+  return head;
+}
+
+test('#60 修正 4：远端修正分支还有开着的 PR -> 工作树接着它的 head 建；PR 已合并 / 已关 -> 从 main 重建，租约是远端旧 head', async () => {
+  const resumeWorld = await world();
+  const remoteHead = await commitOnBranch(resumeWorld.up, STATE.branch);
+  const resumed = await resumeWorld.prepare({ remoteBranch: async () => ({ head: remoteHead, openPr: true }) });
+  assert.equal(resumed.reused, false);
+  assert.equal(resumed.remoteHead, remoteHead, '租约 = 远端已知 head');
+  assert.equal(await git(['-C', resumed.worktree, 'rev-parse', STATE.branch]), remoteHead, '接着远端分支的 head');
+  assert.ok(resumeWorld.sandboxed.some((command) => command[1] === 'fetch' && command[4] === `+refs/remotes/origin/${STATE.branch}:refs/remotes/origin/${STATE.branch}`));
+  assertNoLeak(resumeWorld);
+
+  const freshWorld = await world();
+  const stale = await commitOnBranch(freshWorld.up, STATE.branch);
+  const fresh = await freshWorld.prepare({ remoteBranch: async () => ({ head: stale, openPr: false }) });
+  assert.equal(fresh.remoteHead, stale, '推送时用租约覆盖旧 head（不会撞 non-fast-forward）');
+  assert.equal(await git(['-C', fresh.worktree, 'rev-parse', STATE.branch]), freshWorld.upstreamMain, '从最新 main 重建');
+  assertNoLeak(freshWorld);
+
+  // 远端还没有这条分支：租约是空串（远端必须还没有）。
+  const noneWorld = await world();
+  const none = await noneWorld.prepare({ remoteBranch: async () => ({ head: null, openPr: false }) });
+  assert.equal(none.remoteHead, '');
+});
+
+test('#60 修正 4：再修前远端分支被挪过（pr.update-branch 合了 main）-> 沙箱里快进到远端 head；分叉了就停，不覆盖', async () => {
+  const w = await world();
+  const first = await w.prepare({ remoteBranch: async () => ({ head: null, openPr: false }) });
+  assert.equal(first.remoteHead, '');
+  // 远端：在 main 之上多了一个提交（update-branch 的合并提交之类），工作树分支是它的祖先。
+  const moved = await commitOnBranch(w.up, STATE.branch, { file: 'merged.mjs' });
+  const synced = await w.prepare({ state: { ...STATE, remoteHead: '' }, remoteBranch: async () => ({ head: moved, openPr: true }) });
+  assert.equal(synced.reused, true);
+  assert.equal(synced.remoteHead, moved);
+  assert.equal(await git(['-C', synced.worktree, 'rev-parse', STATE.branch]), moved, '快进到远端 head');
+  // 远端和本地 head 一样：不再取。
+  const fetches = w.gitCalls.filter((call) => call.args.includes('fetch')).length;
+  const same = await w.prepare({ state: { ...STATE, remoteHead: moved }, remoteBranch: async () => ({ head: moved, openPr: true }) });
+  assert.equal(same.remoteHead, moved);
+  assert.equal(w.gitCalls.filter((call) => call.args.includes('fetch')).length, fetches);
+
+  // 分叉：工作树里有本地提交，远端又被别人换成了另一条线。
+  fs.writeFileSync(path.join(synced.worktree, 'local.mjs'), 'export const z = 1;\n');
+  await git(['-C', synced.worktree, 'add', 'local.mjs']);
+  await git(['-C', synced.worktree, '-c', 'user.name=u', '-c', 'user.email=u@example.invalid', 'commit', '-q', '-m', 'local']);
+  const other = await commitOnBranch(w.up, STATE.branch, { file: 'other.mjs' });
+  await assert.rejects(
+    w.prepare({ state: { ...STATE, remoteHead: moved }, remoteBranch: async () => ({ head: other, openPr: true }) }),
+    /branch-diverged/,
+  );
+  assertNoLeak(w);
+});

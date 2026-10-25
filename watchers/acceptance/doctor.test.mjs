@@ -349,3 +349,34 @@ test('SC1 fork 推送按 forkTargets 查对照的 fork 仓（名字和上游不�
   assert.ok(asked.includes(`${OWNER}/cindy-fork`), asked.join(','));
   assert.ok(!asked.includes(`${OWNER}/cindy`), '不该再查同名仓');
 });
+
+test('#60 修正轮交接配置：host.json 配了 prbot 就要求每个具体仓显式写 handoff（owner / watcher），预检格式也查', async () => {
+  const run = (hostConfig) =>
+    runDoctor({ profileEnv: makeFixture().profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, boardItem: `${REPO}#1`, hostConfig });
+  // 没配 prbot：不查这一项。
+  assert.equal(checkOf(await run({}), '修正轮交接配置'), undefined);
+
+  const missing = checkOf(await run({ prbot: { piCommand: ['pi'], repos: { [REPO]: { preflight: '.githooks/pre-push' } } } }), '修正轮交接配置');
+  assert.equal(missing.ok, false);
+  assert.match(missing.detail, new RegExp(`${REPO} 的 handoff 没写成 owner / watcher`));
+  assert.match(missing.detail, /preflight 格式不对/);
+  assert.match(missing.detail, /makecindy\/cindy 没在 prbot\.repos 里写 handoff/, 'forkRepos 里的具体仓也要写');
+
+  const good = checkOf(
+    await run({
+      prbot: {
+        piCommand: ['pi'],
+        repos: { [REPO]: { handoff: 'owner', preflight: ['.githooks/pre-push', ['npm', 'test']] }, 'makecindy/cindy': { handoff: 'watcher' } },
+      },
+    }),
+    '修正轮交接配置',
+  );
+  assert.equal(good.ok, true, good.detail);
+
+  // 不传 hostConfig：从 <home>/config/host.json 读。
+  const fixture = makeFixture();
+  fs.writeFileSync(path.join(fixture.home, 'config', 'host.json'), JSON.stringify({ prbot: { piCommand: ['pi'] } }));
+  const fromFile = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, boardItem: `${REPO}#1` });
+  assert.equal(checkOf(fromFile, '修正轮交接配置').ok, false);
+  assert.equal(fromFile.ok, false);
+});
