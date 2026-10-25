@@ -357,6 +357,7 @@ test('SC11 buildBwrapArgs：可写绑定在只读根之后、遮罩在最后；�
   const worktreeDir = path.join(tmpDir(), 'acc-worktree');
   const roundDir = path.join(tmpDir(), 'round');
   const tokenFile = writeSecret(path.join(tmpDir(), 'secrets', 'github.token'), 'not-a-real-token');
+  const hostHome = tmpDir();
   const profile = { stateDir, worktreeDir, githubTokenFile: tokenFile };
   const args = buildBwrapArgs({
     home,
@@ -365,12 +366,16 @@ test('SC11 buildBwrapArgs：可写绑定在只读根之后、遮罩在最后；�
     masks: { files: [tokenFile], dirs: [path.join(home, 'state')] },
     binds: [stateDir, worktreeDir],
     env: { PATH: '/usr/bin', HOME: path.join(roundDir, 'home') },
+    hostHome,
   });
   assert.deepEqual(args.slice(0, 2), ['--die-with-parent', '--new-session']);
   const roBind = args.indexOf('--ro-bind');
   const firstBind = args.indexOf('--bind');
-  const maskAt = args.indexOf('--tmpfs', args.indexOf('/tmp'));
+  const homeMaskAt = args.indexOf(fs.realpathSync(hostHome));
+  const maskAt = args.indexOf('--tmpfs', firstBind);
   assert.ok(roBind < firstBind, '可写绑定要在只读根之后');
+  assert.equal(args[homeMaskAt - 1], '--tmpfs', '宿主 HOME 整个盖空 tmpfs');
+  assert.ok(args.indexOf('/tmp') < homeMaskAt && homeMaskAt < firstBind, 'HOME 先盖住，可写绑定再挂回来');
   assert.ok(firstBind < maskAt, '遮罩要在可写绑定之后（最后挂，遮罩赢）');
   assert.ok(args.includes(roundDir), 'roundDir 一定可写');
   assert.deepEqual(args.slice(args.indexOf('--ro-bind', maskAt), args.indexOf('--ro-bind', maskAt) + 3), [
@@ -388,6 +393,7 @@ test('SC11 buildBwrapArgs：可写绑定在只读根之后、遮罩在最后；�
         masks: { files: [], dirs: [path.join(home, 'state')] },
         binds: [path.join(home, 'state', 'acc-state'), worktreeDir],
         env: {},
+        hostHome,
       }),
     /与宿主状态目录重叠/,
   );
@@ -400,6 +406,7 @@ test('SC11 buildBwrapArgs：可写绑定在只读根之后、遮罩在最后；�
         masks: { files: [path.join(worktreeDir, 'leak.token')], dirs: [] },
         binds: [worktreeDir],
         env: {},
+        hostHome,
       }),
     /落在可写绑定/,
   );
@@ -471,7 +478,7 @@ test(
     const masks = maskList({ rawProfile, profile, hostConfig: {}, env: { HOME: hostHome }, home });
     const sandboxBin = path.resolve('watchers', 'acceptance', 'host', 'sandbox-bin');
     const env = sandboxEnv({ base: { ...process.env, HOME: hostHome }, roundDir, socketPath, sandboxBin });
-    const args = buildBwrapArgs({ home, profile, roundDir, masks, binds: [stateDir, worktreeDir], env });
+    const args = buildBwrapArgs({ home, profile, roundDir, masks, binds: [stateDir, worktreeDir], env, hostHome });
 
     const targets = [
       tokenFile,

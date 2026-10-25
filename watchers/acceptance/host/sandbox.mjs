@@ -117,13 +117,51 @@ function isInside(child, parent) {
 }
 
 /**
- * 拼 bwrap 参数。顺序：只读根 → 设备/proc/tmp → 可写绑定 → 遮罩（最后挂，遮罩一定赢）→ 干净环境。
- * 宿主状态目录和可写绑定相互包含、或遮罩文件落在可写绑定里，一律抛错（fail-closed）。
+ * 宿主 HOME 默认整个看不见：先在 HOME 上盖一层空 tmpfs，再把白名单里的目录只读挂回来。
+ * 白名单 = 调用方传的 homeAllow（代码仓、host.json 的 homeAllowDirs 等）；可写绑定（roundDir、
+ * stateDir、worktreeDir）照常可写。白名单是 HOME 本身、或落在遮罩目录里，直接抛错（fail-closed）；
+ * 是 HOME 的上级就不挂（挂了会把 HOME 重新露出来）。
+ * 不存在的白名单路径跳过；HOME 之外的白名单路径本来就在只读根里，不用再挂。
  */
-export function buildBwrapArgs({ home, profile, roundDir, masks, binds, env } = {}) {
+function resolveHomeAllow(hostHomeReal, homeAllow, maskDirs) {
+  const out = [];
+  for (const entry of homeAllow || []) {
+    if (typeof entry !== 'string' || !entry) continue;
+    if (!path.isAbsolute(entry)) throw new Error(`HOME 白名单必须是绝对路径：${entry}`);
+    const real = realExisting(entry);
+    if (!real) continue;
+    if (real === hostHomeReal) {
+      throw new Error(`沙箱拒绝：HOME 白名单 ${entry} 就是 HOME 本身，等于不遮`);
+    }
+    // HOME 的上级：HOME 之外的部分本来就在只读根里；挂它会把 HOME 重新露出来，所以不挂（HOME 仍然遮着）。
+    if (isInside(hostHomeReal, real)) continue;
+    if (!isInside(real, hostHomeReal)) continue;
+    for (const maskDir of maskDirs) {
+      if (isInside(real, maskDir)) {
+        throw new Error(`沙箱拒绝：HOME 白名单 ${entry} 落在遮罩目录 ${maskDir} 里`);
+      }
+    }
+    if (!out.includes(real)) out.push(real);
+  }
+  return out;
+}
+
+/**
+ * 拼 bwrap 参数。顺序：只读根 → 设备/proc/tmp → 宿主 HOME 盖空 tmpfs → HOME 白名单只读挂回
+ * → 可写绑定 → 遮罩（最后挂，遮罩一定赢）→ 干净环境。
+ * 宿主状态目录和可写绑定相互包含、或遮罩文件落在可写绑定里，一律抛错（fail-closed）。
+ * hostHome 必填：没有它就没法默认遮掉 HOME，直接抛错，不退回只遮名单的老做法。
+ */
+export function buildBwrapArgs({ home, profile, roundDir, masks, binds, env, hostHome, homeAllow } = {}) {
   if (typeof roundDir !== 'string' || !path.isAbsolute(roundDir)) {
     throw new Error('沙箱需要绝对路径的 roundDir');
   }
+  if (typeof hostHome !== 'string' || !path.isAbsolute(hostHome)) {
+    throw new Error('沙箱需要绝对路径的宿主 HOME（默认整个遮掉）');
+  }
+  const hostHomeReal = realExisting(hostHome);
+  if (!hostHomeReal) throw new Error(`宿主 HOME 不存在：${hostHome}`);
+  if (hostHomeReal === path.parse(hostHomeReal).root) throw new Error('宿主 HOME 不能是根目录');
   const maskFiles = (masks?.files || []).filter((file) => typeof file === 'string' && path.isAbsolute(file));
   const maskDirs = (masks?.dirs || []).filter((dir) => typeof dir === 'string' && path.isAbsolute(dir));
   const bindList = (binds || []).filter((dir) => typeof dir === 'string' && dir);
@@ -140,6 +178,12 @@ export function buildBwrapArgs({ home, profile, roundDir, masks, binds, env } = 
       throw new Error(`沙箱拒绝：${dir} 与宿主状态目录重叠，模型会看到写闸开关`);
     }
   }
+  for (const bind of bindList) {
+    const real = realExisting(bind) || bind;
+    if (isInside(hostHomeReal, real)) {
+      throw new Error(`沙箱拒绝：可写绑定 ${bind} 是宿主 HOME 本身或它的上级`);
+    }
+  }
   for (const maskDir of maskDirs) {
     for (const bind of bindList) {
       if (isInside(bind, maskDir) || isInside(maskDir, bind)) {
@@ -154,6 +198,8 @@ export function buildBwrapArgs({ home, profile, roundDir, masks, binds, env } = 
       }
     }
   }
+
+  const allowList = resolveHomeAllow(hostHomeReal, homeAllow, maskDirs);
 
   const args = [
     '--die-with-parent',
@@ -172,16 +218,41 @@ export function buildBwrapArgs({ home, profile, roundDir, masks, binds, env } = 
     '/proc',
     '--tmpfs',
     '/tmp',
+    '--tmpfs',
+    hostHomeReal,
   ];
+  for (const dir of allowList) args.push('--ro-bind', dir, dir);
   for (const bind of bindList) args.push('--bind', bind, bind);
-  for (const dir of maskDirs) args.push('--tmpfs', dir);
-  for (const file of maskFiles) args.push('--ro-bind', '/dev/null', file);
+  // HOME 里没挂回来的遮罩目标本来就在空 tmpfs 下面、读不到；再挂一次反而要在 tmpfs 里造挂载点，跳过。
+  const reachable = (target) =>
+    !isInside(target, hostHomeReal) || [...allowList, ...bindList].some((dir) => isInside(target, dir));
+  for (const dir of maskDirs) if (reachable(dir)) args.push('--tmpfs', dir);
+  for (const file of maskFiles) if (reachable(file)) args.push('--ro-bind', '/dev/null', file);
   args.push('--clearenv');
   for (const [key, value] of Object.entries(env || {})) {
     if (value === undefined || value === null) continue;
     args.push('--setenv', String(key), String(value));
   }
   return args;
+}
+
+/**
+ * 默认的 HOME 白名单：代码仓（沙箱里要跑 gate-client、sandbox-bin/gh、helper）、node 的安装目录
+ * （node 装在 HOME 里时），再加 host.json 的 homeAllowDirs（比如 pi 的安装目录、pi 配置的来源目录）。
+ * 全部只读挂回；凭证目录照样被遮罩盖住。
+ */
+export function defaultHomeAllow({ repoRoot, hostConfig, execPath = process.execPath } = {}) {
+  const out = [];
+  if (typeof repoRoot === 'string' && path.isAbsolute(repoRoot)) out.push(repoRoot);
+  const nodeReal = realExisting(execPath);
+  if (nodeReal) out.push(path.dirname(path.dirname(nodeReal)));
+  const extra = hostConfig?.homeAllowDirs;
+  if (extra !== undefined && !Array.isArray(extra)) throw new Error('host.json 的 homeAllowDirs 必须是绝对路径数组');
+  for (const dir of extra || []) {
+    if (typeof dir !== 'string' || !path.isAbsolute(dir)) throw new Error(`host.json 的 homeAllowDirs 必须是绝对路径：${dir}`);
+    out.push(dir);
+  }
+  return out;
 }
 
 /** bwrap 在不在、能不能挂命名空间：只跑一条不发散的命令。 */

@@ -28,7 +28,8 @@
 ```json
 {
   "piCommand": ["pi", "--model", "<model id>", "--thinking", "max"],
-  "credentialDirs": ["<可选：额外要遮罩的绝对目录>"]
+  "credentialDirs": ["<可选：额外要遮罩的绝对目录>"],
+  "homeAllowDirs": ["<可选：沙箱里要只读看到的 HOME 内目录，比如 pi 的安装目录、pi 配置副本目录>"]
 }
 ```
 
@@ -44,9 +45,12 @@
   "piCommand": ["sh", "-c", "mkdir -p \"$HOME/.pi/agent\" && cp <配置副本目录>/models.json <配置副本目录>/settings.json \"$HOME/.pi/agent/\" && exec pi \"$@\"", "pi", "--model", "<model id>", "--thinking", "max", "--no-session"]
   ```
 
-- 内置遮罩只认常见的凭证目录（`.ssh`、`.config/gh` 等）。盒子上别的工具自己的密钥目录、浏览器
-  配置、其它 agent 的数据目录，要逐个写进 `credentialDirs`；写完用 `doctor` 的「bwrap 遮罩」和
-  在沙箱里 `ls` 一遍确认读不到。
+- 宿主 `HOME` **默认整个看不见**（盖一层空 tmpfs），只有白名单只读挂回来：代码仓、node 的安装目录
+  （装在 `HOME` 里时）、`host.json` 的 `homeAllowDirs`。pi 装在 `HOME` 里、或 `piCommand` 要从
+  `HOME` 里拷配置副本，就把那两个目录写进 `homeAllowDirs`（只写需要的目录，别写整个 `HOME`——
+  写 `HOME` 本身直接起不来，写它的上级不挂）。可写绑定（`roundDir`、`stateDir`、`worktreeDir`）照常可写。
+  `credentialDirs` 仍然生效，管的是 `HOME` 之外的目录和白名单里面的子目录；白名单落在遮罩目录里直接起不来。
+  写完用 `doctor` 的「bwrap 遮罩」和在沙箱里 `ls` 一遍 `HOME` 确认只剩白名单。
 
 ### 模型
 
@@ -175,8 +179,11 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
   其它调用直接报「沙箱里只允许经写闸读」。它不看 `GH_TOKEN`。
 - 沙箱里的 watcher home 是 profile 的副本：`writeCommand` 换成 `gate-client.mjs`，
   `githubTokenFile` 换成占位文件，`appConfigPath` 和所有 `…TokenFile` 键删掉。
-- `profile.stateDir` 或 `worktreeDir` 与 `<home>/state` 相互包含、或遮罩文件落在可写绑定里，
-  直接拒绝（起不来）。
+- 宿主 `HOME` 默认遮掉：`--tmpfs $HOME` 在只读根之后、可写绑定之前，白名单（`homeAllowDirs` + 代码仓 +
+  node 安装目录）只读挂回。不在白名单上的 `HOME` 文件（比如各工具自己的配置、`.env` 文件）不用逐个列名单
+  也读不到。拼参数时拿不到宿主 `HOME` 就直接拒绝，不退回「只遮名单」的老做法。
+- `profile.stateDir` 或 `worktreeDir` 与 `<home>/state` 相互包含、或遮罩文件落在可写绑定里、
+  可写绑定是宿主 `HOME` 本身或它的上级，直接拒绝（起不来）。
 
 ## 5. 提醒与通知的分工
 

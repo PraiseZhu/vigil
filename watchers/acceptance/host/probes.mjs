@@ -3,8 +3,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildBwrapArgs, maskList, probeBwrap } from './sandbox.mjs';
+import { fileURLToPath } from 'node:url';
+import { buildBwrapArgs, defaultHomeAllow, maskList, probeBwrap } from './sandbox.mjs';
 import { run as procRun } from './proc.mjs';
+
+/** 代码仓根目录：沙箱里要跑仓里的 helper，HOME 被默认遮掉时要把它挂回来。 */
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
 /** PATH 里找可执行文件（只扫目录，不起进程）。 */
 export function which(cmd, env = process.env) {
@@ -109,6 +113,8 @@ export function createProbes({ profile, env = process.env, run = procRun, hostCo
         masks,
         binds: [roundDir],
         env: sandboxEnvironment,
+        hostHome: env?.HOME || process.env.HOME,
+        homeAllow: defaultHomeAllow({ repoRoot: REPO_ROOT, hostConfig }),
       });
       const result = await run('bwrap', [...args, '--', process.execPath, reader, targetsFile, outFile], {
         timeoutMs: 60000,
