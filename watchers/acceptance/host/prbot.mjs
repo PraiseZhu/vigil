@@ -13,9 +13,9 @@ import { ISSUE_BODY_QUERY, collectTree, parseMarker } from '../bin/collect.mjs';
 import { bodyVersion, latestRound, parseRef, parseRounds, ISSUE_COMMENTS_QUERY as ROUND_COMMENTS_QUERY } from '../bin/rounds.mjs';
 import { collectTasks, repoTier } from '../bin/tasks.mjs';
 import { redact } from '../bin/redact.mjs';
-import { appendAlert, hostPaths, releaseLock, tryAcquireLock } from './paths.mjs';
+import { appendAlert, hostPaths, isAlive, readLockPayload, releaseLock, tryAcquireLock } from './paths.mjs';
 import { appendPrbotEvent } from './prbot-events.mjs';
-import { createLocalGit } from '../bin/localgit.mjs';
+import { createLocalGit, localEnv } from '../bin/localgit.mjs';
 import { run as procRun } from './proc.mjs';
 import { MEMORY_GATE_BYTES, acquireSlot, readHostConfig, readMemAvailable } from './round.mjs';
 import {
@@ -192,22 +192,24 @@ function flattenStatus(status) {
   const contexts = (commit.statusCheckRollup?.contexts?.nodes || []).filter(
     (node) => node?.__typename === 'StatusContext' || node?.context,
   );
+  // 还在跑的（排队 / 进行中 / 等待）只算 pending，不算失败：没跑完就重跑或再修，是空转的源头之一。
   const failures = [];
+  const pending = [];
   for (const run of runs) {
-    if (String(run.status) !== 'COMPLETED' || !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(run.conclusion))) {
-      failures.push({
-        name: run.name || String(run.databaseId || 'check'),
-        conclusion: String(run.conclusion || run.status || '?'),
-        runId: run.runId,
-      });
+    const name = run.name || String(run.databaseId || 'check');
+    if (String(run.status) !== 'COMPLETED') {
+      pending.push(name);
+    } else if (!['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(run.conclusion))) {
+      failures.push({ name, conclusion: String(run.conclusion || '?'), runId: run.runId });
     }
   }
   for (const context of contexts) {
-    if (String(context.state) !== 'SUCCESS') {
-      failures.push({ name: context.context || 'status', conclusion: String(context.state || '?'), runId: null });
-    }
+    const state = String(context.state);
+    if (state === 'SUCCESS') continue;
+    if (state === 'PENDING' || state === 'EXPECTED') pending.push(context.context || 'status');
+    else failures.push({ name: context.context || 'status', conclusion: state || '?', runId: null });
   }
-  return { runs, contexts, failures, total: runs.length + contexts.length };
+  return { runs, contexts, failures, pending, total: runs.length + contexts.length };
 }
 
 function failureFingerprint(failures, headSha) {
@@ -264,14 +266,18 @@ export async function pollDraft({
   }
 
   const checks = flattenStatus(status);
-  const behind = String(status?.mergeStateStatus || '').toUpperCase() === 'BEHIND' || Number(status?.behindBy || 0) > 0;
-  if (behind && checks.total === 0) {
+  const mergeState = String(status?.mergeStateStatus || '').toUpperCase();
+  const behind = mergeState === 'BEHIND' || Number(status?.behindBy || 0) > 0;
+  // 冲突（DIRTY）：让 pi 把最新 main 合进来再修；和「落后 main 更新分支」共用 3 轮冲突上限。
+  if (mergeState === 'DIRTY') {
+    if (state.conflictFixedHead === head) return { action: 'wait' };
     if ((state.conflict || 0) >= MAX_CONFLICT) {
       state.conflict = MAX_CONFLICT + 1;
       return { action: 'needs-human', reason: 'limit-conflict' };
     }
     state.conflict = (state.conflict || 0) + 1;
-    return { action: 'update-branch' };
+    state.conflictFixedHead = head;
+    return { action: 'resolve-conflict' };
   }
 
   if (checks.failures.length) {
@@ -293,7 +299,11 @@ export async function pollDraft({
 
     const fingerprint = failureFingerprint(checks.failures, head);
     if (state.lastFixedHead === head && state.lastFixedFingerprint === fingerprint) {
-      return { action: 'needs-human', reason: 'same-head-same-failure' };
+      // 「这个 head 已修过」：不再起 pi，但也计一次；计到上限就需人工处理，计数不再往上涨。
+      if ((state.refix || 0) > MAX_REFIX) return { action: 'needs-human', reason: 'same-head-same-failure' };
+      state.refix = (state.refix || 0) + 1;
+      if (state.refix > MAX_REFIX) return { action: 'needs-human', reason: 'same-head-same-failure' };
+      return { action: 'wait' };
     }
     if ((state.refix || 0) >= MAX_REFIX) {
       state.refix = MAX_REFIX + 1;
@@ -303,6 +313,17 @@ export async function pollDraft({
     state.lastFixedHead = head;
     state.lastFixedFingerprint = fingerprint;
     return { action: 'refix', fingerprint };
+  }
+
+  if (checks.pending.length) return { action: 'wait' };
+
+  if (behind) {
+    if ((state.conflict || 0) >= MAX_CONFLICT) {
+      state.conflict = MAX_CONFLICT + 1;
+      return { action: 'needs-human', reason: 'limit-conflict' };
+    }
+    state.conflict = (state.conflict || 0) + 1;
+    return { action: 'update-branch' };
   }
 
   if (checks.total > 0 && checks.failures.length === 0) {
@@ -438,6 +459,9 @@ function readNotes(roundDir, stdout) {
 
 function buildPrompt(state) {
   const must = (state.mustFix || []).map((item) => `- ${item.ref} SC${item.sc}`).join('\n') || '-（没有列出的条目）';
+  const conflict = state.mergeMain
+    ? ['', '这一次是解决冲突：PR 和最新 main 冲突了。先 git merge origin/main，解决冲突后提交，再确认测试照样通过。']
+    : [];
   return [
     '你是修正机，在目标仓的工作树里修一个验收没过的条目。',
     `修正子 issue：${state.issue}`,
@@ -452,28 +476,56 @@ function buildPrompt(state) {
     '3. 先在工作树里用 git commit -s 提交。',
     '4. 如果某条验收项不成立，不要改代码，写一行：有争议：<owner/repo#n> SC<k>：<理由>',
     '不要把令牌、私钥或本机路径写进代码、提交信息或输出。',
+    ...conflict,
   ].join('\n');
 }
 
-async function defaultPrepareWorktree({ github, state, profile, run }) {
+/**
+ * 宿主上对 pi 写过的工作树跑 git：pi 能改 .git/config，所以一律关掉钩子和 fsmonitor，
+ * 环境用 localEnv（剥掉令牌 / askpass），绝不把宿主的完整环境交给 pi 控制过的仓。
+ */
+export const HOST_GIT_HARDENING = Object.freeze([
+  '-c', 'core.hooksPath=/dev/null',
+  '-c', 'core.fsmonitor=false',
+  '-c', 'diff.external=',
+  '-c', 'core.pager=cat',
+]);
+
+export function hostGit(run, worktree, args) {
+  return run('git', [...HOST_GIT_HARDENING, '-C', worktree, ...args], { env: localEnv(process.env) });
+}
+
+export async function defaultPrepareWorktree({ github, state, profile, run, refresh = false }) {
   const { owner, name, number } = parseRef(state.issue);
   const root = path.join(profile.worktreeDir, 'prbot');
   const worktree = path.join(root, `${owner}__${name}__${number}-r${state.round}`);
   const marker = path.join(worktree, '.acc-owned.json');
+  // 起点永远是目标仓（PR 开在哪个仓）的 main；fork 模式只是推到 fork。
+  const upstream = state.prRepo || parseRef(state.root || state.issue).repo;
   fs.mkdirSync(root, { recursive: true });
+  if (typeof github.fetchBranch !== 'function') throw new Error('github 没有 fetchBranch');
   if (fs.existsSync(worktree)) {
     if (!fs.existsSync(marker)) throw new Error('工作树已存在但没有 .acc-owned.json，拒绝覆盖');
+    // 解决冲突前把最新 main 取回来（只更新 origin/main，不动分支）。
+    if (refresh) await github.fetchBranch({ repo: upstream, branch: 'main', dir: worktree });
     return { worktree, reused: true };
   }
-  if (typeof github.fetchBranch !== 'function') throw new Error('github 没有 fetchBranch');
-  await github.fetchBranch({ repo: state.pushRepo || state.repo || parseRef(state.issue).repo, branch: 'main', dir: worktree });
-  const env = { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0', NO_COLOR: '1' };
-  await run('git', ['-C', worktree, 'checkout', '-q', '-B', state.branch, 'origin/main'], { env });
+  await github.fetchBranch({ repo: upstream, branch: 'main', dir: worktree });
+  const checkout = await hostGit(run, worktree, ['checkout', '-q', '-B', state.branch, 'origin/main']);
+  if (checkout?.code !== 0) throw new Error('建修正分支失败');
+  // pi 在沙箱里 git commit -s：沙箱里的 HOME 是空的，提交身份写进这个工作树自己的配置。
+  const login = String(profile.ownerLogin || 'acceptance-bot');
+  await hostGit(run, worktree, ['config', 'user.name', login]);
+  await hostGit(run, worktree, ['config', 'user.email', `${login}@users.noreply.github.com`]);
   fs.writeFileSync(
     marker,
     JSON.stringify({ kind: 'prbot', issue: state.issue, round: state.round, createdAt: new Date().toISOString() }, null, 2),
     { mode: 0o600 },
   );
+  // 归属标记不进提交：pi 的 git add -A 也带不走它。
+  const exclude = path.join(worktree, '.git', 'info', 'exclude');
+  fs.mkdirSync(path.dirname(exclude), { recursive: true });
+  fs.appendFileSync(exclude, '\n/.acc-owned.json\n');
   return { worktree, reused: false };
 }
 
@@ -501,10 +553,9 @@ function prepareBundle({ state, worktree, localgit }) {
 }
 
 async function diffFiles({ worktree, state, run }) {
-  const result = await run('git', ['-C', worktree, 'diff', '--name-only', `origin/main...${state.branch}`], {
-    env: { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0', NO_COLOR: '1' },
-  });
-  if (!result || result.code !== 0) return [];
+  const result = await hostGit(run, worktree, ['diff', '--name-only', `origin/main...${state.branch}`, '--']);
+  // 读不出改了哪些文件就当失败（null），不能当「什么都没改」放过禁改路径检查。
+  if (!result || result.code !== 0) return null;
   return String(result.stdout || '')
     .split('\n')
     .map((line) => line.trim())
@@ -653,6 +704,15 @@ export function cleanupWorktrees({ home, profile, fsImpl = fs } = {}) {
       continue;
     }
     if (parsed?.kind !== 'prbot') continue;
+    // 只收已经收尾的修正轮：进程还拿着锁、或者状态文件不是终态，都不动（再修 / 解决冲突还要用这个工作树）。
+    if (typeof parsed.issue !== 'string' || !/^[^/\s]+\/[^#\s]+#\d+$/.test(parsed.issue)) continue;
+    const held = readLockPayload(path.join(paths.prbotLocksDir, `${stateKey(parsed.issue)}.lock`));
+    if (held && isAlive(Number(held.pid))) continue;
+    const roundState = loadState(paths, parsed.issue);
+    const finished =
+      roundState &&
+      (Number(roundState.round) !== Number(parsed.round) || CORRECTION_TERMINAL.has(roundState.status));
+    if (!finished) continue;
     try {
       fsImpl.rmSync(dir, { recursive: true, force: true });
       removed.push(dir);
@@ -663,13 +723,28 @@ export function cleanupWorktrees({ home, profile, fsImpl = fs } = {}) {
   return removed;
 }
 
-function makeState({ issue, marker, rootTree }) {
+/** 修正 PR 正文：首行链任务 issue；修正标记原样照抄修正子 issue 的（轮次是验收轮，不是修正轮）。 */
+export function correctionPrBody(state, marker) {
+  return [
+    `任务 issue：${state.root}`,
+    '',
+    `> 修正 PR · 原属 ${state.item} SC${state.sc} · 修正轮第 ${state.round} 轮`,
+    '',
+    `[验收机] 修正 · 总 ${marker.root} · 项 ${marker.item} SC${marker.sc} · 第 ${marker.round} 轮`,
+  ].join('\n');
+}
+
+/** 推到哪个仓：fork 模式推到 ownerLogin 名下同名的 fork，PR 开在上游（总 issue 所在仓）。 */
+export function correctionPushRepo({ issue, marker, fork, ownerLogin }) {
+  if (fork) return `${ownerLogin}/${parseRef(marker.root).name}`;
+  return parseRef(issue).repo;
+}
+
+function makeState({ issue, marker, rootTree, ownerLogin }) {
   const nowIso = new Date().toISOString();
   const correctionRepo = parseRef(issue).repo;
   const rootRepo = parseRef(marker.root).repo;
-  const pushRepo = rootTree?.root?.fork
-    ? (rootTree?.profileForkRepo || correctionRepo)
-    : correctionRepo;
+  const pushRepo = correctionPushRepo({ issue, marker, fork: rootTree?.root?.fork, ownerLogin });
   return {
     issue,
     root: marker.root,
@@ -678,7 +753,8 @@ function makeState({ issue, marker, rootTree }) {
     repo: correctionRepo,
     rootRepo,
     pushRepo,
-    prRepo: rootRepo,
+    // 非 fork：代码和 PR 都在修正子 issue 所在的仓（原属验收项的仓）；fork：PR 开在上游。
+    prRepo: rootTree?.root?.fork ? rootRepo : correctionRepo,
     round: null,
     claimCommentId: null,
     stage: 'assess',
@@ -749,6 +825,7 @@ export async function runPrbotCorrection({
   const gateFor = (binding) =>
     makeGate ? makeGate({ binding, ...context }) : createGate({ home, profile: acceptanceProfile, github: gateGithub, run, binding });
 
+  let state = null;
   try {
     const correction = await readComments(gateGithub, issue);
     if (!correction) return 1;
@@ -756,7 +833,15 @@ export async function runPrbotCorrection({
     if (!marker || marker.root == null) return 1;
     const correctionRounds = parseCorrectionRounds(correction.comments?.nodes || [], acceptanceProfile.ownerLogin);
     const latestCorrection = correctionRounds.at(-1) || null;
-    if (latestCorrection && CORRECTION_TERMINAL.has(latestCorrection.status)) return 0;
+    if (latestCorrection && CORRECTION_TERMINAL.has(latestCorrection.status)) {
+      // 上一修正轮已收尾：只有总 issue 在它之后又出了一次「要修」裁决，才开下一修正轮。
+      const rootNow = await readIssueState(gateGithub, marker.root, acceptanceProfile.ownerLogin);
+      const verdict = latestRound(rootNow?.rounds || []);
+      const verdictAt = Date.parse(verdict?.createdAt || '') || 0;
+      const roundAt = Date.parse(latestCorrection.createdAt || '') || 0;
+      if (!verdict || verdict.status !== '要修' || verdictAt <= roundAt) return 0;
+      fs.rmSync(prbotStatePath(paths, issue), { force: true });
+    }
 
     let tree;
     try {
@@ -764,16 +849,13 @@ export async function runPrbotCorrection({
     } catch {
       return 1;
     }
-    let state = loadState(paths, issue);
+    state = loadState(paths, issue);
+    if (state && latestCorrection && state.round != null && Number(state.round) !== Number(latestCorrection.round) && !CORRECTION_TERMINAL.has(latestCorrection.status)) {
+      // 本地状态和 GitHub 上进行中的轮次对不上：以 GitHub 为准重新接手。
+      state = null;
+    }
     if (!state || !state.startedAt) {
-      state = makeState({ issue, marker, rootTree: tree });
-      if (tree.root.fork) {
-        const forkRepo = (acceptanceProfile.forkRepos || []).find((repo) => !repo.includes('*'));
-        if (forkRepo) {
-          state.pushRepo = forkRepo;
-          state.prRepo = parseRef(marker.root).repo;
-        }
-      }
+      state = makeState({ issue, marker, rootTree: tree, ownerLogin: acceptanceProfile.ownerLogin });
     } else if (!state.startedAt) {
       state.startedAt = new Date(now()).toISOString();
     }
@@ -790,7 +872,8 @@ export async function runPrbotCorrection({
     }
 
     // 1. 认领 / 加载已有修正轮。
-    if (latestCorrection && latestCorrection.status !== '修正中' && !state.claimCommentId) {
+    // 进行中的修正轮（哪怕本地状态丢了）一律接手同一条评论，不再认领新一轮。
+    if (latestCorrection && !CORRECTION_TERMINAL.has(latestCorrection.status) && !state.claimCommentId) {
       state.claimCommentId = latestCorrection.commentId;
       state.round = latestCorrection.round;
     }
@@ -927,7 +1010,7 @@ export async function runPrbotCorrection({
         }
         let work = null;
         try {
-          work = prepareWorktree({ github: gateGithub, state, profile: acceptanceProfile, run });
+          work = prepareWorktree({ github: gateGithub, state, profile: acceptanceProfile, run, refresh: Boolean(state.mergeMain) });
           if (work && typeof work.then === 'function') work = await work;
         } catch (error) {
           state.worktreeError = String(error?.message || error);
@@ -975,7 +1058,19 @@ export async function runPrbotCorrection({
           state.steps.push('评估：有争议的条目不修，写进轮次评论');
         }
         state.fixed = state.mustFix.map((item) => item.sc);
+        state.mergeMain = false;
         const files = await diffFiles({ worktree: state.worktree, state, run });
+        if (files === null) {
+          state.failureReason = 'diff-failed';
+          state.stage = 'stop';
+          continue;
+        }
+        if (!files.length) {
+          // 没有任何改动：全部有争议就交给人裁，否则就是 pi 没修出东西。
+          state.failureReason = state.mustFix.length ? 'no-change' : 'all-disputed';
+          state.stage = 'stop';
+          continue;
+        }
         const forbidden = repoConfig(settings, state.repo).forbiddenPaths || [];
         const hits = files.filter((file) => matchesForbidden(file, forbidden));
         if (hits.length) {
@@ -997,7 +1092,7 @@ export async function runPrbotCorrection({
           continue;
         }
         const roundDir = path.join(paths.roundRunDir, 'prbot', `${stateKey(issue)}-r${state.round}-preflight`);
-        const testLock = config.testLock ? path.join(paths.hostDir, 'locks', 'mivo-test.lock') : null;
+        const testLock = config.testLock ? paths.testLock : null;
         if (testLock && !tryAcquireLock(testLock, { now })) {
           state.stage = 'preflight';
           await sleep(30 * 1000);
@@ -1069,8 +1164,15 @@ export async function runPrbotCorrection({
             continue;
           }
           const [owner, name] = state.prRepo.split('/');
-          const existing = await gateRead(gate, PR_BY_BRANCH_QUERY, { owner, name, head: state.branch });
-          let pr = existing?.repository?.pullRequests?.nodes?.[0];
+          // 这一修正轮已经开过 PR（再修 / 解决冲突后的重推）：直接沿用，不再查也不再开。
+          let pr = state.pr?.number ? { number: state.pr.number, url: state.pr.url } : null;
+          if (!pr) {
+            const existing = await gateRead(gate, PR_BY_BRANCH_QUERY, { owner, name, head: state.branch });
+            // 只认从我们推的那个仓来的 PR：别人 fork 里同名分支开的 PR 不算。
+            pr = (existing?.repository?.pullRequests?.nodes || []).find(
+              (node) => String(node?.headRepository?.nameWithOwner || '').toLowerCase() === String(state.pushRepo).toLowerCase(),
+            );
+          }
           if (!pr) {
             const head = state.pushRepo === state.prRepo ? state.branch : `${repoOwner(state.pushRepo)}:${state.branch}`;
             const created = await gateWrite(
@@ -1083,12 +1185,7 @@ export async function runPrbotCorrection({
                 base: 'main',
                 draft: true,
                 title: `修正：${state.item} SC${state.sc}`,
-                body: [
-                  `> 修正 PR · 总 issue ${state.root} · 原属 ${state.item}`,
-                  '',
-                  `任务 issue：${state.root}`,
-                  `[验收机] 修正 · 总 ${state.root} · 项 ${state.item} SC${state.sc} · 第 ${state.round} 轮`,
-                ].join('\n'),
+                body: correctionPrBody(state, marker),
               },
               { state, sleep, now },
             );
@@ -1099,8 +1196,16 @@ export async function runPrbotCorrection({
               continue;
             }
             pr = { number: created.body.pr, url: created.body.url, headRefOid: bundle.headSha, isDraft: true };
+            state.prCreated = true;
           }
-          state.pr = { number: pr.number, url: pr.url, headSha: bundle.headSha, isDraft: true, draftOpenedAt: new Date(now()).toISOString() };
+          const firstDraft = !state.draftAnnounced;
+          state.pr = {
+            number: pr.number,
+            url: pr.url,
+            headSha: bundle.headSha,
+            isDraft: true,
+            draftOpenedAt: state.pr?.draftOpenedAt || new Date(now()).toISOString(),
+          };
 
           const handoffNew = repoConfig(settings, state.repo).handoffNew;
           if (Array.isArray(handoffNew) && handoffNew.length) {
@@ -1133,16 +1238,23 @@ export async function runPrbotCorrection({
               state.stage = 'stop';
               continue;
             }
-            const gitEnv = { ...process.env, GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0', NO_COLOR: '1' };
-            const dirty = await run('git', ['-C', state.worktree, 'status', '--porcelain'], { env: gitEnv });
+            const dirty = await hostGit(run, state.worktree, ['status', '--porcelain']);
             if (dirty?.code === 0 && String(dirty.stdout || '').trim()) {
-              const added = await run('git', ['-C', state.worktree, 'add', '-A'], { env: gitEnv });
-              const committed = await run(
-                'git',
-                ['-C', state.worktree, 'commit', '-q', '-s', '-m', 'chore: handoff files'],
-                { env: gitEnv },
-              );
-              if (added?.code !== 0 || committed?.code !== 0) {
+              // add / commit 会跑仓里的 clean filter 和钩子：放进同一个沙箱里跑，不在宿主上跑。
+              const committed = await preflight({
+                home,
+                profile: acceptanceProfile,
+                hostConfig: settings,
+                roundDir: path.join(paths.roundRunDir, 'prbot', `${stateKey(issue)}-r${state.round}-handoff-commit`),
+                worktree: state.worktree,
+                commands: [
+                  ['git', 'add', '-A'],
+                  ['git', 'commit', '-q', '-s', '-m', 'chore: handoff files'],
+                ],
+                env,
+                run,
+              });
+              if (!committed?.ok) {
                 state.failureReason = 'handoff-commit-failed';
                 state.stage = 'stop';
                 continue;
@@ -1173,6 +1285,17 @@ export async function runPrbotCorrection({
             }
           }
 
+          if (!firstDraft) {
+            // 再修 / 解决冲突之后的重推：PR 还是那一个，不再发 draft-opened。
+            state.steps.push('再修：重新打包推到同一个 PR');
+            state.status = '等 CI';
+            await updateComment({ gate, state, status: '等 CI', sleep, now });
+            state.watchStartedAt = new Date(now()).toISOString();
+            state.watchHead = state.pr.headSha;
+            state.stage = 'watch';
+            continue;
+          }
+          state.draftAnnounced = true;
           state.steps.push('Draft：经写闸推分支、开 Draft PR');
           state.status = 'Draft 已开';
           await updateComment({ gate, state, status: 'Draft 已开', sleep, now });
@@ -1194,7 +1317,7 @@ export async function runPrbotCorrection({
           state.status = '等 CI';
           await updateComment({ gate, state, status: '等 CI', sleep, now });
           state.watchStartedAt = new Date(now()).toISOString();
-          state.watchHead = bundle.headSha;
+          state.watchHead = state.pr.headSha;
           state.stage = 'watch';
           continue;
         } finally {
@@ -1289,6 +1412,13 @@ export async function runPrbotCorrection({
           }
           continue;
         }
+        if (decision.action === 'resolve-conflict') {
+          state.mergeMain = true;
+          state.steps.push(`盯 CI：和 main 冲突，让 pi 合进最新 main（第 ${state.conflict}/${MAX_CONFLICT} 次）`);
+          await updateComment({ gate, state, status: '等 CI', note: '和 main 冲突，正在合进最新 main', sleep, now });
+          state.stage = 'fix';
+          continue;
+        }
         if (decision.action === 'refix') {
           state.status = `再修 ${state.refix}/2`;
           state.steps.push(`再修：第 ${state.refix}/2 轮`);
@@ -1367,6 +1497,14 @@ export async function runPrbotCorrection({
     }
     return 1;
   } finally {
+    if (state?.issue) {
+      try {
+        state.updatedAt = new Date(now()).toISOString();
+        saveState(paths, state);
+      } catch {
+        // 状态写不下去不影响放锁。
+      }
+    }
     releaseLock(slot.file);
     releaseLock(lockFile);
   }

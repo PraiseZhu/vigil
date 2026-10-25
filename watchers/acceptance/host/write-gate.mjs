@@ -56,6 +56,7 @@ export const PR_READY_QUERY = `query ($owner: String!, $name: String!, $number: 
       headRefName
       headRefOid
       isCrossRepository
+      headRepository { nameWithOwner }
       body
       commits(last: 1) {
         nodes {
@@ -160,7 +161,7 @@ export const PR_STATUS_QUERY = `query ($owner: String!, $name: String!, $number:
 export const PR_BY_BRANCH_QUERY = `query ($owner: String!, $name: String!, $head: String!) {
   repository(owner: $owner, name: $name) {
     pullRequests(first: 10, states: OPEN, headRefName: $head) {
-      nodes { number url isDraft headRefName headRefOid body }
+      nodes { number url isDraft headRefName headRefOid isCrossRepository headRepository { nameWithOwner } body }
     }
   }
 }`;
@@ -431,7 +432,7 @@ export function createGate({
     return { code: 0, body: { data: data ?? {} } };
   }
 
-  async function checkPrReady(action, { number, root }) {
+  async function checkPrReady(action, { number, root, forkRepos = [] }) {
     const [owner, name] = String(action.repo || '').split('/');
     const data = await github.graphql(PR_READY_QUERY, {
       owner,
@@ -441,7 +442,13 @@ export function createGate({
     const pr = data?.repository?.pullRequest;
     if (!pr) return reject('not-in-tree', `找不到 PR ${action.repo}#${action.pr}`);
     // 从 fork 来的 PR 一律不认：分支名、正文谁都能照抄，只有本仓里的分支才是验收机推的。
-    if (pr.isCrossRepository !== false) return reject('not-in-tree', 'PR 来自 fork（跨仓），不是验收机推的分支');
+    if (pr.isCrossRepository !== false) {
+      // 唯一例外：fork 模式的修正 PR，head 仓必须是配置里写死的 fork 仓（不认通配）。
+      const headRepo = String(pr.headRepository?.nameWithOwner || '');
+      if (pr.isCrossRepository !== true || !headRepo || !forkRepos.includes(headRepo)) {
+        return reject('not-in-tree', 'PR 来自 fork（跨仓），不是验收机推的分支');
+      }
+    }
     // 只认本轮任务树里的修正 PR：head 分支是 acceptance/<总 issue 号>-…，正文带本轮总 issue 的修正标记。
     const head = String(pr.headRefName || '');
     const match = BRANCH_PATTERN.exec(head.includes(':') ? head.slice(head.indexOf(':') + 1) : head);
@@ -526,12 +533,15 @@ export function createGate({
       parseRef(marker.root).repo,
       tree.root.ref.split('#')[0],
     ]);
-    if (tree.root.fork) {
-      for (const repo of profile.forkRepos || []) {
-        if (!repo.includes('*')) repos.add(repo);
-      }
-    }
+    const fork = correctionForkRepo(marker, tree);
+    if (fork) repos.add(fork);
     return repos;
+  }
+
+  /** fork 模式：上游仓在 forkRepos 里，推送 / PR head 在 ownerLogin 名下同名的 fork 仓。 */
+  function correctionForkRepo(marker, tree) {
+    if (!tree.root.fork) return null;
+    return `${profile.ownerLogin}/${parseRef(marker.root).name}`;
   }
 
   async function correctionContext() {
@@ -576,6 +586,12 @@ export function createGate({
       const match = CORRECTION_CLAIM_LINE.exec(firstLine(action.body));
       if (!match) return reject('not-current-round', '认领首行必须是「[修正机] 第 m 轮：修正中」');
       const m = Number(match[1]);
+      if (latest && !CORRECTION_TERMINAL.has(latest.status)) {
+        return reject('round-in-progress', `第 ${latest.round} 轮还在进行（${latest.status}），不能再认领新一轮`);
+      }
+      if (latest && !((Date.parse(latestRoot.createdAt || '') || 0) > (Date.parse(latest.createdAt || '') || 0))) {
+        return reject('not-current-round', `第 ${latest.round} 修正轮之后总 issue 还没有新的「要修」裁决`);
+      }
       if (m !== Number(binding.round) || m !== maxRound + 1 || m > 2) {
         return reject('not-current-round', `期望第 ${Math.min(maxRound + 1, 2)} 轮，收到第 ${m} 轮`);
       }
@@ -607,6 +623,8 @@ export function createGate({
       case 'branch.push': {
         if (action.branch !== branch) return reject('not-allowed', `只能推 ${branch}`);
         if (!allowedRepos.has(action.repo)) return reject('not-allowed', `${action.repo} 不是这个修正轮的仓`);
+        const forkRepo = correctionForkRepo(marker, tree);
+        if (forkRepo && action.repo !== forkRepo) return reject('not-allowed', `fork 模式只推到 ${forkRepo}`);
         return null;
       }
       case 'pr.create': {
@@ -638,13 +656,35 @@ export function createGate({
         if (pr.headRefName !== branch) {
           return reject('not-allowed', `PR 的 head 分支是 ${pr.headRefName || '(空)'}，不是 ${branch}`);
         }
-        if (action.type === 'pr.ready') return checkPrReady(action);
+        if (action.type === 'pr.ready') {
+          const forkRepo = correctionForkRepo(marker, tree);
+          return checkPrReady(action, {
+            number: parseRef(marker.root).number,
+            root: marker.root,
+            forkRepos: forkRepo ? [forkRepo] : [],
+          });
+        }
         const module = GATE_ACTIONS.get(action.type);
         const verdict = module.check(action, { tier: correctionScope.tier });
         if (!verdict.ok) return reject(verdict.reason, `${action.type} 不满足条件`);
         const expected = action.expectedHeadSha || action.headSha;
         if (expected && String(expected) !== String(pr.headRefOid || '')) {
           return reject('head-moved', `动作里的 head ${expected} 和 PR 上的 ${pr.headRefOid || '(空)'} 不一致`);
+        }
+        if (action.type === 'ci.rerun') {
+          // 只重跑这个 PR 当前 head 上的 workflow run：runId 由写闸自己查，不信调用方。
+          const status = await github.graphql(PR_STATUS_QUERY, { owner, name, number: Number(action.pr) });
+          const commit = (status?.repository?.pullRequest?.commits?.nodes || []).at(-1)?.commit || {};
+          const runIds = new Set();
+          for (const suite of commit.checkSuites?.nodes || []) {
+            if (suite?.workflowRun?.databaseId != null) runIds.add(Number(suite.workflowRun.databaseId));
+            for (const run of suite?.checkRuns?.nodes || []) {
+              if (run?.checkSuite?.workflowRun?.databaseId != null) runIds.add(Number(run.checkSuite.workflowRun.databaseId));
+            }
+          }
+          if (!runIds.has(Number(action.runId))) {
+            return reject('not-allowed', `run ${action.runId} 不在这个 PR 当前 head 的检查里`);
+          }
         }
         return null;
       }
