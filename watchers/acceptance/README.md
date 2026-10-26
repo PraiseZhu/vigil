@@ -44,7 +44,7 @@
 | `writeCommand` | 否 | 写操作出口 argv；没配则直接用 `gh`/`git` |
 | `appConfigPath` | 否 | GitHub App 配置 JSON；配了读请求走 App 令牌 |
 | `slackBotTokenFile` | 否 | Slack bot 令牌文件（绝对路径）；配了就检查权限是 600，只有 `host/slack-notify.mjs` 读它 |
-| `slackChannelId` | 否 | Slack 频道 id（`C` / `G` 开头）；没配就不发通知 |
+| `slackChannelId` | 否 | Slack 频道 id（`C` / `G` 开头）；没配就不发通知（当前部署不配：通报已关闭，告警只写 `alerts.jsonl`，心跳 `slack.reason=not-configured` 属正常） |
 | `slackMentionUserId` | 否 | 立即发（ping）时 @ 的用户 id（`U` 开头）；摘要不 @ |
 
 Slack 通知怎么配、哪些事件立即发、哪些进摘要，见 [`docs/acceptance-slack.md`](../../docs/acceptance-slack.md)（#61）。

@@ -885,7 +885,7 @@ export async function checkSlackAccess({
   const channel = typeof profile?.slackChannelId === 'string' ? profile.slackChannelId.trim() : '';
   const tokenFile = typeof profile?.slackBotTokenFile === 'string' ? profile.slackBotTokenFile : '';
   // 没配频道就不发通知（notifySlack 也是 not-configured），这一项跳过。
-  if (!channel) return { ok: true, skipped: true, detail: '没配 Slack 频道，跳过' };
+  if (!channel) return { ok: true, skipped: true, detail: '没配 Slack 频道：通报已关闭，告警只写 alerts.jsonl，跳过' };
   if (!CHANNEL_ID.test(channel)) return { ok: false, detail: '频道 id 形状不对（C… / G…）' };
   if (!tokenFile) return { ok: false, detail: '没配 bot 令牌文件' };
   const token = readSlackToken(tokenFile);
