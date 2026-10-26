@@ -45,7 +45,7 @@ test('SC2 owner 档：标题、六个字段、只有一个「打开 PR」按钮�
   const header = payload.blocks[0];
   assert.equal(header.type, 'header');
   assert.equal(header.text.text, `修正 PR 已 Ready：${REPO}#12`);
-  const fields = payload.blocks.find((block) => block.type === 'fields').fields;
+  const fields = payload.blocks.find((block) => block.type === 'section' && Array.isArray(block.fields)).fields;
   const byLabel = Object.fromEntries(fields.map((field) => field.text.split('\n')[0].replaceAll('*', '')).map((label, index) => [label, fields[index].text.split('\n')[1]]));
   assert.equal(byLabel['任务 issue'], `${REPO}#1`);
   assert.equal(byLabel['修正子 issue'], `${REPO}#2`);
@@ -273,7 +273,7 @@ test('#70 复审：打开 PR 的链接要 repo 和 PR 号都对得上，任一�
 test('#61 CI 链接：checks.url 只是 PR 页（prbot 给的）时改成 /checks；没给就按 PR 链接拼 /checks；真 checks 地址原样', () => {
   const ciOf = (event) => {
     const payload = readyBlocks({ event }, {});
-    const fields = payload.blocks.find((block) => block.type === 'fields').fields;
+    const fields = payload.blocks.find((block) => block.type === 'section' && Array.isArray(block.fields)).fields;
     return fields.find((field) => field.text.startsWith('*CI*')).text;
   };
   const prPage = `https://github.com/${REPO}/pull/12`;
@@ -357,4 +357,22 @@ test('gate-rejected 细节行用人话原因；interrupted-repeat / tick-failed-
   const ticksBody = textOf(ticks.blocks);
   assert.match(ticksBody, /验收调度在 10 分钟内连续出错 3 次/);
   assert.equal(ticksBody.includes('tick-failed'), false);
+});
+
+test('Slack 块类型都是 Slack 认的：字段放在 section.fields 里，没有不存在的 fields 块', () => {
+  const allowed = new Set(['section', 'header', 'context', 'actions', 'divider']);
+  const payloads = [
+    readyBlocks({ event: readyEvent() }, {}),
+    readyBlocks({ event: readyEvent({ handoff: 'watcher' }) }, {}),
+    stalledBlocks({ event: readyEvent({ type: 'ready-stalled', readyAt: '2026-10-26T00:00:00Z' }) }, {}),
+  ];
+  for (const payload of payloads) {
+    for (const block of payload.blocks) {
+      assert.ok(allowed.has(block.type), `不认识的块类型：${block.type}`);
+      if (block.fields) {
+        assert.equal(block.type, 'section');
+        assert.ok(block.fields.length <= 10);
+      }
+    }
+  }
 });
