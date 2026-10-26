@@ -410,10 +410,11 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 审计发现分两级：
 
 - **明确违规**（`level: violation`）：写闸规则写得死死的、不用补上下文就能判定的几种——`pr-merge`、`comment-delete`、
-  `repo-out-of-scope`、`tier-not-allowed`、`verdict-only-write`、`round-comment-modified`、`round-comment-missing`。
+  `repo-out-of-scope`、`tier-not-allowed`、`verdict-only-write`、`round-comment-modified`、`round-comment-missing`，
+  以及白名单之外的写类型 `type-not-allowed`、账本已审计部分被改写或截短 `ledger-rewritten`。
   这些写审计日志、写 `gate-audit-violation` 提醒（Slack 立即发），也让 `doctor` 变红、命令行退出码 1。
-- **拿不准**（`level: uncertain`）：认不出记录格式、或缺轮次 / 账本完整性上下文——`no-round`、`round-mismatch`、
-  `unverifiable`、`type-not-allowed`、`ledger-corrupt`、`ledger-rewritten`。这些**只记日志**，绝不写提醒、
+- **拿不准**（`level: uncertain`）：认不出记录格式、缺轮次上下文、或账本有读不出的行——`no-round`、`round-mismatch`、
+  `unverifiable`、`ledger-corrupt`。这些**只记日志**，绝不写提醒、
   不让 `doctor` 变红；命令行报 2（只提示有人看一眼，不当事故）。不认识的规则按拿不准处理。
 
 逐条核对的五条规则：
@@ -447,7 +448,7 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
   `baseline.uncertain` 计拿不准；`baseline.sample` 两类都可以带），不报、不发提醒。
 - 之后只核对基线 / 上次之后新增的行（心跳里的 `checked` 就是这次核对了多少行）。
 - 同一条发现按指纹（规则 + 行号 + 明细 + 原始行）只报一次，指纹留在状态文件里（最多 5000 条）；两类共用同一份已报指纹。
-- 账本应只追加：已审计过的部分被改写或截短时报一次 `ledger-rewritten`（拿不准，只记日志），然后从头重新核对（报过的不重复）。
+- 账本应只追加：已审计过的部分被改写或截短时报一次 `ledger-rewritten`（明确违规：发提醒、`doctor` 变红），然后从头重新核对（报过的不重复）。
 
 状态与明细：
 

@@ -36,7 +36,7 @@ export const SUMMARY_LIMIT = 50;
 /** 「拿不准」的近 N 小时条数窗口。 */
 export const UNCERTAIN_WINDOW_HOURS = 24;
 
-/** 明确违规：写闸规则写得死死的、不用补充上下文就能判定的那几种。 */
+/** 明确违规：写闸规则写得死死的、不用补充上下文就能判定的那几种；白名单外的写类型、账本被改写或截短也算。 */
 export const DEFINITE_RULES = new Set([
   'pr-merge',
   'comment-delete',
@@ -45,16 +45,16 @@ export const DEFINITE_RULES = new Set([
   'verdict-only-write',
   'round-comment-modified',
   'round-comment-missing',
+  'type-not-allowed',
+  'ledger-rewritten',
 ]);
 
-/** 拿不准：认不出记录格式、缺轮次 / 账本完整性上下文，只记日志。 */
+/** 拿不准：认不出记录格式、缺轮次上下文、账本有读不出的行，只记日志。 */
 export const UNCERTAIN_RULES = new Set([
   'no-round',
   'round-mismatch',
   'unverifiable',
-  'type-not-allowed',
   'ledger-corrupt',
-  'ledger-rewritten',
 ]);
 
 /** 规则 → 'violation' | 'uncertain'。不认识的规则按「拿不准」处理（宁可少报，不误报）。 */
@@ -579,7 +579,7 @@ export function formatSummary(summary) {
  * 跑一次审计（可单独跑、可增量）：
  * - 第一次跑（没有状态文件）：以当时账本末尾为基线，基线前的记录只统计、不报；
  * - 之后只核对基线 / 上次之后新增的行；已报过的发现（指纹）不再报；
- * - 账本已审计部分被改写或截短：报一次 ledger-rewritten（拿不准），并从头重新核对（报过的不重复）。
+ * - 账本已审计部分被改写或截短：报一次 ledger-rewritten（明确违规），并从头重新核对（报过的不重复）。
  * `github` 给了才做只读的轮次评论核对（doctor / 命令行用；常驻循环每拍不查 GitHub）。
  * 明确违规才写提醒；拿不准只记日志。
  * 返回 {ok, status, checkedLines, newViolations, newUncertain, sinceBaseline, uncertainSinceBaseline, uncertain24h, baseline}。
