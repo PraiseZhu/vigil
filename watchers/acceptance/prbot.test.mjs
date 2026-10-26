@@ -561,6 +561,12 @@ test('SC1/SC2/SC5/SC11 一次完整跑通：认领 → 评估 → 修复 → Dra
   const prCreate = actions.find((action) => action.type === 'pr.create');
   assert.equal(prCreate.body.split('\n')[0], `任务 issue：${REPO}#1`);
   assert.equal(prCreate.body.includes(CORRECTION_MARKER), true, 'PR 正文照抄修正子 issue 的标记');
+  // #93：正文按 task-pr/v1 逐段对应修正子 issue；范围对照写的是真正要推的 bundle 里的改动文件。
+  for (const heading of ['改了什么', '范围对照', '验收对照', '定下的决定', '未执行的验证', '风险与回滚']) {
+    assert.match(prCreate.body, new RegExp(`^## ${heading}$`, 'm'), heading);
+  }
+  assert.match(prCreate.body, /^- 本 PR 改了：`src\/app\.mjs`/m);
+  assert.equal(prCreate.body.split('\n').filter((line) => /^\|\s*SC\d+/.test(line)).length, 1);
   // 宿主上对 pi 写过的工作树跑 git：钩子和 fsmonitor 关掉，环境里没有令牌。
   const diffRun = runs.find((entry) => entry.args.includes('diff'));
   assert.ok(diffRun);

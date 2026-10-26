@@ -1178,17 +1178,91 @@ export function cleanupWorktrees({ home, profile, fsImpl = fs } = {}) {
 }
 
 /**
- * 修正 PR 正文：首行链任务 issue；第二行「Closes <修正子 issue>」（合并后 GitHub 关掉修正子 issue，trigger 才会再验）；
- * 修正标记原样照抄修正子 issue 的（轮次是验收轮，不是修正轮）。
+ * 修正子 issue 正文里 PR 正文要用的事实：SC1 原文（「## 验收标准」下第一条 SC1）和没过的原因（「## 没过的原因」）。
+ * 读不出来就留空，正文里退回写验收项编号。
+ */
+export function correctionIssueFacts(body) {
+  const sections = new Map();
+  let current = null;
+  for (const line of String(body || '').split('\n')) {
+    const heading = /^##\s+(.+?)\s*$/.exec(line);
+    if (heading) {
+      current = heading[1];
+      sections.set(current, []);
+    } else if (current) {
+      sections.get(current).push(line);
+    }
+  }
+  const scLine = (sections.get('验收标准') || []).map((line) => /^\s*[-*]\s*(?:\[[ xX]\])?\s*(SC1\b.*)$/.exec(line)).find(Boolean);
+  const why = (sections.get('没过的原因') || []).map((line) => line.trim()).filter(Boolean).join(' ');
+  return { scText: scLine ? scLine[1].trim() : '', why };
+}
+
+const MAX_BODY_FILES = 30;
+
+function bodyCell(text) {
+  return String(text || '').replace(/\s+/g, ' ').replace(/\|/g, '\\|').trim();
+}
+
+/**
+ * 修正 PR 正文（task-pr/v1，和修正子 issue 逐段对应）：首行链任务 issue；第二行「Closes <修正子 issue>」
+ * （合并后 GitHub 关掉修正子 issue，trigger 才会再验）；最后一行修正标记原样照抄修正子 issue 的（轮次是验收轮，不是修正轮）。
+ * 这三行写闸都认，不能动。正文只在 pr.create 时写一次（写闸没有改 PR 正文的动作），所以状态只写开 PR 时已有的证据。
  */
 export function correctionPrBody(state, marker) {
   const prRepo = state.prRepo || parseRef(state.issue || state.root).repo;
-  const lines = [`任务 issue：${state.root}`];
-  if (state.issue) lines.push(closesLine(state.issue, prRepo));
+  const head = [`任务 issue：${state.root}`];
+  if (state.issue) head.push(closesLine(state.issue, prRepo));
+  const facts = state.correctionFacts || {};
+  const scText = facts.scText || `SC1 ${state.item} SC${state.sc} 重新验收通过`;
+  const files = Array.isArray(state.changedFiles) ? state.changedFiles : [];
+  const shown = files.slice(0, MAX_BODY_FILES).map((file) => `\`${bodyCell(file)}\``).join('、');
+  const fileLine = files.length
+    ? `${shown}${files.length > MAX_BODY_FILES ? ` 等 ${files.length} 个文件` : ''}（复现测试和最小修复）`
+    : '见本 PR 的改动文件（复现测试和最小修复）';
+  const preflight = state.preflight || null;
+  const passed = Boolean(preflight?.ok && preflight.commands?.length);
+  const evidence = passed
+    ? `pi 写了复现测试和最小修复 → 目标仓预检 ${preflight.commands.map((command) => `\`${bodyCell(command)}\``).join('、')} 在沙箱通过 → 修正轮第 ${state.round} 轮`
+    : '—';
+  const disputes = (state.disputes || []).map(
+    (item) => `- 争议未修：${item.ref} SC${item.sc}（验收方：${bodyCell(redact(String(item.acceptance || ''))) || '裁决是要修'}；修正方：${bodyCell(redact(String(item.reason || ''))) || '没写理由'}），交给人裁。`,
+  );
+  const unrun = [`- SC1 由验收机在本 PR 合并、修正子 issue 关闭后再验；CI 结果看本 PR 的检查。`];
+  if (!passed) unrun.push(`- 目标仓没有配置预检（${bodyCell(state.preflightNote) || '未跑'}），开 PR 时还没有 SC1 的验证证据。`);
   return [
-    ...lines,
+    ...head,
     '',
     `> 修正 PR · 原属 ${state.item} SC${state.sc} · 修正轮第 ${state.round} 轮`,
+    '',
+    '## 改了什么',
+    '',
+    `修正验收没过的 ${state.item} SC${state.sc}：${bodyCell(scText.replace(/^SC1\s*/, ''))}${facts.why ? `。没过的原因：${bodyCell(facts.why)}` : ''}`,
+    '',
+    '## 范围对照',
+    '',
+    `- 本 PR 改了：${fileLine}`,
+    '- 超出 issue 范围：无（推之前按禁改路径检查过）',
+    `- 明确不包含：${disputes.length ? '有争议的条目不修（见「定下的决定」）；' : ''}不改修正子 issue 以外的验收项`,
+    '- 依赖：无',
+    '',
+    '## 验收对照',
+    '',
+    '| 验收项 | 状态 | 证据 |',
+    '|---|---|---|',
+    `| ${bodyCell(scText)} | ${passed ? '通过' : '待验证'} | ${evidence} |`,
+    '',
+    '## 定下的决定',
+    '',
+    ...(disputes.length ? disputes : ['无']),
+    '',
+    '## 未执行的验证',
+    '',
+    ...unrun,
+    '',
+    '## 风险与回滚',
+    '',
+    '只改修正子 issue 对应验收项的代码和测试；回滚：revert 本 PR 的合并提交。',
     '',
     `[验收机] 修正 · 总 ${marker.root} · 项 ${marker.item} SC${marker.sc} · 第 ${marker.round} 轮`,
   ].join('\n');
@@ -1358,6 +1432,7 @@ export async function runPrbotCorrection({
       state.forbiddenPaths = hits;
       return false;
     }
+    state.changedFiles = files;
     return true;
   };
   const gateFor = (binding) =>
@@ -1418,6 +1493,7 @@ export async function runPrbotCorrection({
     state.rootRepo = parseRef(marker.root).repo;
     state.prRepo = state.prRepo || state.rootRepo;
     state.branch = correctionBranch(marker);
+    state.correctionFacts = correctionIssueFacts(pre.correction?.body);
     state.handoff = handoffFor(settings, state.repo);
     state.verdict = null;
 
@@ -1657,6 +1733,7 @@ export async function runPrbotCorrection({
       }
 
       if (state.stage === 'preflight') {
+        delete state.preflight;
         const commands = preflightCommands(repoConfig(settings, state.repo));
         if (commands === null) {
           // 配置写错了：fail-closed，报一次需人工处理，不是每拍崩。
@@ -1709,6 +1786,7 @@ export async function runPrbotCorrection({
           else state.stage = 'fix';
           continue;
         }
+        state.preflight = { ok: true, commands: commands.map((command) => command.join(' ')) };
         state.steps.push('预检：目标仓自己的推送前检查通过');
         state.stage = 'draft';
         continue;
