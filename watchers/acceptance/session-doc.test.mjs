@@ -223,3 +223,10 @@ test('#46 SC8 docs/acceptance-session.md 写清裁决运行已实现：触发、
   assert.match(doc, /adjudicateMaxMinutes/);
   assert.match(doc, /adjudicate-needs-human/);
 });
+
+test('SESSION.md：close 要带 --verdict（写任何东西之前先查「通过」证据），引用要加引号', () => {
+  assert.match(session, /helper\.mjs close +--issue <root> --round <n> --verified <verified\.json> --verdict <verdict\.json>/);
+  assert.match(session, /写任何东西之前先查里面「通过」条目的证据/);
+  assert.match(session, /引号里的内容不算你自己说的「没跑」/);
+  assert.match(doc, /close --verified <verified\.json> --verdict <verdict\.json>/);
+});

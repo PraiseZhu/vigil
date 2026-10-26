@@ -23,6 +23,7 @@ import {
   defaultTree,
   fullConclusions,
   writeJsonFile,
+  PASS_VERDICT_FILE,
 } from './session.fixture.mjs';
 
 const ROOT_REF = `${REPO}#1`;
@@ -81,6 +82,84 @@ test('evidenceEnvHints：只看「通过」条目，证据里同时有「没跑�
   const reason = envUnverifiedReason({ skipped: ['test'], hints: [`${REPO}#2 SC3`] });
   assert.ok(reason.startsWith(ENV_PROBLEM_PREFIX), reason);
   assert.match(reason, /必需检查因环境原因没跑：测试/);
+});
+
+// vigil#105 第 2 轮 SC3 的真实情况：模型在证据里引用了测试场景原文「都没跑（依赖没装上）」，
+// 检查其实都真跑了（npm test 565 项 0 失败），却被关键词检查当成「因环境没跑」，误判成环境问题。
+// 当时的 verdict.json 没留在箱上，下面用它引用的原话加 SC3 的场景描述拼成证据。
+const SC3_105_EVIDENCE =
+  '`node --test watchers/acceptance/verdict-guard.test.mjs` 10/10 通过；用例「checks 都写 ran，但「通过」证据写着因环境没跑」里证据写「都没跑（依赖没装上）」，verdict 退出码 6、标「中断」';
+
+test('evidenceEnvHints：引号和反引号里的引用不算（vigil#105 SC3 原话「都没跑（依赖没装上）」不能触发）', () => {
+  const pass = (sc, evidence) => ({ ref: `${REPO}#2`, sc, result: '通过', evidence });
+  const items = [
+    pass(1, SC3_105_EVIDENCE),
+    pass(2, '场景原文“都没跑（依赖没装上）”，测试 10/10 通过'),
+    pass(3, '场景原文"vitest 没跑：依赖装不上"，测试 10/10 通过'),
+    pass(4, '场景原文 `tests not run: sandbox offline`，测试 10/10 通过'),
+    pass(5, '都没跑（依赖没装上）'),
+  ];
+  assert.deepEqual(evidenceEnvHints(items), [`${REPO}#2 SC5`], '只有没加引号的那条算');
+});
+
+test('evidenceEnvHints：「没跑」和环境原因要在同一句才算', () => {
+  const pass = (sc, evidence) => ({ ref: `${REPO}#2`, sc, result: '通过', evidence });
+  const items = [
+    pass(1, 'e2e 没跑，本条不涉及 UI。依赖装好了，npm test 565 项 0 失败'),
+    pass(2, 'Tests could not run. The sandbox is fine, 565 passed'),
+    pass(3, '测试没跑，因为沙箱里依赖没装上'),
+    pass(4, 'npm test 没跑；沙箱 offline'),
+  ];
+  assert.deepEqual(evidenceEnvHints(items), [`${REPO}#2 SC3`, `${REPO}#2 SC4`]);
+});
+
+test('vigil#105 SC3 原样证据：close 和 verdict 都放行，判「通过」', async () => {
+  const { profile, home } = setup();
+  const world = defaultTree();
+  const items = fullConclusions({ [`${REPO}#2 SC3`]: { evidence: SC3_105_EVIDENCE } });
+  const verdict = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items });
+  const verified = writeJsonFile(home, 'verified.json', {
+    checks: ALL_RAN,
+    items: [{ ref: `${REPO}#2`, sc: 3 }],
+    manual: [],
+  });
+  const closed = await helper(world, profile, [
+    'close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', verdict,
+  ]);
+  assert.equal(closed.code, 0, closed.err);
+  const result = await helper(world, profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', verdict]);
+  assert.equal(result.code, 0, result.err);
+  assert.match(rootComment(world).body.split('\n')[0], /第 1 轮：通过/);
+});
+
+test('close：verdict.json 里「通过」证据写着因环境没跑 → 写任何东西之前就停：退出码 6、不勾选、不写看板、不关单', async () => {
+  const { profile, home } = setup();
+  const world = defaultTree();
+  const items = fullConclusions({ [`${REPO}#2 SC3`]: { evidence: 'build/typecheck/vitest 都没跑（依赖没装上）' } });
+  const verdict = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items });
+  const verified = writeJsonFile(home, 'verified.json', {
+    checks: ALL_RAN,
+    items: [{ ref: `${REPO}#2`, sc: 3 }],
+    manual: [],
+  });
+  const before = world.get(`${REPO}#2`).body;
+  const result = await helper(world, profile, [
+    'close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', verdict,
+  ]);
+  assertEnvInterrupted(world, result);
+  assert.match(rootComment(world).body, /「通过」条目的证据写着因环境没跑：.*SC3/);
+  assert.equal(world.get(`${REPO}#2`).body, before);
+});
+
+test('close：没给 --verdict（证据没法先查）→ 退出码 1、零写入', async () => {
+  const { profile, home } = setup();
+  const world = defaultTree();
+  const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN, items: [{ ref: `${REPO}#2`, sc: 3 }], manual: [] });
+  const result = await helper(world, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified]);
+  assert.equal(result.code, 1);
+  assert.match(result.err, /--verdict/);
+  assert.equal(world.writes.length, 0);
+  assert.match(rootComment(world).body, /第 1 轮：验收中/);
 });
 
 test('verdict 判通过但 checks 里有 env-skipped → 退出码 6、这一轮标中断（环境问题）、不写通过', async () => {
@@ -142,7 +221,7 @@ test('close：verified.json 里有 env-skipped → 先标中断、退出码 6，
     manual: [],
   });
   const before = world.get(`${REPO}#2`).body;
-  const result = await helper(world, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified]);
+  const result = await helper(world, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
   assertEnvInterrupted(world, result);
   assert.equal(world.get(`${REPO}#2`).body, before);
 });
@@ -151,7 +230,7 @@ test('close：verified.json 没写 checks → 退出码 1、零写入', async ()
   const { profile, home } = setup();
   const world = defaultTree();
   const verified = writeJsonFile(home, 'verified.json', { items: [{ ref: `${REPO}#2`, sc: 3 }], manual: [] });
-  const result = await helper(world, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified]);
+  const result = await helper(world, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
   assert.equal(result.code, 1);
   assert.match(result.err, /close 的 verified\.json 缺少 checks/);
   assert.equal(world.writes.length, 0);
@@ -185,7 +264,7 @@ test('环境未验证的中断：trigger 按环境退避重试（不是 up-to-da
     items: [{ ref: `${REPO}#2`, sc: 3 }],
     manual: [],
   });
-  await helper(world, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified]);
+  await helper(world, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
   const rounds = parseRounds(world.get(ROOT_REF).comments, OWNER);
   assert.equal(rounds.at(-1).status, '中断');
   assert.ok(rounds.at(-1).reason.startsWith(ENV_PROBLEM_PREFIX));

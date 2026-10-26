@@ -52,19 +52,60 @@ export function envSkippedChecks(checks) {
   return REQUIRED_CHECKS.filter((key) => checks?.[key] === 'env-skipped');
 }
 
-// 「通过」条目的证据里同时出现「没跑」类说法和环境类原因，也按环境没跑处理（防止 checks 写了 ran、证据却写没跑）。
+// 「通过」条目的证据里同一句同时出现「没跑」类说法和环境类原因，也按环境没跑处理（防止 checks 写了 ran、证据却写没跑）。
 const NOT_RUN = /(没(有)?跑|没法跑|跑不了|未(能)?(运行|执行|跑)|无法(运行|执行|跑)|not\s+(been\s+)?(run|executed)|could\s*n[o']t\s+(run|execute)|cannot\s+(run|execute)|unable\s+to\s+(run|execute))/i;
 const ENV_CAUSE = /(环境|依赖|node_modules|npm|pnpm|yarn|registry|网络|出网|断网|离线|offline|沙箱|sandbox|EAI_AGAIN|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|装不上|没装|未安装)/i;
+
+// 引用不算：证据里常会引用场景原文或别人的话（vigil#105 SC3 就是引用了「都没跑（依赖没装上）」被误判），
+// 「」、“”、""、反引号里的内容先去掉再看。「」可以嵌套，从最里层一层层去掉。
+const QUOTED = [/「[^「」]*」/g, /“[^“”]*”/g, /"[^"\n]*"/g, /```[\s\S]*?```/g, /`[^`\n]*`/g];
+// 「没跑」和环境原因要在同一句：按句号、问号、感叹号、换行和英文句点断句（逗号、分号不断，宁可多拦）。
+const SENTENCE_BREAK = /[。！？!?\n]+|\.(?=\s|$)/;
+
+function stripQuoted(text) {
+  let out = String(text || '');
+  for (let before = null; before !== out; ) {
+    before = out;
+    for (const pattern of QUOTED) out = out.replace(pattern, ' ');
+  }
+  return out;
+}
+
+/** 证据（去掉引用后）里有没有一句同时写着「没跑」类说法和环境类原因。 */
+export function saysEnvNotRun(text) {
+  return stripQuoted(text)
+    .split(SENTENCE_BREAK)
+    .some((sentence) => NOT_RUN.test(sentence) && ENV_CAUSE.test(sentence));
+}
 
 /** 「通过」条目里证据写着「因环境没跑」的：返回 `owner/repo#n SC<k>` 列表。 */
 export function evidenceEnvHints(items = []) {
   const out = [];
   for (const item of items) {
     if (item?.result !== '通过') continue;
-    const text = String(item.evidence || '');
-    if (NOT_RUN.test(text) && ENV_CAUSE.test(text)) out.push(`${item.ref} SC${item.sc}`);
+    if (saysEnvNotRun(item.evidence)) out.push(`${item.ref} SC${item.sc}`);
   }
   return out;
+}
+
+/**
+ * close 的 --verdict：读 verdict.json 的 items（带证据），让 close 在勾选 / 写看板 / 关单之前就查证据。
+ * 没给、读不到、items 不是非空数组：抛普通错误（退出码 1），什么都不写。
+ */
+export function readVerdictItems(file) {
+  if (typeof file !== 'string' || !file) {
+    throw new Error('close 需要 --verdict <verdict.json>（就是随后给 verdict 的那份）：要先查「通过」条目的证据，再勾选、写看板、关单');
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (error) {
+    throw new Error(`读不到 verdict.json ${file}：${error.message}`);
+  }
+  if (!Array.isArray(parsed?.items) || !parsed.items.length) {
+    throw new Error(`verdict.json ${file} 的 items 是空的：close 要先查每条「通过」的证据`);
+  }
+  return parsed.items;
 }
 
 /** 中断原因（写进轮次评论「原因：」行；以 ENV_PROBLEM_PREFIX 开头，trigger 按环境退避）。 */
