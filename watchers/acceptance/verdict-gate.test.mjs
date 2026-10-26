@@ -31,6 +31,8 @@ import {
   defaultTree,
   fullConclusions,
   writeJsonFile,
+  ALL_RAN,
+  ALL_RAN_CHECKS_FILE,
 } from './session.fixture.mjs';
 
 const ROOT_REF = `${REPO}#1`;
@@ -191,7 +193,7 @@ test('配置模板里有 verdictOnlyIssues 占位，而且模板本身能过校�
 
 test('verdict-only：close / correct / push 一律退出码 1、零写入、写清原因；collect 标出 verdictOnly', async () => {
   const { profile, home } = setup({ profile: { verdictOnlyIssues: [ROOT_REF] } });
-  const verified = writeJsonFile(home, 'verified.json', { items: [{ ref: `${REPO}#2`, sc: 3 }], manual: [] });
+  const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN, items: [{ ref: `${REPO}#2`, sc: 3 }], manual: [] });
   const commands = [
     ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified],
     ['correct', '--issue', ROOT_REF, '--round', '1', '--item', `${REPO}#2 SC3`, '--why', 'x'],
@@ -265,16 +267,16 @@ test('端到端 verdict-only：helper → 真写闸，裁决照写并带「本 i
   const gate = openGate({ home, profile, world, binding: bindingFor(world) });
   await gate.start();
   const github = realGithubThroughGate({ profile, world, gate });
-  const verified = writeJsonFile(home, 'verified.json', { items: [{ ref: `${REPO}#2`, sc: 3 }], manual: [] });
+  const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN, items: [{ ref: `${REPO}#2`, sc: 3 }], manual: [] });
 
   const close = await helper(github, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified]);
   assert.equal(close.code, 1, close.err);
   assert.equal(github.gateCalls.length, 0, 'helper 侧先拒，动作根本没到写闸');
 
-  const board = await helper(github, profile, ['board', '--issue', ROOT_REF, '--round', '1', '--target', 'all', '--acceptance', '通过']);
+  const board = await helper(github, profile, ['board', '--issue', ROOT_REF, '--round', '1', '--target', 'all', '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE]);
   assert.equal(board.code, 0, board.err);
 
-  const file = writeJsonFile(home, 'verdict.json', { items: fullConclusions() });
+  const file = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items: fullConclusions() });
   const verdict = await helper(github, profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', file]);
   assert.equal(verdict.code, 0, verdict.err);
   const body = rootComment(world).body;
@@ -299,7 +301,7 @@ test('helper：写闸回 4 verdict-only（绕过 helper 的情形）→ 退出�
       },
     }),
     profile,
-    ['board', '--issue', ROOT_REF, '--round', '1', '--acceptance', '通过'],
+    ['board', '--issue', ROOT_REF, '--round', '1', '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE],
   );
   assert.equal(result.code, 4);
   assert.match(rootComment(world).body, /第 1 轮：验收中/);
@@ -310,7 +312,7 @@ test('helper：写闸回 4 verdict-only（绕过 helper 的情形）→ 退出�
 test('close 顺序 勾选 → 看板 → 关单：看板写失败就停在关单之前，issue 还开着', async () => {
   const { profile, home } = setup();
   const world = defaultTree();
-  const verified = writeJsonFile(home, 'verified.json', { items: [{ ref: `${REPO}#2`, sc: 3 }], manual: [] });
+  const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN, items: [{ ref: `${REPO}#2`, sc: 3 }], manual: [] });
   const result = await helper(
     createFakeGithub(world, {
       onWrite: (action) => {
@@ -335,7 +337,7 @@ test('端到端 close：helper → 真写闸，勾选（含 CRLF 正文）→ �
   const gate = openGate({ home, profile, world, binding: bindingFor(world) });
   await gate.start();
   const github = realGithubThroughGate({ profile, world, gate });
-  const verified = writeJsonFile(home, 'verified.json', {
+  const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN,
     items: [{ ref: `${REPO}#2`, sc: 3 }],
     manual: [{ ref: `${REPO}#2`, sc: 5 }],
   });
@@ -399,6 +401,7 @@ test('verdict 覆盖率：任务树里有 SC 没结论 → 退出码 1、点名�
   // 提炼出来的标准（extracted: true）覆盖率按任务树算：树里没有 SC，就只要求非空。
   const extracted = writeJsonFile(home, 'extracted.json', {
     extracted: true,
+    checks: ALL_RAN,
     items: [{ ref: ROOT_REF, sc: 1, result: '通过', evidence: 'ok' }],
   });
   bare.get(ROOT_REF).state = 'closed';
@@ -422,7 +425,7 @@ test('端到端 verdict：helper → 真写闸，全覆盖的裁决放行；时�
   const gate = openGate({ home, profile, world, binding: bindingFor(world) });
   await gate.start();
   const github = realGithubThroughGate({ profile, world, gate });
-  const file = writeJsonFile(home, 'verdict.json', {
+  const file = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN,
     items: fullConclusions({ [`${REPO}#2 SC4`]: { result: '要修', why: '没写' } }),
   });
   const result = await helper(github, profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', file]);
@@ -806,7 +809,7 @@ test('helper：写闸退出码 1 → helper 退出码 1（不是 4），这一�
       },
     }),
     profile,
-    ['board', '--issue', ROOT_REF, '--round', '1', '--acceptance', '通过'],
+    ['board', '--issue', ROOT_REF, '--round', '1', '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE],
   );
   assert.equal(result.code, 1);
   const body = rootComment(world).body;
@@ -858,7 +861,7 @@ test('helper push：写闸扫到密钥时回的文件名记进「需人工处理
   );
   assert.equal(code, 4, err.text);
   assert.deepEqual(readNeedsHuman(profile, ROOT_REF, 1), [{ reason: 'secret-found', files }]);
-  const file = writeJsonFile(home, 'verdict.json', { items: fullConclusions() });
+  const file = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items: fullConclusions() });
   const verdict = await helper(createFakeGithub(world), profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', file]);
   assert.equal(verdict.code, 0, verdict.err);
   const body = rootComment(world).body;

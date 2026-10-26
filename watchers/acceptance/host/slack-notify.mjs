@@ -45,6 +45,7 @@ export const INTERRUPTION_ALERT_KINDS = Object.freeze([
   'round-stale',
   'round-timeout',
   'deps-failed',
+  'env-unverified',
 ]);
 
 /** 立即发（ping）的 alert kind。gate-audit-violation 不走 6 小时去重：审计自己已按违规指纹去重。 */
@@ -63,6 +64,7 @@ export const PROMPT_ALERT_KINDS = Object.freeze([
   'sandbox-down',
   'prefetch-failed',
   'deps-failed',
+  'env-unverified',
   'gate-rejected',
   'write-rejected',
   'loop-restarted',

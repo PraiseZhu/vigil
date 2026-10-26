@@ -392,6 +392,14 @@ export const NOTICE_COPY = Object.freeze({
     action: '先不用；同一任务反复出现请让修复员查 npm 源或这个仓的 lockfile。',
     needsHuman: false,
   },
+  'env-unverified': {
+    title: '必需检查没跑成，这一轮不判通过（环境问题，未验证）',
+    what: '验收时 build、typecheck 或测试里至少有一项因为环境原因没跑（比如依赖没装上、沙箱里缺工具），验收机不能据此判「通过」。',
+    impact: '这个任务这一轮没出结论：不关单、不打勾、看板不写「通过」，也不会被判不通过；其它任务照常。',
+    auto: '已把这一轮标「中断」并写明是环境问题，按退避稍后自动重验，同一任务连续出现时间隔拉长到 30 分钟、2 小时、6 小时。',
+    action: '先不用；同一任务反复出现请让修复员看看是哪项检查跑不起来、缺什么环境。',
+    needsHuman: false,
+  },
   'loop-restarted': {
     title: '验收机调度循环被重新拉起',
     what: '保活脚本发现调度循环不正常。',

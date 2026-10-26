@@ -17,6 +17,8 @@ import {
   defaultTree,
   fullConclusions,
   writeJsonFile,
+  ALL_RAN,
+  ALL_RAN_CHECKS_FILE,
 } from './session.fixture.mjs';
 
 function loadProfile(extra = {}) {
@@ -49,7 +51,7 @@ async function run(world, profile, argv, extra = {}) {
 }
 
 function verdictFile(home, data) {
-  return writeJsonFile(home, 'verdict.json', data);
+  return writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, ...data });
 }
 
 function writesOf(world, type) {
@@ -170,7 +172,7 @@ test('SC3 关闭勾选后按改后的正文记版本，trigger 不会因此重�
   root.prs = [{ number: 12, url: `https://github.com/${REPO}/pull/12`, mergedAt: '2026-10-20T00:00:00.000Z' }];
   const before = bodyVersion(root.body);
 
-  const verified = writeJsonFile(home, 'verified.json', {
+  const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN,
     items: [{ ref: `${REPO}#1`, sc: 1 }],
     manual: [{ ref: `${REPO}#1`, sc: 1 }],
   });

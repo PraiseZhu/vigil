@@ -281,6 +281,16 @@ function fileSize(file) {
 }
 
 /** status --json 说这一轮已经是终态（通过 / 要修 / 中断）了吗。 */
+/** 本轮被 helper 按裁决防线标成「中断」（环境问题 / 未验证）：必需检查因环境没跑，不能判通过。 */
+function isEnvUnverified(status, round) {
+  return (
+    isTerminalFor(status, round) &&
+    status.status === '中断' &&
+    typeof status.reason === 'string' &&
+    status.reason.startsWith(ENV_PROBLEM_PREFIX)
+  );
+}
+
 function isTerminalFor(status, round) {
   return Boolean(status) && Number(status.round) === round && typeof status.status === 'string' && status.status !== '验收中';
 }
@@ -638,6 +648,14 @@ export async function runHostRound({
       }
       activity.piLogBytes = fileSize(piLog);
 
+      // 裁决防线（helper 退出码 6）：模型把本轮标成「环境问题 / 未验证」时，宿主写一条 env-unverified 提醒（只写一次）。
+      let envAlerted = false;
+      const noteEnvUnverified = (status) => {
+        if (envAlerted || !isEnvUnverified(status, claim.round)) return;
+        envAlerted = true;
+        appendAlert(paths, { kind: 'env-unverified', issue, round: claim.round, reason: status.reason, now, profile });
+      };
+
       let finished = false;
       const exited = Promise.resolve(pi.exit).then((result) => {
         finished = true;
@@ -664,6 +682,7 @@ export async function runHostRound({
         const statusText = await callRound(['status', '--issue', issue, '--json']);
         const status = parseJsonLastLine(statusText.stdout);
         if (isTerminalFor(status, claim.round)) {
+          noteEnvUnverified(status);
           if (verdictSeenMs === null) verdictSeenMs = now();
           if (now() - verdictSeenMs >= verdictGraceMs) {
             await stopPi();
@@ -689,7 +708,10 @@ export async function runHostRound({
       } catch {
         status = null;
       }
-      if (isTerminalFor(status, claim.round)) return exitCode === 0 ? 0 : 1;
+      if (isTerminalFor(status, claim.round)) {
+        noteEnvUnverified(status);
+        return exitCode === 0 ? 0 : 1;
+      }
       const reason = `pi 退出（code=${exitCode}${result?.signal ? `，${result.signal}` : ''}）但没写裁决`;
       const aborted = await callRound(['abort', '--issue', issue, '--round', String(claim.round), '--reason', reason]);
       // 3 = 已不是第 n 轮「验收中」（回读之后刚好写完裁决）：不算失败。

@@ -18,6 +18,8 @@ import {
   defaultTree,
   fullConclusions,
   writeJsonFile,
+  ALL_RAN,
+  ALL_RAN_CHECKS_FILE,
 } from './session.fixture.mjs';
 
 function loadProfile() {
@@ -75,7 +77,7 @@ test('helper 未知命令 / 缺参数 → 退出码 1 并打印用法', async ()
 test('SC4 close 勾掉已验证的项、人工手测标行尾、关总 issue、看板全部写通过', async () => {
   const { profile, home } = loadProfile();
   const world = defaultTree();
-  const verified = writeJsonFile(home, 'verified.json', {
+  const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN,
     items: [
       { ref: `${REPO}#2`, sc: 3 },
       { ref: `${OTHER_REPO}#7`, sc: 7 },
@@ -124,7 +126,7 @@ test('SC4 close 勾掉已验证的项、人工手测标行尾、关总 issue、�
 test('SC4 close 清单里混进任务树外的 issue → 拒绝且零写入', async () => {
   const { profile, home } = loadProfile();
   const world = defaultTree();
-  const verified = writeJsonFile(home, 'verified-outside.json', {
+  const verified = writeJsonFile(home, 'verified-outside.json', { checks: ALL_RAN,
     items: [
       { ref: `${REPO}#2`, sc: 3 },
       { ref: 'example-owner/unrelated-repo#99', sc: 1 },
@@ -152,7 +154,7 @@ test('SC4/SC5 watch 档 close 一律拒绝且零写入', async () => {
   const rootBody = ['# 交接仓', '', '- [ ] SC1 看一下 验证：unit'].join('\n');
   const root = world.addIssue({ repo: HANDOFF_REPO, number: 3, body: rootBody });
   world.addComment(root.ref, roundComment({ round: 1, status: '验收中', bodyVersion: bodyVersion(rootBody) }));
-  const verified = writeJsonFile(home, 'verified.json', { items: [{ ref: root.ref, sc: 1 }], manual: [] });
+  const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN, items: [{ ref: root.ref, sc: 1 }], manual: [] });
 
   const result = await run(world, profile, [
     'close',
@@ -194,7 +196,7 @@ test('SC10 progress 写最近进度时间，done 要求先有裁决', async () =
 
   // 写裁决之后才能 done。「通过」之前总 issue 要已关（helper close 做的事），这里直接置为已关。
   world.get(`${REPO}#1`).state = 'closed';
-  const verdict = writeJsonFile(home, 'verdict.json', { items: fullConclusions() });
+  const verdict = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items: fullConclusions() });
   const judged = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', verdict]);
   assert.equal(judged.code, 0, judged.err);
   assert.equal(JSON.parse(judged.out).status, '通过');
@@ -245,7 +247,7 @@ test('SC4 board --target 指定单个 issue：树内可写，树外整条拒绝�
 
   world.addIssue({ repo: REPO, number: 50, title: '不相干的 issue', body: '- [ ] SC1 别的事' });
   const outside = await run(world, profile, [
-    'board', '--issue', `${REPO}#1`, '--round', '1', '--target', `${REPO}#50`, '--acceptance', '通过',
+    'board', '--issue', `${REPO}#1`, '--round', '1', '--target', `${REPO}#50`, '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE,
   ]);
   assert.equal(outside.code, 1);
   assert.match(outside.err, /不在本轮任务树里/);
@@ -277,6 +279,8 @@ test('SC9 写闸拒绝（非 secret-found）→ 退出码 4 且这一轮标中�
     '1',
     '--acceptance',
     '通过',
+    '--checks',
+    ALL_RAN_CHECKS_FILE,
   ], {
     onWrite: (action) => {
       if (action.type === 'project.field.set') {
@@ -295,7 +299,7 @@ test('SC9 写闸拒绝（非 secret-found）→ 退出码 4 且这一轮标中�
 test('SC9 写闸忙 → 退出码 1 且这一轮标中断写「写闸忙」', async () => {
   const { profile } = loadProfile();
   const world = defaultTree();
-  const result = await run(world, profile, ['board', '--issue', `${REPO}#1`, '--round', '1', '--acceptance', '通过'], {
+  const result = await run(world, profile, ['board', '--issue', `${REPO}#1`, '--round', '1', '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE], {
     onWrite: (action) => {
       if (action.type === 'project.field.set') throw new WriteBusyError('外发忙');
       return undefined;
@@ -309,10 +313,10 @@ test('SC9 写闸忙 → 退出码 1 且这一轮标中断写「写闸忙」', as
 
 test('SC9 写命令不是本轮 → 退出码 3，零写入，消息写清期望和实际', async () => {
   const { profile, home } = loadProfile();
-  const verified = writeJsonFile(home, 'verified.json', { items: [], manual: [] });
-  const verdict = writeJsonFile(home, 'verdict.json', { items: [] });
+  const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN, items: [], manual: [] });
+  const verdict = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items: [] });
   const commands = [
-    ['board', '--issue', `${REPO}#1`, '--round', '2', '--acceptance', '通过'],
+    ['board', '--issue', `${REPO}#1`, '--round', '2', '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE],
     ['close', '--issue', `${REPO}#1`, '--round', '2', '--verified', verified],
     ['correct', '--issue', `${REPO}#1`, '--round', '2', '--item', `${REPO}#2 SC3`, '--why', 'x'],
     [

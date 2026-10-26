@@ -8,6 +8,7 @@ import { collectTree, fetchIssueBody } from './collect.mjs';
 import { isVerdictOnly } from './profile.mjs';
 import { redact } from './redact.mjs';
 import { readNeedsHuman } from './push.mjs';
+import { guardPass } from './checks.mjs';
 
 export const RESULTS = Object.freeze(['通过', '要修', '人工手测', '有争议']);
 
@@ -176,6 +177,11 @@ export async function runVerdict({ github, profile, ref, n, file, statusFlag, no
     throw new Error(`--status 只能是 通过 或 要修：${statusFlag}`);
   }
   const status = derived;
+  // 裁决防线：判「通过」要写明必需检查；有一项因环境没跑（或「通过」条目的证据写着因环境没跑）就不判通过，
+  // 本轮标「中断」（环境问题 / 未验证），退出码 6。「要修」不受影响：真的没过就是没过。
+  if (status === '通过') {
+    await guardPass({ rounds, ref, n, checks: payload.checks, items, where: 'verdict.json' });
+  }
 
   // 正文版本按「现在」的正文算：验收机自己改了正文（勾选、关 issue），就用改后的版本。
   const fresh = await fetchIssueBody(github, ref);

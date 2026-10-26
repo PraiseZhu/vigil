@@ -295,6 +295,7 @@ async function cmdStatus({ flags, github, profile, now, stdout }) {
     commentId: latest.commentId,
     startedAt: latest.startedAt ?? null,
     finishedAt: latest.finishedAt ?? null,
+    reason: latest.reason ?? null,
     lastProgressAt: progressAt ?? null,
     stalled,
     stallMinutes,

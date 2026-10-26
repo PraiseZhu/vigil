@@ -38,7 +38,7 @@ node watchers/acceptance/bin/helper.mjs progress --issue <root> --round <n>
 ## 2. 怎么验
 
 - 代码已由宿主检出：派发消息的「代码」一节列出本轮任务树里每个仓的绝对路径（宿主检出各仓最新 main 的工作树，带 `.git`），**只读**。直接在那里读代码、看 `git log`；需要可写副本（跑会写文件的测试）时复制到 `TMPDIR` 再用（`cp -a <路径> "$TMPDIR/"`），用完清理。沙箱里没有凭证，**不要**自己 `git clone`（私有仓克隆不下来），也不要往 `worktreeDir` 里检出。
-- 依赖已由宿主预装：派发消息的「依赖」一节写明每个 npm 仓的情况。有 lockfile 的仓，`node_modules` 已按 lockfile 装好（`npm ci --ignore-scripts`）并只读挂在检出目录里，直接 `npm run build` / `npx tsc` / `npx vitest run` 即可。沙箱里 npm 一律离线、连不上 registry，**不要**再跑 `npm ci` / `npm install`。写着「没有预装依赖」的仓，或因为安装脚本没跑而缺的产物，要依赖才能跑的检查属**环境限制**：在证据里写明「环境限制：未预装依赖」，不能据此判不通过，也不能把没跑的检查当作已通过。
+- 依赖已由宿主预装：派发消息的「依赖」一节写明每个 npm 仓的情况。有 lockfile 的仓，`node_modules` 已按 lockfile 装好（`npm ci --ignore-scripts`）并只读挂在检出目录里，直接 `npm run build` / `npx tsc` / `npx vitest run` 即可。沙箱里 npm 一律离线、连不上 registry，**不要**再跑 `npm ci` / `npm install`。写着「没有预装依赖」的仓，或因为安装脚本没跑而缺的产物，要依赖才能跑的检查属**环境限制**：在证据里写明「环境限制：未预装依赖」，不能据此判不通过，也不能把没跑的检查当作已通过——见第 4 节「必需检查」：有一项因环境没跑，这一轮就**不能判通过**。
 - `static`、`unit`、`contract`、`browser-fixture` 逐条跑，每条都留下证据：跑的命令 + 关键输出一行。
 - `cindy-mac`、`cindy-windows`、`paid`、`github-live` 这几种层次**不验**，在裁决里列成「人工手测」；人工手测**不拦关闭**。
 - 勾选框（`- [x]`）只算声称，不算证据：每条都要自己找证据。
@@ -69,19 +69,29 @@ node watchers/acceptance/bin/helper.mjs verdict --issue <root> --round <n> --fil
 node watchers/acceptance/bin/helper.mjs done    --issue <root> --round <n>
 ```
 
-`verified.json` 写 `{"items":[{"ref":"<item>","sc":3}],"manual":[{"ref":"<item>","sc":5}]}`：`items` 是验证通过要打勾的，`manual` 是人工手测项（行尾标「人工手测」）。`ref` 是出处 issue，不是总 issue。
+`verified.json` 写 `{"items":[{"ref":"<item>","sc":3}],"manual":[{"ref":"<item>","sc":5}],"checks":{"build":"ran","typecheck":"ran","test":"ran"}}`：`items` 是验证通过要打勾的，`manual` 是人工手测项（行尾标「人工手测」）。`ref` 是出处 issue，不是总 issue。
 
 `close` 自己按 **勾选 → 看板（总 issue 和每个子 issue 写「通过」）→ 关总 issue** 的顺序做：看板写失败就停在关单之前，issue 还开着，不会「关了但看板没写」。
 
 `verdict` 判「通过」时会回读总 issue：还开着就拒绝（退出码 1），说明 `close` 没做完——不要跳过 `close` 直接写裁决。
 
-只出裁决的任务（`root.verdictOnly`）不跑 `close`：直接 `verdict` 再 `done`（要写看板就先 `board --target all --acceptance 通过`）。
+### 必需检查（checks）
+
+判「通过」之前，`close` 的 `verified.json`、`verdict.json`、`board --acceptance 通过` 的 `--checks <file>`（可以直接给 `verdict.json`）都要写 `checks`，把三项必需检查各自的情况写实：
+
+- `build`、`typecheck`、`test` 每项只能是 `ran`（真跑了）/ `not-applicable`（这个仓本来就没有这一项，比如没有 build 脚本、不是 TypeScript）/ `env-skipped`（因为环境原因没跑：依赖没装上、缺工具、连不上网……）。
+- 缺项、写错：退出码 `1`，什么都不写；补齐再跑同一条命令。
+- **只要有一项是 `env-skipped`，或者「通过」条目的证据里写着因环境没跑**：不能判「通过」。helper 会把这一轮标「中断」（原因以「环境问题（不是代码不通过）：」开头），退出码 `6`，不勾选、不写看板、不关单；宿主随后发「环境问题 / 未验证」提醒，按环境退避自动重验。**拿到 6 就停手**，不要改写 `checks` 重试、不要写裁决。
+- 真跑了但没过是「要修」，不是环境问题；「要修」的裁决不检查 `checks`。
+
+只出裁决的任务（`root.verdictOnly`）不跑 `close`：直接 `verdict` 再 `done`（要写看板就先 `board --target all --acceptance 通过 --checks <verdict.json>`）。
 
 ### 裁决文件 verdict.json
 
 ```json
 {
   "extracted": false,
+  "checks": { "build": "ran", "typecheck": "ran", "test": "ran" },
   "items": [
     { "ref": "<item>", "sc": 3, "result": "通过", "evidence": "跑的命令 + 关键输出一行" },
     { "ref": "<item>", "sc": 4, "result": "要修", "why": "没过的原因", "evidence": "…" },
@@ -147,6 +157,7 @@ node watchers/acceptance/bin/helper.mjs done    --issue <root> --round <n>
 | `3` | 认领检查没过（不是本轮，或已不是「验收中」） | 停手：这一轮不是你的了 |
 | `4` | 写闸拒绝 | 停手：这一轮已标「中断」。`reason=secret-found` / `reason=verdict-only` 除外：不标中断，照常写裁决再 `done`（secret-found 自动带「需人工处理」） |
 | `5` | 本地扫到疑似密钥，什么都没推 | 不要重试推送；照第 7 节写裁决（自动带「需人工处理」）再 `done` |
+| `6` | 必需检查因环境没跑（或证据写着因环境没跑），不能判通过 | 停手：这一轮已标「中断」（环境问题 / 未验证），宿主会告警并自动重验；不要改 `checks` 重试、不要写裁决 |
 
 ## 10. 评论和正文的规矩
 

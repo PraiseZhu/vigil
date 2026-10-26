@@ -1,6 +1,7 @@
 // #46 测试用的假 GitHub：内存里的 issue/评论/看板，注入给 runHelper 用。
 // 不起子进程、不触网；写操作和真实现一样只经 github.write(action)。
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { bodyVersion } from './bin/rounds.mjs';
 import { OWNER, OTHER_REPO, REPO, roundComment } from './fake-gh.fixture.mjs';
@@ -419,3 +420,11 @@ export function fullConclusions(overrides = {}, { scs = DEFAULT_SCS, rootRepo = 
     return { ref, sc, result: '通过', evidence: 'ok', ...(overrides[key] || {}) };
   });
 }
+
+/** 判「通过」要带的必需检查（裁决防线）：三项都真跑了。 */
+export const ALL_RAN = Object.freeze({ build: 'ran', typecheck: 'ran', test: 'ran' });
+/** board --acceptance 通过 的 --checks 文件（三项都 ran）。 */
+export const ALL_RAN_CHECKS_FILE = (() => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-checks-'));
+  return writeJsonFile(dir, 'checks.json', { checks: ALL_RAN });
+})();
