@@ -64,12 +64,14 @@ node watchers/acceptance/bin/helper.mjs progress --issue <root> --round <n>
 ## 4. 通过
 
 ```sh
-node watchers/acceptance/bin/helper.mjs close   --issue <root> --round <n> --verified <verified.json>
+node watchers/acceptance/bin/helper.mjs close   --issue <root> --round <n> --verified <verified.json> --verdict <verdict.json>
 node watchers/acceptance/bin/helper.mjs verdict --issue <root> --round <n> --file <verdict.json>
 node watchers/acceptance/bin/helper.mjs done    --issue <root> --round <n>
 ```
 
 `verified.json` 写 `{"items":[{"ref":"<item>","sc":3}],"manual":[{"ref":"<item>","sc":5}],"checks":{"build":"ran","typecheck":"ran","test":"ran"}}`：`items` 是验证通过要打勾的，`manual` 是人工手测项（行尾标「人工手测」）。`ref` 是出处 issue，不是总 issue。
+
+`--verdict` 给的就是随后交给 `verdict` 的同一份 `verdict.json`（先写好它）：`close` 在写任何东西之前先查里面「通过」条目的证据，没给就退出码 `1`、什么都不写。
 
 `close` 自己按 **勾选 → 看板（总 issue 和每个子 issue 写「通过」）→ 关总 issue** 的顺序做：看板写失败就停在关单之前，issue 还开着，不会「关了但看板没写」。
 
@@ -81,6 +83,7 @@ node watchers/acceptance/bin/helper.mjs done    --issue <root> --round <n>
 
 - `build`、`typecheck`、`test` 每项只能是 `ran`（真跑了）/ `not-applicable`（这个仓本来就没有这一项，比如没有 build 脚本、不是 TypeScript）/ `env-skipped`（因为环境原因没跑：依赖没装上、缺工具、连不上网……）。
 - 缺项、写错：退出码 `1`，什么都不写；补齐再跑同一条命令。
+- 证据里引用场景原文或别人的话（比如测试用例里写的「都没跑（依赖没装上）」），用「」、“”、"" 或反引号括起来：引号里的内容不算你自己说的「没跑」。没加引号、同一句里既写「没跑」又写环境原因（依赖、网络、沙箱……），就算因环境没跑。
 - **只要有一项是 `env-skipped`，或者「通过」条目的证据里写着因环境没跑**：不能判「通过」。helper 会把这一轮标「中断」（原因以「环境问题（不是代码不通过）：」开头），退出码 `6`，不勾选、不写看板、不关单；宿主随后发「环境问题 / 未验证」提醒，按环境退避自动重验。**拿到 6 就停手**，不要改写 `checks` 重试、不要写裁决。
 - 真跑了但没过是「要修」，不是环境问题；「要修」的裁决不检查 `checks`。
 

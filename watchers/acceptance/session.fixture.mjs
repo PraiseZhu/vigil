@@ -428,3 +428,8 @@ export const ALL_RAN_CHECKS_FILE = (() => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-checks-'));
   return writeJsonFile(dir, 'checks.json', { checks: ALL_RAN });
 })();
+/** close 的 --verdict（close 先查「通过」条目的证据再写）：一条证据正常的「通过」。 */
+export const PASS_VERDICT_FILE = (() => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-checks-'));
+  return writeJsonFile(dir, 'verdict.json', { checks: ALL_RAN, items: [{ ref: `${REPO}#1`, sc: 1, result: '通过', evidence: 'npm test 全过' }] });
+})();

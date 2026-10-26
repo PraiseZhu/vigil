@@ -61,8 +61,9 @@ node watchers/acceptance/bin/helper.mjs <collect|progress|verdict|close|correct|
 
 ## 2. 通过（SC4）
 
-`close --verified <verified.json>`：
+`close --verified <verified.json> --verdict <verdict.json>`：
 
+0. 写任何东西之前先过裁决防线：`verified.json` 的 `checks` 有 `env-skipped`，或 `--verdict` 给的 `verdict.json` 里「通过」条目的证据写着因环境没跑（去掉「」、“”、""、反引号里的引用后，同一句里同时有「没跑」类说法和环境原因），就标「中断」（环境问题）、退出码 `6`，不勾选、不写看板、不关单。没给 `--verdict` 退出码 `1`、零写入。（以前证据只在 `verdict` 才查，那时已经关单了，vigil#105 第 2 轮就是这样留下「关了单、看板通过、轮次却中断」。）
 1. 在列出的 issue（子 issue 或总 issue 自己，只限本轮任务树；清单里有树外的 issue 就整条拒绝、什么都不写）里，把验证过的 `- [ ] SC<k>` 改成 `- [x] SC<k>`；人工手测项在行尾补「 人工手测」。只有正文真的变了才写 `issue.edit`。正文是 CRLF 的也一样（写闸逐行比对时行尾的 `\r` 不算改动）。
 2. 看板：总 issue 和每个子 issue 都写「验收」= 通过、「裁决」= 本轮评论链接（和 `board --target all --acceptance 通过` 同一个范围）。
 3. **最后**才 `issue.close` 关总 issue（`reason=completed`）。顺序是 勾选 → 看板 → 关单：看板写失败就停在关单之前，issue 还开着，下一轮能接着验；不会出现「关了但看板没写」。

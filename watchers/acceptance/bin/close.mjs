@@ -2,11 +2,12 @@
 // 通过（#46 SC4）：在子 issue 里勾掉验证过的验收项、黑盒项标「人工手测」，
 // 再把看板「验收」写「通过」、「裁决」写本轮评论链接，最后才关总 issue。
 // 顺序是 勾选 → 看板 → 关单：看板写失败就停在关单之前，issue 还开着、下一轮能接着验，不会「关了但看板没写」。
+// 写任何东西之前先过裁决防线（checks + --verdict 里「通过」条目的证据），判不了通过就什么都不写。
 import fs from 'node:fs';
 import { setAcceptanceFields } from './board.mjs';
 import { collectTree, fetchIssueBody } from './collect.mjs';
 import { createRounds, parseRef } from './rounds.mjs';
-import { guardPass } from './checks.mjs';
+import { guardPass, readVerdictItems } from './checks.mjs';
 import { assertNotVerdictOnly } from './profile.mjs';
 
 const SC_LINE = /^\s*[-*]\s*(?:\[\s*([xX ])\s*\])?\s*(?:\*\*)?SC(\d+)\b/;
@@ -67,6 +68,7 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
   assertNotVerdictOnly(profile, tree.root.ref, 'close');
 
   const verified = readVerified(flags.get('verified'));
+  const verdictItems = readVerdictItems(flags.get('verdict'));
   const grouped = new Map();
   for (const entry of verified.items) {
     if (!grouped.has(entry.ref)) grouped.set(entry.ref, { verified: [], manual: [] });
@@ -84,7 +86,8 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
   }
 
   // 裁决防线：必需检查（build / typecheck / 测试）有一项因环境没跑，就不勾、不写看板、不关单，本轮标「中断」（环境问题）。
-  await guardPass({ rounds, ref, n, checks: verified.checks, where: 'close 的 verified.json' });
+  // 「通过」条目的证据也在这里查（--verdict 给的 verdict.json）：以前只在 verdict 才查，那时已经勾选、写看板、关单了。
+  await guardPass({ rounds, ref, n, checks: verified.checks, items: verdictItems, where: 'close 的 verified.json' });
 
   const edited = [];
   for (const [issueRef, changes] of grouped) {

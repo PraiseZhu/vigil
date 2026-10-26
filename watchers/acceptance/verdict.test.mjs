@@ -19,6 +19,7 @@ import {
   writeJsonFile,
   ALL_RAN,
   ALL_RAN_CHECKS_FILE,
+  PASS_VERDICT_FILE,
 } from './session.fixture.mjs';
 
 function loadProfile(extra = {}) {
@@ -176,7 +177,7 @@ test('SC3 关闭勾选后按改后的正文记版本，trigger 不会因此重�
     items: [{ ref: `${REPO}#1`, sc: 1 }],
     manual: [{ ref: `${REPO}#1`, sc: 1 }],
   });
-  const closed = await run(world, profile, ['close', '--issue', `${REPO}#1`, '--round', '1', '--verified', verified]);
+  const closed = await run(world, profile, ['close', '--issue', `${REPO}#1`, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
   assert.equal(closed.code, 0, closed.err);
   const edited = root.body;
   assert.ok(edited.includes('- [x] SC1 跑一遍测试'), edited);

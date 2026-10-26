@@ -20,6 +20,7 @@ import {
   writeJsonFile,
   ALL_RAN,
   ALL_RAN_CHECKS_FILE,
+  PASS_VERDICT_FILE,
 } from './session.fixture.mjs';
 
 function loadProfile() {
@@ -85,7 +86,7 @@ test('SC4 close 勾掉已验证的项、人工手测标行尾、关总 issue、�
     manual: [{ ref: `${REPO}#2`, sc: 5 }],
   });
 
-  const result = await run(world, profile, ['close', '--issue', `${REPO}#1`, '--round', '1', '--verified', verified]);
+  const result = await run(world, profile, ['close', '--issue', `${REPO}#1`, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
   assert.equal(result.code, 0, result.err);
   const printed = JSON.parse(result.out);
   assert.equal(printed.closed, `${REPO}#1`);
@@ -132,7 +133,7 @@ test('SC4 close 清单里混进任务树外的 issue → 拒绝且零写入', as
       { ref: 'example-owner/unrelated-repo#99', sc: 1 },
     ],
   });
-  const result = await run(world, profile, ['close', '--issue', `${REPO}#1`, '--round', '1', '--verified', verified]);
+  const result = await run(world, profile, ['close', '--issue', `${REPO}#1`, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
   assert.equal(result.code, 1);
   assert.match(result.err, /不在本轮任务树里/);
   assert.equal(world.writes.length, 0);
@@ -164,6 +165,8 @@ test('SC4/SC5 watch 档 close 一律拒绝且零写入', async () => {
     '1',
     '--verified',
     verified,
+    '--verdict',
+    PASS_VERDICT_FILE,
   ]);
   assert.equal(result.code, 1);
   assert.match(result.err, /watch 档只出裁决、写看板/);
@@ -317,7 +320,7 @@ test('SC9 写命令不是本轮 → 退出码 3，零写入，消息写清期望
   const verdict = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items: [] });
   const commands = [
     ['board', '--issue', `${REPO}#1`, '--round', '2', '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE],
-    ['close', '--issue', `${REPO}#1`, '--round', '2', '--verified', verified],
+    ['close', '--issue', `${REPO}#1`, '--round', '2', '--verified', verified, '--verdict', PASS_VERDICT_FILE],
     ['correct', '--issue', `${REPO}#1`, '--round', '2', '--item', `${REPO}#2 SC3`, '--why', 'x'],
     [
       'push',

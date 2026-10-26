@@ -46,7 +46,7 @@ const USAGE = `用法：
   collect   --issue <ref>
   progress  --issue <ref> --round <n>
   verdict   --issue <ref> --round <n> --file <verdict.json> [--status 通过|要修]
-  close     --issue <ref> --round <n> --verified <verified.json>
+  close     --issue <ref> --round <n> --verified <verified.json> --verdict <verdict.json>
   correct   --issue <ref> --round <n> --item "<ref> SC<k>" --why <原因> [--title <标题>]
   push      --issue <ref> --round <n> --repo <owner/repo> --branch acceptance/<总>-<出处>-sc<k> --worktree <目录> [--base origin/main]
   board     --issue <ref> --round <n> --target <all|ref> --acceptance <验收中|要修|修正中|通过> [--verdict-url <url>]

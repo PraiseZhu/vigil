@@ -33,6 +33,7 @@ import {
   writeJsonFile,
   ALL_RAN,
   ALL_RAN_CHECKS_FILE,
+  PASS_VERDICT_FILE,
 } from './session.fixture.mjs';
 
 const ROOT_REF = `${REPO}#1`;
@@ -195,7 +196,7 @@ test('verdict-only：close / correct / push 一律退出码 1、零写入、写�
   const { profile, home } = setup({ profile: { verdictOnlyIssues: [ROOT_REF] } });
   const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN, items: [{ ref: `${REPO}#2`, sc: 3 }], manual: [] });
   const commands = [
-    ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified],
+    ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE],
     ['correct', '--issue', ROOT_REF, '--round', '1', '--item', `${REPO}#2 SC3`, '--why', 'x'],
     ['push', '--issue', ROOT_REF, '--round', '1', '--repo', REPO, '--branch', 'acceptance/1-2-sc3', '--worktree', home],
   ];
@@ -269,7 +270,7 @@ test('端到端 verdict-only：helper → 真写闸，裁决照写并带「本 i
   const github = realGithubThroughGate({ profile, world, gate });
   const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN, items: [{ ref: `${REPO}#2`, sc: 3 }], manual: [] });
 
-  const close = await helper(github, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified]);
+  const close = await helper(github, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
   assert.equal(close.code, 1, close.err);
   assert.equal(github.gateCalls.length, 0, 'helper 侧先拒，动作根本没到写闸');
 
@@ -321,7 +322,7 @@ test('close 顺序 勾选 → 看板 → 关单：看板写失败就停在关单
       },
     }),
     profile,
-    ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified],
+    ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE],
   );
   assert.equal(result.code, 1, result.err);
   assert.match(result.err, /看板写失败/);
@@ -341,7 +342,7 @@ test('端到端 close：helper → 真写闸，勾选（含 CRLF 正文）→ �
     items: [{ ref: `${REPO}#2`, sc: 3 }],
     manual: [{ ref: `${REPO}#2`, sc: 5 }],
   });
-  const result = await helper(github, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified]);
+  const result = await helper(github, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
   assert.equal(result.code, 0, result.err);
   const types = github.gateCalls.map((action) => action.type);
   assert.deepEqual(types, ['issue.edit', 'project.field.set', 'project.field.set', 'project.field.set', 'issue.close']);
