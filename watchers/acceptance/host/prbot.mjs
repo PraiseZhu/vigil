@@ -1198,10 +1198,10 @@ function correctionIssueSections(body) {
 }
 
 function correctionIssueSectionText(lines) {
-  return (lines || [])
-    .map((line) => line.trim().replace(/^[-*]\s+/, ''))
-    .filter(Boolean)
-    .join(' ');
+  const out = (lines || []).map((line) => line.replace(/\s+$/, ''));
+  while (out.length && !out[0].trim()) out.shift();
+  while (out.length && !out[out.length - 1].trim()) out.pop();
+  return out.join('\n');
 }
 
 export function correctionIssueFacts(body) {
@@ -1230,6 +1230,17 @@ function bodyCell(text) {
   return String(text || '').replace(/\s+/g, ' ').replace(/\|/g, '\\|').trim();
 }
 
+/** 照抄修正子 issue 的一段：标签放在原文第一行前，其余行原样保留（列表标记和换行都不丢）。 */
+function detailLines(label, text) {
+  const lines = String(text || '').split('\n');
+  const first = lines.findIndex((line) => line.trim());
+  if (first < 0) return [];
+  const out = [`- ${label}：${lines[first].trimEnd()}`];
+  for (const line of lines.slice(first + 1)) out.push(line.trimEnd());
+  while (out.length > 1 && !out[out.length - 1].trim()) out.pop();
+  return out;
+}
+
 /**
  * 修正 PR 正文（task-pr/v1，和修正子 issue 逐段对应）：首行链任务 issue；第二行「Closes <修正子 issue>」
  * （合并后 GitHub 关掉修正子 issue，trigger 才会再验）；最后一行修正标记原样照抄修正子 issue 的（轮次是验收轮，不是修正轮）。
@@ -1241,11 +1252,15 @@ export function correctionPrBody(state, marker) {
   if (state.issue) head.push(closesLine(state.issue, prRepo));
   const facts = state.correctionFacts || {};
   const correctionBody = state.correctionBody || state.correctionIssueBody;
-  const details =
-    state.correctionDetails ||
-    (correctionBody
-      ? correctionIssueDetails(correctionBody)
-      : { scope: facts.scope, notDo: facts.notDo, dependencies: facts.dependencies });
+  const suppliedDetails = state.correctionDetails;
+  const parsedDetails = correctionBody
+    ? correctionIssueDetails(correctionBody)
+    : { scope: facts.scope, notDo: facts.notDo, dependencies: facts.dependencies };
+  const details = {
+    scope: suppliedDetails?.scope || parsedDetails.scope,
+    notDo: suppliedDetails?.notDo || parsedDetails.notDo,
+    dependencies: suppliedDetails?.dependencies || parsedDetails.dependencies,
+  };
   const scText = facts.scText || `SC1 ${state.item} SC${state.sc} 重新验收通过`;
   const files = Array.isArray(state.changedFiles) ? state.changedFiles : [];
   const shown = files.slice(0, MAX_BODY_FILES).map((file) => `\`${bodyCell(file)}\``).join('、');
@@ -1260,6 +1275,7 @@ export function correctionPrBody(state, marker) {
   const disputes = (state.disputes || []).map(
     (item) => `- 争议未修：${item.ref} SC${item.sc}（验收方：${bodyCell(redact(String(item.acceptance || ''))) || '裁决是要修'}；修正方：${bodyCell(redact(String(item.reason || ''))) || '没写理由'}），交给人裁。`,
   );
+  const dependencyLines = detailLines('依赖', details.dependencies);
   const unrun = [`- SC1 由验收机在本 PR 合并、修正子 issue 关闭后再验；CI 结果看本 PR 的检查。`];
   if (!passed) unrun.push(`- 目标仓没有配置预检（${bodyCell(state.preflightNote) || '未跑'}），开 PR 时还没有 SC1 的验证证据。`);
   return [
@@ -1276,11 +1292,11 @@ export function correctionPrBody(state, marker) {
     '## 范围对照',
     '',
     `- 本 PR 改了：${fileLine}`,
-    ...(details.scope ? [`- 修正子 issue 的范围（可改）：${bodyCell(details.scope)}`] : []),
+    ...detailLines('修正子 issue 的范围（可改）', details.scope),
     '- 超出 issue 范围：无（推之前按禁改路径检查过）',
     `- 明确不包含：${disputes.length ? '有争议的条目不修（见「定下的决定」）；' : ''}不改修正子 issue 以外的验收项`,
-    ...(details.notDo ? [`- 修正子 issue 不做：${bodyCell(details.notDo)}`] : []),
-    `- 依赖：${bodyCell(details.dependencies) || '无'}`,
+    ...detailLines('修正子 issue 不做', details.notDo),
+    ...(dependencyLines.length ? dependencyLines : ['- 依赖：无']),
     '',
     '## 验收对照',
     '',

@@ -717,8 +717,8 @@ test('#93 SC1 SC2 SC4 修正 PR 正文按 task-pr/v1 和修正子 issue 逐段�
   assert.equal(facts.scText, 'SC1 导出按钮在空列表时禁用 | 不报错。验证：unit');
   assert.equal(facts.why, '空列表时仍可点击');
   assert.deepEqual(correctionIssueDetails(issueBody), {
-    scope: `修好 ${REPO}#2 SC3 所需的最小代码改动和复现测试，限原属 issue 的范围内（目标仓禁改路径照旧不碰）`,
-    notDo: `不改 ${REPO}#2 的其它验收项，不扩大原属 issue 的范围`,
+    scope: `- 修好 ${REPO}#2 SC3 所需的最小代码改动和复现测试，限原属 issue 的范围内（目标仓禁改路径照旧不碰）`,
+    notDo: `- 不改 ${REPO}#2 的其它验收项，不扩大原属 issue 的范围`,
     dependencies: '无，随时可开工。',
   });
   // #96 之前开的修正子 issue 被复用时还是旧模板（「## 没过的原因」）：两种都读得出。
@@ -794,6 +794,48 @@ test('#93 SC1 修正 PR 正文的范围对照也逐段对应修正子 issue 的�
   assert.match(lines, /范围（可改）：.*最小代码改动和复现测试/);
   assert.match(lines, /不做：.*不改 .*#2 的其它验收项/);
   assert.match(lines, /依赖：无，随时可开工。/);
+});
+
+test('#93 SC1 范围对照照抄修正子 issue 的原文：列表行和换行都不丢', () => {
+  const issueBody = [
+    '> 修正子 issue',
+    '## 目标',
+    '重新验收',
+    '## 范围（可改）',
+    '',
+    `- 修好 ${REPO}#2 SC3 所需的最小代码改动`,
+    `- 补一条会变红的复现测试`,
+    '',
+    '## 不做',
+    '',
+    `- 不改 ${REPO}#2 的其它验收项`,
+    '',
+    '## 依赖',
+    '',
+    '无，随时可开工。',
+    '## 验收标准',
+    '',
+    '- [ ] SC1 导出按钮在空列表时禁用。验证：unit',
+  ].join('\n');
+  const details = correctionIssueDetails(issueBody);
+  assert.equal(details.scope, `- 修好 ${REPO}#2 SC3 所需的最小代码改动\n- 补一条会变红的复现测试`);
+  assert.equal(details.notDo, `- 不改 ${REPO}#2 的其它验收项`);
+  const body = correctionPrBody(
+    {
+      issue: `${REPO}#9`,
+      prRepo: REPO,
+      root: `${REPO}#1`,
+      item: `${REPO}#2`,
+      sc: 3,
+      round: 1,
+      correctionFacts: correctionIssueFacts(issueBody),
+      correctionDetails: details,
+    },
+    { root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1 },
+  );
+  for (const line of details.scope.split('\n')) assert.ok(body.includes(line), `PR 正文丢了范围原文：${line}`);
+  assert.ok(body.includes(details.notDo), 'PR 正文丢了「不做」原文');
+  assert.ok(body.includes(details.dependencies), 'PR 正文丢了「依赖」原文');
 });
 
 test('#60 修正 github 出口：branch.push 带租约只对 acceptance/ 分支生效（--force-with-lease=<分支>:<上次已知 head>），不带就不强推', async () => {
