@@ -796,6 +796,32 @@ test('#93 SC1 修正 PR 正文的范围对照也逐段对应修正子 issue 的�
   assert.match(lines, /依赖：无，随时可开工。/);
 });
 
+test('#93 SC5 未执行的验证写清开 PR 时 CI 还没跑、SC1 合并后再验，不预写 CI 结论', () => {
+  const marker = { root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1 };
+  const base = {
+    issue: `${REPO}#9`,
+    prRepo: REPO,
+    root: `${REPO}#1`,
+    item: `${REPO}#2`,
+    sc: 3,
+    round: 1,
+    correctionFacts: { scText: 'SC1 导出按钮在空列表时禁用。验证：unit', why: '空列表时仍可点击' },
+    changedFiles: ['src/export.js'],
+    preflight: { ok: true, commands: ['npm test'] },
+  };
+  const sectionOf = (body) => body.slice(body.indexOf('## 未执行的验证'), body.indexOf('## 风险与回滚'));
+  const section = sectionOf(correctionPrBody(base, marker));
+  assert.match(section, /开 PR 时 CI 还没跑完/, '正文只写一次，不能把还没跑的 CI 写成结论');
+  assert.match(section, /CI 结果看本 PR 的检查/, 'CI 结果指向 PR 的检查页');
+  assert.match(section, /build \/ typecheck \/ test/, '必需检查也还没跑');
+  assert.match(section, /SC1 由验收机在本 PR 合并、修正子 issue 关闭后再验/, 'SC1 等合并后由验收机再验');
+  assert.doesNotMatch(section, /CI (?:已)?(?:通过|绿)|检查(?:已)?(?:全部)?通过/, '不能预写 CI 结论');
+
+  const noPreflight = sectionOf(correctionPrBody({ ...base, preflight: undefined, preflightNote: '没有配置预检，跳过' }, marker));
+  assert.match(noPreflight, /没有配置预检/);
+  assert.match(noPreflight, /开 PR 时 CI 还没跑完/);
+});
+
 test('#60 修正 github 出口：branch.push 带租约只对 acceptance/ 分支生效（--force-with-lease=<分支>:<上次已知 head>），不带就不强推', async () => {
   const { home, profile } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const gitCalls = [];
