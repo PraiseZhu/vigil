@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertSocketPath } from './egress-proxy.mjs';
 import { isVerdictOnly, loadAcceptanceProfile, watcherHome } from '../bin/profile.mjs';
+import { recordScope } from './scope-snapshot.mjs';
 import { createGithub, WRITE_TYPES } from '../bin/github.mjs';
 import { bodyVersion, latestRound, parseRef, parseRounds } from '../bin/rounds.mjs';
 import {
@@ -326,6 +327,15 @@ export function createGate({
       entries.push(parsed);
     }
     return entries;
+  }
+
+  /** 本写闸放行时用的仓范围快照指纹（同一份范围只存一次快照）；存不下就不带，审计退回按当前配置判。 */
+  function ledgerScope() {
+    try {
+      return recordScope(paths.gateDir, profile);
+    } catch {
+      return undefined;
+    }
   }
 
   function appendLedger(entry) {
@@ -878,6 +888,8 @@ export function createGate({
         type: action.type,
         result: result ?? {},
         at: new Date(now()).toISOString(),
+        // 写入当时放行用的仓范围（快照指纹）：审计按它判范围，事后改 profile 不会把旧写入误判成越权。
+        scope: ledgerScope(),
         ...(scopedToRound() ? { boundCommentId: binding.commentId } : {}),
       });
       if (binding && action.type === 'issue.create' && result?.issue) {

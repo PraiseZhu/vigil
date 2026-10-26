@@ -421,7 +421,11 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 
 1. 写类型：只认写闸的白名单（`pr.merge` 根本不许、`comment.delete` 不许、白名单外的类型报 `type-not-allowed`）。
 2. 仓范围与分档：只能写 `autoRepos` / `forkRepos` / `watchRepos` 里的仓；`watch` 档只许
-   `comment.create`、`comment.update`、`project.field.set`。
+   `comment.create`、`comment.update`、`project.field.set`。**按写入当时的范围判**：写闸记账时给每条记录带上
+   `scope`（放行时那份 `autoRepos` / `forkRepos` / `watchRepos` / `verdictOnlyIssues` 的指纹），快照存在
+   `state/write-gate/scopes/<指纹>.json`；审计用快照判，事后改 profile（比如临时把某个仓移出 `autoRepos`）
+   不会把当时合规的写入（包括宿主自己标「中断」）误判成越权。快照内容和指纹对不上的不认；
+   没有指纹的老记录只能按当前配置判。规则 3 也用同一份快照。
 3. 只出裁决的总 issue（profile 的 `verdictOnlyIssues`）：不许关、勾、开修正、推送（和写闸同一份名单）。
 4. 轮次绑定：每条写入都要对得上账本里登记过的轮次评论（开轮评论 / 修正轮认领评论），对不上报 `no-round` / `round-mismatch`。
 5. 轮次评论只许本轮收尾改（裁决 / 中断各一次）；修正轮只许改自己认领评论。另外用固定查询**只读**看 GitHub
@@ -436,6 +440,10 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
   （`--no-alert` 只写审计日志、不写提醒；`--json` 只打一行 JSON）。
 - 只想看最近出了些啥：`node watchers/acceptance/host/gate-audit.mjs --summary [--hours N] [--json]`。
   它不跑审计、不拿锁、不写任何文件，只读审计日志和状态文件；日志不存在算空，坏行跳过。
+- 判定规则升级（`AUDIT_RULES_VERSION`，v2 = 范围按写入当时判）后，常驻审计下一拍自动按新规则把基线后、
+  上次游标前的账本重算一遍：旧规则下的误判消掉，真违规照算；GitHub 核对和账本被改写这两类账本算不出来，
+  照审计日志沿用。重算在审计日志记一行 `level: info`、`rule: rules-recheck`（写明前后条数），不发提醒、
+  不算拿不准。这不是 `--ack`：不看人、不清零，重算出几条就是几条。
 - 处理完运行 `node watchers/acceptance/host/gate-audit.mjs --ack`：只把「基线后明确违规数」清零，日志和已报指纹保留，
   旧违规不会再报（「基线后拿不准数」不清，它只用于统计）。
 - 退出码：`0` 没有新的明确违规且基线后已清零；`1` 有明确违规；`2` 只有拿不准 / GitHub 没查成 / 锁被占；

@@ -24,9 +24,16 @@ import { isVerdictOnly, loadAcceptanceProfile, watcherHome } from '../bin/profil
 import { ISSUE_COMMENTS_QUERY } from '../bin/rounds.mjs';
 import { repoTier } from '../bin/tasks.mjs';
 import { acquireLock, appendAlert, hostPaths, releaseLock } from './paths.mjs';
+import { loadScopes, scopeForEntry } from './scope-snapshot.mjs';
 
 export const AUDIT_ALERT_KIND = 'gate-audit-violation';
 export const AUDIT_STATE_VERSION = 1;
+/**
+ * 判定规则的版本。规则改了（比如 v2 起仓范围按写入当时的快照判），常驻审计下一拍会按新规则把
+ * 基线后的账本重算一遍（recheck），旧规则下的误判从「基线后违规数」里消掉；真违规照样算。
+ * 这不是 --ack：不看人、不清零，按账本重新算出来是几条就是几条。
+ */
+export const AUDIT_RULES_VERSION = 2;
 /** 去重指纹最多留这么多条（账本一天一两百条，够用很久）。 */
 export const AUDIT_SEEN_LIMIT = 5000;
 /** 一条提醒里最多带几条明细（其余在审计日志里）。 */
@@ -253,8 +260,10 @@ function violation(line, rule, parsed, extra = {}) {
  * 纯函数：核对整本账（entries 是按行解析好的记录；读不出的行传 null）。
  * 返回 {violations, rounds}：violations 带行号（从 1 起）；rounds 是账本里登记过的轮次（评论 id → 轮次）。
  * `from` = 只核对行号 > from 的记录（上下文仍按整本账算：轮次、改评论顺序都要看前面的）。
+ * `scopes` = 写入当时的范围快照（指纹 → 范围，见 scope-snapshot.mjs）：记录带了能核对上的指纹，
+ * 仓范围 / 分档 / 只出裁决就按写入当时的范围判；老记录没指纹才按当前 profile 判。
  */
-export function auditEntries(entries, { profile, from = 0 } = {}) {
+export function auditEntries(entries, { profile, from = 0, scopes = null } = {}) {
   const list = Array.isArray(entries) ? entries : [];
   const parsed = list.map((entry) => (entry && typeof entry === 'object' ? parseEntry(entry) : null));
   /** 评论 id → {root, round, commentId, kind, line} */
@@ -304,10 +313,11 @@ export function auditEntries(entries, { profile, from = 0 } = {}) {
       return;
     }
 
-    // 2. 仓范围（以写闸的 repoTier 为准）和分档
+    // 2. 仓范围（以写闸的 repoTier 为准）和分档：按写入当时的范围判（有快照时），不按此刻的配置判
+    const scoped = scopeForEntry(list[index], profile, scopes);
     for (const repo of item.repos) {
-      const tier = repoTier(repo, profile || {});
-      if (!tier) push('repo-out-of-scope', { repo });
+      const tier = repoTier(repo, scoped.profile);
+      if (!tier) push('repo-out-of-scope', { repo, scopeSource: scoped.source });
       else if (tier.tier === 'watch' && !WATCH_WRITE_TYPES.has(item.type)) push('tier-not-allowed', { repo });
     }
 
@@ -327,7 +337,7 @@ export function auditEntries(entries, { profile, from = 0 } = {}) {
     if (!item.root && root) item.root = root;
 
     // 3. 只出裁决的总 issue
-    if (root && isVerdictOnly(profile || {}, root) && VERDICT_ONLY_SET.has(item.type)) push('verdict-only-write');
+    if (root && isVerdictOnly(scoped.profile, root) && VERDICT_ONLY_SET.has(item.type)) push('verdict-only-write');
 
     // 4. 轮次评论被改：目标是登记过的轮次评论的 comment.update 只许是本轮的收尾（裁决 / 中断，各一次）
     //    或修正轮自己的状态更新（prbot …:comment:…）
@@ -495,7 +505,7 @@ function readAuditLogRows(file) {
 
 /** 日志行的级别：新日志行自带 level；旧日志行没 level，按 rule 现算。 */
 function levelOfLogRow(row) {
-  if (row?.level === 'violation' || row?.level === 'uncertain') return row.level;
+  if (row?.level === 'violation' || row?.level === 'uncertain' || row?.level === 'info') return row.level;
   return ruleLevel(row?.rule);
 }
 
@@ -535,7 +545,7 @@ export function summarizeAudit({ home, now = () => Date.now(), hours = UNCERTAIN
     if (!Number.isFinite(at) || at < nowMs - windowMs || at > nowMs) continue;
     const item = { ...row, level: levelOfLogRow(row) };
     if (item.level === 'violation') violations.push(item);
-    else uncertain.push(item);
+    else if (item.level === 'uncertain') uncertain.push(item);
   }
   const state = readState(paths.auditStateFile);
   return {
@@ -575,6 +585,52 @@ export function formatSummary(summary) {
   return lines.join('\n');
 }
 
+/** auditEntries 自己会报的规则（能按账本重算的）；其余（GitHub 核对、账本被改写）只能沿用审计日志里的记录。 */
+const LEDGER_RULES = new Set([
+  'ledger-corrupt',
+  'pr-merge',
+  'comment-delete',
+  'type-not-allowed',
+  'unverifiable',
+  'repo-out-of-scope',
+  'tier-not-allowed',
+  'no-round',
+  'round-mismatch',
+  'verdict-only-write',
+  'round-comment-modified',
+]);
+
+/**
+ * 规则升级后重算「基线后明确违规数」（不是 --ack）：
+ * - 基线之后、上次审计游标之前的账本行，按现在的规则（含写入当时的范围快照）重新核对；
+ * - 账本算不出来的那几类（GitHub 核对、账本被改写）照审计日志里的记录原样计入；
+ * - 人 --ack 过的，只算 ack 之后的。
+ * 返回 {count, unseen, before}：unseen 是重算出来、以前没报过的明确违规（交给正常流程去报）。
+ */
+function recheckSinceBaseline({ state, entries, lines, profile, scopes, seen, auditLogFile }) {
+  const baselineLines = Number(state.baseline?.lines || 0);
+  const cursor = Math.min(Number(state.cursor) || 0, entries.length);
+  const ackMs = Date.parse(state.acknowledgedAt || '');
+  const afterAck = (iso) => !Number.isFinite(ackMs) || Date.parse(iso || '') > ackMs;
+  const { violations } = auditEntries(entries.slice(0, cursor), { profile, scopes, from: baselineLines });
+  const definite = violations.filter((item) => item.level === 'violation' && afterAck(entries[item.line - 1]?.at));
+  let count = 0;
+  const unseen = [];
+  for (const item of definite) {
+    if (seen.has(fingerprint(item, lines[item.line - 1] || ''))) count += 1;
+    else unseen.push(item);
+  }
+  const baselineMs = Date.parse(state.baseline?.at || '');
+  for (const row of readAuditLogRows(auditLogFile)) {
+    if (levelOfLogRow(row) !== 'violation' || LEDGER_RULES.has(row.rule)) continue;
+    const at = Date.parse(row.ts || '');
+    if (Number.isFinite(baselineMs) && !(at >= baselineMs)) continue;
+    if (!afterAck(row.ts)) continue;
+    count += 1;
+  }
+  return { count, unseen, before: Number(state.sinceBaseline || 0) };
+}
+
 /**
  * 跑一次审计（可单独跑、可增量）：
  * - 第一次跑（没有状态文件）：以当时账本末尾为基线，基线前的记录只统计、不报；
@@ -606,6 +662,7 @@ export async function runGateAudit({ home, profile, github = null, now = () => D
   }
   try {
     const { lines, entries } = readLedgerLines(paths.ledgerFile);
+    const scopes = loadScopes(paths.gateDir);
     let state = readState(paths.auditStateFile);
     const seen = new Set(state?.seen || []);
     const nowMs = now();
@@ -613,7 +670,7 @@ export async function runGateAudit({ home, profile, github = null, now = () => D
 
     if (!state) {
       // 基线：此刻之前的记录只统计，不报。明确违规和拿不准分开数。
-      const { violations, rounds } = auditEntries(entries, { profile });
+      const { violations, rounds } = auditEntries(entries, { profile, scopes });
       let githubFound = [];
       let githubErrors = [];
       if (github) ({ violations: githubFound, errors: githubErrors } = await checkRoundComments({ rounds, entries, github }));
@@ -635,6 +692,7 @@ export async function runGateAudit({ home, profile, github = null, now = () => D
         },
         cursor: lines.length,
         prefixHash: prefixHash(lines, lines.length),
+        rulesVersion: AUDIT_RULES_VERSION,
         sinceBaseline: 0,
         uncertainSinceBaseline: 0,
         lastRunAt: stamp,
@@ -658,6 +716,27 @@ export async function runGateAudit({ home, profile, github = null, now = () => D
     }
 
     const found = [];
+    let recheck = null;
+    if (Number(state.rulesVersion || 1) < AUDIT_RULES_VERSION && prefixHash(lines, Number(state.cursor) || 0) === state.prefixHash) {
+      // 规则升级：按新规则重算基线后的旧账（见 AUDIT_RULES_VERSION），记一条 info 日志，不发提醒。
+      recheck = recheckSinceBaseline({ state, entries, lines, profile, scopes, seen, auditLogFile: paths.auditLogFile });
+      found.push(...recheck.unseen);
+      fs.mkdirSync(path.dirname(paths.auditLogFile), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(
+        paths.auditLogFile,
+        `${JSON.stringify({
+          ts: stamp,
+          level: 'info',
+          rule: 'rules-recheck',
+          detail: `判定规则 v${Number(state.rulesVersion || 1)}→v${AUDIT_RULES_VERSION}，重算基线后账本：明确违规 ${recheck.before} → ${recheck.count} 条`,
+          text: '规则升级后重算',
+        })}\n`,
+        { mode: 0o600 },
+      );
+      state.sinceBaseline = recheck.count;
+      state.rulesVersion = AUDIT_RULES_VERSION;
+      state.recheckedAt = stamp;
+    }
     let from = Math.min(Number(state.cursor) || 0, lines.length);
     if (lines.length < Number(state.cursor) || prefixHash(lines, Number(state.cursor)) !== state.prefixHash) {
       found.push(
@@ -667,7 +746,7 @@ export async function runGateAudit({ home, profile, github = null, now = () => D
       );
       from = 0;
     }
-    const { violations, rounds } = auditEntries(entries, { profile, from });
+    const { violations, rounds } = auditEntries(entries, { profile, from, scopes });
     found.push(...violations);
     let githubErrors = [];
     if (github) {
@@ -749,6 +828,7 @@ export async function runGateAudit({ home, profile, github = null, now = () => D
     const ok = freshViolations.length === 0 && state.sinceBaseline === 0;
     return {
       ok,
+      ...(recheck ? { recheck: { before: recheck.before, after: recheck.count } } : {}),
       status: auditStatus({ ok, newUncertain: freshUncertain, uncertain24h, githubErrors }),
       checkedLines: lines.length - from,
       githubErrors,
