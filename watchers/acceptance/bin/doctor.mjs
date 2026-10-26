@@ -371,6 +371,7 @@ export async function runDoctor({
   }
 
   // 写闸账本审计（只读）：旁路核对写闸账本里已执行的写入，看有没有越规的。只读本地账本 + 只读查轮次评论。
+  // 只有明确违规才让这一项变红；「拿不准」只记日志（detail 里报出来），GitHub 没查成也照旧写进 detail 但不改变红绿。
   try {
     const audit = await gateAudit({ home, profile, github: api, now });
     const parts = [];
@@ -384,6 +385,8 @@ export async function runDoctor({
         );
       }
       parts.push(`基线后违规 ${Number(audit?.sinceBaseline) || 0} 条`);
+      const uncertainNew = Array.isArray(audit?.newUncertain) ? audit.newUncertain.length : 0;
+      parts.push(`拿不准 新 ${uncertainNew} 条、近 24 小时 ${Number(audit?.uncertain24h) || 0} 条（只记日志）`);
     }
     const githubErrors = Array.isArray(audit?.githubErrors) ? audit.githubErrors : [];
     if (githubErrors.length > 0) parts.push(`GitHub 只读核对没做成：${githubErrors.join('；')}`);

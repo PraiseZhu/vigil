@@ -459,6 +459,7 @@ export async function runTick({
       checked: audited.checkedLines,
       found: audited.newViolations.length,
       sinceBaseline: audited.sinceBaseline,
+      uncertain: audited.newUncertain?.length || 0,
     };
   } catch (error) {
     heartbeat.lastTick.gateAuditError = String(error?.message || error);
