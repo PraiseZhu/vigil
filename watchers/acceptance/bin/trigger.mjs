@@ -4,6 +4,16 @@ import { isVerdictOnly } from './profile.mjs';
 import { latestRound } from './rounds.mjs';
 
 export const BACKOFF_MINUTES = Object.freeze([0, 5, 15, 60]);
+/**
+ * 环境问题（依赖装不上等，host/round.mjs 用这个前缀写「中断」原因）：不是代码问题，马上重试多半还是失败，
+ * 白占槽位、在 issue 上刷「验收中 → 中断」。所以最近一次中断是环境问题时退避更长：30 分钟 → 2 小时 → 6 小时封顶。
+ */
+export const ENV_PROBLEM_PREFIX = '环境问题（不是代码不通过）：';
+export const ENV_BACKOFF_MINUTES = Object.freeze([30, 120, 360]);
+
+export function isEnvProblem(round) {
+  return typeof round?.reason === 'string' && round.reason.startsWith(ENV_PROBLEM_PREFIX);
+}
 
 function trailingInterruptCount(rounds) {
   const ordered = [...(rounds || [])].sort((a, b) => a.round - b.round);
@@ -19,8 +29,10 @@ function trailingInterruptCount(rounds) {
 export function backoffUntil(rounds) {
   const k = trailingInterruptCount(rounds);
   if (k === 0) return null;
-  const minutes = k === 1 ? BACKOFF_MINUTES[0] : k === 2 ? BACKOFF_MINUTES[1] : k === 3 ? BACKOFF_MINUTES[2] : BACKOFF_MINUTES[3];
   const last = [...rounds].filter((round) => round.status === '中断').sort((a, b) => a.round - b.round).at(-1);
+  const minutes = isEnvProblem(last)
+    ? ENV_BACKOFF_MINUTES[Math.min(k, ENV_BACKOFF_MINUTES.length) - 1]
+    : k === 1 ? BACKOFF_MINUTES[0] : k === 2 ? BACKOFF_MINUTES[1] : k === 3 ? BACKOFF_MINUTES[2] : BACKOFF_MINUTES[3];
   const from = last?.finishedAt || last?.createdAt;
   if (!from) return null;
   return new Date(Date.parse(from) + minutes * 60 * 1000).toISOString();

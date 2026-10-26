@@ -33,7 +33,8 @@ export const EGRESS_ENV = Object.freeze([
 
 /** 沙箱内部用的变量：两个指向沙箱内路径的（不是宿主的），加上出网变量。 */
 /** 固定值的安静变量：npm 的更新检查会去连 registry（沙箱出网被拒、每轮一条 egress-denied 提醒），直接关掉。 */
-export const QUIET_ENV = Object.freeze({ NPM_CONFIG_UPDATE_NOTIFIER: 'false', NO_UPDATE_NOTIFIER: '1' });
+/** npm_config_offline：沙箱里的 npm 一律离线（依赖由宿主预装、只读挂进来，host/predeps.mjs），不去连 registry。 */
+export const QUIET_ENV = Object.freeze({ NPM_CONFIG_UPDATE_NOTIFIER: 'false', NO_UPDATE_NOTIFIER: '1', npm_config_offline: 'true' });
 
 export const INTERNAL_ENV = Object.freeze(['ACCEPTANCE_WATCHER_HOME', 'ACCEPTANCE_GATE_SOCKET', ...EGRESS_ENV, ...Object.keys(QUIET_ENV)]);
 
@@ -180,7 +181,7 @@ function resolveHomeAllow(hostHomeReal, homeAllow, maskDirs) {
  * hostHome 必填：没有它就没法默认遮掉 HOME，直接抛错，不退回只遮名单的老做法。
  */
 export function buildBwrapArgs(options = {}) {
-  const { home, profile, roundDir, masks, binds, hostHome, homeAllow, readOnlyBinds } = options;
+  const { home, profile, roundDir, masks, binds, hostHome, homeAllow, readOnlyBinds, readOnlyMounts, tmpfsDirs } = options;
   // 环境变量不再进 bwrap 的参数（--setenv 的值会出现在 /proc/<pid>/cmdline，ps 看得见 LLM key）：
   // 调用方把 sandboxEnv() 的结果作为 spawn 的 env 交给 bwrap 进程本身，bwrap 不加 --clearenv，子进程原样继承。
   if (Object.prototype.hasOwnProperty.call(options, 'env')) {
@@ -261,6 +262,54 @@ export function buildBwrapArgs(options = {}) {
     if (!readOnlyList.includes(real)) readOnlyList.push(real);
   }
 
+  // 只读挂到别处（宿主预装的 node_modules → 检出目录里的 node_modules，host/predeps.mjs）：
+  // 目标必须落在某个只读挂载里、并且已经存在（只读挂载里建不出挂载点）；源同样不能碰遮罩。
+  const mountList = [];
+  for (const mount of readOnlyMounts || []) {
+    const src = mount?.src;
+    const dest = mount?.dest;
+    if (typeof src !== 'string' || !path.isAbsolute(src) || typeof dest !== 'string' || !path.isAbsolute(dest)) {
+      throw new Error('只读挂载（src → dest）必须都是绝对路径');
+    }
+    const srcReal = realExisting(src);
+    if (!srcReal || !fs.statSync(srcReal).isDirectory()) throw new Error(`只读挂载的源不存在：${src}`);
+    const destReal = realExisting(dest);
+    if (!destReal || !fs.statSync(destReal).isDirectory()) throw new Error(`只读挂载的目标不存在：${dest}`);
+    if (!readOnlyList.some((dir) => isInside(destReal, dir) && destReal !== dir)) {
+      throw new Error(`沙箱拒绝：只读挂载的目标 ${dest} 不在任何只读挂载里`);
+    }
+    for (const maskDir of maskDirs) {
+      if (isInside(srcReal, maskDir) || isInside(maskDir, srcReal) || isInside(destReal, maskDir)) {
+        throw new Error(`沙箱拒绝：只读挂载 ${src} → ${dest} 与遮罩目录 ${maskDir} 重叠`);
+      }
+    }
+    for (const maskFile of maskFiles) {
+      if (isInside(maskFile, srcReal)) throw new Error(`沙箱拒绝：遮罩文件 ${maskFile} 落在只读挂载 ${src} 里`);
+    }
+    mountList.push({ src: srcReal, dest: destReal, destLexical: path.resolve(dest) });
+  }
+  // 只读挂载里的空 tmpfs（给工具写缓存）：只许落在上面那些只读挂载的目标里；
+  // 挂载点在挂载的源里要已经存在（只读挂载里建不出挂载点）。
+  const tmpfsList = [];
+  for (const dir of tmpfsDirs || []) {
+    if (typeof dir !== 'string' || !path.isAbsolute(dir)) throw new Error(`tmpfs 目录必须是绝对路径：${dir}`);
+    const target = path.resolve(dir);
+    // 目标在宿主上只是空挂载点，按挂载目标（原写法或真实路径）换算到源里去查。
+    const mount = mountList.find((entry) => [entry.dest, entry.destLexical].some((dest) => isInside(target, dest) && target !== dest));
+    if (!mount) throw new Error(`沙箱拒绝：tmpfs 目录 ${dir} 不在只读挂载的目标里`);
+    const rel = path.relative(isInside(target, mount.dest) ? mount.dest : mount.destLexical, target);
+    const inSrc = path.join(mount.src, rel);
+    let stat = null;
+    try {
+      stat = fs.lstatSync(inSrc);
+    } catch {
+      stat = null;
+    }
+    if (!stat || !stat.isDirectory()) throw new Error(`tmpfs 目录不存在：${dir}`);
+    const finalDir = path.join(mount.dest, rel);
+    if (!tmpfsList.includes(finalDir)) tmpfsList.push(finalDir);
+  }
+
   const args = [
     '--die-with-parent',
     '--new-session',
@@ -287,6 +336,8 @@ export function buildBwrapArgs(options = {}) {
   for (const dir of allowList) args.push('--ro-bind', dir, dir);
   for (const bind of bindList) args.push('--bind', bind, bind);
   for (const dir of readOnlyList) args.push('--ro-bind', dir, dir);
+  for (const mount of mountList) args.push('--ro-bind', mount.src, mount.dest);
+  for (const dir of tmpfsList) args.push('--tmpfs', dir);
   // HOME 里没挂回来的遮罩目标本来就在空 tmpfs 下面、读不到；再挂一次反而要在 tmpfs 里造挂载点，跳过。
   // /run 下面同理（整个已是空 tmpfs）。
   const hidden = [hostHomeReal, ...systemTmpfs];
