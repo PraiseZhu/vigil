@@ -16,6 +16,7 @@ import {
 } from './bin/doctor.mjs';
 import { ISSUE_COMMENTS_QUERY } from './bin/rounds.mjs';
 import {
+  AUDIT_RULES_VERSION,
   DEFINITE_RULES,
   RULE_TEXT,
   UNCERTAIN_RULES,
@@ -30,6 +31,7 @@ import {
   summarizeAudit,
 } from './host/gate-audit.mjs';
 import { hostPaths, readAlerts } from './host/paths.mjs';
+import { loadScopes, recordScope, scopeForEntry, scopeOf } from './host/scope-snapshot.mjs';
 import { alertBlocks, esc } from './host/slack-blocks.mjs';
 import { classify } from './host/slack-notify.mjs';
 import { runTick } from './host/tick.mjs';
@@ -1182,4 +1184,145 @@ test('doctor：拿不准是 ✓ 且 detail 带「拿不准」；GitHub 没查成
   const failed = checkOf(definite, '写闸账本审计');
   assert.equal(failed.ok, false);
   assert.match(failed.detail, /这次新发现：第 13 行 pr\.merge/);
+});
+
+// ---- 仓范围按写入当时判（project-keel#59「宿主标中断」被误判越权的根因）----
+
+const KEEL = 'example-owner/keel-repo';
+const KEEL_ROOT = `${KEEL}#59`;
+
+/** 暂停时换上的 profile：通配换成显式名单，keel-repo 不在里面。 */
+function pausedProfile() {
+  return profile({ autoRepos: [REPO] });
+}
+
+/** 一轮 keel 的认领 + 宿主标中断（和真实账本同形：round-finish:<root>:<n>:<评论 id>:中断）。 */
+function keelRound({ scope } = {}) {
+  const stamp = scope ? { scope } : {};
+  return [
+    {
+      ...roundStart(3001, 1, { root: KEEL_ROOT, repo: KEEL, issue: 59 }),
+      ...stamp,
+    },
+    {
+      dedupeKey: `round-finish:${KEEL_ROOT}:1:3001:中断`,
+      type: 'comment.update',
+      result: { commentId: 3001, url: commentUrl(3001, { repo: KEEL, issue: 59 }) },
+      at: AT,
+      ...stamp,
+    },
+  ];
+}
+
+test('范围按写入当时判：带快照指纹的记录，事后把仓移出 autoRepos 也不算越权', () => {
+  const home = homeWithLedger([]);
+  const gateDir = hostPaths(home).gateDir;
+  const hash = recordScope(gateDir, profile());
+  const scopes = loadScopes(gateDir);
+  const entries = [...compliantEntries(), ...keelRound({ scope: hash })];
+  const audited = auditEntries(entries, { profile: pausedProfile(), scopes });
+  assert.deepEqual(audited.violations.map((item) => item.rule), []);
+  // 同样的记录不带指纹（老账本）：只能按当前配置判，照旧报越权（这正是 #59 那条误报的形状）。
+  const legacy = auditEntries([...compliantEntries(), ...keelRound()], { profile: pausedProfile(), scopes });
+  assert.deepEqual([...new Set(legacy.violations.map((item) => item.rule))], ['repo-out-of-scope']);
+  assert.equal(legacy.violations[0].scopeSource, 'current');
+});
+
+test('范围按写入当时判：写入当时就不在范围内的，现在加进名单也照报', () => {
+  const home = homeWithLedger([]);
+  const gateDir = hostPaths(home).gateDir;
+  const hash = recordScope(gateDir, pausedProfile());
+  const scopes = loadScopes(gateDir);
+  const audited = auditEntries([...compliantEntries(), ...keelRound({ scope: hash })], { profile: profile(), scopes });
+  const out = audited.violations.filter((item) => item.rule === 'repo-out-of-scope');
+  assert.ok(out.length >= 1);
+  assert.equal(out[0].scopeSource, 'write-time');
+  assert.equal(out[0].repo, KEEL);
+});
+
+test('范围快照被改过（内容和指纹对不上）就不认，退回按当前配置判', () => {
+  const home = homeWithLedger([]);
+  const gateDir = hostPaths(home).gateDir;
+  const hash = recordScope(gateDir, pausedProfile());
+  // 有人把快照改宽了：指纹核对不上，不认。
+  fs.writeFileSync(path.join(gateDir, 'scopes', `${hash}.json`), JSON.stringify(scopeOf(profile())));
+  const scopes = loadScopes(gateDir);
+  assert.equal(scopes.has(hash), false);
+  const audited = auditEntries([...compliantEntries(), ...keelRound({ scope: hash })], { profile: pausedProfile(), scopes });
+  assert.equal(audited.violations.find((item) => item.rule === 'repo-out-of-scope')?.scopeSource, 'current');
+  // 指纹格式不对的也不认。
+  assert.equal(scopeForEntry({ scope: '../../etc' }, pausedProfile(), scopes).source, 'current');
+});
+
+test('复现 + 修复：写入后才暂停，带指纹的新记录审计不报、不发提醒', async () => {
+  const home = homeWithLedger(compliantEntries());
+  await runGateAudit({ home, profile: profile(), now: () => NOW });
+  // 写闸按全量范围放行并记账（带指纹），之后人把 keel 暂停。
+  const hash = recordScope(hostPaths(home).gateDir, profile());
+  appendLedger(home, keelRound({ scope: hash }));
+  const result = await runGateAudit({ home, profile: pausedProfile(), now: () => NOW });
+  assert.deepEqual(result.newViolations, []);
+  assert.equal(result.sinceBaseline, 0);
+  assert.equal(result.ok, true);
+  assert.deepEqual(readAlerts(hostPaths(home)).filter((alert) => alert.kind === 'gate-audit-violation'), []);
+});
+
+test('规则升级重算：v1 下按暂停配置误判的老记录，范围恢复后自动重算清掉；真违规和 GitHub 发现照算', async () => {
+  const home = homeWithLedger(compliantEntries());
+  await runGateAudit({ home, profile: profile(), now: () => NOW });
+  // 老记录（没指纹）+ 一条真违规（pr.merge）
+  appendLedger(home, [...keelRound(), { dedupeKey: `close:${ROOT}:2`, type: 'pr.merge', result: {}, at: AT }]);
+  const paused = await runGateAudit({ home, profile: pausedProfile(), now: () => NOW });
+  assert.deepEqual(paused.newViolations.map((item) => item.rule).sort(), ['pr-merge', 'repo-out-of-scope', 'repo-out-of-scope']);
+  assert.equal(paused.sinceBaseline, 3);
+  // GitHub 核对发现的（账本算不出来，只能沿用日志）
+  const paths = auditPaths(home);
+  fs.appendFileSync(
+    paths.auditLogFile,
+    `${JSON.stringify({ ts: new Date(NOW).toISOString(), level: 'violation', rule: 'round-comment-missing', line: 1 })}\n`,
+  );
+  // 模拟这批状态是 v1 规则写的
+  const state = JSON.parse(fs.readFileSync(paths.auditStateFile, 'utf8'));
+  delete state.rulesVersion;
+  state.sinceBaseline = 4;
+  fs.writeFileSync(paths.auditStateFile, JSON.stringify(state));
+  const alertsBefore = readAlerts(hostPaths(home)).length;
+
+  // 范围恢复（"example-owner/*"）后的下一次审计：自动重算，误报消掉，pr.merge + GitHub 那条还在。
+  const restored = await runGateAudit({ home, profile: profile(), now: () => NOW });
+  assert.deepEqual(restored.recheck, { before: 4, after: 2 });
+  assert.equal(restored.sinceBaseline, 2);
+  assert.equal(restored.ok, false);
+  assert.equal(readAlerts(hostPaths(home)).length, alertsBefore, '重算不发提醒');
+  const log = fs.readFileSync(paths.auditLogFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  const info = log.filter((row) => row.level === 'info');
+  assert.equal(info.length, 1);
+  assert.match(info[0].detail, /v1→v2.*4 → 2/);
+  // info 行不算拿不准、也不算违规
+  const summary = summarizeAudit({ home, now: () => NOW });
+  assert.equal(summary.uncertainCount, 0);
+  assert.equal(summary.violationCount, 4);
+  // 只重算一次
+  const again = await runGateAudit({ home, profile: profile(), now: () => NOW });
+  assert.equal(again.recheck, undefined);
+  assert.equal(again.sinceBaseline, 2);
+});
+
+test('规则升级重算：只有误报时清零，ok 变 true，不靠 ack', async () => {
+  const home = homeWithLedger(compliantEntries());
+  await runGateAudit({ home, profile: profile(), now: () => NOW });
+  appendLedger(home, keelRound());
+  const paused = await runGateAudit({ home, profile: pausedProfile(), now: () => NOW });
+  assert.equal(paused.ok, false);
+  const paths = auditPaths(home);
+  const state = JSON.parse(fs.readFileSync(paths.auditStateFile, 'utf8'));
+  delete state.rulesVersion;
+  fs.writeFileSync(paths.auditStateFile, JSON.stringify(state));
+  const restored = await runGateAudit({ home, profile: profile(), now: () => NOW });
+  assert.equal(restored.sinceBaseline, 0);
+  assert.equal(restored.ok, true);
+  assert.equal(restored.status, 'ok');
+  const after = JSON.parse(fs.readFileSync(paths.auditStateFile, 'utf8'));
+  assert.equal(after.acknowledgedAt, undefined, '没有走 ack');
+  assert.equal(after.rulesVersion, AUDIT_RULES_VERSION);
 });

@@ -6,6 +6,7 @@ import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { scopeHash, scopeOf } from './host/scope-snapshot.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion, createRounds } from './bin/rounds.mjs';
 import { applyTicks } from './bin/close.mjs';
@@ -514,6 +515,11 @@ test('SC9 同一 dedupeKey 交两次：只执行一次，结果一样', async ()
     .map((line) => JSON.parse(line));
   assert.equal(ledger.length, 1);
   assert.equal(ledger[0].dedupeKey, 'same-key');
+  // 账本记录带上写入当时放行用的仓范围指纹，快照存在 state/write-gate/scopes 下，内容和指纹对得上。
+  assert.match(ledger[0].scope, /^[0-9a-f]{16}$/);
+  const snapshot = JSON.parse(fs.readFileSync(path.join(paths.gateDir, 'scopes', `${ledger[0].scope}.json`), 'utf8'));
+  assert.deepEqual(snapshot, scopeOf(profile));
+  assert.equal(scopeHash(snapshot), ledger[0].scope);
 });
 
 test('SC9 缺 dedupeKey 的写动作 → 4 missing-dedupe-key', async () => {
