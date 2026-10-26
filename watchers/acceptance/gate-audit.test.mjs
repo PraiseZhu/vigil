@@ -330,10 +330,10 @@ test('基线：第一次跑只统计不报；之后新增一条违规报一条�
   assert.deepEqual(first.newViolations, []);
   assert.equal(first.sinceBaseline, 0);
   assert.equal(first.baseline.lines, history.length);
-  assert.equal(first.baseline.violations, 1, 'baseline.violations 只计明确违规（type-not-allowed 是拿不准）');
-  assert.equal(first.baseline.uncertain, 1);
-  assert.deepEqual(first.baseline.rules, { 'repo-out-of-scope': 1 });
-  assert.deepEqual(first.baseline.uncertainRules, { 'type-not-allowed': 1 });
+  assert.equal(first.baseline.violations, 2, 'baseline.violations 只计明确违规（type-not-allowed 也是明确违规）');
+  assert.equal(first.baseline.uncertain, 0);
+  assert.deepEqual(first.baseline.rules, { 'type-not-allowed': 1, 'repo-out-of-scope': 1 });
+  assert.deepEqual(first.baseline.uncertainRules, {});
   assert.equal(first.checkedLines, history.length);
   assert.deepEqual(readAlerts(hostPaths(home)).filter((alert) => alert.kind === 'gate-audit-violation'), []);
 
@@ -363,20 +363,23 @@ test('基线：第一次跑只统计不报；之后新增一条违规报一条�
   assert.equal(readAlerts(hostPaths(home)).filter((alert) => alert.kind === 'gate-audit-violation').length, 1);
   assert.equal(fs.readFileSync(path.join(hostPaths(home).hostDir, 'gate-audit.log'), 'utf8').trim().split('\n').length, 1);
 
-  // 账本被截短：报一次 ledger-rewritten（拿不准，只记日志、不发提醒），旧违规不重复。
+  // 账本被截短：报一次 ledger-rewritten（明确违规：写提醒、ok=false），旧违规不重复。
   const file = hostPaths(home).ledgerFile;
   const kept = fs.readFileSync(file, 'utf8').trim().split('\n').slice(0, 2);
   fs.writeFileSync(file, `${kept.join('\n')}\n`);
   const rewritten = await runGateAudit({ home, profile: profile(), now: () => NOW });
-  assert.deepEqual(rewritten.newViolations, []);
-  assert.deepEqual(rewritten.newUncertain.map((item) => item.rule), ['ledger-rewritten']);
-  assert.equal(rewritten.uncertainSinceBaseline, 1);
-  assert.equal(rewritten.sinceBaseline, 1);
-  // 基线后还有 1 条没清零的明确违规（前面那条 pr-merge），所以 ok 仍是 false、status 仍算 violation。
+  assert.deepEqual(rewritten.newViolations.map((item) => item.rule), ['ledger-rewritten']);
+  assert.equal(rewritten.newViolations[0].level, 'violation');
+  assert.deepEqual(rewritten.newUncertain, []);
+  assert.equal(rewritten.uncertainSinceBaseline, 0);
+  assert.equal(rewritten.sinceBaseline, 2);
   assert.equal(rewritten.ok, false);
   assert.equal(rewritten.status, 'violation');
-  const rewrittenAlert = readAlerts(hostPaths(home)).filter((alert) => alert.kind === 'gate-audit-violation');
-  assert.equal(rewrittenAlert.length, 1);
+  const rewrittenAlerts = readAlerts(hostPaths(home)).filter((alert) => alert.kind === 'gate-audit-violation');
+  assert.equal(rewrittenAlerts.length, 2);
+  assert.equal(rewrittenAlerts[1].count, 1);
+  assert.equal(rewrittenAlerts[1].rules, 'ledger-rewritten');
+  assert.match(rewrittenAlerts[1].detail, /改写或截短/);
 
   // 改写（不是截短）也报：把第一行的去重键换掉，前缀哈希就变了。
   const lines = fs.readFileSync(file, 'utf8').trim().split('\n');
@@ -384,8 +387,10 @@ test('基线：第一次跑只统计不报；之后新增一条违规报一条�
   lines[0] = JSON.stringify({ ...firstEntry, dedupeKey: `${firstEntry.dedupeKey}-changed` });
   fs.writeFileSync(file, `${lines.join('\n')}\n`);
   const edited = await runGateAudit({ home, profile: profile(), now: () => NOW });
-  assert.deepEqual(edited.newUncertain.map((item) => item.rule), ['ledger-rewritten']);
-  assert.equal(edited.newViolations.length, 0);
+  assert.deepEqual(edited.newViolations.map((item) => item.rule), ['ledger-rewritten']);
+  assert.deepEqual(edited.newUncertain, []);
+  assert.equal(edited.ok, false);
+  assert.equal(readAlerts(hostPaths(home)).filter((alert) => alert.kind === 'gate-audit-violation').length, 3);
 });
 
 test('增量：checkedLines 只算这次新增的行', async () => {
@@ -681,15 +686,10 @@ test('规则两级划分：每条规则恰好在一级里，未知规则算拿�
     'verdict-only-write',
     'round-comment-modified',
     'round-comment-missing',
-  ]);
-  assert.deepEqual([...UNCERTAIN_RULES], [
-    'no-round',
-    'round-mismatch',
-    'unverifiable',
     'type-not-allowed',
-    'ledger-corrupt',
     'ledger-rewritten',
   ]);
+  assert.deepEqual([...UNCERTAIN_RULES], ['no-round', 'round-mismatch', 'unverifiable', 'ledger-corrupt']);
   assert.equal(ruleLevel('something-new'), 'uncertain');
   assert.equal(ruleLevel(undefined), 'uncertain');
 });
@@ -770,7 +770,7 @@ test('拿不准只记日志、不发提醒：no-round / round-mismatch / unverif
   }
 });
 
-test('明确违规照旧发提醒：pr.merge / 范围外仓库 / 越权写 / 轮次评论被改', async () => {
+test('明确违规照旧发提醒：pr.merge / 范围外仓库 / 越权写 / 轮次评论被改 / 白名单外写类型', async () => {
   const cases = [
     [
       'pr-merge',
@@ -800,6 +800,12 @@ test('明确违规照旧发提醒：pr.merge / 范围外仓库 / 越权写 / 轮
         result: { commentId: 1001, url: commentUrl(1001) },
         boundCommentId: 1001,
       },
+    ],
+    [
+      'type-not-allowed',
+      profile(),
+      compliantEntries(),
+      { dedupeKey: `board-claim:${ROOT}:1:1001`, type: 'issue.transfer', result: {} },
     ],
   ];
   for (const [rule, prof, history, entry] of cases) {
