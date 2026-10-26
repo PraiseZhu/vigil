@@ -7,6 +7,8 @@ HOME_DIR="${ACCEPTANCE_WATCHER_HOME:?需要 ACCEPTANCE_WATCHER_HOME}"
 mkdir -p "$HOME_DIR/state/host"
 exec 9>"$HOME_DIR/state/host/loop.lock"
 flock -n 9 || { echo "loop 已在跑" >&2; exit 0; }
+# 循环起来了，stop.sh 留的「主动停」标记就用不着了（手动起循环时也要清掉，免得以后真挂了被当成部署重启）。
+rm -f "$HOME_DIR/state/host/planned-stop.json"
 # 锁只属于这个 shell：子进程一律关掉 fd 9（9>&-）。不然 tick 拉起的轮次、正在 sleep 的子进程
 # 会继承锁，loop 被停掉后它们还占着，ensure.sh 拉起的新循环拿不到锁、直接退出。
 while :; do

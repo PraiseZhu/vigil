@@ -1652,3 +1652,9 @@ test('round-failed 同一 issue：第 1 次立即发、第 2 次合成反复中�
     assert.equal(fake.posts().length, 2);
   });
 });
+
+test('心跳延迟和部署重启只进摘要，不立即 ping', () => {
+  assert.equal(classify('alerts', { kind: 'heartbeat-delayed', reason: 'delay-600s' }), 'digest');
+  assert.equal(classify('alerts', { kind: 'loop-deploy-restarted', reason: 'planned-stop' }), 'digest');
+  assert.equal(classify('alerts', { kind: 'loop-restarted', reason: 'heartbeat-stale' }), 'blocked');
+});

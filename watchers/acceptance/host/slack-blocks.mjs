@@ -409,6 +409,22 @@ export const NOTICE_COPY = Object.freeze({
     action: '不用；一天内反复出现请让修复员查。',
     needsHuman: false,
   },
+  'heartbeat-delayed': {
+    title: '验收机心跳晚了，但调度循环还在，没有重启',
+    what: '保活脚本发现调度循环好一阵没写心跳，但原来的循环进程还在、单实例锁也还占着，像是整机被暂停后恢复或某一拍跑得久，不是循环挂了。',
+    impact: '没有影响：原来的循环接着跑，在跑的轮次不受影响，没有补起第二个循环。',
+    auto: '只记了一条「心跳延迟」，没有拉起新循环。',
+    action: '不用；同一天反复出现、或心跳一直不恢复，请让修复员查循环是不是卡住了。',
+    needsHuman: false,
+  },
+  'loop-deploy-restarted': {
+    title: '部署更新后，验收机调度循环已重新拉起',
+    what: '调度循环是用 stop.sh 主动停的（部署更新等），保活脚本按计划把它拉了起来，不是意外重启。',
+    impact: '停的这段时间没有派发新任务；已经在跑的轮次不受影响。',
+    auto: '保活脚本已把调度循环重新拉起。',
+    action: '不用。',
+    needsHuman: false,
+  },
   'tick-failed': {
     title: '验收机有一拍调度出错',
     what: '一次调度（每分钟一次）中途出错，常见是网络瞬断。',
@@ -545,6 +561,13 @@ function noticeCopy(event, type) {
       base.what = '调度循环进程不在了。';
     }
   }
+  if (type === 'heartbeat-delayed') {
+    const secs = Number(/^delay-(\d+)s$/.exec(str(event.reason))?.[1]);
+    if (Number.isFinite(secs) && secs > 0) {
+      const mins = Math.max(1, Math.round(secs / 60));
+      base.title = `验收机心跳晚了约 ${mins} 分钟，但调度循环还在，没有重启`;
+    }
+  }
   if (type === 'interrupted-repeat') {
     const count = Number(event.windowCount) || 0;
     const kinds = Array.isArray(event.windowKinds) ? event.windowKinds : [];
@@ -633,7 +656,7 @@ export function alertBlocks(notice, profile) {
     if (str(event.detail)) lines.push(`动作：${esc(str(event.detail))}`);
   } else {
     // loop-restarted 的已知原因已经写进标题和「发生了什么」，不再重复贴代码名。
-    const knownLoopReason = type === 'loop-restarted' && ['heartbeat-stale', 'loop-not-running'].includes(str(event.reason));
+    const knownLoopReason = knownReason(type, event);
     if (str(event.reason) && !knownLoopReason) lines.push(`原始记录：${esc(str(event.reason))}`);
     if (type === 'needs-human' && str(event.detail)) lines.push(`细节：${esc(str(event.detail))}`);
   }
@@ -648,6 +671,15 @@ export function alertBlocks(notice, profile) {
   return finish({ text: fallbackText(copy, issue, needsHuman, extra), blocks }, profile);
 }
 
+/** 原因已经写进标题和「发生了什么」的，不再贴「原始记录：」。 */
+function knownReason(type, event) {
+  const reason = str(event.reason);
+  if (type === 'loop-restarted') return ['heartbeat-stale', 'loop-not-running'].includes(reason);
+  if (type === 'loop-deploy-restarted') return reason === 'planned-stop';
+  if (type === 'heartbeat-delayed') return /^delay-\d+s$/.test(reason);
+  return false;
+}
+
 function digestLine(data) {
   const type = safeType(data.type) || safeType(data.kind) || 'alert';
   const copy = noticeCopy(data, type);
@@ -657,7 +689,7 @@ function digestLine(data) {
   if (type === 'gate-rejected') {
     const reason = str(data.reason);
     if (reason) extra = `（原始记录：${esc(gateReasonText(reason))}）`;
-  } else {
+  } else if (!knownReason(type, data)) {
     const reason = clip(str(data.reason), 140);
     if (reason) extra = `（原始记录：${esc(reason)}）`;
   }

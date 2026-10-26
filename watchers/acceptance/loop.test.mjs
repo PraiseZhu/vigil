@@ -242,6 +242,167 @@ test('SC12 ensure.sh：心跳过期的拉起循环并写一条提醒；连跑两
   for (const pid of new Set(tickLines(tickLog).map((line) => line.split(':')[0]))) killQuiet(Number(pid));
 });
 
+/** 起一个占着 loop.lock 的假「原循环」（flock 持锁再 sleep），返回它的 pid。 */
+async function holdLoopLock(paths, seconds = 30) {
+  fs.mkdirSync(paths.hostDir, { recursive: true });
+  const lockFile = path.join(paths.hostDir, 'loop.lock');
+  const child = spawn('flock', [lockFile, 'sleep', String(seconds)], { stdio: 'ignore' });
+  spawned.push(child);
+  const held = await waitFor(() => spawnSync('flock', ['-n', lockFile, 'true']).status !== 0, 3000);
+  assert.ok(held, '前提：假原循环要占住 loop.lock');
+  return child.pid;
+}
+
+function loopLogText(paths) {
+  return fs.existsSync(paths.loopLog) ? fs.readFileSync(paths.loopLog, 'utf8') : '';
+}
+
+test('ensure.sh：心跳过期但原循环进程还在、锁还占着 → 只记「心跳延迟」，不补起新循环、不发 loop-restarted', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const tickLog = path.join(home, 'tick.log');
+  knownTickLogs.add(tickLog);
+  const hostCopy = makeHostCopy(home, tickLog);
+  const paths = hostPaths(home);
+  const holder = await holdLoopLock(paths);
+  try {
+    const staleMs = Date.parse('2026-10-24T02:00:00.000Z');
+    fs.writeFileSync(
+      paths.heartbeatFile,
+      JSON.stringify({ at: new Date(staleMs).toISOString(), pid: holder, lastTick: { ok: true }, running: [] }),
+    );
+    const result = await runScript(path.join(hostCopy, 'ensure.sh'), home, { ACCEPTANCE_NOW_MS: String(staleMs + 600000) });
+    assert.equal(result.code, 0, result.stderr);
+    await sleep(1500);
+    assert.deepEqual(tickLines(tickLog), [], '不该拉起新循环跑 tick');
+    const alerts = readAlerts(paths);
+    assert.equal(alerts.filter((entry) => entry.kind === 'loop-restarted').length, 0, JSON.stringify(alerts));
+    const delayed = alerts.filter((entry) => entry.kind === 'heartbeat-delayed');
+    assert.equal(delayed.length, 1, JSON.stringify(alerts));
+    assert.equal(delayed[0].reason, 'delay-600s');
+    assert.match(loopLogText(paths), /心跳延迟 600 秒，但原循环进程还在、单实例锁也还占着/);
+    assert.ok(isAlive(holder), '原循环不该被动');
+  } finally {
+    killQuiet(holder);
+  }
+});
+
+test('ensure.sh：心跳过期且原循环进程已不在 → 照常拉起并发 loop-restarted(heartbeat-stale)', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const tickLog = path.join(home, 'tick.log');
+  knownTickLogs.add(tickLog);
+  const hostCopy = makeHostCopy(home, tickLog);
+  const paths = hostPaths(home);
+  fs.mkdirSync(paths.hostDir, { recursive: true });
+  const gone = spawnSync('sh', ['-c', 'echo $$']);
+  const deadPid = Number(String(gone.stdout).trim());
+  assert.ok(!isAlive(deadPid), '前提：pid 已不在');
+  const staleMs = Date.parse('2026-10-24T02:00:00.000Z');
+  fs.writeFileSync(
+    paths.heartbeatFile,
+    JSON.stringify({ at: new Date(staleMs).toISOString(), pid: deadPid, lastTick: { ok: true }, running: [] }),
+  );
+  try {
+    const result = await runScript(path.join(hostCopy, 'ensure.sh'), home, { ACCEPTANCE_NOW_MS: String(staleMs + 600000) });
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(await waitFor(() => tickLines(tickLog).length >= 1), '要拉起循环');
+    const alerts = readAlerts(paths);
+    assert.deepEqual(alerts.map((entry) => [entry.kind, entry.reason]), [['loop-restarted', 'heartbeat-stale']]);
+    assert.equal(alerts.some((entry) => entry.kind === 'heartbeat-delayed'), false);
+  } finally {
+    for (const line of tickLines(tickLog)) killQuiet(Number(line.split(':')[1]));
+    for (const pid of new Set(tickLines(tickLog).map((line) => line.split(':')[0]))) killQuiet(Number(pid));
+  }
+});
+
+test('ensure.sh：心跳过期、pid 碰巧活着但锁没人占（pid 被别的进程复用）→ 保守起见照常拉起', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const tickLog = path.join(home, 'tick.log');
+  knownTickLogs.add(tickLog);
+  const hostCopy = makeHostCopy(home, tickLog);
+  const paths = hostPaths(home);
+  fs.mkdirSync(paths.hostDir, { recursive: true });
+  fs.writeFileSync(path.join(paths.hostDir, 'loop.lock'), '');
+  const staleMs = Date.parse('2026-10-24T02:00:00.000Z');
+  fs.writeFileSync(
+    paths.heartbeatFile,
+    JSON.stringify({ at: new Date(staleMs).toISOString(), pid: process.pid, lastTick: { ok: true }, running: [] }),
+  );
+  try {
+    const result = await runScript(path.join(hostCopy, 'ensure.sh'), home, { ACCEPTANCE_NOW_MS: String(staleMs + 600000) });
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(await waitFor(() => tickLines(tickLog).length >= 1), '锁没人占就要拉起');
+    assert.deepEqual(readAlerts(paths).map((entry) => entry.kind), ['loop-restarted']);
+  } finally {
+    for (const line of tickLines(tickLog)) killQuiet(Number(line.split(':')[1]));
+    for (const pid of new Set(tickLines(tickLog).map((line) => line.split(':')[0]))) killQuiet(Number(pid));
+  }
+});
+
+test('部署重启：stop.sh 留标记 → ensure.sh 拉起时记 loop-deploy-restarted（不是 loop-restarted），标记用完即删；新循环起来也清标记', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const tickLog = path.join(home, 'tick.log');
+  knownTickLogs.add(tickLog);
+  const hostCopy = makeHostCopy(home, tickLog);
+  const paths = hostPaths(home);
+  const marker = path.join(paths.hostDir, 'planned-stop.json');
+  try {
+    const first = await runScript(path.join(hostCopy, 'ensure.sh'), home);
+    assert.equal(first.code, 0, first.stderr);
+    assert.ok(await waitFor(() => tickLines(tickLog).length >= 1), '先拉起一个循环');
+    const firstLoop = Number(tickLines(tickLog)[0].split(':')[0]);
+
+    const stopped = await runScript(path.join(hostCopy, 'stop.sh'), home);
+    assert.equal(stopped.code, 0, stopped.stderr);
+    assert.ok(fs.existsSync(marker), 'stop.sh 要留「主动停」标记');
+    assert.equal(JSON.parse(fs.readFileSync(marker, 'utf8')).by, 'stop.sh');
+    for (const line of tickLines(tickLog)) killQuiet(Number(line.split(':')[1]));
+    assert.ok(await waitFor(() => !isAlive(firstLoop), 3000), 'loop 要真的退出');
+
+    const again = await runScript(path.join(hostCopy, 'ensure.sh'), home);
+    assert.equal(again.code, 0, again.stderr);
+    assert.ok(
+      await waitFor(() => new Set(tickLines(tickLog).map((line) => line.split(':')[0])).size >= 2),
+      '部署后要拉起新循环',
+    );
+    const kinds = readAlerts(paths).map((entry) => [entry.kind, entry.reason]);
+    assert.deepEqual(kinds.slice(-1), [['loop-deploy-restarted', 'planned-stop']], JSON.stringify(kinds));
+    assert.equal(fs.existsSync(marker), false, '标记用一次就删');
+    assert.match(loopLogText(paths), /按部署重启记录/);
+  } finally {
+    for (const line of tickLines(tickLog)) killQuiet(Number(line.split(':')[1]));
+    for (const pid of new Set(tickLines(tickLog).map((line) => line.split(':')[0]))) killQuiet(Number(pid));
+  }
+
+  // 手动起循环（不经 ensure）也会清掉残留标记，免得以后真挂了被当成部署重启。
+  fs.writeFileSync(marker, JSON.stringify({ at: new Date().toISOString(), by: 'stop.sh', pid: 1 }));
+  const manual = startLoop(hostCopy, home, '30');
+  assert.ok(await waitFor(() => !fs.existsSync(marker), 3000), '循环起来要清标记');
+  killQuiet(manual.child.pid);
+  await manual.exited;
+});
+
+test('部署重启：标记超过 2 小时就不算，按意外重启发 loop-restarted 并删掉旧标记', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const tickLog = path.join(home, 'tick.log');
+  knownTickLogs.add(tickLog);
+  const hostCopy = makeHostCopy(home, tickLog);
+  const paths = hostPaths(home);
+  fs.mkdirSync(paths.hostDir, { recursive: true });
+  const marker = path.join(paths.hostDir, 'planned-stop.json');
+  const nowMs = Date.parse('2026-10-24T05:00:00.000Z');
+  fs.writeFileSync(marker, JSON.stringify({ at: new Date(nowMs - 3 * 3600000).toISOString(), by: 'stop.sh', pid: 1 }));
+  try {
+    const result = await runScript(path.join(hostCopy, 'ensure.sh'), home, { ACCEPTANCE_NOW_MS: String(nowMs) });
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(readAlerts(paths).map((entry) => [entry.kind, entry.reason]), [['loop-restarted', 'heartbeat-stale']]);
+    assert.equal(fs.existsSync(marker), false, '过期标记也要删');
+    assert.ok(await waitFor(() => tickLines(tickLog).length >= 1), '要拉起循环');
+  } finally {
+    for (const line of tickLines(tickLog)) killQuiet(Number(line.split(':')[1]));
+    for (const pid of new Set(tickLines(tickLog).map((line) => line.split(':')[0]))) killQuiet(Number(pid));
+  }
+});
+
 test('SC12 停掉 loop 后，残留的子进程（在跑的轮次、sleep）不占单实例锁：ensure.sh 马上能拉起新循环', async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');

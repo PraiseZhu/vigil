@@ -376,3 +376,33 @@ test('Slack 块类型都是 Slack 认的：字段放在 section.fields 里，没
     }
   }
 });
+
+test('心跳延迟 / 部署重启：人话讲清发生了什么、没有影响、不用人处理；不贴代码名和原始原因', () => {
+  const delayed = alertBlocks({ source: 'alerts', type: 'heartbeat-delayed', event: { kind: 'heartbeat-delayed', reason: 'delay-610s' } }, {});
+  const delayedText = textOf(delayed);
+  assert.match(delayedText, /验收机心跳晚了约 10 分钟，但调度循环还在，没有重启/);
+  assert.match(delayedText, /没有影响/);
+  assert.match(delayedText, /没有补起第二个循环/);
+  assert.equal(delayedText.includes('需要你处理'), false);
+  assert.equal(delayedText.includes('delay-610s'), false, '原因已写进标题，不贴原始记录');
+  assert.equal(delayedText.includes('heartbeat-delayed'), false);
+
+  const deploy = alertBlocks({ source: 'alerts', type: 'loop-deploy-restarted', event: { kind: 'loop-deploy-restarted', reason: 'planned-stop' } }, {});
+  const deployText = textOf(deploy);
+  assert.match(deployText, /部署更新后，验收机调度循环已重新拉起/);
+  assert.match(deployText, /不是意外重启/);
+  assert.equal(deployText.includes('需要你处理'), false);
+  assert.equal(deployText.includes('planned-stop'), false);
+  assert.equal(NOTICE_COPY['loop-deploy-restarted'].needsHuman, false);
+  assert.equal(NOTICE_COPY['heartbeat-delayed'].needsHuman, false);
+
+  const digest = textOf(
+    digestBlocks([
+      { type: 'heartbeat-delayed', reason: 'delay-200s' },
+      { type: 'loop-deploy-restarted', reason: 'planned-stop' },
+    ]),
+  );
+  assert.match(digest, /心跳晚了约 3 分钟/);
+  assert.match(digest, /部署更新后/);
+  assert.equal(digest.includes('原始记录'), false);
+});
