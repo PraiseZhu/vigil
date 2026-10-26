@@ -12,6 +12,8 @@ import {
   createWorld,
   defaultTree,
 } from './session.fixture.mjs';
+import { correctionBody } from './bin/correct.mjs';
+import { parseItems, parseMarker } from './bin/collect.mjs';
 
 function loadProfile() {
   const { home } = writeProfile(tmpDir());
@@ -71,10 +73,10 @@ test('SC5 新开修正子 issue：模板、修正标记、挂到同一个总 iss
 
   const body = created[0].body;
   assert.ok(body.includes(`> 修正子 issue · 总 issue ${REPO}#1 · 原属 ${OTHER_REPO}#7`), body);
-  assert.ok(body.includes('## 没过的验收项'));
+  for (const heading of ['## 目标', '## 原因', '## 范围（可改）', '## 不做', '## 依赖', '## 验收标准']) {
+    assert.ok(body.split('\n').includes(heading), `缺「${heading}」：${body}`);
+  }
   assert.ok(body.includes('跨仓也要收 验证：browser-fixture'), body);
-  assert.ok(body.includes('## 没过的原因'));
-  assert.ok(body.includes('## 验收标准'));
   assert.ok(body.includes('- [ ] SC1 跨仓也要收 验证：browser-fixture'), body);
   assert.ok(body.includes(`[验收机] 修正 · 总 ${REPO}#1 · 项 ${OTHER_REPO}#7 SC7 · 第 1 轮`));
   assert.equal(body.includes('原 issue：'), false, '非 fork 档不写链回原 issue 那一行');
@@ -90,6 +92,24 @@ test('SC5 新开修正子 issue：模板、修正标记、挂到同一个总 iss
   assert.equal(world.get(`${REPO}#1`).project['验收'], '要修');
   assert.equal(world.get(printed.ref).project['验收'], '要修');
   assert.equal(world.get(printed.ref).project['裁决'], world.get(`${REPO}#1`).comments[0].url);
+});
+
+test('#96 修正子 issue 正文按 task-issue/v1 子 issue 模板写：只有一行 SC1，标记不变，过 check-pr-issue 的结构检查', () => {
+  const args = { root: `${REPO}#1`, rootUrl: 'https://example.invalid/1', item: `${OTHER_REPO}#7`, text: '跨仓也要收 验证：browser-fixture', why: '没收到', sc: 7, round: 2 };
+  for (const fork of [false, true]) {
+    const body = correctionBody({ ...args, fork });
+    const items = parseItems(body, 'x');
+    assert.equal(items.length, 1, '正文里只能有一行 SC：parseItems 会把每个 SC 行都当验收项');
+    assert.equal(items[0].sc, 1);
+    assert.equal(items[0].layer, 'browser-fixture');
+    assert.deepEqual(parseMarker(body), { root: `${REPO}#1`, item: `${OTHER_REPO}#7`, sc: 7, round: 2 });
+    // 和本地 check-pr-issue.sh 同一组检查：五个锚点标题 + SC<n> 编号行。
+    for (const heading of ['## 目标', '## 范围', '## 不做', '## 依赖', '## 验收标准']) {
+      assert.ok(body.split('\n').some((line) => line.startsWith(heading)), heading);
+    }
+    assert.ok(body.split('\n').some((line) => /^\s*[-*]\s*(\[[ xX]\])?\s*(\*\*)?SC[0-9]+\b/.test(line)));
+    assert.equal(body.split('\n')[0].startsWith('原 issue：'), fork);
+  }
 });
 
 test('SC5 复用上一轮中断时留下的开着的修正子 issue，不重复开', async () => {

@@ -716,6 +716,9 @@ test('#93 SC1 SC2 SC4 修正 PR 正文按 task-pr/v1 和修正子 issue 逐段�
   const facts = correctionIssueFacts(issueBody);
   assert.equal(facts.scText, 'SC1 导出按钮在空列表时禁用 | 不报错。验证：unit');
   assert.equal(facts.why, '空列表时仍可点击');
+  // #96 之前开的修正子 issue 被复用时还是旧模板（「## 没过的原因」）：两种都读得出。
+  const legacy = ['> 修正子 issue', '## 没过的验收项', '导出按钮', '## 没过的原因', '旧原因', '## 验收标准', '- [ ] SC1 导出按钮。验证：unit'].join('\n');
+  assert.deepEqual(correctionIssueFacts(legacy), { scText: 'SC1 导出按钮。验证：unit', why: '旧原因' });
   const marker = { root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1 };
   const base = { issue: `${REPO}#9`, prRepo: REPO, root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1, correctionFacts: facts };
   const sectionsOf = (body) => {

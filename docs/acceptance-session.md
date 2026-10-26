@@ -86,15 +86,37 @@ profile 的 `verdictOnlyIssues`（显式 issue 名单，形如 `["owner/repo#43"
 
 ### 修正子 issue 模板
 
+按子 issue 模板（task-issue/v1，2026-10-26，#96）写，五个锚点标题和本地 `check-pr-issue.sh` 一致。正文里**只能有一行** `- [ ] SC1`：
+`parseItems` 会把任何 SC 行都当验收项。#96 之前开的修正子 issue 复用时保持原文（旧模板是「没过的验收项 / 没过的原因 / 验收标准」），
+prbot 两种都认。
+
 ```md
 原 issue：<总 issue 链接>            ← 只有 fork 档有这一行
 
-> 修正子 issue · 总 issue <owner/repo#n> · 原属 <owner/repo#n>
-## 没过的验收项
-<原验收项原文（含验证层次）>
-## 没过的原因
+> 修正子 issue · 总 issue <owner/repo#n> · 原属 <owner/repo#n> SC<k> · 对应 1 个修正 PR（prbot 开，指向 main）
+
+## 目标
+
+让验收没过的 <owner/repo#n> SC<k> 重新验收通过：<原验收项原文（含验证层次）>
+
+## 原因
+
 <脱敏后的原因>
+
+## 范围（可改）
+
+- 修好 <owner/repo#n> SC<k> 所需的最小代码改动和复现测试，限原属 issue 的范围内（目标仓禁改路径照旧不碰）
+
+## 不做
+
+- 不改 <owner/repo#n> 的其它验收项，不扩大原属 issue 的范围
+
+## 依赖
+
+无，随时可开工。
+
 ## 验收标准
+
 - [ ] SC1 <原验收项原文（含验证层次）>
 
 [验收机] 修正 · 总 <owner/repo#n> · 项 <owner/repo#n> SC<k> · 第 n 轮
