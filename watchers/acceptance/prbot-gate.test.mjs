@@ -15,7 +15,8 @@ import { hostPaths } from './host/paths.mjs';
 import { defaultTree } from './session.fixture.mjs';
 import { HANDOFF_REPO, OWNER, REPO, createFakeRun, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import { PR_STATUS_QUERY } from './host/write-gate.mjs';
-import { correctionPrBody, correctionPushRepo } from './host/prbot.mjs';
+import { correctionIssueFacts, correctionPrBody, correctionPushRepo } from './host/prbot.mjs';
+import { correctionBody } from './bin/correct.mjs';
 import { bodyVersion } from './bin/rounds.mjs';
 
 const HERE_HOST = path.join(path.dirname(fileURLToPath(import.meta.url)), 'host');
@@ -670,7 +671,18 @@ test('SC5 prbot 自己拼的修正 PR 正文过得了真写闸：标记照抄修
     onWrite: (action) => (action.type.startsWith('comment.') ? undefined : { pr: 12, url: `https://example.invalid/${REPO}/pull/12` }),
   });
   const gate = await claimedGate({ home, profile, world, github });
-  const state = { issue: `${REPO}#9`, prRepo: REPO, root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 2 };
+  const state = {
+    issue: `${REPO}#9`,
+    prRepo: REPO,
+    root: `${REPO}#1`,
+    item: `${REPO}#2`,
+    sc: 3,
+    round: 2,
+    correctionFacts: { scText: 'SC1 导出按钮在空列表时禁用。验证：unit', why: '空列表时仍可点击' },
+    changedFiles: ['src/export.js', 'test/export.test.js'],
+    preflight: { ok: true, commands: ['npm test'] },
+    disputes: [{ ref: `${REPO}#2`, sc: 4, acceptance: '文案不对', reason: '文案由产品定' }],
+  };
   const marker = { root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1 };
   const body = correctionPrBody(state, marker);
   assert.equal(body.split('\n')[0], `任务 issue：${REPO}#1`);
@@ -688,6 +700,65 @@ test('SC5 prbot 自己拼的修正 PR 正文过得了真写闸：标记照抄修
     dedupeKey: 'pr-from-prbot',
   });
   assert.equal(created.code, 0, JSON.stringify(created));
+});
+
+test('#93 SC1 SC2 SC4 修正 PR 正文按 task-pr/v1 和修正子 issue 逐段对应', () => {
+  const issueBody = correctionBody({
+    root: `${REPO}#1`,
+    rootUrl: '',
+    item: `${REPO}#2`,
+    text: '导出按钮在空列表时禁用 | 不报错。验证：unit',
+    why: '空列表时仍可点击',
+    sc: 3,
+    round: 1,
+    fork: false,
+  });
+  const facts = correctionIssueFacts(issueBody);
+  assert.equal(facts.scText, 'SC1 导出按钮在空列表时禁用 | 不报错。验证：unit');
+  assert.equal(facts.why, '空列表时仍可点击');
+  const marker = { root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1 };
+  const base = { issue: `${REPO}#9`, prRepo: REPO, root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1, correctionFacts: facts };
+  const sectionsOf = (body) => {
+    const out = new Map();
+    let current = null;
+    for (const line of body.split('\n')) {
+      if (line.startsWith('## ')) out.set((current = line.slice(3)), []);
+      else if (current) out.get(current).push(line);
+    }
+    return out;
+  };
+
+  const passed = correctionPrBody(
+    {
+      ...base,
+      changedFiles: ['src/export.js', 'test/export.test.js'],
+      preflight: { ok: true, commands: ['npm test', 'npm run lint'] },
+      disputes: [{ ref: `${REPO}#2`, sc: 4, acceptance: '文案不对', reason: '文案由产品定' }],
+    },
+    marker,
+  );
+  const sections = sectionsOf(passed);
+  assert.deepEqual([...sections.keys()], ['改了什么', '范围对照', '验收对照', '定下的决定', '未执行的验证', '风险与回滚']);
+  for (const [name, lines] of sections) assert.ok(lines.some((line) => line.trim()), `「${name}」段不能是空的`);
+  const rows = sections.get('验收对照').filter((line) => /^\|\s*SC\d+/.test(line));
+  assert.equal(rows.length, 1, '只对修正子 issue 的 SC1');
+  const cells = rows[0].split(/(?<!\\)\|/).slice(1, -1).map((cell) => cell.trim());
+  assert.equal(cells[0], 'SC1 导出按钮在空列表时禁用 \\| 不报错。验证：unit', 'SC 原文照抄，竖线转义');
+  assert.equal(cells[1], '通过');
+  assert.match(cells[2], /`npm test`、`npm run lint` 在沙箱通过/);
+  assert.match(sections.get('范围对照').join('\n'), /`src\/export\.js`、`test\/export\.test\.js`/);
+  assert.match(sections.get('定下的决定').join('\n'), /争议未修：.*#2 SC4/);
+  assert.ok(!passed.split('\n').some((line) => /^\s*-\s*(有争议|要修)：/.test(line)), '不用验收机会解析的行头');
+  assert.ok(!passed.split('\n').some((line) => /^\s*[-*]\s*\[[ xX]\]/.test(line)), '验收项不用勾选框');
+
+  const noPreflight = correctionPrBody({ ...base, preflightNote: '没有配置预检，跳过' }, marker);
+  const row = noPreflight.split('\n').find((line) => /^\|\s*SC1/.test(line));
+  assert.match(row, /\| 待验证 \| — \|$/);
+  assert.match(sectionsOf(noPreflight).get('未执行的验证').join('\n'), /没有配置预检/);
+  assert.match(sectionsOf(noPreflight).get('范围对照').join('\n'), /见本 PR 的改动文件/);
+
+  const unknown = correctionPrBody({ ...base, correctionFacts: { scText: '', why: '' } }, marker);
+  assert.match(unknown, /^\| SC1 example-owner\/[\w.-]+#2 SC3 重新验收通过 \| 待验证 \| — \|$/m, '读不出 SC 原文时退回写验收项编号');
 });
 
 test('#60 修正 github 出口：branch.push 带租约只对 acceptance/ 分支生效（--force-with-lease=<分支>:<上次已知 head>），不带就不强推', async () => {
