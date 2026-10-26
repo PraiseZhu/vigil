@@ -730,3 +730,23 @@ test('SC6 真进程并发 start：退出码只可能是 0 和 3，评论只有�
     1,
   );
 });
+
+test('status --json 带上最近一轮的中断原因（宿主据此认出「环境问题 / 未验证」）', async () => {
+  const { profile } = loadHome();
+  const reason = '环境问题（不是代码不通过）：必需检查因环境原因没跑：测试。这一轮未验证，不判「通过」';
+  const store = issueStore(
+    standaloneIssue({
+      comments: [roundComment({ round: 1, status: '中断', finishedAt: '2026-10-24T01:05:00.000Z', reason })],
+    }),
+  );
+  const github = trackedGithub(store, profile);
+  const result = await capture(['status', '--issue', `${REPO}#1`, '--json'], {
+    github,
+    profile,
+    now: () => Date.parse('2026-10-24T01:10:00.000Z'),
+  });
+  assert.equal(result.code, EXIT.OK, result.stderr);
+  const json = JSON.parse(result.stdout.trim());
+  assert.equal(json.status, '中断');
+  assert.equal(json.reason, reason);
+});

@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import { setAcceptanceFields } from './board.mjs';
 import { collectTree, fetchIssueBody } from './collect.mjs';
 import { createRounds, parseRef } from './rounds.mjs';
+import { guardPass } from './checks.mjs';
 import { assertNotVerdictOnly } from './profile.mjs';
 
 const SC_LINE = /^\s*[-*]\s*(?:\[\s*([xX ])\s*\])?\s*(?:\*\*)?SC(\d+)\b/;
@@ -54,7 +55,7 @@ function readVerified(file) {
       throw new Error(`已验证清单里的 sc 不合法：${entry?.sc}`);
     }
   }
-  return { items, manual };
+  return { items, manual, checks: parsed?.checks };
 }
 
 export async function runClose({ github, profile, ref, n, flags, now = () => Date.now(), stdout }) {
@@ -81,6 +82,9 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
   for (const issueRef of grouped.keys()) {
     if (!inTree.has(issueRef.toLowerCase())) throw new Error(`${issueRef} 不在本轮任务树里，不能勾选`);
   }
+
+  // 裁决防线：必需检查（build / typecheck / 测试）有一项因环境没跑，就不勾、不写看板、不关单，本轮标「中断」（环境问题）。
+  await guardPass({ rounds, ref, n, checks: verified.checks, where: 'close 的 verified.json' });
 
   const edited = [];
   for (const [issueRef, changes] of grouped) {

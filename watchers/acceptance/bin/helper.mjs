@@ -12,9 +12,10 @@ import { collectTree } from './collect.mjs';
 import { runClose } from './close.mjs';
 import { runCorrect } from './correct.mjs';
 import { runPush, secretFiles, sessionPath, writeNeedsHuman } from './push.mjs';
+import { EnvUnverifiedError, guardPass, readChecksRaw } from './checks.mjs';
 import { runVerdict } from './verdict.mjs';
 
-export const EXIT = Object.freeze({ OK: 0, FAIL: 1, CLAIM: 3, REJECTED: 4, SECRET: 5 });
+export const EXIT = Object.freeze({ OK: 0, FAIL: 1, CLAIM: 3, REJECTED: 4, SECRET: 5, ENV: 6 });
 
 const COMMANDS = ['collect', 'progress', 'verdict', 'close', 'correct', 'push', 'board', 'done'];
 const NEEDS_ROUND = new Set(['progress', 'verdict', 'close', 'correct', 'push', 'board', 'done']);
@@ -119,6 +120,7 @@ async function bestEffortInterrupt({ github, profile, now, ref, n, reason }) {
 }
 
 function exitCodeFor(error) {
+  if (error instanceof EnvUnverifiedError) return EXIT.ENV;
   if (error instanceof WriteRejectedError) return EXIT.REJECTED;
   if (error instanceof WriteBusyError) return EXIT.FAIL;
   if (error instanceof RoundError && (error.code === 'NOT_CURRENT' || error.code === 'NOT_FOUND')) {
@@ -141,6 +143,10 @@ async function cmdBoard({ github, profile, ref, n, flags, now, stdout }) {
   const acceptance = flags.get('acceptance');
   if (typeof acceptance !== 'string' || !ACCEPTANCE_VALUES.has(acceptance)) {
     throw new UsageError('board 需要 --acceptance <验收中|要修|修正中|通过>');
+  }
+  if (acceptance === '通过') {
+    // 裁决防线：看板写「通过」也要带必需检查（--checks，可以直接给 verdict.json）；环境没跑就标中断、退出码 6。
+    await guardPass({ rounds, ref, n, checks: readChecksRaw(flags.get('checks')), where: 'board --acceptance 通过 的 --checks' });
   }
   const verdictUrl = flags.get('verdict-url') || current.url;
   const target = flags.get('target');

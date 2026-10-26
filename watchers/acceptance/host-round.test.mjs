@@ -10,6 +10,7 @@ import { roundDirFor, roundKey, runHostRound, startGateRelay } from './host/roun
 import { runTick } from './host/tick.mjs';
 import { run as procRun } from './host/proc.mjs';
 import { OWNER, REPO, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
+import { ENV_PROBLEM_PREFIX } from './bin/trigger.mjs';
 
 const ROOT_REF = `${REPO}#1`;
 
@@ -625,4 +626,43 @@ test('SC11 同一个仓两个总 issue 的同号轮次：roundDir、登记文件
   assert.notEqual(roundDirFor(paths, first, 1), roundDirFor(paths, second, 1));
   assert.notEqual(roundDirFor(paths, first, 1), roundDirFor(paths, first, 2));
   assert.match(path.basename(roundDirFor(paths, second, 1)), /__2__1$/);
+});
+
+test('裁决防线：pi 退出时这一轮是「中断」且原因是环境问题（必需检查没跑）→ 写一条 env-unverified 提醒，不 abort', async () => {
+  const reason = `${ENV_PROBLEM_PREFIX}必需检查因环境原因没跑：测试。这一轮未验证，不判「通过」`;
+  const fixture = roundFixture({ status: { round: 1, status: '中断', reason } });
+  const code = await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: BWRAP_OK,
+    runRound: fixture.runRoundFake,
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    spawnPi: exitingPi(fixture.calls, 0),
+    meminfoPath: writeMeminfo(),
+    log: () => {},
+  });
+  assert.equal(code, 0);
+  assert.equal(fixture.calls.round.some((argv) => argv[0] === 'abort'), false);
+  const alerts = readAlerts(hostPaths(fixture.home));
+  assert.equal(alerts.length, 1, JSON.stringify(alerts));
+  assert.equal(alerts[0].kind, 'env-unverified');
+  assert.equal(alerts[0].issue, ROOT_REF);
+  assert.equal(alerts[0].reason, reason);
+});
+
+test('裁决防线：别的原因的「中断」（不是环境问题）不写 env-unverified', async () => {
+  const fixture = roundFixture({ status: { round: 1, status: '中断', reason: '写闸拒绝：denied' } });
+  await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: BWRAP_OK,
+    runRound: fixture.runRoundFake,
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    spawnPi: exitingPi(fixture.calls, 0),
+    meminfoPath: writeMeminfo(),
+    log: () => {},
+  });
+  assert.equal(readAlerts(hostPaths(fixture.home)).some((a) => a.kind === 'env-unverified'), false);
 });

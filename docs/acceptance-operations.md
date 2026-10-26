@@ -308,7 +308,7 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 - **验收结论不发通知**：通过/要修、中断都只在 GitHub 的轮次评论和看板里。
 
 常见 `kind`：`loop-restarted`、`tick-failed`、`round-stale`、`round-stalled`、`round-failed`、`round-timeout`、
-`prefetch-failed`、`deps-failed`、`sandbox-down`、`sandbox-unavailable`、`gate-unavailable`、`gate-rejected`、`secret-found`、`write-rejected`、`egress-denied`；裁决运行的
+`prefetch-failed`、`deps-failed`、`env-unverified`、`sandbox-down`、`sandbox-unavailable`、`gate-unavailable`、`gate-rejected`、`secret-found`、`write-rejected`、`egress-denied`；裁决运行的
 `adjudicate-failed`、`adjudicate-timeout`、`adjudicate-needs-human`、`adjudicate-not-configured`；
 Slack 自己的 `slack-failed`（重试用完）、`slack-history-failed`（读频道历史失败）。
 
@@ -501,6 +501,7 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 | 心跳不更新 | `state/host/heartbeat.json` 的 `at`/`lastTick.error` | 跑 `ensure.sh`；还不行看 `loop.log`，`stop.sh` 后重起 |
 | 轮次一直「验收中」 | `state/host/progress/` 里这一轮的 `lastActivityAt`（`round.mjs status` 的 `stalled` 按模型写的时间算，只作参考） | 等调度先杀进程再 abort；要手动就 `abort --reason` |
 | `prefetch-failed` | 提醒的 `reason`（哪个仓）、`state/prbot/mirrors/acceptance__*` | 多半是令牌看不到这个仓或网络问题；`doctor` 的「仓可读」先过 |
+| `env-unverified` | 提醒的 `reason`（哪几项必需检查因环境没跑 / 哪几条「通过」的证据写着因环境没跑） | 裁决防线：build / typecheck / 测试有一项因环境没跑就不能判通过，helper 把本轮标「中断」（环境问题）、退出码 6，宿主写这条提醒，按环境退避（30 分钟、2 小时、6 小时）自动重验。反复出现就查那项检查缺什么环境 |
 | `deps-failed` | 提醒的 `reason`（哪个仓、退出码 / 超时 / 被拒的主机）和 `detail`（npm 输出尾巴） | 环境问题，不判代码；多半是 npm 官方源连不上，或 lockfile 里有官方源以外的 `resolved` 地址（被出网代理拒）。会按退避自动重试 |
 | `sandbox-down` | `bwrap --ro-bind / / true` | 修好 bwrap 之前不会认领；提醒一小时一条 |
 | 所有写都被拒 | `alerts.jsonl` 的 `gate-rejected` | 看 `reason`：`gate-disabled` → 建开关文件；`not-current-round` → 轮次已结束 |
