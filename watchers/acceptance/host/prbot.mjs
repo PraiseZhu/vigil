@@ -1178,7 +1178,8 @@ export function cleanupWorktrees({ home, profile, fsImpl = fs } = {}) {
 }
 
 /**
- * 修正子 issue 正文里 PR 正文要用的事实：SC1 原文（「## 验收标准」下第一条 SC1）和没过的原因（「## 没过的原因」）。
+ * 修正子 issue 正文里 PR 正文要用的事实：SC1 原文（「## 验收标准」下第一条 SC1）和没过的原因
+ * （新模板是「## 原因」，复用的旧修正子 issue 是「## 没过的原因」，两种都认）。
  * 读不出来就留空，正文里退回写验收项编号。
  */
 export function correctionIssueFacts(body) {
@@ -1194,7 +1195,7 @@ export function correctionIssueFacts(body) {
     }
   }
   const scLine = (sections.get('验收标准') || []).map((line) => /^\s*[-*]\s*(?:\[[ xX]\])?\s*(SC1\b.*)$/.exec(line)).find(Boolean);
-  const why = (sections.get('没过的原因') || []).map((line) => line.trim()).filter(Boolean).join(' ');
+  const why = (sections.get('原因') || sections.get('没过的原因') || []).map((line) => line.trim()).filter(Boolean).join(' ');
   return { scText: scLine ? scLine[1].trim() : '', why };
 }
 

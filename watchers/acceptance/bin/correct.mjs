@@ -15,19 +15,40 @@ export function parseItemArg(value) {
   return { ref: match[1], sc: Number(match[2]) };
 }
 
-/** 修正子 issue 的模板；fork 档第一行链回原 issue。 */
+/**
+ * 修正子 issue 的模板（task-issue/v1 子 issue 格式：目标 / 原因 / 范围 / 不做 / 依赖 / 验收标准）；fork 档第一行链回原 issue。
+ * 正文里只能有一行 `- [ ] SC1`：collect 的 parseItems 会把任何 SC 行都当成验收项。
+ */
 export function correctionBody({ root, rootUrl, item, text, why, sc, round, fork }) {
   const lines = [];
   if (fork) {
     lines.push(`原 issue：${rootUrl}`);
     lines.push('');
   }
-  lines.push(`> 修正子 issue · 总 issue ${root} · 原属 ${item}`);
-  lines.push('## 没过的验收项');
-  lines.push(text);
-  lines.push('## 没过的原因');
+  lines.push(`> 修正子 issue · 总 issue ${root} · 原属 ${item} SC${sc} · 对应 1 个修正 PR（prbot 开，指向 main）`);
+  lines.push('');
+  lines.push('## 目标');
+  lines.push('');
+  lines.push(`让验收没过的 ${item} SC${sc} 重新验收通过：${text}`);
+  lines.push('');
+  lines.push('## 原因');
+  lines.push('');
   lines.push(why);
+  lines.push('');
+  lines.push('## 范围（可改）');
+  lines.push('');
+  lines.push(`- 修好 ${item} SC${sc} 所需的最小代码改动和复现测试，限原属 issue 的范围内（目标仓禁改路径照旧不碰）`);
+  lines.push('');
+  lines.push('## 不做');
+  lines.push('');
+  lines.push(`- 不改 ${item} 的其它验收项，不扩大原属 issue 的范围`);
+  lines.push('');
+  lines.push('## 依赖');
+  lines.push('');
+  lines.push('无，随时可开工。');
+  lines.push('');
   lines.push('## 验收标准');
+  lines.push('');
   lines.push(`- [ ] SC1 ${text}`);
   lines.push('');
   lines.push(`[验收机] 修正 · 总 ${root} · 项 ${item} SC${sc} · 第 ${round} 轮`);
