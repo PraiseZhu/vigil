@@ -392,7 +392,8 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
   `ownerLogin` 名下）。修正轮推分支、写闸核对 PR head 用的都是同一个对照。
 - `常驻循环`：心跳里的 pid 活着且心跳不超过 3 分钟。
 - `写闸账本审计`：只读跑一次写闸账本审计（第 3 节的 `state/write-gate/ledger.jsonl`），看有没有越规写入；
-  明细报「核对了多少行、基线是什么、基线后违规几条、这次新发现哪几条」。审计内部出错只报这一项失败。
+  明细报「核对了多少行、基线是什么、基线后违规几条、拿不准几条、这次新发现哪几条」。只有**明确违规**让这一项变红；
+  「拿不准」只记日志（明细里报出来），GitHub 只读核对没做成也照旧写进明细但不改变红绿。审计内部出错只报这一项失败。
 - `令牌文件`：`…TokenFile` / App 私钥文件全部通过 600、属主当前用户、非空检查。
 - `Slack 频道`：只读——bot 令牌能过 `auth.test`，bot 在 `slackChannelId` 那个频道里（`conversations.info`
   的 `is_member`；令牌没有 `channels:read` / `groups:read` 就退到 `conversations.history limit=1`，bot 不在频道里
@@ -405,6 +406,15 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 
 `host/gate-audit.mjs` 旁路核对写闸账本（`state/write-gate/ledger.jsonl`）：每一条**已执行**的写入都要对得上写闸规则。
 它**只能事后发现，拦不住**写入；不开关写闸、不改账本、不撤回任何东西。
+
+审计发现分两级：
+
+- **明确违规**（`level: violation`）：写闸规则写得死死的、不用补上下文就能判定的几种——`pr-merge`、`comment-delete`、
+  `repo-out-of-scope`、`tier-not-allowed`、`verdict-only-write`、`round-comment-modified`、`round-comment-missing`。
+  这些写审计日志、写 `gate-audit-violation` 提醒（Slack 立即发），也让 `doctor` 变红、命令行退出码 1。
+- **拿不准**（`level: uncertain`）：认不出记录格式、或缺轮次 / 账本完整性上下文——`no-round`、`round-mismatch`、
+  `unverifiable`、`type-not-allowed`、`ledger-corrupt`、`ledger-rewritten`。这些**只记日志**，绝不写提醒、
+  不让 `doctor` 变红；命令行报 2（只提示有人看一眼，不当事故）。不认识的规则按拿不准处理。
 
 逐条核对的五条规则：
 
@@ -419,25 +429,36 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 怎么跑：
 
 - 常驻循环每拍跑一次（只读本地账本，**不查 GitHub**），结果写进 `heartbeat.lastTick.gateAudit`
-  （`checked` / `found` / `sinceBaseline`）；出错只写 `heartbeat.lastTick.gateAuditError`，不影响这一拍。
+  （`checked` / `found` / `sinceBaseline` / `uncertain`）；出错只写 `heartbeat.lastTick.gateAuditError`，不影响这一拍。
 - `doctor` 的「写闸账本审计」和手动运行会带上 `--github` 的只读评论核对。
-- 单独跑：`node watchers/acceptance/host/gate-audit.mjs [--github] [--no-alert]`（`--no-alert` 只写审计日志、不写提醒）。
-- 处理完运行 `node watchers/acceptance/host/gate-audit.mjs --ack`：只把「基线后违规数」清零，日志和已报指纹保留，旧违规不会再报。
+- 单独跑：`node watchers/acceptance/host/gate-audit.mjs [--github] [--no-alert] [--json]`
+  （`--no-alert` 只写审计日志、不写提醒；`--json` 只打一行 JSON）。
+- 只想看最近出了些啥：`node watchers/acceptance/host/gate-audit.mjs --summary [--hours N] [--json]`。
+  它不跑审计、不拿锁、不写任何文件，只读审计日志和状态文件；日志不存在算空，坏行跳过。
+- 处理完运行 `node watchers/acceptance/host/gate-audit.mjs --ack`：只把「基线后明确违规数」清零，日志和已报指纹保留，
+  旧违规不会再报（「基线后拿不准数」不清，它只用于统计）。
+- 退出码：`0` 没有新的明确违规且基线后已清零；`1` 有明确违规；`2` 只有拿不准 / GitHub 没查成 / 锁被占；
+  `3` 运行出错（stderr 一行错误）。`--ack` / `--summary` 成功即 `0`。
+- 边界：GitHub 只做只读查询；本地只写 `state/host` 下的审计状态、审计日志和提醒队列。
 
 基线与增量：
 
-- 第一次跑时以**当时账本末尾**为基线：基线前的记录只统计（`baseline.lines` / `baseline.violations`），不报、不发提醒。
+- 第一次跑时以**当时账本末尾**为基线：基线前的记录只统计（`baseline.lines` / `baseline.violations` 只计明确违规，
+  `baseline.uncertain` 计拿不准；`baseline.sample` 两类都可以带），不报、不发提醒。
 - 之后只核对基线 / 上次之后新增的行（心跳里的 `checked` 就是这次核对了多少行）。
-- 同一条违规按指纹（规则 + 行号 + 明细 + 原始行）只报一次，指纹留在状态文件里（最多 5000 条）。
-- 账本应只追加：已审计过的部分被改写或截短时报一次 `ledger-rewritten`，然后从头重新核对（报过的不重复）。
+- 同一条发现按指纹（规则 + 行号 + 明细 + 原始行）只报一次，指纹留在状态文件里（最多 5000 条）；两类共用同一份已报指纹。
+- 账本应只追加：已审计过的部分被改写或截短时报一次 `ledger-rewritten`（拿不准，只记日志），然后从头重新核对（报过的不重复）。
 
 状态与明细：
 
-- 状态文件：`<home>/state/host/gate-audit.json`（基线、游标、前缀哈希、基线后违规数、已报指纹）。
-- 明细日志：`<home>/state/host/gate-audit.log`（一行一条 JSON：时间、规则、行号、类型、去重键、明细）。
-- 提醒：`alerts.jsonl` 里一条 `gate-audit-violation`（含前 5 条明细和总数），由 Slack 立即发（见
-  [`docs/acceptance-slack.md`](acceptance-slack.md)）。
-- 账本坏行报 `ledger-corrupt`；认不出格式的记录报 `unverifiable`。
+- 状态文件：`<home>/state/host/gate-audit.json`（基线、游标、前缀哈希、`sinceBaseline`（明确违规）、
+  `uncertainSinceBaseline`（拿不准，只统计）、已报指纹）。
+- 明细日志：`<home>/state/host/gate-audit.log`（一行一条 JSON：时间、`level`、规则、行号、类型、去重键、明细）。
+  老日志行没有 `level`，汇总时按规则现算。
+- 提醒：只有明确违规才在 `alerts.jsonl` 里写一条 `gate-audit-violation`（含前 5 条明细和总数），由 Slack 立即发
+  （见 [`docs/acceptance-slack.md`](acceptance-slack.md)）；拿不准不写提醒。
+- 账本坏行报 `ledger-corrupt`（拿不准）；认不出格式的记录报 `unverifiable`（拿不准）；类型已经报了 `pr-merge` /
+  `comment-delete` / `type-not-allowed` 又认不出格式时只报那一条，不再补 `unverifiable`。
 
 ## 9. 组织仓的开关
 

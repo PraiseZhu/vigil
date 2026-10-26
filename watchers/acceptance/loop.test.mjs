@@ -293,8 +293,8 @@ test('SC12 tick 写心跳：时间、pid、上一拍结果、在跑的轮次', a
     started: [],
     stale: [],
     error: null,
-    // 写闸账本旁路审计（空账本：建基线，不报）：这一拍核对了 0 行。
-    gateAudit: { checked: 0, found: 0, sinceBaseline: 0 },
+    // 写闸账本旁路审计（空账本：建基线，不报）：这一拍核对了 0 行、没有新拿不准。
+    gateAudit: { checked: 0, found: 0, sinceBaseline: 0, uncertain: 0 },
   });
   assert.deepEqual(heartbeat.running, []);
   const onDisk = JSON.parse(fs.readFileSync(hostPaths(home).heartbeatFile, 'utf8'));
