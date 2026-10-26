@@ -1262,7 +1262,7 @@ export function correctionPrBody(state, marker) {
     '',
     '## 风险与回滚',
     '',
-    '只改修正子 issue 对应验收项的代码和测试；回滚：revert 本 PR 的合并提交，修正子 issue 会重新打开等下一轮。',
+    '只改修正子 issue 对应验收项的代码和测试；回滚：revert 本 PR 的合并提交。',
     '',
     `[验收机] 修正 · 总 ${marker.root} · 项 ${marker.item} SC${marker.sc} · 第 ${marker.round} 轮`,
   ].join('\n');
