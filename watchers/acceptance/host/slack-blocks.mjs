@@ -130,7 +130,8 @@ function section(text) {
 
 function fieldsBlock(fields) {
   const items = fields.filter(Boolean).map(([label, value]) => ({ type: 'mrkdwn', text: `*${label}*\n${value}` }));
-  return items.length ? { type: 'fields', fields: items } : null;
+  // Slack 没有 `fields` 这种块：字段必须放在 section 的 fields 里（最多 10 个），否则整条消息被 invalid_blocks 拒掉。
+  return items.length ? { type: 'section', fields: items.slice(0, 10) } : null;
 }
 
 /** 深度脱敏：blocks 里每个字符串都过一遍 redact。 */
