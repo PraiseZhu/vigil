@@ -3,7 +3,9 @@
 //
 // 平时安静。只有三类立即发（ping）：blocked（被卡住要人处理）、ready-to-merge（可以合并）、
 // finished（一件事做完了）；其余一律进摘要，攒起来最多每 60 分钟发一条。
-// 首次卡住、写闸拒绝、调度循环停摆也立即发，但同一任务同一原因 6 小时内只发一次（再来就进摘要）。
+// 首次卡住、轮次失败（round-failed）、写闸拒绝、调度循环停摆也立即发，但同一任务同一原因 6 小时内只发一次（再来就进摘要）。
+// 预期拒绝（出网白名单外、写闸 query/repo/edit-not-allowed、写闸探针）只记 alerts.jsonl，不发 Slack、不进摘要、不 @。
+// tick-failed / prbot-tick-failed 单次进摘要；10 分钟内 3 次合成一条 tick-failed-repeat 立即发。
 // 每天最多 slackDailyCap 条（host.json，默认 30，摘要算 1 条）：到了上限只攒进摘要，当天发一条「已达上限」。
 // 重试用完的发送失败写 alerts（slack-failed），并留在账本的 failing 里（心跳 slackFailing），下一次发成功才清。
 //
@@ -47,13 +49,15 @@ export const INTERRUPTION_ALERT_KINDS = Object.freeze([
 export const BLOCKED_ALERT_KINDS = Object.freeze(['secret-found', 'sandbox-unavailable']);
 
 /**
- * 也立即发、但同一任务同一原因（kind）6 小时内只发一次的 alert kind（#43）：首次轮次卡住 / 超时、沙箱起不来、
+ * 也立即发、但同一任务同一原因（kind）6 小时内只发一次的 alert kind（#43）：首次轮次卡住 / 超时 / 失败、沙箱起不来、
  * 代码预取失败、写闸拒绝、调度循环停摆（ensure.sh 拉起循环），以及裁决运行重试用完要人工裁决。6 小时内再来就进摘要。
+ * round-failed 同时在 INTERRUPTION_ALERT_KINDS 里：第一次立即发，第二次（6h 内）合成「连续中断」，第三次不发。
  */
 export const PROMPT_ALERT_KINDS = Object.freeze([
   'round-stalled',
   'round-stale',
   'round-timeout',
+  'round-failed',
   'sandbox-down',
   'prefetch-failed',
   'gate-rejected',
@@ -62,8 +66,35 @@ export const PROMPT_ALERT_KINDS = Object.freeze([
   'adjudicate-needs-human',
 ]);
 
+/** 写闸「预期拒绝」：查询 / 仓库 / 修改不在允许范围内，属正常防护，不发 Slack。 */
+export const EXPECTED_GATE_REASONS = Object.freeze(['query-not-allowed', 'repo-not-allowed', 'edit-not-allowed']);
+
+/** 调度拍失败：单次进摘要；窗口内连着几次合成一条立即发。 */
+export const TICK_FAILURE_KINDS = Object.freeze(['tick-failed', 'prbot-tick-failed']);
+export const TICK_REPEAT_COUNT = 3;
+export const TICK_REPEAT_WINDOW_MS = 10 * 60 * 1000;
+
 /** 不发也不进摘要的 alert kind：Slack 自己的发送失败（发不出去还往 Slack 报，会自己绕圈）。 */
 export const SILENT_ALERT_KINDS = Object.freeze(['slack-failed']);
+
+/**
+ * 预期拒绝：只记 alerts.jsonl，不发 Slack、不进摘要、不 @。
+ * event 可以是原始 alert，也可以是账本 pending 里 project() 出来的条目（后者用 type 存 kind）。
+ */
+export function isExpectedRejection(event) {
+  if (!event || typeof event !== 'object') return false;
+  if (event.probe === true) return true;
+  // 原始 alert 用 kind；账本 pending 用 type 存原 kind（kind 字段是分类 blocked/digest）。两者都要认。
+  const kind = String(event.kind ?? event.type ?? '');
+  const type = String(event.type ?? '');
+  const names = [kind, type];
+  if (names.includes('egress-denied')) return true;
+  if (names.includes('gate-rejected')) {
+    if (EXPECTED_GATE_REASONS.includes(String(event.reason ?? ''))) return true;
+    if (/^probe(\s|$)/.test(String(event.detail ?? ''))) return true;
+  }
+  return false;
+}
 
 /** 每天最多发多少条（摘要算 1 条），host.json 的 slackDailyCap 可改。 */
 export const DEFAULT_DAILY_CAP = 30;
@@ -90,8 +121,10 @@ export function eventId(source, line) {
  * - prbot：needs-human / interrupted-exhausted / ready-stalled 是 blocked；
  *   ready 按 handoff 分 ready-to-merge（owner）和 finished（watcher）；
  *   claimed / draft-opened 和未知 type 不发。
- * - alerts：secret-found / sandbox-unavailable 和 PROMPT_ALERT_KINDS 是 blocked（后者在 notifySlack 里按
- *   6 小时去重）；slack-failed 不发；其余（含未知 kind）进摘要，不丢。
+ * - alerts：先判 isExpectedRejection（egress-denied、gate-rejected 的 query/repo/edit-not-allowed、写闸探针）→ skip；
+ *   secret-found / sandbox-unavailable 和 PROMPT_ALERT_KINDS（含 round-failed）是 blocked（后者在 notifySlack 里按
+ *   6 小时去重）；gate-rejected 的其它原因（needs-round-binding、bad-action、not-in-tree、gate-error 等）仍立即发；
+ *   slack-failed 不发；其余（含未知 kind、单次 tick-failed）进摘要，不丢。
  */
 export function classify(source, event) {
   if (!event || typeof event !== 'object') return 'skip';
@@ -108,6 +141,7 @@ export function classify(source, event) {
     }
   }
   if (source === 'alerts') {
+    if (isExpectedRejection(event)) return 'skip';
     const kind = String(event.kind ?? '');
     if (SILENT_ALERT_KINDS.includes(kind)) return 'skip';
     return BLOCKED_ALERT_KINDS.includes(kind) || PROMPT_ALERT_KINDS.includes(kind) ? 'blocked' : 'digest';
@@ -131,6 +165,7 @@ function emptyLedger() {
     failed: [],
     rebuiltAt: null,
     recent: {},
+    ticks: {},
     daily: null,
     failing: null,
     historyFailedAt: null,
@@ -162,6 +197,7 @@ function readLedger(home) {
         failed: Array.isArray(parsed.failed) ? parsed.failed : [],
         windows: parsed.windows && typeof parsed.windows === 'object' ? parsed.windows : {},
         recent: parsed.recent && typeof parsed.recent === 'object' && !Array.isArray(parsed.recent) ? parsed.recent : {},
+        ticks: parsed.ticks && typeof parsed.ticks === 'object' && !Array.isArray(parsed.ticks) ? parsed.ticks : {},
         daily: parsed.daily && typeof parsed.daily === 'object' ? parsed.daily : null,
         failing: parsed.failing && typeof parsed.failing === 'object' ? parsed.failing : null,
       },
@@ -576,6 +612,7 @@ export async function notifySlack({
   const pending = [...data.pending];
   const windows = { ...data.windows };
   const recent = { ...data.recent };
+  const ticks = { ...data.ticks };
   const today = dayKey(nowMs);
   const daily = data.daily && data.daily.day === today ? { ...data.daily } : { day: today, sent: 0, capNoticeAt: null };
   daily.sent = Number(daily.sent) || 0;
@@ -674,6 +711,27 @@ export async function notifySlack({
         notice.windowKinds = [...win.kinds];
       }
     }
+    // 连续 tick 失败：10 分钟内达到 3 次，且 6 小时内没发过合成条，改成 tick-failed-repeat 立即发。
+    if (notice.source === 'alerts' && TICK_FAILURE_KINDS.includes(notice.type)) {
+      const tickKind = notice.type;
+      const stamp = Number.isFinite(notice.atMs) ? notice.atMs : nowMs;
+      const recentAt = (Array.isArray(ticks[tickKind]) ? ticks[tickKind] : [])
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && stamp - value < TICK_REPEAT_WINDOW_MS && stamp - value >= 0);
+      recentAt.push(stamp);
+      ticks[tickKind] = recentAt;
+      const repeatKey = `tick-failed-repeat|${tickKind}`;
+      const lastRepeat = Date.parse(recent[repeatKey] ?? '');
+      const already = Number.isFinite(lastRepeat) && stamp - lastRepeat < PROMPT_DEDUPE_MS;
+      if (recentAt.length >= TICK_REPEAT_COUNT && !already) {
+        kind = 'blocked';
+        notice.kind = 'blocked';
+        notice.type = 'tick-failed-repeat';
+        notice.windowCount = recentAt.length;
+        notice.windowKinds = [tickKind];
+        recent[repeatKey] = notice.at;
+      }
+    }
     // 首次卡住 / 写闸拒绝 / 循环停摆：同一任务同一原因 6 小时内只立即发一次，再来就进摘要（按事件时间算）。
     const dedupeKey = notice.source === 'alerts' && PROMPT_ALERT_KINDS.includes(notice.type) ? `${notice.type}|${notice.issue || '-'}` : null;
     if (kind === 'blocked' && dedupeKey) {
@@ -712,6 +770,10 @@ export async function notifySlack({
   }
 
   // 3. 摘要：攒着，到点（最多每 60 分钟）发一条；到了当天上限就留到明天。
+  // 部署前已经攒进账本的预期拒绝也不能再发出去。
+  for (let i = pending.length - 1; i >= 0; i -= 1) {
+    if (isExpectedRejection(pending[i])) pending.splice(i, 1);
+  }
   let digestNextAt = typeof data.digestNextAt === 'string' ? data.digestNextAt : null;
   if (!pending.length) {
     digestNextAt = null;
@@ -761,6 +823,13 @@ export async function notifySlack({
     const sentAt = Date.parse(at ?? '');
     if (!Number.isFinite(sentAt) || nowMs - sentAt >= 24 * 60 * 60 * 1000) delete recent[key];
   }
+  for (const [key, list] of Object.entries(ticks)) {
+    const kept = (Array.isArray(list) ? list : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && nowMs - value < 24 * 60 * 60 * 1000);
+    if (kept.length) ticks[key] = kept;
+    else delete ticks[key];
+  }
   const nextLedger = {
     version: 1,
     ids: [...sentIds],
@@ -768,6 +837,7 @@ export async function notifySlack({
     digestNextAt,
     windows,
     recent,
+    ticks,
     daily,
     failing,
     retry: retryQueue,

@@ -13,14 +13,20 @@ import {
   BLOCKED_ALERT_KINDS,
   DEFAULT_DAILY_CAP,
   DIGEST_MINUTES,
+  EXPECTED_GATE_REASONS,
   RETRY_MINUTES,
+  TICK_FAILURE_KINDS,
+  TICK_REPEAT_COUNT,
+  TICK_REPEAT_WINDOW_MS,
   checkSlackAccess,
   classify,
   eventId,
+  isExpectedRejection,
   notifySlack,
   readDailyCap,
   readSlackToken,
 } from './host/slack-notify.mjs';
+import { NOTICE_COPY } from './host/slack-blocks.mjs';
 import { runTick } from './host/tick.mjs';
 import { REPO, START_AT, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 
@@ -159,7 +165,7 @@ test('事件表：每个 type / kind 是立即发、进摘要还是不（含未�
     ['alerts', { kind: 'round-timeout' }, 'blocked'],
     ['alerts', { kind: 'sandbox-down' }, 'blocked'],
     ['alerts', { kind: 'prefetch-failed' }, 'blocked'],
-    ['alerts', { kind: 'round-failed' }, 'digest'],
+    ['alerts', { kind: 'round-failed' }, 'blocked'],
     ['alerts', { kind: 'gate-unavailable' }, 'digest'],
     ['alerts', { kind: 'adjudicate-failed' }, 'digest'],
     ['alerts', { kind: 'slack-history-failed' }, 'digest'],
@@ -168,6 +174,14 @@ test('事件表：每个 type / kind 是立即发、进摘要还是不（含未�
     ['alerts', { kind: 'tick-failed' }, 'digest'],
     ['alerts', { kind: 'prbot-tick-failed' }, 'digest'],
     ['alerts', { kind: '从未见过的新提醒' }, 'digest'],
+    ['alerts', { kind: 'egress-denied' }, 'skip'],
+    ['alerts', { kind: 'gate-rejected', reason: 'query-not-allowed' }, 'skip'],
+    ['alerts', { kind: 'gate-rejected', reason: 'repo-not-allowed' }, 'skip'],
+    ['alerts', { kind: 'gate-rejected', reason: 'edit-not-allowed' }, 'skip'],
+    ['alerts', { kind: 'gate-rejected', reason: 'needs-round-binding' }, 'blocked'],
+    ['alerts', { kind: 'gate-rejected', detail: 'probe write' }, 'skip'],
+    ['alerts', { kind: 'gate-rejected', probe: true }, 'skip'],
+    ['alerts', { kind: 'round-failed', probe: true }, 'skip'],
   ];
   for (const [source, event, expected] of cases) {
     assert.equal(classify(source, event), expected, `${source} ${JSON.stringify(event)}`);
@@ -327,7 +341,7 @@ test('摘要攒满 60 分钟才发一条，且不 @', async () => {
     assert.equal(first.pending, 1);
     assert.equal(fake.posts().length, 0, '刚进来只攒着');
 
-    alertEvent(home, { kind: 'round-failed', issue: `${REPO}#3`, reason: '宿主出错' }, t0 + 30 * 60000);
+    alertEvent(home, { kind: 'adjudicate-failed', issue: `${REPO}#3`, reason: '裁决出错' }, t0 + 30 * 60000);
     const second = await send(t0 + 30 * 60000);
     assert.equal(second.pending, 2);
     assert.equal(fake.posts().length, 0, '30 分钟还不到点');
@@ -341,9 +355,11 @@ test('摘要攒满 60 分钟才发一条，且不 @', async () => {
     assert.equal(fourth.pending, 0);
     assert.equal(fake.posts().length, 1, '最多每 60 分钟一条');
     const body = fake.posts()[0].body;
-    assert.match(body, /验收机摘要（2 条）/);
-    assert.match(body, /tick-failed/);
-    assert.match(body, /round-failed/);
+    assert.match(body, /验收机摘要（2 条，不紧急）/);
+    assert.match(body, /验收机有一拍调度出错/);
+    assert.match(body, /裁决运行失败一次，会自动重试/);
+    assert.equal(body.includes('tick-failed'), false, '摘要不出现 kind 代码名');
+    assert.equal(body.includes('adjudicate-failed'), false, '摘要不出现 kind 代码名');
     assert.equal(body.includes(`<@${MENTION}>`), false, '摘要不 @');
     assert.deepEqual(readLedger(home).pending, []);
     assert.equal(readLedger(home).digestNextAt, null);
@@ -354,7 +370,7 @@ test('ping 配了 slackMentionUserId 就 @，摘要永不 @', async () => {
   const { home, profile } = setup();
   const t0 = Date.parse(START_AT);
   prbotEvent(home, { type: 'ready', ...readyEvent() }, t0);
-  alertEvent(home, { kind: 'round-failed', issue: `${REPO}#9`, reason: '宿主出错' }, t0);
+  alertEvent(home, { kind: 'tick-failed', issue: `${REPO}#9`, reason: '这一拍出错' }, t0);
   await withSlack(undefined, async (fake) => {
     await notifySlack({ home, profile, now: () => t0, fetch: fake.fetch, apiBase: fake.apiBase });
     const [ping] = bodies(fake.posts());
@@ -375,8 +391,10 @@ test('同一 issue 6 小时内的第 2 次中断合成一条「同一任务连�
     const send = (ts) => notifySlack({ home, profile, now: () => ts, fetch: fake.fetch, apiBase: fake.apiBase });
     alertEvent(home, { kind: 'round-failed', issue: `${REPO}#3`, round: 1, reason: '第 1 次' }, t0);
     const first = await send(t0);
-    assert.equal(first.digested, 1, '第一次只进摘要');
-    assert.equal(fake.posts().length, 0);
+    assert.equal(first.sent, 1, '第一次 round-failed 立即发');
+    assert.equal(fake.posts().length, 1);
+    assert.match(fake.posts()[0].body, /验收轮次出错，已自动中止/);
+    assert.ok(fake.posts()[0].body.includes(`<@${MENTION}>`));
 
     alertEvent(home, { kind: 'round-failed', issue: `${REPO}#3`, round: 2, reason: '第 2 次' }, t0 + 2 * 60000);
     const second = await send(t0 + 2 * 60000);
@@ -385,10 +403,10 @@ test('同一 issue 6 小时内的第 2 次中断合成一条「同一任务连�
     alertEvent(home, { kind: 'round-failed', issue: `${REPO}#3`, round: 3, reason: '第 3 次' }, t0 + 4 * 60000);
     const third = await send(t0 + 4 * 60000);
     assert.equal(third.sent, 0, '同一窗口只发一次');
-    assert.equal(fake.posts().length, 1);
-    const body = fake.posts()[0].body;
-    assert.match(body, /同一任务连续中断/);
-    assert.match(body, /连续中断 2 次/);
+    assert.equal(fake.posts().length, 2);
+    const body = fake.posts()[1].body;
+    assert.match(body, /同一任务 6 小时内反复中断/);
+    assert.match(body, /中断了 2 次/);
     assert.ok(body.includes(`${REPO}#3`));
     assert.equal(body.includes('第 3 次'), false);
   });
@@ -426,7 +444,7 @@ test('SC2 Ready owner：一个「打开 PR」按钮、没有「合并」；watch
   });
 });
 
-test('伪造 prUrl 在真发出去的消息里被替换；ready-stalled 文案带 review-ingress-missing', async () => {
+test('伪造 prUrl 在真发出去的消息里被替换；ready-stalled 文案用人话写审查流程不在线', async () => {
   const forged = setup();
   const t0 = Date.parse(START_AT);
   prbotEvent(forged.home, { type: 'ready', ...readyEvent({ prUrl: 'https://github.com/example-org/other-repo/pull/99' }) }, t0);
@@ -448,7 +466,8 @@ test('伪造 prUrl 在真发出去的消息里被替换；ready-stalled 文案�
     const [body] = bodies(fake.posts());
     const whole = JSON.stringify(body);
     assert.match(body.text, /修正 PR 转 Ready 24 小时没人接/);
-    assert.match(whole, /review-ingress-missing/);
+    assert.match(whole, /多半是审查流程不在线，请看 Mac mini 和审查入口/);
+    assert.equal(whole.includes('review-ingress-missing'), false);
     assert.match(whole, /2026-01-05T00:00:00\.000Z/, '附转 Ready 时间');
     assert.ok(whole.includes(`https://github.com/${REPO}/pull/12`), '附 PR 链接');
     assert.match(whole, /abcdef1/, 'head 前 7 位');
@@ -1200,8 +1219,8 @@ test('round-stalled 也算中断；连续中断按事件时间算：隔 7 小时
     const result = await notifySlack({ home: stalled.home, profile: stalled.profile, now: () => t0 + 120000, fetch: fake.fetch, apiBase: fake.apiBase });
     // 第 1 次卡住立即发（#43），第 2 次合成「同一任务连续中断」。
     assert.equal(result.sent, 2);
-    assert.match(fake.posts()[0].body, /轮次卡住/);
-    assert.match(fake.posts()[1].body, /同一任务连续中断/);
+    assert.match(fake.posts()[0].body, /轮次卡住没进度，已自动中止/);
+    assert.match(fake.posts()[1].body, /同一任务 6 小时内反复中断/);
   });
 
   const apart = setup();
@@ -1209,9 +1228,11 @@ test('round-stalled 也算中断；连续中断按事件时间算：隔 7 小时
     alertEvent(apart.home, { kind: 'round-failed', issue: `${REPO}#5`, round: 1, reason: '早' }, t0);
     alertEvent(apart.home, { kind: 'round-failed', issue: `${REPO}#5`, round: 2, reason: '晚' }, t0 + 7 * 3600000);
     const result = await notifySlack({ home: apart.home, profile: apart.profile, now: () => t0 + 8 * 3600000, fetch: fake.fetch, apiBase: fake.apiBase });
-    assert.equal(result.sent, 0, '两次隔了 7 小时，不算连续');
-    assert.equal(result.digested, 2);
-    assert.equal(fake.posts().length, 0);
+    assert.equal(result.sent, 2, '两次隔了 7 小时，不算连续，各自立即发');
+    assert.equal(result.digested, 0);
+    assert.equal(fake.posts().length, 2);
+    assert.match(fake.posts()[0].body, /验收轮次出错，已自动中止/);
+    assert.match(fake.posts()[1].body, /验收轮次出错，已自动中止/);
   });
 });
 
@@ -1234,9 +1255,9 @@ test('首次卡住 / 写闸拒绝 / 循环停摆立即发（带 @）；同一任
     assert.equal(first.digested, 0);
     const posted = bodies(fake.posts());
     assert.ok(posted.every((body) => body.text.startsWith(`<@${MENTION}>`)), '立即发的都 @');
-    assert.ok(posted.some((body) => body.text.includes('轮次卡住')));
-    assert.ok(posted.some((body) => body.text.includes('写闸拒绝了写动作')));
-    assert.ok(posted.some((body) => body.text.includes('调度循环被重新拉起')));
+    assert.ok(posted.some((body) => body.text.includes('轮次卡住没进度，已自动中止')));
+    assert.ok(posted.some((body) => body.text.includes('写闸拦下了一个不合规的写操作')));
+    assert.ok(posted.some((body) => body.text.includes('验收机心跳过期，已自动重新拉起')));
 
     // 1 小时后同一任务同一原因再来：进摘要，不再 @。别的任务照样立即发。
     alertEvent(home, { kind: 'gate-rejected', issue: `${REPO}#3`, round: 2, reason: 'not-in-tree' }, t0 + 3600000);
@@ -1251,7 +1272,7 @@ test('首次卡住 / 写闸拒绝 / 循环停摆立即发（带 @）；同一任
     alertEvent(home, { kind: 'gate-rejected', issue: `${REPO}#3`, round: 3, reason: 'not-in-tree' }, t0 + 7 * 3600000);
     const third = await send(t0 + 7 * 3600000);
     assert.ok(third.sent >= 1);
-    assert.ok(bodies(fake.posts()).some((body, index) => index >= 5 && body.text.includes('写闸拒绝了写动作')));
+    assert.ok(bodies(fake.posts()).some((body, index) => index >= 5 && body.text.includes('写闸拦下了一个不合规的写操作')));
   });
 });
 
@@ -1266,7 +1287,7 @@ test('裁决运行重试用完（adjudicate-needs-human）立即发；超时 / �
     const result = await notifySlack({ home, profile, now: () => t0, fetch: fake.fetch, apiBase: fake.apiBase });
     assert.equal(result.sent, 1);
     assert.equal(result.digested, 1);
-    assert.match(fake.posts()[0].body, /需要人工裁决/);
+    assert.match(fake.posts()[0].body, /有争议的条目裁决不出来，需要你裁决/);
   });
 });
 
@@ -1374,7 +1395,7 @@ test('每日上限（host.json slackDailyCap）：到了只攒进摘要、当天
     const nextDay = await send(t0 + 26 * 3600000);
     assert.equal(nextDay.sent, 1);
     assert.equal(nextDay.pending, 0);
-    assert.match(fake.posts()[3].body, /验收机摘要（3 条）/);
+    assert.match(fake.posts()[3].body, /验收机摘要（3 条，不紧急）/);
     assert.equal(readLedger(home).daily.sent, 1);
   });
 });
@@ -1442,4 +1463,190 @@ test('doctor 的 Slack 检查（只读）：auth.test + bot 在频道里；没 c
   const skipped = await checkSlackAccess({ profile: { ...profile, slackChannelId: undefined } });
   assert.equal(skipped.ok, true);
   assert.equal(skipped.skipped, true);
+});
+
+function assertHumanPing(body, kind, label) {
+  const copy = NOTICE_COPY[kind];
+  const whole = typeof body === 'string' ? body : JSON.stringify(body);
+  const text = typeof body === 'string' ? body : body.text;
+  assert.ok(text.includes(copy.title), `${label} text 缺 title：${text}`);
+  for (const heading of ['发生了什么', '有没有影响', '验收机已自动做了什么', '要不要人处理']) {
+    assert.ok(whole.includes(heading), `${label} 缺「${heading}」`);
+  }
+  assert.ok(whole.includes(copy.auto), `${label} 缺 auto 文案`);
+}
+
+test('预期拒绝不发 Slack、不进 pending、不 @：query/repo/edit-not-allowed、egress-denied、probe', async () => {
+  const cases = [
+    { kind: 'gate-rejected', reason: 'query-not-allowed' },
+    { kind: 'gate-rejected', reason: 'repo-not-allowed' },
+    { kind: 'gate-rejected', reason: 'edit-not-allowed' },
+    { kind: 'egress-denied', reason: 'not-allowlisted' },
+    { kind: 'gate-rejected', reason: 'needs-round-binding', detail: 'probe write' },
+    { kind: 'gate-rejected', reason: 'not-in-tree', probe: true },
+    { kind: 'round-failed', probe: true, issue: `${REPO}#8` },
+  ];
+  for (const event of cases) {
+    assert.equal(isExpectedRejection(event), true, JSON.stringify(event));
+    assert.equal(classify('alerts', event), 'skip', JSON.stringify(event));
+  }
+  assert.deepEqual([...EXPECTED_GATE_REASONS], ['query-not-allowed', 'repo-not-allowed', 'edit-not-allowed']);
+
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ledgerFile(home), JSON.stringify({ version: 1, ids: [] }), { mode: 0o600 });
+  for (const event of cases) alertEvent(home, { ...event, issue: event.issue || `${REPO}#3` }, t0);
+  await withSlack(undefined, async (fake) => {
+    const result = await notifySlack({ home, profile, now: () => t0, fetch: fake.fetch, apiBase: fake.apiBase });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(fake.posts().length, 0, '预期拒绝不发 Slack');
+    assert.equal(result.pending, 0, '不进 pending');
+    assert.equal(result.digested, 0);
+    assert.equal(result.sent, 0);
+    const ledger = readLedger(home);
+    assert.equal(ledger.pending.length, 0);
+    assert.equal(JSON.stringify(fake.posts()).includes(`<@${MENTION}>`), false);
+  });
+});
+
+test('账本 pending 里旧的预期拒绝到点发摘要时被滤掉，只留 tick-failed 人话', async () => {
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(
+    ledgerFile(home),
+    JSON.stringify({
+      version: 1,
+      ids: [],
+      pending: [
+        { id: 'old-gate', source: 'alerts', type: 'gate-rejected', kind: 'digest', issue: `${REPO}#3`, reason: 'query-not-allowed' },
+        { id: 'old-tick', source: 'alerts', type: 'tick-failed', kind: 'digest', issue: `${REPO}#4`, reason: '这一拍出错' },
+      ],
+      digestNextAt: new Date(t0).toISOString(),
+    }),
+    { mode: 0o600 },
+  );
+  await withSlack(undefined, async (fake) => {
+    const result = await notifySlack({ home, profile, now: () => t0, fetch: fake.fetch, apiBase: fake.apiBase });
+    assert.equal(result.sent, 1);
+    assert.equal(fake.posts().length, 1);
+    const body = fake.posts()[0].body;
+    assert.match(body, /验收机摘要（1 条，不紧急）/);
+    assert.match(body, /验收机有一拍调度出错/);
+    assert.equal(body.includes('query-not-allowed'), false);
+    assert.equal(body.includes('写闸拦下'), false);
+    assert.equal(body.includes(`<@${MENTION}>`), false);
+    assert.deepEqual(readLedger(home).pending, []);
+  });
+});
+
+test('真故障立即发且文案含人话与自动处置：round-failed、loop-restarted、secret-found、gate-rejected、tick 连错 3 次', async () => {
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ledgerFile(home), JSON.stringify({ version: 1, ids: [] }), { mode: 0o600 });
+  await withSlack(undefined, async (fake) => {
+    const send = (ts) => notifySlack({ home, profile, now: () => ts, fetch: fake.fetch, apiBase: fake.apiBase });
+    alertEvent(home, { kind: 'round-failed', issue: `${REPO}#3`, reason: '宿主出错' }, t0);
+    alertEvent(home, { kind: 'loop-restarted', reason: 'heartbeat-stale' }, t0);
+    alertEvent(home, { kind: 'secret-found', issue: `${REPO}#4`, reason: 'branch.push 扫到疑似密钥，没推：a.js' }, t0);
+    alertEvent(home, { kind: 'gate-rejected', issue: `${REPO}#5`, reason: 'needs-round-binding', detail: 'comment.create' }, t0);
+    const first = await send(t0);
+    assert.equal(first.sent, 4);
+    const posted = bodies(fake.posts());
+    assert.ok(posted.every((body) => body.text.startsWith(`<@${MENTION}>`)), '立即发都 @');
+    assertHumanPing(posted.find((body) => body.text.includes('验收轮次出错')), 'round-failed', 'round-failed');
+    const heartbeat = posted.find((body) => body.text.includes('心跳过期'));
+    assert.ok(heartbeat);
+    assert.ok(JSON.stringify(heartbeat).includes('发生了什么'));
+    assert.ok(JSON.stringify(heartbeat).includes('保活脚本已把调度循环重新拉起'));
+    assertHumanPing(posted.find((body) => body.text.includes('疑似密钥')), 'secret-found', 'secret-found');
+    const gate = posted.find((body) => body.text.includes('写闸拦下了一个不合规的写操作'));
+    assertHumanPing(gate, 'gate-rejected', 'gate-rejected');
+    assert.match(JSON.stringify(gate.blocks), /拦下原因：这个写操作只允许在验收轮里做，当时不在轮次里/);
+
+  });
+
+  const loopHome = setup();
+  fs.mkdirSync(path.join(loopHome.home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ledgerFile(loopHome.home), JSON.stringify({ version: 1, ids: [] }), { mode: 0o600 });
+  alertEvent(loopHome.home, { kind: 'loop-restarted', reason: 'loop-not-running' }, t0);
+  await withSlack(undefined, async (fake) => {
+    const loopResult = await notifySlack({ home: loopHome.home, profile: loopHome.profile, now: () => t0, fetch: fake.fetch, apiBase: fake.apiBase });
+    assert.equal(loopResult.sent, 1);
+    assert.match(fake.posts()[0].body, /验收机调度循环挂了，已自动重新拉起/);
+    const whole = fake.posts()[0].body;
+    assert.ok(whole.includes('发生了什么'));
+    assert.ok(whole.includes('调度循环进程不在了'));
+  });
+});
+
+test('tick-failed 10 分钟内 3 次合成一条立即发；2 次只进摘要；6 小时内第 4、5 次不再立即发', async () => {
+  assert.deepEqual([...TICK_FAILURE_KINDS], ['tick-failed', 'prbot-tick-failed']);
+  assert.equal(TICK_REPEAT_COUNT, 3);
+  assert.equal(TICK_REPEAT_WINDOW_MS, 10 * 60 * 1000);
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ledgerFile(home), JSON.stringify({ version: 1, ids: [] }), { mode: 0o600 });
+  await withSlack(undefined, async (fake) => {
+    const send = (ts) => notifySlack({ home, profile, now: () => ts, fetch: fake.fetch, apiBase: fake.apiBase });
+    alertEvent(home, { kind: 'tick-failed', reason: '第 1 次' }, t0);
+    const first = await send(t0);
+    assert.equal(first.sent, 0);
+    assert.equal(first.digested, 1);
+    alertEvent(home, { kind: 'tick-failed', reason: '第 2 次' }, t0 + 60000);
+    const second = await send(t0 + 60000);
+    assert.equal(second.sent, 0, '2 次只进摘要');
+    assert.equal(second.digested, 1);
+    assert.equal(fake.posts().length, 0);
+
+    alertEvent(home, { kind: 'tick-failed', reason: '第 3 次' }, t0 + 2 * 60000);
+    const third = await send(t0 + 2 * 60000);
+    assert.equal(third.sent, 1, '第 3 次合成立即发');
+    const ping = bodies(fake.posts())[0];
+    assert.match(ping.text, /验收机调度连续出错/);
+    assert.ok(ping.text.startsWith(`<@${MENTION}>`));
+    assertHumanPing(ping, 'tick-failed-repeat', 'tick-failed-repeat');
+    assert.match(JSON.stringify(ping.blocks), /验收调度在 10 分钟内连续出错 3 次/);
+    assert.equal(JSON.stringify(ping.blocks).includes('tick-failed'), false);
+
+    alertEvent(home, { kind: 'tick-failed', reason: '第 4 次' }, t0 + 3 * 60000);
+    const fourth = await send(t0 + 3 * 60000);
+    assert.equal(fourth.sent, 0, '6 小时内第 4 次不再立即发');
+    assert.equal(fourth.digested, 1);
+    alertEvent(home, { kind: 'tick-failed', reason: '第 5 次' }, t0 + 4 * 60000);
+    const fifth = await send(t0 + 4 * 60000);
+    assert.equal(fifth.sent, 0, '6 小时内第 5 次不再立即发');
+    assert.equal(fake.posts().length, 1);
+  });
+});
+
+test('round-failed 同一 issue：第 1 次立即发、第 2 次合成反复中断、第 3 次不发', async () => {
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT);
+  fs.mkdirSync(path.join(home, 'state', 'slack'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ledgerFile(home), JSON.stringify({ version: 1, ids: [] }), { mode: 0o600 });
+  await withSlack(undefined, async (fake) => {
+    const send = (ts) => notifySlack({ home, profile, now: () => ts, fetch: fake.fetch, apiBase: fake.apiBase });
+    alertEvent(home, { kind: 'round-failed', issue: `${REPO}#11`, round: 1, reason: '第 1 次' }, t0);
+    const first = await send(t0);
+    assert.equal(first.sent, 1);
+    assert.match(fake.posts()[0].body, /验收轮次出错，已自动中止/);
+    assert.ok(fake.posts()[0].body.includes(`<@${MENTION}>`));
+
+    alertEvent(home, { kind: 'round-failed', issue: `${REPO}#11`, round: 2, reason: '第 2 次' }, t0 + 2 * 60000);
+    const second = await send(t0 + 2 * 60000);
+    assert.equal(second.sent, 1);
+    const body = fake.posts()[1].body;
+    assert.match(body, /同一任务 6 小时内反复中断/);
+    assert.match(body, /中断了 2 次/);
+    assert.ok(body.includes(`<@${MENTION}>`));
+
+    alertEvent(home, { kind: 'round-failed', issue: `${REPO}#11`, round: 3, reason: '第 3 次' }, t0 + 4 * 60000);
+    const third = await send(t0 + 4 * 60000);
+    assert.equal(third.sent, 0);
+    assert.equal(fake.posts().length, 2);
+  });
 });

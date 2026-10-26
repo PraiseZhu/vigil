@@ -81,14 +81,27 @@
 | prbot | 未知 type | **忽略** |
 | alerts | `secret-found` | **ping**（只列文件名） |
 | alerts | `sandbox-unavailable` | **ping**（沙箱起不来） |
-| alerts | `round-stalled`、`round-stale`、`round-timeout`（首次轮次卡住 / 卡死 / 超时）、`sandbox-down`、`prefetch-failed`、`gate-rejected`、`write-rejected`（写闸拒绝）、`loop-restarted`（调度循环停摆，`ensure.sh` 拉起）、`adjudicate-needs-human`（裁决运行重试用完） | **ping**（#43：即时提醒）；同一任务（没有 issue 的按同一 kind）**同一原因 6 小时内只立即发一次**，再来就进摘要。6 小时按事件自己的时间算 |
-| alerts | `round-failed`、`gate-unavailable`、`sandbox-unavailable`、`round-stalled`、`round-stale`、`round-timeout` | 中断类：同一 issue **6 小时内第 2 次及以上**合成一条「同一任务连续中断」立即发，每个 issue 每 6 小时窗口只发一次（第 1 次：`round-failed`、`gate-unavailable` 进摘要，其余照上两行立即发）。6 小时按事件自己的时间算（循环停摆后一次补发积压时，隔得久的不算连续） |
-| alerts | `tick-failed`、`prbot-tick-failed`、`adjudicate-failed`、`adjudicate-timeout`、`adjudicate-not-configured`、`slack-history-failed` | **摘要** |
+| alerts | `round-failed`（验收轮次出错）、`round-stalled`、`round-stale`、`round-timeout`（首次轮次卡住 / 卡死 / 超时）、`sandbox-down`、`prefetch-failed`、`gate-rejected`（`needs-round-binding` / `bad-action` / `not-in-tree` / `gate-error` 等真故障）、`write-rejected`（写闸拒绝）、`loop-restarted`（调度循环停摆，`ensure.sh` 拉起）、`adjudicate-needs-human`（裁决运行重试用完） | **ping**（#43：即时提醒）；同一任务（没有 issue 的按同一 kind）**同一原因 6 小时内只立即发一次**，再来就进摘要。6 小时按事件自己的时间算。`round-failed` 第一次就立即发 |
+| alerts | `round-failed`、`gate-unavailable`、`sandbox-unavailable`、`round-stalled`、`round-stale`、`round-timeout` | 中断类：同一 issue **6 小时内第 2 次及以上**合成一条「同一任务连续中断」（标题「同一任务 6 小时内反复中断」）立即发，每个 issue 每 6 小时窗口只发一次（第 1 次：`gate-unavailable` 进摘要，`round-failed` 和其余照上一行立即发；第 2 次合成；第 3 次不发）。6 小时按事件自己的时间算（循环停摆后一次补发积压时，隔得久的不算连续） |
+| alerts | `tick-failed`、`prbot-tick-failed` | 单次进**摘要**；10 分钟内 3 次合成一条「验收机调度连续出错」立即发（同一 kind 6 小时内只合成一次） |
+| alerts | `adjudicate-failed`、`adjudicate-timeout`、`adjudicate-not-configured`、`slack-history-failed` | **摘要** |
+| alerts | `gate-rejected` 且原因是 `query-not-allowed` / `repo-not-allowed` / `edit-not-allowed`、`egress-denied`、写闸探针（`probe`） | **预期拒绝（只记日志，不发）**：不发 Slack、不进摘要、不 @ |
 | alerts | `slack-failed` | **不发**（Slack 自己的发送失败；发不出去还往 Slack 报会绕圈，靠心跳和 `ensure.sh` 报出来，见第 5 节） |
 | alerts | 其它未知 kind | **摘要**（未知的也进摘要，不丢） |
 | — | 验收结论本身（通过 / 要修 / 中断） | **不发**：只在 GitHub 的轮次评论和看板里 |
 
 摘要攒起来，**最多每 60 分钟**发一条汇总，摘要永不 @。
+
+### 消息怎么写
+
+每条提醒都写清四件事，不只丢代码名：
+
+- **发生了什么**
+- **有没有影响**
+- **验收机已自动做了什么**
+- **要不要人处理**
+
+通知栏文字只用固定人话标题 + 校验过的字段（合规的 `owner/repo#n`、合规的 PR 链接、数字），事件原文和 kind 代码名不进 `text`。
 
 ## 5. 去重、重试和心跳
 

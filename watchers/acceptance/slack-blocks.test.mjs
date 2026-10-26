@@ -1,7 +1,7 @@
 // #61 SC2 / SC3：Slack 消息体的纯函数测试（Ready、ready-stalled、单条提醒、摘要）。
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { alertBlocks, capBlocks, ciLink, digestBlocks, prLink, readyBlocks, stalledBlocks } from './host/slack-blocks.mjs';
+import { alertBlocks, capBlocks, ciLink, digestBlocks, GATE_REASON_TEXT, NOTICE_COPY, prLink, readyBlocks, stalledBlocks } from './host/slack-blocks.mjs';
 import { REPO } from './fake-gh.fixture.mjs';
 
 const MENTION = 'U0123456789';
@@ -92,12 +92,15 @@ test('SC3 ready-stalled：标题、审查入口提示、PR 链接、readyAt、he
   }, {});
   assert.match(payload.text, /^修正 PR 转 Ready 24 小时没人接：example-owner\/example-repo#12/);
   const body = textOf(payload);
-  assert.match(body, /review-ingress-missing/);
-  assert.match(body, /Mac mini/);
+  assert.match(body, /多半是审查流程不在线，请看 Mac mini 和审查入口/);
+  assert.equal(body.includes('review-ingress-missing'), false, '正文不再丢代码名');
+  assert.match(body, /有没有影响：这个修正 PR 一直没人审，不会自动合并/);
+  assert.match(body, /验收机已自动做了什么：PR 原样留着，没有再动/);
+  assert.match(body, /要不要人处理：需要：看一眼 Mac mini 上的审查流程是否在线/);
   assert.ok(body.includes(`https://github.com/${REPO}/pull/12`), '附 PR 链接');
   assert.match(body, /2026-10-01T08:00:00\.000Z/);
   assert.match(body, /abcdef1/);
-  assert.equal(body.includes('合并'), false);
+  assert.equal(payload.blocks.some((block) => block.type === 'actions'), false, '没有按钮');
 });
 
 test('SC4 secret-found 消息只取冒号后的文件名列表', () => {
@@ -140,9 +143,11 @@ test('摘要：多条合成一条，永不 @（即使 profile 配了 slackMentio
     { slackMentionUserId: MENTION },
   );
   const body = textOf(payload);
-  assert.match(payload.text, /^验收机摘要（2 条）/);
-  assert.match(body, /loop-restarted/);
-  assert.match(body, /round-failed/);
+  assert.match(payload.text, /^验收机摘要（2 条，不紧急）/);
+  assert.match(body, /验收机调度循环被重新拉起/);
+  assert.match(body, /验收轮次出错，已自动中止/);
+  assert.equal(body.includes('loop-restarted'), false, '摘要不出现 kind 代码名');
+  assert.equal(body.includes('round-failed'), false, '摘要不出现 kind 代码名');
   assert.ok(body.includes(`${REPO}#5`));
   assert.equal(body.includes(`<@${MENTION}>`), false, '摘要永不 @');
 });
@@ -198,7 +203,7 @@ function assertNoPing(payload, label) {
 test('#70 复审：secret-found 的文件名（模型能起成 <!channel>）只进转义过的 blocks，不进通知栏文字', () => {
   const payload = alertBlocks({ source: 'alerts', kind: 'secret-found', issue: `${REPO}#2`, reason: `branch.push 扫到疑似密钥，没推：${FILES}` });
   assertNoPing(payload, 'secret-found');
-  assert.match(payload.text, /^扫到疑似密钥，没有推送：example-owner\/example-repo#2｜3 个文件/);
+  assert.match(payload.text, /^推送前扫到疑似密钥，已拦下没推：example-owner\/example-repo#2｜3 个文件，文件名见消息｜需要你处理$/);
   assert.match(textOf(payload.blocks), /&lt;!channel&gt;\.txt/, '文件名在 blocks 里还能看到（转义后）');
 });
 
@@ -216,7 +221,7 @@ test('#70 复审：提醒的原因 / 细节 / 伪造 issue 名 / 伪造类型都
     assertNoPing(payload, label);
   }
   assert.match(textOf(alertBlocks(cases.issueTitle).blocks), /&lt;!channel&gt; .*伪造标题/, '伪造的 issue 名在 blocks 里转义后给出');
-  assert.match(alertBlocks(cases.badType).text, /^验收机提醒：alert/, '不合规的类型当没有');
+  assert.match(alertBlocks(cases.badType).text, /^验收机报了一条还没归类的提醒/, '不合规的类型当没有');
 });
 
 test('#70 复审：Ready / ready-stalled 缺 repo 或 PR 号时，标题退回合规的 ref，不用事件原文', () => {
@@ -247,7 +252,9 @@ test('#70 复审：摘要的 blocks 转义、通知栏文字只有类型和合�
     { source: 'alerts', kind: 'secret-found', issue: `${REPO}#3`, reason: `没推：${FILES}` },
   ]);
   assertNoPing(payload, 'digest');
-  assert.match(payload.text, /^验收机摘要（3 条）：gate-rejected example-owner\/example-repo#2；alert；secret-found example-owner\/example-repo#3$/);
+  assert.match(payload.text, /^验收机摘要（3 条，不紧急）：写闸拦下了一个不合规的写操作 example-owner\/example-repo#2；验收机报了一条还没归类的提醒；推送前扫到疑似密钥，已拦下没推 example-owner\/example-repo#3$/);
+  assert.equal(payload.text.includes('gate-rejected'), false);
+  assert.equal(payload.text.includes('secret-found'), false);
 });
 
 test('#70 复审：打开 PR 的链接要 repo 和 PR 号都对得上，任一不对就自己拼', () => {
@@ -283,4 +290,71 @@ test('#61 每日上限通知：不 @、只有固定文字和条数', () => {
   assert.match(payload.text, /已达上限（30 条）/);
   assert.equal(payload.text.includes('<@'), false);
   assert.match(JSON.stringify(payload.blocks), /明天的第一条摘要/);
+});
+
+function assertFourHeadings(payload, label) {
+  const body = textOf(payload.blocks);
+  for (const heading of ['发生了什么', '有没有影响', '验收机已自动做了什么', '要不要人处理']) {
+    assert.ok(body.includes(heading), `${label} 缺小标题「${heading}」`);
+  }
+}
+
+test('NOTICE_COPY 每个 kind 渲染成人话：text 不含代码名、含中文 title，blocks 含四个小标题', () => {
+  for (const [kind, copy] of Object.entries(NOTICE_COPY)) {
+    if (kind === 'expected-gate-rejected') continue;
+    const event = {
+      source: 'alerts',
+      kind,
+      type: kind,
+      issue: `${REPO}#7`,
+      reason: kind === 'loop-restarted' ? 'heartbeat-stale' : 'not-in-tree',
+      windowCount: 3,
+      windowKinds: kind === 'interrupted-repeat' ? ['round-failed', 'round-stalled'] : kind === 'tick-failed-repeat' ? ['tick-failed'] : undefined,
+    };
+    const payload = alertBlocks(event);
+    assert.ok(payload.text.includes(copy.title) || /心跳过期|调度循环挂了/.test(payload.text), `${kind} text 要含人话 title`);
+    assert.equal(payload.text.includes(kind), false, `${kind} 的 text 不能含代码名：${payload.text}`);
+    assertFourHeadings(payload, kind);
+    if (copy.auto) assert.ok(textOf(payload.blocks).includes(copy.auto), `${kind} blocks 要含 auto 文案`);
+  }
+  const unknown = alertBlocks({ kind: 'never-seen-kind', type: 'never-seen-kind' });
+  assertFourHeadings(unknown, 'unknown');
+  assert.match(unknown.text, /验收机报了一条还没归类的提醒/);
+  assert.match(textOf(unknown.blocks), /代码名：never-seen-kind/);
+  assert.equal(GATE_REASON_TEXT['needs-round-binding'], '这个写操作只允许在验收轮里做，当时不在轮次里');
+});
+
+test('gate-rejected 细节行用人话原因；interrupted-repeat / tick-failed-repeat 的 what 列人话 title', () => {
+  const gate = alertBlocks({
+    kind: 'gate-rejected',
+    issue: `${REPO}#2`,
+    reason: 'needs-round-binding',
+    detail: 'comment.create',
+  });
+  const gateBody = textOf(gate.blocks);
+  assert.match(gateBody, /拦下原因：这个写操作只允许在验收轮里做，当时不在轮次里（代码：needs-round-binding）/);
+  assert.match(gateBody, /动作：comment\.create/);
+  assert.match(gate.text, /已自动处理，暂不用管/);
+
+  const repeat = alertBlocks({
+    kind: 'interrupted-repeat',
+    issue: `${REPO}#2`,
+    windowCount: 2,
+    windowKinds: ['round-failed', 'round-stalled'],
+  });
+  const repeatBody = textOf(repeat.blocks);
+  assert.match(repeatBody, /这个任务 6 小时内中断了 2 次/);
+  assert.match(repeatBody, /验收轮次出错，已自动中止/);
+  assert.match(repeatBody, /轮次卡住没进度，已自动中止/);
+  assert.equal(repeatBody.includes('round-failed'), false);
+  assert.match(repeat.text, /需要你处理/);
+
+  const ticks = alertBlocks({
+    kind: 'tick-failed-repeat',
+    windowCount: 3,
+    windowKinds: ['tick-failed'],
+  });
+  const ticksBody = textOf(ticks.blocks);
+  assert.match(ticksBody, /验收调度在 10 分钟内连续出错 3 次/);
+  assert.equal(ticksBody.includes('tick-failed'), false);
 });

@@ -81,6 +81,15 @@ test('SC6 文档：事件表写清每类是 ping / 摘要 / 不发', () => {
   assert.match(doc, /最多每 60 分钟/);
   assert.match(doc, /验收结论本身/);
   assert.match(doc, /\*\*不发\*\*/);
+  assert.match(doc, /egress-denied/);
+  assert.match(doc, /query-not-allowed/);
+  assert.match(doc, /只记日志/);
+  assert.match(doc, /消息怎么写/);
+  assert.match(doc, /发生了什么/);
+  assert.match(doc, /有没有影响/);
+  assert.match(doc, /验收机已自动做了什么/);
+  assert.match(doc, /要不要人处理/);
+  assert.match(doc, /验收机调度连续出错/);
 });
 
 test('SC6 文档：去重（事件 id、metadata、删账本重建、重建失败不发）与失败重试、心跳', () => {
