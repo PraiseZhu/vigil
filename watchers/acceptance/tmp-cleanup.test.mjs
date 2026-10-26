@@ -10,8 +10,20 @@ import { tmpBase } from './fake-gh.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
+// parent 要短：它会成为子进程的 TMPDIR，超过 tmpBase() 的 30 字节阈值时子进程改用 /tmp，tmpDir 就不在 parent 下了。
+// npm test 入口（scripts/run-tests.mjs）把 TMPDIR 设成 /tmp/vigil-test-run-XXXXXX，在它下面再建一层就超了（#113）。
+function shortParentBase() {
+  try {
+    fs.accessSync('/tmp', fs.constants.W_OK);
+    return '/tmp';
+  } catch {
+    return tmpBase();
+  }
+}
+
 test('tmpDir 夹具建的目录在进程退出时删掉，权限被改成 000 / 只读的也删得掉', () => {
-  const parent = fs.mkdtempSync(path.join(tmpBase(), 'acc-clean-'));
+  const parent = fs.mkdtempSync(path.join(shortParentBase(), 'acc-clean-'));
+  assert.ok(parent.length <= 30, `parent 要不超过 tmpBase() 的 30 字节阈值，实际 ${parent.length}：${parent}`);
   try {
     const fixture = pathToFileURL(path.join(HERE, 'fake-gh.fixture.mjs')).href;
     const script = `
