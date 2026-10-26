@@ -302,7 +302,8 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 一行一条写进 `state/host/alerts.jsonl`（`ts`、`kind`、`issue`、`round`、`reason`、`detail`）。
 **不调 Slack。**
 
-- 发 Slack 归 #61：Slack app 显示为 Jasper，发到 profile 的 `slackChannelId` 指的那个频道（频道名不写进仓库）；
+- **当前 Slack 通报已关闭**：部署 profile 不配 `slackChannelId`，所有提醒只写 `alerts.jsonl`，一条都不发 Slack。
+- 发 Slack 归 #61（打开时的行为）：Slack app 显示为 Jasper，发到 profile 的 `slackChannelId` 指的那个频道（频道名不写进仓库）；
   修正 PR 已 Ready 的消息只带「打开 PR」链接。怎么配频道、令牌、哪些事件立即发、哪些进摘要，
   见 [`docs/acceptance-slack.md`](acceptance-slack.md)。
 - **验收结论不发通知**：通过/要修、中断都只在 GitHub 的轮次评论和看板里。
@@ -416,7 +417,7 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 - `令牌文件`：`…TokenFile` / App 私钥文件全部通过 600、属主当前用户、非空检查。
 - `Slack 频道`：只读——bot 令牌能过 `auth.test`，bot 在 `slackChannelId` 那个频道里（`conversations.info`
   的 `is_member`；令牌没有 `channels:read` / `groups:read` 就退到 `conversations.history limit=1`，bot 不在频道里
-  会报 `not_in_channel`）。不发任何消息；没配 `slackChannelId` 就跳过（算通过）。
+  会报 `not_in_channel`）。不发任何消息；没配 `slackChannelId` 就跳过（算通过）——当前部署就是这样：Slack 通报已关闭，告警只写 `alerts.jsonl`。
 - `bwrap 遮罩`：在 bwrap 里跑一个读文件的小脚本，名单上的文件和凭证目录必须一个都读不到；
   bwrap 不可用算失败。遮罩名单按 `<home>/config/host.json` 算（`credentialDirs` 也遮），并且先查
   `credentialDirs` / `homeAllowDirs` 每一项都存在、不与可写绑定（`stateDir`、`worktreeDir`）互相包含。

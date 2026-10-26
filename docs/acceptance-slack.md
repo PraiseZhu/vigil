@@ -2,6 +2,14 @@
 
 对应本仓 issue #61。本文档写清谁能发、发到哪、发什么、不发什么，以及以后要不要加「合并」按钮。
 
+> **当前状态：Slack 通报已关闭。** 部署用的 profile 去掉了 `slackChannelId`，验收机一条 Slack 都不发
+> （心跳过期、轮次进程没了、PR 已 Ready、同任务反复中断等都不发）。告警照常只写 `state/host/alerts.jsonl`
+> （修正轮事件照常写 `state/prbot/events.jsonl`），由值守的人自己看。
+> 心跳里 `slack.reason` 为 `not-configured`、`slack.ok` 为 `true` 是正常状态；`doctor` 的「Slack 频道」项跳过，算通过。
+> 关闭期间不建、不动 Slack 账本（`state/slack/ledger.json`），里面旧的 pending / 重试原样冻住、不会再发。
+> 以后要重新打开：先清掉账本里的旧 pending / 重试，再把 `slackChannelId` 配回去（否则 `startAt` 之后攒下的告警会按摘要补发）。
+> 下面各节写的是打开时的行为。
+
 相关文档：
 
 - [`docs/acceptance-operations.md`](acceptance-operations.md)：宿主接入、写闸、提醒分工（第 5 节）。
@@ -190,7 +198,7 @@ head SHA 前 7 位。
 
 | 现象 | 先看 | 处理 |
 |---|---|---|
-| 一条都不发 | `state/host/heartbeat.json` 的 `slack.reason` | `not-configured` → 补 `slackChannelId` / `slackBotTokenFile`；`profile-error` → 跑一次 `node bin/doctor.mjs` |
+| 一条都不发 | `state/host/heartbeat.json` 的 `slack.reason` | `not-configured` → 通报已关闭（见文首），属正常；要打开再补 `slackChannelId` / `slackBotTokenFile`；`profile-error` → 跑一次 `node bin/doctor.mjs` |
 | 心跳 `token-file-*` | 令牌文件的属主和权限 | `chown` 成跑验收机的用户，`chmod 600`，确认不是符号链接、不是空文件 |
 | 心跳 `ledger-rebuild-failed` / 提醒 `slack-history-failed` | 令牌的 scope、频道 id | 补 `channels:history`（私有频道 `groups:history`），确认 bot 在频道里；读历史失败不再拦发送，只是那一拍之前的事件不补发 |
 | `ensure.sh` 输出 `slack-failed: …` / 心跳有 `slackFailing` | 账本的 `failing`、`failed` | 发送重试用完；看 `error`（`slack-not_in_channel` → `/invite` bot；`http-…` / `rate-limited` → 等），下一次发成功自动清 |

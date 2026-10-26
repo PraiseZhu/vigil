@@ -70,8 +70,10 @@ function writeJsonAtomic(file, data) {
 /** Slack 通知的结果（#61）统一成心跳里的形状，缺字段补 0 / 空数组。 */
 function slackHeartbeat(result) {
   const value = result && typeof result === 'object' ? result : {};
+  // 没配 slackChannelId = Slack 通报已关闭（告警只写 alerts.jsonl），是正常状态，不算失败。
+  const disabled = value.reason === 'not-configured';
   const out = {
-    ok: value.ok === true,
+    ok: value.ok === true || disabled,
     sent: Number(value.sent) || 0,
     digested: Number(value.digested) || 0,
     pending: Number(value.pending) || 0,
@@ -473,6 +475,8 @@ export async function runTick({
     heartbeat.slack = slackHeartbeat(result);
     // 读到了账本才知道失败标记的最新状态；没读到（没配、令牌坏、超时）就沿用上一拍的。
     if (result && typeof result === 'object' && Object.hasOwn(result, 'failing')) slackFailing = result.failing || null;
+    // 通报已关闭：不会再有「发送失败」，上一拍留下的失败标记一并清掉（ensure 不再报 slack-failed）。
+    if (result?.reason === 'not-configured') slackFailing = null;
   } catch (error) {
     // 异常文字不进心跳（万一里面带了请求头之类的东西），只记原因。
     heartbeat.slack = slackHeartbeat({ ok: false, reason: 'notify-error', error: String(error?.name || 'unknown') });

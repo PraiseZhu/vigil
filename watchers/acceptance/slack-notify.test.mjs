@@ -822,7 +822,7 @@ test('runTick 用真 notify：心跳里的 slack 就是这一拍的发送结果�
     assert.equal(JSON.stringify(stored).includes(TOKEN), false, '心跳里没有令牌');
   });
 
-  // 没配 Slack 的 profile：不发、不抛，心跳里说明原因。
+  // 没配 Slack 的 profile：不发、不抛，心跳里说明原因；没配 = 通报已关闭，算正常（ok=true）。
   const plain = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const heartbeat = await runTick({
     home: plain.home,
@@ -832,7 +832,7 @@ test('runTick 用真 notify：心跳里的 slack 就是这一拍的发送结果�
     runRound: async () => ({ code: 0, stdout: '', stderr: '' }),
     now: () => t0,
   });
-  assert.equal(heartbeat.slack.ok, false);
+  assert.equal(heartbeat.slack.ok, true);
   assert.equal(heartbeat.slack.reason, 'not-configured');
   assert.equal(heartbeat.lastTick.ok, true);
 });
