@@ -116,7 +116,7 @@ test('SC1/SC10 全部就绪：exit 0，逐项都标 ok', async () => {
   assert.equal(result.ok, true, JSON.stringify(result.checks, null, 2));
   for (const check of result.checks) assert.equal(check.ok, true, `${check.name}：${check.detail}`);
   const names = result.checks.map((check) => check.name);
-  for (const name of ['node 版本', 'gh 在 PATH 上', 'git 在 PATH 上', '令牌账号', '仓可读', '写闸探针', '看板', '看板写回', 'fork 推送', '常驻循环', '令牌文件', 'bwrap 遮罩']) {
+  for (const name of ['node 版本', 'gh 在 PATH 上', 'git 在 PATH 上', '令牌账号', '仓可读', '写闸探针', '看板', '看板写回', 'fork 推送', '常驻循环', '写闸账本审计', '令牌文件', 'bwrap 遮罩']) {
     assert.ok(names.includes(name), `少了检查项 ${name}`);
   }
   // doctor 不对 GitHub 做任何真实写入：看板写回只读判断（账号令牌查 viewerCanUpdate 和字段）。

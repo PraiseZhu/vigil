@@ -9,6 +9,8 @@ import { redact } from '../bin/redact.mjs';
 const MINUS = '\u2212';
 const HEADER_LIMIT = 150;
 const SECTION_LIMIT = 2900;
+/** 一条「写闸账本审计」提醒最多带几条明细（其余见审计日志）；和 host/gate-audit.mjs 的 AUDIT_DETAIL_LIMIT 一致。 */
+const AUDIT_DETAIL_LIMIT = 5;
 
 /** 只有这个形状的 PR 链接才认；<repo>/<pr> 对不上事件字段就自己拼。 */
 const PR_URL = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)$/;
@@ -292,6 +294,14 @@ export const NOTICE_COPY = Object.freeze({
     impact: '代码没有推出去，密钥没有外泄；这一步修正没推成。',
     auto: '已拦下这次推送，内容没有离开本机。',
     action: '需要：确认这些文件里是不是真密钥，是的话删掉或换掉。',
+    needsHuman: true,
+  },
+  'gate-audit-violation': {
+    title: '写闸账本审计发现越规写入',
+    what: '旁路审计逐条核对写闸账本，发现有已执行的写入不符合写闸规则（明细见下）。',
+    impact: '这些写入已经发生在 GitHub 上（审计是事后核对，拦不住）；验收机其它部分照常运行。',
+    auto: '只把明细记进了审计日志并发了这条提醒；没有关写闸，也没有改动、撤回任何东西。',
+    action: '需要：请让修复员按明细逐条核对，确认是不是写闸放行出了问题；核对完运行 gate-audit.mjs --ack 清零。',
     needsHuman: true,
   },
   'sandbox-unavailable': {
@@ -582,6 +592,21 @@ export function alertBlocks(notice, profile) {
     // 文件名可能是模型起的（比如就叫 `<!channel>`），只进转义过的 blocks，不进通知栏文字。
     const count = files ? files.split(',').filter((name) => name.trim()).length : 0;
     return finish({ text: `${title}｜${count} 个文件，文件名见消息｜需要你处理`, blocks }, profile);
+  }
+  if (type === 'gate-audit-violation') {
+    // 明细（event.detail）每行一条违规，来自账本里的写入摘要：只进转义过的 blocks，不进通知栏文字。
+    // reason 是机器摘要（已在标题和「发生了什么」里说清），不再贴「原始记录：」那一行。
+    const rows = str(event.detail)
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const count = Number(event.count) > 0 ? Number(event.count) : rows.length;
+    const shown = rows.slice(0, AUDIT_DETAIL_LIMIT);
+    const body = [`违规明细（共 ${count} 条，最多列 ${AUDIT_DETAIL_LIMIT} 条，其余见审计日志）：`];
+    if (shown.length) body.push(...shown.map((line) => `· ${esc(line)}`));
+    else body.push('（提醒里没给明细，见审计日志）');
+    blocks.push(section(body.join('\n')));
+    return finish({ text: `${title}｜${count} 条，明细见消息｜需要你处理`, blocks }, profile);
   }
 
   const lines = [];

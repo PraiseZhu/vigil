@@ -14,6 +14,7 @@ import { MAX_ROUNDS, TEST_LOCK_PATTERN, readHostConfig } from './round.mjs';
 import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbot.mjs';
 import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
 import { defaultSpawnAdjudicate, scheduleAdjudications } from './adjudicate.mjs';
+import { runGateAudit } from './gate-audit.mjs';
 
 const SLOTS = ['slot-0', 'slot-1'];
 const KILL_GRACE_MS = 10000;
@@ -246,6 +247,7 @@ export async function runTick({
   notify = notifySlack,
   notifyOptions = {},
   notifyWaitMs = NOTIFY_WAIT_MS,
+  gateAudit = (options) => runGateAudit(options),
 } = {}) {
   if (typeof home !== 'string' || !path.isAbsolute(home)) throw new Error('runTick 需要绝对路径的 home');
   const repoRoot = root || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -445,6 +447,21 @@ export async function runTick({
     } catch {
       // 提醒也写不下去就只留心跳。
     }
+  }
+
+  // 3d. 写闸账本旁路审计：只读本地账本，不查 GitHub（每拍都查 GitHub 就太重了，doctor / 命令行才查）。
+  //     放在 Slack 通知之前：这一拍新发现的违规提醒同一拍就发出去。单独 try/catch：出错只进心跳，
+  //     绝不让这一拍失败、绝不写 tick-failed（审计坏了不是验收坏了）。
+  try {
+    const auditProfile = loadAcceptanceProfile({ ...env, ACCEPTANCE_WATCHER_HOME: home });
+    const audited = await gateAudit({ home, profile: auditProfile, now, github: null });
+    heartbeat.lastTick.gateAudit = {
+      checked: audited.checkedLines,
+      found: audited.newViolations.length,
+      sinceBaseline: audited.sinceBaseline,
+    };
+  } catch (error) {
+    heartbeat.lastTick.gateAuditError = String(error?.message || error);
   }
 
   // 4. Slack 通知（#61）：放在验收调度之后（#70 复审：Slack 卡住不能拖慢验收），这一拍新写的提醒也一起发。

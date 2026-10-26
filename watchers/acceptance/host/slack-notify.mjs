@@ -4,6 +4,7 @@
 // 平时安静。只有三类立即发（ping）：blocked（被卡住要人处理）、ready-to-merge（可以合并）、
 // finished（一件事做完了）；其余一律进摘要，攒起来最多每 60 分钟发一条。
 // 首次卡住、轮次失败（round-failed）、写闸拒绝、调度循环停摆也立即发，但同一任务同一原因 6 小时内只发一次（再来就进摘要）。
+// 写闸账本审计发现的越规写入（gate-audit-violation）也立即发，但不进 6 小时去重：审计自己已经按违规指纹去过重了。
 // 预期拒绝（出网白名单外、写闸 query/repo/edit-not-allowed、写闸探针）只记 alerts.jsonl，不发 Slack、不进摘要、不 @。
 // tick-failed / prbot-tick-failed 单次进摘要；10 分钟内 3 次合成一条 tick-failed-repeat 立即发。
 // 每天最多 slackDailyCap 条（host.json，默认 30，摘要算 1 条）：到了上限只攒进摘要，当天发一条「已达上限」。
@@ -45,8 +46,8 @@ export const INTERRUPTION_ALERT_KINDS = Object.freeze([
   'round-timeout',
 ]);
 
-/** 立即发（ping）的 alert kind。 */
-export const BLOCKED_ALERT_KINDS = Object.freeze(['secret-found', 'sandbox-unavailable']);
+/** 立即发（ping）的 alert kind。gate-audit-violation 不走 6 小时去重：审计自己已按违规指纹去重。 */
+export const BLOCKED_ALERT_KINDS = Object.freeze(['secret-found', 'sandbox-unavailable', 'gate-audit-violation']);
 
 /**
  * 也立即发、但同一任务同一原因（kind）6 小时内只发一次的 alert kind（#43）：首次轮次卡住 / 超时 / 失败、沙箱起不来、
@@ -122,9 +123,9 @@ export function eventId(source, line) {
  *   ready 按 handoff 分 ready-to-merge（owner）和 finished（watcher）；
  *   claimed / draft-opened 和未知 type 不发。
  * - alerts：先判 isExpectedRejection（egress-denied、gate-rejected 的 query/repo/edit-not-allowed、写闸探针）→ skip；
- *   secret-found / sandbox-unavailable 和 PROMPT_ALERT_KINDS（含 round-failed）是 blocked（后者在 notifySlack 里按
- *   6 小时去重）；gate-rejected 的其它原因（needs-round-binding、bad-action、not-in-tree、gate-error 等）仍立即发；
- *   slack-failed 不发；其余（含未知 kind、单次 tick-failed）进摘要，不丢。
+ *   secret-found / sandbox-unavailable / gate-audit-violation 和 PROMPT_ALERT_KINDS（含 round-failed）是 blocked（后者在
+ *   notifySlack 里按 6 小时去重；gate-audit-violation 不去重，审计自己已去重）；gate-rejected 的其它原因（needs-round-binding、
+ *   bad-action、not-in-tree、gate-error 等）仍立即发；slack-failed 不发；其余（含未知 kind、单次 tick-failed）进摘要，不丢。
  */
 export function classify(source, event) {
   if (!event || typeof event !== 'object') return 'skip';

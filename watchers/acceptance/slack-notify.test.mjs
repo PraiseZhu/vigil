@@ -155,6 +155,8 @@ test('事件表：每个 type / kind 是立即发、进摘要还是不（含未�
     ['prbot', { type: 'something-new' }, 'skip'],
     ['alerts', { kind: 'secret-found' }, 'blocked'],
     ['alerts', { kind: 'sandbox-unavailable' }, 'blocked'],
+    // 写闸账本审计发现越规写入：立即发（审计自己已按违规指纹去重，不走 6 小时窗口）。
+    ['alerts', { kind: 'gate-audit-violation' }, 'blocked'],
     // #43：首次卡住、写闸拒绝、调度循环停摆立即发（notifySlack 里再按 6 小时去重）。
     ['alerts', { kind: 'gate-rejected' }, 'blocked'],
     ['alerts', { kind: 'write-rejected' }, 'blocked'],
@@ -186,7 +188,7 @@ test('事件表：每个 type / kind 是立即发、进摘要还是不（含未�
   for (const [source, event, expected] of cases) {
     assert.equal(classify(source, event), expected, `${source} ${JSON.stringify(event)}`);
   }
-  assert.deepEqual([...BLOCKED_ALERT_KINDS].sort(), ['sandbox-unavailable', 'secret-found']);
+  assert.deepEqual([...BLOCKED_ALERT_KINDS].sort(), ['gate-audit-violation', 'sandbox-unavailable', 'secret-found']);
   assert.deepEqual([...RETRY_MINUTES], [1, 5, 15]);
   assert.equal(DIGEST_MINUTES, 60);
 });
