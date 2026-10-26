@@ -1260,7 +1260,11 @@ export function correctionPrBody(state, marker) {
   const disputes = (state.disputes || []).map(
     (item) => `- 争议未修：${item.ref} SC${item.sc}（验收方：${bodyCell(redact(String(item.acceptance || ''))) || '裁决是要修'}；修正方：${bodyCell(redact(String(item.reason || ''))) || '没写理由'}），交给人裁。`,
   );
-  const unrun = [`- SC1 由验收机在本 PR 合并、修正子 issue 关闭后再验；CI 结果看本 PR 的检查。`];
+  const unrun = [
+    '- 开 PR 时 CI 还没跑完（build / typecheck / test）：正文不写没发生的 CI 结果。',
+    '- CI 结果看本 PR 的检查。',
+    '- SC1 由验收机在本 PR 合并、修正子 issue 关闭后再验。',
+  ];
   if (!passed) unrun.push(`- 目标仓没有配置预检（${bodyCell(state.preflightNote) || '未跑'}），开 PR 时还没有 SC1 的验证证据。`);
   return [
     ...head,
