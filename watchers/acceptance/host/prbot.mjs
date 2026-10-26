@@ -1182,7 +1182,7 @@ export function cleanupWorktrees({ home, profile, fsImpl = fs } = {}) {
  * （新模板是「## 原因」，复用的旧修正子 issue 是「## 没过的原因」，两种都认）。
  * 读不出来就留空，正文里退回写验收项编号。
  */
-export function correctionIssueFacts(body) {
+function correctionIssueSections(body) {
   const sections = new Map();
   let current = null;
   for (const line of String(body || '').split('\n')) {
@@ -1194,9 +1194,34 @@ export function correctionIssueFacts(body) {
       sections.get(current).push(line);
     }
   }
-  const scLine = (sections.get('验收标准') || []).map((line) => /^\s*[-*]\s*(?:\[[ xX]\])?\s*(SC1\b.*)$/.exec(line)).find(Boolean);
+  return sections;
+}
+
+function correctionIssueSectionText(lines) {
+  return (lines || [])
+    .map((line) => line.trim().replace(/^[-*]\s+/, ''))
+    .filter(Boolean)
+    .join(' ');
+}
+
+export function correctionIssueFacts(body) {
+  const sections = correctionIssueSections(body);
+  const scLine = ['验收标准', '没过的验收项']
+    .flatMap((name) => sections.get(name) || [])
+    .map((line) => /^\s*[-*]\s*(?:\[[ xX]\])?\s*(?:\*\*)?(SC1\b.*?)(?:\*\*)?\s*$/.exec(line))
+    .find(Boolean);
   const why = (sections.get('原因') || sections.get('没过的原因') || []).map((line) => line.trim()).filter(Boolean).join(' ');
   return { scText: scLine ? scLine[1].trim() : '', why };
+}
+
+/** 修正子 issue 的范围（可改）/ 不做 / 依赖，PR 正文的「范围对照」逐段照抄这三段。 */
+export function correctionIssueDetails(body) {
+  const sections = correctionIssueSections(body);
+  return {
+    scope: correctionIssueSectionText(sections.get('范围（可改）') || sections.get('范围')),
+    notDo: correctionIssueSectionText(sections.get('不做')),
+    dependencies: correctionIssueSectionText(sections.get('依赖')),
+  };
 }
 
 const MAX_BODY_FILES = 30;
@@ -1215,6 +1240,12 @@ export function correctionPrBody(state, marker) {
   const head = [`任务 issue：${state.root}`];
   if (state.issue) head.push(closesLine(state.issue, prRepo));
   const facts = state.correctionFacts || {};
+  const correctionBody = state.correctionBody || state.correctionIssueBody;
+  const details =
+    state.correctionDetails ||
+    (correctionBody
+      ? correctionIssueDetails(correctionBody)
+      : { scope: facts.scope, notDo: facts.notDo, dependencies: facts.dependencies });
   const scText = facts.scText || `SC1 ${state.item} SC${state.sc} 重新验收通过`;
   const files = Array.isArray(state.changedFiles) ? state.changedFiles : [];
   const shown = files.slice(0, MAX_BODY_FILES).map((file) => `\`${bodyCell(file)}\``).join('、');
@@ -1240,12 +1271,16 @@ export function correctionPrBody(state, marker) {
     '',
     `修正验收没过的 ${state.item} SC${state.sc}：${bodyCell(scText.replace(/^SC1\s*/, ''))}${facts.why ? `。没过的原因：${bodyCell(facts.why)}` : ''}`,
     '',
+    `- 本 PR 改了：${fileLine}`,
+    '',
     '## 范围对照',
     '',
     `- 本 PR 改了：${fileLine}`,
+    ...(details.scope ? [`- 修正子 issue 的范围（可改）：${bodyCell(details.scope)}`] : []),
     '- 超出 issue 范围：无（推之前按禁改路径检查过）',
     `- 明确不包含：${disputes.length ? '有争议的条目不修（见「定下的决定」）；' : ''}不改修正子 issue 以外的验收项`,
-    '- 依赖：无',
+    ...(details.notDo ? [`- 修正子 issue 不做：${bodyCell(details.notDo)}`] : []),
+    `- 依赖：${bodyCell(details.dependencies) || '无'}`,
     '',
     '## 验收对照',
     '',
@@ -1495,6 +1530,7 @@ export async function runPrbotCorrection({
     state.prRepo = state.prRepo || state.rootRepo;
     state.branch = correctionBranch(marker);
     state.correctionFacts = correctionIssueFacts(pre.correction?.body);
+    state.correctionDetails = correctionIssueDetails(pre.correction?.body);
     state.handoff = handoffFor(settings, state.repo);
     state.verdict = null;
 

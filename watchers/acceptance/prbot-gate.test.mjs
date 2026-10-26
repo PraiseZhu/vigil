@@ -15,7 +15,7 @@ import { hostPaths } from './host/paths.mjs';
 import { defaultTree } from './session.fixture.mjs';
 import { HANDOFF_REPO, OWNER, REPO, createFakeRun, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import { PR_STATUS_QUERY } from './host/write-gate.mjs';
-import { correctionIssueFacts, correctionPrBody, correctionPushRepo } from './host/prbot.mjs';
+import { correctionIssueDetails, correctionIssueFacts, correctionPrBody, correctionPushRepo } from './host/prbot.mjs';
 import { correctionBody } from './bin/correct.mjs';
 import { bodyVersion } from './bin/rounds.mjs';
 
@@ -716,9 +716,16 @@ test('#93 SC1 SC2 SC4 修正 PR 正文按 task-pr/v1 和修正子 issue 逐段�
   const facts = correctionIssueFacts(issueBody);
   assert.equal(facts.scText, 'SC1 导出按钮在空列表时禁用 | 不报错。验证：unit');
   assert.equal(facts.why, '空列表时仍可点击');
+  assert.deepEqual(correctionIssueDetails(issueBody), {
+    scope: `修好 ${REPO}#2 SC3 所需的最小代码改动和复现测试，限原属 issue 的范围内（目标仓禁改路径照旧不碰）`,
+    notDo: `不改 ${REPO}#2 的其它验收项，不扩大原属 issue 的范围`,
+    dependencies: '无，随时可开工。',
+  });
   // #96 之前开的修正子 issue 被复用时还是旧模板（「## 没过的原因」）：两种都读得出。
   const legacy = ['> 修正子 issue', '## 没过的验收项', '导出按钮', '## 没过的原因', '旧原因', '## 验收标准', '- [ ] SC1 导出按钮。验证：unit'].join('\n');
   assert.deepEqual(correctionIssueFacts(legacy), { scText: 'SC1 导出按钮。验证：unit', why: '旧原因' });
+  // 旧模板没有这三段时留空，正文退回原来的写法。
+  assert.deepEqual(correctionIssueDetails(legacy), { scope: '', notDo: '', dependencies: '' });
   const marker = { root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1 };
   const base = { issue: `${REPO}#9`, prRepo: REPO, root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1, correctionFacts: facts };
   const sectionsOf = (body) => {
@@ -749,6 +756,7 @@ test('#93 SC1 SC2 SC4 修正 PR 正文按 task-pr/v1 和修正子 issue 逐段�
   assert.equal(cells[0], 'SC1 导出按钮在空列表时禁用 \\| 不报错。验证：unit', 'SC 原文照抄，竖线转义');
   assert.equal(cells[1], '通过');
   assert.match(cells[2], /`npm test`、`npm run lint` 在沙箱通过/);
+  assert.match(sections.get('改了什么').join('\n'), /本 PR 改了：`src\/export\.js`、`test\/export\.test\.js`/);
   assert.match(sections.get('范围对照').join('\n'), /`src\/export\.js`、`test\/export\.test\.js`/);
   assert.match(sections.get('定下的决定').join('\n'), /争议未修：.*#2 SC4/);
   assert.ok(!passed.split('\n').some((line) => /^\s*-\s*(有争议|要修)：/.test(line)), '不用验收机会解析的行头');
@@ -762,6 +770,30 @@ test('#93 SC1 SC2 SC4 修正 PR 正文按 task-pr/v1 和修正子 issue 逐段�
 
   const unknown = correctionPrBody({ ...base, correctionFacts: { scText: '', why: '' } }, marker);
   assert.match(unknown, /^\| SC1 example-owner\/[\w.-]+#2 SC3 重新验收通过 \| 待验证 \| — \|$/m, '读不出 SC 原文时退回写验收项编号');
+});
+
+test('#93 SC1 修正 PR 正文的范围对照也逐段对应修正子 issue 的可改范围 / 不做 / 依赖', () => {
+  const marker = { root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1 };
+  const base = {
+    issue: `${REPO}#9`,
+    prRepo: REPO,
+    root: `${REPO}#1`,
+    item: `${REPO}#2`,
+    sc: 3,
+    round: 1,
+    changedFiles: ['src/export.js'],
+    preflight: { ok: true, commands: ['npm test'] },
+    correctionDetails: {
+      scope: `- 修好 ${REPO}#2 SC3 所需的最小代码改动和复现测试，限原属 issue 的范围内`,
+      notDo: `- 不改 ${REPO}#2 的其它验收项，不扩大原属 issue 的范围`,
+      dependencies: '无，随时可开工。',
+    },
+  };
+  const body = correctionPrBody(base, marker);
+  const lines = body.slice(body.indexOf('## 范围对照'), body.indexOf('## 验收对照'));
+  assert.match(lines, /范围（可改）：.*最小代码改动和复现测试/);
+  assert.match(lines, /不做：.*不改 .*#2 的其它验收项/);
+  assert.match(lines, /依赖：无，随时可开工。/);
 });
 
 test('#60 修正 github 出口：branch.push 带租约只对 acceptance/ 分支生效（--force-with-lease=<分支>:<上次已知 head>），不带就不强推', async () => {
