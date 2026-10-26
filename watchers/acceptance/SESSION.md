@@ -37,7 +37,8 @@ node watchers/acceptance/bin/helper.mjs progress --issue <root> --round <n>
 
 ## 2. 怎么验
 
-- 代码已由宿主检出：派发消息的「代码」一节列出本轮任务树里每个仓的绝对路径（宿主检出各仓最新 main 的工作树，带 `.git`），**只读**。直接在那里读代码、看 `git log`；需要可写副本（装依赖、跑会写文件的测试）时复制到 `TMPDIR` 再用（`cp -a <路径> "$TMPDIR/"`），用完清理。沙箱里没有凭证，**不要**自己 `git clone`（私有仓克隆不下来），也不要往 `worktreeDir` 里检出。
+- 代码已由宿主检出：派发消息的「代码」一节列出本轮任务树里每个仓的绝对路径（宿主检出各仓最新 main 的工作树，带 `.git`），**只读**。直接在那里读代码、看 `git log`；需要可写副本（跑会写文件的测试）时复制到 `TMPDIR` 再用（`cp -a <路径> "$TMPDIR/"`），用完清理。沙箱里没有凭证，**不要**自己 `git clone`（私有仓克隆不下来），也不要往 `worktreeDir` 里检出。
+- 依赖已由宿主预装：派发消息的「依赖」一节写明每个 npm 仓的情况。有 lockfile 的仓，`node_modules` 已按 lockfile 装好（`npm ci --ignore-scripts`）并只读挂在检出目录里，直接 `npm run build` / `npx tsc` / `npx vitest run` 即可。沙箱里 npm 一律离线、连不上 registry，**不要**再跑 `npm ci` / `npm install`。写着「没有预装依赖」的仓，或因为安装脚本没跑而缺的产物，要依赖才能跑的检查属**环境限制**：在证据里写明「环境限制：未预装依赖」，不能据此判不通过，也不能把没跑的检查当作已通过。
 - `static`、`unit`、`contract`、`browser-fixture` 逐条跑，每条都留下证据：跑的命令 + 关键输出一行。
 - `cindy-mac`、`cindy-windows`、`paid`、`github-live` 这几种层次**不验**，在裁决里列成「人工手测」；人工手测**不拦关闭**。
 - 勾选框（`- [x]`）只算声称，不算证据：每条都要自己找证据。

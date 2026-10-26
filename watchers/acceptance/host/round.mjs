@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 一轮验收（#47 SC11）：起 pi 的唯一入口。
-// 顺序：内存门 → 槽/测试锁 → 写闸总开关 → bwrap 探针 → 认领（经写闸 exec）→ 预取代码 → 起写闸 serve
+// 顺序：内存门 → 槽/测试锁 → 写闸总开关 → bwrap 探针 → 认领（经写闸 exec）→ 预取代码 → 预装依赖 → 起写闸 serve
 // → bwrap 参数 + 出网代理 → 跑 pi → 收尾。总开关关着、bwrap 探针不过都不认领；认领之后沙箱参数拼不出来
 // 就不跑模型，这一轮 abort 成「中断」并写提醒；没有任何开关能绕过沙箱。
 import fs from 'node:fs';
@@ -18,6 +18,8 @@ import { EGRESS_BRIDGE_PORT, bridgeCommand, startRoundEgress } from './egress-pr
 import { run as procRun, spawnDetached, spawnProcess } from './proc.mjs';
 // prefetch.mjs → prbot.mjs → 本文件成环：两边都只在函数里用对方的导出，模块求值顺序不受影响。
 import { prefetchCode } from './prefetch.mjs';
+import { appendDepsInfo, prepareDeps } from './predeps.mjs';
+import { ENV_PROBLEM_PREFIX } from '../bin/trigger.mjs';
 
 /** 内存门：MemAvailable 低于 3 GiB 就不认领、不跑模型。常量，不可配。 */
 export const MEMORY_GATE_BYTES = 3 * 1024 ** 3;
@@ -340,6 +342,7 @@ export async function runHostRound({
   startGate = defaultStartGate,
   startEgress = startRoundEgress,
   prefetch = prefetchCode,
+  predeps = prepareDeps,
   now = () => Date.now(),
   meminfoPath = '/proc/meminfo',
   statusIntervalMs = STATUS_INTERVAL_MS,
@@ -538,7 +541,17 @@ export async function runHostRound({
       return 1;
     }
     const codeDirs = (code || []).map((entry) => entry.path);
-    const message = appendCodePaths(claim.message, code || []);
+
+    // 7b. 依赖预装（方案 B）：宿主在模型沙箱之外按 lockfile 跑 npm ci --ignore-scripts，只读挂进去。
+    //     装不上是环境问题：中止本轮（GitHub 上标「中断」并写明原因），不出任何代码结论，按退避稍后重试。
+    let deps;
+    try {
+      deps = await predeps({ home, profile: hostProfile, hostConfig: settings, code: code || [], roundDir, env, run, repoRoot: root, touch, issue, round: claim.round });
+    } catch (error) {
+      await abortWithAlert('deps-failed', `${ENV_PROBLEM_PREFIX}依赖预装失败：${String(error?.message || error).slice(0, 300)}`, error?.detail);
+      return 1;
+    }
+    const message = appendDepsInfo(appendCodePaths(claim.message, code || []), deps?.deps || []);
 
     // 8. 写闸 serve：绑定本轮，socket 权限 600。沙箱看到的是宿主转发的那个 socket（记本轮活动）。
     const socketPath = path.join(roundDir, 'gate', 'gate.sock');
@@ -591,7 +604,9 @@ export async function runHostRound({
         roundDir,
         masks,
         binds: [profile.stateDir, profile.worktreeDir],
-        readOnlyBinds: codeDirs,
+        readOnlyBinds: [...codeDirs, ...(deps?.readOnlyBinds || [])],
+        readOnlyMounts: deps?.mounts || [],
+        tmpfsDirs: deps?.tmpfs || [],
         hostHome: env.HOME || process.env.HOME,
         homeAllow: defaultHomeAllow({ repoRoot: root, hostConfig: settings }),
       });

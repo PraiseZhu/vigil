@@ -384,6 +384,14 @@ export const NOTICE_COPY = Object.freeze({
     action: '先不用；反复出现请检查 GitHub 访问。',
     needsHuman: false,
   },
+  'deps-failed': {
+    title: '依赖装不上，这一轮已中止（环境问题，不是代码不通过）',
+    what: '开轮前验收机要在沙箱外按 lockfile 预装 npm 依赖，这次没装成（常见是 npm 官方源连不上、lockfile 里有官方源以外的地址，或超时）。',
+    impact: '这个任务这一轮没验、没出任何结论，不会被判不通过；其它任务照常。',
+    auto: '已中止这一轮（GitHub 上标「中断」并写明是环境问题），按退避稍后自动重试，同一任务连续失败时间隔拉长到 30 分钟、2 小时、6 小时。',
+    action: '先不用；同一任务反复出现请让修复员查 npm 源或这个仓的 lockfile。',
+    needsHuman: false,
+  },
   'loop-restarted': {
     title: '验收机调度循环被重新拉起',
     what: '保活脚本发现调度循环不正常。',

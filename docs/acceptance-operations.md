@@ -45,7 +45,8 @@
 `egressAllow` 是沙箱**唯一**能出网的名单（见第 4 节「网络」）：只写 `host:port`（小写，不认通配、不认 URL），
 LLM 网关的 host 取 pi 的 `models.json` 里 `baseUrl` 的主机名。代码由宿主预取、只读挂进沙箱（见下面「代码预取」），
 pi 不用自己 `git clone`，所以**只放行网关就够**；名单越短越好（每个放行的主机都是一条潜在的外传通道）。
-沙箱里固定关掉 npm 的更新检查（`NPM_CONFIG_UPDATE_NOTIFIER=false`），跑 `npm test` 不会去连 registry。**不配就是空名单，pi 连不上模型网关，这一轮跑不起来。**
+沙箱里固定关掉 npm 的更新检查（`NPM_CONFIG_UPDATE_NOTIFIER=false`），并让 npm 一律离线（`npm_config_offline=true`），
+跑 `npm test` 不会去连 registry；依赖由宿主在沙箱外预装（见下面「依赖预装」），**不要为了 npm 往 `egressAllow` 里加 registry**。**不配就是空名单，pi 连不上模型网关，这一轮跑不起来。**
 写错（通配、URL、缺端口）整轮直接起不来，不会悄悄放宽。
 
 `maxRoundMinutes` 可选：一轮的总时长上限（分钟，宿主墙钟，从认领算起），缺了或不是正数按 120。
@@ -264,6 +265,24 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 - 任何一个仓取不下来：这一轮 `abort`（原因「代码预取失败：…」），写提醒 `prefetch-failed`，不起 pi。
 - 轮次收尾时 `roundDir` 里除 `pi.log` 外都清掉（含检出的代码）；镜像留着，下一轮只是增量取。
 
+### 依赖预装（npm）
+
+沙箱只能连模型网关，在沙箱里 `npm ci` 必然卡住或失败。所以代码预取之后、起 pi 之前，宿主替这一轮装依赖（`host/predeps.mjs`）：
+
+- 只在仓根有 `package.json` 且有 `npm-shrinkwrap.json` / `package-lock.json` 时装；没有 lockfile 就不装，
+  派发消息里写明「没有预装依赖，要依赖的检查属环境限制，不能据此判不通过」。
+- 只跑 `npm ci --ignore-scripts --no-audit --no-fund --registry https://registry.npmjs.org/`：任何安装脚本都不跑，
+  源写死，项目和宿主的 `.npmrc` 都不读（项目 `.npmrc` 不拷进工作目录，`userconfig` / `globalconfig` 指向空文件）。
+- 装在 `<roundDir>/deps/<owner>__<repo>`（检出目录的副本，不含 `.git`），npm 缓存在 `<home>/cache/npm`，都不进宿主 `HOME` 的点目录。
+- npm 自己也跑在一个 bwrap 里（`--unshare-net`，凭证目录照样遮住），出网只走一个临时出网代理，放行名单写死为
+  `registry.npmjs.org:443`，装完就关；`host.json` 的 `egressAllow` 不变。环境只带 `PATH` / `LANG` / `TZ` 和固定的
+  `npm_config_*`，**不带任何令牌**（GitHub / LLM / Slack / npm 都不带）。每个仓最多 15 分钟，期间每分钟刷新本轮宿主进度。
+- 装好的各级 `node_modules` 以 `--ro-bind` 挂到检出目录里同一位置（和代码一样只读）；`node_modules/.cache`、`.vite`、`.vitest`
+  在沙箱里是空 tmpfs，给工具写缓存。沙箱里能直接 `npm run build` / `npx tsc` / `npx vitest run`，全程离线。
+- 装不上（退出码非 0、超时、出网被拒）是**环境问题，不是代码不通过**：这一轮 `abort`（原因以「环境问题（不是代码不通过）：」开头），
+  写提醒 `deps-failed`（四段式 Slack），不起 pi、不出任何结论。npm 输出的尾巴（路径换成 `<path>`、密钥脱敏）只进提醒的 `detail`。
+  同一任务最近一次中断是环境问题时，重试间隔是 30 分钟 → 2 小时 → 6 小时封顶（普通中断仍是 0 → 5 → 15 → 60 分钟）。
+
 ### 轮次生命周期
 
 - **卡住**以宿主观察到的活动为准：宿主每个查进度的间隔看一次 `pi.log` 有没有长，并经一层转发 socket 数本轮写闸请求
@@ -289,7 +308,7 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 - **验收结论不发通知**：通过/要修、中断都只在 GitHub 的轮次评论和看板里。
 
 常见 `kind`：`loop-restarted`、`tick-failed`、`round-stale`、`round-stalled`、`round-failed`、`round-timeout`、
-`prefetch-failed`、`sandbox-down`、`sandbox-unavailable`、`gate-unavailable`、`gate-rejected`、`secret-found`、`write-rejected`、`egress-denied`；裁决运行的
+`prefetch-failed`、`deps-failed`、`sandbox-down`、`sandbox-unavailable`、`gate-unavailable`、`gate-rejected`、`secret-found`、`write-rejected`、`egress-denied`；裁决运行的
 `adjudicate-failed`、`adjudicate-timeout`、`adjudicate-needs-human`、`adjudicate-not-configured`；
 Slack 自己的 `slack-failed`（重试用完）、`slack-history-failed`（读频道历史失败）。
 
@@ -474,10 +493,11 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 | 心跳不更新 | `state/host/heartbeat.json` 的 `at`/`lastTick.error` | 跑 `ensure.sh`；还不行看 `loop.log`，`stop.sh` 后重起 |
 | 轮次一直「验收中」 | `state/host/progress/` 里这一轮的 `lastActivityAt`（`round.mjs status` 的 `stalled` 按模型写的时间算，只作参考） | 等调度先杀进程再 abort；要手动就 `abort --reason` |
 | `prefetch-failed` | 提醒的 `reason`（哪个仓）、`state/prbot/mirrors/acceptance__*` | 多半是令牌看不到这个仓或网络问题；`doctor` 的「仓可读」先过 |
+| `deps-failed` | 提醒的 `reason`（哪个仓、退出码 / 超时 / 被拒的主机）和 `detail`（npm 输出尾巴） | 环境问题，不判代码；多半是 npm 官方源连不上，或 lockfile 里有官方源以外的 `resolved` 地址（被出网代理拒）。会按退避自动重试 |
 | `sandbox-down` | `bwrap --ro-bind / / true` | 修好 bwrap 之前不会认领；提醒一小时一条 |
 | 所有写都被拒 | `alerts.jsonl` 的 `gate-rejected` | 看 `reason`：`gate-disabled` → 建开关文件；`not-current-round` → 轮次已结束 |
 | `sandbox-unavailable` | `pi.log`、`gate.log` | `bwrap --ro-bind / / true` 跑一下；参数拼错看 detail（含 `egressAllow` 写法不对） |
-| `egress-denied` | 提醒里的 `reason`（被拒的 `host:port`）和 `detail`（`not-allowed` / `not-connect` / `blocked-address`） | 该放行就把 `host:port` 加进 `host.json` 的 `egressAllow`；不该放行的说明模型在往外连别处，看 `pi.log` |
+| `egress-denied` | 提醒里的 `reason`（被拒的 `host:port`）和 `detail`（`not-allowed` / `not-connect` / `blocked-address`） | 该放行就把 `host:port` 加进 `host.json` 的 `egressAllow`（npm 源除外：依赖走宿主预装）；不该放行的说明模型在往外连别处，看 `pi.log` |
 | pi 连不上模型网关 | `pi.log`、`alerts.jsonl` 的 `egress-denied` | `egressAllow` 里要有 `models.json` 的 `baseUrl` 主机名 `:443` |
 | `secret-found` | 提醒里的 `reason`（只有文件名） | 按 #46 SC7 记「需人工处理」，别自己推 |
 | `tick-failed` | `heartbeat.lastTick.error` | 多半是 `poll.mjs` 或配置报错，跑一次 `poll.mjs --json` 看 |

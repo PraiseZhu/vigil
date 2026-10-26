@@ -44,6 +44,7 @@ export const INTERRUPTION_ALERT_KINDS = Object.freeze([
   'round-stalled',
   'round-stale',
   'round-timeout',
+  'deps-failed',
 ]);
 
 /** 立即发（ping）的 alert kind。gate-audit-violation 不走 6 小时去重：审计自己已按违规指纹去重。 */
@@ -51,7 +52,7 @@ export const BLOCKED_ALERT_KINDS = Object.freeze(['secret-found', 'sandbox-unava
 
 /**
  * 也立即发、但同一任务同一原因（kind）6 小时内只发一次的 alert kind（#43）：首次轮次卡住 / 超时 / 失败、沙箱起不来、
- * 代码预取失败、写闸拒绝、调度循环停摆（ensure.sh 拉起循环），以及裁决运行重试用完要人工裁决。6 小时内再来就进摘要。
+ * 代码预取失败、依赖预装失败、写闸拒绝、调度循环停摆（ensure.sh 拉起循环），以及裁决运行重试用完要人工裁决。6 小时内再来就进摘要。
  * round-failed 同时在 INTERRUPTION_ALERT_KINDS 里：第一次立即发，第二次（6h 内）合成「连续中断」，第三次不发。
  */
 export const PROMPT_ALERT_KINDS = Object.freeze([
@@ -61,6 +62,7 @@ export const PROMPT_ALERT_KINDS = Object.freeze([
   'round-failed',
   'sandbox-down',
   'prefetch-failed',
+  'deps-failed',
   'gate-rejected',
   'write-rejected',
   'loop-restarted',
