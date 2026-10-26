@@ -11,6 +11,7 @@ import { hostPaths, isAlive } from '../host/paths.mjs';
 import { createProbes } from '../host/probes.mjs';
 import { handoffFor, preflightCommands, repoConfig } from '../host/prbot-config.mjs';
 import { checkSlackAccess } from '../host/slack-notify.mjs';
+import { describeViolation, runGateAudit } from '../host/gate-audit.mjs';
 
 /** 令牌账号 == ownerLogin 用这条。 */
 export const VIEWER_QUERY = `query {
@@ -152,6 +153,7 @@ export async function runDoctor({
   github,
   hostConfig,
   slackCheck = checkSlackAccess,
+  gateAudit = (options) => runGateAudit(options),
 } = {}) {
   const checks = [];
   const add = (name, ok, detail = '') => {
@@ -366,6 +368,30 @@ export async function runDoctor({
     );
   } catch {
     add('常驻循环', false, '没有心跳文件（循环没跑）');
+  }
+
+  // 写闸账本审计（只读）：旁路核对写闸账本里已执行的写入，看有没有越规的。只读本地账本 + 只读查轮次评论。
+  try {
+    const audit = await gateAudit({ home, profile, github: api, now });
+    const parts = [];
+    if (audit?.busy) {
+      parts.push('另一处审计正在跑，这次跳过');
+    } else {
+      parts.push(`核对 ${Number(audit?.checkedLines) || 0} 行`);
+      if (audit?.baseline) {
+        parts.push(
+          `基线 ${audit.baseline.at}（基线前 ${Number(audit.baseline.lines) || 0} 条，疑似违规 ${Number(audit.baseline.violations) || 0} 条）`,
+        );
+      }
+      parts.push(`基线后违规 ${Number(audit?.sinceBaseline) || 0} 条`);
+    }
+    const githubErrors = Array.isArray(audit?.githubErrors) ? audit.githubErrors : [];
+    if (githubErrors.length > 0) parts.push(`GitHub 只读核对没做成：${githubErrors.join('；')}`);
+    const fresh = Array.isArray(audit?.newViolations) ? audit.newViolations : [];
+    if (fresh.length > 0) parts.push(`这次新发现：${fresh.slice(0, 3).map(describeViolation).join('；')}`);
+    add('写闸账本审计', audit?.ok, parts.join('；'));
+  } catch (error) {
+    add('写闸账本审计', false, firstLine(error?.message));
   }
 
   // 令牌文件从原始 profile.json 算（loadAcceptanceProfile 只回白名单键，新增的 …TokenFile 键看不到）。

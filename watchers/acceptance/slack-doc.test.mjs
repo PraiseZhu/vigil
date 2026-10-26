@@ -58,6 +58,7 @@ test('SC6 文档：事件表写清每类是 ping / 摘要 / 不发', () => {
   for (const kind of [
     'secret-found',
     'sandbox-unavailable',
+    'gate-audit-violation',
     'round-failed',
     'gate-unavailable',
     'round-stale',
