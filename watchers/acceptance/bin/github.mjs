@@ -242,6 +242,29 @@ function signJwt(pem, payload) {
   return `${data}.${sig}`;
 }
 
+/** 读请求遇 GitHub 瞬时故障时，当次重试前等多久（只重试一次）。 */
+export const READ_RETRY_DELAY_MS = 4000;
+
+/**
+ * gh 失败输出是不是 GitHub / 网络的瞬时故障：502/503/504、HTTP/2 流被对方断开、连接被重置、超时。
+ * 404、401、权限、GraphQL 业务错误等都不算，不重试。
+ */
+export function isTransientGithubFailure(result) {
+  const text = `${result?.stderr || ''}\n${result?.stdout || ''}`;
+  return (
+    /\bHTTP 50[234]\b/.test(text) ||
+    /\bstream error\b/i.test(text) ||
+    /connection reset|ECONNRESET|ETIMEDOUT|i\/o timeout|TLS handshake timeout|unexpected EOF/i.test(text)
+  );
+}
+
+/** GraphQL 文本是不是纯查询（不含 mutation / subscription）。拿不准一律当写，不重试。 */
+export function isReadOnlyGraphql(query) {
+  const text = String(query || '').replace(/#[^\n]*/g, '');
+  if (!/^\s*(query\b|\{)/.test(text)) return false;
+  return !/\b(mutation|subscription)\b/.test(text);
+}
+
 function parseJson(stdout, label) {
   try {
     return JSON.parse(stdout);
@@ -303,12 +326,23 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
     throw new Error(detail);
   }
 
+  /**
+   * 跑一条只读的 gh 命令：遇到瞬时故障（见 isTransientGithubFailure）等几秒、当次重试一次，
+   * 还失败就把第二次的结果原样交回去，由调用方照旧报错。写请求绝不经过这里。
+   */
+  async function runRead(args, opts) {
+    const first = await runCmd('gh', args, opts);
+    if (first.code === 0 || !isTransientGithubFailure(first)) return first;
+    await sleepFn(READ_RETRY_DELAY_MS);
+    return runCmd('gh', args, opts);
+  }
+
   async function graphql(query, variables) {
     const token = await getReadToken();
-    const result = await runCmd('gh', ['api', 'graphql', '--input', '-'], {
-      env: ghEnv(token),
-      input: JSON.stringify({ query, variables }),
-    });
+    const opts = { env: ghEnv(token), input: JSON.stringify({ query, variables }) };
+    const args = ['api', 'graphql', '--input', '-'];
+    // 只有纯查询才重试；mutation 哪怕走到这里也只发一次。
+    const result = isReadOnlyGraphql(query) ? await runRead(args, opts) : await runCmd('gh', args, opts);
     if (result.code !== 0) failFrom(result, token);
     const parsed = parseJson(result.stdout, 'GraphQL');
     if (parsed.errors?.length) {
@@ -323,7 +357,18 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
    */
   async function ownerGraphql(query, variables) {
     if (/^\s*mutation\b/.test(String(query || ''))) throw new Error('ownerGraphql 只做只读查询');
-    return graphqlWrite(query, variables);
+    if (!isReadOnlyGraphql(query)) return graphqlWrite(query, variables);
+    const token = getOwnerToken();
+    const result = await runRead(['api', 'graphql', '--input', '-'], {
+      env: ghEnv(token),
+      input: JSON.stringify({ query, variables }),
+    });
+    if (result.code !== 0) failFrom(result, token);
+    const parsed = parseJson(result.stdout, 'GraphQL');
+    if (parsed.errors?.length) {
+      throw new Error(redact(parsed.errors.map((err) => err.message).join('; '), [token]));
+    }
+    return parsed.data ?? parsed;
   }
 
   async function ghApi(method, apiPath, body) {

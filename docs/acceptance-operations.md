@@ -104,6 +104,9 @@ pi 不用自己 `git clone`，所以**只放行网关就够**；名单越短越�
 - 令牌**不进仓、不进日志、不进 bwrap**：沙箱里看到的是一个内容为
   `sandbox-placeholder-not-a-token` 的占位文件，`…TokenFile` / App 私钥一律被 bwrap 遮成 `/dev/null`。
 - 提醒和裁决里的自由文本都过 `bin/redact.mjs`，不会带出令牌、私钥或本机路径。
+- **GitHub 临时故障**：只读请求（`graphql` / `ownerGraphql` 里的纯 query）遇到 502/503/504、连接被断或超时，
+  等 4 秒当次重试**一次**，还失败就照旧报错、记告警。mutation 和所有 `write()`（评论、关单、看板、推送、开 PR……）
+  一律只发一次，绝不重试。
 
 ### 两种令牌方案
 
