@@ -12,12 +12,16 @@ import {
   DEPS_EGRESS_ALLOW,
   DEPS_ENV_ALLOWLIST,
   DepsError,
+  LOCKFILES,
   NPM_CI_ARGS,
   NPM_REGISTRY,
+  PNPM_INSTALL_ARGS,
   appendDepsInfo,
   depsEnv,
   findLockfile,
+  lockfileManager,
   prepareDeps,
+  resolvePnpm,
 } from './host/predeps.mjs';
 import { runHostRound } from './host/round.mjs';
 import { QUIET_ENV, buildBwrapArgs, probeBwrap, sandboxEnv } from './host/sandbox.mjs';
@@ -448,4 +452,240 @@ test('只认本轮 <roundDir>/code 下的检出：别处的目录即使有 lockf
   assert.equal(npm.calls.length, 0);
   assert.deepEqual(deps.deps, []);
   assert.equal(fs.existsSync(path.join(elsewhere, 'node_modules')), false);
+});
+
+// ---- pnpm（#pnpm 预装）：仓根只有 pnpm-lock.yaml 的仓（比如 pnpm workspace）也由宿主预装 ----
+
+/** 假的 pnpm：宿主上「找到了」一个 pnpm 入口（不碰真文件系统里的 pnpm）。 */
+const FAKE_PNPM = Object.freeze({ command: '/fake/node22/bin/node', args: ['/fake/corepack/v1/pnpm/10.0.0/bin/pnpm.cjs'], entry: '/fake/corepack/v1/pnpm/10.0.0/bin/pnpm.cjs', version: '10.0.0' });
+
+test('pnpm-lock.yaml 也认；仓根同时有 npm 和 pnpm 的 lockfile 时按 npm（npm 仓行为不变）', () => {
+  const root = tmpDir();
+  fs.writeFileSync(path.join(root, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n");
+  assert.equal(findLockfile(root), null, '没有 package.json');
+  fs.writeFileSync(path.join(root, 'package.json'), '{}');
+  assert.equal(findLockfile(root), 'pnpm-lock.yaml');
+  assert.equal(lockfileManager('pnpm-lock.yaml'), 'pnpm');
+  fs.writeFileSync(path.join(root, 'package-lock.json'), '{}');
+  assert.equal(findLockfile(root), 'package-lock.json', 'npm 的 lockfile 优先');
+  assert.equal(lockfileManager('package-lock.json'), 'npm');
+  fs.writeFileSync(path.join(root, 'npm-shrinkwrap.json'), '{}');
+  assert.equal(findLockfile(root), 'npm-shrinkwrap.json');
+  assert.deepEqual([...LOCKFILES], ['npm-shrinkwrap.json', 'package-lock.json'], 'npm 的 lockfile 名单原样');
+  const dirLock = tmpDir();
+  fs.writeFileSync(path.join(dirLock, 'package.json'), '{}');
+  fs.mkdirSync(path.join(dirLock, 'pnpm-lock.yaml'));
+  assert.equal(findLockfile(dirLock), null, '同名目录不算 lockfile');
+});
+
+test('pnpm 仓：宿主跑 pnpm install --frozen-lockfile --ignore-scripts（固定官方源、store 在 <home>/cache/pnpm-store），挂载和 npm 一样只读', async () => {
+  const fx = fixture();
+  const dir = checkout(fx.codeRoot, 'example__mono', {
+    'package.json': '{"name":"mono","packageManager":"pnpm@10.0.0"}',
+    'pnpm-lock.yaml': "lockfileVersion: '9.0'\n",
+    'pnpm-workspace.yaml': 'packages:\n  - "packages/*"\n',
+    '.npmrc': 'registry=https://registry.example.invalid/\n//registry.example.invalid/:_authToken=npm-token-not-real\nnode-linker=hoisted\nshamefully-hoist=maybe\n',
+    'packages/web/package.json': '{"name":"web"}',
+  });
+  const npm = fakeNpm();
+  const proxy = fakeProxy();
+  const deps = await prepareDeps({
+    home: fx.home,
+    profile: fx.profile,
+    hostConfig: hostConfig(),
+    code: [{ repo: 'example/mono', path: dir }],
+    roundDir: fx.roundDir,
+    env: { ...process.env, ...SECRETS },
+    run: npm.run,
+    repoRoot: REPO_ROOT,
+    startProxy: proxy.startProxy,
+    findPnpm: () => FAKE_PNPM,
+  });
+  assert.equal(npm.calls.length, 1);
+  const { cmd, args, options } = npm.calls[0];
+  assert.equal(cmd, 'bwrap');
+  assert.ok(args.includes('--unshare-net'), 'pnpm 也在隔离网络里，只能走出网桥');
+  const tail = args.slice(args.indexOf(FAKE_PNPM.command));
+  assert.deepEqual(tail, [FAKE_PNPM.command, ...FAKE_PNPM.args, ...PNPM_INSTALL_ARGS], '用解析出的绝对路径跑，不靠 PATH 里的 pnpm（corepack 会去下载别的版本）');
+  assert.ok(!args.includes('npm'), '不跑 npm ci');
+  assert.deepEqual(PNPM_INSTALL_ARGS.slice(0, 3), ['install', '--frozen-lockfile', '--ignore-scripts']);
+  assert.equal(PNPM_INSTALL_ARGS[PNPM_INSTALL_ARGS.indexOf('--registry') + 1], 'https://registry.npmjs.org/');
+  const workDir = args[args.indexOf('--chdir') + 1];
+  assert.ok(workDir.startsWith(path.join(fx.roundDir, 'deps')));
+  assert.equal(fs.existsSync(path.join(workDir, '.npmrc')), false, '不抄项目 .npmrc（不许换源、不带令牌）');
+  assert.ok(fs.existsSync(path.join(workDir, 'pnpm-workspace.yaml')), 'workspace 配置照抄');
+
+  const env = options.env;
+  const store = path.join(fx.home, 'cache', 'pnpm-store');
+  assert.equal(env.npm_config_store_dir, store);
+  assert.equal(fs.statSync(store).mode & 0o777, 0o700, 'store 目录 700');
+  assert.equal(fs.statSync(path.join(fx.home, 'cache', 'pnpm-cache')).mode & 0o777, 0o700);
+  assert.ok(!store.startsWith(fx.roundDir), 'store 不在本轮目录（沙箱可写区）里');
+  assert.ok(args.some((v, i) => v === '--bind' && args[i + 1] === store), 'store 只在预装这一步可写');
+  assert.equal(env.npm_config_registry, NPM_REGISTRY);
+  assert.equal(env.npm_config_ignore_scripts, 'true');
+  assert.equal(env.npm_config_frozen_lockfile, 'true');
+  assert.equal(env.npm_config_manage_package_manager_versions, 'false', '不按 packageManager 字段自己去下别的 pnpm');
+  assert.equal(env.COREPACK_ENABLE_STRICT, '0');
+  assert.equal(env.npm_config_node_linker, 'hoisted', '项目 .npmrc 里的 node-linker 照仓的设计用');
+  assert.equal(env.npm_config_shamefully_hoist, undefined, '不认的值不带');
+  const allowed = new Set([...DEPS_ENV_ALLOWLIST, 'HOME', 'NO_UPDATE_NOTIFIER', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'COREPACK_ENABLE_STRICT', 'COREPACK_ENABLE_NETWORK', 'CI']);
+  for (const key of Object.keys(env)) {
+    assert.ok(allowed.has(key) || key.startsWith('npm_config_'), `预装环境里多了 ${key}`);
+  }
+  for (const value of Object.values(SECRETS)) {
+    assert.ok(!Object.values(env).includes(value), '令牌不进 pnpm 的环境');
+    assert.ok(!args.includes(value), '令牌不进 bwrap 参数');
+  }
+  assert.ok(!Object.values(env).some((value) => /registry\.example\.invalid/.test(value)), '项目 .npmrc 的源不带');
+
+  assert.deepEqual(
+    deps.mounts.map((mount) => path.relative(dir, mount.dest)).sort(),
+    ['node_modules', path.join('packages', 'web', 'node_modules')],
+  );
+  assert.deepEqual(deps.readOnlyBinds, [path.join(fx.roundDir, 'deps')]);
+  assert.ok(deps.tmpfs.includes(path.join(dir, 'node_modules', '.cache')));
+  assert.equal(deps.deps[0].status, 'installed');
+  assert.equal(deps.deps[0].lockfile, 'pnpm-lock.yaml');
+  assert.equal(deps.deps[0].manager, 'pnpm');
+  assert.deepEqual(proxy.seen[0].allow, ['registry.npmjs.org:443'], '出网名单和 npm 一样只有官方源');
+  assert.ok(proxy.seen.stopped);
+
+  const message = appendDepsInfo('派发消息', deps.deps);
+  assert.match(message, /example\/mono：已按 pnpm-lock\.yaml 预装（pnpm install --frozen-lockfile --ignore-scripts/);
+  assert.match(message, /不要再跑 pnpm install/);
+  assert.match(message, new RegExp(`node ${FAKE_PNPM.entry.replace(/[.]/g, '\\.')}`), '告诉评审沙箱里怎么离线跑 pnpm 脚本');
+  assert.doesNotMatch(message, /npm-token-not-real/);
+});
+
+test('npm 和 pnpm 的 lockfile 并存：照旧跑 npm ci，不找 pnpm', async () => {
+  const fx = fixture();
+  const dir = checkout(fx.codeRoot, 'example__both', { 'package.json': '{}', 'package-lock.json': '{}', 'pnpm-lock.yaml': "lockfileVersion: '9.0'\n" });
+  const npm = fakeNpm();
+  let looked = 0;
+  const deps = await prepareDeps({
+    home: fx.home,
+    profile: fx.profile,
+    code: [{ repo: 'example/both', path: dir }],
+    roundDir: fx.roundDir,
+    run: npm.run,
+    repoRoot: REPO_ROOT,
+    startProxy: fakeProxy().startProxy,
+    findPnpm: () => {
+      looked += 1;
+      return FAKE_PNPM;
+    },
+  });
+  assert.equal(looked, 0);
+  const { args, options } = npm.calls[0];
+  assert.deepEqual(args.slice(args.indexOf('npm')), ['npm', ...NPM_CI_ARGS]);
+  assert.equal(options.env.npm_config_store_dir, undefined, 'npm 的环境不加 pnpm 的配置');
+  assert.equal(options.env.COREPACK_ENABLE_STRICT, undefined);
+  assert.equal(deps.deps[0].lockfile, 'package-lock.json');
+  assert.equal(deps.deps[0].manager, 'npm');
+  const message = appendDepsInfo('派发消息', deps.deps);
+  assert.match(message, /已按 package-lock\.json 预装（npm ci --ignore-scripts/);
+  assert.doesNotMatch(message, /pnpm/);
+});
+
+test('宿主上找不到 pnpm：抛 DepsError（人话：哪个仓、缺什么、怎么办，不带路径和令牌），不留半截预装目录和挂载点，不起 pnpm', async () => {
+  const fx = fixture();
+  const dir = checkout(fx.codeRoot, 'example__mono', { 'package.json': '{}', 'pnpm-lock.yaml': "lockfileVersion: '9.0'\n" });
+  const npm = fakeNpm();
+  await assert.rejects(
+    prepareDeps({
+      home: fx.home,
+      profile: fx.profile,
+      code: [{ repo: 'example/mono', path: dir }],
+      roundDir: fx.roundDir,
+      env: { ...process.env, ...SECRETS, PATH: `/home/x/${SECRETS.GH_TOKEN}/bin:/usr/bin` },
+      run: npm.run,
+      repoRoot: REPO_ROOT,
+      startProxy: fakeProxy().startProxy,
+      findPnpm: () => null,
+    }),
+    (error) => {
+      assert.ok(error instanceof DepsError);
+      assert.match(error.message, /example\/mono/);
+      assert.match(error.message, /pnpm-lock\.yaml/);
+      assert.match(error.message, /宿主上找不到 pnpm/);
+      assert.match(error.message, /装好 pnpm/);
+      assert.doesNotMatch(`${error.message} ${error.detail || ''}`, /\/home\/|not-real/);
+      return true;
+    },
+  );
+  assert.equal(npm.calls.length, 0);
+  assert.equal(fs.existsSync(path.join(fx.roundDir, 'deps')), false);
+  assert.equal(fs.existsSync(path.join(dir, 'node_modules')), false);
+});
+
+test('pnpm install 失败：DepsError 写「pnpm install 失败」，输出尾巴脱敏只进 detail', async () => {
+  const fx = fixture();
+  const dir = checkout(fx.codeRoot, 'example__mono', { 'package.json': '{}', 'pnpm-lock.yaml': "lockfileVersion: '9.0'\n" });
+  const npm = fakeNpm({ code: 1, stderr: `ERR_PNPM_OUTDATED_LOCKFILE Cannot install with "frozen-lockfile"\nat /home/someone/x\ntoken ${'ghp_' + 'b'.repeat(36)}\n` });
+  await assert.rejects(
+    prepareDeps({
+      home: fx.home,
+      profile: fx.profile,
+      code: [{ repo: 'example/mono', path: dir }],
+      roundDir: fx.roundDir,
+      run: npm.run,
+      repoRoot: REPO_ROOT,
+      startProxy: fakeProxy().startProxy,
+      findPnpm: () => FAKE_PNPM,
+    }),
+    (error) => {
+      assert.ok(error instanceof DepsError);
+      assert.match(error.message, /example\/mono：pnpm install 失败（退出码 1）/);
+      assert.match(error.detail, /OUTDATED_LOCKFILE/);
+      assert.doesNotMatch(error.detail, /\/home\/someone|ghp_b{36}/);
+      return true;
+    },
+  );
+  assert.equal(fs.existsSync(path.join(fx.roundDir, 'deps')), false);
+});
+
+test('resolvePnpm：PATH 里的独立 pnpm 直接用；corepack 垫片改用 corepack 缓存里的 pnpm.cjs（不经 corepack、不下载）；都没有返回 null', () => {
+  const root = tmpDir();
+  const execPath = '/fake/node';
+  // 1) 独立的 pnpm 可执行文件。
+  const binA = path.join(root, 'a', 'bin');
+  fs.mkdirSync(binA, { recursive: true });
+  fs.writeFileSync(path.join(binA, 'pnpm'), '#!/bin/sh\n', { mode: 0o755 });
+  const a = resolvePnpm({ env: { PATH: binA }, execPath, corepackHomes: [] });
+  assert.equal(a.command, path.join(binA, 'pnpm'));
+  assert.deepEqual(a.args, []);
+  // 2) npm 全局装的 pnpm（bin 是 .cjs 的符号链接）：用 node 跑。
+  const binB = path.join(root, 'b', 'bin');
+  const pkgB = path.join(root, 'b', 'lib', 'node_modules', 'pnpm', 'bin');
+  fs.mkdirSync(binB, { recursive: true });
+  fs.mkdirSync(pkgB, { recursive: true });
+  fs.writeFileSync(path.join(pkgB, 'pnpm.cjs'), '');
+  fs.symlinkSync(path.join(pkgB, 'pnpm.cjs'), path.join(binB, 'pnpm'));
+  const b = resolvePnpm({ env: { PATH: binB }, execPath, corepackHomes: [] });
+  assert.equal(b.command, execPath);
+  assert.deepEqual(b.args, [fs.realpathSync(path.join(pkgB, 'pnpm.cjs'))]);
+  // 3) corepack 垫片：取 lastKnownGood 指的那个缓存版本。
+  const binC = path.join(root, 'c', 'bin');
+  const shim = path.join(root, 'c', 'lib', 'node_modules', 'corepack', 'dist');
+  fs.mkdirSync(binC, { recursive: true });
+  fs.mkdirSync(shim, { recursive: true });
+  fs.writeFileSync(path.join(shim, 'pnpm.js'), '');
+  fs.symlinkSync(path.join(shim, 'pnpm.js'), path.join(binC, 'pnpm'));
+  const corepackHome = path.join(root, 'corepack');
+  for (const version of ['9.15.0', '10.34.6', '10.4.0']) {
+    fs.mkdirSync(path.join(corepackHome, 'v1', 'pnpm', version, 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(corepackHome, 'v1', 'pnpm', version, 'bin', 'pnpm.cjs'), '');
+  }
+  fs.writeFileSync(path.join(corepackHome, 'lastKnownGood.json'), '{"pnpm":"10.4.0"}');
+  const c = resolvePnpm({ env: { PATH: binC }, execPath, corepackHomes: [corepackHome] });
+  assert.equal(c.command, execPath);
+  assert.deepEqual(c.args, [path.join(corepackHome, 'v1', 'pnpm', '10.4.0', 'bin', 'pnpm.cjs')]);
+  assert.equal(c.version, '10.4.0');
+  fs.rmSync(path.join(corepackHome, 'lastKnownGood.json'));
+  assert.equal(resolvePnpm({ env: { PATH: binC }, execPath, corepackHomes: [corepackHome] }).version, '10.34.6', '没有 lastKnownGood 取最高版本');
+  // corepack 垫片但缓存里没有 pnpm：不算找到（垫片会去下载）。
+  assert.equal(resolvePnpm({ env: { PATH: binC }, execPath, corepackHomes: [path.join(root, 'none')], fallbackDirs: [] }), null);
+  // 4) 都没有。
+  assert.equal(resolvePnpm({ env: { PATH: path.join(root, 'empty') }, execPath, corepackHomes: [], fallbackDirs: [] }), null);
 });
