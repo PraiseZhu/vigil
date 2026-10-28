@@ -112,7 +112,8 @@ test('prepare is a no-op on a clean watch worktree already at the PR head', (t) 
 test('a nested repository in the watch tree is refused and the tree is left untouched', (t) => {
   const f = fixture(t);
   withPlugin(t, f.plugin);
-  const nested = path.join(f.worktree, 'nested');
+  // a non-ASCII name: Git quotes such paths unless status is read with -z
+  const nested = path.join(f.worktree, '嵌套仓');
   fs.mkdirSync(nested);
   git(nested, 'init', '-b', 'main');
   fs.writeFileSync(path.join(nested, 'n.txt'), 'nested work\n');

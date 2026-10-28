@@ -269,12 +269,16 @@ function preservedMessage(task, originalHead, reasons, now) {
 // git add -A records only a gitlink for a submodule and skips a nested repository's own history, so a backup would
 // look complete while losing that work. Such trees are refused and left exactly as they are.
 function assertPreservable(worktree, gitFn) {
-  const lines = gitOutput(['-C', worktree, 'status', '--porcelain=v2', '--untracked-files=all', '--ignore-submodules=none'], gitFn).split('\n');
-  for (const line of lines) {
-    const fields = line.split(' ');
-    if ((fields[0] === '1' || fields[0] === '2') && /^S(?!\.\.\.)/.test(fields[2] ?? '')) fail(`worktree has submodule changes (${fields.at(-1)}); refusing to preserve it`);
+  // -z keeps paths raw: without it Git quotes non-ASCII paths and a nested repository's trailing slash is hidden.
+  const entries = gitOutput(['-C', worktree, 'status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignore-submodules=none'], gitFn).split('\0');
+  for (let i = 0; i < entries.length; i += 1) {
+    const entry = entries[i];
+    if (!entry) continue;
+    const fields = entry.split(' ');
+    if (fields[0] === '2') i += 1; // a rename entry is followed by its original path
+    if ((fields[0] === '1' || fields[0] === '2') && /^S(?!\.\.\.)/.test(fields[2] ?? '')) fail(`worktree has submodule changes (${fields.slice(fields[0] === '2' ? 9 : 8).join(' ')}); refusing to preserve it`);
     if (fields[0] === 'u') fail('worktree has unmerged index entries; refusing to preserve it');
-    if (fields[0] === '?' && line.endsWith('/')) fail(`worktree has a nested repository (${line.slice(2)}); refusing to preserve it`);
+    if (fields[0] === '?' && entry.endsWith('/')) fail(`worktree has a nested repository (${entry.slice(2)}); refusing to preserve it`);
   }
 }
 // Snapshot every Git-visible part of a drifted watch clone into a local ref before any reset.

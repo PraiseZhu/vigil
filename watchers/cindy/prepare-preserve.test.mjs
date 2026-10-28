@@ -112,7 +112,8 @@ test('preserving uses a private index: what the session had staged stays exactly
 test('a nested repository in the watch tree is refused and the tree is left untouched', (t) => {
   const f = fixture(t);
   const wt = f.checkout.worktree;
-  const nested = path.join(wt, 'nested');
+  // a non-ASCII name: Git quotes such paths unless status is read with -z
+  const nested = path.join(wt, '嵌套仓');
   fs.mkdirSync(nested);
   git(nested, 'init', '-b', 'main');
   fs.writeFileSync(path.join(nested, 'n.txt'), 'nested work\n');
