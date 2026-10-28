@@ -58,3 +58,19 @@ test('R-3 fixing a repeated finding needs inventory and approach evidence', () =
   ]), task });
   assertRepeatInventory({ scs: sc(['no repeat key here']), task: {} });
 });
+
+test('R-4 the same feedback key coming back is a repeat even when the reviewer marker is missing', (t) => {
+  const paths = home(t, [['live-9-1.json',
+    { nodeId: 'PR_9', feedback: [{ key: 'thread:same', source: 'thread', body: 'the guard is bypassed' }] },
+    { scs: [{ id: 'SC-1', status: 'pass', feedbackKeys: ['thread:same'] }] }]]);
+  const repeat = repeatFindingsFor({ paths, pr, fresh: [{ key: 'thread:same', source: 'thread', body: 'still bypassed after the fix' }] });
+  assert.deepEqual(repeat.map((r) => [r.feedbackKey, r.reason]), [['thread:same', 'same-key']]);
+});
+
+test('R-5 the reviewer class is compared case-insensitively after decoding', (t) => {
+  const paths = home(t, [['live-9-1.json',
+    { nodeId: 'PR_9', feedback: [item('mivo-review:a', '111111111111', 'Static-Analysis-False-Negative')] },
+    { scs: [{ id: 'SC-1', status: 'pass', feedbackKeys: ['mivo-review:a'] }] }]]);
+  const repeat = repeatFindingsFor({ paths, pr, fresh: [item('mivo-review:c', '222222222222', 'static-analysis-false-negative')] });
+  assert.deepEqual(repeat.map((r) => [r.feedbackKey, r.reason]), [['mivo-review:c', 'same-class']]);
+});

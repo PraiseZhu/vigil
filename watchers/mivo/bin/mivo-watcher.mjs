@@ -1131,10 +1131,11 @@ function hasWatchOff(labels) {
   return (labels ?? []).map((item) => typeof item === 'string' ? item : item?.name).includes('mivo-watch:off');
 }
 
-// Reviewer findings already fixed in an earlier task of this PR coming back: the same finding key again, or the
-// same class after an earlier fix. Only the reviewer's findings carry a key and class (mivo-finding marker).
+// Findings already fixed in an earlier task of this PR coming back: the same feedback key, the reviewer's same
+// finding key, or the same class after an earlier fix (the key and class come from the mivo-finding marker).
 export function repeatFindingsFor({ paths, pr, fresh }) {
   const fixedKeys = new Set();
+  const fixedFindingKeys = new Set();
   const fixedClasses = new Set();
   let names = [];
   try { names = fs.readdirSync(path.join(paths.stateDir, 'tasks')); } catch { return []; }
@@ -1145,17 +1146,21 @@ export function repeatFindingsFor({ paths, pr, fresh }) {
     if (!task || !result || task.nodeId !== pr.id) continue;
     const fixed = new Set((result.scs ?? []).filter((sc) => sc.status === 'pass').flatMap((sc) => sc.feedbackKeys ?? []));
     for (const item of task.feedback ?? []) {
+      if (!fixed.has(item.key)) continue;
+      fixedKeys.add(item.key);
       const marker = findingMarkerOf(item?.body);
-      if (!marker || !fixed.has(item.key)) continue;
-      fixedKeys.add(marker.key);
-      if (marker.cls) fixedClasses.add(marker.cls);
+      if (!marker) continue;
+      fixedFindingKeys.add(marker.key);
+      if (marker.cls) fixedClasses.add(marker.cls.trim().toLowerCase());
     }
   }
   return (fresh ?? []).flatMap((item) => {
     const marker = findingMarkerOf(item?.body);
-    if (!marker) return [];
-    if (fixedKeys.has(marker.key)) return [{ feedbackKey: item.key, findingKey: marker.key, cls: marker.cls, reason: 'same-key' }];
-    if (marker.cls && fixedClasses.has(marker.cls)) return [{ feedbackKey: item.key, findingKey: marker.key, cls: marker.cls, reason: 'same-class' }];
+    const cls = marker?.cls?.trim().toLowerCase() ?? '';
+    if (fixedKeys.has(item.key) || (marker && fixedFindingKeys.has(marker.key))) {
+      return [{ feedbackKey: item.key, ...(marker ? { findingKey: marker.key } : {}), cls: marker?.cls ?? '', reason: 'same-key' }];
+    }
+    if (cls && fixedClasses.has(cls)) return [{ feedbackKey: item.key, findingKey: marker.key, cls: marker.cls, reason: 'same-class' }];
     return [];
   });
 }
@@ -3022,8 +3027,16 @@ const RULES_REFRESH_ATTEMPTS = 3;
 function* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn, remaining, unlockForDispatch, relockForDispatch }) {
   const version = rulesVersion();
   const entry = readPr(paths.home, key);
-  if (dryRun || typeof dispatchFn !== 'function' || !entry?.sessionId || entry.rulesVersion === version
-    || entry.retiredSession?.sessionId === entry.sessionId) return null;
+  if (dryRun || typeof dispatchFn !== 'function' || !entry?.sessionId || entry.retiredSession?.sessionId === entry.sessionId) return null;
+  // A session whose task is complete is not refreshed, even when the PR is quiet and never reaches processPr: it is
+  // listed for the sweeper here, and the next feedback opens a fresh session.
+  if (entry.activeTask?.status === 'complete' && entry.activeTask.dispatchId && !entry.pendingDispatch) {
+    const retired = { sessionId: entry.sessionId, dispatchId: entry.activeTask.dispatchId, at: now };
+    retireSession(paths, { sessionId: entry.sessionId, nodeId: key, number: entry.number, dispatchId: retired.dispatchId, at: now });
+    writePr(paths.home, key, { ...entry, retiredSession: retired });
+    return 'session-retired';
+  }
+  if (entry.rulesVersion === version) return null;
   if (item?.dispatch?.attempted || item?.dispatch?.reason === 'dispatch-budget-deferred' || item?.dispatch?.reason === 'merge-ready'
     || entry.mergeReady === true || entry.collectRetry || Number(entry.pendingFeedback ?? 0) > 0) return null;
   if (entry.pendingDispatch || entry.needsHuman || entry.optOut || entry.closedHandled || entry.wasDraft === true

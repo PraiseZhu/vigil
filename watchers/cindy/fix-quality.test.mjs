@@ -60,3 +60,14 @@ test('C-T3 already-fixed proof: in the validated head and not in the reviewed he
   assert.equal(proof({ [`${FIX}..${HEAD}`]: 1, [`${FIX}..${REVIEWED}`]: 1 })(FIX, REVIEWED), false, 'not in the validated head');
   assert.equal(proof({ [`${FIX}..${HEAD}`]: 0 })(FIX, null), false, 'no reviewed head');
 });
+
+test('C-R2 the same feedback key is a repeat even without a review-thread id', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-repeat-key-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, 'state');
+  for (const dir of ['tasks', 'results']) fs.mkdirSync(path.join(stateDir, dir), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'tasks', 'live-5-1.json'), JSON.stringify({ nodeId: 'PR_5', feedback: [{ key: 'comment:same', nativeId: 'comment:1', body: 'old' }] }));
+  fs.writeFileSync(path.join(stateDir, 'results', 'live-5-1.json'), JSON.stringify({ scs: [{ id: 'SC-1', status: 'pass', feedbackKeys: ['comment:same'] }] }));
+  const repeat = repeatFindingsFor({ paths: { stateDir }, pr: { id: 'PR_5', number: 5 }, fresh: [{ key: 'comment:same', nativeId: 'comment:2', body: 'same issue again' }] });
+  assert.deepEqual(repeat.map((r) => [r.feedbackKey, r.reason]), [['comment:same', 'same-key']]);
+});

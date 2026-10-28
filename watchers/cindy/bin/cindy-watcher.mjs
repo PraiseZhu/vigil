@@ -972,9 +972,10 @@ function hasWatchOff({ home, number, comments, author, labels } = {}) {
   return isOptedOut({ home, number, comments, author });
 }
 
-// A review thread that comes back after an earlier task of this PR fixed it. Cindy's reviewers carry no stable
-// finding key or class, so the thread is the unit.
+// A finding that comes back after an earlier task of this PR fixed it: the same feedback key, or the same review
+// thread (Cindy's reviewers carry no separate finding key or class, so the thread is the unit).
 export function repeatFindingsFor({ paths, pr, fresh }) {
+  const fixedKeys = new Set();
   const fixedThreads = new Set();
   let names = [];
   try { names = fs.readdirSync(path.join(paths.stateDir, 'tasks')); } catch { return []; }
@@ -985,12 +986,15 @@ export function repeatFindingsFor({ paths, pr, fresh }) {
     if (!task || !result || task.nodeId !== pr.id) continue;
     const fixed = new Set((result.scs ?? []).filter((sc) => sc.status === 'pass').flatMap((sc) => sc.feedbackKeys ?? []));
     for (const item of task.feedback ?? []) {
+      if (!fixed.has(item.key)) continue;
+      fixedKeys.add(item.key);
       const thread = threadIdOf(item);
-      if (thread && fixed.has(item.key)) fixedThreads.add(thread);
+      if (thread) fixedThreads.add(thread);
     }
   }
   return (fresh ?? []).flatMap((item) => {
     const thread = threadIdOf(item);
+    if (fixedKeys.has(item.key)) return [{ feedbackKey: item.key, ...(thread ? { threadId: thread } : {}), reason: 'same-key' }];
     return thread && fixedThreads.has(thread) ? [{ feedbackKey: item.key, threadId: thread, reason: 'same-thread' }] : [];
   });
 }
@@ -2334,8 +2338,16 @@ const RULES_REFRESH_ATTEMPTS = 3;
 function* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn, remaining, unlockForDispatch, relockForDispatch }) {
   const version = rulesVersion();
   const entry = readPr(paths.home, key);
-  if (dryRun || typeof dispatchFn !== 'function' || !entry?.sessionId || entry.rulesVersion === version
-    || entry.retiredSession?.sessionId === entry.sessionId) return null;
+  if (dryRun || typeof dispatchFn !== 'function' || !entry?.sessionId || entry.retiredSession?.sessionId === entry.sessionId) return null;
+  // A session whose task is complete is not refreshed, even when the PR is quiet and never reaches processPr: it is
+  // listed for the sweeper here, and the next feedback opens a fresh session.
+  if (entry.activeTask?.status === 'complete' && entry.activeTask.dispatchId && !entry.pendingDispatch) {
+    const retired = { sessionId: entry.sessionId, dispatchId: entry.activeTask.dispatchId, at: now };
+    retireSession(paths, { sessionId: entry.sessionId, nodeId: key, number: entry.number, dispatchId: retired.dispatchId, at: now });
+    writePr(paths.home, key, { ...entry, retiredSession: retired });
+    return 'session-retired';
+  }
+  if (entry.rulesVersion === version) return null;
   if (item?.dispatch?.attempted || item?.dispatch?.reason === 'dispatch-budget-deferred' || item?.dispatch?.reason === 'merge-ready'
     || entry.mergeReady === true || entry.collectRetry || Number(entry.pendingFeedback ?? 0) > 0) return null;
   if (entry.pendingDispatch || entry.needsHuman || entry.optOut || entry.closedHandled || entry.wasDraft === true
