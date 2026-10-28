@@ -20,6 +20,7 @@ import { run as procRun, spawnDetached, spawnProcess } from './proc.mjs';
 import { prefetchCode } from './prefetch.mjs';
 import { appendDepsInfo, prepareDeps } from './predeps.mjs';
 import { ENV_PROBLEM_PREFIX } from '../bin/trigger.mjs';
+import { redact } from '../bin/redact.mjs';
 
 /** 内存门：MemAvailable 低于 3 GiB 就不认领、不跑模型。常量，不可配。 */
 export const MEMORY_GATE_BYTES = 3 * 1024 ** 3;
@@ -165,11 +166,51 @@ function cleanRoundDir(roundDir) {
   }
 }
 
-async function defaultStartGate({ home, socketPath, binding, env, repoRoot, sleep, logFile: gateLog }) {
+/**
+ * 起写闸 serve 后最多等多久看到 socket（可注入，只给测试）。serve 开 socket 前要先读一次任务树
+ * （总 issue 1 条查询 + 修正子 issue 搜索 1+forkRepos 条，逐条串行）；每条读遇瞬时故障会等 4 秒重试一次
+ * （bin/github.mjs），gh 的 TLS 握手超时约 10 秒，一条最坏约 25 秒。原来只等 20 秒，GitHub 慢时一条读重试
+ * 就超了，轮次被放弃。60 秒够三条各重试一次；重试也失败时 serve 自己会退出，下面会立刻发现、不等满。
+ */
+export const GATE_START_TIMEOUT_MS = 60000;
+
+/** gate.log 末几行（写进提醒用）：只取最后几行、限长，令牌和本机路径先抹掉。 */
+function gateLogTail(file, { lines = 5, maxChars = 600 } = {}) {
+  let text = '';
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch {
+    return '';
+  }
+  const tail = text
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() !== '')
+    .slice(-lines)
+    .join(' / ');
+  return redact(tail).slice(-maxChars);
+}
+
+function formatSeconds(ms) {
+  return `${Number((ms / 1000).toFixed(1))} 秒`;
+}
+
+export async function defaultStartGate({
+  home,
+  socketPath,
+  binding,
+  env,
+  repoRoot,
+  sleep,
+  logFile: gateLog,
+  startTimeoutMs = GATE_START_TIMEOUT_MS,
+  spawn = spawnDetached,
+  clock = Date.now,
+}) {
   fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
   const logFile = gateLog || path.join(path.dirname(path.dirname(socketPath)), 'gate.log');
   const logFd = fs.openSync(logFile, 'a');
-  const child = spawnDetached(
+  const child = spawn(
     process.execPath,
     [
       path.join(repoRoot, 'watchers', 'acceptance', 'host', 'write-gate.mjs'),
@@ -188,8 +229,13 @@ async function defaultStartGate({ home, socketPath, binding, env, repoRoot, slee
     { env, stdio: ['ignore', logFd, logFd] },
   );
   fs.closeSync(logFd);
-  const deadline = Date.now() + 20000;
-  while (Date.now() < deadline) {
+  // 子进程先退了（比如读任务树失败）就不必等满上限。
+  let exited = null;
+  child.on('exit', (code, signal) => {
+    exited = { code, signal };
+  });
+  const deadline = clock() + startTimeoutMs;
+  while (clock() < deadline) {
     if (fs.existsSync(socketPath)) {
       return {
         socketPath,
@@ -217,14 +263,21 @@ async function defaultStartGate({ home, socketPath, binding, env, repoRoot, slee
         },
       };
     }
+    if (exited) break;
     await sleep(100);
   }
-  try {
-    process.kill(child.pid, 'SIGKILL');
-  } catch {
-    // 已经退了。
+  if (!exited) {
+    try {
+      process.kill(child.pid, 'SIGKILL');
+    } catch {
+      // 已经退了。
+    }
   }
-  throw new Error('写闸 serve 没起来');
+  const tail = gateLogTail(logFile);
+  const why = exited
+    ? `子进程已经退出（${exited.signal ? `信号 ${exited.signal}` : `退出码 ${exited.code}`}）`
+    : `等了 ${formatSeconds(startTimeoutMs)}没等到 socket（等待超时）`;
+  throw new Error(`写闸 serve 没起来：${why}${tail ? `；gate.log 末几行：${tail}` : ''}`);
 }
 
 /**
