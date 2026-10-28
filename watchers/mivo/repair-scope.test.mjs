@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { adjudicationBrief, assertOwner, finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/mivo-repair.mjs';
+import { adjudicationBrief, assertDisputesAdjudicated, assertOwner, finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/mivo-repair.mjs';
 import { writePr } from './bin/mivo-state.mjs';
 import { ownershipGh } from './ownership-gh.fixture.mjs';
 
@@ -1062,4 +1062,32 @@ test('T-7 the reviewer class counts as test/doc only by whole words: claim-integ
   f.saveTask([product]);
   f.report([f.sc('no-change', ['thread:claim'])], [ruled([{ feedbackKey: 'thread:claim', verdict: 'p3', reason: 'only wording' }])]);
   assert.equal(f.finalize().status, 'complete');
+});
+
+// SC6: a code finding already fixed after the version the reviewer saw needs no arbiter.
+const SC6_HEAD = 'a'.repeat(40);
+const codeFinding = (extra = {}) => ({ key: 'thread:code', source: 'mivo-review', sha: SC6_HEAD,
+  user: { login: 'github-actions[bot]', type: 'Bot' }, body: '**P2**: concrete finding', ...extra });
+const codeTask = (item) => ({ headRefOid: SC6_HEAD, feedback: [item], prSnapshot: { unresolvedThreads: [] } });
+const codeSc = (evidence) => [{ id: 'SC-code', status: 'no-change', feedbackKeys: ['thread:code'], evidence }];
+
+test('A-6 a proven already-fixed commit lets a code P2 close without an arbiter', () => {
+  assertDisputesAdjudicated({ scs: codeSc(['already-fixed: ' + 'f'.repeat(40)]), workers: [], task: codeTask(codeFinding()),
+    fixedAfterReview: (sha, reviewed) => sha.startsWith('f') && reviewed === SC6_HEAD });
+});
+
+test('A-6 already-fixed does not exempt a commit outside HEAD, already in the reviewed version, or without a reviewed version', () => {
+  const sc = codeSc(['already-fixed: ' + 'f'.repeat(40)]);
+  assert.throws(() => assertDisputesAdjudicated({ scs: sc, workers: [], task: codeTask(codeFinding()), fixedAfterReview: () => false }), /ADJUDICATE_REQUIRED/);
+  assert.throws(() => assertDisputesAdjudicated({ scs: sc, workers: [], task: codeTask(codeFinding()), fixedAfterReview: (sha, reviewed) => reviewed !== SC6_HEAD }), /ADJUDICATE_REQUIRED/);
+  assert.throws(() => assertDisputesAdjudicated({ scs: sc, workers: [], task: codeTask(codeFinding({ sha: undefined })), fixedAfterReview: (sha, reviewed) => reviewed !== null }), /ADJUDICATE_REQUIRED/);
+});
+
+test('A-6 Mivo prefers the finding marker head over the feedback item sha', () => {
+  const reviewed = 'c'.repeat(12);
+  const item = codeFinding({ body: '**P2**: concrete finding\n<!-- mivo-finding key=aaaaaaaaaaaa round=1 head=' + reviewed + ' -->' });
+  let seen = null;
+  assertDisputesAdjudicated({ scs: codeSc(['already-fixed: ' + 'f'.repeat(40)]), workers: [], task: codeTask(item),
+    fixedAfterReview: (sha, head) => { seen = head; return true; } });
+  assert.equal(seen, reviewed);
 });

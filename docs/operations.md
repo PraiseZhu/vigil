@@ -177,3 +177,49 @@ node watchers/<mivo|cindy>/deploy.mjs apply --plan <file>
 `watchers/mivo/test.env` 与 `watchers/cindy/test.env` 是跑测试时用的占位环境变量
 (`node --env-file=...`),指向 `/tmp/...` 之类的不存在路径——这些路径仅用于触发 fail-closed
 分支的断言,不需要真实存在。不要把真实路径写进这两个文件。
+
+## 9. 工作树残留的自动保全
+
+准备修复工作树（`prepare`）时，如果 watch 工作树里还有没推上去的本地提交、分叉，或未提交的改动，watcher 不再拒绝、也不再等人手工处理。它先把这些内容存进本地保留引用，再把工作树重置到任务 PR 的 head，然后继续返回 `prepared`：
+
+- 备份引用：`refs/vigil/preserved/<dispatchId>`。新派发的 `dispatchId` 已经是 ref-safe 的；升级前带冒号、点的旧 ID 会分别编码成 `%3A`、`%2E`，任务文件和会话绑定里的旧 ID 不变。
+- Mivo 的 watch 工作树是配置插件仓的 linked worktree，引用和对象本来就在插件仓的 Git common dir。
+- Cindy 的 watch 工作树是独立 clone。备份引用会同时复制到配置插件仓（`CINDY_WATCHER_REPO` / `pluginRepoPath`）的同一引用名下；正常清理删除 clone 后，仍可从插件仓恢复。
+- 未提交内容先提交到备份上：staged 版本和 worktree 里的最终版本各有一个提交，普通未跟踪文件也进入快照提交。快照使用固定服务身份 `Vigil Preservation <vigil@localhost>`，不触发个人签名或 commit hook。
+- 同一 dispatch 再次遇到新残留时，新快照的父链保留上一份备份；旧备份不会因为引用更新而不可达。
+- 保留引用只在本地，永不 push、不自动过期、不自动回放。watcher 不会替你把备份合并回任务分支。
+
+`prepare` 的 JSON 输出现有字段不变，并新增：
+
+```json
+{
+  "preservation": {
+    "dispatchId": "live-7-...",
+    "backupRef": "refs/vigil/preserved/live-7-...",
+    "originalHead": "<原 HEAD>",
+    "backupHead": "<备份提交>",
+    "backupRepo": "<配置插件仓路径>",
+    "hadUncommitted": true,
+    "reasons": ["head-mismatch", "dirty"],
+    "previousBackupHead": null
+  },
+  "realigned": { "from": "<原 HEAD>", "to": "<PR head>", "backupRef": "refs/vigil/preserved/live-7-..." }
+}
+```
+
+没有残留时两个字段都是 `null`。恢复示例（把占位符换成实际仓库路径和引用名）：
+
+```sh
+git -C <配置插件仓> log --oneline <backupRef>
+git -C <配置插件仓> show <backupRef>:<file>
+```
+
+需要完整编辑时，另开恢复分支或 worktree 检出该引用，不要直接重置正在被盯梢的 `watch/pr-N` 分支。以下内容无法完整快照，watcher 会明确报错并保持原状：unmerged index、dirty submodule、嵌套 Git 仓库，以及 reset 会覆盖 ignored 文件的冲突。普通 tracked、staged、未跟踪文件和 symlink 可以恢复。
+
+## 10. PR 结束后的任务处理
+
+- **派活前重新确认状态。** 每轮采集到准备派发之间，watcher 会确认 PR 仍是 OPEN。采集结果已经带状态时用该状态；采集结果没有 PR 状态时，再读一次 `gh pr view --json id,state`。MERGED、CLOSED、读失败、非法 JSON、身份不一致或未知状态都不派发，也不扣反馈游标、派发次数、重试次数或轮次。原因写在 PR 条目的 `lastDispatchGuard`，下一轮按现有 closedown 流程处理。
+- **已派出任务的 PR 已合并/关闭时，允许 no-change 收口。** 任务的所有 SC 都是 `no-change`、SC 证据和 feedback 覆盖完整，并且 `validatedHead` 等于派发时的 head 时，`finalize` 可以读 MERGED/CLOSED 的 PR 并写出完成结果。结果带 `completionKind: "pr-terminal-no-change"`、`terminalPr`（实际状态、head、读取时间、工作树是已校验干净还是关闭后已清理）和 `ci.status: "not-run"`；它不 push、不重跑 CI、不评论、不 resolve，也不声称 CI 通过。
+- 有 SC 为 `pass`、head 变过、SC 证据不完整、工作树脏、任务/会话/dispatch 身份不匹配、handoff 被撤回或 Keel 证据无效时，不走这个例外，仍按原来的 OPEN 校验处理。
+- 正常 complete 仍要求当前 head 的绿 CI。只有严格校验通过的 terminal no-change 回执可以跳过该条件；它也不会写入 feedback ledger，不会把审查意见标成已裁定。PR 重开后，旧终态回执只作为历史完成，原反馈可以重新派发。
+- 已在派发队列里的任务不受影响；派发后 PR 才关闭时，finalize 的终态分支就是正常收口路径。watcher 在 closedown 时也会消费关闭后晚到的合法终态回执。

@@ -385,7 +385,7 @@ function scanHome(t) {
 function runScan(paths, listed, collect, dispatchFn, now = '2026-09-10T00:00:00Z') {
   return scanOnce({
     enabled: true, allowDispatch: true, paths, now,
-    ghFn: (args) => args[0] === 'api' ? 'owner' : JSON.stringify([listed]),
+    ghFn: (args) => args[0] === 'api' ? 'owner' : args[0] === 'pr' && args[1] === 'view' ? JSON.stringify({ id: 'PR_1', state: 'OPEN' }) : JSON.stringify([listed]),
     collect, dispatchFn,
   });
 }
@@ -621,7 +621,7 @@ for (const withTask of [true,false]) test(`discover claim-retry strips old P2 gr
     params:{title:'t',message:'schedule-prefix\nOWNER_STANDING_AUTH: PR_PUSH_AND_REPLY',target_session_id:'s1'},
   }});
   let sent;const out=scanOnce({mode:'discover',enabled:true,allowDispatch:true,paths,now:'2026-09-10T01:00:00Z',
-    ghFn:args=>args[0]==='api'&&args[1]==='user'?'owner':args[0]==='pr'&&args[1]==='list'?JSON.stringify([{id:'PR_1',number:1,headRefOid:HEAD,isDraft:false,labels:[]}]):'[]',
+    ghFn:args=>args[0]==='api'&&args[1]==='user'?'owner':args[0]==='pr'&&args[1]==='view'?JSON.stringify({id:'PR_1',state:'OPEN'}):args[0]==='pr'&&args[1]==='list'?JSON.stringify([{id:'PR_1',number:1,headRefOid:HEAD,isDraft:false,labels:[]}]):'[]',
     collect:()=>{throw Error('must not collect');},dispatchFn:p=>{sent=p;return {target_session_id:'s1',dispatch_id:id};},
   });
   assert.equal(out.prs[0].dispatch.reason,'claim-retry-wakeup');assertNoExternalAuthority(sent.message);

@@ -58,6 +58,7 @@ function gitRepos(t) {
   const watch = path.join(root, 'watch');
   const plugin = path.join(root, 'plugin');
   fs.mkdirSync(plugin);
+  git(plugin, 'init', '-b', 'main');
   git(root, 'init', '--bare', '-b', 'main', fork);
   git(root, 'init', '-b', 'feature', seed);
   git(seed, 'commit', '--allow-empty', '-m', 'base');
@@ -69,37 +70,41 @@ function gitRepos(t) {
 }
 const gitFn = (binary, args) => command(binary, args);
 
-test('a watch tree behind the fork fast-forwards; one ahead keeps its commits', t => {
+test('a watch tree behind or ahead of the fork is preserved, then reset to the fork head', t => {
   const r = gitRepos(t);
   r.git(r.seed, 'commit', '--allow-empty', '-m', 'author push');
   r.git(r.seed, 'push', 'origin', 'feature');
   const remoteHead = r.git(r.seed, 'rev-parse', 'HEAD');
-  const task = { number: 7, headRefName: 'feature' };
-  const behind = alignWatchWorktree({ task, checkout: { worktree: r.watch, head: r.git(r.watch, 'rev-parse', 'HEAD'), created: false }, remoteHead, gitFn, env: { CINDY_WATCHER_REPO: r.plugin } });
+  const task = { number: 7, headRefName: 'feature', dispatchId: 'live-7-2026-10-15T00:00:00.000Z' };
+  const before = r.git(r.watch, 'rev-parse', 'HEAD');
+  const behind = alignWatchWorktree({ task, checkout: { worktree: r.watch, head: before, created: false }, remoteHead, gitFn, env: { CINDY_WATCHER_REPO: r.plugin } });
   assert.equal(behind.head, remoteHead);
+  assert.equal(behind.preservation.originalHead, before);
   assert.equal(behind.realigned.backup, null);
+  assert.match(r.git(r.watch, 'log', '--format=%H', behind.preservation.backupRef), new RegExp(before));
   r.git(r.watch, 'commit', '--allow-empty', '-m', 'this round, not pushed yet');
   const local = r.git(r.watch, 'rev-parse', 'HEAD');
   const ahead = alignWatchWorktree({ task, checkout: { worktree: r.watch, head: local, created: false }, remoteHead, gitFn, env: { CINDY_WATCHER_REPO: r.plugin } });
-  assert.equal(ahead.head, local);
-  assert.equal(ahead.realigned, null);
+  assert.equal(ahead.head, remoteHead);
+  assert.equal(ahead.preservation.originalHead, local);
+  assert.match(r.git(r.watch, 'log', '--format=%H', ahead.preservation.backupRef), new RegExp(local));
+  assert.equal(r.git(r.plugin, 'rev-parse', ahead.preservation.backupRef), ahead.preservation.backupHead, 'canonical copy survives clone cleanup');
 });
 
-// 2026-10-15 #6077: an earlier round's unpushed commit and the author's own push diverged, and every later round
-// blocked on "worktree HEAD does not match validated-head".
-test('a watch tree that diverged from the fork is backed up and rebuilt from the fork head', t => {
+// 2026-10-15 #6077: an earlier round's unpushed commit and the author own push diverged.
+test('a watch tree that diverged from the fork is preserved and rebuilt from the fork head', t => {
   const r = gitRepos(t);
   r.git(r.watch, 'commit', '--allow-empty', '-m', 'stale round commit');
   const stale = r.git(r.watch, 'rev-parse', 'HEAD');
   r.git(r.seed, 'commit', '--allow-empty', '-m', 'author push');
   r.git(r.seed, 'push', 'origin', 'feature');
   const remoteHead = r.git(r.seed, 'rev-parse', 'HEAD');
-  const aligned = alignWatchWorktree({ task: { number: 7, headRefName: 'feature' }, checkout: { worktree: r.watch, head: stale, created: false },
-    remoteHead, gitFn, now: '2026-10-15T00:00:00Z', env: { CINDY_WATCHER_REPO: r.plugin } });
+  const aligned = alignWatchWorktree({ task: { number: 7, headRefName: 'feature', dispatchId: 'live-7-2026-10-15T00:00:00.000Z' },
+    checkout: { worktree: r.watch, head: stale, created: false }, remoteHead, gitFn, now: '2026-10-15T00:00:00Z', env: { CINDY_WATCHER_REPO: r.plugin } });
   assert.equal(aligned.head, remoteHead);
   assert.equal(aligned.realigned.from, stale);
-  assert.ok(fs.existsSync(aligned.realigned.backup), 'the stale commit is kept in a bundle');
-  assert.match(r.git(r.root, 'bundle', 'list-heads', aligned.realigned.backup), new RegExp(stale));
+  assert.equal(aligned.realigned.backup, null);
+  assert.match(r.git(r.watch, 'log', '--format=%H', aligned.preservation.backupRef), new RegExp(stale));
 });
 
 test('an environment block hands its feedback back with the round refunded, a bounded number of times', t => {

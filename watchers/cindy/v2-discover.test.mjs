@@ -60,6 +60,7 @@ function discover(paths, { now = '2026-09-28T00:00:00Z', prs = [listed], collect
         const extra = ghExtra(args);
         if (extra !== undefined) return extra;
       }
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: nodeId, state: 'OPEN' });
       if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { node } });
       return '[]';
     },

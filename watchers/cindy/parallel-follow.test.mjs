@@ -198,8 +198,8 @@ test('a PR dispatched again in the follow pass gets its own task, not the first 
   assert.match(messages[1], /新修复会话。上一会话 sess-841-1 已完成任务/);
   assert.doesNotMatch(messages[0], /新修复会话/);
   const tasks = fs.readdirSync(path.join(paths.stateDir, 'tasks')).filter((name) => name.endsWith('.json')).sort();
-  assert.deepEqual(tasks, ['live-841-2026-10-15T00:00:00Z.json', 'live-841-2026-10-15T00:00:45.000Z.json']);
-  assert.equal(readPr(paths.home, 'PR_841').lastDispatch.dispatchId, 'live-841-2026-10-15T00:00:45.000Z');
+  assert.deepEqual(tasks, ['live-841-2026-10-15T00-00-00Z.json', 'live-841-2026-10-15T00-00-45-000Z.json']);
+  assert.equal(readPr(paths.home, 'PR_841').lastDispatch.dispatchId, 'live-841-2026-10-15T00-00-45-000Z');
 });
 
 async function driveAsync(iterator) {

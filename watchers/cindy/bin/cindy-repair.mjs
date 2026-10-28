@@ -3,6 +3,7 @@
 // It deliberately has no session-runtime integration: the watcher is the
 // source of the session binding and Cindy is responsible for the session.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -224,6 +225,109 @@ function ghJson(args, ghFn = command) {
 
 function gitOutput(args, gitFn = command) { return String(gitFn(GIT, args)); }
 
+const PRESERVED_REF_ROOT = 'refs/vigil/preserved/';
+const ZERO_SHA = '0'.repeat(40);
+
+export function preservedRefFor(dispatchId) {
+  if (typeof dispatchId !== 'string' || !/^[A-Za-z0-9._:-]+$/.test(dispatchId)) fail('task.dispatchId is invalid');
+  return PRESERVED_REF_ROOT + dispatchId.replace(/:/g, '%3A').replace(/\./g, '%2E');
+}
+
+function isAncestor(worktree, older, newer, gitFn) {
+  try { gitOutput(['-C', worktree, 'merge-base', '--is-ancestor', older, newer], gitFn); return true; }
+  catch { return false; }
+}
+
+function preservationEnv(now) {
+  return {
+    GIT_AUTHOR_NAME: 'Vigil Preservation', GIT_AUTHOR_EMAIL: 'vigil@localhost',
+    GIT_COMMITTER_NAME: 'Vigil Preservation', GIT_COMMITTER_EMAIL: 'vigil@localhost',
+    GIT_AUTHOR_DATE: now, GIT_COMMITTER_DATE: now,
+  };
+}
+
+function snapshotCommit({ worktree, tree, parents, message, gitFn, env }) {
+  const unique = [...new Set(parents.filter(Boolean))];
+  const args = ['-C', worktree, '-c', 'commit.gpgsign=false', 'commit-tree', tree,
+    ...unique.flatMap((parent) => ['-p', parent]), '-m', message];
+  return gitOutput(args, gitFn, { env }).trim();
+}
+
+function preservedMessage(task, originalHead, reasons, now) {
+  return [
+    `vigil: preserve watch worktree for ${task.dispatchId}`,
+    '',
+    `Original-Head: ${originalHead}`,
+    `Target-Head: ${task.headRefOid ?? ''}`,
+    `Reasons: ${reasons.join(', ')}`,
+    `Preserved-At: ${now}`,
+    '',
+    'Local preservation only; the watcher never pushes it.',
+  ].join('\n');
+}
+
+// Snapshot every Git-visible part of a drifted watch clone into a local ref before any reset.
+// Cindy clones are removed on cleanup, so the ref and its objects are also copied into the
+// configured plugin repository, which survives the clone.
+export function preserveWatchCheckout({ task, worktree, originalHead, remoteHead, gitFn = command, env = process.env, now = new Date().toISOString() }) {
+  if (!isSha(originalHead) || !isSha(remoteHead)) fail('preserve requires valid original and target HEAD');
+  const status = gitOutput(['-C', worktree, 'status', '--porcelain'], gitFn).trim();
+  const reasons = [];
+  if (originalHead !== remoteHead) reasons.push('head-mismatch');
+  if (status) reasons.push('dirty');
+  if (!reasons.length) return null;
+  if (gitOutput(['-C', worktree, 'ls-files', '-u'], gitFn).trim()) fail('worktree has unmerged index entries; refusing to preserve it');
+  const backupRepo = pluginRepoPath(env);
+  const backupRef = preservedRefFor(task.dispatchId);
+  let previousBackupHead = null;
+  try { gitOutput(['-C', worktree, 'fetch', '--no-tags', backupRepo, `+${backupRef}:${backupRef}`], gitFn); } catch { previousBackupHead = null; }
+  try { previousBackupHead = gitOutput(['-C', worktree, 'rev-parse', '--verify', '--quiet', backupRef], gitFn).trim(); } catch { previousBackupHead = null; }
+  if (!isSha(previousBackupHead)) previousBackupHead = null;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vigil-preserve-'));
+  const tempIndex = path.join(tempDir, 'index');
+  const indexEnv = { ...env, ...preservationEnv(now), GIT_INDEX_FILE: tempIndex };
+  try {
+    const indexPath = gitOutput(['-C', worktree, 'rev-parse', '--git-path', 'index'], gitFn).trim();
+    const realIndex = path.isAbsolute(indexPath) ? indexPath : path.resolve(worktree, indexPath);
+    if (fs.existsSync(realIndex)) fs.copyFileSync(realIndex, tempIndex);
+    else gitOutput(['-C', worktree, 'read-tree', originalHead], gitFn, { env: indexEnv });
+    let staged = false;
+    try { gitOutput(['-C', worktree, 'diff', '--cached', '--quiet'], gitFn); } catch { staged = true; }
+    let base = originalHead;
+    if (staged) {
+      const tree = gitOutput(['-C', worktree, 'write-tree'], gitFn, { env: indexEnv }).trim();
+      base = snapshotCommit({ worktree, tree, parents: [originalHead], gitFn, env: indexEnv,
+        message: preservedMessage(task, originalHead, [...reasons, 'staged'], now) });
+    }
+    if (status) {
+      gitOutput(['-C', worktree, 'add', '-A', '--', '.'], gitFn, { env: indexEnv });
+      const tree = gitOutput(['-C', worktree, 'write-tree'], gitFn, { env: indexEnv }).trim();
+      base = snapshotCommit({ worktree, tree, parents: [base], gitFn, env: indexEnv,
+        message: preservedMessage(task, originalHead, reasons, now) });
+    }
+    let backupHead = base;
+    if (previousBackupHead && previousBackupHead !== base) {
+      if (isAncestor(worktree, base, previousBackupHead, gitFn)) backupHead = previousBackupHead;
+      else {
+        const tree = gitOutput(['-C', worktree, 'rev-parse', `${base}^{tree}`], gitFn).trim();
+        backupHead = snapshotCommit({ worktree, tree, parents: [base, previousBackupHead], gitFn, env: indexEnv,
+          message: preservedMessage(task, originalHead, [...reasons, 'append'], now) });
+      }
+    }
+    gitOutput(['-C', worktree, 'update-ref', backupRef, backupHead, previousBackupHead ?? ZERO_SHA], gitFn);
+    if (gitOutput(['-C', worktree, 'rev-parse', backupRef], gitFn).trim() !== backupHead) fail('preserved ref verification failed');
+    // Copy the objects and ref into the configured plugin repository before any reset, so deleting
+    // the watch clone later cannot take the only copy of the preserved work with it.
+    gitOutput(['-C', backupRepo, 'fetch', '--no-tags', worktree, `+${backupRef}:${backupRef}`], gitFn);
+    if (gitOutput(['-C', backupRepo, 'rev-parse', backupRef], gitFn).trim() !== backupHead) fail('canonical preserved ref verification failed');
+    gitOutput(['-C', backupRepo, 'cat-file', '-e', `${backupHead}^{commit}`], gitFn);
+    return { dispatchId: task.dispatchId, backupRef, originalHead, backupHead,
+      backupRepo, hadUncommitted: Boolean(status), reasons, previousBackupHead };
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
 function refuseDeployLock(home) {
   if (lockStatus(home, DEPLOY_LOCK_NAME).live) fail('deploy lock held');
 }
@@ -292,7 +396,7 @@ function boundSession(paths, task) {
   if (entry.activeTask?.blockedKind === AUTHOR_RECLAIMED && entry.activeTask.dispatchId === task.dispatchId) {
     fail('task superseded: the author reclaimed this PR (Ready -> Draft); wait for the next watcher dispatch');
   }
-  return { sessionId: entry.sessionId };
+  return { sessionId: entry.sessionId, entry };
 }
 
 function ghPr(task, ghFn, requireHead = true) {
@@ -361,7 +465,7 @@ export function assertUpstreamFetchOnly(worktree, gitFn) {
   }
 }
 
-function assertWorktree(worktree, task, gitFn, expectedUrl = remoteUrl(task.headRepo || task.repo)) {
+function assertWorktree(worktree, task, gitFn, expectedUrl = remoteUrl(task.headRepo || task.repo), { allowDirty = false } = {}) {
   if (!fs.existsSync(worktree)) return false;
   if (!fs.statSync(worktree).isDirectory()) fail('worktree path exists but is not a directory');
   const top = gitOutput(['-C', worktree, 'rev-parse', '--show-toplevel'], gitFn);
@@ -377,13 +481,13 @@ function assertWorktree(worktree, task, gitFn, expectedUrl = remoteUrl(task.head
   const tracking = gitOutput(['-C', worktree, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], gitFn);
   if (tracking !== `origin/${task.headRefName}`) fail(`worktree upstream mismatch: ${tracking}`);
   const status = gitOutput(['-C', worktree, 'status', '--porcelain'], gitFn);
-  if (status) fail('worktree is dirty');
+  if (status && !allowDirty) fail('worktree is dirty');
   const head = gitOutput(['-C', worktree, 'rev-parse', 'HEAD'], gitFn);
   if (!isSha(head)) fail('worktree HEAD is invalid');
   return { head };
 }
 
-export function cloneWorktree(paths, task, gitFn, cloneUrl, expectedUrl, remoteHead = task.headRefOid, env = process.env) {
+export function cloneWorktree(paths, task, gitFn, cloneUrl, expectedUrl, remoteHead = task.headRefOid, env = process.env, { allowDirty = false } = {}) {
   const plugin = pluginRepoPath(env);
   const worktree = watchWorktreePath(plugin, task.number);
   const branch = watchBranchName(task.number);
@@ -391,8 +495,8 @@ export function cloneWorktree(paths, task, gitFn, cloneUrl, expectedUrl, remoteH
   const originUrl = cloneUrl ?? githubRepoUrl(headRepo);
   const expectUrl = expectedUrl ?? originUrl;
   if (isBaseGithubUrl(originUrl) || headRepo === REPO) fail(`refusing to clone base repo ${REPO} as origin`);
-  const existing = assertWorktree(worktree, task, gitFn, expectUrl);
-  if (existing) return { worktree, head: existing.head, created: false };
+  const existing = assertWorktree(worktree, task, gitFn, expectUrl, { allowDirty });
+  if (existing) return { worktree, head: existing.head, created: false, dirty: existing.dirty };
   fs.mkdirSync(path.dirname(worktree), { recursive: true, mode: 0o700 });
   if (fs.existsSync(worktree)) fail('worktree path is unknown; refusing to remove it');
   // --reference-if-able reuses the local repo's objects (both remotes are already
@@ -541,24 +645,23 @@ export function ciErrorExcerpts(task, ghFn = command) {
   });
 }
 
-// An existing watch tree behind the fork is fast-forwarded; one that diverged from it (an earlier round's commits
-// that were never pushed, while the author pushed their own) is bundled into _backup and rebuilt from the fork.
-// Local commits on top of the fork head are this round's unpushed work and stay. Before this, 2026-10-15 #6077
-// blocked twice on "worktree HEAD does not match validated-head" with no way to recover.
-export function alignWatchWorktree({ task, checkout, remoteHead, gitFn = command, now = new Date().toISOString(), env = process.env }) {
-  if (checkout.created || checkout.head === remoteHead) return { ...checkout, realigned: null };
+// Any drift from the fork head is preserved into a ref first, then the watch clone is reset to the
+// PR head. Local commits, staged content and dirty files stay recoverable from the backup ref.
+export function alignWatchWorktree({ task, checkout, remoteHead, gitFn = command, env = process.env, now = new Date().toISOString() }) {
+  if (checkout.created) return { ...checkout, preservation: null, realigned: null };
   const worktree = checkout.worktree;
+  const status = gitOutput(['-C', worktree, 'status', '--porcelain'], gitFn).trim();
+  if (checkout.head === remoteHead && !status) return { ...checkout, preservation: null, realigned: null };
   gitOutput(['-C', worktree, 'fetch', '--quiet', 'origin', task.headRefName], gitFn);
-  const isAncestor = (older, newer) => {
-    try { gitOutput(['-C', worktree, 'merge-base', '--is-ancestor', older, newer], gitFn); return true; } catch { return false; }
-  };
-  if (isAncestor(remoteHead, checkout.head)) return { ...checkout, realigned: null };
-  const backup = isAncestor(checkout.head, remoteHead) ? null
-    : backupWatchBranch({ plugin: pluginRepoPath(env), number: task.number, branch: watchBranchName(task.number), gitFn, now, worktree });
+  const fetched = gitOutput(['-C', worktree, 'rev-parse', `origin/${task.headRefName}`], gitFn).trim();
+  if (fetched !== remoteHead) fail(`fetched head ${fetched} does not match observed PR head ${remoteHead}`);
+  const preservation = preserveWatchCheckout({ task, worktree, originalHead: checkout.head, remoteHead, gitFn, env, now });
+  if (preservation?.hadUncommitted) gitOutput(['-C', worktree, 'reset', '--hard', preservation.backupHead], gitFn);
   gitOutput(['-C', worktree, 'reset', '--hard', remoteHead], gitFn);
-  const head = gitOutput(['-C', worktree, 'rev-parse', 'HEAD'], gitFn);
+  const head = gitOutput(['-C', worktree, 'rev-parse', 'HEAD'], gitFn).trim();
   if (head !== remoteHead) fail('watch tree realign did not reach the fork head');
-  return { ...checkout, head, realigned: { from: checkout.head, to: head, backup: backup?.bundlePath ?? null } };
+  return { ...checkout, head, preservation,
+    realigned: { from: checkout.head, to: head, backup: null, backupRef: preservation?.backupRef ?? null } };
 }
 
 export function prepare({ home, taskPath, ghFn = command, gitFn = command, cloneUrl, originUrl, viewer, keelRoot = keelLedgerRoot() } = {}) {
@@ -582,12 +685,16 @@ export function prepare({ home, taskPath, ghFn = command, gitFn = command, clone
   const forkUrl = originUrl ?? cloneUrl ?? githubRepoUrl(headRepo);
   if (isBaseGithubUrl(forkUrl) || headRepo === REPO) fail(`refusing origin=${REPO}; push only to the PR fork`);
   const pr = ghPr(task, ghFn, false);
-  const checkout = alignWatchWorktree({ task, checkout: cloneWorktree(paths, task, gitFn, forkUrl, forkUrl, pr.headRefOid), remoteHead: pr.headRefOid, gitFn });
-  const repairPolicy = assertTaskRepairScope(task, checkout.head);
-  const needsSync = checkout.head !== pr.headRefOid || task.headRefOid !== pr.headRefOid;
+  const checkout = cloneWorktree(paths, task, gitFn, forkUrl, forkUrl, pr.headRefOid, process.env, { allowDirty: true });
+  const aligned = alignWatchWorktree({ task, checkout, remoteHead: pr.headRefOid, gitFn });
+  const strict = assertWorktree(aligned.worktree, { ...task, headRefOid: pr.headRefOid }, gitFn, forkUrl);
+  if (!strict || strict.head !== pr.headRefOid) fail('watch worktree was not aligned to the PR head');
+  const repairPolicy = assertTaskRepairScope(task, pr.headRefOid);
+  const needsSync = task.headRefOid !== pr.headRefOid;
   return { ...identity(task, sessionId), repairPolicy, status: needsSync ? 'needs-sync' : 'prepared', needsSync,
-    worktree: checkout.worktree, head: checkout.head, remoteHead: pr.headRefOid, sourceHead: task.headRefOid,
-    origin: forkUrl, headRepo, created: checkout.created, realigned: checkout.realigned, ciErrors: ciErrorExcerpts(task, ghFn) };
+    worktree: aligned.worktree, head: pr.headRefOid, remoteHead: pr.headRefOid, sourceHead: task.headRefOid,
+    origin: forkUrl, headRepo, created: checkout.created, preservation: aligned.preservation ?? null,
+    realigned: aligned.realigned, ciErrors: ciErrorExcerpts(task, ghFn) };
   });
 }
 
@@ -675,23 +782,27 @@ export function assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview
   const ruled = (workers ?? []).some((item) => item.purpose === 'adjudicate');
   const testDoc = testDocFeedbackKeys(task);
   const shas = new Map((task?.feedback ?? []).map((item) => [item?.key, item?.sha]));
+  const proofFor = (sc) => {
+    const fixedBy = sc.evidence.map((line) => line.trim()).find((line) => line.startsWith(ALREADY_FIXED))
+      ?.slice(ALREADY_FIXED.length).trim().split(/\s+/)[0] ?? '';
+    return (key) => /^[0-9a-f]{7,40}$/.test(fixedBy) && typeof fixedAfterReview === 'function' && fixedAfterReview(fixedBy, shas.get(key) ?? null);
+  };
   for (const sc of scs) {
     if (sc.status !== 'no-change') continue;
     const mustFix = (sc.feedbackKeys ?? []).filter((key) => testDoc.has(key) && permissions.get(key)?.canChangeCode === true);
     if (!mustFix.length) continue;
-    const fixedBy = sc.evidence.map((line) => line.trim()).find((line) => line.startsWith(ALREADY_FIXED))
-      ?.slice(ALREADY_FIXED.length).trim().split(/\s+/)[0] ?? '';
+    const proven = proofFor(sc);
     for (const key of mustFix) {
-      const proven = /^[0-9a-f]{7,40}$/.test(fixedBy) && typeof fixedAfterReview === 'function' && fixedAfterReview(fixedBy, shas.get(key) ?? null);
-      if (!proven) fail(`[TEST_DOC_MUST_FIX] ${sc.id} closes ${key} as no-change, but findings about tests, docs, the PR body or handoff files are fixed, not disputed or adjudicated; fix it, or add an evidence line "${ALREADY_FIXED} <commit>" naming the commit after the reviewed head that already fixed it`);
+      if (!proven(key)) fail(`[TEST_DOC_MUST_FIX] ${sc.id} closes ${key} as no-change, but findings about tests, docs, the PR body or handoff files are fixed, not disputed or adjudicated; fix it, or add an evidence line "${ALREADY_FIXED} <commit>" naming the commit after the reviewed head that already fixed it`);
     }
   }
   for (const sc of scs) {
     if (sc.status !== 'no-change') continue;
+    const proven = proofFor(sc);
     const disputed = (sc.feedbackKeys ?? []).filter((key) => {
       const item = permissions.get(key);
-      // test/doc findings were settled above (fix, or a proven already-fixed commit); they get no arbiter
-      return item?.canChangeCode === true && item.action === 'code-fix' && !testDoc.has(key);
+      // test/doc findings and code findings already fixed after the reviewed version get no arbiter
+      return item?.canChangeCode === true && item.action === 'code-fix' && !testDoc.has(key) && !proven(key);
     });
     if (!disputed.length || ruled) continue;
     if (sc.evidence.some((line) => line.trim().startsWith(ADJUDICATE_SKIPPED))) continue;
@@ -1082,17 +1193,53 @@ export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, o
   return { pushed: true };
 }
 
+
+// Finalize needs to see MERGED/CLOSED to close a finished task without pretending CI passed.
+// Ownership assertions for OPEN work stay unchanged.
+function readPrForFinalize(task, ghFn) {
+  const pr = ghJson(['pr', 'view', String(task.number), '--repo', task.repo, '--json', 'id,state,isDraft,headRefOid,headRefName,baseRefOid'], ghFn);
+  if (!pr || !['OPEN', 'MERGED', 'CLOSED'].includes(pr.state)) fail(`PR state is unavailable or unknown: ${String(pr?.state)}`);
+  if (pr.id !== task.nodeId) fail('gh PR identity does not match task');
+  if (pr.headRefName !== task.headRefName) fail(`PR branch mismatch: expected ${task.headRefName}`);
+  if (!isSha(pr.headRefOid)) fail('gh PR headRefOid is invalid');
+  return pr;
+}
+
 export function finalize({ home, taskPath, scReport, validatedHead, validationReceipt, keelRun, keelRoot = keelLedgerRoot(), ghFn = command, gitFn = command, env = process.env, originUrl } = {}) {
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
   recordActivity(paths, task, 'finalize');
-  const { sessionId } = boundSession(paths, task);
+  const { sessionId, entry } = boundSession(paths, task);
   if (!isSha(validatedHead)) fail('validated-head must be a 40-character SHA');
-  const pr = ghPr(task, ghFn, false);
-  const worktree = taskWorktree(task);
+  const observed = readPrForFinalize(task, ghFn);
   originUrl = originUrl ?? githubRepoUrl(resolveHeadRepo(task));
   if (isBaseGithubUrl(originUrl)) fail(`refusing to push to base repo ${REPO}`);
+  if (observed.state !== 'OPEN') {
+    if (entry.activeTask?.dispatchId !== task.dispatchId) fail('task dispatchId is not the active watcher dispatch');
+    const { scs, feedbackCoverage, workers } = loadScs(scReport, task);
+    if (validatedHead !== task.headRefOid) fail('terminal finalize requires validated-head to equal the dispatched head');
+    if (!scs.every((sc) => sc.status === 'no-change')) fail('[TERMINAL_NO_CHANGE_ONLY] a closed or merged PR only accepts all-no-change SCs');
+    const worktree = taskWorktree(task);
+    let checkoutState = 'missing-after-close';
+    if (fs.existsSync(worktree)) {
+      const checked = assertWorktree(worktree, { ...task, headRefOid: validatedHead }, gitFn, originUrl);
+      if (!checked || checked.head !== validatedHead) fail('worktree HEAD does not match validated-head');
+      checkoutState = 'verified-clean';
+    }
+    const verification = { status: 'not-required-no-change', head: validatedHead, localTests: 'not-run', reason: 'PR 已结束，本轮未修改' };
+    const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot, validatedHead, verification });
+    const workersField = workers ? { workers } : {};
+    return saveResult(paths, task, sessionId, {
+      status: 'complete', completionKind: 'pr-terminal-no-change', head: validatedHead, scs, feedbackCoverage, ...workersField, keel, verification,
+      terminalPr: { nodeId: task.nodeId, number: task.number, repo: task.repo, state: observed.state, head: observed.headRefOid,
+        checkedAt: new Date().toISOString(), checkout: checkoutState },
+      ci: { status: 'not-run', head: validatedHead, requiredGreen: false, reason: 'pr-terminal' },
+      checks: [], pushed: false, reason: observed.state === 'MERGED' ? 'pr-merged-no-change' : 'pr-closed-no-change',
+    });
+  }
+  const pr = ghPr(task, ghFn, false);
+  const worktree = taskWorktree(task);
   const checkout = assertWorktree(worktree, { ...task, headRefOid: validatedHead }, gitFn, originUrl);
   if (!checkout || checkout.head !== validatedHead) fail('worktree HEAD does not match validated-head');
   const branchHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
