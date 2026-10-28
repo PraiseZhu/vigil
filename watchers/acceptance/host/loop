@@ -1,7 +1,8 @@
 #!/bin/sh
 # 常驻调度循环（#47 SC12）：单实例，每拍跑一次 tick.mjs。
-# 第二个实例拿不到 flock 就退出 0，不跑 tick。
+# 第二个实例拿不到 flock 就退出 0，不跑 tick。拿不到锁那一行不留痕（本来就没跑起来）。
 # ACCEPTANCE_TICK_SECONDS 只给测试用（正式部署用默认 60）。
+# SIGKILL 杀不了 trap，那种退出留不了痕迹。
 set -u
 HOME_DIR="${ACCEPTANCE_WATCHER_HOME:?需要 ACCEPTANCE_WATCHER_HOME}"
 mkdir -p "$HOME_DIR/state/host"
@@ -11,7 +12,25 @@ flock -n 9 || { echo "loop 已在跑" >&2; exit 0; }
 rm -f "$HOME_DIR/state/host/planned-stop.json"
 # 锁只属于这个 shell：子进程一律关掉 fd 9（9>&-）。不然 tick 拉起的轮次、正在 sleep 的子进程
 # 会继承锁，loop 被停掉后它们还占着，ensure.sh 拉起的新循环拿不到锁、直接退出。
+#
+# dash 在等前台子进程时不处理 trap。tick 和 sleep 改成后台起再 wait $!，stop.sh 的 kill
+# 马上生效，EXIT trap 才能把退出原因写进 loop.log。
+exit_reason=""
+trap 'exit_reason="收到 TERM 信号"; exit 143' TERM
+trap 'exit_reason="收到 INT 信号"; exit 130' INT
+trap 'exit_reason="收到 HUP 信号"; exit 129' HUP
+trap '
+  code=$?
+  if [ -n "$exit_reason" ]; then
+    why="$exit_reason"
+  else
+    why="退出码 $code"
+  fi
+  printf "%s loop: 调度循环退出（pid %s，%s）\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$why" >> "$HOME_DIR/state/host/loop.log"
+' EXIT
 while :; do
-  node "$(dirname "$0")/tick.mjs" 9>&-
-  sleep "${ACCEPTANCE_TICK_SECONDS:-60}" 9>&-
+  node "$(dirname "$0")/tick.mjs" 9>&- &
+  wait $!
+  sleep "${ACCEPTANCE_TICK_SECONDS:-60}" 9>&- &
+  wait $!
 done
