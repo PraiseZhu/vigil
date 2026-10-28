@@ -98,6 +98,7 @@ function evidenceLines(result, key, status) {
     .flatMap((sc) => sc.evidence ?? []).filter((line) => typeof line === 'string' && line.trim());
 }
 function completeCodeFixThreads(result, task, { disposition, scStatus, kind }) {
+  if (result?.completionKind === 'pr-terminal-no-change') return [];
   if (result?.schemaVersion !== 2 || !['complete', 'waiting-ci'].includes(result.status) || result.dispatchId !== task?.dispatchId) return [];
   const policy = new Map((task.repairPolicy?.items ?? []).map((item) => [item.key, item]));
   const items = [];

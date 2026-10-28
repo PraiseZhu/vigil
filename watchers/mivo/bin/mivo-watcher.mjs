@@ -880,7 +880,7 @@ export function severityRule(standard = severityStandard()) {
 export const WORKER_RULE = [
   '审查与 e2e 用 Orca Worker（create_worker），不用原生子代理：原生子代理不能指定通道，达不到路由要求。模型现读 ~/.claude/skills/orca-fanout/routing.json：审查取 review 档、e2e 取 e2e 档；本会话是 codex，审查取 review.when_lead.codex ?? review（不取 when_lead.claude-code），带上 provider_id；主选报 NO_PROVIDER_FOR_AGENT / PROVIDER_ROUTE_UNAVAILABLE / BUDGET_MODEL_REQUIRES_API_MODE 才按该档 fallbacks 顺序降级。本条是盯梢修复轮对全局「native subagent 锁定 Luna、不得用 Orca worker」要求的例外。',
   '审查/e2e Worker 只读、只交报告：不改文件、不 commit/push、不回复或 resolve thread；修复与受控 push 仍由本会话完成。本条是 AUTO_ADVANCE_RULE 与派单后段「缺环境/外部服务故障 blocked」的局部例外，仅适用于本地审查/e2e Worker 的可用性。本机缺 routing.json 或开不了 Orca Worker 时不 blocked：没有 routing.json 就记录具体缺项并跳过本地审查/e2e，不猜模型、不写配置。路由可读且工具存在时，在本轮首次派本地审查/e2e Worker 前调用一次 start_team({worker_permission_mode:"bypassPermissions"}) 并核对返回模式仍是 bypassPermissions；已有可用 team 复用，无活动 team 就由这一次调用初始化。未提供工具、初始化失败/模式不符、或后续 Worker 仍不能创建时，不反复初始化，跳过尚未运行的本地审查/e2e。不要改用原生子代理。skip 写在受影响 SC.evidence 的第二条及以后，至少包括步骤 review/e2e、原因（missing-routing / no-tool / start-team-error / create-worker-error）、实际尝试与错误码、未运行事实和后续门禁；第一条仍写 thread 的人话问题结论。不要写出 token、个人路径或内部调度信息。workers 数组只记实际创建的 Worker，可以省略或为空，禁止伪造 skipped Worker。主会话的仓库预检、受影响测试、validate 收据、required CI、服务器审查要求不豁免。Worker 创建成功后发现的真实 P0/P1/P2 仍须处理。',
-  '各执一词裁决（测试、文档类意见不适用，按 TEST_DOC 规则直接修）：本会话核实后准备把审查机、Greptile 或仓库成员提的 P0/P1/P2（canChangeCode=true 的 code-fix 项）判为不成立、记 SC=no-change 时，不能自己定，必须先开一个只读裁决 Worker（purpose=adjudicate）。模型现读 ~/.claude/skills/orca-fanout/routing.json 的 adjudicate 档：本会话是 codex，取 adjudicate.when_lead.codex ?? adjudicate，带上 provider_id；条目带 agent_device_id 时原样传给 create_worker 的 agent_device_id（它指定裁决者跑在哪个远程网关，漏传会派到本机通路而开不出来）；主选报 NO_PROVIDER_FOR_AGENT / PROVIDER_ROUTE_UNAVAILABLE / BUDGET_MODEL_REQUIRES_API_MODE，或带 agent_device_id 的条目报 REMOTE_AGENT_DEVICE_UNREACHABLE / REMOTE_AGENT_SHARE_* 时，按该对象 fallbacks 顺序降级，每个备选同样原样带上它自己的 provider_id 与 agent_device_id。裁决材料由 helper 生成：运行同一 helper adjudication-brief --keys <争议的反馈 key，逗号分隔> --claim <你复现与反驳的证据>，把返回的 brief 原样交给裁决者（里面有意见原文、审查机问题 key、相关文件的改动、你的说法、本任务的统一分级全文和交回格式）；不得改写或删减 brief。裁决者只按 brief 里的统一分级判级（KEEL J4 等其他分级说法不算），亲自读代码或复现，不改文件、不 commit/push、不回复，交回 {"rulings":[{"feedbackKey","verdict":"valid|invalid|p3","reason"}]}；你把它原样记进该裁决 Worker 的 workers[].rulings。valid＝成立，必须修并记 SC=pass，helper 会拒绝把 valid 的项记成 no-change；invalid（不成立）或 p3（属实但只到 P3）才记 no-change，evidence 第一条仍写给评论人的人话结论并说明经裁决。审查账号的 P1/P2 判 invalid/p3 后，watcher 回帖会附一行裁决记录，审查机核对后采信放行，不再来回重审；P0 审查机不按裁决放行。同一轮多条争议可交给同一个裁决者一并判。统一分级读不到时，审查账号（source=mivo-review）的 P0/P1/P2 不开裁决，直接修。缺 adjudicate 档、没有 Orca 工具，或主选和全部备选都创建失败时，不 blocked、不改用原生子代理，也不换顾问顶替：在该 SC.evidence 加一条以 adjudicate-skipped: 开头的原因（missing-routing / no-tool / start-team-error / create-worker-error 与错误码），helper 会拒绝既没有裁决结论也没有这条说明的 no-change。审查账号的 P1/P2 走这条说明记 no-change 时，watcher 会把它转成 issue 跟进、登记到 PR 说明，审查机按问题 key 认这个 issue、不再阻断，由人在 issue 里确认；P0 不转。',
+  '各执一词裁决（测试、文档类意见不适用，按 TEST_DOC 规则直接修）：已被审查看的版本之后的提交修掉的意见除外：在该 SC.evidence 写一条 already-fixed: <提交 SHA>，helper 核实该提交在当前 HEAD 且不在审查看的版本（Mivo 取 finding marker 的 head，缺失时取反馈条目的 sha；Cindy 取反馈条目的 sha）后，不用开裁决；取不到审查看的版本仍按本条开裁决或写 adjudicate-skipped。本会话核实后准备把审查机、Greptile 或仓库成员提的 P0/P1/P2（canChangeCode=true 的 code-fix 项）判为不成立、记 SC=no-change 时，不能自己定，必须先开一个只读裁决 Worker（purpose=adjudicate）。模型现读 ~/.claude/skills/orca-fanout/routing.json 的 adjudicate 档：本会话是 codex，取 adjudicate.when_lead.codex ?? adjudicate，带上 provider_id；条目带 agent_device_id 时原样传给 create_worker 的 agent_device_id（它指定裁决者跑在哪个远程网关，漏传会派到本机通路而开不出来）；主选报 NO_PROVIDER_FOR_AGENT / PROVIDER_ROUTE_UNAVAILABLE / BUDGET_MODEL_REQUIRES_API_MODE，或带 agent_device_id 的条目报 REMOTE_AGENT_DEVICE_UNREACHABLE / REMOTE_AGENT_SHARE_* 时，按该对象 fallbacks 顺序降级，每个备选同样原样带上它自己的 provider_id 与 agent_device_id。裁决材料由 helper 生成：运行同一 helper adjudication-brief --keys <争议的反馈 key，逗号分隔> --claim <你复现与反驳的证据>，把返回的 brief 原样交给裁决者（里面有意见原文、审查机问题 key、相关文件的改动、你的说法、本任务的统一分级全文和交回格式）；不得改写或删减 brief。裁决者只按 brief 里的统一分级判级（KEEL J4 等其他分级说法不算），亲自读代码或复现，不改文件、不 commit/push、不回复，交回 {"rulings":[{"feedbackKey","verdict":"valid|invalid|p3","reason"}]}；你把它原样记进该裁决 Worker 的 workers[].rulings。valid＝成立，必须修并记 SC=pass，helper 会拒绝把 valid 的项记成 no-change；invalid（不成立）或 p3（属实但只到 P3）才记 no-change，evidence 第一条仍写给评论人的人话结论并说明经裁决。审查账号的 P1/P2 判 invalid/p3 后，watcher 回帖会附一行裁决记录，审查机核对后采信放行，不再来回重审；P0 审查机不按裁决放行。同一轮多条争议可交给同一个裁决者一并判。统一分级读不到时，审查账号（source=mivo-review）的 P0/P1/P2 不开裁决，直接修。缺 adjudicate 档、没有 Orca 工具，或主选和全部备选都创建失败时，不 blocked、不改用原生子代理，也不换顾问顶替：在该 SC.evidence 加一条以 adjudicate-skipped: 开头的原因（missing-routing / no-tool / start-team-error / create-worker-error 与错误码），helper 会拒绝既没有裁决结论也没有这条说明的 no-change。审查账号的 P1/P2 走这条说明记 no-change 时，watcher 会把它转成 issue 跟进、登记到 PR 说明，审查机按问题 key 认这个 issue、不再阻断，由人在 issue 里确认；P0 不转。',
   '卡住求助：同一问题验证两次仍失败、或判断拿不准且 Jev 低置信时，可开只读顾问 Worker 诊断并给修法（各执一词走上一条裁决，不走顾问）。首选 agent=codex model=gpt-6.1-sol effort=medium provider_id=art-cindy；首选报不可用才用 agent=codex model=grok-4.6 effort=high。顾问禁止 max/ultra 档，禁止改文件、push、回复。同一 PR 同一 head 最多 2 个顾问（首选与备选合计）；用完仍卡住按 blocked 收口。',
   '每个 Worker 交回结论后立即 archive_worker。SC JSON 里用 workers:[{purpose:"review"|"e2e"|"consult"|"adjudicate",agent,model,effort,providerId,workerId,verdict}] 记下本轮开过的每个 Worker，adjudicate 另带 rulings；helper 会拒绝超过 2 个顾问或顾问用 max/ultra 的报告。',
 ].join('');
@@ -1008,10 +1008,33 @@ export function watchSuccessorMessage({ prNumber, predecessorId, reason, summary
 export function watchDispatchConflictMessage({ prNumber, bindSession, receiptSession, dispatchId }) {
   return `PR #${prNumber} 回执冲突：合法 owner 是 ${bindSession}，但 dispatch ${dispatchId ?? ''} 的回执指向 ${receiptSession}。请核实 ${receiptSession} 是否也在处理同一 PR，如是请人工归档多余 session。`;
 }
-function* notifyDispatchConflictOnce({ previous, key, paths, now, dryRun, dispatchFn, remaining, pr }) {
+// A dispatch must be based on a fresh OPEN read, not on the round's listing. A closed or merged
+// PR stops here; transport and identity problems also fail closed.
+export function* readDispatchGate({ pr, ghFn }) {
+  let raw;
+  try { raw = yield () => ghFn(['pr', 'view', String(pr.number), '--repo', REPO, '--json', 'id,state']); }
+  catch (error) { return { ok: false, reason: 'pr-state-unavailable-before-dispatch', error: String(error?.message ?? error).slice(0, 400) }; }
+  let view;
+  try { view = JSON.parse(String(raw)); }
+  catch { return { ok: false, reason: 'pr-state-unavailable-before-dispatch', error: 'gh returned invalid JSON' }; }
+  if (!view || typeof view.id !== 'string' || (pr.id && view.id !== pr.id)) {
+    return { ok: false, reason: 'pr-state-unavailable-before-dispatch', error: 'PR identity mismatch' };
+  }
+  if (view.state === 'OPEN') return { ok: true, state: 'OPEN' };
+  if (view.state === 'MERGED' || view.state === 'CLOSED') return { ok: false, reason: 'pr-not-open-before-dispatch', state: view.state };
+  return { ok: false, reason: 'pr-state-unavailable-before-dispatch', error: 'unknown PR state: ' + String(view.state) };
+}
+
+function* notifyDispatchConflictOnce({ previous, key, paths, now, dryRun, dispatchFn, remaining, pr, ghFn }) {
   const conflict = previous?.dispatchConflict;
   if (dryRun || !conflict || conflict.notifiedAt || !previous.sessionId || typeof dispatchFn !== 'function') {
     return previous;
+  }
+  const gate = yield* readDispatchGate({ pr: { number: pr.number, id: pr.id ?? previous.nodeId }, ghFn });
+  if (!gate.ok) {
+    const next = { ...previous, lastDispatchGuard: { at: now, reason: gate.reason, state: gate.state ?? null, error: gate.error ?? null } };
+    writePr(paths.home, key, next);
+    return next;
   }
   try {
     yield () => dispatchFn({
@@ -1162,7 +1185,7 @@ export function repeatFindingsFor({ paths, pr, fresh }) {
 
 function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix = '', collected = null }) {
   const repeatFindings = repeatFindingsFor({ paths, pr, fresh });
-  const dispatchId = `${dryRun ? 'dry' : 'live'}-${pr.number}-${now}`;
+  const dispatchId = `${dryRun ? 'dry' : 'live'}-${pr.number}-${now.replace(/[:.]/g, '-')}`;
   const taskPath = path.join(paths.stateDir, 'tasks', `${dispatchId}.json`);
   const prSnapshot = compactPrSnapshot(collected, now);
   const pending = { dispatchId, params: dispatchParams({ pr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, prIntent: prSnapshot?.prIntent, handledFindings: collected?.handledFindings ?? [], repeatFindings }), at: now, taskPath };
@@ -1291,6 +1314,9 @@ export function* superviseExcludedThreads({ pr, view, paths, now, ghFn, dryRun, 
   const recent = current.at && Date.parse(now) - Date.parse(current.at) < EXCLUDED_THREAD_RETRY_MS;
   if (sameBatch && recent) return { state: current, dispatched: false, open: open.length, reason: 'in-flight' };
   if (dryRun) return { state: current, dispatched: false, open: open.length, reason: 'dry-run' };
+  const gate = yield* readDispatchGate({ pr, ghFn });
+  if (!gate.ok) return { state: { ...current, dispatchGuard: { at: now, reason: gate.reason, state: gate.state ?? null } },
+    dispatched: false, open: open.length, reason: gate.reason };
   retireUnknown(); // a day has passed: the unaddressable session is long done, hand it over before opening another
   let worktree = null;
   try { worktree = watchWorktreePath(pluginRepoPath(), pr.number); } catch { worktree = null; }
@@ -1504,6 +1530,7 @@ function rememberPendingClose(previous, paths) {
   if (previous.activeTask?.status !== 'waiting-ci') return previous;
   try {
     const result = resultFor(previous, paths);
+    if (isTerminalNoChangeResult(result)) return previous;
     const task = readActiveTask(previous, paths);
     const items = [...fixedThreads(result, task), ...refutedThreads(result, task)]
       .map((item) => ({ ...item, dispatchId: result.dispatchId, head: result.head }));
@@ -1524,7 +1551,7 @@ function handledFindingsFrom(paths, previous) {
   try { names = fs.readdirSync(path.join(paths.stateDir, 'results')); } catch { return items; }
   for (const name of names.filter((item) => item.endsWith('.json')).sort()) {
     const result = readJsonOrNull(path.join(paths.stateDir, 'results', name));
-    if (!result || result.nodeId !== previous.nodeId) continue;
+    if (!result || result.nodeId !== previous.nodeId || isTerminalNoChangeResult(result)) continue;
     const task = result.dispatchId ? readDispatchTask(paths, result.dispatchId) : {};
     const filesByKey = new Map();
     for (const item of task.feedback ?? []) if (item?.key && item.path) filesByKey.set(item.key, item.path);
@@ -1601,9 +1628,35 @@ export function scanRecheckDue(previous, now) {
   if (!previous.scanCheckedAt) return true;
   return Date.parse(now) - Date.parse(previous.scanCheckedAt) >= CI_UNKNOWN_RECHECK_MS;
 }
+// A PR that was merged or closed while a no-change round was finishing is still a finished task.
+// This predicate is deliberately strict: only a locally written, identity-bound, all-no-change
+// receipt can skip the normal current-head CI gate.
+export function isTerminalNoChangeResult(result) {
+  if (result?.schemaVersion !== 2 || result?.kind !== 'mivo-repair-result' || result?.status !== 'complete'
+    || result?.completionKind !== 'pr-terminal-no-change') return false;
+  const terminal = result.terminalPr;
+  const sha = (value) => typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value);
+  if (!terminal || !['MERGED', 'CLOSED'].includes(terminal.state) || terminal.nodeId !== result.nodeId
+    || terminal.number !== result.number || terminal.repo !== result.repo || result.repo !== REPO) return false;
+  if (!sha(result.head) || !sha(result.sourceHead) || !sha(result.verification?.head)) return false;
+  if (result.head !== result.sourceHead || result.head !== result.verification.head || !sha(terminal.head)) return false;
+  if (terminal.head !== result.head) return false;
+  if (!Number.isFinite(Date.parse(terminal.checkedAt ?? ''))) return false;
+  if (!['verified-clean', 'missing-after-close'].includes(terminal.checkout)) return false;
+  if (!Array.isArray(result.scs) || result.scs.length === 0 || result.scs.some((sc) => sc?.status !== 'no-change')) return false;
+  if (result.feedbackCoverage?.complete !== true) return false;
+  if (result.pushed !== false || result.prReady !== false) return false;
+  if (result.verification.status !== 'not-required-no-change' || result.verification.localTests !== 'not-run'
+    || typeof result.verification.reason !== 'string' || !result.verification.reason.trim()) return false;
+  if (result.ci?.status !== 'not-run' || result.ci.requiredGreen !== false || result.ci.head !== result.head) return false;
+  if (result.reason !== (terminal.state === 'MERGED' ? 'pr-merged-no-change' : 'pr-closed-no-change')) return false;
+  return true;
+}
+
 // Coverage ledger: what a finished round (complete / waiting-ci) judged for each feedback key, stamped with the
 // cursor stamp it was delivered under. A Draft -> Ready round keeps cursor keys that the ledger still vouches for.
 function ledgerAfterResult(previous, result, status) {
+  if (isTerminalNoChangeResult(result)) return previous.feedbackLedger;
   const dispositions = result?.feedbackCoverage?.dispositions;
   if (!['complete', 'waiting-ci'].includes(status) || !Array.isArray(dispositions)) return previous.feedbackLedger;
   const ledger = { ...(previous.feedbackLedger ?? {}) };
@@ -1630,7 +1683,11 @@ export function consumeResult(previous, result, now) {
   const verified = result.schemaVersion === 2;
   const status = result.status === 'prepared' ? 'running'
     : result.status === 'complete' && !verified ? 'legacy-complete' : result.status;
-  if (status === 'complete' && verified && (
+  const terminalNoChange = verified && isTerminalNoChangeResult(result);
+  if (verified && result.completionKind === 'pr-terminal-no-change' && !terminalNoChange) {
+    throw new Error('terminal completion receipt is invalid');
+  }
+  if (status === 'complete' && verified && !terminalNoChange && (
     result.ci?.requiredGreen !== true || result.ci?.head !== result.head
     || !['passed', 'pass', 'approved-exception', 'baseline-only-failure', 'not-required-no-change'].includes(result.verification?.status)
   )) throw new Error('complete result lacks current-head CI and validation evidence');
@@ -1643,6 +1700,7 @@ export function consumeResult(previous, result, now) {
       status, reason: result.reason ?? null, blockedKind: result.blockedKind ?? null,
       ...(result.validationBlock ? { validationBlock: { ...result.validationBlock, remoteHead: previous.headRefOid ?? null, baseRefOid: previous.baseRefOid ?? null } } : {}),
       evidenceVersion: verified ? 2 : 1,
+      ...(terminalNoChange ? { completionKind: result.completionKind, terminalPr: result.terminalPr, mergeReady: false } : {}),
       receiptId: result.receiptId ?? digest(result),
       observedAt: result.observedAt ?? now,
     },
@@ -2542,6 +2600,19 @@ export function* processPr({
   }
   // Revived keys stay out of the cursor until a delivery is acknowledged, so a skipped delivery repeats next scan.
   for (const key of revivedKeys) delete retainedCursor[key];
+  const wantsDeliveryBeforeGate = shouldDispatch || recovery || previous.pendingDispatch?.status === 'retryable';
+  if (!dryRun && wantsDeliveryBeforeGate) {
+    const observedState = collected?.pr?.state;
+    const gate = observedState && observedState !== 'OPEN'
+      ? { ok: false, reason: 'pr-not-open-before-dispatch', state: observedState }
+      : observedState === 'OPEN' ? { ok: true, state: 'OPEN' } : yield* readDispatchGate({ pr, ghFn });
+    if (!gate.ok) {
+      state.prs[key] = { ...previous, lastDispatchGuard: { at: now, reason: gate.reason, state: gate.state ?? null, error: gate.error ?? null } };
+      persistState(state, paths);
+      report.push({ number: pr.number, dispatch: { attempted: false, bound: false, reason: gate.reason, state: gate.state ?? null } });
+      return;
+    }
+  }
   previous = {
     ...previous, feedbackCursor: retainedCursor, pendingFeedback: fresh.length,
     sessionId: mapping.sessionId ?? previous.sessionId ?? null,
@@ -2604,7 +2675,7 @@ export function* processPr({
       const bound = applyDispatchReceipt({ state, pr, mapping,
         receipt: { ...receipt, dispatch_id: receipt?.dispatch_id ?? pending.dispatchId },
         now, cursor: pending.cursor ?? retainedCursor, collected, fresh: [], paths, recovery: pending.recovery === true });
-      previous = yield* notifyDispatchConflictOnce({ previous: state.prs[key], key, paths, now, dryRun, dispatchFn, remaining, pr });
+      previous = yield* notifyDispatchConflictOnce({ previous: state.prs[key], key, paths, now, dryRun, dispatchFn, remaining, pr, ghFn });
       state.prs[key] = previous;
       dispatch = { attempted: true, ...bound, reason: 'confirmed-nondelivery-retry' };
     } catch (error) {
@@ -2641,7 +2712,7 @@ export function* processPr({
       const bound = applyDispatchReceipt({ state, pr, mapping,
         receipt: { ...receipt, dispatch_id: receipt?.dispatch_id ?? pending.dispatchId },
         now, cursor: retainedCursor, collected, fresh: [], paths, recovery: true });
-      previous = yield* notifyDispatchConflictOnce({ previous: state.prs[key], key, paths, now, dryRun, dispatchFn, remaining, pr });
+      previous = yield* notifyDispatchConflictOnce({ previous: state.prs[key], key, paths, now, dryRun, dispatchFn, remaining, pr, ghFn });
       state.prs[key] = previous;
       dispatch = { attempted: true, ...bound, reason: 'missing-result-recovery' };
     } catch (error) {
@@ -2688,7 +2759,7 @@ export function* processPr({
         const bound = applyDispatchReceipt({ state, pr, mapping: dispatchMapping,
           receipt: { ...receipt, dispatch_id: receipt?.dispatch_id ?? pending.dispatchId },
           now, cursor, collected, fresh, paths });
-        previous = yield* notifyDispatchConflictOnce({ previous: state.prs[key], key, paths, now, dryRun, dispatchFn, remaining, pr });
+        previous = yield* notifyDispatchConflictOnce({ previous: state.prs[key], key, paths, now, dryRun, dispatchFn, remaining, pr, ghFn });
         const handedBack = orphans.filter((item) => bound.bound === true && fresh.some((row) => row.key === item.key));
         if (handedBack.length) {
           previous = { ...previous, orphanRedelivery: { ...(previous.orphanRedelivery ?? {}),
@@ -2929,7 +3000,7 @@ export function* pollWorkflow({
     return { mode: 'poll', dispatch: false, prs: [{ number, nodeId, needsHuman: previous.needsHuman, dispatch: { attempted: false, reason: 'needs-human' } }] };
   }
   previous = yield* notifyDispatchConflictOnce({
-    previous, key: nodeId, paths, now, dryRun, dispatchFn, remaining, pr: { number },
+    previous, key: nodeId, paths, now, dryRun, dispatchFn, remaining, pr: { number }, ghFn,
   });
   if (canSkipCollection({ previous, fingerprint, normalized, paths, now })) {
     // A pushed HEAD is still waiting for its in-flight result. GitHub itself has
@@ -2989,6 +3060,15 @@ function* deliverClosedown({
     writePr(paths.home, nodeId, next);
     return next;
   };
+  // A finalize receipt written just after the PR closed must still be consumed; closedHandled is not
+  // a reason to ignore a valid local result. Only the strict terminal predicate qualifies.
+  try {
+    const late = resultFor(previous, paths);
+    if (late && (late.receiptId ?? digest(late)) !== previous.activeTask?.receiptId && isTerminalNoChangeResult(late)) {
+      previous = save(consumeResult(previous, late, now));
+      retireSession(paths, { sessionId: previous.sessionId, nodeId, number: prNumber, dispatchId: previous.activeTask?.dispatchId, at: now });
+    }
+  } catch { /* an unreadable result is handled by the normal path */ }
   // Cleanup is deterministic, so the script does it instead of waking the
   // repair session. Only a merged PR's watch worktree is removed, and only when
   // it is safe (autoCleanupWatch); anything else is recorded for a human.
@@ -3019,7 +3099,7 @@ const RULES_REFRESH_ATTEMPTS = 3;
 // A bound session with no task running whose last delivery carried older rules gets the current rules once.
 // It is not a task: it neither touches the feedback cursor nor counts as a repair round. A PR that is
 // merge-ready, or whose feedback is waiting for delivery (which carries the current rules), is left alone.
-function* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn, remaining, unlockForDispatch, relockForDispatch }) {
+function* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn, remaining, unlockForDispatch, relockForDispatch, ghFn }) {
   const version = rulesVersion();
   const entry = readPr(paths.home, key);
   if (dryRun || typeof dispatchFn !== 'function' || !entry?.sessionId || entry.retiredSession?.sessionId === entry.sessionId) return null;
@@ -3038,6 +3118,11 @@ function* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn, remai
     || TASK_IN_FLIGHT.has(entry.activeTask?.status) || entry.activeTask?.blockedKind === AUTHOR_RECLAIMED) return null;
   const attempts = entry.rulesRefresh?.version === version ? Number(entry.rulesRefresh.attempts ?? 0) : 0;
   if (attempts >= RULES_REFRESH_ATTEMPTS || remaining() < 15000) return null;
+  const gate = yield* readDispatchGate({ pr: { number: entry.number, id: entry.nodeId }, ghFn });
+  if (!gate.ok) {
+    writePr(paths.home, key, { ...entry, lastDispatchGuard: { at: now, reason: gate.reason, state: gate.state ?? null, error: gate.error ?? null } });
+    return 'guard-skip:' + gate.reason;
+  }
   const params = { title: entry.title || repairSessionTitle({ task: entry.taskName ?? 'PR', prNumber: entry.number, createdAt: now }),
     message: rulesRefreshMessage(version), target_session_id: entry.sessionId };
   let outcome;
@@ -3119,7 +3204,7 @@ function* discoverOnePr(pr, ctx) {
     writePr(paths.home, key, previous);
   }
   previous = yield* notifyDispatchConflictOnce({
-    previous, key, paths, now, dryRun, dispatchFn, remaining, pr,
+    previous, key, paths, now, dryRun, dispatchFn, remaining, pr, ghFn,
   });
   if (previous.needsHuman) {
     // The resident discover loop stops here, so this is where the person has to hear about it.
@@ -3175,7 +3260,7 @@ function* discoverOnePr(pr, ctx) {
       });
       report.push(inner[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: true, reason: 'successor' }, predecessors: previous.predecessors });
     } else {
-      const refreshed = yield* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn,
+      const refreshed = yield* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn, ghFn,
         remaining: () => Math.max(0, deadline - clock()), unlockForDispatch, relockForDispatch });
       report.push(refreshed ? { ...item, rulesRefresh: refreshed } : item);
     }
@@ -3202,6 +3287,13 @@ function* discoverOnePr(pr, ctx) {
           if (current) writePr(paths.home, key, supersedeOnRedraft(previous, now));
           report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false,
             reason: current ? 'recovery-handoff-invalid' : 'ownership-query-unavailable' } });
+          return done();
+        }
+        const gate = yield* readDispatchGate({ pr: { number: pr.number, id: key }, ghFn });
+        if (!gate.ok) {
+          previous = { ...previous, lastDispatchGuard: { at: now, reason: gate.reason, state: gate.state ?? null, error: gate.error ?? null } };
+          writePr(paths.home, key, previous);
+          report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: gate.reason, state: gate.state ?? null } });
           return done();
         }
         const retryParams = constrainRetryDispatch({

@@ -685,7 +685,7 @@ for (const withTask of [true,false,'legacy']) test(`discover claim-retry require
     params:{title:'t',message:'schedule-prefix\nOWNER_STANDING_AUTH: PR_PUSH_AND_REPLY',target_session_id:'s1'},
   }});
   let sent;const out=scanOnce({mode:'discover',enabled:true,allowDispatch:true,paths,now:'2026-09-10T01:00:00Z',
-    ghFn:args=>args[0]==='api'&&args[1]==='user'?'owner':args[0]==='pr'&&args[1]==='list'?JSON.stringify([{id:'PR_1',number:1,headRefOid:HEAD,isDraft:false,labels:[]}]):'[]',
+    ghFn:args=>args[0]==='api'&&args[1]==='user'?'owner':args[0]==='pr'&&args[1]==='view'?JSON.stringify({id:'PR_1',state:'OPEN'}):args[0]==='pr'&&args[1]==='list'?JSON.stringify([{id:'PR_1',number:1,headRefOid:HEAD,isDraft:false,labels:[]}]):'[]',
     ownershipSnapshot:function*(){return {pr:currentPr};},
     collect:()=>{throw Error('must not collect');},dispatchFn:p=>{sent=p;return {target_session_id:'s1',dispatch_id:id};},
   });

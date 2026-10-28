@@ -44,6 +44,7 @@ function discover(t, paths, dispatchFn) {
     gitFn: () => '', env: { MIVO_PLUGIN_REPO: plugin },
     ghFn: (args) => {
       if (args[0] === 'api' && args[1] === 'user') return 'owner';
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: nodeId, state: 'OPEN' });
       if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([listed]);
       if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { node: graphqlNode() } });
       return '[]';

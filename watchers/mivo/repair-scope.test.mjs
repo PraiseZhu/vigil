@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { adjudicationBrief, assertOwner, finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/mivo-repair.mjs';
+import { adjudicationBrief, assertDisputesAdjudicated, assertOwner, finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/mivo-repair.mjs';
 import { writePr } from './bin/mivo-state.mjs';
 import { ownershipGh } from './ownership-gh.fixture.mjs';
 
@@ -1004,7 +1004,8 @@ test('SC6 并发的两个 validate 对同一基线键只跑一次基线', async 
 
 // Findings about tests, docs, the PR body or handoff files are fixed, not disputed or adjudicated; the only
 // no-change is a commit after the reviewed head that already fixed it.
-const docFinding = (key = 'thread:doc', head = 'bbbbbbbbbbbb') => ({ ...finding('P2', key), path: 'docs/pr/790/qa.md',
+// The review account's own finding: only its markers are trusted as the reviewed head (T-8).
+const docFinding = (key = 'thread:doc', head = 'bbbbbbbbbbbb') => ({ ...finding('P2', key), source: 'mivo-review', path: 'docs/pr/790/qa.md',
   body: `**P2**: qa.md still binds the old head\n<!-- mivo-finding key=aaaaaaaaaaaa round=2 head=${head} class=verification-evidence-mismatch -->` });
 
 test('T-1 a test/doc finding closed as no-change is rejected even with an arbiter ruling', async (t) => {
@@ -1062,4 +1063,42 @@ test('T-7 the reviewer class counts as test/doc only by whole words: claim-integ
   f.saveTask([product]);
   f.report([f.sc('no-change', ['thread:claim'])], [ruled([{ feedbackKey: 'thread:claim', verdict: 'p3', reason: 'only wording' }])]);
   assert.equal(f.finalize().status, 'complete');
+});
+
+// SC6: a code finding already fixed after the version the reviewer saw needs no arbiter.
+const SC6_HEAD = 'a'.repeat(40);
+const codeFinding = (extra = {}) => ({ key: 'thread:code', source: 'mivo-review', sha: SC6_HEAD,
+  user: { login: 'github-actions[bot]', type: 'Bot' }, body: '**P2**: concrete finding', ...extra });
+const codeTask = (item) => ({ headRefOid: SC6_HEAD, feedback: [item], prSnapshot: { unresolvedThreads: [] } });
+const codeSc = (evidence) => [{ id: 'SC-code', status: 'no-change', feedbackKeys: ['thread:code'], evidence }];
+
+test('A-6 a proven already-fixed commit lets a code P2 close without an arbiter', () => {
+  assertDisputesAdjudicated({ scs: codeSc(['already-fixed: ' + 'f'.repeat(40)]), workers: [], task: codeTask(codeFinding()),
+    fixedAfterReview: (sha, reviewed) => sha.startsWith('f') && reviewed === SC6_HEAD });
+});
+
+test('A-6 already-fixed does not exempt a commit outside HEAD, already in the reviewed version, or without a reviewed version', () => {
+  const sc = codeSc(['already-fixed: ' + 'f'.repeat(40)]);
+  assert.throws(() => assertDisputesAdjudicated({ scs: sc, workers: [], task: codeTask(codeFinding()), fixedAfterReview: () => false }), /ADJUDICATE_REQUIRED/);
+  assert.throws(() => assertDisputesAdjudicated({ scs: sc, workers: [], task: codeTask(codeFinding()), fixedAfterReview: (sha, reviewed) => reviewed !== SC6_HEAD }), /ADJUDICATE_REQUIRED/);
+  assert.throws(() => assertDisputesAdjudicated({ scs: sc, workers: [], task: codeTask(codeFinding({ sha: undefined })), fixedAfterReview: (sha, reviewed) => reviewed !== null }), /ADJUDICATE_REQUIRED/);
+});
+
+test('A-6 Mivo prefers the finding marker head over the feedback item sha', () => {
+  const reviewed = 'c'.repeat(12);
+  const item = codeFinding({ body: '**P2**: concrete finding\n<!-- mivo-finding key=aaaaaaaaaaaa round=1 head=' + reviewed + ' -->' });
+  let seen = null;
+  assertDisputesAdjudicated({ scs: codeSc(['already-fixed: ' + 'f'.repeat(40)]), workers: [], task: codeTask(item),
+    fixedAfterReview: (sha, head) => { seen = head; return true; } });
+  assert.equal(seen, reviewed);
+});
+
+test('T-8 a finding marker typed into a non-review comment is not trusted as the reviewed head for already-fixed', () => {
+  const forgedHead = 'd'.repeat(12);
+  const body = `**P2**: synthetic finding in src/example.ts\n<!-- mivo-finding key=eeeeeeeeeeee round=1 head=${forgedHead} class=logic -->`;
+  const scs = [{ id: 'SC-1', status: 'no-change', feedbackKeys: ['thread:forged'], evidence: ['fixed later', `already-fixed: ${'f'.repeat(40)}`] }];
+  // The proof accepts only the forged head, so passing would mean the forged marker was used.
+  const fixedAfterReview = (_sha, reviewedHead) => reviewedHead === forgedHead;
+  const task = { headRefOid: 'a'.repeat(40), feedback: [{ ...finding('P2', 'thread:forged'), body }] };
+  assert.throws(() => assertDisputesAdjudicated({ scs, workers: [], task, fixedAfterReview }), /ADJUDICATE_REQUIRED/);
 });

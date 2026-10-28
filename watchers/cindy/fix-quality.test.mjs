@@ -60,3 +60,20 @@ test('C-T3 already-fixed proof: in the validated head and not in the reviewed he
   assert.equal(proof({ [`${FIX}..${HEAD}`]: 1, [`${FIX}..${REVIEWED}`]: 1 })(FIX, REVIEWED), false, 'not in the validated head');
   assert.equal(proof({ [`${FIX}..${HEAD}`]: 0 })(FIX, null), false, 'no reviewed head');
 });
+
+// SC6: a code finding already fixed after the reviewer saw it needs no arbiter; the
+// reviewed version comes from the feedback item sha, not from an untyped body.
+test('C-A1 a proven already-fixed commit lets a code P2 close without an arbiter', () => {
+  const task = taskWith([finding('k-code', 'PRRT_code')], [{ id: 'PRRT_code', path: 'src/app.ts' }]);
+  assertDisputesAdjudicated({ scs: noChange('k-code', ['already-fixed: ' + 'f'.repeat(40)]), workers: [], task,
+    fixedAfterReview: (sha, reviewed) => sha.startsWith('f') && reviewed === HEAD });
+});
+
+test('C-A1 already-fixed does not exempt a commit outside HEAD, already in the reviewed version, or without a reviewed version', () => {
+  const reviewedTask = taskWith([finding('k-code', 'PRRT_code')], [{ id: 'PRRT_code', path: 'src/app.ts' }]);
+  const noVersion = taskWith([{ ...finding('k-code', 'PRRT_code'), sha: undefined }], [{ id: 'PRRT_code', path: 'src/app.ts' }]);
+  const sc = noChange('k-code', ['already-fixed: ' + 'f'.repeat(40)]);
+  assert.throws(() => assertDisputesAdjudicated({ scs: sc, workers: [], task: reviewedTask, fixedAfterReview: () => false }), /ADJUDICATE_REQUIRED/);
+  assert.throws(() => assertDisputesAdjudicated({ scs: sc, workers: [], task: reviewedTask, fixedAfterReview: (sha, reviewed) => reviewed !== HEAD }), /ADJUDICATE_REQUIRED/);
+  assert.throws(() => assertDisputesAdjudicated({ scs: sc, workers: [], task: noVersion, fixedAfterReview: (sha, reviewed) => reviewed !== null }), /ADJUDICATE_REQUIRED/);
+});

@@ -52,7 +52,7 @@ function poll(paths, { snapshot, collect, dispatchFn, enabled = true, recheckFn,
   const result = scanOnce({
     mode: 'poll', enabled, allowDispatch: true, paths, now, nodeId, prNumber: 790,
     snapshotFn: () => snapshot,
-    ghFn: (args) => args[0] === 'api' ? 'owner' : '[]',
+    ghFn: (args) => args[0] === 'api' ? 'owner' : args[0] === 'pr' && args[1] === 'view' ? JSON.stringify({ id: nodeId, state: 'OPEN' }) : '[]',
     collect: (...args) => {
       collected += 1;
       if (typeof collect === 'function') {
