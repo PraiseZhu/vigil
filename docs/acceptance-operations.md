@@ -268,12 +268,20 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 - 任何一个仓取不下来：这一轮 `abort`（原因「代码预取失败：…」），写提醒 `prefetch-failed`，不起 pi。
 - 轮次收尾时 `roundDir` 里除 `pi.log` 外都清掉（含检出的代码）；镜像留着，下一轮只是增量取。
 
-### 依赖预装（npm）
+### 依赖预装（npm / pnpm）
 
 沙箱只能连模型网关，在沙箱里 `npm ci` 必然卡住或失败。所以代码预取之后、起 pi 之前，宿主替这一轮装依赖（`host/predeps.mjs`）：
 
-- 只在仓根有 `package.json` 且有 `npm-shrinkwrap.json` / `package-lock.json` 时装；没有 lockfile 就不装，
-  派发消息里写明「没有预装依赖，要依赖的检查属环境限制，不能据此判不通过」。
+- 只在仓根有 `package.json` 且有 `npm-shrinkwrap.json` / `package-lock.json` / `pnpm-lock.yaml` 时装；没有 lockfile 就不装，
+  派发消息里写明「没有预装依赖，要依赖的检查属环境限制，不能据此判不通过」。npm 和 pnpm 的 lockfile 并存时按 npm。
+- pnpm 仓（仓根只有 `pnpm-lock.yaml`）：只跑 `pnpm install --frozen-lockfile --ignore-scripts --registry https://registry.npmjs.org/`，
+  不改 lockfile、任何安装脚本都不跑。pnpm 用宿主上解析出的绝对路径跑：PATH 里的 `pnpm` 是 corepack 垫片时，改用 corepack 缓存
+  （`COREPACK_HOME`、`~/.cache/node/corepack`、`/usr/local/share/corepack`）里的 `pnpm.cjs`，由 node 直接跑——垫片会按
+  `packageManager` 字段去下载别的版本。另外固定 `manage-package-manager-versions=false`（pnpm 不自己切版本）、
+  `COREPACK_ENABLE_STRICT=0`、`package-import-method=copy`。store 在 `<home>/cache/pnpm-store`、元数据缓存在 `<home>/cache/pnpm-cache`
+  （都是 700，只在预装这一步可写，不进模型沙箱）。项目 `.npmrc` 照样不拷、不读源和令牌，只认 `node-linker`（isolated / hoisted）
+  和 `shamefully-hoist` 两项布局设置。宿主上找不到 pnpm → 按环境问题中止本轮，原因写明哪个仓要 pnpm、怎么补。
+  派发消息里告诉评审：已按 `pnpm-lock.yaml` 预装、不要再跑 `pnpm install`，沙箱里跑 pnpm 脚本用 `node <pnpm.cjs> run <脚本>`。
 - 只跑 `npm ci --ignore-scripts --no-audit --no-fund --registry https://registry.npmjs.org/`：任何安装脚本都不跑，
   源写死，项目和宿主的 `.npmrc` 都不读（项目 `.npmrc` 不拷进工作目录，`userconfig` / `globalconfig` 指向空文件）。
 - 装在 `<roundDir>/deps/<owner>__<repo>`（检出目录的副本，不含 `.git`），npm 缓存在 `<home>/cache/npm`，都不进宿主 `HOME` 的点目录。
