@@ -559,8 +559,83 @@ function validateRulings(value, index) {
 // reviewer. It is not the session's call alone: an adjudicate worker must have ruled, or the SC
 // must say why none could be opened (missing route, no Orca tool, creation error).
 export const ADJUDICATE_SKIPPED = 'adjudicate-skipped:';
-export function assertDisputesAdjudicated({ scs, workers, task }) {
+
+// Findings about tests, docs, the PR body or the handoff files are fixed, never disputed: changing them is
+// cheap and never changes product behaviour, while disputing them cost ~66 review rounds over ~11 findings
+// in Oct 2026. The one way out is a commit made after the review that already fixed it.
+export const ALREADY_FIXED = 'already-fixed:';
+const TEST_DOC_PATH_RE = /(^|\/)(docs|tests?|__tests__)\/|\.(test|spec)\.[cm]?[jt]sx?$|\.md$|^public\/changelog\.json$/;
+// Whole words of the reviewer's free-form class (e.g. test-coverage-gap, qa-handoff-mismatch, pr-description-mismatch);
+// substrings would also catch product classes such as claim-integrity or docker-*.
+const TEST_DOC_CLASS_WORDS = new Set(['test', 'tests', 'coverage', 'oracle', 'mock', 'precondition', 'verification', 'handoff', 'evidence', 'qa', 'description', 'doc', 'docs']);
+export function isTestDocClass(cls) {
+  return String(cls ?? '').toLowerCase().split(/[^a-z]+/).some((word) => TEST_DOC_CLASS_WORDS.has(word));
+}
+const FINDING_MARKER_RE = /<!--\s*mivo-finding\s+key=([0-9a-f]{12})\s+round=(?:\d+|null)\s+head=([0-9a-f]{7,40})(?:\s+class=([^\s>]+))?/;
+export function findingMarkerOf(body) {
+  const match = FINDING_MARKER_RE.exec(String(body ?? ''));
+  return match ? { key: match[1], head: match[2], cls: match[3] ? decodeURIComponent(match[3]) : '' } : null;
+}
+export function testDocFeedbackKeys(task) {
+  const threadPaths = new Map((task?.prSnapshot?.unresolvedThreads ?? [])
+    .filter((thread) => typeof thread?.id === 'string' && typeof thread.path === 'string')
+    .map((thread) => [thread.id, thread.path]));
+  const keys = new Set();
+  for (const item of task?.feedback ?? []) {
+    if (!item?.key || ['ci', 'conflict'].includes(item.source)) continue;
+    const file = item.path ?? threadPaths.get(item.threadId) ?? null;
+    const cls = findingMarkerOf(item.body)?.cls ?? '';
+    if ((file && TEST_DOC_PATH_RE.test(file)) || isTestDocClass(cls)) keys.add(item.key);
+  }
+  return keys;
+}
+
+// The second time a problem (same finding key, or same class after an earlier fix) comes back, patching the one
+// reported spot again is what kept three guard PRs going for 10-20 rounds in Oct 2026. The SC that fixes it must
+// show the full inventory of the problem class and the chosen approach (vigil: repeat-finding inventory).
+export const INVENTORY = 'inventory:';
+export const APPROACH = 'approach:';
+export function assertRepeatInventory({ scs, task }) {
+  const repeat = new Set((task?.repeatFindings ?? []).map((item) => item?.feedbackKey).filter(Boolean));
+  if (!repeat.size) return;
+  for (const sc of scs) {
+    if (sc.status !== 'pass') continue;
+    const keys = (sc.feedbackKeys ?? []).filter((key) => repeat.has(key));
+    if (!keys.length) continue;
+    const has = (prefix) => sc.evidence.some((line) => line.trim().startsWith(prefix) && line.trim().length > prefix.length + 10);
+    if (!has(INVENTORY) || !has(APPROACH)) {
+      fail(`[REPEAT_INVENTORY_REQUIRED] ${sc.id} fixes a repeated finding (${keys.join(', ')}) without "${INVENTORY}" (every case of this problem class and whether it is handled) and "${APPROACH}" (point fix or root change, and why) evidence lines`);
+    }
+  }
+}
+
+// already-fixed proof: the named commit is in the validated HEAD and not in the head the reviewer saw. A missing or
+// unreadable reviewed head, or any git error other than "not an ancestor" (exit 1), proves nothing.
+export function alreadyFixedProof({ worktree, validatedHead, gitFn }) {
+  const ancestry = (a, b) => {
+    try { gitOutput(['-C', worktree, 'merge-base', '--is-ancestor', a, b], gitFn); return 'yes'; }
+    catch (error) { return error?.status === 1 ? 'no' : 'unknown'; }
+  };
+  return (sha, reviewedHead) => typeof reviewedHead === 'string' && /^[0-9a-f]{7,40}$/.test(reviewedHead)
+    && ancestry(sha, validatedHead) === 'yes' && ancestry(sha, reviewedHead) === 'no';
+}
+
+export function assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview = null }) {
   const permissions = new Map(taskRepairPolicy(task).items.map((item) => [item.key, item]));
+  const testDoc = testDocFeedbackKeys(task);
+  const bodies = new Map((task?.feedback ?? []).map((item) => [item?.key, item?.body]));
+  for (const sc of scs) {
+    if (sc.status !== 'no-change') continue;
+    const mustFix = (sc.feedbackKeys ?? []).filter((key) => testDoc.has(key) && permissions.get(key)?.canChangeCode === true);
+    if (!mustFix.length) continue;
+    const fixedBy = sc.evidence.map((line) => line.trim()).find((line) => line.startsWith(ALREADY_FIXED))
+      ?.slice(ALREADY_FIXED.length).trim().split(/\s+/)[0] ?? '';
+    for (const key of mustFix) {
+      const reviewedHead = findingMarkerOf(bodies.get(key))?.head ?? null;
+      const proven = /^[0-9a-f]{7,40}$/.test(fixedBy) && typeof fixedAfterReview === 'function' && fixedAfterReview(fixedBy, reviewedHead);
+      if (!proven) fail(`[TEST_DOC_MUST_FIX] ${sc.id} closes ${key} as no-change, but findings about tests, docs, the PR body or handoff files are fixed, not disputed or adjudicated; fix it, or add an evidence line "${ALREADY_FIXED} <commit>" naming the commit after the reviewed head that already fixed it`);
+    }
+  }
   const ruled = (workers ?? []).some((item) => item.purpose === 'adjudicate');
   const structured = task?.adjudicationRecord === ADJUDICATION_RECORD_VERSION;
   const rulings = new Map((workers ?? []).filter((item) => item.purpose === 'adjudicate')
@@ -569,7 +644,8 @@ export function assertDisputesAdjudicated({ scs, workers, task }) {
     if (sc.status !== 'no-change') continue;
     const disputed = (sc.feedbackKeys ?? []).filter((key) => {
       const item = permissions.get(key);
-      return item?.canChangeCode === true && item.action === 'code-fix';
+      // test/doc findings were settled above (fix, or a proven already-fixed commit); they get no arbiter
+      return item?.canChangeCode === true && item.action === 'code-fix' && !testDoc.has(key);
     });
     if (!disputed.length) continue;
     const skipped = sc.evidence.some((line) => line.trim().startsWith(ADJUDICATE_SKIPPED));
@@ -1148,7 +1224,8 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
   const { scs, feedbackCoverage, workers } = loadScs(scReport, task);
-  assertDisputesAdjudicated({ scs, workers, task });
+  assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview: alreadyFixedProof({ worktree, validatedHead, gitFn }) });
+  assertRepeatInventory({ scs, task });
   assertStandardAllowsDisputes({ scs, task });
   const workersField = workers ? { workers } : {};
   const emptyRetrigger = allNoChange(scs) && isEmptyCiRetrigger(worktree, task.headRefOid, validatedHead, gitFn);

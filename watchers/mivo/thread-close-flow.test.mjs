@@ -10,7 +10,7 @@ import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.
 const ROOT = '/virtual/vigil-thread-close';
 
 function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = false, outdated = false, badCi = false, replyError = false, legacyIntent = false, frozen = null, deleteErrors = 0 } = {}) {
-  const original = Object.fromEntries(['existsSync', 'readFileSync', 'mkdirSync', 'writeFileSync', 'renameSync', 'unlinkSync'].map((k) => [k, fs[k]]));
+  const original = Object.fromEntries(['existsSync', 'readFileSync', 'readdirSync', 'mkdirSync', 'writeFileSync', 'renameSync', 'unlinkSync'].map((k) => [k, fs[k]]));
   const files = new Map();
   const dirs = new Set([ROOT, ROOT + '/state', ROOT + '/state/prs']);
   const scoped = (p) => String(p).startsWith(ROOT + '/') || p === ROOT;
@@ -19,6 +19,12 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
     if (!scoped(p)) return original.readFileSync(p, ...args);
     if (!files.has(String(p))) throw Object.assign(new Error('missing virtual file ' + p), { code: 'ENOENT' });
     return files.get(String(p));
+  };
+  // A rotated session is checked against every PR file, which lists the prs directory.
+  fs.readdirSync = (p, ...args) => {
+    if (!scoped(p)) return original.readdirSync(p, ...args);
+    const dir = String(p).replace(/\/$/, '') + '/';
+    return [...files.keys()].filter((f) => f.startsWith(dir) && !f.slice(dir.length).includes('/')).map((f) => f.slice(dir.length));
   };
   fs.mkdirSync = (p) => { assert.ok(scoped(p), 'filesystem write must be virtual'); dirs.add(String(p)); };
   fs.writeFileSync = (p, value, options) => {

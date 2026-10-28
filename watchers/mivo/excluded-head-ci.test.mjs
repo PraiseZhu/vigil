@@ -122,3 +122,141 @@ test('执行:head 变了重新来一轮;CI 转绿后什么都不做', (t) => {
   assert.deepEqual(quiet, []);
   assert.equal(out.ciStatus, 'green');
 });
+
+// --- 更新日志 PR 上的审查意见:派一个只许改 public/changelog.json 的会话,讨论清掉后交给扫地僧归档 ---
+function runThreads(paths, { threads, pages = null, now = '2026-10-25T08:00:00Z', head = HEAD, sent = [], dispatchError = null, queries = [] }) {
+  const ghFn = (args) => {
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: pr.id, number: pr.number, headRefOid: head, baseRefOid: 'b'.repeat(40), state: 'OPEN', isDraft: false, url: pr.url });
+    if (args[0] === 'api' && args[1] === 'graphql') {
+      queries.push(args.at(-1));
+      const reviewThreads = pages ? pages[queries.length - 1] : { nodes: threads };
+      return JSON.stringify({ data: { repository: { pullRequest: { reviewThreads } } } });
+    }
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const dispatchFn = (params) => {
+    sent.push(params);
+    if (dispatchError) throw new Error(dispatchError);
+    return { target_session_id: params.target_session_id ?? `cl-${sent.length}` };
+  };
+  return drive(superviseExcludedHead({ pr, key: pr.id, paths, now, ghFn, dryRun: false, dispatchFn,
+    collectCi: function* () { return { status: 'green', required: [] }; } }));
+}
+const greptile = { id: 'PRRT_cl', isResolved: false, isOutdated: false, path: 'public/changelog.json',
+  comments: { nodes: [{ author: { login: 'greptile-apps' }, url: 'https://example.test/t', body: 'P2 失败提示描述不准确' }] } };
+
+test('更新日志 PR:有没处理的审查意见就派一次只许改 changelog.json 的会话,同一批一小时内不重复派', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  const out = runThreads(paths, { threads: [greptile], sent });
+  assert.equal(out.threads.dispatched, true);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].target_session_id, undefined);
+  assert.match(sent[0].message, /只允许改 public\/changelog\.json/);
+  assert.match(sent[0].message, /PRRT_cl/);
+  assert.match(sent[0].message, /禁止 --no-verify 和 force push/);
+  assert.equal(readPr(paths.home, pr.id).excludedThreads.sessionId, 'cl-1');
+  const again = runThreads(paths, { threads: [greptile], sent, now: '2026-10-25T08:30:00Z' });
+  assert.equal(again.threads.reason, 'in-flight');
+  assert.equal(sent.length, 1);
+});
+
+test('更新日志 PR:讨论都关掉后,处理它的会话进待归档名单;没有讨论就不派', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  runThreads(paths, { threads: [greptile], sent });
+  const out = runThreads(paths, { threads: [{ ...greptile, isResolved: true }], sent, now: '2026-10-25T08:10:00Z' });
+  assert.equal(out.threads.open, 0);
+  assert.equal(sent.length, 1);
+  const retired = JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions;
+  assert.deepEqual(retired.map((item) => [item.sessionId, item.number]), [['cl-1', 1278]]);
+  runThreads(paths, { threads: [], sent, now: '2026-10-25T08:20:00Z' });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions.length, 1);
+});
+
+test('更新日志 PR:同一批意见最多派三次,隔一小时补派也发回原会话,不另开会话', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  for (const now of ['2026-10-25T08:00:00Z', '2026-10-25T09:01:00Z', '2026-10-25T10:02:00Z', '2026-10-25T11:03:00Z']) runThreads(paths, { threads: [greptile], sent, now });
+  assert.equal(sent.length, 3);
+  assert.deepEqual(sent.map((item) => item.target_session_id), [undefined, 'cl-1', 'cl-1']);
+  assert.equal(fs.existsSync(path.join(paths.stateDir, 'retired-sessions.json')), false);
+  assert.equal(readPr(paths.home, pr.id).excludedThreads.attempts, 3);
+});
+
+test('更新日志 PR:首次派发没收到回执时不再自动另开会话,通知一次,一天后才重派', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  const out = runThreads(paths, { threads: [greptile], sent, dispatchError: 'Cindy dispatch receipt timed out; pending dispatch retained' });
+  assert.equal(out.threads.dispatched, false);
+  assert.equal(out.threads.reason, 'receipt-unknown');
+  const saved = readPr(paths.home, pr.id).excludedThreads;
+  assert.equal(saved.receiptUnknown, true);
+  assert.equal(saved.sessionId, null);
+  const notices = pendingEvents(paths.home).filter((event) => event.kind === 'changelog-dispatch-unknown');
+  assert.equal(notices.length, 1);
+  assert.match(formatNoticeText([notices[0]]), /24 小时内不再派/);
+  for (const now of ['2026-10-25T08:05:00Z', '2026-10-25T09:01:00Z', '2026-10-26T07:59:00Z']) {
+    assert.equal(runThreads(paths, { threads: [greptile], sent, now }).threads.reason, 'receipt-unknown');
+  }
+  assert.equal(sent.length, 1);
+  runThreads(paths, { threads: [greptile], sent, now: '2026-10-26T08:01:00Z' });
+  assert.equal(sent.length, 2);
+  // the unaddressable session from the first dispatch is listed by title before the new one is opened
+  const retired = JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions;
+  assert.deepEqual(retired.map((item) => [item.sessionId, item.title, item.createdFrom]), [[null, '更新日志 PR #1278 处理审查意见', '2026-10-25T08:00:00Z']]);
+  assert.equal(sent[1].title, '更新日志 PR #1278 处理审查意见');
+});
+
+test('更新日志 PR:回执未知的会话把讨论都关掉后,按标题和派发时间进待归档名单,只记一次', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  runThreads(paths, { threads: [greptile], sent, dispatchError: 'Cindy dispatch receipt timed out; pending dispatch retained' });
+  runThreads(paths, { threads: [{ ...greptile, isResolved: true }], sent, now: '2026-10-25T08:30:00Z' });
+  runThreads(paths, { threads: [], sent, now: '2026-10-25T08:40:00Z' });
+  const retired = JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions;
+  assert.deepEqual(retired.map((item) => [item.sessionId, item.title, item.createdFrom, item.number]), [[null, '更新日志 PR #1278 处理审查意见', '2026-10-25T08:00:00Z', 1278]]);
+  assert.equal(sent.length, 1);
+});
+
+test('更新日志 PR:没送到的错误(HOST_NOT_READY)或已知会话的补派失败,一小时后照常重试', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  const out = runThreads(paths, { threads: [greptile], sent, dispatchError: 'HOST_NOT_READY: host is starting' });
+  assert.equal(out.threads.reason, 'dispatch-error');
+  assert.equal(readPr(paths.home, pr.id).excludedThreads.attempts, 1);
+  assert.equal(runThreads(paths, { threads: [greptile], sent, now: '2026-10-25T08:05:00Z' }).threads.reason, 'in-flight');
+  runThreads(paths, { threads: [greptile], sent, now: '2026-10-25T09:01:00Z' });
+  assert.equal(sent.length, 2);
+  assert.equal(readPr(paths.home, pr.id).excludedThreads.sessionId, 'cl-2');
+  const failed = runThreads(paths, { threads: [greptile], sent, now: '2026-10-25T10:02:00Z', dispatchError: 'Cindy dispatch receipt timed out; pending dispatch retained' });
+  assert.equal(failed.threads.reason, 'dispatch-error');
+  assert.equal(sent.at(-1).target_session_id, 'cl-2');
+  assert.equal(readPr(paths.home, pr.id).excludedThreads.sessionId, 'cl-2');
+  assert.equal(pendingEvents(paths.home).filter((event) => event.kind === 'changelog-dispatch-unknown').length, 0);
+});
+
+test('更新日志 PR:一条讨论评论超过一页时,派活消息标出并要求会话自己读全', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  const long = { ...greptile, comments: { pageInfo: { hasNextPage: true }, nodes: greptile.comments.nodes } };
+  runThreads(paths, { threads: [long], sent });
+  assert.match(sent[0].message, /"moreComments":true/);
+  assert.match(sent[0].message, /分页读全这条讨论的评论/);
+});
+
+test('更新日志 PR:讨论超过一页时翻页读全,后一页的讨论也会派出', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  const queries = [];
+  const resolved = { ...greptile, id: 'PRRT_done', isResolved: true };
+  const pages = [
+    { pageInfo: { hasNextPage: true, endCursor: 'CURSOR_1' }, nodes: [resolved] },
+    { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ ...greptile, id: 'PRRT_late' }] },
+  ];
+  const out = runThreads(paths, { pages, sent, queries });
+  assert.equal(queries.length, 2);
+  assert.match(queries[1], /after:"CURSOR_1"/);
+  assert.equal(out.threads.open, 1);
+  assert.match(sent[0].message, /PRRT_late/);
+});
