@@ -38,6 +38,59 @@ export const DEFAULT_MAX_ROUND_MINUTES = 120;
 export const SANDBOX_DOWN_ALERT_MS = 60 * 60 * 1000;
 /** mivo 的仓名（`/` 后面那段）以 mivo 开头就占测试锁。 */
 export const TEST_LOCK_PATTERN = /^mivo/i;
+const SERIAL_REPO_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
+/**
+ * host.json 的 serialRepos：这些仓（"owner/repo"，不分大小写）同一时刻最多 1 轮（验收轮 + 修正轮合计）。
+ * 给内存吃得重的仓用（比如两个轮次同时跑 typecheck 会把整机内存吃光）。没配就是空（老行为）。
+ * 写错（不是 "owner/repo" 字符串数组）直接报错：宁可这一拍不认领，也不悄悄放开并发。
+ */
+export function serialRepos(hostConfig) {
+  const raw = hostConfig?.serialRepos;
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error('host.json 的 serialRepos 必须是 "owner/repo" 字符串数组');
+  return raw.map((entry) => {
+    if (typeof entry !== 'string' || !SERIAL_REPO_PATTERN.test(entry)) {
+      throw new Error(`host.json 的 serialRepos 写法不对（要 "owner/repo"，不认通配和 issue 号）：${JSON.stringify(entry)}`);
+    }
+    return entry.toLowerCase();
+  });
+}
+
+/**
+ * 同仓最多 1 轮的锁（和 mivo 测试锁同一套：O_EXCL 锁文件、整轮持有、认领之前拿、拿不到这一拍不认领）。
+ * 仓名以 mivo 开头 → `mivo-test.lock`（不用配，和以前一样）；在 serialRepos 名单里 → 这个仓自己的
+ * `locks/serial-<owner>__<repo>.lock`（不和 mivo 共用，互不挡）。返回去重、排好序的锁文件列表。
+ */
+export function serialLockFiles(paths, repos, hostConfig) {
+  const listed = new Set(serialRepos(hostConfig));
+  const files = new Set();
+  for (const repo of repos) {
+    const full = String(repo || '').toLowerCase();
+    const name = full.split('/')[1] || '';
+    if (TEST_LOCK_PATTERN.test(name)) files.add(paths.testLock);
+    if (listed.has(full)) files.add(path.join(paths.locksDir, `serial-${full.replace('/', '__')}.lock`));
+  }
+  return [...files].sort();
+}
+
+/** 按顺序拿 serialLockFiles 给的锁；有一把拿不到就把已拿的放回去，返回 null。 */
+export function acquireSerialLocks(files, now = () => Date.now()) {
+  const held = [];
+  for (const file of files) {
+    if (!tryAcquireLock(file, { now })) {
+      for (const taken of held) releaseLock(taken);
+      return null;
+    }
+    held.push(file);
+  }
+  return held;
+}
+
+/** 放回 acquireSerialLocks 拿到的锁。 */
+export function releaseSerialLocks(files) {
+  for (const file of files || []) releaseLock(file);
+}
 const ISSUE_PATTERN = /^([^/\s]+)\/([^#\s]+)#(\d+)$/;
 
 function sink() {
@@ -424,6 +477,9 @@ export async function runHostRound({
   const settings = hostConfig || readHostConfig(paths.hostConfig);
   const piCommand = requirePiCommand(settings);
   const maxRoundMs = maxRoundMinutes(settings) * 60 * 1000;
+  const { repo } = parseRef(issue);
+  // 同仓最多 1 轮的锁（mivo 测试锁 + serialRepos）：在占槽之前算好，名单写错就在这里报错、什么都不占。
+  const serialFiles = serialLockFiles(paths, [repo], settings);
 
   // 1. 内存门：放在认领之前，不够就什么都不写。
   const available = readMemAvailable(meminfoPath);
@@ -436,22 +492,17 @@ export async function runHostRound({
     return 3;
   }
 
-  // 2. 槽 + mivo 测试锁
+  // 2. 槽 + 同仓最多 1 轮的锁（mivo 测试锁 / serialRepos）：拿不到这一拍不认领，不写评论、不算一轮。
   const slot = acquireSlot(paths, now);
   if (!slot) {
     log(`槽位已满（最多 ${MAX_ROUNDS} 轮），这一拍不认领`);
     return 3;
   }
-  const { repo } = parseRef(issue);
-  const needTestLock = TEST_LOCK_PATTERN.test(repo.split('/')[1] || '');
-  let testLockHeld = false;
-  if (needTestLock) {
-    if (!tryAcquireLock(paths.testLock, { now })) {
-      releaseLock(slot.file);
-      log('测试锁被占（mivo 同时只跑一轮），这一拍不认领');
-      return 3;
-    }
-    testLockHeld = true;
+  const serialHeld = acquireSerialLocks(serialFiles, now);
+  if (!serialHeld) {
+    releaseLock(slot.file);
+    log(serialFiles.includes(paths.testLock) ? '测试锁被占（mivo 同时只跑一轮），这一拍不认领' : `同仓锁被占（${repo} 同时只跑一轮），这一拍不认领`);
+    return 3;
   }
 
   const profile = loadAcceptanceProfile({ ...env, ACCEPTANCE_WATCHER_HOME: home });
@@ -820,7 +871,7 @@ export async function runHostRound({
     if (registryFile) fs.rmSync(registryFile, { force: true });
     if (progressFile) fs.rmSync(progressFile, { force: true });
     if (roundDir) cleanRoundDir(roundDir);
-    if (testLockHeld) releaseLock(paths.testLock);
+    releaseSerialLocks(serialHeld);
     releaseLock(slot.file);
   }
 }
