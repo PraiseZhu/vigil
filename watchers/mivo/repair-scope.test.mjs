@@ -1004,7 +1004,8 @@ test('SC6 并发的两个 validate 对同一基线键只跑一次基线', async 
 
 // Findings about tests, docs, the PR body or handoff files are fixed, not disputed or adjudicated; the only
 // no-change is a commit after the reviewed head that already fixed it.
-const docFinding = (key = 'thread:doc', head = 'bbbbbbbbbbbb') => ({ ...finding('P2', key), path: 'docs/pr/790/qa.md',
+// The review account's own finding: only its markers are trusted as the reviewed head (T-8).
+const docFinding = (key = 'thread:doc', head = 'bbbbbbbbbbbb') => ({ ...finding('P2', key), source: 'mivo-review', path: 'docs/pr/790/qa.md',
   body: `**P2**: qa.md still binds the old head\n<!-- mivo-finding key=aaaaaaaaaaaa round=2 head=${head} class=verification-evidence-mismatch -->` });
 
 test('T-1 a test/doc finding closed as no-change is rejected even with an arbiter ruling', async (t) => {
