@@ -19,6 +19,7 @@ import { run as procRun, spawnDetached, spawnProcess } from './proc.mjs';
 // prefetch.mjs → prbot.mjs → 本文件成环：两边都只在函数里用对方的导出，模块求值顺序不受影响。
 import { prefetchCode } from './prefetch.mjs';
 import { appendDepsInfo, prepareDeps } from './predeps.mjs';
+import { appendBuildCiInfo, buildCiPolicyFor, collectBuildCiFacts } from './build-ci.mjs';
 import { ENV_PROBLEM_PREFIX } from '../bin/trigger.mjs';
 import { redact } from '../bin/redact.mjs';
 
@@ -459,6 +460,7 @@ export async function runHostRound({
   startEgress = startRoundEgress,
   prefetch = prefetchCode,
   predeps = prepareDeps,
+  buildCi = collectBuildCiFacts,
   now = () => Date.now(),
   meminfoPath = '/proc/meminfo',
   statusIntervalMs = STATUS_INTERVAL_MS,
@@ -665,7 +667,26 @@ export async function runHostRound({
       await abortWithAlert('deps-failed', `${ENV_PROBLEM_PREFIX}依赖预装失败：${String(error?.message || error).slice(0, 300)}`, error?.detail);
       return 1;
     }
-    const message = appendDepsInfo(appendCodePaths(claim.message, code || []), deps?.deps || []);
+    // 7c. build 项 CI 口径（host.json 的 buildCiPolicy，按仓开、默认关）：宿主只读查关联 PR 的 CI，结论作为只读事实追加到消息末尾。
+    //     没开就不查、消息一字不差；查出错按「取不到」写（未验证），不中止本轮、不当成绿。
+    let buildCiFacts = null;
+    try {
+      buildCiFacts = await buildCi({ github, profile: hostProfile, hostConfig: settings, issue });
+    } catch (error) {
+      const policy = buildCiPolicyFor(settings, parseRef(issue).repo);
+      if (policy) {
+        buildCiFacts = {
+          repo: policy.repo,
+          bundleStep: policy.bundleStep,
+          ciChecks: policy.ciChecks,
+          prs: [],
+          status: 'unavailable',
+          reason: `查 CI 出错：${String(error?.message || error).split('\n')[0].slice(0, 200)}`,
+        };
+      }
+    }
+    touch();
+    const message = appendBuildCiInfo(appendDepsInfo(appendCodePaths(claim.message, code || []), deps?.deps || []), buildCiFacts);
 
     // 8. 写闸 serve：绑定本轮，socket 权限 600。沙箱看到的是宿主转发的那个 socket（记本轮活动）。
     const socketPath = path.join(roundDir, 'gate', 'gate.sock');

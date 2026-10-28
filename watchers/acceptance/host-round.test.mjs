@@ -11,6 +11,9 @@ import { runTick } from './host/tick.mjs';
 import { run as procRun } from './host/proc.mjs';
 import { OWNER, REPO, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import { ENV_PROBLEM_PREFIX } from './bin/trigger.mjs';
+import { appendCodePaths } from './bin/message.mjs';
+import { appendDepsInfo } from './host/predeps.mjs';
+import { collectBuildCiFacts } from './host/build-ci.mjs';
 
 const ROOT_REF = `${REPO}#1`;
 
@@ -665,4 +668,89 @@ test('裁决防线：别的原因的「中断」（不是环境问题）不写 e
     log: () => {},
   });
   assert.equal(readAlerts(hostPaths(fixture.home)).some((a) => a.kind === 'env-unverified'), false);
+});
+
+// build 项 CI 口径（host/build-ci.mjs）接进派发消息：口径关着时消息一字不差；开着时追加宿主只读查到的 CI 事实。
+function recordingPi(calls, written) {
+  return (options) => {
+    calls.pi.push(options);
+    return {
+      pid: 555020,
+      stdin: {
+        write(chunk) {
+          written.push(String(chunk));
+        },
+        end() {},
+      },
+      kill() {},
+      exit: Promise.resolve({ code: 0 }),
+    };
+  };
+}
+
+test('build 项 CI 口径没配：派发消息和以前一字不差，也不多查 GitHub', async () => {
+  const fixture = roundFixture({ status: { round: 1, status: '要修' } });
+  const written = [];
+  const seen = [];
+  const code = await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: BWRAP_OK,
+    runRound: fixture.runRoundFake,
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    buildCi: async (options) => {
+      seen.push(options);
+      return collectBuildCiFacts({ ...options, github: { graphql: async () => assert.fail('不该查 GitHub') } });
+    },
+    spawnPi: recordingPi(fixture.calls, written),
+    meminfoPath: writeMeminfo(),
+    log: () => {},
+  });
+  assert.equal(code, 0);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].issue, ROOT_REF);
+  // 和接入口径之前的拼法完全一样：appendDepsInfo(appendCodePaths(...))，再加 pi 输入末尾的换行。
+  assert.equal(written.join(''), `${appendDepsInfo(appendCodePaths(fixture.message, []), [])}\n`);
+});
+
+test('build 项 CI 口径开着：派发消息末尾追加 CI 事实；查 CI 出错不影响本轮，按「取不到」写', async () => {
+  for (const mode of ['green', 'throws']) {
+    const fixture = roundFixture({ status: { round: 1, status: '要修' } });
+    const hostFile = path.join(fixture.home, 'config', 'host.json');
+    const host = JSON.parse(fs.readFileSync(hostFile, 'utf8'));
+    host.buildCiPolicy = {
+      [REPO]: { bundleStep: 'node scripts/bundle.mjs', ciChecks: { build: ['verify-checks'], test: ['verify'] } },
+    };
+    fs.writeFileSync(hostFile, JSON.stringify(host));
+    const written = [];
+    const code = await runHostRound({
+      home: fixture.home,
+      issue: ROOT_REF,
+      run: BWRAP_OK,
+      runRound: fixture.runRoundFake,
+      startGate: fixture.startGateFake,
+      prefetch: fixture.prefetchFake,
+      buildCi: async (options) => {
+        assert.deepEqual(options.hostConfig.buildCiPolicy, host.buildCiPolicy);
+        if (mode === 'throws') throw new Error('意外出错');
+        return {
+          repo: REPO,
+          bundleStep: 'node scripts/bundle.mjs',
+          ciChecks: { build: ['verify-checks'], test: ['verify'] },
+          prs: [],
+          status: 'green',
+        };
+      },
+      spawnPi: recordingPi(fixture.calls, written),
+      meminfoPath: writeMeminfo(),
+      log: () => {},
+    });
+    assert.equal(code, 0, mode);
+    const message = written.join('');
+    assert.ok(message.startsWith(fixture.message), mode);
+    assert.match(message, /build 项 CI 口径/);
+    assert.match(message, mode === 'green' ? /CI 结论：绿/ : /CI 结论：取不到/);
+    if (mode === 'throws') assert.match(message, /意外出错/);
+  }
 });

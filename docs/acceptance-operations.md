@@ -34,6 +34,7 @@
   "egressAllow": ["<LLM 网关 host>:443"],
   "maxRoundMinutes": 120,
   "serialRepos": ["<可选：吃内存重、同一时刻只跑一轮的仓，owner/repo>"],
+  "buildCiPolicy": { "<可选：完整 build 在沙箱里跑不了的仓，owner/repo>": { "bundleStep": "<沙箱里要离线跑通的代码打包命令>", "ciChecks": { "build": ["<CI 检查名>"], "test": ["<CI 检查名>"] } } },
   "adjudicateCommand": ["pi", "--model", "anthropic/claude-opus-5-5", "--thinking", "medium"],
   "adjudicateMaxMinutes": 30,
   "slackDailyCap": 30
@@ -58,6 +59,15 @@ pi 不用自己 `git clone`，所以**只放行网关就够**；名单越短越�
 tick 不给锁被占的仓起进程，这一拍空出来的槽照样给别的仓，等锁的 issue 记在心跳 `lastTick.serialWaiting`（没人等就没有这个字段）。
 给内存吃得重的仓用（两个轮次同时跑 typecheck 会把整机内存吃光、被系统的内存保护杀掉）。不配就是空（老行为）；
 mivo 不用配，照旧按仓名占 `mivo-test.lock`。写错整轮起不来（不认领），不会悄悄放开并发。
+
+`buildCiPolicy` 可选，按仓开、默认关（不配就是老行为：不查、派发消息一字不差）。给完整 build 在沙箱里跑不了的仓用
+（要 electron 分发产物——安装脚本按设计不跑；打包要 fakeroot——沙箱里没有），否则每轮都停在「环境问题」。开了之后**只有 build 一项**改口径：
+代码打包步骤（`bundleStep`）在沙箱里离线跑通，**并且**关联 PR 自己 CI 的 build 检查（`ciChecks.build`）和测试检查（`ciChecks.test`）都是绿的才算过。
+CI 结论由宿主在代码预取、依赖预装之后、起 pi 之前只读查（`host/build-ci.mjs`：任务树里本仓的关联 PR，取最后一个提交的
+`statusCheckRollup`，检查名精确匹配；GraphQL 纯查询，瞬时故障按现有读重试一次），作为只读事实追加在派发消息末尾，评审按
+`watchers/acceptance/SESSION.md`「build 项的 CI 口径」记：绿（列的检查全部成功）且打包步骤通过 → `ran`；红（有一个失败 / 超时 / 启动失败）→ 如实判「要修」；
+没跑（缺检查、没跑完、被取消或跳过、没有关联 PR）或取不到（读失败、PR 找不到、配置写错）→ `env-skipped`，仍是未验证、按环境退避重验。
+查不到绝不当成绿，也不中止本轮。只认总 issue 所在仓的配置；别的仓、typecheck、test、写闸、判定、沙箱出网都不变。配置里不放任何密钥。
 
 未知键一律忽略；写 `"sandbox": false` 或 `"noSandbox": true` **没有任何作用**——沙箱只有一条路。
 
