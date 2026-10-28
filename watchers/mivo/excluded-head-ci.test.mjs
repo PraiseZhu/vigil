@@ -184,21 +184,50 @@ test('更新日志 PR:同一批意见最多派三次,隔一小时补派也发回
   assert.equal(readPr(paths.home, pr.id).excludedThreads.attempts, 3);
 });
 
-test('更新日志 PR:派发回执超时也算一次尝试,一小时内不重派,补派仍只有一个会话', (t) => {
+test('更新日志 PR:首次派发没收到回执时不再自动另开会话,通知一次,一天后才重派', (t) => {
   const paths = homeOf(t);
   const sent = [];
   const out = runThreads(paths, { threads: [greptile], sent, dispatchError: 'Cindy dispatch receipt timed out; pending dispatch retained' });
   assert.equal(out.threads.dispatched, false);
-  assert.equal(out.threads.reason, 'dispatch-error');
+  assert.equal(out.threads.reason, 'receipt-unknown');
   const saved = readPr(paths.home, pr.id).excludedThreads;
-  assert.equal(saved.attempts, 1);
-  assert.equal(saved.receiptMissing, true);
-  const again = runThreads(paths, { threads: [greptile], sent, now: '2026-10-25T08:05:00Z' });
-  assert.equal(again.threads.reason, 'in-flight');
+  assert.equal(saved.receiptUnknown, true);
+  assert.equal(saved.sessionId, null);
+  const notices = pendingEvents(paths.home).filter((event) => event.kind === 'changelog-dispatch-unknown');
+  assert.equal(notices.length, 1);
+  assert.match(formatNoticeText([notices[0]]), /24 小时内不再派/);
+  for (const now of ['2026-10-25T08:05:00Z', '2026-10-25T09:01:00Z', '2026-10-26T07:59:00Z']) {
+    assert.equal(runThreads(paths, { threads: [greptile], sent, now }).threads.reason, 'receipt-unknown');
+  }
   assert.equal(sent.length, 1);
+  runThreads(paths, { threads: [greptile], sent, now: '2026-10-26T08:01:00Z' });
+  assert.equal(sent.length, 2);
+});
+
+test('更新日志 PR:没送到的错误(HOST_NOT_READY)或已知会话的补派失败,一小时后照常重试', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  const out = runThreads(paths, { threads: [greptile], sent, dispatchError: 'HOST_NOT_READY: host is starting' });
+  assert.equal(out.threads.reason, 'dispatch-error');
+  assert.equal(readPr(paths.home, pr.id).excludedThreads.attempts, 1);
+  assert.equal(runThreads(paths, { threads: [greptile], sent, now: '2026-10-25T08:05:00Z' }).threads.reason, 'in-flight');
   runThreads(paths, { threads: [greptile], sent, now: '2026-10-25T09:01:00Z' });
   assert.equal(sent.length, 2);
-  assert.equal(readPr(paths.home, pr.id).excludedThreads.attempts, 2);
+  assert.equal(readPr(paths.home, pr.id).excludedThreads.sessionId, 'cl-2');
+  const failed = runThreads(paths, { threads: [greptile], sent, now: '2026-10-25T10:02:00Z', dispatchError: 'Cindy dispatch receipt timed out; pending dispatch retained' });
+  assert.equal(failed.threads.reason, 'dispatch-error');
+  assert.equal(sent.at(-1).target_session_id, 'cl-2');
+  assert.equal(readPr(paths.home, pr.id).excludedThreads.sessionId, 'cl-2');
+  assert.equal(pendingEvents(paths.home).filter((event) => event.kind === 'changelog-dispatch-unknown').length, 0);
+});
+
+test('更新日志 PR:一条讨论评论超过一页时,派活消息标出并要求会话自己读全', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  const long = { ...greptile, comments: { pageInfo: { hasNextPage: true }, nodes: greptile.comments.nodes } };
+  runThreads(paths, { threads: [long], sent });
+  assert.match(sent[0].message, /"moreComments":true/);
+  assert.match(sent[0].message, /分页读全这条讨论的评论/);
 });
 
 test('更新日志 PR:讨论超过一页时翻页读全,后一页的讨论也会派出', (t) => {

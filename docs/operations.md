@@ -140,7 +140,7 @@ node watchers/<mivo|cindy>/deploy.mjs apply --plan <file>
 分支名以 `chore/changelog-` 开头的 PR 由每日更新日志工作流生成，只改 `public/changelog.json`。这个工作流开完 PR 就结束，不看 CI、不合并。盯梢对它的处理和普通 PR 不同：
 
 - CI 红不派修复会话：改动只有数据文件，会话只能去「修」与它无关的测试。
-- 有没处理的审查讨论（例如 Greptile 指出某条更新日志写得不准）时，交给这个 PR 唯一的一个修复会话，只许改 `public/changelog.json` 里被指出的文字，推上去后逐条回复并 resolve。讨论按页读全。同一批讨论（head + 讨论 id）一小时内不重复派，最多派 3 次；派发回执超时也算一次。补派和新一批讨论都发回同一个会话，不另开会话，所以不会有两个会话同时改同一个工作树。下一天的更新换了 head 后重新计算。讨论都关掉后，这个会话进待归档名单。状态记在该 PR 条目的 `excludedThreads` 字段。
+- 有没处理的审查讨论（例如 Greptile 指出某条更新日志写得不准）时，交给这个 PR 唯一的一个修复会话，只许改 `public/changelog.json` 里被指出的文字，推上去后逐条回复并 resolve。讨论按页读全，单条讨论评论超过 100 条时派活消息会标出，让会话自己读全。同一批讨论（head + 讨论 id）一小时内不重复派，最多派 3 次。补派和新一批讨论都发回同一个会话，不另开会话，所以不会有两个会话同时改同一个工作树。首次派发没收到回执（不知道会话开没开出来）时，盯梢不另开会话：通知一次（`changelog-dispatch-unknown`），24 小时内不再派；能确定没送到的错误（如 `HOST_NOT_READY`）一小时后照常重试。下一天的更新换了 head 后重新计算。讨论都关掉后，这个会话进待归档名单。状态记在该 PR 条目的 `excludedThreads` 字段。
 - 必需检查变红时，对每个失败检查所在的 Actions run 调一次 `rerun-failed-jobs`；同一个 head、同一个 run 只重跑一次。只等上游的门（如 `pr-ci-freshness`）在上游没跑完时按分诊暂缓，不计入。
 - 重跑后的新一轮尝试仍然红，或失败的必需检查不是 Actions（没法重跑），就通知一次（通知类型 `excluded-head-ci-red`，按 PR 号和 head 去重）。
 - PR 被下一天的更新覆盖（head 变化）后重新计算。状态记在该 PR 条目的 `excludedHead` 字段。
