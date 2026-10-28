@@ -223,7 +223,7 @@ function ghJson(args, ghFn = command) {
   catch (error) { fail(`gh returned invalid JSON: ${error.message}`); }
 }
 
-function gitOutput(args, gitFn = command) { return String(gitFn(GIT, args)); }
+function gitOutput(args, gitFn = command, options) { return String(gitFn(GIT, args, options)); }
 
 const PRESERVED_REF_ROOT = 'refs/vigil/preserved/';
 const ZERO_SHA = '0'.repeat(40);
@@ -266,6 +266,17 @@ function preservedMessage(task, originalHead, reasons, now) {
   ].join('\n');
 }
 
+// git add -A records only a gitlink for a submodule and skips a nested repository's own history, so a backup would
+// look complete while losing that work. Such trees are refused and left exactly as they are.
+function assertPreservable(worktree, gitFn) {
+  const lines = gitOutput(['-C', worktree, 'status', '--porcelain=v2', '--untracked-files=all', '--ignore-submodules=none'], gitFn).split('\n');
+  for (const line of lines) {
+    const fields = line.split(' ');
+    if ((fields[0] === '1' || fields[0] === '2') && /^S(?!\.\.\.)/.test(fields[2] ?? '')) fail(`worktree has submodule changes (${fields.at(-1)}); refusing to preserve it`);
+    if (fields[0] === 'u') fail('worktree has unmerged index entries; refusing to preserve it');
+    if (fields[0] === '?' && line.endsWith('/')) fail(`worktree has a nested repository (${line.slice(2)}); refusing to preserve it`);
+  }
+}
 // Snapshot every Git-visible part of a drifted watch clone into a local ref before any reset.
 // Cindy clones are removed on cleanup, so the ref and its objects are also copied into the
 // configured plugin repository, which survives the clone.
@@ -277,6 +288,7 @@ export function preserveWatchCheckout({ task, worktree, originalHead, remoteHead
   if (status) reasons.push('dirty');
   if (!reasons.length) return null;
   if (gitOutput(['-C', worktree, 'ls-files', '-u'], gitFn).trim()) fail('worktree has unmerged index entries; refusing to preserve it');
+  assertPreservable(worktree, gitFn);
   const backupRepo = pluginRepoPath(env);
   const backupRef = preservedRefFor(task.dispatchId);
   let previousBackupHead = null;
@@ -1220,6 +1232,8 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
     const { scs, feedbackCoverage, workers } = loadScs(scReport, task);
     if (validatedHead !== task.headRefOid) fail('terminal finalize requires validated-head to equal the dispatched head');
     if (!scs.every((sc) => sc.status === 'no-change')) fail('[TERMINAL_NO_CHANGE_ONLY] a closed or merged PR only accepts all-no-change SCs');
+    // The PR must have ended on the head this task was about; a later push means the no-change was judged on stale code.
+    if (observed.headRefOid !== task.headRefOid) fail(`[TERMINAL_HEAD_DRIFT] PR ended at ${observed.headRefOid}, task was dispatched for ${task.headRefOid}`);
     const worktree = taskWorktree(task);
     let checkoutState = 'missing-after-close';
     if (fs.existsSync(worktree)) {
@@ -1227,6 +1241,9 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
       if (!checked || checked.head !== validatedHead) fail('worktree HEAD does not match validated-head');
       checkoutState = 'verified-clean';
     }
+    // A closed PR does not lower the bar for calling a finding wrong: the same adjudication rules apply.
+    assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview: alreadyFixedProof({ worktree, validatedHead, gitFn }) });
+    assertRepeatInventory({ scs, task });
     const verification = { status: 'not-required-no-change', head: validatedHead, localTests: 'not-run', reason: 'PR 已结束，本轮未修改' };
     const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot, validatedHead, verification });
     const workersField = workers ? { workers } : {};

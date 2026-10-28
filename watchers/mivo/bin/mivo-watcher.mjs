@@ -1640,6 +1640,7 @@ export function isTerminalNoChangeResult(result) {
     || terminal.number !== result.number || terminal.repo !== result.repo || result.repo !== REPO) return false;
   if (!sha(result.head) || !sha(result.sourceHead) || !sha(result.verification?.head)) return false;
   if (result.head !== result.sourceHead || result.head !== result.verification.head || !sha(terminal.head)) return false;
+  if (terminal.head !== result.head) return false;
   if (!Number.isFinite(Date.parse(terminal.checkedAt ?? ''))) return false;
   if (!['verified-clean', 'missing-after-close'].includes(terminal.checkout)) return false;
   if (!Array.isArray(result.scs) || result.scs.length === 0 || result.scs.some((sc) => sc?.status !== 'no-change')) return false;

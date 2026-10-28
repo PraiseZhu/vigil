@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { prepare, preservedRefFor, repairPaths } from './bin/mivo-repair.mjs';
+import { prepare, preservedRefFor, preserveWatchCheckout, repairPaths } from './bin/mivo-repair.mjs';
 import { writePr } from './bin/mivo-state.mjs';
 import { handoffPr, handoffReceipt } from './handoff.fixture.mjs';
 
@@ -109,3 +109,18 @@ test('prepare is a no-op on a clean watch worktree already at the PR head', (t) 
   assert.equal(result.realigned, null);
 });
 
+test('a nested repository in the watch tree is refused and the tree is left untouched', (t) => {
+  const f = fixture(t);
+  withPlugin(t, f.plugin);
+  const nested = path.join(f.worktree, 'nested');
+  fs.mkdirSync(nested);
+  git(nested, 'init', '-b', 'main');
+  fs.writeFileSync(path.join(nested, 'n.txt'), 'nested work\n');
+  git(nested, 'add', '.');
+  git(nested, '-c', 'commit.gpgsign=false', 'commit', '-m', 'nested');
+  const head = git(f.worktree, 'rev-parse', 'HEAD');
+  assert.throws(() => preserveWatchCheckout({ task: f.task, worktree: f.worktree, originalHead: head, remoteHead: head, gitFn: f.gitFn,
+    env: { ...process.env, MIVO_PLUGIN_REPO: f.plugin } }), /nested repository/);
+  assert.equal(git(nested, 'log', '--format=%s', '-1'), 'nested');
+  assert.throws(() => git(f.worktree, 'rev-parse', '--verify', preservedRefFor(f.task.dispatchId)));
+});

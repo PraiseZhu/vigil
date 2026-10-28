@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { cloneWorktree, prepare, preservedRefFor, repairPaths, REPO } from './bin/cindy-repair.mjs';
+import { cloneWorktree, prepare, preservedRefFor, preserveWatchCheckout, repairPaths, REPO } from './bin/cindy-repair.mjs';
 import { writePr } from './bin/cindy-state.mjs';
 
 const DISPATCH = 'live-7-2026-10-28T01:02:03.000Z';
@@ -95,3 +95,31 @@ test('prepare is a no-op on a clean clone at the PR head', (t) => {
   assert.equal(result.realigned, null);
 });
 
+test('preserving uses a private index: what the session had staged stays exactly as it was', (t) => {
+  const f = fixture(t);
+  const wt = f.checkout.worktree;
+  fs.writeFileSync(path.join(wt, 's.txt'), 'staged\n');
+  git(wt, 'add', 's.txt');
+  fs.writeFileSync(path.join(wt, 'a.txt'), 'unstaged edit\n');
+  fs.writeFileSync(path.join(wt, 'u.txt'), 'untracked\n');
+  const head = git(wt, 'rev-parse', 'HEAD');
+  const saved = preserveWatchCheckout({ task: f.task, worktree: wt, originalHead: head, remoteHead: head, gitFn: f.gitFn, env: f.env });
+  assert.equal(git(wt, 'diff', '--cached', '--name-only'), 's.txt');
+  assert.match(git(wt, 'show', saved.backupHead + ':u.txt'), /untracked/);
+  assert.match(git(wt, 'show', saved.backupHead + ':a.txt'), /unstaged edit/);
+});
+
+test('a nested repository in the watch tree is refused and the tree is left untouched', (t) => {
+  const f = fixture(t);
+  const wt = f.checkout.worktree;
+  const nested = path.join(wt, 'nested');
+  fs.mkdirSync(nested);
+  git(nested, 'init', '-b', 'main');
+  fs.writeFileSync(path.join(nested, 'n.txt'), 'nested work\n');
+  git(nested, 'add', '.');
+  git(nested, '-c', 'commit.gpgsign=false', 'commit', '-m', 'nested');
+  const head = git(wt, 'rev-parse', 'HEAD');
+  assert.throws(() => preserveWatchCheckout({ task: f.task, worktree: wt, originalHead: head, remoteHead: head, gitFn: f.gitFn, env: f.env }), /nested repository/);
+  assert.equal(git(nested, 'log', '--format=%s', '-1'), 'nested');
+  assert.throws(() => git(wt, 'rev-parse', '--verify', preservedRefFor(f.task.dispatchId)));
+});

@@ -67,4 +67,3 @@ test('processPr still dispatches an OPEN PR', (t) => {
   assert.equal(open.sent.length, 1);
   assert.equal(open.report[0].dispatch.attempted, true);
 });
-

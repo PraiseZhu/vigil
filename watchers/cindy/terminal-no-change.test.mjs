@@ -70,3 +70,21 @@ test('terminal finalize rejects a pass SC and consumeResult rejects a forged ter
   assert.throws(() => consumeResult({ nodeId: 'PR_7', sessionId: 'sess-7' }, forged, 'now'), /terminal completion receipt is invalid/);
 });
 
+test('terminal finalize rejects a PR that ended on a different head than the task was dispatched for', (t) => {
+  const f = fixture(t, 'CLOSED');
+  const drifted = (binary, args) => JSON.stringify({ id: 'PR_7', state: 'CLOSED', isDraft: false, headRefOid: 'c'.repeat(40), headRefName: 'fix/x', baseRefOid: 'b'.repeat(40) });
+  assert.throws(() => finalize({ home: f.home, taskPath: f.taskPath, scReport: f.scReport, validatedHead: HEAD,
+    ghFn: drifted, gitFn: () => '', keelRoot: '/tmp' }), /TERMINAL_HEAD_DRIFT/);
+  const receipt = finalize({ home: f.home, taskPath: f.taskPath, scReport: f.scReport, validatedHead: HEAD, ghFn: f.ghFn, gitFn: () => '', keelRoot: '/tmp' });
+  assert.equal(isTerminalNoChangeResult({ ...receipt, terminalPr: { ...receipt.terminalPr, head: 'c'.repeat(40) } }), false);
+});
+
+test('a closed PR does not skip the arbiter rule: a code finding closed as no-change still needs a ruling', (t) => {
+  const f = fixture(t, 'CLOSED');
+  const task = JSON.parse(fs.readFileSync(f.taskPath, 'utf8'));
+  task.feedback = [{ key: 'thread:P2', source: 'thread', nativeId: 'PRRT_1:PRRC_1', sha: HEAD, user: { login: 'greptile-apps[bot]', type: 'Bot' }, author: 'greptile-apps[bot]', body: '**P2**: concrete finding', category: 'actionable-fix' }];
+  fs.writeFileSync(f.taskPath, JSON.stringify(task));
+  fs.writeFileSync(f.scReport, JSON.stringify({ scs: [{ id: 'SC1', status: 'no-change', evidence: ['不成立'], feedbackKeys: ['thread:P2'] }], workers: null }));
+  assert.throws(() => finalize({ home: f.home, taskPath: f.taskPath, scReport: f.scReport, validatedHead: HEAD,
+    ghFn: f.ghFn, gitFn: () => '', keelRoot: '/tmp' }), /ADJUDICAT/);
+});

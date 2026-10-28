@@ -281,6 +281,17 @@ function preservedMessage(task, originalHead, reasons, now) {
   ].join('\n');
 }
 
+// git add -A records only a gitlink for a submodule and skips a nested repository's own history, so a backup would
+// look complete while losing that work. Such trees are refused and left exactly as they are.
+function assertPreservable(worktree, gitFn) {
+  const lines = gitOutput(['-C', worktree, 'status', '--porcelain=v2', '--untracked-files=all', '--ignore-submodules=none'], gitFn).split('\n');
+  for (const line of lines) {
+    const fields = line.split(' ');
+    if ((fields[0] === '1' || fields[0] === '2') && /^S(?!\.\.\.)/.test(fields[2] ?? '')) fail(`worktree has submodule changes (${fields.at(-1)}); refusing to preserve it`);
+    if (fields[0] === 'u') fail('worktree has unmerged index entries; refusing to preserve it');
+    if (fields[0] === '?' && line.endsWith('/')) fail(`worktree has a nested repository (${line.slice(2)}); refusing to preserve it`);
+  }
+}
 // Snapshot every Git-visible part of a drifted watch checkout into a local ref before any reset.
 // Tracked, staged and ordinary untracked content are recoverable from the resulting commits.
 export function preserveWatchCheckout({ task, worktree, originalHead, remoteHead, gitFn = command, env = process.env, now = new Date().toISOString() }) {
@@ -291,6 +302,7 @@ export function preserveWatchCheckout({ task, worktree, originalHead, remoteHead
   if (status) reasons.push('dirty');
   if (!reasons.length) return null;
   if (gitOutput(['-C', worktree, 'ls-files', '-u'], gitFn).trim()) fail('worktree has unmerged index entries; refusing to preserve it');
+  assertPreservable(worktree, gitFn);
   const backupRef = preservedRefFor(task.dispatchId);
   let previousBackupHead = null;
   try { previousBackupHead = gitOutput(['-C', worktree, 'rev-parse', '--verify', '--quiet', backupRef], gitFn).trim(); } catch { previousBackupHead = null; }
@@ -742,10 +754,12 @@ export function assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview
   const permissions = new Map(taskRepairPolicy(task).items.map((item) => [item.key, item]));
   const testDoc = testDocFeedbackKeys(task);
   const bodies = new Map((task?.feedback ?? []).map((item) => [item?.key, item?.body]));
+  // Only the review account writes trusted finding markers; anyone else can type one into a comment.
+  const markerTrusted = new Set((task?.feedback ?? []).filter((item) => item?.source === 'mivo-review').map((item) => item.key));
   const shas = new Map((task?.feedback ?? []).map((item) => [item?.key, item?.sha]));
-  // The reviewed version is the finding marker's head, or the feedback item's own commit when
-  // the marker is absent. Without either, already-fixed proves nothing and the arbiter rule stands.
-  const reviewedHeadFor = (key) => findingMarkerOf(bodies.get(key))?.head ?? shas.get(key) ?? null;
+  // The reviewed version is the review account's finding marker head, or the feedback item's own commit (from the
+  // GitHub API) otherwise. Without either, already-fixed proves nothing and the arbiter rule stands.
+  const reviewedHeadFor = (key) => (markerTrusted.has(key) ? findingMarkerOf(bodies.get(key))?.head : null) ?? shas.get(key) ?? null;
   const proofFor = (sc) => {
     const fixedBy = sc.evidence.map((line) => line.trim()).find((line) => line.startsWith(ALREADY_FIXED))
       ?.slice(ALREADY_FIXED.length).trim().split(/\s+/)[0] ?? '';
@@ -1364,6 +1378,8 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
     const { scs, feedbackCoverage, workers } = loadScs(scReport, task);
     if (validatedHead !== task.headRefOid) fail('terminal finalize requires validated-head to equal the dispatched head');
     if (!scs.every((sc) => sc.status === 'no-change')) fail('[TERMINAL_NO_CHANGE_ONLY] a closed or merged PR only accepts all-no-change SCs');
+    // The PR must have ended on the head this task was about; a later push means the no-change was judged on stale code.
+    if (observed.headRefOid !== task.headRefOid) fail(`[TERMINAL_HEAD_DRIFT] PR ended at ${observed.headRefOid}, task was dispatched for ${task.headRefOid}`);
     const worktree = taskWorktree(task);
     let checkoutState = 'missing-after-close';
     if (fs.existsSync(worktree)) {
@@ -1371,6 +1387,10 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
       if (!checked || checked.head !== validatedHead) fail('worktree HEAD does not match validated-head');
       checkoutState = 'verified-clean';
     }
+    // A closed PR does not lower the bar for calling a finding wrong: the same adjudication rules apply.
+    assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview: alreadyFixedProof({ worktree, validatedHead, gitFn }) });
+    assertRepeatInventory({ scs, task });
+    assertStandardAllowsDisputes({ scs, task });
     const verification = { status: 'not-required-no-change', head: validatedHead, localTests: 'not-run', reason: 'PR 已结束，本轮未修改' };
     const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot, validatedHead, verification });
     const workersField = workers ? { workers } : {};

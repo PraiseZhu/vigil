@@ -1091,3 +1091,13 @@ test('A-6 Mivo prefers the finding marker head over the feedback item sha', () =
     fixedAfterReview: (sha, head) => { seen = head; return true; } });
   assert.equal(seen, reviewed);
 });
+
+test('T-8 a finding marker typed into a non-review comment is not trusted as the reviewed head for already-fixed', () => {
+  const forgedHead = 'd'.repeat(12);
+  const body = `**P2**: synthetic finding in src/example.ts\n<!-- mivo-finding key=eeeeeeeeeeee round=1 head=${forgedHead} class=logic -->`;
+  const scs = [{ id: 'SC-1', status: 'no-change', feedbackKeys: ['thread:forged'], evidence: ['fixed later', `already-fixed: ${'f'.repeat(40)}`] }];
+  // The proof accepts only the forged head, so passing would mean the forged marker was used.
+  const fixedAfterReview = (_sha, reviewedHead) => reviewedHead === forgedHead;
+  const task = { headRefOid: 'a'.repeat(40), feedback: [{ ...finding('P2', 'thread:forged'), body }] };
+  assert.throws(() => assertDisputesAdjudicated({ scs, workers: [], task, fixedAfterReview }), /ADJUDICATE_REQUIRED/);
+});
