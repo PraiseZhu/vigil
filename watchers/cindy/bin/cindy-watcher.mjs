@@ -2334,8 +2334,16 @@ const RULES_REFRESH_ATTEMPTS = 3;
 function* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn, remaining, unlockForDispatch, relockForDispatch }) {
   const version = rulesVersion();
   const entry = readPr(paths.home, key);
-  if (dryRun || typeof dispatchFn !== 'function' || !entry?.sessionId || entry.rulesVersion === version
-    || entry.retiredSession?.sessionId === entry.sessionId) return null;
+  if (dryRun || typeof dispatchFn !== 'function' || !entry?.sessionId || entry.retiredSession?.sessionId === entry.sessionId) return null;
+  // A session whose task is complete is not refreshed, even when the PR is quiet and never reaches processPr: it is
+  // listed for the sweeper here, and the next feedback opens a fresh session.
+  if (entry.activeTask?.status === 'complete' && entry.activeTask.dispatchId && !entry.pendingDispatch) {
+    const retired = { sessionId: entry.sessionId, dispatchId: entry.activeTask.dispatchId, at: now };
+    retireSession(paths, { sessionId: entry.sessionId, nodeId: key, number: entry.number, dispatchId: retired.dispatchId, at: now });
+    writePr(paths.home, key, { ...entry, retiredSession: retired });
+    return 'session-retired';
+  }
+  if (entry.rulesVersion === version) return null;
   if (item?.dispatch?.attempted || item?.dispatch?.reason === 'dispatch-budget-deferred' || item?.dispatch?.reason === 'merge-ready'
     || entry.mergeReady === true || entry.collectRetry || Number(entry.pendingFeedback ?? 0) > 0) return null;
   if (entry.pendingDispatch || entry.needsHuman || entry.optOut || entry.closedHandled || entry.wasDraft === true

@@ -147,7 +147,7 @@ node watchers/<mivo|cindy>/deploy.mjs apply --plan <file>
 
 ### 修复会话的生命周期与归档
 
-- 一个任务一个会话：任务完成（`complete`）后，watcher 把这个会话写进 `state/retired-sessions.json`，下一批反馈开新会话，消息开头带一段前情摘要（上一会话、上一轮 SC、已处理的意见）。任务还没完成（`blocked`、`waiting-ci`）时，后续反馈仍发回原会话。同一个 PR 同一时间只有一个任务在跑，所有会话共用该 PR 的 watch 工作树。
+- 一个任务一个会话：任务完成（`complete`）后，watcher 在下一轮就把这个会话写进 `state/retired-sessions.json`（PR 没有新动静、走指纹跳过的轮次也一样，这时不再给它发规则刷新），下一批反馈开新会话，消息开头带一段前情摘要（上一会话、上一轮 SC、已处理的意见）。任务还没完成（`blocked`、`waiting-ci`）时，后续反馈仍发回原会话。同一个 PR 同一时间只有一个任务在跑，所有会话共用该 PR 的 watch 工作树。
 - watcher 自己不能归档会话（调度脚本只有 `sessions.dispatch`）。归档由清理伙伴的例行任务读这份名单完成，工作树和分支仍在 PR 合并后清理。
 
 ## 7. 本地 validate 的并发、日志与收据

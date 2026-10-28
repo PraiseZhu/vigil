@@ -86,7 +86,7 @@ test('a receipt records the rules version of the message that was actually deliv
 
 test('an idle bound session with older rules gets the current rules once', (t) => {
   const paths = homeOf(t);
-  seedBound(paths, { rulesVersion: '0123456789ab' });
+  seedBound(paths, { rulesVersion: '0123456789ab', activeTask: { status: 'blocked', blockedKind: 'scope' } });
   const calls = [];
   const dispatchFn = (params) => { calls.push(params); return { target_session_id: 'sess-790' }; };
   const first = discover(t, paths, dispatchFn);
@@ -98,7 +98,7 @@ test('an idle bound session with older rules gets the current rules once', (t) =
   const entry = readPr(paths.home, nodeId);
   assert.equal(entry.rulesVersion, rulesVersion());
   assert.equal(entry.repairRounds, undefined, 'a rules refresh is not a repair round');
-  assert.equal(entry.activeTask.status, 'complete');
+  assert.equal(entry.activeTask.status, 'blocked');
   discover(t, paths, dispatchFn);
   assert.equal(calls.length, 1, 'the same version is not sent twice');
 });
@@ -115,9 +115,25 @@ test('a session with a task running, pending feedback or a merge-ready PR is not
   }
 });
 
+test('an idle session whose task is complete is listed for the sweeper, not refreshed, even on a quiet PR', (t) => {
+  const paths = homeOf(t);
+  seedBound(paths, { rulesVersion: '0123456789ab', activeTask: { status: 'complete', dispatchId: 'live-790-1' } });
+  const calls = [];
+  const dispatchFn = (params) => { calls.push(params); return { target_session_id: 'sess-790' }; };
+  const first = discover(t, paths, dispatchFn);
+  assert.equal(calls.length, 0, 'a finished session gets no rules refresh');
+  assert.equal(first.prs[0].rulesRefresh, 'session-retired');
+  const retired = JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions;
+  assert.deepEqual(retired.map((item) => [item.sessionId, item.dispatchId, item.number]), [['sess-790', 'live-790-1', 790]]);
+  assert.deepEqual(readPr(paths.home, nodeId).retiredSession, { sessionId: 'sess-790', dispatchId: 'live-790-1', at: '2026-10-16T00:00:00Z' });
+  discover(t, paths, dispatchFn);
+  assert.equal(calls.length, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions.length, 1, 'listed once');
+});
+
 test('a refresh that fails is retried at most three times per rules version', (t) => {
   const paths = homeOf(t);
-  seedBound(paths);
+  seedBound(paths, { activeTask: { status: 'blocked', blockedKind: 'scope' } });
   let calls = 0;
   const dispatchFn = () => { calls += 1; throw new Error('INTERNAL: host busy'); };
   for (let round = 0; round < 5; round += 1) discover(t, paths, dispatchFn);
