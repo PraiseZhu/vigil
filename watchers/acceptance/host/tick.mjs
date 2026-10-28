@@ -11,7 +11,7 @@ import { createGithub } from '../bin/github.mjs';
 import { runRound as runRoundCommand } from '../bin/round.mjs';
 import { appendAlert, hostPaths, isAlive, readAlerts, readLockPayload } from './paths.mjs';
 import { run as procRun, spawnBackground } from './proc.mjs';
-import { MAX_ROUNDS, TEST_LOCK_PATTERN, readHostConfig } from './round.mjs';
+import { MAX_ROUNDS, readHostConfig, serialLockFiles } from './round.mjs';
 import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbot.mjs';
 import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
 import { defaultSpawnAdjudicate, scheduleAdjudications } from './adjudicate.mjs';
@@ -302,6 +302,28 @@ export async function runTick({
     const registry = readRegistry(paths);
     const byIssue = new Map(registry.map((entry) => [entry.issue, entry]));
 
+    // 同仓最多 1 轮的锁（mivo 测试锁 + host.json serialRepos）：锁被活着的轮次占着的仓，这一拍不起它的验收轮
+    // （起了也只会在认领前退出 3，白占这一拍的空槽）。host.json 读不了 / 名单写错：这里按「只有 mivo」算，
+    // round.mjs 自己会在认领前报错、不认领。
+    let tickHostConfig = {};
+    try {
+      tickHostConfig = readHostConfig(paths.hostConfig);
+      serialLockFiles(paths, [], tickHostConfig);
+    } catch {
+      tickHostConfig = {};
+    }
+    const lockFilesFor = (issue) => {
+      try {
+        return serialLockFiles(paths, [String(issue || '').split('#')[0]], tickHostConfig);
+      } catch {
+        return [];
+      }
+    };
+    const lockHeld = (file) => {
+      const held = readLockPayload(file);
+      return Boolean(held && isAlive(Number(held.pid)));
+    };
+
     // 2. 卡住的轮次（poll 按宿主侧进度时间判定）：有活进程先杀，等它退出，再 abort。
     for (const entry of entries.filter((item) => item?.stale)) {
       const record = byIssue.get(entry.issue);
@@ -366,17 +388,12 @@ export async function runTick({
         const discover =
           discoverPrbot || ((options) => discoverCorrections({ ...options, github: prbotGithub, profile: prbotProfile, hostConfig: prbotSettings }));
         const found = await discover({ now, home });
-        // 修正轮和验收轮共用 2 个槽：先给这一拍该开始的验收轮留位（测试锁被占、起不来的 mivo 验收轮不算），剩下的才给修正轮。
-        const testLockHeld = (() => {
-          const held = readLockPayload(paths.testLock);
-          return Boolean(held && isAlive(Number(held.pid)));
-        })();
+        // 修正轮和验收轮共用 2 个槽：先给这一拍该开始的验收轮留位（同仓锁被占、起不来的 mivo / serialRepos 验收轮不算），剩下的才给修正轮。
         const pendingAcceptance = entries.filter((item) => {
           if (!item || item.stale) return false;
           const record = byIssue.get(item.issue);
           if (record && isAlive(Number(record.pid))) return false;
-          const repoName = String(item.issue || '').split('#')[0].split('/')[1] || '';
-          return !(testLockHeld && TEST_LOCK_PATTERN.test(repoName));
+          return !lockFilesFor(item.issue).some(lockHeld);
         }).length;
         // 写闸总开关关着：修正轮的写（推分支、开 PR、写评论）同样全被拒，起了只会白跑、白耗重试次数，所以也不起。
         let prbotFree = gateEnabled ? Math.max(0, MAX_ROUNDS - liveSlotCount(paths) - pendingAcceptance) : 0;
@@ -412,15 +429,26 @@ export async function runTick({
     }
 
     // 3. 该开始的任务：已在跑的不重开，最多占到空槽数；总开关关着就一个都不起。
+    //    同仓最多 1 轮的仓：锁被占着、或这一拍已经给同一把锁起过一轮的，记进 serialWaiting，等锁放了再起（不认领、不写提醒）。
     let free = gateEnabled ? Math.max(0, MAX_ROUNDS - liveSlotCount(paths)) : 0;
+    const serialWaiting = [];
+    const claimedThisTick = new Set();
     for (const entry of entries.filter((item) => item && !item.stale && !item.outOfScope && !item.passedButOpen && !item.adjudicate)) {
       if (free <= 0) break;
       const record = byIssue.get(entry.issue);
       if (record && isAlive(Number(record.pid))) continue;
+      const lockFiles = lockFilesFor(entry.issue);
+      if (lockFiles.some((file) => claimedThisTick.has(file) || lockHeld(file))) {
+        serialWaiting.push({ issue: entry.issue });
+        continue;
+      }
+      for (const file of lockFiles) claimedThisTick.add(file);
       const pid = startRound(entry.issue);
       heartbeat.lastTick.started.push({ issue: entry.issue, pid: pid ?? null });
       free -= 1;
     }
+    // 只在有 issue 等同仓锁时才写进心跳（心跳的形状平时不变）。
+    if (serialWaiting.length > 0) heartbeat.lastTick.serialWaiting = serialWaiting;
 
     // 3c. 有争议、等裁决（#46 SC8）：剩下的空槽给只读裁决运行；出错不拖垮这一拍。
     if (entries.some((item) => item?.adjudicate)) {

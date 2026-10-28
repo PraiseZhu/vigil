@@ -17,7 +17,7 @@
 |---|---|---|
 | 常驻调度 | `watchers/acceptance/host/loop` | 单实例（flock），**每分钟**跑一拍 `host/tick.mjs`，顺序照 `docs/acceptance-scheduler.md` |
 | 每小时巡检 | `watchers/acceptance/host/ensure.sh` | 给每小时一次的 routine 调用：心跳不超过 180 秒就不做事；心跳过期但原循环进程还在、单实例锁还占着，只记一条「心跳延迟」（`heartbeat-delayed`，进摘要），不补起；其中墙钟跳了很久、按机器实际运行时间心跳还在 180 秒内的，记 `host-frozen`（整机冻结），也不补起；其余情况把 `loop` 拉起来并写一条提醒（`stop.sh` 主动停过的记成部署重启 `loop-deploy-restarted`，进摘要；整机冻结后原循环已经不在的记 `heartbeat-stale-after-freeze`） |
-| 资源门 | `host/round.mjs` | 认领**之前**过内存门（MemAvailable ≥ 3 GiB）和测试锁（mivo 同时只跑一轮）；最多 2 轮同时跑 |
+| 资源门 | `host/round.mjs` | 认领**之前**过内存门（MemAvailable ≥ 3 GiB）和测试锁（mivo 同时只跑一轮；`host.json` 的 `serialRepos` 名单里的仓同样各自同时只跑一轮）；最多 2 轮同时跑 |
 | 写闸 | `host/write-gate.mjs` | 所有写动作在沙箱外再查一遍，以它为准（见第 3 节） |
 | 模型 | `host/round.mjs` + `<home>/config/host.json` | pi 用 **DeepSeek V4.1 Flash**，推理 **max**；有争议条目的裁决运行（`host/adjudicate.mjs`）用 `anthropic/claude-opus-5-5`，推理 **medium**（`adjudicateCommand`） |
 | 卡住 | `host/tick.mjs`、`host/round.mjs` | 按**宿主观察到的活动**判卡住（见第 4 节「轮次生命周期」）；卡住时**先结束进程，再 `round.mjs abort`** |
@@ -33,6 +33,7 @@
   "homeAllowDirs": ["<可选：沙箱里要只读看到的 HOME 内目录，比如 pi 的安装目录、pi 配置副本目录>"],
   "egressAllow": ["<LLM 网关 host>:443"],
   "maxRoundMinutes": 120,
+  "serialRepos": ["<可选：吃内存重、同一时刻只跑一轮的仓，owner/repo>"],
   "adjudicateCommand": ["pi", "--model", "anthropic/claude-opus-5-5", "--thinking", "medium"],
   "adjudicateMaxMinutes": 30,
   "slackDailyCap": 30
@@ -50,6 +51,13 @@ pi 不用自己 `git clone`，所以**只放行网关就够**；名单越短越�
 写错（通配、URL、缺端口）整轮直接起不来，不会悄悄放宽。
 
 `maxRoundMinutes` 可选：一轮的总时长上限（分钟，宿主墙钟，从认领算起），缺了或不是正数按 120。
+
+`serialRepos` 可选：`"owner/repo"` 数组（不分大小写，不认通配和 issue 号）。名单里的仓**同一时刻最多 1 轮**（验收轮 + 修正轮合计），
+用的是和 mivo 测试锁同一套锁：整轮持有 `state/host/locks/serial-<owner>__<repo>.lock`（每个仓一把，不和 mivo 共用），
+认领**之前**拿，拿不到这一拍就不认领（退出 3，不写评论、不算一轮、不进退避、不写提醒），等锁放了下一拍再认领；
+tick 不给锁被占的仓起进程，这一拍空出来的槽照样给别的仓，等锁的 issue 记在心跳 `lastTick.serialWaiting`（没人等就没有这个字段）。
+给内存吃得重的仓用（两个轮次同时跑 typecheck 会把整机内存吃光、被系统的内存保护杀掉）。不配就是空（老行为）；
+mivo 不用配，照旧按仓名占 `mivo-test.lock`。写错整轮起不来（不认领），不会悄悄放开并发。
 
 未知键一律忽略；写 `"sandbox": false` 或 `"noSandbox": true` **没有任何作用**——沙箱只有一条路。
 

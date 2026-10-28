@@ -1394,6 +1394,54 @@ test('#60 修正 5：Mivo 仓的修正轮整轮持测试锁（不看 host.json �
   assert.ok(plainSeen.every((holder) => holder === null));
 });
 
+test('serialRepos：名单里的重仓修正轮整轮持本仓的同仓锁（和验收轮共用一把）；锁被占就不认领；mivo-test.lock 不碰', async () => {
+  const HEAVY = 'example-owner/heavy-app';
+  const world = defaultTree({ roundStatus: '要修', rootRepo: HEAVY });
+  const correction = world.addIssue({ repo: HEAVY, number: 9, title: '修正', body: `[验收机] 修正 · 总 ${HEAVY}#1 · 项 ${HEAVY}#2 SC3 · 第 1 轮` });
+  world.addChild(`${HEAVY}#1`, correction.ref);
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state'), autoRepos: [`${OWNER}/*`, REPO, HEAVY] } });
+  const paths = hostPaths(home);
+  const hostConfig = { serialRepos: [HEAVY], prbot: { piCommand: ['pi'], repos: { [HEAVY]: { handoff: 'watcher' } } } };
+  const lockFile = path.join(paths.locksDir, 'serial-example-owner__heavy-app.lock');
+  const holder = (file) => {
+    try {
+      return JSON.parse(fs.readFileSync(file, 'utf8')).pid;
+    } catch {
+      return null;
+    }
+  };
+  const seen = [];
+  const result = await runOnce({
+    world,
+    home,
+    issue: correction.ref,
+    hostConfig,
+    statuses: [prStatus('c'.repeat(40), [greenRun()])],
+    preflightRunner: async () => ({ ok: true, runs: [] }),
+    onAction: (action) => {
+      seen.push({ serial: holder(lockFile), mivo: holder(paths.testLock) });
+      return undefined;
+    },
+  });
+  assert.equal(result.code, 0, JSON.stringify(result.actions.map((action) => action.type)));
+  assert.ok(seen.length > 3);
+  assert.ok(seen.every((entry) => entry.serial === process.pid && entry.mivo === null), '从认领到转 Ready 一直拿着本仓的锁，不碰 mivo 测试锁');
+  assert.equal(fs.existsSync(lockFile), false, '跑完放锁');
+
+  // 验收轮（活着的进程）占着这把锁：修正轮这一拍不认领，返回 3，什么都不写。
+  const other = defaultTree({ roundStatus: '要修', rootRepo: HEAVY });
+  const otherCorrection = other.addIssue({ repo: HEAVY, number: 9, title: '修正', body: `[验收机] 修正 · 总 ${HEAVY}#1 · 项 ${HEAVY}#2 SC3 · 第 1 轮` });
+  other.addChild(`${HEAVY}#1`, otherCorrection.ref);
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+  const blocked = await runOnce({ world: other, home, issue: otherCorrection.ref, hostConfig });
+  assert.equal(blocked.code, 3);
+  assert.deepEqual(blocked.actions, []);
+  assert.equal(fs.existsSync(lockFile), true, '别人的锁不动');
+  assert.equal(fs.existsSync(path.join(paths.slotsDir, 'slot-0')), false, '槽放回去');
+  fs.rmSync(lockFile);
+});
+
 test('#60 修正 6：交接方式没在 host.json 显式配置 -> 不认领，需人工处理只报一次；进行中的轮次不转 Ready', async () => {
   assert.equal(handoffFor({ prbot: { repos: { [REPO]: { handoff: 'watcher' } } } }, REPO), 'watcher');
   assert.equal(handoffFor({ prbot: { repos: { [REPO.toUpperCase()]: { handoff: 'owner' } } } }, REPO), 'owner', '仓名不分大小写');

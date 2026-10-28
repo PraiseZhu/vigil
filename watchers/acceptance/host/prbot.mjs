@@ -18,7 +18,7 @@ import { appendAlert, hostPaths, isAlive, readLockPayload, releaseLock, tryAcqui
 import { appendPrbotEvent } from './prbot-events.mjs';
 import { localEnv } from '../bin/localgit.mjs';
 import { run as procRun } from './proc.mjs';
-import { MEMORY_GATE_BYTES, TEST_LOCK_PATTERN, acquireSlot, readHostConfig, readMemAvailable } from './round.mjs';
+import { MEMORY_GATE_BYTES, acquireSerialLocks, acquireSlot, readHostConfig, readMemAvailable, releaseSerialLocks, serialLockFiles } from './round.mjs';
 import { CORRECTION_BOARD_VALUE, closesLine } from './prbot-gate-check.mjs';
 import { HANDOFF_VALUES, handoffFor, preflightCommands, repoConfig } from './prbot-config.mjs';
 import {
@@ -1429,13 +1429,18 @@ export async function runPrbotCorrection({
     releaseLock(lockFile);
     return 3;
   }
-  // Mivo 测试锁（#43：mivo 同时最多 1 轮，验收轮 + 修正轮合计）：和验收轮同一判定（仓名以 mivo 开头），整轮持有。
-  const needTestLock = [parseRef(issue).repo, parseRef(marker.root).repo].some((repo) => TEST_LOCK_PATTERN.test(repo.split('/')[1] || ''));
-  if (needTestLock && !tryAcquireLock(paths.testLock, { now })) {
-    releaseLock(slot.file);
-    releaseLock(lockFile);
-    return 3;
+  // 同仓最多 1 轮的锁（验收轮 + 修正轮合计），整轮持有，和验收轮同一判定（看修正子 issue 和总 issue 的仓）：
+  // Mivo 测试锁（#43：仓名以 mivo 开头）+ host.json serialRepos 名单里的仓各自一把。
+  let serialHeld = null;
+  try {
+    serialHeld = acquireSerialLocks(serialLockFiles(paths, [parseRef(issue).repo, parseRef(marker.root).repo], settings), now);
+  } finally {
+    if (!serialHeld) {
+      releaseLock(slot.file);
+      releaseLock(lockFile);
+    }
   }
+  if (!serialHeld) return 3;
 
   const context = { paths, settings, profile: acceptanceProfile, github: gateGithub, run, now, sleep, log };
   const pi = piRunner || runPiInSandbox;
@@ -2254,7 +2259,7 @@ export async function runPrbotCorrection({
         // 状态写不下去不影响放锁。
       }
     }
-    if (needTestLock) releaseLock(paths.testLock);
+    releaseSerialLocks(serialHeld);
     releaseLock(slot.file);
     releaseLock(lockFile);
   }

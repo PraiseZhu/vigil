@@ -104,6 +104,7 @@ Draft 已开、每次 CI 结果、再修开始、每轮进度**不发** Slack；
 - `preflight`：命令列表，每项是一条命令——字符串（只有程序本身，如 `".githooks/pre-push"`）或 argv 数组（如 `["npm", "test"]`）。
   没写就没有预检。
 - Mivo 测试锁不用配：仓名以 `mivo` 开头的仓（和验收轮同一判定）整个修正轮都持 `<home>/state/host/locks/mivo-test.lock`。
+- `host.json` 的 `serialRepos` 名单里的仓（修正子 issue 或总 issue 的仓在名单里）整个修正轮都持这个仓自己的 `<home>/state/host/locks/serial-<owner>__<repo>.lock`，和验收轮共用：合计同时最多 1 轮，锁被占这一拍不认领。
   以前的 `testLock` 键不再读。
 - `handoffNew`：拿到 PR 号后在预检沙箱里跑这条命令，再 `git commit -s`、重新打包推送。
 - `reviewCheckPattern`：`ready-stalled` 判「审查 check run」用的名字匹配，默认 `/review/i`。
