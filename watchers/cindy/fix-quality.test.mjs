@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { assertDisputesAdjudicated, assertRepeatInventory, testDocFeedbackKeys } from './bin/cindy-repair.mjs';
+import { alreadyFixedProof, assertDisputesAdjudicated, assertRepeatInventory, testDocFeedbackKeys } from './bin/cindy-repair.mjs';
 import { dispatchParams, repeatFindingsFor } from './bin/cindy-watcher.mjs';
 
 const HEAD = 'a'.repeat(40);
@@ -43,4 +43,20 @@ test('C-R1 a review thread fixed in an earlier task and raised again is a repeat
   assert.match(message, /deep-research/);
   assert.match(message, /测试、文档类意见直接修/);
   assert.match(message, /任务完成后，watcher 把本会话交给扫地僧归档/);
+});
+
+test('C-T3 already-fixed proof: in the validated head and not in the reviewed head; a missing head or a git error proves nothing', () => {
+  const FIX = 'f'.repeat(40);
+  const REVIEWED = 'e'.repeat(40);
+  const gitFor = (answers) => (binary, args) => {
+    const code = answers[`${args.at(-2)}..${args.at(-1)}`];
+    if (code === 0) return '';
+    throw Object.assign(new Error(`merge-base exit ${code}`), { status: code });
+  };
+  const proof = (answers) => alreadyFixedProof({ worktree: '/repo', validatedHead: HEAD, gitFn: gitFor(answers) });
+  assert.equal(proof({ [`${FIX}..${HEAD}`]: 0, [`${FIX}..${REVIEWED}`]: 1 })(FIX, REVIEWED), true);
+  assert.equal(proof({ [`${FIX}..${HEAD}`]: 0, [`${FIX}..${REVIEWED}`]: 0 })(FIX, REVIEWED), false, 'already in the reviewed head');
+  assert.equal(proof({ [`${FIX}..${HEAD}`]: 0, [`${FIX}..${REVIEWED}`]: 128 })(FIX, REVIEWED), false, 'reviewed head unreadable');
+  assert.equal(proof({ [`${FIX}..${HEAD}`]: 1, [`${FIX}..${REVIEWED}`]: 1 })(FIX, REVIEWED), false, 'not in the validated head');
+  assert.equal(proof({ [`${FIX}..${HEAD}`]: 0 })(FIX, null), false, 'no reviewed head');
 });

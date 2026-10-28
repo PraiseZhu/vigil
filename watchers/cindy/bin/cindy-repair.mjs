@@ -659,6 +659,17 @@ export function assertRepeatInventory({ scs, task }) {
   }
 }
 
+// already-fixed proof: the named commit is in the validated HEAD and not in the head the reviewer saw. A missing or
+// unreadable reviewed head, or any git error other than "not an ancestor" (exit 1), proves nothing.
+export function alreadyFixedProof({ worktree, validatedHead, gitFn }) {
+  const ancestry = (a, b) => {
+    try { gitOutput(['-C', worktree, 'merge-base', '--is-ancestor', a, b], gitFn); return 'yes'; }
+    catch (error) { return error?.status === 1 ? 'no' : 'unknown'; }
+  };
+  return (sha, reviewedHead) => typeof reviewedHead === 'string' && /^[0-9a-f]{7,40}$/.test(reviewedHead)
+    && ancestry(sha, validatedHead) === 'yes' && ancestry(sha, reviewedHead) === 'no';
+}
+
 export function assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview = null }) {
   const permissions = new Map(taskRepairPolicy(task).items.map((item) => [item.key, item]));
   const ruled = (workers ?? []).some((item) => item.purpose === 'adjudicate');
@@ -1088,11 +1099,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
   const { scs, feedbackCoverage, workers } = loadScs(scReport, task);
-  assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview: (sha, reviewedHead) => {
-    const isAncestor = (a, b) => { try { gitOutput(['-C', worktree, 'merge-base', '--is-ancestor', a, b], gitFn); return true; } catch { return false; } };
-    if (!isAncestor(sha, validatedHead)) return false;
-    return !reviewedHead || !isAncestor(sha, reviewedHead);
-  } });
+  assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview: alreadyFixedProof({ worktree, validatedHead, gitFn }) });
   assertRepeatInventory({ scs, task });
   const workersField = workers ? { workers } : {};
   const emptyRetrigger = allNoChange(scs) && isEmptyCiRetrigger(worktree, task.headRefOid, validatedHead, gitFn);

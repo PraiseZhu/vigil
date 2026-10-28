@@ -1217,9 +1217,9 @@ export function planExcludedHeadCi({ ci, state, headRefOid }) {
 }
 
 // Review threads on a changelog PR (e.g. Greptile flagging an inaccurate line, #1348) block its merge and nothing
-// else answers them. They go to a one-shot session that may only edit public/changelog.json, push, reply and
+// else answers them. They go to one session per PR that may only edit public/changelog.json, push, reply and
 // resolve; once the threads are gone the session is listed for the sweeper. A batch is the head plus the open
-// thread ids; each batch gets a few attempts, and a new head (the next daily update) starts over.
+// thread ids; each batch gets a few attempts an hour apart, and a new head (the next daily update) starts over.
 export const EXCLUDED_THREAD_ATTEMPTS = 3;
 export const EXCLUDED_THREAD_RETRY_MS = 60 * 60 * 1000;
 export const CHANGELOG_FILE = 'public/changelog.json';
@@ -1239,35 +1239,57 @@ export function excludedThreadMessage({ pr, view, threads, worktree }) {
     '做完回复一行 CHANGELOG_THREADS_DONE <新 head>；做不了就回复 CHANGELOG_THREADS_BLOCKED <原因>。watcher 看到讨论都关掉后会把本会话交给扫地僧归档。',
   ].join('\n');
 }
-export function* superviseExcludedThreads({ pr, view, paths, now, ghFn, dryRun, dispatchFn, state = null }) {
+// One session per changelog PR handles its threads: later batches and retries go back to it (they queue there), so
+// two sessions never edit the same watch worktree. A dispatch whose receipt never came back still counts as an
+// attempt, so a timeout cannot turn into a fresh session every round.
+const EXCLUDED_THREAD_PAGE = 100;
+function* openReviewThreads({ pr, ghFn }) {
   const [owner, name] = REPO.split('/');
-  const query = `query{repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){pullRequest(number:${Number(pr.number)}){reviewThreads(first:50){nodes{id isResolved isOutdated path comments(first:5){nodes{author{login} body url}}}}}}}`;
-  const raw = yield () => ghFn(['api', 'graphql', '-f', `query=${query}`]);
-  const open = (JSON.parse(raw)?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? []).filter((t) => t?.id && !t.isResolved && !t.isOutdated);
+  const threads = [];
+  let after = null;
+  for (;;) {
+    const page = after ? `,after:${JSON.stringify(after)}` : '';
+    const query = `query{repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){pullRequest(number:${Number(pr.number)}){reviewThreads(first:${EXCLUDED_THREAD_PAGE}${page}){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated path comments(first:30){nodes{author{login} body url}}}}}}}`;
+    const raw = yield () => ghFn(['api', 'graphql', '-f', `query=${query}`]);
+    const connection = JSON.parse(raw)?.data?.repository?.pullRequest?.reviewThreads;
+    if (!connection || !Array.isArray(connection.nodes)) throw new Error(`review threads unreadable for #${pr.number}`);
+    threads.push(...connection.nodes);
+    if (!connection.pageInfo?.hasNextPage) break;
+    if (!connection.pageInfo.endCursor) throw new Error(`review threads page cursor missing for #${pr.number}`);
+    after = connection.pageInfo.endCursor;
+  }
+  return threads.filter((t) => t?.id && !t.isResolved && !t.isOutdated);
+}
+export function* superviseExcludedThreads({ pr, view, paths, now, ghFn, dryRun, dispatchFn, state = null }) {
+  const open = yield* openReviewThreads({ pr, ghFn });
   let current = state ?? {};
-  const retirePrevious = () => {
-    if (!current.sessionId || current.retired) return;
-    if (!dryRun) retireSession(paths, { sessionId: current.sessionId, nodeId: pr.id, number: pr.number, dispatchId: current.dispatchId ?? null, at: now });
-    current = { ...current, retired: true };
-  };
   if (!open.length) {
-    retirePrevious();
+    if (current.sessionId && !current.retired) {
+      if (!dryRun) retireSession(paths, { sessionId: current.sessionId, nodeId: pr.id, number: pr.number, dispatchId: current.dispatchId ?? null, at: now });
+      current = { ...current, retired: true };
+    }
     return { state: current, dispatched: false, open: 0 };
   }
   const batch = `${view.headRefOid}:${open.map((t) => t.id).sort().join(',')}`;
   const sameBatch = current.batch === batch;
   if (sameBatch && Number(current.attempts ?? 0) >= EXCLUDED_THREAD_ATTEMPTS) return { state: current, dispatched: false, open: open.length, reason: 'attempts-exhausted' };
   const recent = current.at && Date.parse(now) - Date.parse(current.at) < EXCLUDED_THREAD_RETRY_MS;
-  if (current.sessionId && !current.retired && recent) return { state: current, dispatched: false, open: open.length, reason: 'in-flight' };
+  if (sameBatch && recent) return { state: current, dispatched: false, open: open.length, reason: 'in-flight' };
   if (dryRun) return { state: current, dispatched: false, open: open.length, reason: 'dry-run' };
   let worktree = null;
   try { worktree = watchWorktreePath(pluginRepoPath(), pr.number); } catch { worktree = null; }
   const dispatchId = `changelog-${pr.number}-${now}`;
-  const receipt = yield () => dispatchFn({ title: `更新日志 PR #${pr.number} 处理审查意见`, message: excludedThreadMessage({ pr, view, threads: open, worktree }) },
-    { timeoutMs: 60000 });
-  retirePrevious();
+  const session = current.sessionId && !current.retired ? current.sessionId : null;
   const attempts = sameBatch ? Number(current.attempts ?? 0) + 1 : 1;
-  return { state: { batch, attempts, sessionId: receipt?.target_session_id ?? null, dispatchId, at: now, retired: false }, dispatched: true, open: open.length };
+  const next = { batch, attempts, sessionId: session, dispatchId, at: now, retired: false };
+  try {
+    const receipt = yield () => dispatchFn({ title: `更新日志 PR #${pr.number} 处理审查意见`, message: excludedThreadMessage({ pr, view, threads: open, worktree }),
+      ...(session ? { target_session_id: session } : {}) }, { timeoutMs: 60000 });
+    return { state: { ...next, sessionId: receipt?.target_session_id ?? session }, dispatched: true, open: open.length };
+  } catch (error) {
+    // the request may still have reached Cindy: count the attempt and wait out the retry window
+    return { state: { ...next, receiptMissing: true }, dispatched: false, open: open.length, reason: 'dispatch-error', error: String(error?.message ?? error).slice(0, 200) };
+  }
 }
 
 export function* superviseExcludedHead({ pr, key, paths, now, ghFn, dryRun, collectCi = collectMivoCiSteps, dispatchFn = null }) {

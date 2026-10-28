@@ -124,13 +124,21 @@ test('执行:head 变了重新来一轮;CI 转绿后什么都不做', (t) => {
 });
 
 // --- 更新日志 PR 上的审查意见:派一个只许改 public/changelog.json 的会话,讨论清掉后交给扫地僧归档 ---
-function runThreads(paths, { threads, now = '2026-10-25T08:00:00Z', head = HEAD, sent = [] }) {
+function runThreads(paths, { threads, pages = null, now = '2026-10-25T08:00:00Z', head = HEAD, sent = [], dispatchError = null, queries = [] }) {
   const ghFn = (args) => {
     if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: pr.id, number: pr.number, headRefOid: head, baseRefOid: 'b'.repeat(40), state: 'OPEN', isDraft: false, url: pr.url });
-    if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: threads } } } } });
+    if (args[0] === 'api' && args[1] === 'graphql') {
+      queries.push(args.at(-1));
+      const reviewThreads = pages ? pages[queries.length - 1] : { nodes: threads };
+      return JSON.stringify({ data: { repository: { pullRequest: { reviewThreads } } } });
+    }
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
-  const dispatchFn = (params) => { sent.push(params); return { target_session_id: `cl-${sent.length}` }; };
+  const dispatchFn = (params) => {
+    sent.push(params);
+    if (dispatchError) throw new Error(dispatchError);
+    return { target_session_id: params.target_session_id ?? `cl-${sent.length}` };
+  };
   return drive(superviseExcludedHead({ pr, key: pr.id, paths, now, ghFn, dryRun: false, dispatchFn,
     collectCi: function* () { return { status: 'green', required: [] }; } }));
 }
@@ -166,11 +174,45 @@ test('更新日志 PR:讨论都关掉后,处理它的会话进待归档名单;�
   assert.equal(JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions.length, 1);
 });
 
-test('更新日志 PR:同一批意见最多派三次,一小时没处理完再派新会话并把上一个交去归档', (t) => {
+test('更新日志 PR:同一批意见最多派三次,隔一小时补派也发回原会话,不另开会话', (t) => {
   const paths = homeOf(t);
   const sent = [];
   for (const now of ['2026-10-25T08:00:00Z', '2026-10-25T09:01:00Z', '2026-10-25T10:02:00Z', '2026-10-25T11:03:00Z']) runThreads(paths, { threads: [greptile], sent, now });
   assert.equal(sent.length, 3);
-  const retired = JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions;
-  assert.deepEqual(retired.map((item) => item.sessionId), ['cl-1', 'cl-2']);
+  assert.deepEqual(sent.map((item) => item.target_session_id), [undefined, 'cl-1', 'cl-1']);
+  assert.equal(fs.existsSync(path.join(paths.stateDir, 'retired-sessions.json')), false);
+  assert.equal(readPr(paths.home, pr.id).excludedThreads.attempts, 3);
+});
+
+test('更新日志 PR:派发回执超时也算一次尝试,一小时内不重派,补派仍只有一个会话', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  const out = runThreads(paths, { threads: [greptile], sent, dispatchError: 'Cindy dispatch receipt timed out; pending dispatch retained' });
+  assert.equal(out.threads.dispatched, false);
+  assert.equal(out.threads.reason, 'dispatch-error');
+  const saved = readPr(paths.home, pr.id).excludedThreads;
+  assert.equal(saved.attempts, 1);
+  assert.equal(saved.receiptMissing, true);
+  const again = runThreads(paths, { threads: [greptile], sent, now: '2026-10-25T08:05:00Z' });
+  assert.equal(again.threads.reason, 'in-flight');
+  assert.equal(sent.length, 1);
+  runThreads(paths, { threads: [greptile], sent, now: '2026-10-25T09:01:00Z' });
+  assert.equal(sent.length, 2);
+  assert.equal(readPr(paths.home, pr.id).excludedThreads.attempts, 2);
+});
+
+test('更新日志 PR:讨论超过一页时翻页读全,后一页的讨论也会派出', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  const queries = [];
+  const resolved = { ...greptile, id: 'PRRT_done', isResolved: true };
+  const pages = [
+    { pageInfo: { hasNextPage: true, endCursor: 'CURSOR_1' }, nodes: [resolved] },
+    { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ ...greptile, id: 'PRRT_late' }] },
+  ];
+  const out = runThreads(paths, { pages, sent, queries });
+  assert.equal(queries.length, 2);
+  assert.match(queries[1], /after:"CURSOR_1"/);
+  assert.equal(out.threads.open, 1);
+  assert.match(sent[0].message, /PRRT_late/);
 });

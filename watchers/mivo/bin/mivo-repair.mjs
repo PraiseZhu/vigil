@@ -565,7 +565,12 @@ export const ADJUDICATE_SKIPPED = 'adjudicate-skipped:';
 // in Oct 2026. The one way out is a commit made after the review that already fixed it.
 export const ALREADY_FIXED = 'already-fixed:';
 const TEST_DOC_PATH_RE = /(^|\/)(docs|tests?|__tests__)\/|\.(test|spec)\.[cm]?[jt]sx?$|\.md$|^public\/changelog\.json$/;
-const TEST_DOC_CLASS_RE = /test|coverage|oracle|mock|precondition|verification|handoff|evidence|qa|pr-description|claim|doc/i;
+// Whole words of the reviewer's free-form class (e.g. test-coverage-gap, qa-handoff-mismatch, pr-description-mismatch);
+// substrings would also catch product classes such as claim-integrity or docker-*.
+const TEST_DOC_CLASS_WORDS = new Set(['test', 'tests', 'coverage', 'oracle', 'mock', 'precondition', 'verification', 'handoff', 'evidence', 'qa', 'description', 'doc', 'docs']);
+export function isTestDocClass(cls) {
+  return String(cls ?? '').toLowerCase().split(/[^a-z]+/).some((word) => TEST_DOC_CLASS_WORDS.has(word));
+}
 const FINDING_MARKER_RE = /<!--\s*mivo-finding\s+key=([0-9a-f]{12})\s+round=(?:\d+|null)\s+head=([0-9a-f]{7,40})(?:\s+class=([^\s>]+))?/;
 export function findingMarkerOf(body) {
   const match = FINDING_MARKER_RE.exec(String(body ?? ''));
@@ -580,7 +585,7 @@ export function testDocFeedbackKeys(task) {
     if (!item?.key || ['ci', 'conflict'].includes(item.source)) continue;
     const file = item.path ?? threadPaths.get(item.threadId) ?? null;
     const cls = findingMarkerOf(item.body)?.cls ?? '';
-    if ((file && TEST_DOC_PATH_RE.test(file)) || (cls && TEST_DOC_CLASS_RE.test(cls))) keys.add(item.key);
+    if ((file && TEST_DOC_PATH_RE.test(file)) || isTestDocClass(cls)) keys.add(item.key);
   }
   return keys;
 }
@@ -602,6 +607,17 @@ export function assertRepeatInventory({ scs, task }) {
       fail(`[REPEAT_INVENTORY_REQUIRED] ${sc.id} fixes a repeated finding (${keys.join(', ')}) without "${INVENTORY}" (every case of this problem class and whether it is handled) and "${APPROACH}" (point fix or root change, and why) evidence lines`);
     }
   }
+}
+
+// already-fixed proof: the named commit is in the validated HEAD and not in the head the reviewer saw. A missing or
+// unreadable reviewed head, or any git error other than "not an ancestor" (exit 1), proves nothing.
+export function alreadyFixedProof({ worktree, validatedHead, gitFn }) {
+  const ancestry = (a, b) => {
+    try { gitOutput(['-C', worktree, 'merge-base', '--is-ancestor', a, b], gitFn); return 'yes'; }
+    catch (error) { return error?.status === 1 ? 'no' : 'unknown'; }
+  };
+  return (sha, reviewedHead) => typeof reviewedHead === 'string' && /^[0-9a-f]{7,40}$/.test(reviewedHead)
+    && ancestry(sha, validatedHead) === 'yes' && ancestry(sha, reviewedHead) === 'no';
 }
 
 export function assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview = null }) {
@@ -1208,11 +1224,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
   const { scs, feedbackCoverage, workers } = loadScs(scReport, task);
-  assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview: (sha, reviewedHead) => {
-    const isAncestor = (a, b) => { try { gitOutput(['-C', worktree, 'merge-base', '--is-ancestor', a, b], gitFn); return true; } catch { return false; } };
-    if (!isAncestor(sha, validatedHead)) return false;
-    return !reviewedHead || !isAncestor(sha, reviewedHead);
-  } });
+  assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview: alreadyFixedProof({ worktree, validatedHead, gitFn }) });
   assertRepeatInventory({ scs, task });
   assertStandardAllowsDisputes({ scs, task });
   const workersField = workers ? { workers } : {};
