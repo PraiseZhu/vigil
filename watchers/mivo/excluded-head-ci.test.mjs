@@ -202,6 +202,21 @@ test('更新日志 PR:首次派发没收到回执时不再自动另开会话,通
   assert.equal(sent.length, 1);
   runThreads(paths, { threads: [greptile], sent, now: '2026-10-26T08:01:00Z' });
   assert.equal(sent.length, 2);
+  // the unaddressable session from the first dispatch is listed by title before the new one is opened
+  const retired = JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions;
+  assert.deepEqual(retired.map((item) => [item.sessionId, item.title, item.createdFrom]), [[null, '更新日志 PR #1278 处理审查意见', '2026-10-25T08:00:00Z']]);
+  assert.equal(sent[1].title, '更新日志 PR #1278 处理审查意见');
+});
+
+test('更新日志 PR:回执未知的会话把讨论都关掉后,按标题和派发时间进待归档名单,只记一次', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  runThreads(paths, { threads: [greptile], sent, dispatchError: 'Cindy dispatch receipt timed out; pending dispatch retained' });
+  runThreads(paths, { threads: [{ ...greptile, isResolved: true }], sent, now: '2026-10-25T08:30:00Z' });
+  runThreads(paths, { threads: [], sent, now: '2026-10-25T08:40:00Z' });
+  const retired = JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions;
+  assert.deepEqual(retired.map((item) => [item.sessionId, item.title, item.createdFrom, item.number]), [[null, '更新日志 PR #1278 处理审查意见', '2026-10-25T08:00:00Z', 1278]]);
+  assert.equal(sent.length, 1);
 });
 
 test('更新日志 PR:没送到的错误(HOST_NOT_READY)或已知会话的补派失败,一小时后照常重试', (t) => {

@@ -1263,14 +1263,23 @@ function* openReviewThreads({ pr, ghFn }) {
   }
   return threads.filter((t) => t?.id && !t.isResolved && !t.isOutdated);
 }
+export const changelogSessionTitle = (number) => `更新日志 PR #${Number(number)} 处理审查意见`;
 export function* superviseExcludedThreads({ pr, view, paths, now, ghFn, dryRun, dispatchFn, state = null }) {
   const open = yield* openReviewThreads({ pr, ghFn });
   let current = state ?? {};
+  // A session opened by a dispatch whose receipt never came back has no id here: list it by its title and dispatch
+  // time, and the sweeper looks it up in Cindy's session list.
+  const retireUnknown = () => {
+    if (!current.receiptUnknown || current.sessionId || current.unknownRetired) return;
+    if (!dryRun) retireSession(paths, { sessionId: null, title: changelogSessionTitle(pr.number), createdFrom: current.at, nodeId: pr.id, number: pr.number, dispatchId: current.dispatchId ?? null, at: now });
+    current = { ...current, unknownRetired: true };
+  };
   if (!open.length) {
     if (current.sessionId && !current.retired) {
       if (!dryRun) retireSession(paths, { sessionId: current.sessionId, nodeId: pr.id, number: pr.number, dispatchId: current.dispatchId ?? null, at: now });
       current = { ...current, retired: true };
     }
+    retireUnknown();
     return { state: current, dispatched: false, open: 0 };
   }
   const batch = `${view.headRefOid}:${open.map((t) => t.id).sort().join(',')}`;
@@ -1282,6 +1291,7 @@ export function* superviseExcludedThreads({ pr, view, paths, now, ghFn, dryRun, 
   const recent = current.at && Date.parse(now) - Date.parse(current.at) < EXCLUDED_THREAD_RETRY_MS;
   if (sameBatch && recent) return { state: current, dispatched: false, open: open.length, reason: 'in-flight' };
   if (dryRun) return { state: current, dispatched: false, open: open.length, reason: 'dry-run' };
+  retireUnknown(); // a day has passed: the unaddressable session is long done, hand it over before opening another
   let worktree = null;
   try { worktree = watchWorktreePath(pluginRepoPath(), pr.number); } catch { worktree = null; }
   const dispatchId = `changelog-${pr.number}-${now}`;
@@ -1289,7 +1299,7 @@ export function* superviseExcludedThreads({ pr, view, paths, now, ghFn, dryRun, 
   const attempts = sameBatch ? Number(current.attempts ?? 0) + 1 : 1;
   const next = { batch, attempts, sessionId: session, dispatchId, at: now, retired: false };
   try {
-    const receipt = yield () => dispatchFn({ title: `更新日志 PR #${pr.number} 处理审查意见`, message: excludedThreadMessage({ pr, view, threads: open, worktree }),
+    const receipt = yield () => dispatchFn({ title: changelogSessionTitle(pr.number), message: excludedThreadMessage({ pr, view, threads: open, worktree }),
       ...(session ? { target_session_id: session } : {}) }, { timeoutMs: 60000 });
     return { state: { ...next, sessionId: receipt?.target_session_id ?? session }, dispatched: true, open: open.length };
   } catch (error) {
