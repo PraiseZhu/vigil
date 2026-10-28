@@ -1001,3 +1001,37 @@ test('SC6 并发的两个 validate 对同一基线键只跑一次基线', async 
   assert.deepEqual(results.map((item) => item.status), ['baseline-only-failure', 'baseline-only-failure']);
   assert.equal(baselineRuns.length, 1);
 });
+
+// Findings about tests, docs, the PR body or handoff files are fixed, not disputed or adjudicated; the only
+// no-change is a commit after the reviewed head that already fixed it.
+const docFinding = (key = 'thread:doc') => ({ ...finding('P2', key), path: 'docs/pr/790/qa.md',
+  body: '**P2**: qa.md still binds the old head\n<!-- mivo-finding key=aaaaaaaaaaaa round=2 head=bbbbbbbbbbbb class=verification-evidence-mismatch -->' });
+
+test('T-1 a test/doc finding closed as no-change is rejected even with an arbiter ruling', async (t) => {
+  const f = fixture(t, { changed: false });
+  f.saveTask([docFinding()]);
+  f.report([f.sc('no-change', ['thread:doc'])], [ruled([{ feedbackKey: 'thread:doc', verdict: 'p3', reason: 'only wording' }])]);
+  assert.throws(f.finalize, /\[TEST_DOC_MUST_FIX\].*thread:doc/);
+  assert.equal(f.pushCalls.length, 0);
+});
+
+test('T-2 a test/doc finding closes as no-change when already-fixed names a commit in HEAD after the reviewed head', async (t) => {
+  const f = fixture(t, { changed: false });
+  f.saveTask([docFinding()]);
+  f.report([{ ...f.sc('no-change', ['thread:doc']), evidence: ['qa.md names the current head', `already-fixed: ${f.head}`] }], []);
+  assert.equal(f.finalize().status, 'complete');
+});
+
+test('T-3 already-fixed naming a commit that is not in HEAD is rejected', async (t) => {
+  const f = fixture(t, { changed: false });
+  f.saveTask([docFinding()]);
+  f.report([{ ...f.sc('no-change', ['thread:doc']), evidence: ['claimed fixed', `already-fixed: ${'c'.repeat(40)}`] }], []);
+  assert.throws(f.finalize, /\[TEST_DOC_MUST_FIX\]/);
+});
+
+test('T-4 a finding on a test file path is test/doc even without a reviewer class', async (t) => {
+  const f = fixture(t, { changed: false });
+  f.saveTask([{ ...finding('P2', 'thread:spec'), path: 'src/canvas/example.test.tsx' }]);
+  f.report([f.sc('no-change', ['thread:spec'])]);
+  assert.throws(f.finalize, /\[TEST_DOC_MUST_FIX\].*thread:spec/);
+});

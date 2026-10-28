@@ -219,6 +219,7 @@ test('a PR dispatched again in the follow pass gets its own task, not the first 
   let now = 0;
   let round = 1;
   const sent = [];
+  const messages = [];
   const plugin = fs.mkdtempSync(path.join(os.tmpdir(), 'parallel-follow-plugin-'));
   t.after(() => fs.rmSync(plugin, { recursive: true, force: true }));
   scanOnce({
@@ -243,10 +244,18 @@ test('a PR dispatched again in the follow pass gets its own task, not the first 
       const value = failing(pr);
       return { ...value, ci: { ...value.ci, required: [{ context: 'unit', status: 'failed', evidence: { id: round, runId: 10 + round, attempt: 1 } }] } };
     },
-    dispatchFn: (params) => { sent.push(params.target_session_id ?? 'create'); return { target_session_id: 'sess-841' }; },
+    dispatchFn: (params) => { sent.push(params.target_session_id ?? 'create'); messages.push(params.message); return { target_session_id: params.target_session_id ?? `sess-841-${sent.length}` }; },
     ownershipSnapshot: ownership,
   });
-  assert.deepEqual(sent, ['create', 'sess-841']);
+  // The first task completed, so its session is retired for the sweeper and the next batch opens a fresh session.
+  assert.deepEqual(sent, ['create', 'create']);
+  const retired = JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions;
+  assert.deepEqual(retired.map((item) => [item.sessionId, item.number]), [['sess-841-1', 841]]);
+  const entry = readPr(paths.home, 'PR_841');
+  assert.equal(entry.sessionId, 'sess-841-2');
+  assert.deepEqual(entry.predecessors.map((item) => [item.sessionId, item.reason]), [['sess-841-1', 'task-complete']]);
+  assert.match(messages[1], /新修复会话。上一会话 sess-841-1 已完成任务/);
+  assert.doesNotMatch(messages[0], /新修复会话/);
   const tasks = fs.readdirSync(path.join(paths.stateDir, 'tasks')).filter((name) => name.endsWith('.json')).sort();
   assert.deepEqual(tasks, ['live-841-2026-10-15T00:00:00Z.json', 'live-841-2026-10-15T00:00:45.000Z.json']);
   assert.equal(readPr(paths.home, 'PR_841').lastDispatch.dispatchId, 'live-841-2026-10-15T00:00:45.000Z');

@@ -16,7 +16,7 @@ import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor, normalizeActo
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent } from './cindy-review-resolve.mjs';
 import {
   autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt,
-  pluginRepoPath, preflightFile, watchWorktreePath,
+  pluginRepoPath, preflightFile, watchWorktreePath, threadIdOf,
 } from './cindy-repair.mjs';
 import { canonicalRuntime, runtimeSha256 } from './cindy-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
@@ -707,16 +707,26 @@ export const AUTO_ADVANCE_RULE = '全自动推进：目标是把 PR 推到可合
 export const WORKER_RULE = [
   '审查与 e2e 用 Orca Worker（create_worker），不用原生子代理：原生子代理不能指定通道，达不到路由要求。模型现读 ~/.claude/skills/orca-fanout/routing.json：审查取 review 档、e2e 取 e2e 档；本会话是 codex，取档位顶层三元组（不取 when_lead.claude-code），带上 provider_id；主选报 NO_PROVIDER_FOR_AGENT / PROVIDER_ROUTE_UNAVAILABLE 才按该档 fallbacks 顺序降级。本条是盯梢修复轮对全局「native subagent 锁定 Luna、不得用 Orca worker」要求的例外。',
   '审查/e2e Worker 只读、只交报告：不改文件、不 commit/push、不回复或 resolve thread；修复与受控 push 仍由本会话完成。开不了 Orca（没有工具或调用报错）才 blocked，reason 写错误原文；不要改用原生子代理，也不要只记一笔交差。',
-  '各执一词裁决：本会话核实后准备把审查机、Greptile 或仓库成员提的 P0/P1/P2（canChangeCode=true 的 code-fix 项）判为不成立、记 SC=no-change 时，不能自己定，必须先开一个只读裁决 Worker（purpose=adjudicate）。模型现读 ~/.claude/skills/orca-fanout/routing.json 的 adjudicate 档：本会话是 codex，取 adjudicate.when_lead.codex ?? adjudicate，带上 provider_id；条目带 agent_device_id 时原样传给 create_worker 的 agent_device_id（它指定裁决者跑在哪个远程网关，漏传会派到本机通路而开不出来）；主选报 NO_PROVIDER_FOR_AGENT / PROVIDER_ROUTE_UNAVAILABLE / BUDGET_MODEL_REQUIRES_API_MODE，或带 agent_device_id 的条目报 REMOTE_AGENT_DEVICE_UNREACHABLE / REMOTE_AGENT_SHARE_* 时，按该对象 fallbacks 顺序降级，每个备选同样原样带上它自己的 provider_id 与 agent_device_id。交给裁决者：原意见全文、相关代码位置、你复现与反驳的证据；要求它亲自读代码或复现，给出「成立 / 不成立」和理由，不改文件、不 commit/push、不回复。裁决成立就照修，记 SC=pass；裁决不成立才记 no-change，evidence 第一条仍写给评论人的人话结论并说明经裁决，另起一条写裁决者的理由。同一轮多条争议可交给同一个裁决者一并判。缺 adjudicate 档、没有 Orca 工具，或主选和全部备选都创建失败时，不 blocked、不改用原生子代理，也不换顾问顶替：在该 SC.evidence 加一条以 adjudicate-skipped: 开头的原因（missing-routing / no-tool / start-team-error / create-worker-error 与错误码），helper 会拒绝既没有 adjudicate Worker 也没有这条说明的 no-change。',
+  '各执一词裁决（测试、文档类意见不适用，按 TEST_DOC 规则直接修）：本会话核实后准备把审查机、Greptile 或仓库成员提的 P0/P1/P2（canChangeCode=true 的 code-fix 项）判为不成立、记 SC=no-change 时，不能自己定，必须先开一个只读裁决 Worker（purpose=adjudicate）。模型现读 ~/.claude/skills/orca-fanout/routing.json 的 adjudicate 档：本会话是 codex，取 adjudicate.when_lead.codex ?? adjudicate，带上 provider_id；条目带 agent_device_id 时原样传给 create_worker 的 agent_device_id（它指定裁决者跑在哪个远程网关，漏传会派到本机通路而开不出来）；主选报 NO_PROVIDER_FOR_AGENT / PROVIDER_ROUTE_UNAVAILABLE / BUDGET_MODEL_REQUIRES_API_MODE，或带 agent_device_id 的条目报 REMOTE_AGENT_DEVICE_UNREACHABLE / REMOTE_AGENT_SHARE_* 时，按该对象 fallbacks 顺序降级，每个备选同样原样带上它自己的 provider_id 与 agent_device_id。交给裁决者：原意见全文、相关代码位置、你复现与反驳的证据；要求它亲自读代码或复现，给出「成立 / 不成立」和理由，不改文件、不 commit/push、不回复。裁决成立就照修，记 SC=pass；裁决不成立才记 no-change，evidence 第一条仍写给评论人的人话结论并说明经裁决，另起一条写裁决者的理由。同一轮多条争议可交给同一个裁决者一并判。缺 adjudicate 档、没有 Orca 工具，或主选和全部备选都创建失败时，不 blocked、不改用原生子代理，也不换顾问顶替：在该 SC.evidence 加一条以 adjudicate-skipped: 开头的原因（missing-routing / no-tool / start-team-error / create-worker-error 与错误码），helper 会拒绝既没有 adjudicate Worker 也没有这条说明的 no-change。',
   '卡住求助：同一问题验证两次仍失败、或判断拿不准且 Jev 低置信时，可开只读顾问 Worker 诊断并给修法（各执一词走上一条裁决，不走顾问）。首选 agent=codex model=gpt-6.1-sol effort=medium provider_id=art-cindy；首选报不可用才用 agent=codex model=grok-4.6 effort=high。顾问禁止 max/ultra 档，禁止改文件、push、回复。同一 PR 同一 head 最多 2 个顾问（首选与备选合计）；用完仍卡住按 blocked 收口。',
   '每个 Worker 交回结论后立即 archive_worker。SC JSON 里用 workers:[{purpose:"review"|"e2e"|"consult"|"adjudicate",agent,model,effort,providerId,workerId,verdict}] 记下本轮开过的每个 Worker；helper 会拒绝超过 2 个顾问或顾问用 max/ultra 的报告。',
 ].join('');
 export const SIBLING_FIX_RULE = '对每条要修的 P0/P1/P2：检查同一函数及其调用方有没有同类问题，并一并修掉。同类问题联动修复不得突破允许路径和本 PR 范围。';
+export const TEST_DOC_RULE = '测试、文档类意见直接修，不争、不开裁决：凡是指向测试文件、docs/ 或 *.md、PR 正文的 P0/P1/P2，一律动手修（补或改测试，或如实改文档、PR 正文），记 SC=pass。唯一例外：审查看的是旧提交，之后已有提交修掉了，在 evidence 写一行「already-fixed: <该提交 SHA>」，helper 会核对它在当前 HEAD 里且晚于被审查的提交；否则 helper 拒收这类 no-change。';
+export const SESSION_SCOPE_RULE = '本会话只负责到本任务完成：任务未完成（blocked / waiting-ci）时，后续反馈仍发回本会话；任务完成后，watcher 把本会话交给扫地僧归档，下一批反馈由新会话接手（带前情摘要）。';
+export function repeatFindingRule(repeat = []) {
+  if (!repeat.length) return '';
+  return [
+    `重复出现的问题（${repeat.map((item) => `${item.feedbackKey}（讨论 ${item.threadId} 修过后再次提出）`).join('；')}）：不许再只补被点名的那一处。`,
+    '先加载 deep-research skill，按「这一类问题」盘点：列出它所有可能出现的输入/写法/调用路径，逐项写现在是否已处理；再决定修法——逐个补，还是从根上换做法（例如认不出的写法一律拦下、改成运行时检查）。可能情况列不完的必须选从根上换做法。',
+    '修复这些反馈的 SC 必须带两行 evidence：「inventory: <全部情况及处理状态>」「approach: <选的修法和理由>」，缺了 helper 拒收。',
+  ].join('');
+}
 export function handledFindingsSummary(items = []) {
   if (!Array.isArray(items) || !items.length) return '此前各轮已处理 finding：无。';
   return `此前各轮已处理 finding：${items.map((item) => `${item.key}${item.file ? ` ${item.file}` : ''} ${item.summary}`.trim()).join('；')}`;
 }
-export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messagePrefix = '', keelVersion = KEEL_FLOW_VERSION, version = null, handledFindings = [] }) {
+export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messagePrefix = '', keelVersion = KEEL_FLOW_VERSION, version = null, handledFindings = [], repeatFindings = [] }) {
   const repairPolicy = taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh });
   const title = mapping.title || repairSessionTitle({ task: pr.title, prNumber: pr.number, createdAt: now });
   const outdatedNotes = (fresh ?? [])
@@ -737,6 +747,9 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       `feedback=${JSON.stringify(fresh.map(({ key, source, nativeId, revision, sha, body, category, isOutdated }) => ({ key, source, nativeId, revision, sha, isOutdated, body: promptFeedbackBody(body), category })))}`,
       AUTO_ADVANCE_RULE,
       SIBLING_FIX_RULE,
+      TEST_DOC_RULE,
+      SESSION_SCOPE_RULE,
+      ...(repeatFindings.length ? [repeatFindingRule(repeatFindings)] : []),
       handledFindingsSummary(handledFindings),
       repairPolicy.canChangeCode ? 'OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY' : 'OWNER_STANDING_AUTH: NO_CODE_NO_PUSH_NO_EXTERNAL_REPLY',
       repairPolicy.canChangeCode ? '按下方 KEEL_FLOW 执行修复。' : '本轮只在当前会话说明并按 helper 以 no-change 收口，不改代码，不索取 push 或外发权限。',
@@ -959,14 +972,38 @@ function hasWatchOff({ home, number, comments, author, labels } = {}) {
   return isOptedOut({ home, number, comments, author });
 }
 
+// A review thread that comes back after an earlier task of this PR fixed it. Cindy's reviewers carry no stable
+// finding key or class, so the thread is the unit.
+export function repeatFindingsFor({ paths, pr, fresh }) {
+  const fixedThreads = new Set();
+  let names = [];
+  try { names = fs.readdirSync(path.join(paths.stateDir, 'tasks')); } catch { return []; }
+  for (const name of names) {
+    if (!name.endsWith('.json') || !name.startsWith(`live-${pr.number}-`)) continue;
+    const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', name));
+    const result = readJsonOrNull(path.join(paths.stateDir, 'results', name));
+    if (!task || !result || task.nodeId !== pr.id) continue;
+    const fixed = new Set((result.scs ?? []).filter((sc) => sc.status === 'pass').flatMap((sc) => sc.feedbackKeys ?? []));
+    for (const item of task.feedback ?? []) {
+      const thread = threadIdOf(item);
+      if (thread && fixed.has(item.key)) fixedThreads.add(thread);
+    }
+  }
+  return (fresh ?? []).flatMap((item) => {
+    const thread = threadIdOf(item);
+    return thread && fixedThreads.has(thread) ? [{ feedbackKey: item.key, threadId: thread, reason: 'same-thread' }] : [];
+  });
+}
+
 function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix = '', collected } = {}) {
+  const repeatFindings = repeatFindingsFor({ paths, pr, fresh });
   const headPr = prWithHeadRepo(pr, collected);
   const dispatchId = `${dryRun ? 'dry' : 'live'}-${headPr.number}-${now}`;
   const taskPath = path.join(paths.stateDir, 'tasks', `${dispatchId}.json`);
-  const pending = { dispatchId, params: dispatchParams({ pr: headPr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, handledFindings: collected?.handledFindings ?? [] }), at: now, taskPath };
+  const pending = { dispatchId, params: dispatchParams({ pr: headPr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, handledFindings: collected?.handledFindings ?? [], repeatFindings }), at: now, taskPath };
   if (!dryRun) {
     fs.mkdirSync(path.dirname(taskPath), { recursive: true });
-    atomic(taskPath, JSON.stringify({ dispatchId, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: headPr.id, number: headPr.number, repo: REPO, headRefOid: headPr.headRefOid, headRefName: headPr.headRefName, headRepo: headRepoOf(headPr), headOwner: headOwnerOf(headPr), feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: headPr.headRefOid, feedback: fresh }), prSnapshot: compactPrSnapshot(collected, now), params: pending.params, createdAt: now }));
+    atomic(taskPath, JSON.stringify({ dispatchId, repeatFindings, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: headPr.id, number: headPr.number, repo: REPO, headRefOid: headPr.headRefOid, headRefName: headPr.headRefName, headRepo: headRepoOf(headPr), headOwner: headOwnerOf(headPr), feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: headPr.headRefOid, feedback: fresh }), prSnapshot: compactPrSnapshot(collected, now), params: pending.params, createdAt: now }));
   }
   return pending;
 }
@@ -1062,6 +1099,27 @@ export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor,
   return { bound: true, sessionId: state.prs[key].sessionId, reused: Boolean(mapping.sessionId || previous.claimedAt) };
 }
 
+// Sessions whose task is complete, for the sweeper to archive. Append-only, capped; the sweeper keeps its own done list.
+export const RETIRED_SESSIONS_FILE = 'retired-sessions.json';
+const RETIRED_SESSIONS_CAP = 500;
+export function retireSession(paths, entry) {
+  const file = path.join(paths.stateDir, RETIRED_SESSIONS_FILE);
+  const current = readJsonOrNull(file);
+  const sessions = Array.isArray(current?.sessions) ? current.sessions : [];
+  if (sessions.some((item) => item?.sessionId === entry.sessionId && item?.dispatchId === entry.dispatchId)) return;
+  atomic(file, JSON.stringify({ version: 1, sessions: [...sessions, entry].slice(-RETIRED_SESSIONS_CAP) }, null, 2));
+}
+// The few lines a fresh session needs about the previous one; the handled-findings list follows in the message.
+export function sessionHandoffNote({ pr, previous, paths }) {
+  let result = null;
+  try { result = resultFor(previous, paths); } catch { result = null; }
+  const scs = (result?.scs ?? []).slice(0, 6).map((sc) => `${sc.id} ${sc.status}：${String(sc.evidence?.[0] ?? '').replace(/\s+/g, ' ').slice(0, 100)}`);
+  return [
+    `你是 PR #${pr.number} 的新修复会话。上一会话 ${previous.sessionId} 已完成任务 ${previous.activeTask?.dispatchId ?? '?'}（结果 ${result?.status ?? previous.activeTask?.status ?? '?'}，head ${String(result?.head ?? previous.activeTask?.head ?? '').slice(0, 12)}），已交给扫地僧归档，不要再给它发消息。`,
+    scs.length ? `上一轮 SC：${scs.join('；')}` : '',
+    `工作树沿用本 PR 的 watch 工作树（路径由 prepare 返回），照常先 prepare 再动手。`,
+  ].filter(Boolean).join('\n');
+}
 function resultFor(previous, paths) {
   const dispatchId = previous.activeTask?.dispatchId ?? previous.lastDispatch?.dispatchId;
   if (!dispatchId || !/^[A-Za-z0-9._:-]+$/.test(dispatchId)) return null;
@@ -1734,6 +1792,13 @@ export function* processPr({
       autoClosedThisRound = [...autoClosedThisRound, ...outcome.closed];
     }
   }
+  // A finished task's session is done: list it for the sweeper (Mini-扫地僧 archives it within ~2 min) and send
+  // the next batch of feedback to a fresh session with a short handoff, so no session keeps re-reading a long history.
+  if (!dryRun && !resultError && previous.activeTask?.status === 'complete' && previous.sessionId
+    && previous.retiredSession?.dispatchId !== previous.activeTask.dispatchId) {
+    retireSession(paths, { sessionId: previous.sessionId, nodeId: key, number: pr.number, dispatchId: previous.activeTask.dispatchId, at: now });
+    previous = { ...previous, retiredSession: { sessionId: previous.sessionId, dispatchId: previous.activeTask.dispatchId, at: now } };
+  }
   fresh = includeOpenThreadFeedback(fresh, allItems);
   // CI/threads can be ready while a trusted bot still has an unhandled finding
   // in an issue comment or COMMENTED review. Only fresh, authorized feedback
@@ -1931,8 +1996,16 @@ export function* processPr({
     previous = { ...previous, needsOwner: true };
     dispatch = { attempted: false, bound: false, reason: 'needs-owner' };
   } else if (shouldDispatch) {
-    const prefix = [reclaimNote(previous, pr.headRefName), messagePrefix].filter(Boolean).join('\n');
-    const pending = { ...dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix: prefix, collected: { ...collected, handledFindings: handledFindingsFrom(paths, previous) } }), cursor };
+    let dispatchMapping = mapping;
+    let handoffNote = '';
+    if (previous.sessionId && previous.retiredSession?.sessionId === previous.sessionId) {
+      handoffNote = sessionHandoffNote({ pr, previous, paths });
+      previous = { ...previous, sessionId: null, claimedAt: null,
+        predecessors: [...(previous.predecessors ?? []), { sessionId: previous.sessionId, at: now, reason: 'task-complete', lastDispatch: previous.lastDispatch ?? null }] };
+      dispatchMapping = { ...mapping, sessionId: null };
+    }
+    const prefix = [reclaimNote(previous, pr.headRefName), handoffNote, messagePrefix].filter(Boolean).join('\n');
+    const pending = { ...dispatchIntent({ pr, mapping: dispatchMapping, fresh, now, paths, dryRun, messagePrefix: prefix, collected: { ...collected, handledFindings: handledFindingsFrom(paths, previous) } }), cursor };
     previous = { ...previous, pendingDispatch: pending };
     if (dryRun) {
       dispatch = { attempted: false, bound: false, reason: 'dry-run', pending };
@@ -1941,7 +2014,7 @@ export function* processPr({
       persistState(state, paths);
       try {
         const receipt = yield* yieldDispatch(() => dispatchFn(pending.params,{timeoutMs:Math.max(1,remaining())}));
-        const bound = applyDispatchReceipt({ state, pr, mapping,
+        const bound = applyDispatchReceipt({ state, pr, mapping: dispatchMapping,
           receipt: { ...receipt, dispatch_id: receipt?.dispatch_id ?? pending.dispatchId },
           now, cursor, collected, fresh, paths });
         previous = yield* notifyDispatchConflictOnce({ previous: state.prs[key], key, paths, now, dryRun, dispatchFn, remaining, pr });
@@ -2261,7 +2334,8 @@ const RULES_REFRESH_ATTEMPTS = 3;
 function* refreshSessionRules({ key, item, paths, now, dryRun, dispatchFn, remaining, unlockForDispatch, relockForDispatch }) {
   const version = rulesVersion();
   const entry = readPr(paths.home, key);
-  if (dryRun || typeof dispatchFn !== 'function' || !entry?.sessionId || entry.rulesVersion === version) return null;
+  if (dryRun || typeof dispatchFn !== 'function' || !entry?.sessionId || entry.rulesVersion === version
+    || entry.retiredSession?.sessionId === entry.sessionId) return null;
   if (item?.dispatch?.attempted || item?.dispatch?.reason === 'dispatch-budget-deferred' || item?.dispatch?.reason === 'merge-ready'
     || entry.mergeReady === true || entry.collectRetry || Number(entry.pendingFeedback ?? 0) > 0) return null;
   if (entry.pendingDispatch || entry.needsHuman || entry.optOut || entry.closedHandled || entry.wasDraft === true

@@ -122,3 +122,55 @@ test('执行:head 变了重新来一轮;CI 转绿后什么都不做', (t) => {
   assert.deepEqual(quiet, []);
   assert.equal(out.ciStatus, 'green');
 });
+
+// --- 更新日志 PR 上的审查意见:派一个只许改 public/changelog.json 的会话,讨论清掉后交给扫地僧归档 ---
+function runThreads(paths, { threads, now = '2026-10-25T08:00:00Z', head = HEAD, sent = [] }) {
+  const ghFn = (args) => {
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: pr.id, number: pr.number, headRefOid: head, baseRefOid: 'b'.repeat(40), state: 'OPEN', isDraft: false, url: pr.url });
+    if (args[0] === 'api' && args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: threads } } } } });
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const dispatchFn = (params) => { sent.push(params); return { target_session_id: `cl-${sent.length}` }; };
+  return drive(superviseExcludedHead({ pr, key: pr.id, paths, now, ghFn, dryRun: false, dispatchFn,
+    collectCi: function* () { return { status: 'green', required: [] }; } }));
+}
+const greptile = { id: 'PRRT_cl', isResolved: false, isOutdated: false, path: 'public/changelog.json',
+  comments: { nodes: [{ author: { login: 'greptile-apps' }, url: 'https://example.test/t', body: 'P2 失败提示描述不准确' }] } };
+
+test('更新日志 PR:有没处理的审查意见就派一次只许改 changelog.json 的会话,同一批一小时内不重复派', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  const out = runThreads(paths, { threads: [greptile], sent });
+  assert.equal(out.threads.dispatched, true);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].target_session_id, undefined);
+  assert.match(sent[0].message, /只允许改 public\/changelog\.json/);
+  assert.match(sent[0].message, /PRRT_cl/);
+  assert.match(sent[0].message, /禁止 --no-verify 和 force push/);
+  assert.equal(readPr(paths.home, pr.id).excludedThreads.sessionId, 'cl-1');
+  const again = runThreads(paths, { threads: [greptile], sent, now: '2026-10-25T08:30:00Z' });
+  assert.equal(again.threads.reason, 'in-flight');
+  assert.equal(sent.length, 1);
+});
+
+test('更新日志 PR:讨论都关掉后,处理它的会话进待归档名单;没有讨论就不派', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  runThreads(paths, { threads: [greptile], sent });
+  const out = runThreads(paths, { threads: [{ ...greptile, isResolved: true }], sent, now: '2026-10-25T08:10:00Z' });
+  assert.equal(out.threads.open, 0);
+  assert.equal(sent.length, 1);
+  const retired = JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions;
+  assert.deepEqual(retired.map((item) => [item.sessionId, item.number]), [['cl-1', 1278]]);
+  runThreads(paths, { threads: [], sent, now: '2026-10-25T08:20:00Z' });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions.length, 1);
+});
+
+test('更新日志 PR:同一批意见最多派三次,一小时没处理完再派新会话并把上一个交去归档', (t) => {
+  const paths = homeOf(t);
+  const sent = [];
+  for (const now of ['2026-10-25T08:00:00Z', '2026-10-25T09:01:00Z', '2026-10-25T10:02:00Z', '2026-10-25T11:03:00Z']) runThreads(paths, { threads: [greptile], sent, now });
+  assert.equal(sent.length, 3);
+  const retired = JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'retired-sessions.json'), 'utf8')).sessions;
+  assert.deepEqual(retired.map((item) => item.sessionId), ['cl-1', 'cl-2']);
+});

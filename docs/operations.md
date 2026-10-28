@@ -139,10 +139,16 @@ node watchers/<mivo|cindy>/deploy.mjs apply --plan <file>
 
 分支名以 `chore/changelog-` 开头的 PR 由每日更新日志工作流生成，只改 `public/changelog.json`。这个工作流开完 PR 就结束，不看 CI、不合并。盯梢对它的处理和普通 PR 不同：
 
-- 不派修复会话：改动只有数据文件，会话只能去「修」与它无关的测试。
+- CI 红不派修复会话：改动只有数据文件，会话只能去「修」与它无关的测试。
+- 有没处理的审查讨论（例如 Greptile 指出某条更新日志写得不准）时，派一个一次性会话，只许改 `public/changelog.json` 里被指出的文字，推上去后逐条回复并 resolve。同一批讨论（head + 讨论 id）一小时内不重复派，最多派 3 次；下一天的更新换了 head 后重新计算。讨论都关掉后，这个会话进待归档名单。状态记在该 PR 条目的 `excludedThreads` 字段。
 - 必需检查变红时，对每个失败检查所在的 Actions run 调一次 `rerun-failed-jobs`；同一个 head、同一个 run 只重跑一次。只等上游的门（如 `pr-ci-freshness`）在上游没跑完时按分诊暂缓，不计入。
 - 重跑后的新一轮尝试仍然红，或失败的必需检查不是 Actions（没法重跑），就通知一次（通知类型 `excluded-head-ci-red`，按 PR 号和 head 去重）。
 - PR 被下一天的更新覆盖（head 变化）后重新计算。状态记在该 PR 条目的 `excludedHead` 字段。
+
+### 修复会话的生命周期与归档
+
+- 一个任务一个会话：任务完成（`complete`）后，watcher 把这个会话写进 `state/retired-sessions.json`，下一批反馈开新会话，消息开头带一段前情摘要（上一会话、上一轮 SC、已处理的意见）。任务还没完成（`blocked`、`waiting-ci`）时，后续反馈仍发回原会话。同一个 PR 同一时间只有一个任务在跑，所有会话共用该 PR 的 watch 工作树。
+- watcher 自己不能归档会话（调度脚本只有 `sessions.dispatch`）。归档由清理伙伴的例行任务读这份名单完成，工作树和分支仍在 PR 合并后清理。
 
 ## 7. 本地 validate 的并发、日志与收据
 

@@ -430,6 +430,13 @@ test('dispatchParams message contains repair rules and old bans', () => {
   assert.doesNotMatch(message, /禁止 create_worker|不要用 Orca Worker/, 'review and e2e must be allowed to use Orca Workers');
   assert.match(message, /start_team\(\{worker_permission_mode:"bypassPermissions"\}\)/);
   assert.match(message, /missing-routing/);
+  // a routing entry pinned to a remote gateway must reach create_worker, and an offline gateway falls back
+  assert.match(message, /条目带 agent_device_id 时原样传给 create_worker 的 agent_device_id/);
+  assert.match(message, /REMOTE_AGENT_DEVICE_UNREACHABLE \/ REMOTE_AGENT_SHARE_\* 时，按该对象 fallbacks 顺序降级/);
+  assert.match(message, /主选和全部备选都创建失败时/);
+  assert.match(message, /测试、文档类意见直接修，不争、不开裁决/);
+  assert.match(message, /各执一词裁决（测试、文档类意见不适用/);
+  assert.match(message, /任务完成后，watcher 把本会话交给扫地僧归档/);
   assert.match(message, /本机缺 routing\.json 或开不了 Orca Worker 时不 blocked/);
   assert.match(message, /不要改用原生子代理/);
   assert.match(message, /required CI、服务器审查要求不豁免/);
