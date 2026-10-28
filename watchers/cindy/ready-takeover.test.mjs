@@ -68,7 +68,7 @@ function gitRepos(t) {
   git(watch, 'checkout', '-B', 'watch/pr-7');
   return { root, git, fork, seed, watch, plugin };
 }
-const gitFn = (binary, args) => command(binary, args);
+const gitFn = (binary, args, options) => command(binary, args, options);
 
 test('a watch tree behind or ahead of the fork is preserved, then reset to the fork head', t => {
   const r = gitRepos(t);

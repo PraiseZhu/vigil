@@ -248,7 +248,8 @@ function preservationEnv(now) {
 
 function snapshotCommit({ worktree, tree, parents, message, gitFn, env }) {
   const unique = [...new Set(parents.filter(Boolean))];
-  const args = ['-C', worktree, '-c', 'commit.gpgsign=false', 'commit-tree', tree,
+  // Identity on the command line too, so a missing global git identity can never fail the backup.
+  const args = ['-C', worktree, '-c', 'commit.gpgsign=false', '-c', 'user.name=Vigil Preservation', '-c', 'user.email=vigil@localhost', 'commit-tree', tree,
     ...unique.flatMap((parent) => ['-p', parent]), '-m', message];
   return gitOutput(args, gitFn, { env }).trim();
 }
