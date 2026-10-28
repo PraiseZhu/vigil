@@ -4,6 +4,12 @@
   "adjudicateCommand": ["pi", "--model", "anthropic/claude-opus-5-5", "--thinking", "medium"],
   "adjudicateMaxMinutes": 30,
   "slackDailyCap": 30,
+  "buildCiPolicy": {
+    "makecindy/cindy": {
+      "bundleStep": "node apps/desktop/scripts/build-remote-bundles.mjs",
+      "ciChecks": { "build": ["verify-checks"], "test": ["verify", "Windows unit tests"] }
+    }
+  },
   "prbot": {
     "piCommand": ["pi", "--model", "<deepseek-v4.1-flash id>", "--thinking", "high"],
     "reviewCheckPattern": "review",

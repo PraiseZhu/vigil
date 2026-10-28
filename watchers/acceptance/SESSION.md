@@ -87,6 +87,15 @@ node watchers/acceptance/bin/helper.mjs done    --issue <root> --round <n>
 - **只要有一项是 `env-skipped`，或者「通过」条目的证据里写着因环境没跑**：不能判「通过」。helper 会把这一轮标「中断」（原因以「环境问题（不是代码不通过）：」开头），退出码 `6`，不勾选、不写看板、不关单；宿主随后发「环境问题 / 未验证」提醒，按环境退避自动重验。**拿到 6 就停手**，不要改写 `checks` 重试、不要写裁决。
 - 真跑了但没过是「要修」，不是环境问题；「要修」的裁决不检查 `checks`。
 
+### build 项的 CI 口径
+
+只管 build 一项，**只在派发消息末尾有「build 项 CI 口径」一段时适用**（宿主按仓开，给完整 build 在沙箱里跑不了的仓：要 electron 分发产物、fakeroot）；没有这一段就照上面的老规矩。typecheck、test 照旧。
+那一段里的 CI 结论是宿主在沙箱外只读查 GitHub 得到的，以它为准，不要自己换别的说法。`checks.build` 这样写：
+
+- **绿**，且消息里给的代码打包步骤在沙箱里离线跑通（exit 0）：写 `{"status":"ran","note":"代码打包步骤 <命令> 沙箱离线通过；<PR 链接> CI <检查名> 绿（宿主只读查询）"}`。完整打包没跑这件事只写在这条 note 里，不写进「通过」条目的证据。代码打包步骤跑了没过是代码问题，判「要修」；因环境原因跑不起来写 `env-skipped`。
+- **红**：如实记不通过。`checks.build` 写 `ran`，裁决判「要修」，`why` 写明哪个 CI 检查红了（带 PR 链接）。
+- **没跑**或**取不到**：build 项未验证。`checks.build` 写 `env-skipped`（note 写「CI 没跑」或「CI 结果取不到」），不得写 `ran`；helper 照旧标「中断」（环境问题）、退出码 `6`。
+
 只出裁决的任务（`root.verdictOnly`）不跑 `close`：直接 `verdict` 再 `done`（要写看板就先 `board --target all --acceptance 通过 --checks <verdict.json>`）。
 
 ### 裁决文件 verdict.json
