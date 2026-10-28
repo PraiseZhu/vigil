@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test, { after } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -437,6 +438,218 @@ test('SC12 停掉 loop 后，残留的子进程（在跑的轮次、sleep）不�
   }
 });
 
+test('#T9 ensure.sh：墙钟过期 2000 秒、uptime 只差 30 秒、pid 活着锁占着 → 记 host-frozen，不补起', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const tickLog = path.join(home, 'tick.log');
+  knownTickLogs.add(tickLog);
+  const hostCopy = makeHostCopy(home, tickLog);
+  const paths = hostPaths(home);
+  const holder = await holdLoopLock(paths);
+  try {
+    const staleMs = Date.parse('2026-10-24T02:00:00.000Z');
+    fs.writeFileSync(
+      paths.heartbeatFile,
+      JSON.stringify({
+        at: new Date(staleMs).toISOString(),
+        pid: holder,
+        uptimeS: 1000,
+        lastTick: { ok: true },
+        running: [],
+      }),
+    );
+    const result = await runScript(path.join(hostCopy, 'ensure.sh'), home, {
+      ACCEPTANCE_NOW_MS: String(staleMs + 2000000),
+      ACCEPTANCE_UPTIME_S: '1030',
+    });
+    assert.equal(result.code, 0, result.stderr);
+    await sleep(1500);
+    assert.deepEqual(tickLines(tickLog), [], '不该拉起新循环跑 tick');
+    const alerts = readAlerts(paths);
+    const frozen = alerts.filter((entry) => entry.kind === 'host-frozen');
+    assert.equal(frozen.length, 1, JSON.stringify(alerts));
+    assert.match(frozen[0].reason, /^frozen-1970s$/);
+    assert.equal(alerts.some((entry) => entry.kind === 'heartbeat-delayed'), false, JSON.stringify(alerts));
+    assert.equal(alerts.some((entry) => entry.kind === 'loop-restarted'), false, JSON.stringify(alerts));
+    assert.match(loopLogText(paths), /整机冻结/);
+    assert.ok(isAlive(holder), '原循环不该被动');
+  } finally {
+    killQuiet(holder);
+  }
+});
+
+test('#T9 ensure.sh：不设 ACCEPTANCE_UPTIME_S 时用机器真实 uptime 判冻结（正式部署走这条）', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const tickLog = path.join(home, 'tick.log');
+  knownTickLogs.add(tickLog);
+  const hostCopy = makeHostCopy(home, tickLog);
+  const paths = hostPaths(home);
+  const holder = await holdLoopLock(paths);
+  try {
+    const staleMs = Date.parse('2026-10-24T02:00:00.000Z');
+    fs.writeFileSync(
+      paths.heartbeatFile,
+      JSON.stringify({
+        at: new Date(staleMs).toISOString(),
+        pid: holder,
+        uptimeS: Math.max(0, os.uptime() - 30),
+        lastTick: { ok: true },
+        running: [],
+      }),
+    );
+    const env = { ACCEPTANCE_NOW_MS: String(staleMs + 2000000) };
+    const result = await runScript(path.join(hostCopy, 'ensure.sh'), home, env);
+    assert.equal(result.code, 0, result.stderr);
+    const alerts = readAlerts(paths);
+    const frozen = alerts.filter((entry) => entry.kind === 'host-frozen');
+    assert.equal(frozen.length, 1, JSON.stringify(alerts));
+    assert.ok(Number(/^frozen-(\d+)s$/.exec(frozen[0].reason)?.[1]) >= 1800, frozen[0].reason);
+    assert.equal(alerts.some((entry) => entry.kind === 'heartbeat-delayed'), false, JSON.stringify(alerts));
+  } finally {
+    killQuiet(holder);
+  }
+});
+
+test('#T9 ensure.sh：墙钟过期 2000 秒、uptime 也差 2000 秒（真慢）、pid 活着锁占着 → 仍是 heartbeat-delayed', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const tickLog = path.join(home, 'tick.log');
+  knownTickLogs.add(tickLog);
+  const hostCopy = makeHostCopy(home, tickLog);
+  const paths = hostPaths(home);
+  const holder = await holdLoopLock(paths);
+  try {
+    const staleMs = Date.parse('2026-10-24T02:00:00.000Z');
+    fs.writeFileSync(
+      paths.heartbeatFile,
+      JSON.stringify({
+        at: new Date(staleMs).toISOString(),
+        pid: holder,
+        uptimeS: 1000,
+        lastTick: { ok: true },
+        running: [],
+      }),
+    );
+    const result = await runScript(path.join(hostCopy, 'ensure.sh'), home, {
+      ACCEPTANCE_NOW_MS: String(staleMs + 2000000),
+      ACCEPTANCE_UPTIME_S: '3000',
+    });
+    assert.equal(result.code, 0, result.stderr);
+    await sleep(1500);
+    assert.deepEqual(tickLines(tickLog), [], '不该拉起新循环跑 tick');
+    const alerts = readAlerts(paths);
+    assert.equal(alerts.some((entry) => entry.kind === 'host-frozen'), false, JSON.stringify(alerts));
+    const delayed = alerts.filter((entry) => entry.kind === 'heartbeat-delayed');
+    assert.equal(delayed.length, 1, JSON.stringify(alerts));
+    assert.equal(delayed[0].reason, 'delay-2000s');
+    assert.match(loopLogText(paths), /心跳延迟 2000 秒/);
+  } finally {
+    killQuiet(holder);
+  }
+});
+
+test('#T9 ensure.sh：墙钟过期 2000 秒、uptime 差 30 秒、pid 已死 → 拉起并记 heartbeat-stale-after-freeze', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const tickLog = path.join(home, 'tick.log');
+  knownTickLogs.add(tickLog);
+  const hostCopy = makeHostCopy(home, tickLog);
+  const paths = hostPaths(home);
+  fs.mkdirSync(paths.hostDir, { recursive: true });
+  const gone = spawnSync('sh', ['-c', 'echo $$']);
+  const deadPid = Number(String(gone.stdout).trim());
+  assert.ok(!isAlive(deadPid), '前提：pid 已不在');
+  const staleMs = Date.parse('2026-10-24T02:00:00.000Z');
+  fs.writeFileSync(
+    paths.heartbeatFile,
+    JSON.stringify({
+      at: new Date(staleMs).toISOString(),
+      pid: deadPid,
+      uptimeS: 1000,
+      lastTick: { ok: true },
+      running: [],
+    }),
+  );
+  try {
+    const result = await runScript(path.join(hostCopy, 'ensure.sh'), home, {
+      ACCEPTANCE_NOW_MS: String(staleMs + 2000000),
+      ACCEPTANCE_UPTIME_S: '1030',
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(await waitFor(() => tickLines(tickLog).length >= 1), '要拉起循环');
+    const alerts = readAlerts(paths);
+    assert.deepEqual(alerts.map((entry) => [entry.kind, entry.reason]), [['loop-restarted', 'heartbeat-stale-after-freeze']]);
+    assert.match(loopLogText(paths), /整机冻结 1970 秒后原循环已不在，已补起新循环/);
+  } finally {
+    for (const line of tickLines(tickLog)) killQuiet(Number(line.split(':')[1]));
+    for (const pid of new Set(tickLines(tickLog).map((line) => line.split(':')[0]))) killQuiet(Number(pid));
+  }
+});
+
+test('#T9 ensure.sh：旧心跳没有 uptimeS、pid 已死 → 仍是 loop-restarted(heartbeat-stale)', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const tickLog = path.join(home, 'tick.log');
+  knownTickLogs.add(tickLog);
+  const hostCopy = makeHostCopy(home, tickLog);
+  const paths = hostPaths(home);
+  fs.mkdirSync(paths.hostDir, { recursive: true });
+  const gone = spawnSync('sh', ['-c', 'echo $$']);
+  const deadPid = Number(String(gone.stdout).trim());
+  assert.ok(!isAlive(deadPid), '前提：pid 已不在');
+  const staleMs = Date.parse('2026-10-24T02:00:00.000Z');
+  fs.writeFileSync(
+    paths.heartbeatFile,
+    JSON.stringify({ at: new Date(staleMs).toISOString(), pid: deadPid, lastTick: { ok: true }, running: [] }),
+  );
+  try {
+    const result = await runScript(path.join(hostCopy, 'ensure.sh'), home, {
+      ACCEPTANCE_NOW_MS: String(staleMs + 2000000),
+      ACCEPTANCE_UPTIME_S: '1030',
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(await waitFor(() => tickLines(tickLog).length >= 1), '要拉起循环');
+    const alerts = readAlerts(paths);
+    assert.deepEqual(alerts.map((entry) => [entry.kind, entry.reason]), [['loop-restarted', 'heartbeat-stale']]);
+    assert.equal(alerts.some((entry) => entry.kind === 'host-frozen'), false);
+    assert.doesNotMatch(loopLogText(paths), /整机冻结/);
+  } finally {
+    for (const line of tickLines(tickLog)) killQuiet(Number(line.split(':')[1]));
+    for (const pid of new Set(tickLines(tickLog).map((line) => line.split(':')[0]))) killQuiet(Number(pid));
+  }
+});
+
+test('#T9 loop 收到 SIGTERM：2 秒内 loop.log 记下退出，锁立刻释放，ensure.sh 能拉起新循环', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const tickLog = path.join(home, 'tick.log');
+  knownTickLogs.add(tickLog);
+  const hostCopy = makeHostCopy(home, tickLog);
+  const paths = hostPaths(home);
+  const first = startLoop(hostCopy, home);
+  try {
+    assert.ok(await waitFor(() => tickLines(tickLog).length >= 1), '先要跑一拍');
+    const loopPid = Number(tickLines(tickLog)[0].split(':')[0]);
+    assert.ok(loopPid > 0);
+    killQuiet(loopPid, 'SIGTERM');
+    assert.ok(
+      await waitFor(() => {
+        const text = loopLogText(paths);
+        return text.includes('调度循环退出') && text.includes('TERM');
+      }, 2000),
+      `2 秒内 loop.log 要记下 TERM 退出；实际：${loopLogText(paths)}`,
+    );
+    const again = await runScript(path.join(hostCopy, 'ensure.sh'), home);
+    assert.equal(again.code, 0, again.stderr);
+    assert.ok(
+      await waitFor(() => new Set(tickLines(tickLog).map((line) => line.split(':')[0])).size >= 2, 2500),
+      `ensure.sh 要马上拉起新循环（锁已释放）；loop.log：${loopLogText(paths)}`,
+    );
+  } finally {
+    killQuiet(first.child.pid);
+    for (const line of tickLines(tickLog)) {
+      killQuiet(Number(line.split(':')[1]));
+      killQuiet(Number(line.split(':')[0]));
+    }
+    await first.exited;
+  }
+});
+
 test('SC12 tick 写心跳：时间、pid、上一拍结果、在跑的轮次', async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const heartbeat = await runTick({
@@ -446,9 +659,11 @@ test('SC12 tick 写心跳：时间、pid、上一拍结果、在跑的轮次', a
     spawnRound: () => 1,
     runRound: async () => ({ code: 0, stdout: '', stderr: '' }),
     now: () => Date.parse('2026-10-24T02:00:00.000Z'),
+    uptime: () => 12345.6,
   });
   assert.equal(heartbeat.at, '2026-10-24T02:00:00.000Z');
   assert.ok(Number.isInteger(heartbeat.pid));
+  assert.equal(heartbeat.uptimeS, 12345.6);
   assert.deepEqual(heartbeat.lastTick, {
     ok: true,
     started: [],
@@ -461,6 +676,7 @@ test('SC12 tick 写心跳：时间、pid、上一拍结果、在跑的轮次', a
   const onDisk = JSON.parse(fs.readFileSync(hostPaths(home).heartbeatFile, 'utf8'));
   assert.equal(onDisk.at, heartbeat.at);
   assert.equal(onDisk.pid, heartbeat.pid);
+  assert.equal(onDisk.uptimeS, 12345.6);
   assert.deepEqual(onDisk.lastTick, heartbeat.lastTick);
   assert.deepEqual(onDisk.running, []);
 });

@@ -16,7 +16,7 @@
 | 部分 | 落在哪 | 规则 |
 |---|---|---|
 | 常驻调度 | `watchers/acceptance/host/loop` | 单实例（flock），**每分钟**跑一拍 `host/tick.mjs`，顺序照 `docs/acceptance-scheduler.md` |
-| 每小时巡检 | `watchers/acceptance/host/ensure.sh` | 给每小时一次的 routine 调用：心跳不超过 180 秒就不做事；心跳过期但原循环进程还在、单实例锁还占着，只记一条「心跳延迟」（`heartbeat-delayed`，进摘要），不补起；其余情况把 `loop` 拉起来并写一条提醒（`stop.sh` 主动停过的记成部署重启 `loop-deploy-restarted`，进摘要） |
+| 每小时巡检 | `watchers/acceptance/host/ensure.sh` | 给每小时一次的 routine 调用：心跳不超过 180 秒就不做事；心跳过期但原循环进程还在、单实例锁还占着，只记一条「心跳延迟」（`heartbeat-delayed`，进摘要），不补起；其中墙钟跳了很久、按机器实际运行时间心跳还在 180 秒内的，记 `host-frozen`（整机冻结），也不补起；其余情况把 `loop` 拉起来并写一条提醒（`stop.sh` 主动停过的记成部署重启 `loop-deploy-restarted`，进摘要；整机冻结后原循环已经不在的记 `heartbeat-stale-after-freeze`） |
 | 资源门 | `host/round.mjs` | 认领**之前**过内存门（MemAvailable ≥ 3 GiB）和测试锁（mivo 同时只跑一轮）；最多 2 轮同时跑 |
 | 写闸 | `host/write-gate.mjs` | 所有写动作在沙箱外再查一遍，以它为准（见第 3 节） |
 | 模型 | `host/round.mjs` + `<home>/config/host.json` | pi 用 **DeepSeek V4.1 Flash**，推理 **max**；有争议条目的裁决运行（`host/adjudicate.mjs`）用 `anthropic/claude-opus-5-5`，推理 **medium**（`adjudicateCommand`） |
@@ -502,7 +502,7 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 
 | 现象 | 先看 | 处理 |
 |---|---|---|
-| 心跳不更新 | `state/host/heartbeat.json` 的 `at`/`lastTick.error` | 跑 `ensure.sh`；还不行看 `loop.log`，`stop.sh` 后重起 |
+| 心跳不更新 | `state/host/heartbeat.json` 的 `at`/`lastTick.error` | 跑 `ensure.sh`；还不行看 `loop.log`（循环退出会记下时间和原因），`stop.sh` 后重起 |
 | 轮次一直「验收中」 | `state/host/progress/` 里这一轮的 `lastActivityAt`（`round.mjs status` 的 `stalled` 按模型写的时间算，只作参考） | 等调度先杀进程再 abort；要手动就 `abort --reason` |
 | `prefetch-failed` | 提醒的 `reason`（哪个仓）、`state/prbot/mirrors/acceptance__*` | 多半是令牌看不到这个仓或网络问题；`doctor` 的「仓可读」先过 |
 | `env-unverified` | 提醒的 `reason`（哪几项必需检查因环境没跑 / 哪几条「通过」的证据写着因环境没跑） | 裁决防线：build / typecheck / 测试有一项因环境没跑就不能判通过，helper 把本轮标「中断」（环境问题）、退出码 6，宿主写这条提醒，按环境退避（30 分钟、2 小时、6 小时）自动重验。反复出现就查那项检查缺什么环境 |

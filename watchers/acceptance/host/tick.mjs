@@ -3,6 +3,7 @@
 // 1) poll.mjs 在沙箱外跑（只读盘点，可以读 GitHub 令牌），不进 bwrap；2) 卡住的轮次先杀进程再 abort；
 // 3) 按空槽起新的 round；4) 写心跳。任何错误都只落进心跳和 alerts.jsonl，绝不抛出循环。
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadAcceptanceProfile } from '../bin/profile.mjs';
@@ -243,6 +244,7 @@ export async function runTick({
   checkPrbotStalled,
   cleanupPrbot,
   now = () => Date.now(),
+  uptime = () => os.uptime(),
   sleep = defaultSleep,
   root,
   killGraceMs = KILL_GRACE_MS,
@@ -262,6 +264,7 @@ export async function runTick({
   const heartbeat = {
     at: new Date(now()).toISOString(),
     pid: loopPid(env),
+    uptimeS: uptime(),
     lastTick: { ok: true, started: [], stale: [], error: null },
     running: [],
   };
