@@ -91,6 +91,8 @@ stdout 是 JSON 数组。该开始的任务：
 
 tick 不起验收轮，而是起一次只读裁决运行（`host/adjudicate.mjs`）；结果出来后这条任务按「该开始」照常报出，派发消息带上裁决结果。
 
+「批准执行」推进的总 issue（总 issue 上有我发的「批准执行登记」评论）在 lead 发交接评论（首行 `[批准执行] 交接验收 · 第 n 次`）之前不报；子 issue 全关满 24 小时仍没交接就照常报（#140，见 [`docs/acceptance-session.md`](../../docs/acceptance-session.md)）。
+
 没有任务时输出 `[]`。不加 `--json` 则每条一行。`poll` **不发任何写请求、不写本地缓存、不调模型**。失败时往 stderr 写错误并退出码 1。
 
 ## 写操作出口

@@ -59,6 +59,26 @@ function formatNeedsHuman(entries, profile) {
   return lines;
 }
 
+/** 批准执行推进、却没有 lead 交接的任务：等满 24 小时后照常验收，裁决里写明（#140）。 */
+export const NO_HANDOFF_LINE = '批准执行没有交接评论，等满 24 小时后照常验收。';
+
+/** lead 交接里「请重点查」的逐条结论（#140）：一条重点项一行，序号对齐交接里的编号。 */
+function formatHandoffChecks(handoff, checks, profile) {
+  if (!handoff?.focus?.length) return [];
+  const byN = new Map((checks || []).map((check) => [Number(check.n), check]));
+  const lines = ['## 交接重点核对', `对照 lead 交接第 ${handoff.n} 次：${redact(handoff.url || '', profile)}`];
+  handoff.focus.forEach((focus, i) => {
+    lines.push(`- ${i + 1}. ${redact(focus, profile)} → ${redact(byN.get(i + 1)?.result || '', profile)}`);
+  });
+  return lines;
+}
+
+/** 有交接重点项时，每一条都要有结论：返回缺结论的序号（从 1 起）。 */
+export function missingHandoffChecks(handoff, checks = []) {
+  const have = new Set((checks || []).filter((check) => String(check?.result || '').trim()).map((check) => Number(check.n)));
+  return (handoff?.focus || []).map((_, i) => i + 1).filter((n) => !have.has(n));
+}
+
 /** 拼裁决正文。测试直接断言这一段。 */
 export function formatVerdictBody({
   round,
@@ -70,6 +90,9 @@ export function formatVerdictBody({
   extracted = false,
   needsHuman = [],
   verdictOnly = false,
+  approveExec = false,
+  handoff = null,
+  handoffChecks = [],
   profile,
 } = {}) {
   const lines = [
@@ -84,6 +107,8 @@ export function formatVerdictBody({
   if (extracted) {
     lines.push('本任务没写验收标准，以上标准由验收机从正文和关联 PR 提炼。');
   }
+  if (approveExec && !handoff) lines.push(NO_HANDOFF_LINE);
+  lines.push(...formatHandoffChecks(handoff, handoffChecks, profile));
   const human = formatNeedsHuman(needsHuman, profile);
   if (human.length) {
     lines.push('## 需人工处理');
@@ -152,6 +177,12 @@ function readVerdictFile(file) {
     if (!Number.isInteger(item.sc) || item.sc <= 0) throw new Error(`裁决项 sc 不合法：${item?.sc}`);
     if (!RESULTS.includes(item.result)) throw new Error(`裁决项结果只能是 ${RESULTS.join(' / ')}：${item?.result}`);
   }
+  if (parsed.handoffChecks !== undefined) {
+    if (!Array.isArray(parsed.handoffChecks)) throw new Error('裁决文件的 handoffChecks 必须是数组 [{"n":1,"result":"…"}]');
+    for (const check of parsed.handoffChecks) {
+      if (!Number.isInteger(check?.n) || check.n <= 0) throw new Error(`handoffChecks 的 n 不合法：${check?.n}`);
+    }
+  }
   return parsed;
 }
 
@@ -167,6 +198,11 @@ export async function runVerdict({ github, profile, ref, n, file, statusFlag, no
   const missing = missingConclusions(tree, items);
   if (missing.length) {
     throw new Error(`裁决缺结论（通过 / 要修 / 人工手测 / 有争议），没写：${missing.join('、')}`);
+  }
+  // 批准执行 lead 交接里的「请重点查」每条都要有结论（#140），缺了同样整条拒绝、什么都不写。
+  const missingFocus = missingHandoffChecks(tree.handoff, payload.handoffChecks);
+  if (missingFocus.length) {
+    throw new Error(`交接重点核对缺结论：lead 交接第 ${tree.handoff.n} 次「请重点查」第 ${missingFocus.join('、')} 条没写（verdict.json 的 handoffChecks）`);
   }
   const needsHuman = readNeedsHuman(profile, ref, n);
   const derived = deriveStatus(items, needsHuman);
@@ -201,6 +237,9 @@ export async function runVerdict({ github, profile, ref, n, file, statusFlag, no
     extracted: Boolean(payload.extracted),
     needsHuman,
     verdictOnly,
+    approveExec: Boolean(tree.root.approveExec),
+    handoff: tree.handoff || null,
+    handoffChecks: payload.handoffChecks || [],
     profile,
   });
 

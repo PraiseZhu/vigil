@@ -140,3 +140,27 @@ test('SC1 我建的总 issue 下我建的子 issue 不单独成任务（查询�
   const tasks = await collectTasks(github, profile);
   assert.deepEqual(tasks.map((t) => t.ref), [`${REPO}#20`]);
 });
+
+test('#140 SC1/SC3 盘点从总 issue 评论算出登记与交接时间：只认我发的，别人发的同样首行不算', async () => {
+  const profile = profileWith();
+  const comment = (author, body, createdAt, databaseId) => ({ id: `IC_${databaseId}`, databaseId, body, createdAt, updatedAt: createdAt, url: `u${databaseId}`, author: { login: author } });
+  const parent = issueNode({
+    repo: REPO,
+    number: 10,
+    author: OWNER,
+    subIssues: [childNode({ repo: REPO, number: 11, author: OWNER, state: 'CLOSED' })],
+    comments: [
+      comment(OWNER, `批准执行登记：2026-10-22 ${REPO}#11 → 会话 s1（x）claim c1`, '2026-10-22T00:00:00.000Z', 1),
+      comment(OWNER, '[批准执行] 交接验收 · 第 1 次\n总 issue：x', '2026-10-23T00:00:00.000Z', 2),
+      comment('SomeoneElse', '[批准执行] 交接验收 · 第 2 次', '2026-10-24T00:00:00.000Z', 3),
+      comment('SomeoneElse', `批准执行登记：2026-10-25 ${REPO}#11 → 会话 s9（x）claim c9`, '2026-10-25T00:00:00.000Z', 4),
+    ],
+  });
+  const plain = issueNode({ repo: REPO, number: 20, author: OWNER, subIssues: [childNode({ repo: REPO, number: 21, author: OWNER })] });
+  const run = createFakeRun({ onGraphql: () => inventoryData({ open: [parent, plain] }) });
+  const github = createGithub({ profile, run });
+  const tasks = await collectTasks(github, profile);
+  const byRef = Object.fromEntries(tasks.map((t) => [t.ref, t]));
+  assert.deepEqual(byRef[`${REPO}#10`].leadHandoff, { registeredAt: '2026-10-22T00:00:00.000Z', handoffAt: '2026-10-23T00:00:00.000Z' });
+  assert.deepEqual(byRef[`${REPO}#20`].leadHandoff, { registeredAt: null, handoffAt: null }, '没有登记的任务两项都是 null');
+});
