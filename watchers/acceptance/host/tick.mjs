@@ -16,7 +16,63 @@ import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbo
 import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
 import { defaultSpawnAdjudicate, scheduleAdjudications } from './adjudicate.mjs';
 import { runGateAudit } from './gate-audit.mjs';
-import { POLL_BEAT_MS, startPollBeat } from './poll-beat.mjs';
+import { POLL_BEAT_MS, startTickBeat } from './poll-beat.mjs';
+import { isReadOnlyGraphql } from '../bin/github.mjs';
+
+/**
+ * 这一拍里读 GitHub 的超时（T20）：120 秒，和拉取（poll）的超时同一口径。正常一次 GraphQL 读几秒内就回来，
+ * 120 秒足够慢网络；又小于心跳上限 180 秒，掐掉后体检不会报红。超时退出码 124、没有「瞬时故障」字样，
+ * 所以 github.mjs 的读重试（只认 502/503/504、连接重置等）不会再叠一次，单次读最多约 122 秒。
+ */
+export const TICK_READ_TIMEOUT_MS = 120000;
+
+/** gh 这条命令是不是只读：只读 GraphQL 查询，或 gh api 不带 -X / -X GET。拿不准一律当写，不加超时。 */
+function isGhRead(cmd, args, opts) {
+  if (cmd !== 'gh' || !Array.isArray(args) || args[0] !== 'api') return false;
+  if (args[1] === 'graphql') {
+    try {
+      return isReadOnlyGraphql(JSON.parse(String(opts?.input ?? '')).query);
+    } catch {
+      return false;
+    }
+  }
+  const x = args.indexOf('-X');
+  const method = x >= 0 ? String(args[x + 1] || '').toUpperCase() : 'GET';
+  return method === 'GET' && !args.includes('--input');
+}
+
+/**
+ * 给传进 createGithub 的 run 包一层（T20）：只给读加超时，写（含经写闸的）原样放过、不加超时、不重试。
+ * 除了把 timeoutMs 交给 run（proc.run 到点 SIGTERM、2 秒后 SIGKILL），再兜一层计时：run 自己不认超时时也按读失败
+ * （退出码 124）收尾，不让这一拍挂住。onRead 在每次读开始时调用（用来刷新心跳阶段）。
+ */
+export function withReadTimeout(run, timeoutMs = TICK_READ_TIMEOUT_MS, { onRead } = {}) {
+  return async (cmd, args, opts = {}) => {
+    if (!isGhRead(cmd, args, opts) || Number(opts?.timeoutMs) > 0) return run(cmd, args, opts);
+    try {
+      onRead?.();
+    } catch {
+      // 心跳刷新失败不影响读。
+    }
+    let timer;
+    const guard = new Promise((resolve) => {
+      timer = setTimeout(
+        () => resolve({ code: 124, stdout: '', stderr: `读 GitHub 超过 ${Math.round(timeoutMs / 1000)} 秒没返回，已掐掉（exit 124）` }),
+        timeoutMs + Math.min(5000, timeoutMs),
+      );
+      // 不 unref：兜底计时本身要撑住这一拍，读真挂住时也一定按时以读失败收尾（finally 里会清掉）。
+    });
+    try {
+      const result = await Promise.race([Promise.resolve(run(cmd, args, { ...opts, timeoutMs })), guard]);
+      if (result && result.code === 124 && !String(result.stderr || '').trim()) {
+        return { ...result, stderr: `读 GitHub 超过 ${Math.round(timeoutMs / 1000)} 秒没返回，已掐掉（exit 124）` };
+      }
+      return result;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
 
 const SLOTS = ['slot-0', 'slot-1'];
 const KILL_GRACE_MS = 10000;
@@ -254,6 +310,7 @@ export async function runTick({
   notifyWaitMs = NOTIFY_WAIT_MS,
   gateAudit = (options) => runGateAudit(options),
   pollBeatMs = POLL_BEAT_MS,
+  prbotReadTimeoutMs = TICK_READ_TIMEOUT_MS,
 } = {}) {
   if (typeof home !== 'string' || !path.isAbsolute(home)) throw new Error('runTick 需要绝对路径的 home');
   const repoRoot = root || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -286,24 +343,41 @@ export async function runTick({
     return heartbeat;
   }
 
-  /** 拉取期间的心跳（T18）：沿用上一拍心跳（上一拍结果、Slack 状态），只刷新时间/pid/在跑轮次，并带上 polling。 */
-  function pollBeat(polling) {
+  /**
+   * 拍中心跳（T18 拉取期间，T20 扩到整拍）：沿用上一拍心跳（上一拍结果、Slack 状态），只刷新时间/pid/在跑轮次，
+   * 并带上当前阶段 phase；拉取阶段另带旧字段 polling（兼容旧体检），其它阶段把残留的 polling 去掉。
+   */
+  function phaseBeat(phase) {
     let previous = {};
     try {
       previous = JSON.parse(fs.readFileSync(paths.heartbeatFile, 'utf8')) || {};
     } catch {
       previous = {};
     }
-    return {
-      ...previous,
+    const { polling: _oldPolling, phase: _oldPhase, ...rest } = previous;
+    const out = {
+      ...rest,
       at: new Date(now()).toISOString(),
       pid: heartbeat.pid,
       uptimeS: uptime(),
       gate: heartbeat.gate,
       running: aliveRunning(),
-      polling,
+      phase,
     };
+    if (phase?.name === 'poll') {
+      const { name: _name, ...polling } = phase;
+      out.polling = polling;
+    }
+    return out;
   }
+
+  const tickBeat = startTickBeat({
+    now,
+    uptime,
+    beatMs: pollBeatMs,
+    buildBeat: phaseBeat,
+    write: (beat) => writeJsonAtomic(paths.heartbeatFile, beat),
+  });
 
   try {
     fs.mkdirSync(paths.hostDir, { recursive: true, mode: 0o700 });
@@ -311,22 +385,11 @@ export async function runTick({
     // 不写 write-rejected 提醒（只读期每拍都会碰到，写提醒就是刷屏）。
     const gateEnabled = fs.existsSync(paths.enabledFile);
     heartbeat.gate = gateEnabled ? 'enabled' : 'disabled';
-    const stopPollBeat = startPollBeat({
-      now,
-      uptime,
-      beatMs: pollBeatMs,
-      buildBeat: pollBeat,
-      write: (beat) => writeJsonAtomic(paths.heartbeatFile, beat),
+    tickBeat.setPhase('poll');
+    const poll = await run('node', [path.join(repoRoot, 'watchers', 'acceptance', 'bin', 'poll.mjs'), '--json'], {
+      env: { ...env, ACCEPTANCE_WATCHER_HOME: home },
+      timeoutMs: 120000,
     });
-    let poll;
-    try {
-      poll = await run('node', [path.join(repoRoot, 'watchers', 'acceptance', 'bin', 'poll.mjs'), '--json'], {
-        env: { ...env, ACCEPTANCE_WATCHER_HOME: home },
-        timeoutMs: 120000,
-      });
-    } finally {
-      stopPollBeat();
-    }
     if (!poll || poll.code !== 0) {
       throw new Error(`poll 失败（退出码 ${poll?.code ?? '未知'}）：${String(poll?.stderr || '').trim().split('\n')[0] || ''}`);
     }
@@ -364,7 +427,9 @@ export async function runTick({
     };
 
     // 2. 卡住的轮次（poll 按宿主侧进度时间判定）：有活进程先杀，等它退出，再 abort。
-    for (const entry of entries.filter((item) => item?.stale)) {
+    const staleEntries = entries.filter((item) => item?.stale);
+    if (staleEntries.length > 0) tickBeat.setPhase('abort');
+    for (const entry of staleEntries) {
       const record = byIssue.get(entry.issue);
       const piPid = Number(record?.piPid);
       let reason = '卡死：进程不在';
@@ -418,15 +483,19 @@ export async function runTick({
       heartbeat.lastTick.prbotError = String(error?.message || error);
     }
     if (prbotSettings) {
+      tickBeat.setPhase('prbot');
       heartbeat.lastTick.prbotStarted = [];
       heartbeat.lastTick.prbotStalled = [];
       heartbeat.lastTick.prbotCleaned = [];
       try {
         const prbotProfile = loadAcceptanceProfile({ ...env, ACCEPTANCE_WATCHER_HOME: home });
-        const prbotGithub = createGithub({ profile: { ...prbotProfile, writeCommand: undefined }, run });
+        // T20：这一段读 GitHub 原先没有超时，对端不回包时整拍挂住（2026-10-30 卡了约 14 分钟）。只给读加超时，
+        // 每次读开始重新记阶段时长（一次读最多约 122 秒，远小于 180 秒上限）。
+        const prbotRun = withReadTimeout(run, prbotReadTimeoutMs, { onRead: () => tickBeat.setPhase('prbot') });
+        const prbotGithub = createGithub({ profile: { ...prbotProfile, writeCommand: undefined }, run: prbotRun });
         const discover =
           discoverPrbot || ((options) => discoverCorrections({ ...options, github: prbotGithub, profile: prbotProfile, hostConfig: prbotSettings }));
-        const found = await discover({ now, home });
+        const found = await discover({ now, home, github: prbotGithub });
         // 修正轮和验收轮共用 2 个槽：先给这一拍该开始的验收轮留位（同仓锁被占、起不来的 mivo / serialRepos 验收轮不算），剩下的才给修正轮。
         const pendingAcceptance = entries.filter((item) => {
           if (!item || item.stale) return false;
@@ -446,7 +515,7 @@ export async function runTick({
           heartbeat.lastTick.prbotStarted.push({ issue: entry.issue, pid: pid ?? null });
         }
         const checkStalled = checkPrbotStalled || ((options) => checkReadyStalled({ ...options, github: prbotGithub, profile: prbotProfile }));
-        const stalled = await checkStalled({ home, now, reviewCheckPattern: prbotSettings.reviewCheckPattern });
+        const stalled = await checkStalled({ home, now, github: prbotGithub, reviewCheckPattern: prbotSettings.reviewCheckPattern });
         heartbeat.lastTick.prbotStalled = (stalled || []).map((entry) => ({ issue: entry.issue, pr: entry.pr }));
         const clean = cleanupPrbot || ((options) => cleanupWorktrees({ ...options, profile: prbotProfile }));
         heartbeat.lastTick.prbotCleaned = clean({ home }) || [];
@@ -460,6 +529,7 @@ export async function runTick({
       }
     }
 
+    tickBeat.setPhase('dispatch');
     // 2b. 不派发、只提醒的条目（outOfScope / passedButOpen）：写提醒（节流），出错不拖垮这一拍。
     try {
       remindPollNotices(paths, entries, { now });
@@ -524,6 +594,7 @@ export async function runTick({
   // 3d. 写闸账本旁路审计：只读本地账本，不查 GitHub（每拍都查 GitHub 就太重了，doctor / 命令行才查）。
   //     放在 Slack 通知之前：这一拍新发现的违规提醒同一拍就发出去。单独 try/catch：出错只进心跳，
   //     绝不让这一拍失败、绝不写 tick-failed（审计坏了不是验收坏了）。
+  tickBeat.setPhase('audit');
   try {
     const auditProfile = loadAcceptanceProfile({ ...env, ACCEPTANCE_WATCHER_HOME: home });
     const audited = await gateAudit({ home, profile: auditProfile, now, github: null });
@@ -539,6 +610,7 @@ export async function runTick({
 
   // 4. Slack 通知（#61）：放在验收调度之后（#70 复审：Slack 卡住不能拖慢验收），这一拍新写的提醒也一起发。
   //    总时长有上限（boundedNotify），整个调用 try/catch：出错只进心跳，绝不影响这一拍。
+  tickBeat.setPhase('notify');
   let slackFailing = previousSlackFailing(paths);
   try {
     const result = await boundedNotify(notify, { home, env: { ...env, ACCEPTANCE_WATCHER_HOME: home }, now, ...notifyOptions }, notifyWaitMs);
@@ -553,6 +625,7 @@ export async function runTick({
   }
   if (slackFailing) heartbeat.slackFailing = slackFailing;
 
+  tickBeat.stop();
   try {
     return writeHeartbeat();
   } catch {

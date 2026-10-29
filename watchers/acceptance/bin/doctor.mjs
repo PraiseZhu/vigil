@@ -13,7 +13,7 @@ import { createProbes } from '../host/probes.mjs';
 import { handoffFor, preflightCommands, repoConfig } from '../host/prbot-config.mjs';
 import { checkSlackAccess } from '../host/slack-notify.mjs';
 import { describeViolation, runGateAudit } from '../host/gate-audit.mjs';
-import { POLL_STALL_S, pollingElapsedS } from '../host/poll-beat.mjs';
+import { POLL_STALL_S, heartbeatPhase, phaseLabel, pollingElapsedS } from '../host/poll-beat.mjs';
 
 /** 令牌账号 == ownerLogin 用这条。 */
 export const VIEWER_QUERY = `query {
@@ -364,14 +364,18 @@ export async function runDoctor({
     const alive = isAlive(Number(heartbeat.pid));
     const ageS = Math.round(age / 1000);
     // T18：心跳带 polling（正在拉取）时另按拉取时长判；超过上限照样报红，不让新鲜心跳藏住真卡死。
+    // T20：扩到整拍——心跳带 phase（当前阶段、已多久）时按阶段说真话（「修正轮读取已 N 秒」），旧心跳只有 polling 时当拉取。
     // 超限的说明故意不以「心跳 N 秒前」开头，免得外面的复核把它当成整机冻结/心跳延迟放过。
-    const pollS = heartbeat.polling ? pollingElapsedS(heartbeat.polling, { now, uptime }) : null;
+    const phase = heartbeatPhase(heartbeat);
+    const label = phase ? phaseLabel(phase.name) : '';
+    const pollS = phase ? pollingElapsedS(phase, { now, uptime }) : null;
     const pollStuck = pollS !== null && pollS > POLL_STALL_S;
     const heartbeatDetail = `心跳 ${ageS} 秒前（上限 ${HEARTBEAT_MAX_AGE_MS / 1000} 秒）`;
+    const killHint = phase?.name === 'poll' ? '拉取 120 秒就该被掐掉' : phase?.name === 'prbot' ? '每次读取 120 秒就该被掐掉' : '这一段不该这么久';
     let detail;
     if (!alive) detail = '心跳里的 pid 已经不在（循环没跑）';
-    else if (pollStuck) detail = `拉取已 ${pollS} 秒没结束，超过上限 ${POLL_STALL_S} 秒（拉取 120 秒就该被掐掉，可能卡死）；${heartbeatDetail}`;
-    else if (pollS !== null) detail = `${heartbeatDetail}，正在拉取（已 ${pollS} 秒，上限 ${POLL_STALL_S} 秒）`;
+    else if (pollStuck) detail = `${label}已 ${pollS} 秒没结束，超过上限 ${POLL_STALL_S} 秒（${killHint}，可能卡死）；${heartbeatDetail}`;
+    else if (pollS !== null) detail = `${heartbeatDetail}，正在${label}（已 ${pollS} 秒，上限 ${POLL_STALL_S} 秒）`;
     else detail = heartbeatDetail;
     add('常驻循环', alive && age <= HEARTBEAT_MAX_AGE_MS && !pollStuck, detail);
   } catch {
