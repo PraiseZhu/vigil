@@ -404,3 +404,36 @@ test('#61 doctor 加一项只读的 Slack 检查：结果原样报出；没配�
   assert.equal(checkOf(skipped, 'Slack 频道').ok, true);
   assert.match(checkOf(skipped, 'Slack 频道').detail, /跳过/);
 });
+
+// T18：心跳带「正在拉取」状态时，体检按拉取时长另判；超过上限照样报红，真卡死不被新鲜心跳藏住。
+test('T18 常驻循环：正在拉取 60 秒、心跳新鲜 → 绿，详情写明正在拉取', async () => {
+  const fixture = makeFixture({ heartbeat: { at: new Date(NOW).toISOString(), pid: process.pid, polling: { startedAt: new Date(NOW - 60000).toISOString(), startedUptimeS: 940, elapsedS: 60 } } });
+  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, uptime: () => 1000 });
+  const check = checkOf(result, '常驻循环');
+  assert.equal(check.ok, true, check.detail);
+  assert.match(check.detail, /正在拉取（已 60 秒，上限 180 秒）/);
+});
+
+test('T18 常驻循环：心跳新鲜但拉取已 200 秒（超上限 180）→ 红，详情不以「心跳 N 秒前」开头（不被当成冻结/延迟复核）', async () => {
+  const fixture = makeFixture({ heartbeat: { at: new Date(NOW).toISOString(), pid: process.pid, polling: { startedAt: new Date(NOW - 200000).toISOString(), startedUptimeS: 800, elapsedS: 170 } } });
+  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, uptime: () => 1000 });
+  const check = checkOf(result, '常驻循环');
+  assert.equal(check.ok, false);
+  assert.match(check.detail, /^拉取已 200 秒没结束，超过上限 180 秒/);
+  assert.equal(result.ok, false);
+});
+
+test('T18 常驻循环：拉取状态显示没超限，但心跳已 400 秒没刷新（真卡死）→ 照样红', async () => {
+  const fixture = makeFixture({ heartbeat: { at: new Date(NOW - 400000).toISOString(), pid: process.pid, polling: { startedAt: new Date(NOW - 500000).toISOString(), elapsedS: 100 } } });
+  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, uptime: () => -1 });
+  const check = checkOf(result, '常驻循环');
+  assert.equal(check.ok, false, check.detail);
+});
+
+test('T18 常驻循环：机器整机冻结（墙钟过了 2000 秒、uptime 只过 30 秒）不把拉取算成超时', async () => {
+  const fixture = makeFixture({ heartbeat: { at: new Date(NOW).toISOString(), pid: process.pid, polling: { startedAt: new Date(NOW - 2000000).toISOString(), startedUptimeS: 970, elapsedS: 20 } } });
+  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, uptime: () => 1000 });
+  const check = checkOf(result, '常驻循环');
+  assert.equal(check.ok, true, check.detail);
+  assert.match(check.detail, /正在拉取（已 30 秒/);
+});

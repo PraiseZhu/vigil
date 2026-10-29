@@ -16,6 +16,7 @@ import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbo
 import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
 import { defaultSpawnAdjudicate, scheduleAdjudications } from './adjudicate.mjs';
 import { runGateAudit } from './gate-audit.mjs';
+import { POLL_BEAT_MS, startPollBeat } from './poll-beat.mjs';
 
 const SLOTS = ['slot-0', 'slot-1'];
 const KILL_GRACE_MS = 10000;
@@ -252,6 +253,7 @@ export async function runTick({
   notifyOptions = {},
   notifyWaitMs = NOTIFY_WAIT_MS,
   gateAudit = (options) => runGateAudit(options),
+  pollBeatMs = POLL_BEAT_MS,
 } = {}) {
   if (typeof home !== 'string' || !path.isAbsolute(home)) throw new Error('runTick 需要绝对路径的 home');
   const repoRoot = root || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -269,13 +271,38 @@ export async function runTick({
     running: [],
   };
 
-  function writeHeartbeat() {
-    const registry = readRegistry(paths);
-    heartbeat.running = registry
+  function aliveRunning() {
+    return readRegistry(paths)
       .filter((entry) => isAlive(Number(entry.pid)))
       .map((entry) => ({ issue: entry.issue, round: entry.round }));
+  }
+
+  function writeHeartbeat() {
+    heartbeat.running = aliveRunning();
+    // 拍尾心跳的时间取写入时刻（T18）：拉取期间已经刷新过更晚的时间，拍尾不能倒回拍头。
+    heartbeat.at = new Date(now()).toISOString();
+    heartbeat.uptimeS = uptime();
     writeJsonAtomic(paths.heartbeatFile, heartbeat);
     return heartbeat;
+  }
+
+  /** 拉取期间的心跳（T18）：沿用上一拍心跳（上一拍结果、Slack 状态），只刷新时间/pid/在跑轮次，并带上 polling。 */
+  function pollBeat(polling) {
+    let previous = {};
+    try {
+      previous = JSON.parse(fs.readFileSync(paths.heartbeatFile, 'utf8')) || {};
+    } catch {
+      previous = {};
+    }
+    return {
+      ...previous,
+      at: new Date(now()).toISOString(),
+      pid: heartbeat.pid,
+      uptimeS: uptime(),
+      gate: heartbeat.gate,
+      running: aliveRunning(),
+      polling,
+    };
   }
 
   try {
@@ -284,10 +311,22 @@ export async function runTick({
     // 不写 write-rejected 提醒（只读期每拍都会碰到，写提醒就是刷屏）。
     const gateEnabled = fs.existsSync(paths.enabledFile);
     heartbeat.gate = gateEnabled ? 'enabled' : 'disabled';
-    const poll = await run('node', [path.join(repoRoot, 'watchers', 'acceptance', 'bin', 'poll.mjs'), '--json'], {
-      env: { ...env, ACCEPTANCE_WATCHER_HOME: home },
-      timeoutMs: 120000,
+    const stopPollBeat = startPollBeat({
+      now,
+      uptime,
+      beatMs: pollBeatMs,
+      buildBeat: pollBeat,
+      write: (beat) => writeJsonAtomic(paths.heartbeatFile, beat),
     });
+    let poll;
+    try {
+      poll = await run('node', [path.join(repoRoot, 'watchers', 'acceptance', 'bin', 'poll.mjs'), '--json'], {
+        env: { ...env, ACCEPTANCE_WATCHER_HOME: home },
+        timeoutMs: 120000,
+      });
+    } finally {
+      stopPollBeat();
+    }
     if (!poll || poll.code !== 0) {
       throw new Error(`poll 失败（退出码 ${poll?.code ?? '未知'}）：${String(poll?.stderr || '').trim().split('\n')[0] || ''}`);
     }
