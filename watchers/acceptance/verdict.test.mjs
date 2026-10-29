@@ -337,3 +337,16 @@ test('#140 SC2 批准执行推进、却没有交接：裁决多一行「没有�
   const body = writesOf(world, 'comment.update')[0].body;
   assert.ok(!body.includes(NO_HANDOFF_LINE) && !body.includes('交接重点核对'));
 });
+
+test('#140 反例（review-pr141）：交接早于最后一条登记时按没有交接写裁决：带「没有交接评论」一行，不要求旧重点项', async () => {
+  const { profile, home } = loadProfile();
+  const world = defaultTree();
+  withHandoff(world);
+  world.addComment(`${REPO}#1`, { body: `批准执行登记：2026-10-24 ${REPO}#3 → 会话 s2（x）claim c2`, createdAt: '2026-10-24T00:30:00.000Z' });
+  const items = fullConclusions({ [`${REPO}#2 SC4`]: { result: '要修', why: '看板没写', evidence: 'x' } });
+  const res = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', verdictFile(home, { items })]);
+  assert.equal(res.code, 0, res.err);
+  const body = writesOf(world, 'comment.update')[0].body;
+  assert.ok(body.includes(NO_HANDOFF_LINE));
+  assert.ok(!body.includes('交接重点核对'));
+});

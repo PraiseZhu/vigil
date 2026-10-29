@@ -56,8 +56,8 @@ node watchers/acceptance/bin/helper.mjs <collect|progress|verdict|close|correct|
 「批准执行」（approve-exec）推进的总 issue：lead 派出会话时在总 issue 上发 `批准执行登记：…`，验收完总 issue 后发交接评论，首行 `[批准执行] 交接验收 · 第 n 次`，正文里「## 请重点查」一节是编号列表。都只认 `ownerLogin` 发的。
 
 - **等交接**：有登记评论、还没有晚于最后一条登记的交接时，`trigger` 判 `awaiting-lead-handoff`，不开轮；从子 issue 全关（独立 issue 是关联 PR 合并）起满 24 小时仍没交接，照常开轮。已经出过晚于最后一条登记的裁决，就不再等。
-- **读交接**：`collect` 输出 `handoff: {url, createdAt, n, focus}`（最新一条）和 `root.approveExec`。验收会话只把它当线索，每条 SC 照样自己验。
-- 盘点只看总 issue 最近 50 条评论：登记评论落在 50 条之外时按「不是批准执行推进的」处理，和以前一样直接验。
+- **读交接**：`collect` 输出 `handoff: {url, createdAt, n, focus}`（最新一条，且晚于最后一条登记；早于它的算过期，输出 `null`，裁决按没有交接写）和 `root.approveExec`。验收会话只把它当线索，每条 SC 照样自己验。
+- 盘点只看总 issue 最近 50 条评论：登记评论落在 50 条之外时按「不是批准执行推进的」处理，和以前一样直接验。`collect` 拉了 100 条，判断登记和交接时也只用最近 50 条（`LEAD_HANDOFF_COMMENT_WINDOW`），两处结论一致。
 
 ### 有争议的行格式
 

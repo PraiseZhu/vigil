@@ -47,7 +47,7 @@ node watchers/acceptance/bin/helper.mjs progress --issue <root> --round <n>
 
 ### 批准执行的交接
 
-`root.approveExec` 为 `true` 表示这棵树由「批准执行」推进：lead 派出会话时在总 issue 上发了「批准执行登记」。lead 验收完总 issue 后会再发一条交接评论（首行 `[批准执行] 交接验收 · 第 n 次`），`collect` 把最新一条放在 `handoff`：`{url, createdAt, n, focus}`，`focus` 是交接里「请重点查」的每一条原文。
+`root.approveExec` 为 `true` 表示这棵树由「批准执行」推进：lead 派出会话时在总 issue 上发了「批准执行登记」。lead 验收完总 issue 后会再发一条交接评论（首行 `[批准执行] 交接验收 · 第 n 次`），`collect` 把最新一条放在 `handoff`：`{url, createdAt, n, focus}`，`focus` 是交接里「请重点查」的每一条原文。早于最后一条登记的交接不算（lead 之后又派了会话，旧交接已过期），这时 `handoff` 是 `null`。和盘点一样只看总 issue 最近 50 条评论。
 
 - 交接**只当线索，不算证据**：每条 SC 照样自己验、自己留证据，和勾选框一样不因为 lead 说过就算通过。lead 写的「lead 没验到的」也照样自己验。
 - `focus` 里每一条都要查，结论写进 `verdict.json` 的 `handoffChecks`：`[{"n":1,"result":"查了什么、结论"}]`，`n` 对应交接里的序号，一条重点项一条，缺了 `verdict` 以退出码 `1` 拒绝。裁决里会多一节「交接重点核对」逐条列出。

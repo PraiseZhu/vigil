@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { collectTasks, repoTier, bodyVersion, INVENTORY_QUERY } from './bin/tasks.mjs';
+import { collectTasks, repoTier, bodyVersion, INVENTORY_QUERY, LEAD_HANDOFF_COMMENT_WINDOW } from './bin/tasks.mjs';
 import { createGithub } from './bin/github.mjs';
 import {
   OWNER,
@@ -163,4 +163,24 @@ test('#140 SC1/SC3 盘点从总 issue 评论算出登记与交接时间：只认
   const byRef = Object.fromEntries(tasks.map((t) => [t.ref, t]));
   assert.deepEqual(byRef[`${REPO}#10`].leadHandoff, { registeredAt: '2026-10-22T00:00:00.000Z', handoffAt: '2026-10-23T00:00:00.000Z' });
   assert.deepEqual(byRef[`${REPO}#20`].leadHandoff, { registeredAt: null, handoffAt: null }, '没有登记的任务两项都是 null');
+});
+
+test('#140 反例（review-pr141）：交接早于最后一条登记（之后又派了会话）就不算；评论窗口和盘点查询一致', async () => {
+  assert.ok(INVENTORY_QUERY.includes(`comments(last: ${LEAD_HANDOFF_COMMENT_WINDOW})`), '窗口常量要和盘点查询的条数一致');
+  const profile = profileWith();
+  const comment = (body, createdAt, databaseId) => ({ id: `IC_${databaseId}`, databaseId, body, createdAt, updatedAt: createdAt, url: `u${databaseId}`, author: { login: OWNER } });
+  const parent = issueNode({
+    repo: REPO,
+    number: 10,
+    author: OWNER,
+    subIssues: [childNode({ repo: REPO, number: 11, author: OWNER, state: 'CLOSED' })],
+    comments: [
+      comment(`批准执行登记：2026-10-22 ${REPO}#11 → 会话 s1（x）claim c1`, '2026-10-22T00:00:00.000Z', 1),
+      comment('[批准执行] 交接验收 · 第 1 次', '2026-10-23T00:00:00.000Z', 2),
+      comment(`批准执行登记：2026-10-24 ${REPO}#12 → 会话 s2（x）claim c2`, '2026-10-24T00:00:00.000Z', 3),
+    ],
+  });
+  const run = createFakeRun({ onGraphql: () => inventoryData({ open: [parent] }) });
+  const tasks = await collectTasks(createGithub({ profile, run }), profile);
+  assert.deepEqual(tasks[0].leadHandoff, { registeredAt: '2026-10-24T00:00:00.000Z', handoffAt: null });
 });

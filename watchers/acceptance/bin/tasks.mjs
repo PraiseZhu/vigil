@@ -102,6 +102,8 @@ function issueRef(repo, number) {
 // 批准执行（approve-exec）的交接（#140）：lead 派出 owner 会话时在总 issue 上发「批准执行登记：…」，
 // 验收总 issue 通过后发「[批准执行] 交接验收 · 第 n 次」。只认 ownerLogin 发的，别人发同样首行的评论不算。
 export const APPROVE_EXEC_REGISTRATION = '批准执行登记：';
+/** 只看总 issue 最近这么多条评论：和盘点查询的 `comments(last: 50)` 一致，collect 拉了 100 条也只按这 50 条判断（#140「不做」）。 */
+export const LEAD_HANDOFF_COMMENT_WINDOW = 50;
 export const LEAD_HANDOFF_FIRST_LINE = /^\[批准执行\] 交接验收 · 第 (\d+) 次\s*$/;
 
 function byTime(a, b) {
@@ -127,11 +129,16 @@ export function handoffFocus(body) {
   return focus;
 }
 
-/** 总 issue 的评论 → 最近一条登记的时间、最新一条交接（{url, createdAt, n, focus}）；都没有就是 null。 */
+/**
+ * 总 issue 的评论 → 最近一条登记的时间、最新一条交接（{url, createdAt, n, focus}）；没有就是 null。
+ * 早于最后一条登记的交接不算（之后又派了会话，旧交接已过期）：trigger、collect、verdict 都按「没有交接」处理。
+ */
 export function leadHandoffOf(comments, ownerLogin) {
-  const own = (comments || []).filter((comment) => sameLogin(comment?.author?.login, ownerLogin)).sort(byTime);
+  const recent = [...(comments || [])].sort(byTime).slice(-LEAD_HANDOFF_COMMENT_WINDOW);
+  const own = recent.filter((comment) => sameLogin(comment?.author?.login, ownerLogin));
   const registration = own.filter((comment) => String(comment.body || '').startsWith(APPROVE_EXEC_REGISTRATION)).at(-1);
-  const latest = own.filter((comment) => LEAD_HANDOFF_FIRST_LINE.test(String(comment.body || '').split('\n')[0])).at(-1);
+  const handoffs = own.filter((comment) => LEAD_HANDOFF_FIRST_LINE.test(String(comment.body || '').split('\n')[0]));
+  const latest = handoffs.filter((comment) => !registration || byTime(comment, registration) > 0).at(-1);
   return {
     registeredAt: registration?.createdAt || null,
     handoff: latest
