@@ -221,6 +221,19 @@ export function createWorld({ now = () => Date.parse(CLOCK) } = {}) {
     };
   }
 
+  /** 只读查看板「验收」当前值（认领后写看板失败、重试前先查）：条目只在写过看板字段后才有。 */
+  function boardValueData(variables) {
+    const issue = issues.get(refOf(`${variables.owner}/${variables.name}`, Number(variables.issue)));
+    const value = issue?.project?.['验收'];
+    const nodes = value
+      ? [{ isArchived: false, project: { id: 'PVT_1' }, fieldValueByName: { __typename: 'ProjectV2ItemFieldSingleSelectValue', name: value } }]
+      : [];
+    return {
+      user: { projectV2: { id: 'PVT_1' } },
+      repository: { issue: issue ? { projectItems: { nodes } } : null },
+    };
+  }
+
   function addProjectItem(variables) {
     const ref = [...issues.values()].find((issue) => issue.id === variables.contentId)?.ref;
     const itemId = ref ? `PVTI_${nextItemId += 1}_${ref}` : `PVTI_${nextItemId += 1}`;
@@ -246,6 +259,7 @@ export function createWorld({ now = () => Date.parse(CLOCK) } = {}) {
     const variables = payload.variables || {};
     if (query.includes('search(')) return searchData(variables);
     if (query.includes('subIssues(')) return rootData(variables);
+    if (query.includes('fieldValueByName(')) return boardValueData(variables);
     if (query.includes('projectV2(')) return projectData(variables);
     if (query.includes('addProjectV2ItemById')) return addProjectItem(variables);
     if (query.includes('updateProjectV2ItemFieldValue')) return setProjectField(variables);

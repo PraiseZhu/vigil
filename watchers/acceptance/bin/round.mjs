@@ -4,12 +4,12 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadAcceptanceProfile } from './profile.mjs';
-import { createGithub, WriteBusyError, WriteRejectedError } from './github.mjs';
+import { createGithub, WriteBusyError, WriteFailedError, WriteRejectedError } from './github.mjs';
 import { collectTasks } from './tasks.mjs';
 import { shouldTrigger } from './trigger.mjs';
 import { createRounds, latestRound, parseRounds, RoundError } from './rounds.mjs';
 import { buildDispatchMessage } from './message.mjs';
-import { setAcceptanceFields } from './board.mjs';
+import { readAcceptanceField, setAcceptanceFields } from './board.mjs';
 import { collectTree } from './collect.mjs';
 import { appendAlert, hostPaths } from '../host/paths.mjs';
 
@@ -151,9 +151,40 @@ function defaultAlert(profile, now) {
   };
 }
 
+function messageOf(error) {
+  return String(error?.message || error);
+}
+
+/**
+ * 认领后写一个目标的看板「验收中」。这是「写不重试」（#115）的唯一例外，只限这一处：
+ * 写闸回「外发失败」（write-failed：写闸放行了、写 GitHub 时出错，比如 TLS 超时 / EOF）时，
+ * 先只读查看板：已经是「验收中」就不再写（GitHub 可能已经写成、只是回包丢了）；
+ * 确认没写成才经写闸、用同一个去重键重试一次。查不清、被拒、忙、别的失败都不重试，照原路径交回错误。
+ */
+async function writeClaimBoard(github, profile, fields) {
+  try {
+    await setAcceptanceFields(github, profile, fields);
+    return;
+  } catch (error) {
+    if (!(error instanceof WriteFailedError) || error.reason !== 'write-failed') throw error;
+    let current;
+    try {
+      current = await readAcceptanceField(github, profile, { repo: fields.repo, issue: fields.issue });
+    } catch (readError) {
+      throw new Error(`${messageOf(error)}；重试前查看板也失败（${messageOf(readError)}），不重试`);
+    }
+    if (current === fields.acceptance) return;
+    try {
+      await setAcceptanceFields(github, profile, fields);
+    } catch (retryError) {
+      throw new Error(`${messageOf(error)}；查看板确认没写成，重试一次仍失败：${messageOf(retryError)}`);
+    }
+  }
+}
+
 /**
  * 认领成功后看板写「验收中」：总 issue 和任务树里的子 issue（和 close 写「通过」的范围一致）。
- * 写失败不让认领失败：记一条提醒、stderr 留一行，返回没写成的条目。
+ * 外发失败时查看板后最多重试一次（见 writeClaimBoard）；仍没写成不让认领失败：记一条提醒、stderr 留一行，返回没写成的条目。
  */
 async function markClaimed({ github, profile, task, started, now, stderr, alert }) {
   const failed = [];
@@ -168,7 +199,7 @@ async function markClaimed({ github, profile, task, started, now, stderr, alert 
   for (const target of targets) {
     try {
       const { owner, name, number } = parseIssueRef(target);
-      await setAcceptanceFields(github, profile, {
+      await writeClaimBoard(github, profile, {
         repo: `${owner}/${name}`,
         issue: number,
         acceptance: '验收中',
