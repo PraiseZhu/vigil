@@ -7,7 +7,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { isVerdictOnly, loadAcceptanceProfile } from './bin/profile.mjs';
 import { beijingIso, bodyVersion, createRounds, parseRounds } from './bin/rounds.mjs';
-import { createGithub, WriteFailedError, WriteRejectedError } from './bin/github.mjs';
+import { createGithub, isReadOnlyGraphql, WriteFailedError, WriteRejectedError } from './bin/github.mjs';
+import { ACCEPTANCE_VALUE_QUERY } from './bin/board.mjs';
 import { runHelper } from './bin/helper.mjs';
 import { runRound } from './bin/round.mjs';
 import { poll } from './bin/poll.mjs';
@@ -593,6 +594,145 @@ test('认领：看板写失败不让认领失败，写一条 board-claim-failed 
   assert.equal(alerts[0].issue, ROOT_REF);
   assert.equal(alerts[0].round, 1);
   assert.match(alerts[0].detail, /example-owner\/example-repo#2/);
+});
+
+/**
+ * 认领后写看板的「外发失败」模拟：写闸照常放行，到真正写 GitHub 那一步按 plan 出错。
+ * plan: ref → [{ landed }...]，每次写这个 ref 的看板消耗一条；landed=true 表示 GitHub 其实写成了、只是回包丢了（TLS EOF）。
+ */
+function openFlakyBoardGate({ home, profile, world, plan, failComment = false }) {
+  const github = {
+    async graphql(query, variables) {
+      return world.graphql({ query, variables });
+    },
+    async write(action) {
+      if (failComment && action.type === 'comment.create') throw new Error('net/http: TLS handshake timeout');
+      if (action.type === 'project.field.set') {
+        const queue = plan.get(`${action.repo}#${action.issue}`);
+        const step = queue?.shift();
+        if (step) {
+          if (step.landed) world.write(action);
+          throw new Error(step.landed ? 'unexpected EOF' : 'net/http: TLS handshake timeout');
+        }
+      }
+      return world.write(action);
+    },
+  };
+  return createGate({ home, profile, github, run: procRun, binding: null, which: async () => false });
+}
+
+function boardCallsFor(github, ref) {
+  return github.gateCalls.filter((action) => action.type === 'project.field.set' && action.ref === ref);
+}
+
+test('认领后看板外发失败：先查看板没写成 → 经写闸重试一次写成，不记 board-claim-failed', async () => {
+  const { home, profile, paths } = setup();
+  const world = claimableWorld();
+  const child = `${REPO}#2`;
+  const gate = openFlakyBoardGate({ home, profile, world, plan: new Map([[child, [{ landed: false }]]]) });
+  const github = realGithubThroughGate({ profile, world, gate });
+  const result = await claim(github, profile);
+  assert.equal(result.code, 0, result.err);
+  for (const ref of [ROOT_REF, child, `${OTHER_REPO}#7`]) assert.equal(world.get(ref).project['验收'], '验收中', ref);
+  const calls = boardCallsFor(github, child);
+  assert.equal(calls.length, 2, '只重试一次');
+  assert.equal(calls[0].dedupeKey, calls[1].dedupeKey, '重试用同一个去重键');
+  assert.equal(boardCallsFor(github, ROOT_REF).length, 1, '没失败的目标不重试');
+  assert.equal(readAlerts(paths).filter((alert) => alert.kind === 'board-claim-failed').length, 0);
+  // 重试也走写闸：账本里记了这条（写闸只在真写成后记账）。
+  const ledger = fs.readFileSync(paths.ledgerFile, 'utf8');
+  assert.match(ledger, new RegExp(`board-claim:${child.replace('/', '\\/')}:1:`));
+});
+
+test('认领后看板外发失败但 GitHub 其实已写成：查到已是「验收中」就不再写', async () => {
+  const { home, profile, paths } = setup();
+  const world = claimableWorld();
+  const child = `${REPO}#2`;
+  const gate = openFlakyBoardGate({ home, profile, world, plan: new Map([[child, [{ landed: true }]]]) });
+  const github = realGithubThroughGate({ profile, world, gate });
+  const result = await claim(github, profile);
+  assert.equal(result.code, 0, result.err);
+  assert.equal(world.get(child).project['验收'], '验收中');
+  assert.equal(boardCallsFor(github, child).length, 1, '已写成就不重复写');
+  assert.equal(world.writes.filter((action) => action.type === 'project.field.set' && action.issue === 2).length, 1);
+  assert.equal(readAlerts(paths).filter((alert) => alert.kind === 'board-claim-failed').length, 0);
+});
+
+test('认领后看板重试一次仍失败：照原路径记 board-claim-failed，认领照常，不再第三次', async () => {
+  const { home, profile, paths } = setup();
+  const world = claimableWorld();
+  const child = `${REPO}#2`;
+  const gate = openFlakyBoardGate({ home, profile, world, plan: new Map([[child, [{ landed: false }, { landed: false }, { landed: false }]]]) });
+  const github = realGithubThroughGate({ profile, world, gate });
+  const result = await claim(github, profile);
+  assert.equal(result.code, 0, result.err);
+  assert.match(result.err, /看板「验收中」没写成（认领照常）/);
+  assert.match(world.get(ROOT_REF).comments[0].body, /第 1 轮：验收中/);
+  assert.equal(boardCallsFor(github, child).length, 2);
+  assert.equal(world.get(child).project['验收'], undefined);
+  const alerts = readAlerts(paths).filter((alert) => alert.kind === 'board-claim-failed');
+  assert.equal(alerts.length, 1);
+  assert.match(alerts[0].detail, /example-owner\/example-repo#2/);
+  assert.match(alerts[0].detail, /重试一次仍失败/);
+});
+
+test('认领后看板：重试前查看板也失败 → 不重试，照原路径记提醒', async () => {
+  const { home, profile, paths } = setup();
+  const world = claimableWorld();
+  const child = `${REPO}#2`;
+  const gate = openFlakyBoardGate({ home, profile, world, plan: new Map([[child, [{ landed: false }]]]) });
+  const github = realGithubThroughGate({ profile, world, gate });
+  github.ownerGraphql = async () => {
+    throw new Error('net/http: TLS handshake timeout');
+  };
+  const result = await claim(github, profile);
+  assert.equal(result.code, 0, result.err);
+  assert.equal(boardCallsFor(github, child).length, 1, '查不清就不重试');
+  const alerts = readAlerts(paths).filter((alert) => alert.kind === 'board-claim-failed');
+  assert.equal(alerts.length, 1);
+  assert.match(alerts[0].detail, /查看板也失败/);
+});
+
+test('认领后看板：写闸拒绝（4）不重试，不查看板', async () => {
+  const { home, profile, paths } = setup();
+  const world = claimableWorld();
+  const gate = openGate({ home, profile, world, binding: null });
+  const github = realGithubThroughGate({ profile, world, gate });
+  let boardReads = 0;
+  const origOwner = github.ownerGraphql;
+  github.ownerGraphql = async (query, variables) => {
+    if (String(query).includes('fieldValueByName(')) boardReads += 1;
+    return origOwner(query, variables);
+  };
+  const origWrite = github.write;
+  let attempts = 0;
+  github.write = async (action) => {
+    if (action.type === 'project.field.set' && action.issue === 2) {
+      attempts += 1;
+      throw new WriteRejectedError('外发被拒：not-in-tree', { exitCode: 4, reason: 'not-in-tree' });
+    }
+    return origWrite(action);
+  };
+  const result = await claim(github, profile);
+  assert.equal(result.code, 0, result.err);
+  assert.equal(attempts, 1);
+  assert.equal(boardReads, 0);
+  assert.equal(readAlerts(paths).filter((alert) => alert.kind === 'board-claim-failed').length, 1);
+});
+
+test('重试前查看板用的是纯只读 GraphQL', () => {
+  assert.equal(isReadOnlyGraphql(ACCEPTANCE_VALUE_QUERY), true);
+});
+
+test('别的写不重试：认领评论外发失败只发一次', async () => {
+  const { home, profile } = setup();
+  const world = claimableWorld();
+  const gate = openFlakyBoardGate({ home, profile, world, plan: new Map(), failComment: true });
+  const github = realGithubThroughGate({ profile, world, gate });
+  const result = await claim(github, profile);
+  assert.notEqual(result.code, 0);
+  assert.equal(github.gateCalls.filter((action) => action.type === 'comment.create').length, 1);
+  assert.equal(github.gateCalls.filter((action) => action.type === 'project.field.set').length, 0);
 });
 
 test('写闸 exec 看板：只许认领时把「验收」写成「验收中」，字段 / 值 / 轮次 / 树外 / 缺 root 一律拒绝', async () => {
