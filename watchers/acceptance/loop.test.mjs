@@ -702,3 +702,80 @@ test('SC12 tick 起的后台进程要放手（unref）：起了一个要跑很�
     }
   }
 });
+
+// T18：拉取（poll）慢时心跳照常刷新，另记「正在拉取、已多久」；拉取超过上限就不再刷新，真卡死照样露出来。
+function slowPollTick({ home, clock, pollBeatMs = 15 }) {
+  let release;
+  const pollDone = new Promise((resolve) => { release = resolve; });
+  const tick = runTick({
+    home,
+    env: { ...process.env },
+    run: async (_cmd, args) => {
+      if (args.some((arg) => String(arg).endsWith('poll.mjs'))) {
+        await pollDone;
+      }
+      return { code: 0, stdout: '[]', stderr: '' };
+    },
+    spawnRound: () => 1,
+    runRound: async () => ({ code: 0, stdout: '', stderr: '' }),
+    now: () => clock.wall,
+    uptime: () => clock.up,
+    pollBeatMs,
+  });
+  return { tick, release: () => release() };
+}
+
+const readBeat = (home) => JSON.parse(fs.readFileSync(hostPaths(home).heartbeatFile, 'utf8'));
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test('T18 慢拉取期间心跳照常刷新、带「正在拉取、已多久」，上一拍结果保留；拉完收尾心跳不再带拉取状态', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const T0 = Date.parse('2026-10-24T02:00:00.000Z');
+  const clock = { wall: T0, up: 1000 };
+  fs.mkdirSync(hostPaths(home).hostDir, { recursive: true });
+  fs.writeFileSync(hostPaths(home).heartbeatFile, JSON.stringify({ at: new Date(T0 - 60000).toISOString(), lastTick: { ok: true, marker: 'prev' }, running: [] }));
+  const { tick, release } = slowPollTick({ home, clock });
+  try {
+    await sleepMs(60);
+    clock.wall = T0 + 95000;
+    clock.up = 1095;
+    await sleepMs(80);
+    const beat = readBeat(home);
+    assert.equal(beat.at, new Date(T0 + 95000).toISOString(), '拉取中心跳时间要跟着刷新');
+    assert.equal(beat.uptimeS, 1095);
+    assert.deepEqual(beat.lastTick, { ok: true, marker: 'prev' }, '上一拍结果不能被抹掉');
+    assert.ok(beat.polling, '心跳要带拉取状态');
+    assert.equal(beat.polling.startedAt, new Date(T0).toISOString());
+    assert.equal(beat.polling.elapsedS, 95);
+  } finally {
+    release();
+  }
+  const done = await tick;
+  const final = readBeat(home);
+  assert.equal(final.polling, undefined, '拉完收尾心跳不带拉取状态');
+  assert.equal(done.polling, undefined);
+  assert.equal(final.at, new Date(T0 + 95000).toISOString(), '收尾心跳时间取写入时刻，不能比拉取中刷新的还旧');
+});
+
+test('T18 拉取超过上限（180 秒）就不再刷新心跳：真卡死照样表现为心跳过期', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const T0 = Date.parse('2026-10-24T02:00:00.000Z');
+  const clock = { wall: T0, up: 1000 };
+  const { tick, release } = slowPollTick({ home, clock });
+  try {
+    await sleepMs(60);
+    clock.wall = T0 + 170000;
+    clock.up = 1170;
+    await sleepMs(80);
+    assert.equal(readBeat(home).polling.elapsedS, 170);
+    clock.wall = T0 + 400000;
+    clock.up = 1400;
+    await sleepMs(80);
+    const beat = readBeat(home);
+    assert.equal(beat.at, new Date(T0 + 170000).toISOString(), '超过上限后心跳停在最后一次刷新');
+    assert.equal(beat.polling.elapsedS, 170);
+  } finally {
+    release();
+  }
+  await tick;
+});
