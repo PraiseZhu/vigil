@@ -57,3 +57,73 @@ export function startPollBeat({ now, uptime, beatMs = POLL_BEAT_MS, buildBeat, w
     timer = null;
   };
 }
+
+// T20：心跳覆盖整拍。拉取结束后同一拍还有修正轮（prbot）读 GitHub、清理卡住的轮次、写闸审计、通知等阶段，
+// 任何一段挂住都会让心跳停在拉取那一刻、体检误说「拉取已 N 秒」。这里把上面的拉取心跳扩成整拍的阶段心跳：
+// 心跳带 phase：{ name, startedAt, startedUptimeS, elapsedS }（当前阶段、已多久）；name 为 poll 时另写旧字段 polling（兼容）。
+// 每个阶段（修正轮里每发起一次读取都重新起算）超过 POLL_STALL_S 就停刷，真卡死照样表现为心跳过期并被体检报红。
+
+/** 阶段名 → 体检文案里的人话。 */
+export const PHASE_LABELS = Object.freeze({
+  poll: '拉取',
+  abort: '清理卡住的轮次',
+  prbot: '修正轮读取',
+  dispatch: '派发',
+  audit: '写闸审计',
+  notify: '发通知',
+});
+
+export function phaseLabel(name) {
+  return PHASE_LABELS[name] || `阶段 ${String(name || '未知')}`;
+}
+
+/** 心跳里的当前阶段：新字段 phase 优先；只有旧字段 polling 的心跳当成拉取阶段。 */
+export function heartbeatPhase(heartbeat) {
+  if (heartbeat?.phase && typeof heartbeat.phase === 'object') return heartbeat.phase;
+  if (heartbeat?.polling && typeof heartbeat.polling === 'object') return { ...heartbeat.polling, name: 'poll' };
+  return null;
+}
+
+/**
+ * 一拍开始时调用：返回 { setPhase(name), stop() }。setPhase 立刻写一次心跳并从此刻重新计时；
+ * 之后每 beatMs 刷新，当前阶段超过 POLL_STALL_S 就停刷（直到下一次 setPhase，说明这一段已经过去了）。
+ * buildBeat(phase) 返回要写的完整心跳对象；write 负责落盘。写失败不影响这一拍。
+ */
+export function startTickBeat({ now, uptime, beatMs = POLL_BEAT_MS, buildBeat, write }) {
+  let phase = null;
+  let timer = null;
+  let stopped = false;
+  const clear = () => {
+    if (timer) clearInterval(timer);
+    timer = null;
+  };
+  const beat = () => {
+    if (!phase || stopped) return;
+    const elapsedS = pollingElapsedS(phase, { now, uptime });
+    if (elapsedS !== null && elapsedS > POLL_STALL_S) {
+      clear();
+      return;
+    }
+    phase.elapsedS = elapsedS ?? 0;
+    try {
+      write(buildBeat({ ...phase }));
+    } catch {
+      // 心跳写不了不影响这一拍；拍尾还会再写一次。
+    }
+  };
+  return {
+    setPhase(name) {
+      if (stopped) return;
+      phase = { name, startedAt: new Date(now()).toISOString(), startedUptimeS: uptime(), elapsedS: 0 };
+      beat();
+      if (!timer) {
+        timer = setInterval(beat, beatMs);
+        timer.unref?.();
+      }
+    },
+    stop() {
+      stopped = true;
+      clear();
+    },
+  };
+}

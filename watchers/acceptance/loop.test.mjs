@@ -779,3 +779,109 @@ test('T18 拉取超过上限（180 秒）就不再刷新心跳：真卡死照样
   }
   await tick;
 });
+
+// T20：修正轮（prbot）阶段读 GitHub 挂住时，读取要被超时掐掉、这一拍以读失败收尾；心跳在整拍内都刷新并带当前阶段。
+function prbotHangTick({ home, clock, pollBeatMs = 15, prbotReadTimeoutMs = 300, onGh }) {
+  fs.mkdirSync(path.join(home, 'config'), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, 'config', 'host.json'),
+    JSON.stringify({ prbot: { piCommand: ['pi'], repos: { 'example-owner/example-repo': { handoff: 'owner' } } } }),
+  );
+  return runTick({
+    home,
+    env: { ...process.env },
+    run: async (cmd, args, opts = {}) => {
+      if (cmd === 'gh') return onGh(args, opts);
+      return { code: 0, stdout: '[]', stderr: '' };
+    },
+    spawnRound: () => 1,
+    spawnPrbot: () => 1,
+    runRound: async () => ({ code: 0, stdout: '', stderr: '' }),
+    discoverPrbot: async ({ github }) => {
+      await github.graphql('query { viewer { login } }', {});
+      return [];
+    },
+    checkPrbotStalled: async () => [],
+    cleanupPrbot: () => [],
+    gateAudit: async () => ({ checkedLines: 0, newViolations: [], sinceBaseline: null, newUncertain: [] }),
+    notify: async () => ({ ok: false, reason: 'not-configured' }),
+    now: () => clock.wall,
+    uptime: () => clock.up,
+    pollBeatMs,
+    prbotReadTimeoutMs,
+  });
+}
+
+test('T20 修正轮读取挂住：超时被掐掉，这一拍记 prbotError 收尾；挂住期间心跳刷新且阶段是 prbot、不再残留拉取状态', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const T0 = Date.parse('2026-10-30T18:47:00.000Z');
+  const clock = { wall: T0, up: 5000 };
+  const seen = [];
+  const tick = prbotHangTick({
+    home,
+    clock,
+    onGh: (args, opts) => {
+      seen.push(opts.timeoutMs);
+      return new Promise(() => {}); // 对端不回包：永远不返回
+    },
+  });
+  await sleepMs(80);
+  clock.wall = T0 + 40000;
+  clock.up = 5040;
+  await sleepMs(80);
+  const mid = readBeat(home);
+  assert.equal(mid.polling, undefined, '拉取已结束，心跳不能再残留拉取状态');
+  assert.equal(mid.phase?.name, 'prbot', '心跳要带当前阶段 prbot');
+  assert.equal(mid.phase.elapsedS, 40);
+  assert.equal(mid.at, new Date(T0 + 40000).toISOString(), '修正轮阶段心跳照常刷新');
+  const done = await tick;
+  assert.ok(seen.length >= 1 && seen.every((ms) => ms === 300), `读取要带超时：${seen}`);
+  assert.match(String(done.lastTick.prbotError || ''), /124|超时/);
+  assert.equal(done.phase, undefined, '拍尾心跳不带阶段');
+});
+
+test('T20 修正轮阶段超过上限（180 秒）就停刷心跳，真卡死照样露出来', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const T0 = Date.parse('2026-10-30T18:47:00.000Z');
+  const clock = { wall: T0, up: 5000 };
+  let release;
+  const tick = prbotHangTick({
+    home,
+    clock,
+    prbotReadTimeoutMs: 60000,
+    onGh: () => new Promise((resolve) => { release = () => resolve({ code: 0, stdout: '{"data":{}}', stderr: '' }); }),
+  });
+  try {
+    await sleepMs(80);
+    clock.wall = T0 + 170000;
+    clock.up = 5170;
+    await sleepMs(80);
+    assert.equal(readBeat(home).phase.elapsedS, 170);
+    clock.wall = T0 + 400000;
+    clock.up = 5400;
+    await sleepMs(80);
+    const beat = readBeat(home);
+    assert.equal(beat.at, new Date(T0 + 170000).toISOString(), '超过上限后心跳停在最后一次刷新');
+    assert.equal(beat.phase.name, 'prbot');
+  } finally {
+    release?.();
+  }
+  await tick;
+});
+
+test('T20 读超时只加在读上：只读 graphql、GET 带超时；mutation、POST/PATCH 不加（写不改）', async () => {
+  const { withReadTimeout } = await import('./host/tick.mjs');
+  const calls = [];
+  const wrapped = withReadTimeout(async (cmd, args, opts) => {
+    calls.push(opts?.timeoutMs);
+    return { code: 0, stdout: '{}', stderr: '' };
+  }, 120000);
+  await wrapped('gh', ['api', 'graphql', '--input', '-'], { input: JSON.stringify({ query: 'query { viewer { login } }' }) });
+  await wrapped('gh', ['api', 'repos/o/r/issues/1'], {});
+  await wrapped('gh', ['api', '-X', 'GET', 'repos/o/r'], {});
+  await wrapped('gh', ['api', 'graphql', '--input', '-'], { input: JSON.stringify({ query: 'mutation { x }' }) });
+  await wrapped('gh', ['api', '-X', 'POST', 'repos/o/r/issues'], {});
+  await wrapped('gh', ['api', '-X', 'PATCH', 'repos/o/r/issues/1'], {});
+  await wrapped('git', ['push'], {});
+  assert.deepEqual(calls, [120000, 120000, 120000, undefined, undefined, undefined, undefined]);
+});

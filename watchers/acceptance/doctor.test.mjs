@@ -437,3 +437,21 @@ test('T18 常驻循环：机器整机冻结（墙钟过了 2000 秒、uptime 只
   assert.equal(check.ok, true, check.detail);
   assert.match(check.detail, /正在拉取（已 30 秒/);
 });
+
+// T20：心跳带「当前阶段」时按阶段说真话，不再一律说「拉取」。
+test('T20 常驻循环：修正轮读取已 200 秒 → 红，文案说修正轮读取', async () => {
+  const fixture = makeFixture({ heartbeat: { at: new Date(NOW).toISOString(), pid: process.pid, phase: { name: 'prbot', startedAt: new Date(NOW - 200000).toISOString(), startedUptimeS: 800, elapsedS: 170 } } });
+  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, uptime: () => 1000 });
+  const check = checkOf(result, '常驻循环');
+  assert.equal(check.ok, false);
+  assert.match(check.detail, /^修正轮读取已 200 秒没结束，超过上限 180 秒/);
+  assert.doesNotMatch(check.detail, /拉取/);
+});
+
+test('T20 常驻循环：正在修正轮读取 60 秒、心跳新鲜 → 绿，详情写明阶段', async () => {
+  const fixture = makeFixture({ heartbeat: { at: new Date(NOW).toISOString(), pid: process.pid, phase: { name: 'prbot', startedAt: new Date(NOW - 60000).toISOString(), startedUptimeS: 940, elapsedS: 60 } } });
+  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, uptime: () => 1000 });
+  const check = checkOf(result, '常驻循环');
+  assert.equal(check.ok, true, check.detail);
+  assert.match(check.detail, /正在修正轮读取（已 60 秒，上限 180 秒）/);
+});
