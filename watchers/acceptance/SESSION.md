@@ -51,7 +51,7 @@ node watchers/acceptance/bin/helper.mjs progress --issue <root> --round <n>
 
 - 交接**只当线索，不算证据**：每条 SC 照样自己验、自己留证据，和勾选框一样不因为 lead 说过就算通过。lead 写的「lead 没验到的」也照样自己验。
 - `focus` 里每一条都要查，结论写进 `verdict.json` 的 `handoffChecks`：`[{"n":1,"result":"查了什么、结论"}]`，`n` 对应交接里的序号，一条重点项一条，缺了 `verdict` 以退出码 `1` 拒绝。裁决里会多一节「交接重点核对」逐条列出。
-- 交接的「子 PR」表写着 lead 验收时的 head：合并进 main 的提交里，**lead 验收时的 head 之后新增的提交要重点查**（Ready 之后盯梢按审查意见推的修复，lead 没看过）。
+- 交接的「子 PR」表写着 lead 通过时的 head：合并进 main 的提交里，**lead 通过时的 head 之后新增的提交要重点查**（Ready 之后盯梢按审查意见推的修复，lead 没看过）。
 - `approveExec` 为 `true`、`handoff` 却是 `null`：盘点已经等满 24 小时才开这一轮，照常验；裁决里会自动多一行「批准执行没有交接评论，等满 24 小时后照常验收。」
 
 ## 3. 有争议的条目

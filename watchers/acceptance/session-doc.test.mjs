@@ -236,7 +236,7 @@ test('#140 SC5 SESSION.md 写清批准执行的交接：只当线索、每条 SC
   assert.match(session, /交接\*\*只当线索，不算证据\*\*/);
   assert.match(session, /每条 SC 照样自己验/);
   assert.match(session, /`handoffChecks`/);
-  assert.match(session, /lead 验收时的 head 之后新增的提交要重点查/);
+  assert.match(session, /lead 通过时的 head 之后新增的提交要重点查/);
   assert.match(session, /等满 24 小时后照常验收/);
   assert.match(doc, /awaiting-lead-handoff/);
   assert.match(doc, /\[批准执行\] 交接验收 · 第 n 次/);
