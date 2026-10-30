@@ -99,6 +99,59 @@ function issueRef(repo, number) {
   return `${repo}#${number}`;
 }
 
+// 批准执行（approve-exec）的交接（#140）：lead 派出 owner 会话时在总 issue 上发「批准执行登记：…」，
+// 验收总 issue 通过后发「[批准执行] 交接验收 · 第 n 次」。只认 ownerLogin 发的，别人发同样首行的评论不算。
+export const APPROVE_EXEC_REGISTRATION = '批准执行登记：';
+/** 只看总 issue 最近这么多条评论：和盘点查询的 `comments(last: 50)` 一致，collect 拉了 100 条也只按这 50 条判断（#140「不做」）。 */
+export const LEAD_HANDOFF_COMMENT_WINDOW = 50;
+export const LEAD_HANDOFF_FIRST_LINE = /^\[批准执行\] 交接验收 · 第 (\d+) 次\s*$/;
+
+function byTime(a, b) {
+  const ta = Date.parse(a.createdAt || 0) || 0;
+  const tb = Date.parse(b.createdAt || 0) || 0;
+  if (ta !== tb) return ta - tb;
+  return (a.databaseId || 0) - (b.databaseId || 0);
+}
+
+/** 交接评论「## 请重点查」一节下的编号列表（到下一个二级标题为止），每条取原文。 */
+export function handoffFocus(body) {
+  const focus = [];
+  let inSection = false;
+  for (const line of String(body ?? '').split('\n')) {
+    if (/^##\s/.test(line)) {
+      inSection = /^##\s*请重点查\s*$/.test(line.trim());
+      continue;
+    }
+    if (!inSection) continue;
+    const match = /^\s*\d+\.\s+(.+?)\s*$/.exec(line);
+    if (match) focus.push(match[1]);
+  }
+  return focus;
+}
+
+/**
+ * 总 issue 的评论 → 最近一条登记的时间、最新一条交接（{url, createdAt, n, focus}）；没有就是 null。
+ * 早于最后一条登记的交接不算（之后又派了会话，旧交接已过期）：trigger、collect、verdict 都按「没有交接」处理。
+ */
+export function leadHandoffOf(comments, ownerLogin) {
+  const recent = [...(comments || [])].sort(byTime).slice(-LEAD_HANDOFF_COMMENT_WINDOW);
+  const own = recent.filter((comment) => sameLogin(comment?.author?.login, ownerLogin));
+  const registration = own.filter((comment) => String(comment.body || '').startsWith(APPROVE_EXEC_REGISTRATION)).at(-1);
+  const handoffs = own.filter((comment) => LEAD_HANDOFF_FIRST_LINE.test(String(comment.body || '').split('\n')[0]));
+  const latest = handoffs.filter((comment) => !registration || byTime(comment, registration) > 0).at(-1);
+  return {
+    registeredAt: registration?.createdAt || null,
+    handoff: latest
+      ? {
+          url: latest.url || null,
+          createdAt: latest.createdAt || null,
+          n: Number(LEAD_HANDOFF_FIRST_LINE.exec(String(latest.body).split('\n')[0])[1]),
+          focus: handoffFocus(latest.body),
+        }
+      : null,
+  };
+}
+
 function asIssueList(connection) {
   return connection?.nodes || [];
 }
@@ -134,6 +187,7 @@ function toTask(issue, profile) {
   ];
   const ref = issueRef(repo, issue.number);
   const rounds = parseRounds(issue.comments?.nodes || [], profile.ownerLogin);
+  const lead = leadHandoffOf(issue.comments?.nodes, profile.ownerLogin);
   return {
     ref,
     repo,
@@ -160,6 +214,8 @@ function toTask(issue, profile) {
     })),
     rounds,
     outOfScope,
+    // 批准执行推进的任务：最近一条登记、最新一条 lead 交接（#140）。trigger 据此在 lead 交接前不开轮。
+    leadHandoff: { registeredAt: lead.registeredAt, handoffAt: lead.handoff?.createdAt || null },
     // 最近一次裁决里的「有争议」条目和宿主的裁决结果（#46 SC8）：trigger 据此等裁决、裁决出来后触发下一轮。
     dispute: taskDispute({ comments: issue.comments?.nodes, rounds, profile, ref }),
   };

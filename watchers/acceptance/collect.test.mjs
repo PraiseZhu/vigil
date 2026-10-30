@@ -272,3 +272,77 @@ test('SC8 有多条已出裁决的轮次评论时，只取最新那条的争议�
     [`${REPO}#2 SC4`],
   );
 });
+
+const HANDOFF_BODY = [
+  '[批准执行] 交接验收 · 第 2 次',
+  `总 issue：${REPO}#1`,
+  '',
+  '## 结论',
+  'lead 判总 issue 通过。',
+  '',
+  '## 请重点查',
+  '1. src/a.ts 的重试分支：只在集成预览跑过单测',
+  '2. 两个子 PR 都改了 config 读取顺序',
+  '   - 这是补充说明，不算一条',
+  '',
+  '## lead 没验到的',
+  '3. 这里的编号不算重点项',
+].join('\n');
+
+test('#140 SC4 collect 输出最新一条我发的 lead 交接（序号、链接、请重点查），别人发的不算；没有就是 null', async () => {
+  const profile = loadProfile();
+  let world = defaultTree({ childBody: DEFAULT_CHILD_BODY });
+  let { code, out, err } = await runCollect(world, profile);
+  assert.equal(code, 0, err);
+  let tree = JSON.parse(out);
+  assert.equal(tree.handoff, null);
+  assert.equal(tree.root.approveExec, false);
+
+  world = defaultTree({ childBody: DEFAULT_CHILD_BODY });
+  world.addComment(`${REPO}#1`, { body: `批准执行登记：2026-10-24 ${REPO}#2 → 会话 s1（x）claim c1`, createdAt: '2026-10-24T00:10:00.000Z' });
+  world.addComment(`${REPO}#1`, { body: '[批准执行] 交接验收 · 第 1 次\n## 请重点查\n1. 旧的一条', createdAt: '2026-10-24T00:20:00.000Z' });
+  const latest = world.addComment(`${REPO}#1`, { body: HANDOFF_BODY, createdAt: '2026-10-24T00:30:00.000Z' });
+  world.addComment(`${REPO}#1`, { body: '[批准执行] 交接验收 · 第 9 次\n## 请重点查\n1. 伪造', author: 'StrangerUser', createdAt: '2026-10-24T00:40:00.000Z' });
+  ({ code, out, err } = await runCollect(world, profile));
+  assert.equal(code, 0, err);
+  tree = JSON.parse(out);
+  assert.equal(tree.root.approveExec, true);
+  assert.deepEqual(tree.handoff, {
+    url: latest.url,
+    createdAt: '2026-10-24T00:30:00.000Z',
+    n: 2,
+    focus: ['src/a.ts 的重试分支：只在集成预览跑过单测', '两个子 PR 都改了 config 读取顺序'],
+  });
+});
+
+test('#140 SC3 别人发的「批准执行登记」不让树变成批准执行推进的', async () => {
+  const profile = loadProfile();
+  const world = defaultTree({ childBody: DEFAULT_CHILD_BODY });
+  world.addComment(`${REPO}#1`, { body: `批准执行登记：2026-10-24 ${REPO}#2 → 会话 s1（x）claim c1`, author: 'StrangerUser' });
+  const { code, out, err } = await runCollect(world, profile);
+  assert.equal(code, 0, err);
+  assert.equal(JSON.parse(out).root.approveExec, false);
+});
+
+test('#140 反例（review-pr141）：交接早于最后一条登记时 handoff 为 null；登记落在最近 50 条评论之外时不算批准执行推进的', async () => {
+  const profile = loadProfile();
+  let world = defaultTree({ childBody: DEFAULT_CHILD_BODY });
+  world.addComment(`${REPO}#1`, { body: `批准执行登记：2026-10-24 ${REPO}#2 → 会话 s1（x）claim c1`, createdAt: '2026-10-24T00:10:00.000Z' });
+  world.addComment(`${REPO}#1`, { body: '[批准执行] 交接验收 · 第 1 次\n## 请重点查\n1. 旧的一条', createdAt: '2026-10-24T00:20:00.000Z' });
+  world.addComment(`${REPO}#1`, { body: `批准执行登记：2026-10-24 ${REPO}#2 → 会话 s2（x）claim c2`, createdAt: '2026-10-24T00:30:00.000Z' });
+  let { code, out, err } = await runCollect(world, profile);
+  assert.equal(code, 0, err);
+  let tree = JSON.parse(out);
+  assert.equal(tree.root.approveExec, true);
+  assert.equal(tree.handoff, null, '过期交接不再交给验收会话');
+
+  world = defaultTree({ childBody: DEFAULT_CHILD_BODY });
+  world.addComment(`${REPO}#1`, { body: `批准执行登记：2026-10-24 ${REPO}#2 → 会话 s1（x）claim c1`, createdAt: '2026-10-24T00:00:01.000Z' });
+  for (let i = 0; i < 50; i += 1) {
+    world.addComment(`${REPO}#1`, { body: `普通评论 ${i}`, createdAt: new Date(Date.parse('2026-10-24T01:00:00.000Z') + i * 1000).toISOString() });
+  }
+  ({ code, out, err } = await runCollect(world, profile));
+  assert.equal(code, 0, err);
+  tree = JSON.parse(out);
+  assert.equal(tree.root.approveExec, false, '和盘点一样只看最近 50 条：登记被挤出窗口就按旧行为');
+});

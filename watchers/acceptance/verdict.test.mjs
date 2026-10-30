@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
+import { NO_HANDOFF_LINE } from './bin/verdict.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion, lockPath, parseRounds } from './bin/rounds.mjs';
 import { shouldTrigger } from './bin/trigger.mjs';
@@ -290,4 +291,62 @@ test('「通过」之前总 issue 必须已关：还开着 → 退出码 1、不
   const needsFix = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', fix]);
   assert.equal(needsFix.code, 0, needsFix.err);
   assert.match(writesOf(world, 'comment.update')[0].body.split('\n')[0], /第 1 轮：要修/);
+});
+
+// #140 批准执行 lead 的交接：重点项逐条要结论；没有交接时裁决写明。
+function withHandoff(world) {
+  world.addComment(`${REPO}#1`, { body: `批准执行登记：2026-10-24 ${REPO}#2 → 会话 s1（x）claim c1`, createdAt: '2026-10-24T00:10:00.000Z' });
+  return world.addComment(`${REPO}#1`, {
+    body: ['[批准执行] 交接验收 · 第 1 次', '', '## 请重点查', '1. 重试分支没在真实环境跑过', '2. 合并后 head 比 lead 验收时多了两个提交', '', '## lead 没验到的', '- 无'].join('\n'),
+    createdAt: '2026-10-24T00:20:00.000Z',
+  });
+}
+
+test('#140 SC5 交接有重点项时 handoffChecks 缺一条 → 退出码 1、什么都不写；补齐后裁决多一节「交接重点核对」', async () => {
+  const { profile, home } = loadProfile();
+  const world = defaultTree();
+  const handoff = withHandoff(world);
+  const items = fullConclusions({ [`${REPO}#2 SC4`]: { result: '要修', why: '看板没写', evidence: 'x' } });
+  const short = verdictFile(home, { items, handoffChecks: [{ n: 1, result: '查了，没问题' }] });
+  const bad = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', short]);
+  assert.equal(bad.code, 1);
+  assert.match(bad.err, /交接重点核对缺结论：lead 交接第 1 次「请重点查」第 2 条没写/);
+  assert.equal(writesOf(world, 'comment.update').length, 0, '缺结论时什么都不写');
+
+  const full = verdictFile(home, { items, handoffChecks: [{ n: 1, result: '查了，没问题' }, { n: 2, result: '两个提交只改文案' }] });
+  const ok = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', full]);
+  assert.equal(ok.code, 0, ok.err);
+  const body = writesOf(world, 'comment.update')[0].body;
+  assert.ok(body.includes(`## 交接重点核对\n对照 lead 交接第 1 次：${handoff.url}\n- 1. 重试分支没在真实环境跑过 → 查了，没问题\n- 2. 合并后 head 比 lead 验收时多了两个提交 → 两个提交只改文案`), body);
+  assert.ok(!body.includes(NO_HANDOFF_LINE));
+});
+
+test('#140 SC2 批准执行推进、却没有交接：裁决多一行「没有交接评论」；不是批准执行推进的不加', async () => {
+  const { profile, home } = loadProfile();
+  const items = fullConclusions({ [`${REPO}#2 SC4`]: { result: '要修', why: '看板没写', evidence: 'x' } });
+  let world = defaultTree();
+  world.addComment(`${REPO}#1`, { body: `批准执行登记：2026-10-24 ${REPO}#2 → 会话 s1（x）claim c1` });
+  let res = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', verdictFile(home, { items })]);
+  assert.equal(res.code, 0, res.err);
+  assert.ok(writesOf(world, 'comment.update')[0].body.includes(NO_HANDOFF_LINE));
+  assert.equal(NO_HANDOFF_LINE, '批准执行没有交接评论，等满 24 小时后照常验收。');
+
+  world = defaultTree();
+  res = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', verdictFile(home, { items })]);
+  assert.equal(res.code, 0, res.err);
+  const body = writesOf(world, 'comment.update')[0].body;
+  assert.ok(!body.includes(NO_HANDOFF_LINE) && !body.includes('交接重点核对'));
+});
+
+test('#140 反例（review-pr141）：交接早于最后一条登记时按没有交接写裁决：带「没有交接评论」一行，不要求旧重点项', async () => {
+  const { profile, home } = loadProfile();
+  const world = defaultTree();
+  withHandoff(world);
+  world.addComment(`${REPO}#1`, { body: `批准执行登记：2026-10-24 ${REPO}#3 → 会话 s2（x）claim c2`, createdAt: '2026-10-24T00:30:00.000Z' });
+  const items = fullConclusions({ [`${REPO}#2 SC4`]: { result: '要修', why: '看板没写', evidence: 'x' } });
+  const res = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', verdictFile(home, { items })]);
+  assert.equal(res.code, 0, res.err);
+  const body = writesOf(world, 'comment.update')[0].body;
+  assert.ok(body.includes(NO_HANDOFF_LINE));
+  assert.ok(!body.includes('交接重点核对'));
 });

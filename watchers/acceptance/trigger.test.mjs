@@ -271,3 +271,58 @@ test('通过但没关：同一份正文只通过过一次 → 再触发一轮收
   assert.equal(shouldTrigger({ ...once, tier: 'watch' }, { now, profile }).trigger, false);
   assert.equal(shouldTrigger({ ...once, state: 'closed', closedAt: '2026-10-23T01:00:00.000Z' }, { now, profile }).trigger, false);
 });
+
+// #140 批准执行：lead 交接前不开轮，满 24 小时照常验。
+const REGISTERED = '2026-10-22T00:00:00.000Z';
+const CHILD_CLOSED = '2026-10-23T00:00:00.000Z';
+
+function approveExecParent({ handoffAt = null, rounds = [], children } = {}) {
+  return parentTask({
+    children: children ?? [{ ref: `${REPO}#2`, state: 'closed', closedAt: CHILD_CLOSED }],
+    rounds,
+    rest: { leadHandoff: { registeredAt: REGISTERED, handoffAt } },
+  });
+}
+
+test('#140 SC1 有登记、没交接、子 issue 全关不满 24 小时：awaiting-lead-handoff；有交接后照常触发', () => {
+  const profile = { startAt: START_AT };
+  const at = nowAt('2026-10-23T23:59:00.000Z');
+  assert.deepEqual(shouldTrigger(approveExecParent(), { now: at, profile }), { trigger: false, reason: 'awaiting-lead-handoff' });
+  assert.deepEqual(
+    shouldTrigger(approveExecParent({ handoffAt: '2026-10-21T00:00:00.000Z' }), { now: at, profile }),
+    { trigger: false, reason: 'awaiting-lead-handoff' },
+    '早于最后一条登记的交接不算（之后又派了会话）',
+  );
+  assert.deepEqual(shouldTrigger(approveExecParent({ handoffAt: '2026-10-23T05:00:00.000Z' }), { now: at, profile }), { trigger: true, reason: 'no-verdict' });
+});
+
+test('#140 SC2 满 24 小时仍没交接照常触发；等满后验过的那一轮之后不再等', () => {
+  const profile = { startAt: START_AT };
+  assert.deepEqual(shouldTrigger(approveExecParent(), { now: nowAt('2026-10-24T00:00:01.000Z'), profile }), { trigger: true, reason: 'no-verdict' });
+  // 等满 24 小时验了一轮（要修），修正子 issue 刚关：不再等交接。
+  const task = approveExecParent({
+    children: [
+      { ref: `${REPO}#2`, state: 'closed', closedAt: CHILD_CLOSED },
+      { ref: `${REPO}#5`, state: 'closed', closedAt: '2026-10-25T00:00:00.000Z' },
+    ],
+    rounds: [{ round: 1, status: '要修', bodyVersion: bodyVersion('parent body'), finishedAt: '2026-10-24T02:00:00.000Z' }],
+  });
+  assert.deepEqual(shouldTrigger(task, { now: nowAt('2026-10-25T01:00:00.000Z'), profile }), { trigger: true, reason: 'children-closed-after-verdict' });
+});
+
+test('#140 SC1 独立 issue：有登记、PR 刚合并、没交接时等；满 24 小时照常验', () => {
+  const profile = { startAt: START_AT };
+  const task = { ...standaloneTask({ linkedPrs: [{ ref: `${REPO}#9`, mergedAt: CHILD_CLOSED }] }), leadHandoff: { registeredAt: REGISTERED, handoffAt: null } };
+  assert.equal(shouldTrigger(task, { now: nowAt('2026-10-23T12:00:00.000Z'), profile }).reason, 'awaiting-lead-handoff');
+  assert.deepEqual(shouldTrigger(task, { now: nowAt('2026-10-24T00:00:01.000Z'), profile }), { trigger: true, reason: 'no-verdict' });
+});
+
+test('#140 SC3 没有登记的任务和以前一样：子 issue 全关就触发', () => {
+  const profile = { startAt: START_AT };
+  const at = nowAt('2026-10-23T01:00:00.000Z');
+  assert.deepEqual(shouldTrigger(parentTask({ children: [{ ref: `${REPO}#2`, state: 'closed', closedAt: CHILD_CLOSED }] }), { now: at, profile }), { trigger: true, reason: 'no-verdict' });
+  assert.deepEqual(
+    shouldTrigger(parentTask({ rest: { leadHandoff: { registeredAt: null, handoffAt: null } } }), { now: at, profile }),
+    { trigger: true, reason: 'no-verdict' },
+  );
+});

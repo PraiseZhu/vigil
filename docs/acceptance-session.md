@@ -27,6 +27,11 @@ node watchers/acceptance/bin/helper.mjs <collect|progress|verdict|close|correct|
 - 人工手测：owner/repo#12 SC5（cindy-mac）
 - 有争议：owner/repo#12 SC6 · 验收方：… · 修正方：…
 
+批准执行没有交接评论，等满 24 小时后照常验收。   ← 只有批准执行推进、又没有交接时有这一行
+## 交接重点核对                                       ← 只有 lead 交接里有「请重点查」时有这一节
+对照 lead 交接第 1 次：https://github.com/…
+- 1. <重点项原文> → <查了什么、结论>
+
 ## 需人工处理
 - 扫到疑似密钥，没推：path/a, path/b
 
@@ -39,11 +44,20 @@ node watchers/acceptance/bin/helper.mjs <collect|progress|verdict|close|correct|
 - `ref` 是验收项的**出处 issue**（`collect` 里那条 SC 所在的 issue），不是总 issue。
 - **覆盖率**：写之前按 `collect` 重新收一遍任务树，树里（总 issue、子 issue、挂着的修正子 issue）每条 SC 都要有一条结论（通过 / 要修 / 人工手测 / 有争议）；缺了就退出码 `1`，stderr 列出缺的 `owner/repo#n SC<k>`，什么都不写。`items` 为空一律拒绝，不得判通过。
 - `extracted: true` 表示任务本来没写验收标准，标准是验收机从正文和关联 PR 提炼的；裁决里会多一行说明。
+- `handoffChecks`（#140）：`[{"n":1,"result":"…"}]`，`collect` 的 `handoff.focus` 非空时每条重点项一条（`n` 是交接里的序号），缺了退出码 `1`、什么都不写；渲染成「交接重点核对」一节。`root.approveExec` 为真、`handoff` 为空时裁决自动带「没有交接评论」那一行。
 - 状态推导：任一条「要修」或「有争议」→ 要修；本轮有「需人工处理」记录 → 要修；否则通过。人工手测**不拦**通过。
 - 去重键：`verdict:<总 issue>:<n>:<轮次评论 id>:<结论>`（带评论 id：轮次评论被删后同号重新认领，不会命中旧记录）。
 - `--status 通过|要修` 可选；写错（和逐条结果不一致）直接退出码 `1`。
 - 正文版本按**改完之后**的正文算：验收机自己勾选或关 issue 改了正文，就用改后的版本，`trigger` 不会因此重验。
 - 写完放锁、更新缓存（`lastVerdict`）。**不调 `rounds.finish`**：那会保留旧的正文版本行。
+
+### 批准执行的交接（#140）
+
+「批准执行」（approve-exec）推进的总 issue：lead 派出会话时在总 issue 上发 `批准执行登记：…`，验收完总 issue 后发交接评论，首行 `[批准执行] 交接验收 · 第 n 次`，正文里「## 请重点查」一节是编号列表。都只认 `ownerLogin` 发的。
+
+- **等交接**：有登记评论、还没有晚于最后一条登记的交接时，`trigger` 判 `awaiting-lead-handoff`，不开轮；从子 issue 全关（独立 issue 是关联 PR 合并）起满 24 小时仍没交接，照常开轮。已经出过晚于最后一条登记的裁决，就不再等。
+- **读交接**：`collect` 输出 `handoff: {url, createdAt, n, focus}`（最新一条，且晚于最后一条登记；早于它的算过期，输出 `null`，裁决按没有交接写）和 `root.approveExec`。验收会话只把它当线索，每条 SC 照样自己验。
+- 盘点只看总 issue 最近 50 条评论：登记评论落在 50 条之外时按「不是批准执行推进的」处理，和以前一样直接验。`collect` 拉了 100 条，判断登记和交接时也只用最近 50 条（`LEAD_HANDOFF_COMMENT_WINDOW`），两处结论一致。
 
 ### 有争议的行格式
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// 收集（#46 SC1、SC8）：总 issue、子 issue、修正子 issue、验收项、关联 PR、有争议的条目。
+// 收集（#46 SC1、SC8；#140）：总 issue、子 issue、修正子 issue、验收项、关联 PR、有争议的条目、批准执行 lead 的交接。
 // 只读：本文件不发任何写请求。
 import { bodyVersion, parseRef } from './rounds.mjs';
-import { repoTier } from './tasks.mjs';
+import { leadHandoffOf, repoTier } from './tasks.mjs';
 import { isVerdictOnly } from './profile.mjs';
 
 export const MANUAL_LAYERS = Object.freeze(['cindy-mac', 'cindy-windows', 'paid', 'github-live']);
@@ -263,6 +263,8 @@ export async function collectTree({ github, profile, ref }) {
   }
 
   const manual = issues.flatMap((entry) => entry.items.filter((item) => item.manual));
+  // 批准执行的交接只是线索：验收会话按它多查几处，每条 SC 照样自己验（SESSION.md「批准执行的交接」）。
+  const lead = leadHandoffOf(issue.comments?.nodes, ownerLogin);
 
   return {
     root: {
@@ -276,7 +278,10 @@ export async function collectTree({ github, profile, ref }) {
       fork: Boolean(ranked.fork),
       // 只出裁决（profile 的 verdictOnlyIssues）：不关、不勾、不开修正、不推送，最后一步只写裁决。
       verdictOnly: isVerdictOnly(profile, rootRef),
+      // 有 ownerLogin 发的「批准执行登记」评论：这棵树由批准执行推进（#140）。
+      approveExec: Boolean(lead.registeredAt),
     },
+    handoff: lead.handoff,
     issues,
     corrections,
     disputed,

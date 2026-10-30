@@ -72,6 +72,27 @@ function disputeOf(task, f) {
   return dispute;
 }
 
+/** 批准执行推进的任务，lead 交接之前最多等这么久（从子 issue 全关 / PR 合并算起），之后照常验（#140）。 */
+export const LEAD_HANDOFF_WAIT_HOURS = 24;
+
+function latestMs(stamps) {
+  const ms = stamps.map((stamp) => Date.parse(stamp || '')).filter(Number.isFinite);
+  return ms.length ? Math.max(...ms) : null;
+}
+
+/**
+ * 总 issue 上有 ownerLogin 发的「批准执行登记」、还没有晚于最后一条登记的 lead 交接：先等 lead 验收总 issue、发交接。
+ * 等满 LEAD_HANDOFF_WAIT_HOURS 照常验；已经出过晚于最后一条登记的裁决（等满后验过的那一轮）就不再等。
+ */
+function awaitingLeadHandoff(task, f, nowMs, readyAt) {
+  const registered = Date.parse(task.leadHandoff?.registeredAt || '');
+  if (!Number.isFinite(registered)) return false;
+  if (Date.parse(task.leadHandoff.handoffAt || '') >= registered) return false;
+  if (Date.parse(f?.finishedAt || '') >= registered) return false;
+  if (readyAt === null) return false;
+  return nowMs - readyAt < LEAD_HANDOFF_WAIT_HOURS * 60 * 60 * 1000;
+}
+
 export function shouldTrigger(task, { now, profile }) {
   if (!task?.tier) return { trigger: false, reason: 'no-tier' };
   if (task.closedAt && Date.parse(task.closedAt) < Date.parse(profile.startAt)) {
@@ -89,6 +110,9 @@ export function shouldTrigger(task, { now, profile }) {
 
   if (isParent) {
     if ((task.children || []).some(childOpen)) return { trigger: false, reason: 'children-open' };
+    if (awaitingLeadHandoff(task, f, now(), latestMs((task.children || []).map((child) => child.closedAt)))) {
+      return { trigger: false, reason: 'awaiting-lead-handoff' };
+    }
     if (!f) return { trigger: true, reason: 'no-verdict' };
     if (dispute) return { trigger: true, reason: 'adjudicated' };
     if (f.bodyVersion !== task.bodyVersion) return { trigger: true, reason: 'body-changed' };
@@ -100,6 +124,9 @@ export function shouldTrigger(task, { now, profile }) {
 
   const merged = (task.linkedPrs || []).filter((pr) => pr.mergedAt);
   if (!merged.length) return { trigger: false, reason: 'no-merged-pr' };
+  if (awaitingLeadHandoff(task, f, now(), latestMs(merged.map((pr) => pr.mergedAt)))) {
+    return { trigger: false, reason: 'awaiting-lead-handoff' };
+  }
   if (!f) return { trigger: true, reason: 'no-verdict' };
   if (dispute) return { trigger: true, reason: 'adjudicated' };
   if (merged.some((pr) => f.finishedAt && Date.parse(pr.mergedAt) > Date.parse(f.finishedAt))) {

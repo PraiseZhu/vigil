@@ -23,7 +23,7 @@
 node watchers/acceptance/bin/helper.mjs collect --issue <root>
 ```
 
-stdout 是 JSON：`root`（kind / tier / fork / 正文版本 / `verdictOnly`）、`issues`（总 issue 在前，每条验收项的出处 issue、原文、验证层次、测试点、关联 PR）、`corrections`（修正子 issue）、`disputed`（有争议的条目）、`manual`（人工手测项）。按它决定这一轮验什么。
+stdout 是 JSON：`root`（kind / tier / fork / 正文版本 / `verdictOnly` / `approveExec`）、`handoff`（批准执行 lead 的交接，没有就是 `null`）、`issues`（总 issue 在前，每条验收项的出处 issue、原文、验证层次、测试点、关联 PR）、`corrections`（修正子 issue）、`disputed`（有争议的条目）、`manual`（人工手测项）。按它决定这一轮验什么。
 
 `root.verdictOnly` 为 `true` 的是**只出裁决**的任务（profile 的 `verdictOnlyIssues`，比如验收机自己的总 issue）：照常验、照常写看板，但**不关、不勾、不开修正、不推送**——这类任务**最后一步只写裁决**（`verdict` 再 `done`），`close` / `correct` / `push` 会以退出码 `1` 拒绝。裁决里会自动加一行「本 issue 由人工复核后关闭。」
 
@@ -44,6 +44,15 @@ node watchers/acceptance/bin/helper.mjs progress --issue <root> --round <n>
 - 勾选框（`- [x]`）只算声称，不算证据：每条都要自己找证据。
 - 正文里**没写验收标准的**：先从正文和关联 PR 里提炼标准，写进裁决时标 `extracted: true`，再按提炼出来的标准验。
 - 目标仓自己的 `AGENTS.md`、PR 模板和合并门禁照常遵守。
+
+### 批准执行的交接
+
+`root.approveExec` 为 `true` 表示这棵树由「批准执行」推进：lead 派出会话时在总 issue 上发了「批准执行登记」。lead 验收完总 issue 后会再发一条交接评论（首行 `[批准执行] 交接验收 · 第 n 次`），`collect` 把最新一条放在 `handoff`：`{url, createdAt, n, focus}`，`focus` 是交接里「请重点查」的每一条原文。早于最后一条登记的交接不算（lead 之后又派了会话，旧交接已过期），这时 `handoff` 是 `null`。和盘点一样只看总 issue 最近 50 条评论。
+
+- 交接**只当线索，不算证据**：每条 SC 照样自己验、自己留证据，和勾选框一样不因为 lead 说过就算通过。lead 写的「lead 没验到的」也照样自己验。
+- `focus` 里每一条都要查，结论写进 `verdict.json` 的 `handoffChecks`：`[{"n":1,"result":"查了什么、结论"}]`，`n` 对应交接里的序号，一条重点项一条，缺了 `verdict` 以退出码 `1` 拒绝。裁决里会多一节「交接重点核对」逐条列出。
+- 交接的「子 PR」表写着 lead 通过时的 head：合并进 main 的提交里，**lead 通过时的 head 之后新增的提交要重点查**（Ready 之后盯梢按审查意见推的修复，lead 没看过）。
+- `approveExec` 为 `true`、`handoff` 却是 `null`：盘点已经等满 24 小时才开这一轮，照常验；裁决里会自动多一行「批准执行没有交接评论，等满 24 小时后照常验收。」
 
 ## 3. 有争议的条目
 
@@ -104,6 +113,7 @@ node watchers/acceptance/bin/helper.mjs done    --issue <root> --round <n>
 {
   "extracted": false,
   "checks": { "build": "ran", "typecheck": "ran", "test": "ran" },
+  "handoffChecks": [{ "n": 1, "result": "查了 lead 点的那处：…，没问题" }],
   "items": [
     { "ref": "<item>", "sc": 3, "result": "通过", "evidence": "跑的命令 + 关键输出一行" },
     { "ref": "<item>", "sc": 4, "result": "要修", "why": "没过的原因", "evidence": "…" },
@@ -116,6 +126,7 @@ node watchers/acceptance/bin/helper.mjs done    --issue <root> --round <n>
 - `ref` 是出处 issue `<item>`，`sc` 是那条验收项的编号；`result` 只能是 `通过` / `要修` / `人工手测` / `有争议`。
 - **`collect` 收到的任务树里每条 SC 都要有一条结论**：缺了 `verdict` 以退出码 `1` 拒绝，stderr 写清缺哪几条，什么都不写；`items` 为空也拒绝（空的不能判通过）。
 - `extracted: true`：任务本来没写验收标准，`items` 是你提炼出来的标准。
+- `handoffChecks`：只在 `collect` 的 `handoff.focus` 非空时必填，见第 2 节「批准执行的交接」。
 - 结论由 `items` 推出：任一条「要修」或「有争议」、或本轮有「需人工处理」记录 → 要修；否则通过（人工手测不拦）。`--status` 可选，和推出的不一致就退出码 `1`。
 
 ## 5. 要修
