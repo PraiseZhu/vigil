@@ -439,7 +439,7 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
   `ADMIN`/`MAINTAIN`/`WRITE`。fork 默认是 `ownerLogin` 名下同名的仓；名字不同就在 profile 里写
   `"forkTargets": {"<上游 owner/repo>": "<ownerLogin>/<fork 名>"}`（键必须在 `forkRepos` 里，fork 必须在
   `ownerLogin` 名下）。修正轮推分支、写闸核对 PR head 用的都是同一个对照。
-- `常驻循环`：心跳里的 pid 活着且心跳不超过 3 分钟。心跳只表示循环活着：拉取（poll）期间每 30 秒刷新一次，并带 `polling`（`startedAt`、`startedUptimeS`、`elapsedS`，正在拉取、已多久），拍尾的心跳不带它。拉取按机器实际运行时间算超过 180 秒（poll 120 秒就会被掐掉，过了 180 秒说明掐不掉）就不再刷新心跳，这一项也单独报红（「拉取已 N 秒没结束，超过上限 180 秒」）。
+- `常驻循环`：心跳里的 pid 活着且心跳不超过 3 分钟。心跳只表示循环活着：一拍内每 30 秒刷新一次，并带 `phase`（`name`、`startedAt`、`startedUptimeS`、`elapsedS`，当前阶段、已多久；阶段有 `poll` 拉取、`abort` 清理卡住的轮次、`prbot` 修正轮读取、`dispatch` 派发、`audit` 写闸审计、`notify` 发通知），拉取阶段另带旧字段 `polling`（兼容），拍尾的心跳两者都不带。修正轮里每发起一次 GitHub 读取都重新计时，每次读取 120 秒没返回就被掐掉、按读失败收尾（写不加超时、不重试）。任何阶段按机器实际运行时间算超过 180 秒就不再刷新心跳，这一项也单独报红并写明阶段（例如「修正轮读取已 N 秒没结束，超过上限 180 秒」）。
 - `写闸账本审计`：只读跑一次写闸账本审计（第 3 节的 `state/write-gate/ledger.jsonl`），看有没有越规写入；
   明细报「核对了多少行、基线是什么、基线后违规几条、拿不准几条、这次新发现哪几条」。只有**明确违规**让这一项变红；
   「拿不准」只记日志（明细里报出来），GitHub 只读核对没做成也照旧写进明细但不改变红绿。审计内部出错只报这一项失败。
