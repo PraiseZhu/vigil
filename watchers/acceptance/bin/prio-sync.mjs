@@ -340,7 +340,7 @@ export function readRepoClassTable(file) {
   };
 }
 
-/** 表里点名的用该档；没点名的按 daily-tool，并记「不在分类表里」。 */
+/** 表里点名的用该档；没点名的按 daily-tool（待 Praise 确认），并记「不在分类表里」。 */
 export function classifyRepo(repo, table = DEFAULT_REPO_CLASS_TABLE) {
   const key = String(repo || '').toLowerCase();
   const has = (names) => (names || []).some((entry) => String(entry).toLowerCase() === key);

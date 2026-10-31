@@ -829,6 +829,15 @@ test('#157 闲置仓情形档 P0 再低一档记成 P1', async () => {
   assert.match(readJsonl(dir)[0].basis, /idle/);
 });
 
+test('#180 未分类仓仍按 daily-tool，注释标待 Praise 确认', async () => {
+  const { classifyRepo } = await import('./bin/prio-sync.mjs');
+  const source = fs.readFileSync(fileURLToPath(new URL('./bin/prio-sync.mjs', import.meta.url)), 'utf8');
+  const unlisted = classifyRepo('example-owner/unlisted');
+  assert.equal(unlisted.repoClass, 'daily-tool');
+  assert.equal(unlisted.unlisted, true);
+  assert.match(source, /待 Praise 确认/);
+});
+
 test('#180 看板「情形档」不参与组装，带这个字段和不带打分相同', async () => {
   const { mapItem, factsForScore } = await import('./bin/prio-sync.mjs');
   const { scorePriority } = await import('./bin/prio-score.mjs');

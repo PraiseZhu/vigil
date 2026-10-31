@@ -1,12 +1,15 @@
 // 看板优先级打分（#153，规则以 #62 为准）。纯函数：事实、当前时间和防抖状态都由调用方传入。
 // 不联网、不读环境变量、不读写看板。返回 write 只表示「调用方可以写」；本模块自己不写。
 //
-// 情形档 situationTier（P0–P3）由调用方按四条语义给出。再按 repoClass 换算
-// （https://github.com/PraiseZhu/vigil/issues/62 方案 B 第 2 条）：
+// 情形档：调用方传入 situationTier 就用传入值。没传则只认事实里已有的标签
+// （线上坏了 / main坏了 / 人被卡 / 数据安全 → P0；影响发布 / 影响审查 / 有任务在等 / 只差合并 → P1；
+// 体验改进 / 功能改进 → P2；清理 / 重构 → P3）。PR 的 CI、「被要求修改」是机器信号，不当情形档。
+// 事实里没有依赖列表，读不到依赖线索。都读不到就低置信记 P2。
+// 再按 repoClass 换算（https://github.com/PraiseZhu/vigil/issues/62 方案 B 第 2 条）：
 // mivo 用情形档；daily-tool 低半档（P0 不变，P1 记成 P2，P2 和 P3 不变）；
 // idle 在 daily-tool 的结果上再低一档，最低 P3（情形档 P0 记成 P1）。
-// 机器信号 S1–S5 只能升档。最终档是换算结果和信号档里更高的那个，信号不能把档降下来。
-// 没给情形档、也没有信号时，低置信记 P2。
+// 机器信号 S1–S5 只能升档，不能降档，也不能推翻前面的结果。
+// 没判出情形档时，信号只有比 P2 更急才升；等于或更低仍是低置信 P2。
 // 只有 issueState === 'closed' 才清空。Done 或验收通过但 issue 仍开着时，保留算出来的档。
 // 标签 prio:pin 原样返回当前优先级。
 //
@@ -48,6 +51,14 @@ const RANK = new Map([
 const DAILY_TOOL = Object.freeze({ P0: 'P0', P1: 'P2', P2: 'P2', P3: 'P3' });
 // 在 daily-tool 的结果上再低一档，最低 P3。idle 对每个情形档都用这一步。
 const STEP_DOWN = Object.freeze({ P0: 'P1', P1: 'P2', P2: 'P3', P3: 'P3' });
+
+// 情形档只从已经在事实里的标签读。命中靠前的档就停。
+const SITUATION_CLUES = Object.freeze([
+  Object.freeze({ tier: 'P0', labels: Object.freeze(['线上坏了', 'main坏了', '人被卡', '数据安全']) }),
+  Object.freeze({ tier: 'P1', labels: Object.freeze(['影响发布', '影响审查', '有任务在等', '只差合并']) }),
+  Object.freeze({ tier: 'P2', labels: Object.freeze(['体验改进', '功能改进']) }),
+  Object.freeze({ tier: 'P3', labels: Object.freeze(['清理', '重构']) }),
+]);
 
 function priorityOf(id) {
   const found = RULES.find((rule) => rule.id === id);
@@ -98,6 +109,13 @@ function describeRepo(situation, repoClass, adjusted) {
   return '不按仓降档';
 }
 
+function clueTier(labels) {
+  for (const group of SITUATION_CLUES) {
+    if (group.labels.some((name) => labels.includes(name))) return group.tier;
+  }
+  return null;
+}
+
 function signalOf(id) {
   return { id, priority: priorityOf(id) };
 }
@@ -144,17 +162,19 @@ export function scorePriority(facts, nowMs) {
   }
 
   const signal = highestSignal(item, labels, nowMs);
-  const situation = normalizeSituation(item.situationTier);
+  const explicit = normalizeSituation(item.situationTier);
+  const situation = explicit || clueTier(labels);
   if (situation == null) {
-    if (!signal) {
-      const priority = priorityOf('fallback');
-      return result(priority, 'fallback', {
-        lowConfidence: true,
-        basis: `没给情形档，也没有机器信号，低置信记 ${priority}`,
+    const priority = priorityOf('fallback');
+    if (signal && moreUrgent(signal.priority, priority)) {
+      return result(signal.priority, signal.id, {
+        basis: `没给情形档，机器信号 ${signal.id} 升到 ${signal.priority}`,
       });
     }
-    return result(signal.priority, signal.id, {
-      basis: `没给情形档，机器信号 ${signal.id} 升到 ${signal.priority}`,
+    const held = signal ? `，机器信号 ${signal.id} 不高于 ${priority}，不降档` : '，也没有机器信号';
+    return result(priority, 'fallback', {
+      lowConfidence: true,
+      basis: `没给情形档${held}，低置信记 ${priority}`,
     });
   }
 
