@@ -474,7 +474,7 @@ test('#157 关联 PR 用 W3 的文本，CI 失败同时升级优先级', async (
   assert.match(linkLog.basis, /^link /);
 });
 
-test('#157 没传入 PR 列表时不改关联 PR；传入空列表才清空', async () => {
+test('#157 没传入 PR 列表时不改关联 PR；传入空列表也不清空已有值', async () => {
   const dir = tmpDir();
   const gate = recorder();
   const base = {
@@ -490,8 +490,8 @@ test('#157 没传入 PR 列表时不改关联 PR；传入空列表才清空', as
   assert.equal(gate.writes.length, 0);
   fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
   await runPrioSync({ ...base, items: [item(5, { priority: 'P3', linkedPr: '#4(merged)' })], prs: [] });
-  assert.equal(gate.writes.length, 1);
-  assert.deepEqual(gate.writes[0].fields, { '关联 PR': null });
+  assert.equal(gate.writes.length, 0);
+  assert.equal(readJsonl(dir).some((row) => row.field === '关联 PR'), false);
 });
 
 test('#157 每小时已经变更 4 次时再升级只冻结、不写', async () => {
@@ -1047,4 +1047,248 @@ test('#157 看板条目和 PR 映射：归档和非 issue 跳过，查询是只�
     headRefName: 'fix',
   }]);
   assert.ok(queries.length >= 2);
+});
+
+function stableItem(number, extra = {}) {
+  return item(number, {
+    priority: 'P3',
+    status: 'Todo',
+    situationTier: 'P3',
+    repoClass: 'mivo',
+    issueState: 'open',
+    ...extra,
+  });
+}
+
+function seedLink(dir, number, value, old = '') {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(path.join(dir, 'changes.jsonl'), `${JSON.stringify({
+    at: new Date(T0 - DAY_MS).toISOString(),
+    item: `${REPO}#${number}`,
+    repo: REPO,
+    issue: number,
+    field: '关联 PR',
+    old,
+    new: value,
+    basis: 'link 关联 PR 文本与看板不一致',
+  })}\n`);
+}
+
+function openPr(number, issueNumber) {
+  return {
+    repo: REPO,
+    number,
+    title: `fix #${issueNumber}`,
+    state: 'open',
+    ci: 'pass',
+    headRefName: 'fix',
+  };
+}
+
+test('#179 SC1 人工「关联 PR」算出为空时，dry-run 和 apply 都不产生变更、不调用 write', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const gate = recorder();
+  const manual = stableItem(5, { linkedPr: '#4(merged)' });
+  const base = {
+    dir,
+    items: [manual],
+    prs: [],
+    nowMs: T0,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+  };
+  const dry = capture();
+  await runPrioSync({ ...base, stdout: dry.stdout });
+  assert.equal(gate.writes.length, 0);
+  assert.doesNotMatch(dry.text(), /关联 PR .+→/);
+  assert.match(dry.text(), /dry-run：1 条，变更 0，写入 0/);
+  assert.match(dry.text(), new RegExp(`${REPO.replaceAll('/', '\\/')}#5 关联 PR 手动值与规则不一致，提醒一次`));
+
+  const applied = capture();
+  await runPrioSync({ ...base, apply: true, nowMs: T0 + 1000, stdout: applied.stdout });
+  assert.equal(gate.writes.length, 0);
+  assert.doesNotMatch(applied.text(), /关联 PR .+→/);
+  assert.doesNotMatch(applied.text(), /手动值与规则不一致/);
+  assert.equal(readJsonl(dir).some((row) => row.field === '关联 PR'), false);
+});
+
+test('#179 SC2 人工「关联 PR」与算出的非空值不同时不改，只提醒一次', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const gate = recorder();
+  const manual = stableItem(5, { linkedPr: '#4(merged)' });
+  const prs = [openPr(9, 5)];
+  const run = async (nowMs) => {
+    const io = capture();
+    await runPrioSync({
+      dir,
+      items: [manual],
+      prs,
+      nowMs,
+      apply: true,
+      ownerLogin: OWNER,
+      projectNumber: PROJECT,
+      write: gate.write,
+      stdout: io.stdout,
+    });
+    return io.text();
+  };
+  const first = await run(T0);
+  assert.equal(gate.writes.length, 0);
+  assert.doesNotMatch(first, /关联 PR .+→/);
+  assert.match(first, new RegExp(`${REPO.replaceAll('/', '\\/')}#5 关联 PR 手动值与规则不一致，提醒一次`));
+  const reminded = fs.readFileSync(path.join(dir, 'reminded.jsonl'), 'utf8').split('\n').filter(Boolean);
+  assert.equal(reminded.length, 1);
+  assert.equal(JSON.parse(reminded[0]).field, '关联 PR');
+  assert.equal(JSON.parse(reminded[0]).target, '#9(open,CI✓)');
+
+  const second = await run(T0 + 1000);
+  assert.equal(gate.writes.length, 0);
+  assert.doesNotMatch(second, /手动值与规则不一致/);
+  assert.equal(fs.readFileSync(path.join(dir, 'reminded.jsonl'), 'utf8').split('\n').filter(Boolean).length, 1);
+  assert.equal(readJsonl(dir).some((row) => row.field === '关联 PR'), false);
+});
+
+test('#179 SC3 空值或上次由 prio-sync 写入才更新；算出为空则保留任何非空值', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const gate = recorder();
+  await runPrioSync({
+    dir,
+    items: [stableItem(21, { linkedPr: '' })],
+    prs: [openPr(9, 21)],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: capture().stdout,
+  });
+  assert.equal(gate.writes.length, 1);
+  assert.deepEqual(gate.writes[0].fields, { '关联 PR': '#9(open,CI✓)' });
+  assert.equal(gate.writes[0].issue, 21);
+
+  seedLink(dir, 22, '#3(open)');
+  const preview = capture();
+  await runPrioSync({
+    dir,
+    items: [stableItem(22, { linkedPr: '#3(open)' })],
+    prs: [openPr(9, 22)],
+    nowMs: T0 + 1000,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: preview.stdout,
+  });
+  assert.equal(gate.writes.length, 1, '默认 dry-run，不调用 write');
+  assert.match(preview.text(), /dry-run：/);
+  assert.match(preview.text(), /#3\(open\) → #9\(open,CI✓\)/);
+
+  const owned = capture();
+  await runPrioSync({
+    dir,
+    items: [stableItem(22, { linkedPr: '#3(open)' })],
+    prs: [openPr(9, 22)],
+    nowMs: T0 + 2000,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: owned.stdout,
+  });
+  assert.equal(gate.writes.length, 2);
+  assert.deepEqual(gate.writes[1].fields, { '关联 PR': '#9(open,CI✓)' });
+  assert.equal(gate.writes[1].issue, 22);
+  const logged = readJsonl(dir).filter((row) => row.item === `${REPO}#22` && row.field === '关联 PR');
+  assert.equal(logged.at(-1).old, '#3(open)');
+  assert.equal(logged.at(-1).new, '#9(open,CI✓)');
+
+  seedLink(dir, 23, '#8(open)');
+  const kept = capture();
+  await runPrioSync({
+    dir,
+    items: [stableItem(23, { linkedPr: '#8(open)' })],
+    prs: [],
+    nowMs: T0 + 3000,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: kept.stdout,
+  });
+  assert.equal(gate.writes.length, 2);
+  assert.doesNotMatch(kept.text(), /关联 PR .+→/);
+  assert.doesNotMatch(kept.text(), /手动值与规则不一致/);
+  assert.match(kept.text(), /变更 0，写入 0/);
+  assert.equal(readJsonl(dir).filter((row) => row.item === `${REPO}#23` && row.field === '关联 PR').length, 1);
+});
+
+test('#179 上次写入 A、看板被改成 B、算出 C 时不改，只提醒', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  seedLink(dir, 31, '#1(open)');
+  const gate = recorder();
+  const io = capture();
+  await runPrioSync({
+    dir,
+    items: [stableItem(31, { linkedPr: '#2(merged)' })],
+    prs: [openPr(9, 31)],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: io.stdout,
+  });
+  assert.equal(gate.writes.length, 0);
+  assert.doesNotMatch(io.text(), /关联 PR .+→/);
+  assert.match(io.text(), new RegExp(`${REPO.replaceAll('/', '\\/')}#31 关联 PR 手动值与规则不一致，提醒一次`));
+  const reminded = fs.readFileSync(path.join(dir, 'reminded.jsonl'), 'utf8').split('\n').filter(Boolean);
+  assert.equal(reminded.length, 1);
+  assert.equal(JSON.parse(reminded[0]).target, '#9(open,CI✓)');
+  const logged = readJsonl(dir).filter((row) => row.field === '关联 PR');
+  assert.equal(logged.length, 1);
+  assert.equal(logged[0].new, '#1(open)');
+});
+
+test('#179 多条关联 PR 记录只看最后一条，中间一条等于当前值也不可写', async () => {
+  const dir = tmpDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const rows = [
+    { at: new Date(T0 - 3 * DAY_MS).toISOString(), value: '#1(open)' },
+    { at: new Date(T0 - 2 * DAY_MS).toISOString(), value: '#4(merged)' },
+    { at: new Date(T0 - DAY_MS).toISOString(), value: '#8(open)' },
+  ];
+  for (const row of rows) {
+    fs.appendFileSync(path.join(dir, 'changes.jsonl'), `${JSON.stringify({
+      at: row.at,
+      item: `${REPO}#32`,
+      repo: REPO,
+      issue: 32,
+      field: '关联 PR',
+      old: '',
+      new: row.value,
+      basis: 'link 关联 PR 文本与看板不一致',
+    })}\n`);
+  }
+  const gate = recorder();
+  const io = capture();
+  await runPrioSync({
+    dir,
+    items: [stableItem(32, { linkedPr: '#4(merged)' })],
+    prs: [openPr(9, 32)],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: io.stdout,
+  });
+  assert.equal(gate.writes.length, 0);
+  assert.doesNotMatch(io.text(), /关联 PR .+→/);
+  assert.match(io.text(), new RegExp(`${REPO.replaceAll('/', '\\/')}#32 关联 PR 手动值与规则不一致，提醒一次`));
+  assert.equal(readJsonl(dir).filter((row) => row.field === '关联 PR').length, 3);
 });
