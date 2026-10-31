@@ -1,8 +1,14 @@
-// 看板优先级打分（#153）。纯函数：事实、当前时间和防抖状态都由调用方传入。
+// 看板优先级打分（#153，规则以 #62 为准）。纯函数：事实、当前时间和防抖状态都由调用方传入。
 // 不联网、不读环境变量、不读写看板。返回 write 只表示「调用方可以写」；本模块自己不写。
 //
-// 未完成的 item 取命中的最高档（S1 高于 S6）。Done 或验收=通过则清空。
-// 标签 prio:pin 时原样返回 facts.priority，不看其它信号。
+// 情形档 situationTier（P0–P3）由调用方按四条语义给出。再按 repoClass 换算：
+// mivo 用情形档；daily-tool 低半档（P0 不变，P1 记成 P2，P2 和 P3 不变）；
+// idle 的情形档 P0 保持 P0（已确认：线上坏了、数据或安全问题不因项目闲置降档）。
+// 情形档 P1 及以下才在 daily-tool 的结果上再低一档，最低 P3。
+// 机器信号 S1–S5 只能升档。最终档是换算结果和信号档里更高的那个，信号不能把档降下来。
+// 没给情形档、也没有信号时，低置信记 P2。
+// 只有 issueState === 'closed' 才清空。Done 或验收通过但 issue 仍开着时，保留算出来的档。
+// 标签 prio:pin 原样返回当前优先级。
 //
 // 防抖状态（上次重算时间 lastRecalcAt、连续次数 consecutive，以及 pending / changes）
 // 由调用方保存并在下次传入。升级立刻生效。降级要同一目标连续出现至少 2 次，
@@ -22,13 +28,13 @@ export const PIN_LABEL = 'prio:pin';
 export const BLOCKER_LABEL = 'blocker';
 
 export const RULES = Object.freeze([
-  Object.freeze({ id: 'S1', priority: 'P0', when: '心跳超时、host 冻结、写闸报错，或带 blocker 标签' }),
-  Object.freeze({ id: 'S2', priority: 'P0', when: '验收中，且进度超过 30 分钟没更新，或本轮超过上限' }),
-  Object.freeze({ id: 'S3', priority: 'P1', when: '关联 PR 的 CI 失败或被要求修改，或要修超过 4 小时没开 PR' }),
-  Object.freeze({ id: 'S4', priority: 'P1', when: 'In Progress，且最近一次事件超过 24 小时' }),
-  Object.freeze({ id: 'S5', priority: 'P2', when: '验收为修正中或验收中' }),
-  Object.freeze({ id: 'S6', priority: 'P3', when: '其它未完成项' }),
-  Object.freeze({ id: 'clear', priority: null, when: 'Done 或验收通过' }),
+  Object.freeze({ id: 'S1', priority: 'P0', when: '心跳超时、host 冻结、写闸报错，或带 blocker 标签。只升档' }),
+  Object.freeze({ id: 'S2', priority: 'P0', when: '验收中，且进度超过 30 分钟没更新，或本轮超过上限。只升档' }),
+  Object.freeze({ id: 'S3', priority: 'P1', when: '关联 PR 的 CI 失败或被要求修改，或要修超过 4 小时没开 PR。只升档' }),
+  Object.freeze({ id: 'S4', priority: 'P1', when: 'In Progress，且最近一次事件超过 24 小时。只升档' }),
+  Object.freeze({ id: 'S5', priority: 'P2', when: '验收为修正中或验收中。只升档' }),
+  Object.freeze({ id: 'fallback', priority: 'P2', when: '没给情形档，也没有机器信号，低置信' }),
+  Object.freeze({ id: 'clear', priority: null, when: 'issue 已关闭才清空' }),
 ]);
 
 const RANK = new Map([
@@ -37,6 +43,11 @@ const RANK = new Map([
   ['P2', 2],
   ['P3', 3],
 ]);
+
+// daily-tool 比 mivo 低半档：P0 保持，P1 记成 P2，P2 和 P3 不变。
+const DAILY_TOOL = Object.freeze({ P0: 'P0', P1: 'P2', P2: 'P2', P3: 'P3' });
+// 再低一档，最低 P3。idle 只对情形档 P1 及以下使用，并且用在 daily-tool 的结果上。
+const STEP_DOWN = Object.freeze({ P0: 'P1', P1: 'P2', P2: 'P3', P3: 'P3' });
 
 function priorityOf(id) {
   const found = RULES.find((rule) => rule.id === id);
@@ -50,51 +61,115 @@ function normalizePriority(value) {
   throw new Error(`非法优先级：${value}`);
 }
 
+function normalizeSituation(value) {
+  if (value == null || value === '') return null;
+  if (RANK.has(value)) return value;
+  throw new Error(`非法情形档：${value}`);
+}
+
 function rank(priority) {
   return priority == null ? RANK.size : RANK.get(priority);
+}
+
+function moreUrgent(left, right) {
+  return rank(left) < rank(right);
 }
 
 function olderThan(at, nowMs, limitMs) {
   return Number.isFinite(at) && Number.isFinite(nowMs) && nowMs - at > limitMs;
 }
 
-/**
- * @param {object} facts 一条 item 的事实快照。进度时间、要修开始时间、最近事件时间缺了就不算「超过 N」。
- * @param {number} nowMs 本次重算的毫秒时间，由调用方传入。
- * @returns {{ priority: 'P0'|'P1'|'P2'|'P3'|null, rule: string, pinned: boolean }}
- */
-export function scorePriority(facts, nowMs) {
-  const item = facts && typeof facts === 'object' ? facts : {};
-  const labels = Array.isArray(item.labels) ? item.labels : [];
-  if (labels.includes(PIN_LABEL)) {
-    return { priority: normalizePriority(item.priority), rule: 'pin', pinned: true };
+function adjustTier(situation, repoClass) {
+  if (repoClass === 'daily-tool') return DAILY_TOOL[situation];
+  if (repoClass === 'idle') {
+    if (situation === 'P0') return 'P0';
+    return STEP_DOWN[DAILY_TOOL[situation]];
   }
-  const status = item.status ?? null;
-  const acceptance = item.acceptance ?? null;
-  if (status === 'Done' || acceptance === '通过') {
-    return { priority: null, rule: 'clear', pinned: false };
-  }
+  return situation;
+}
 
-  const matched = [];
+function describeRepo(situation, repoClass, adjusted) {
+  if (repoClass === 'daily-tool') {
+    return adjusted === situation ? `daily-tool 不降档，仍是 ${adjusted}` : `daily-tool 降半档为 ${adjusted}`;
+  }
+  if (repoClass === 'idle') {
+    if (situation === 'P0') return 'idle 的 P0 保持 P0';
+    const daily = DAILY_TOOL[situation];
+    return adjusted === daily
+      ? `idle 再低一档，最低仍是 ${adjusted}`
+      : `idle 在每天在用的结果 ${daily} 上再低一档为 ${adjusted}`;
+  }
+  return '不按仓降档';
+}
+
+function signalOf(id) {
+  return { id, priority: priorityOf(id) };
+}
+
+function highestSignal(item, labels, nowMs) {
   if (
     item.heartbeatTimeout === true ||
     item.hostFrozen === true ||
     item.writeGateError === true ||
     labels.includes(BLOCKER_LABEL)
   ) {
-    matched.push('S1');
+    return signalOf('S1');
   }
   const progressStale = olderThan(item.progressUpdatedAt, nowMs, PROGRESS_STALE_MS);
-  if (acceptance === '验收中' && (progressStale || item.roundOverLimit === true)) matched.push('S2');
+  if (item.acceptance === '验收中' && (progressStale || item.roundOverLimit === true)) return signalOf('S2');
   const waitingWithoutPr =
-    acceptance === '要修' && item.hasPr !== true && olderThan(item.fixRequestedAt, nowMs, FIX_WITHOUT_PR_MS);
-  if (item.prCiRed === true || item.prChangesRequested === true || waitingWithoutPr) matched.push('S3');
-  if (status === 'In Progress' && olderThan(item.lastEventAt, nowMs, IDLE_EVENT_MS)) matched.push('S4');
-  if (acceptance === '修正中' || acceptance === '验收中') matched.push('S5');
-  matched.push('S6');
+    item.acceptance === '要修' && item.hasPr !== true && olderThan(item.fixRequestedAt, nowMs, FIX_WITHOUT_PR_MS);
+  if (item.prCiRed === true || item.prChangesRequested === true || waitingWithoutPr) return signalOf('S3');
+  if (item.status === 'In Progress' && olderThan(item.lastEventAt, nowMs, IDLE_EVENT_MS)) return signalOf('S4');
+  if (item.acceptance === '修正中' || item.acceptance === '验收中') return signalOf('S5');
+  return null;
+}
 
-  const rule = matched[0];
-  return { priority: priorityOf(rule), rule, pinned: false };
+function result(priority, rule, { pinned = false, lowConfidence = false, basis }) {
+  return { priority, rule, pinned, lowConfidence, basis };
+}
+
+/**
+ * @param {object} facts 一条 item 的事实快照。情形档、仓类别和 issue 开关由调用方给出。
+ * @param {number} nowMs 本次重算的毫秒时间，由调用方传入。
+ * @returns {{ priority: 'P0'|'P1'|'P2'|'P3'|null, rule: string, pinned: boolean, lowConfidence: boolean, basis: string }}
+ */
+export function scorePriority(facts, nowMs) {
+  const item = facts && typeof facts === 'object' ? facts : {};
+  const labels = Array.isArray(item.labels) ? item.labels : [];
+  if (labels.includes(PIN_LABEL)) {
+    return result(normalizePriority(item.priority), 'pin', {
+      pinned: true,
+      basis: '标签 prio:pin，保持原值',
+    });
+  }
+  if (item.issueState === 'closed') {
+    return result(null, 'clear', { basis: 'issue 已关闭，清空优先级' });
+  }
+
+  const signal = highestSignal(item, labels, nowMs);
+  const situation = normalizeSituation(item.situationTier);
+  if (situation == null) {
+    if (!signal) {
+      const priority = priorityOf('fallback');
+      return result(priority, 'fallback', {
+        lowConfidence: true,
+        basis: `没给情形档，也没有机器信号，低置信记 ${priority}`,
+      });
+    }
+    return result(signal.priority, signal.id, {
+      basis: `没给情形档，机器信号 ${signal.id} 升到 ${signal.priority}`,
+    });
+  }
+
+  const adjusted = adjustTier(situation, item.repoClass);
+  const raised = Boolean(signal) && moreUrgent(signal.priority, adjusted);
+  const priority = raised ? signal.priority : adjusted;
+  const repo = describeRepo(situation, item.repoClass, adjusted);
+  const signalText = raised ? `机器信号 ${signal.id} 升到 ${signal.priority}` : '没有机器信号升档';
+  return result(priority, raised ? signal.id : 'situation', {
+    basis: `情形档 ${situation}，${repo}，${signalText}`,
+  });
 }
 
 function recentChanges(changes, nowMs) {
