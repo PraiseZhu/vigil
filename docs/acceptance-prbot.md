@@ -158,6 +158,17 @@ pi 写过的工作树不可信：它的 `.git/config`、钩子、`origin/main` �
   和宿主自己取的 `origin/main` 比；镜像上的 git 不读全局 / 系统配置。读不出 → `diff-failed`，打包失败 → `bundle-failed`，
   导入 main 失败 → `main-import-failed`。
 
+## 修正子 issue 的格式（#169）
+
+修正子 issue 由验收会话的 `correct`（`watchers/acceptance/bin/correct.mjs`）开，prbot 只读它。格式对齐本机子 issue 模板（task-issue-child）：
+
+- 标题 `[子N/M] 一句话`：N = 总 issue 下现有子 issue 数 + 1，M = N；`--title` 给了也只换「一句话」部分。
+- 标签 `子issue`：`issue.create` 带 `labels: ['子issue']`，写闸原样透传，不改写闸。
+- 「范围（可改）」每行都以反引号包住的路径或 glob 开头：照抄原属 issue「范围」段里带反引号的行；读不到就写一行 `` `**` ``，限原属 issue 的范围内（禁改路径照旧由 prbot 检查）。
+- 有「参考」（原验收项、验收裁决链接）和「待定问题」（写「无」）两段。
+- 验收标准那一行带「验证：<层>（测试点：…）」：原文已有层和测试点就原样照抄；缺测试点补「<原属项> SC<k> 的原验收入口」；原项没标层次时层写 `static` 占位，验收机仍按原验收项验。
+- **例外：正文只有一行 SC1**。本机模板的最后一条「SCn 目标仓测试与 CI 全绿」不加：collect 的 `parseItems` 会把正文里任何 SC 行都当验收项，多一行就多一个要验的项，修正 PR 正文的验收对照也只照抄 SC1。
+
 修正 PR 正文第一行是「任务 issue：<总 issue>」，第二行是「Closes <修正子 issue>」（同仓 `#n`，跨仓 `owner/repo#n`：
 合并后修正子 issue 才会关，trigger 才会再验），最后一行照抄修正子 issue 上的修正标记
 （轮次是验收轮，不是修正轮），所以真写闸的 `pr.create` 认得。修正 PR 只由 prbot 开，这三行都由 prbot

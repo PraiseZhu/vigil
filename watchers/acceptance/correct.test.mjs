@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion } from './bin/rounds.mjs';
 import { runHelper } from './bin/helper.mjs';
@@ -12,7 +13,7 @@ import {
   createWorld,
   defaultTree,
 } from './session.fixture.mjs';
-import { correctionBody } from './bin/correct.mjs';
+import { correctionBody, correctionTitle, scopeLinesOf } from './bin/correct.mjs';
 import { parseItems, parseMarker } from './bin/collect.mjs';
 
 function loadProfile() {
@@ -69,7 +70,9 @@ test('SC5 新开修正子 issue：模板、修正标记、挂到同一个总 iss
   assert.equal(created.length, 1);
   assert.equal(created[0].repo, OTHER_REPO, '非 fork 档开在原属子 issue 的仓里');
   assert.equal(created[0].dedupeKey, `correct:${REPO}#1:${OTHER_REPO}#7:SC7:1`);
-  assert.equal(created[0].title, `修正：${OTHER_REPO}#7 SC7`);
+  assert.match(created[0].title, /^\[子[0-9]+\/[0-9]+\] /, '#169 SC1：标题按本机子 issue 模板');
+  assert.equal(created[0].title, `[子3/3] 修正：${OTHER_REPO}#7 SC7`);
+  assert.deepEqual(created[0].labels, ['子issue'], '#169 SC1：创建请求带标签「子issue」');
 
   const body = created[0].body;
   assert.ok(body.includes(`> 修正子 issue · 总 issue ${REPO}#1 · 原属 ${OTHER_REPO}#7`), body);
@@ -77,7 +80,8 @@ test('SC5 新开修正子 issue：模板、修正标记、挂到同一个总 iss
     assert.ok(body.split('\n').includes(heading), `缺「${heading}」：${body}`);
   }
   assert.ok(body.includes('跨仓也要收 验证：browser-fixture'), body);
-  assert.ok(body.includes('- [ ] SC1 跨仓也要收 验证：browser-fixture'), body);
+  assert.ok(body.includes('- [ ] SC1 跨仓也要收 验证：browser-fixture（测试点：夹具跨仓）'), body);
+  assert.ok(body.includes('## 参考') && body.includes('## 待定问题'), body);
   assert.ok(body.includes(`[验收机] 修正 · 总 ${REPO}#1 · 项 ${OTHER_REPO}#7 SC7 · 第 1 轮`));
   assert.equal(body.includes('原 issue：'), false, '非 fork 档不写链回原 issue 那一行');
   assert.equal(body.includes(profile.stateDir), false, '原因要脱敏');
@@ -110,6 +114,64 @@ test('#96 修正子 issue 正文按 task-issue/v1 子 issue 模板写：只有�
     assert.ok(body.split('\n').some((line) => /^\s*[-*]\s*(\[[ xX]\])?\s*(\*\*)?SC[0-9]+\b/.test(line)));
     assert.equal(body.split('\n')[0].startsWith('原 issue：'), fork);
   }
+});
+
+/** 与本机 check-pr-issue.sh 同等的规则，加上 #169 的模板细则（范围反引号、参考 / 待定问题段、SC 验证层和测试点）。 */
+function assertChildTemplate(body) {
+  const lines = body.split('\n');
+  for (const heading of ['## 目标', '## 范围', '## 不做', '## 依赖', '## 验收标准']) {
+    assert.ok(lines.some((line) => line.startsWith(heading)), `缺「${heading}」：${body}`);
+  }
+  assert.ok(lines.some((line) => /^\s*[-*]\s*(\[[ xX]\])?\s*(\*\*)?SC[0-9]+\b/.test(line)), '没有 SC<n> 项');
+  for (const heading of ['## 参考', '## 待定问题']) {
+    const at = lines.indexOf(heading);
+    assert.ok(at !== -1, `缺「${heading}」`);
+    const content = lines.slice(at + 1).find((line) => line.trim());
+    assert.ok(content && !content.startsWith('## '), `「${heading}」段为空，没内容要写「无」`);
+  }
+  const scopeAt = lines.findIndex((line) => line.startsWith('## 范围'));
+  const scope = [];
+  for (const line of lines.slice(scopeAt + 1)) {
+    if (line.startsWith('## ')) break;
+    if (line.trim()) scope.push(line);
+  }
+  assert.ok(scope.length > 0, '范围段为空');
+  for (const line of scope) assert.match(line, /^- `[^`]+`/, `范围行没有反引号路径：${line}`);
+  const sc = lines.filter((line) => /^\s*[-*]\s*(\[[ xX]\])?\s*SC[0-9]+\b/.test(line));
+  assert.equal(sc.length, 1, '正文只有一行 SC1（例外，见 docs/acceptance-prbot.md）');
+  assert.match(sc[0], /验证：[A-Za-z][\w-]*（测试点：[^）]+）/, `SC 行缺「验证：<层>（测试点：…）」：${sc[0]}`);
+}
+
+test('#169 修正子 issue 正文过本机子 issue 模板规则：范围反引号、参考 / 待定问题、SC 验证层和测试点', () => {
+  const base = { root: `${REPO}#1`, rootUrl: 'https://example.invalid/1', item: `${OTHER_REPO}#7`, why: '没收到', sc: 7, round: 2 };
+  const cases = [
+    { text: '跨仓也要收 验证：browser-fixture' },
+    { text: '能导出 CSV。验证：unit（测试点：export()）', scopeLines: ['- `src/export.mjs`：导出'] },
+    { text: '没写层次的旧项' },
+  ];
+  for (const fork of [false, true]) {
+    for (const extra of cases) {
+      const body = correctionBody({ ...base, ...extra, fork, verdictUrl: 'https://example.invalid/c/1' });
+      assertChildTemplate(body);
+      const items = parseItems(body, 'x');
+      assert.equal(items.length, 1);
+      assert.deepEqual(parseMarker(body), { root: `${REPO}#1`, item: `${OTHER_REPO}#7`, sc: 7, round: 2 });
+    }
+  }
+  const kept = correctionBody({ ...base, ...cases[1] });
+  assert.ok(kept.includes('- [ ] SC1 能导出 CSV。验证：unit（测试点：export()）'), '原文已有层和测试点就原样照抄');
+  assert.ok(kept.includes('- `src/export.mjs`：导出'), '范围行照抄原属 issue');
+  assert.equal(parseItems(kept, 'x')[0].layer, 'unit');
+  const filled = correctionBody({ ...base, text: '跨仓也要收 验证：browser-fixture' });
+  assert.ok(filled.includes(`- [ ] SC1 跨仓也要收。验证：browser-fixture（测试点：${OTHER_REPO}#7 SC7 的原验收入口）`), filled);
+  assert.ok(correctionBody({ ...base, text: '没写层次的旧项' }).includes('- [ ] SC1 没写层次的旧项。验证：static（测试点：'));
+});
+
+test('#169 scopeLinesOf 只取「## 范围」段里带反引号的行，标题已带 [子N/M] 不重复加', () => {
+  const body = ['## 范围（可改）', '', '- `a/**/*.mjs`：改', '- 相关测试', '* `b.md`：文档', '', '## 不做', '- `c`'].join('\n');
+  assert.deepEqual(scopeLinesOf(body), ['- `a/**/*.mjs`：改', '- `b.md`：文档']);
+  assert.deepEqual(scopeLinesOf('没有范围段'), []);
+  assert.equal(correctionTitle({ index: 2, title: '[子1/1] 修 X' }), '[子2/2] 修 X');
 });
 
 test('SC5 复用上一轮中断时留下的开着的修正子 issue，不重复开', async () => {
@@ -215,4 +277,12 @@ test('SC9 correct 不是本轮 → 退出码 3，零写入', async () => {
   assert.match(result.err, /期望第 7 轮/);
   assert.match(result.err, /实际第 1 轮（验收中）/);
   assert.equal(world.writes.length, 0);
+});
+
+test('#169 文档写明修正子 issue 的模板格式和「正文只有一行 SC1」例外', () => {
+  const doc = readFileSync(new URL('../../docs/acceptance-prbot.md', import.meta.url), 'utf8');
+  assert.match(doc, /## 修正子 issue 的格式（#169）/);
+  for (const phrase of ['[子N/M]', '`子issue`', '「参考」', '「待定问题」', '验证：<层>（测试点：…）', '正文只有一行 SC1']) {
+    assert.ok(doc.includes(phrase), `docs/acceptance-prbot.md 缺「${phrase}」`);
+  }
 });

@@ -707,17 +707,17 @@ test('#93 SC1 SC2 SC4 修正 PR 正文按 task-pr/v1 和修正子 issue 逐段�
     root: `${REPO}#1`,
     rootUrl: '',
     item: `${REPO}#2`,
-    text: '导出按钮在空列表时禁用 | 不报错。验证：unit',
+    text: '导出按钮在空列表时禁用 | 不报错。验证：unit（测试点：export）',
     why: '空列表时仍可点击',
     sc: 3,
     round: 1,
     fork: false,
   });
   const facts = correctionIssueFacts(issueBody);
-  assert.equal(facts.scText, 'SC1 导出按钮在空列表时禁用 | 不报错。验证：unit');
+  assert.equal(facts.scText, 'SC1 导出按钮在空列表时禁用 | 不报错。验证：unit（测试点：export）');
   assert.equal(facts.why, '空列表时仍可点击');
   assert.deepEqual(correctionIssueDetails(issueBody), {
-    scope: `修好 ${REPO}#2 SC3 所需的最小代码改动和复现测试，限原属 issue 的范围内（目标仓禁改路径照旧不碰）`,
+    scope: `\`**\`：修好 ${REPO}#2 SC3 所需的最小代码改动和复现测试，限原属 issue 的范围内（目标仓禁改路径照旧不碰）`,
     notDo: `不改 ${REPO}#2 的其它验收项，不扩大原属 issue 的范围`,
     dependencies: '无，随时可开工。',
   });
@@ -753,7 +753,7 @@ test('#93 SC1 SC2 SC4 修正 PR 正文按 task-pr/v1 和修正子 issue 逐段�
   const rows = sections.get('验收对照').filter((line) => /^\|\s*SC\d+/.test(line));
   assert.equal(rows.length, 1, '只对修正子 issue 的 SC1');
   const cells = rows[0].split(/(?<!\\)\|/).slice(1, -1).map((cell) => cell.trim());
-  assert.equal(cells[0], 'SC1 导出按钮在空列表时禁用 \\| 不报错。验证：unit', 'SC 原文照抄，竖线转义');
+  assert.equal(cells[0], 'SC1 导出按钮在空列表时禁用 \\| 不报错。验证：unit（测试点：export）', 'SC 原文照抄，竖线转义');
   assert.equal(cells[1], '通过');
   assert.match(cells[2], /`npm test`、`npm run lint` 在沙箱通过/);
   assert.match(sections.get('改了什么').join('\n'), /本 PR 改了：`src\/export\.js`、`test\/export\.test\.js`/);

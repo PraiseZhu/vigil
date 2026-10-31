@@ -13,6 +13,7 @@
 | 验收会话 | `bin/helper.mjs` 与步骤文档 | [`docs/acceptance-session.md`](../../docs/acceptance-session.md)、[`SESSION.md`](SESSION.md) |
 | 宿主接入、写闸、部署检查 | `host/`、`bin/doctor.mjs` | [`docs/acceptance-operations.md`](../../docs/acceptance-operations.md) |
 | 修正轮 prbot | `host/prbot.mjs`、`host/gate-actions/` | [`docs/acceptance-prbot.md`](../../docs/acceptance-prbot.md) |
+| 舰队任务标准 | `bin/fleet-standard.mjs` | [`docs/fleet-standard.md`](../../docs/fleet-standard.md) |
 
 对应 issue：#44（盘点与触发）、#45（调度接口）、#46（验收会话）、#47（宿主接入、写闸与首跑）。
 
