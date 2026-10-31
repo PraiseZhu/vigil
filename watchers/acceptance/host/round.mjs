@@ -22,6 +22,7 @@ import { appendDepsInfo, prepareDeps } from './predeps.mjs';
 import { appendBuildCiInfo, buildCiPolicyFor, collectBuildCiFacts } from './build-ci.mjs';
 import { ENV_PROBLEM_PREFIX } from '../bin/trigger.mjs';
 import { redact } from '../bin/redact.mjs';
+import { activityChange, probeSandboxActivity } from './activity.mjs';
 
 /** 内存门：MemAvailable 低于 3 GiB 就不认领、不跑模型。常量，不可配。 */
 export const MEMORY_GATE_BYTES = 3 * 1024 ** 3;
@@ -459,6 +460,7 @@ export async function runHostRound({
   startGate = defaultStartGate,
   startEgress = startRoundEgress,
   prefetch = prefetchCode,
+  probeActivity = probeSandboxActivity,
   predeps = prepareDeps,
   buildCi = collectBuildCiFacts,
   now = () => Date.now(),
@@ -598,7 +600,7 @@ export async function runHostRound({
 
     // 宿主侧进度（卡住判定以它为准）：认领时算一次，之后宿主看到 pi 输出增长、本轮写闸请求、预取进展就刷新。
     // 文件在 <home>/state/host/progress 下，沙箱看不见；stateDir 里模型写的 lastProgressAt 只作参考。
-    const activity = { lastActivityMs: roundStartedMs, piLogBytes: 0, gateRequests: 0 };
+    const activity = { lastActivityMs: roundStartedMs, piLogBytes: 0, gateRequests: 0, source: 'start' };
     progressFile = progressFileFor(paths, issue, claim.round);
     function saveProgress() {
       try {
@@ -609,13 +611,15 @@ export async function runHostRound({
           lastActivityAt: new Date(activity.lastActivityMs).toISOString(),
           piLogBytes: activity.piLogBytes,
           gateRequests: activity.gateRequests,
+          activitySource: activity.source,
         });
       } catch {
         // 写不下去不影响这一轮；tick 会回落到轮次评论的创建时间。
       }
     }
-    function touch() {
+    function touch(source = 'prepare') {
       activity.lastActivityMs = now();
+      activity.source = source;
       saveProgress();
     }
     saveProgress();
@@ -708,7 +712,7 @@ export async function runHostRound({
         innerPath: innerSocket,
         onRequest: () => {
           activity.gateRequests += 1;
-          touch();
+          touch('gate');
         },
       });
     } catch (error) {
@@ -792,14 +796,25 @@ export async function runHostRound({
       // 11. 看着 pi：总时长上限 → 裁决已写还不退 → 宿主侧卡住判定。
       const stallMs = (profile.stallMinutes ?? 30) * 60 * 1000;
       let verdictSeenMs = null;
+      let lastSample = null;
       while (!finished) {
         await waitTick(statusIntervalMs, exited);
         if (finished) break;
         const size = fileSize(piLog);
         if (size !== activity.piLogBytes) {
           activity.piLogBytes = size;
-          touch();
+          touch('pi-log');
         }
+        // 沙箱里在跑长命令时 pi.log 不长：再看 pi 进程树 CPU 和沙箱目录 mtime（#149）。
+        let sample = null;
+        try {
+          sample = probeActivity({ piPid: pi.pid, roundDir });
+        } catch {
+          sample = null;
+        }
+        const changed = activityChange(lastSample, sample);
+        if (sample) lastSample = sample;
+        if (changed) touch(changed);
         if (now() - roundStartedMs >= maxRoundMs) {
           await stopPi();
           await abortWithAlert('round-timeout', `超过总时长上限（${maxRoundMinutes(settings)} 分钟）`);
