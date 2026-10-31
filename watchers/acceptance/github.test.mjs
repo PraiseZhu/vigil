@@ -341,6 +341,133 @@ test('安全 branch.push 的 bundlePath 必须是绝对路径，不会被 git �
   assert.equal(run.calls.length, 0, '参数不合法时不应调 git');
 });
 
+function boardLookup(fields) {
+  return {
+    user: {
+      projectV2: {
+        id: 'PROJ',
+        fields: { nodes: fields },
+      },
+    },
+    repository: {
+      issue: {
+        id: 'ISSUE',
+        projectItems: { nodes: [{ id: 'ITEM1', isArchived: false, project: { id: 'PROJ' } }] },
+      },
+    },
+  };
+}
+
+const PRIO_FIELD = {
+  id: 'F_PRIO',
+  name: '优先级',
+  dataType: 'SINGLE_SELECT',
+  options: [
+    { id: 'O_P0', name: 'P0' },
+    { id: 'O_P1', name: 'P1' },
+    { id: 'O_P2', name: 'P2' },
+    { id: 'O_P3', name: 'P3' },
+  ],
+};
+const LINK_FIELD = { id: 'F_LINK', name: '关联 PR', dataType: 'TEXT' };
+
+test('#157 SC2 写闸白名单只有「优先级」「关联 PR」，写其它字段被拒', async () => {
+  const { PRIO_BOARD_FIELDS } = await import('./bin/github.mjs');
+  assert.ok(PRIO_BOARD_FIELDS, '缺少优先级写回白名单');
+  assert.equal(PRIO_BOARD_FIELDS.size, 2);
+  assert.equal(PRIO_BOARD_FIELDS.has('优先级'), true);
+  assert.equal(PRIO_BOARD_FIELDS.has('关联 PR'), true);
+
+  const profile = loadHome();
+  const rejected = createFakeRun({
+    onGraphql: () => {
+      throw new Error('白名单应在发请求前拒绝');
+    },
+  });
+  const blocked = createGithub({ profile, run: rejected });
+  await assert.rejects(
+    () =>
+      blocked.write({
+        type: 'project.field.set',
+        dedupeKey: 'reject-status',
+        repo: REPO,
+        issue: 1,
+        ownerLogin: 'ExampleUser',
+        projectNumber: 7,
+        fields: { 状态: 'Done' },
+      }),
+    /拒绝写入看板字段「状态」/,
+  );
+  await assert.rejects(
+    () =>
+      blocked.write({
+        type: 'project.field.set',
+        dedupeKey: 'reject-mixed',
+        repo: REPO,
+        issue: 1,
+        ownerLogin: 'ExampleUser',
+        projectNumber: 7,
+        fields: { 验收: '通过', 优先级: 'P0' },
+      }),
+    /拒绝写入看板字段/,
+  );
+  assert.equal(rejected.calls.length, 0, '被拒的字段不能发到 GitHub');
+
+  const mutations = [];
+  const run = createFakeRun({
+    onGraphql: (payload) => {
+      const query = String(payload.query);
+      if (query.includes('mutation')) {
+        mutations.push({ query, variables: payload.variables });
+        if (query.includes('clearProjectV2ItemFieldValue')) {
+          return { clearProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM1' } } };
+        }
+        return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM1' } } };
+      }
+      return boardLookup([PRIO_FIELD, LINK_FIELD]);
+    },
+  });
+  const github = createGithub({ profile, run });
+  await github.write({
+    type: 'project.field.set',
+    dedupeKey: 'set-prio',
+    repo: REPO,
+    issue: 1,
+    ownerLogin: 'ExampleUser',
+    projectNumber: 7,
+    fields: { 优先级: 'P0' },
+  });
+  await github.write({
+    type: 'project.field.set',
+    dedupeKey: 'set-link',
+    repo: REPO,
+    issue: 1,
+    ownerLogin: 'ExampleUser',
+    projectNumber: 7,
+    fields: { '关联 PR': '#3(open,CI✓)' },
+  });
+  await github.write({
+    type: 'project.field.set',
+    dedupeKey: 'clear-prio',
+    repo: REPO,
+    issue: 1,
+    ownerLogin: 'ExampleUser',
+    projectNumber: 7,
+    fields: { 优先级: null },
+  });
+
+  const update = mutations.find((entry) => entry.variables?.optionId === 'O_P0');
+  assert.ok(update, '优先级要写成单选 P0');
+  assert.equal(update.variables.fieldId, 'F_PRIO');
+  const link = mutations.find((entry) => entry.variables?.text === '#3(open,CI✓)');
+  assert.ok(link, '关联 PR 要写成文本');
+  assert.equal(link.variables.fieldId, 'F_LINK');
+  const cleared = mutations.find((entry) => entry.query.includes('clearProjectV2ItemFieldValue'));
+  assert.ok(cleared, '清空优先级走 clear，不写一个空选项');
+  assert.equal(cleared.variables.fieldId, 'F_PRIO');
+  assert.equal(mutations.some((entry) => entry.variables?.fieldId === 'F_KIND'), false);
+});
+
 test('默认执行器按 UTF-8 流式解码：大输出里跨块的多字节字符不变乱码（#43 正文版本每拍误判「变了」）', async () => {
   // 20 万个「。」（每个 3 字节，约 600 KiB）必然跨过管道块边界；逐块 `+=` 会在边界处拼出 U+FFFD。
   const script = "process.stdout.write('。'.repeat(200000))";

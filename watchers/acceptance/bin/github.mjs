@@ -37,6 +37,8 @@ export const GATE_ACTION_WRITE_TYPES = Object.freeze(['pr.update-branch', 'ci.re
 
 const WRITE_TYPE_SET = new Set([...WRITE_TYPES, ...GATE_ACTION_WRITE_TYPES]);
 const BOARD_FIELDS = new Set(['验收', '裁决']);
+/** 优先级写回只许这两个字段。不能和「验收」「裁决」写在同一次动作里。 */
+export const PRIO_BOARD_FIELDS = new Set(['优先级', '关联 PR']);
 
 export class WriteBusyError extends Error {
   constructor(message = '外发忙') {
@@ -400,10 +402,16 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
 
   async function setProjectFields(action) {
     const { repo, issue, fields = {}, ownerLogin, projectNumber } = action;
-    for (const name of Object.keys(fields)) {
-      if (!BOARD_FIELDS.has(name)) {
+    const names = Object.keys(fields);
+    for (const name of names) {
+      if (!BOARD_FIELDS.has(name) && !PRIO_BOARD_FIELDS.has(name)) {
         throw new Error(`拒绝写入看板字段「${name}」`);
       }
+    }
+    const usesPrio = names.some((name) => PRIO_BOARD_FIELDS.has(name));
+    const usesBoard = names.some((name) => BOARD_FIELDS.has(name));
+    if (usesPrio && usesBoard) {
+      throw new Error('拒绝写入看板字段：优先级写回不能和验收、裁决一起写');
     }
     const [owner, name] = String(repo).split('/');
     const login = ownerLogin || profile.ownerLogin;
@@ -495,6 +503,58 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
         }`,
         { projectId: project.id, itemId: item.id, fieldId: field.id, text: String(fields['裁决']) },
       );
+    }
+    const clearField = async (fieldId) => {
+      await graphqlWrite(
+        `mutation ($projectId: ID!, $itemId: ID!, $fieldId: ID!) {
+          clearProjectV2ItemFieldValue(input: {
+            projectId: $projectId, itemId: $itemId, fieldId: $fieldId
+          }) { projectV2Item { id } }
+        }`,
+        { projectId: project.id, itemId: item.id, fieldId },
+      );
+    };
+    if (Object.hasOwn(fields, '优先级')) {
+      const field = fieldByName.get('优先级');
+      if (!field?.id) throw new Error('看板没有「优先级」字段');
+      if (field.dataType !== 'SINGLE_SELECT') throw new Error('「优先级」字段必须是单选');
+      const value = fields['优先级'];
+      if (value == null || value === '') {
+        await clearField(field.id);
+      } else {
+        const option = (field.options || []).find((entry) => entry.name === value);
+        if (!option?.id) throw new Error(`优先级字段没有选项「${value}」`);
+        await graphqlWrite(
+          `mutation ($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+            updateProjectV2ItemFieldValue(input: {
+              projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
+              value: { singleSelectOptionId: $optionId }
+            }) { projectV2Item { id } }
+          }`,
+          { projectId: project.id, itemId: item.id, fieldId: field.id, optionId: option.id },
+        );
+      }
+    }
+    if (Object.hasOwn(fields, '关联 PR')) {
+      const field = fieldByName.get('关联 PR');
+      if (!field?.id) throw new Error('看板没有「关联 PR」字段');
+      if (field.dataType === 'SINGLE_SELECT') {
+        throw new Error('「关联 PR」字段必须是文本，不能是单选');
+      }
+      const value = fields['关联 PR'];
+      if (value == null || value === '') {
+        await clearField(field.id);
+      } else {
+        await graphqlWrite(
+          `mutation ($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+            updateProjectV2ItemFieldValue(input: {
+              projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
+              value: { text: $text }
+            }) { projectV2Item { id } }
+          }`,
+          { projectId: project.id, itemId: item.id, fieldId: field.id, text: String(value) },
+        );
+      }
     }
     return { itemId: item.id, projectId: project.id };
   }
