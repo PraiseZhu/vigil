@@ -2,9 +2,11 @@
 // 纯函数。只看调用方传入的字符串。
 //
 // 命中：
-// - 标题或正文里的裸 #n，只算这条 PR 自己的仓
-// - owner/repo#n（Refs、Closes、任务 issue： 都是这种写法）
-// - https://github.com/owner/repo/issues/n （pull 链接不算）
+// - 正文「任务 issue：」行上的 owner/repo#n、issue 链接；这一行没有这两种写法时才取裸 #n
+//   （所以「#147（#148 的补充）」里的 #148 不算，那是在说上一个 PR）
+// - 行首，或冒号后面，的 Closes / Fixes / Refs（大小写不敏感）之后的 #n、owner/repo#n、issue 链接
+// - Resolves、Close、Fixed，以及写在句子中间的关闭字，不算
+// - 标题里的 #n 不算；正文其它地方顺手提到的 #n、owner/repo#n、issue 链接不算
 // - 分支 acceptance/<号>-<号>-sc<k> 的前两个号（sc 后面的号不算）
 // - 分支里的 issue-<号>、issue/<号>、issues/<号>、#<号>
 //
@@ -44,15 +46,48 @@ function comparePr(a, b) {
   return Number(a.number) - Number(b.number) || String(a.repo).localeCompare(String(b.repo));
 }
 
+function collectTextRefs(found, text, own, { bare }) {
+  const source = String(text || '');
+  for (const match of source.matchAll(ISSUE_URL)) addRef(found, `${match[1]}/${match[2]}`, match[3]);
+  for (const match of source.matchAll(EXPLICIT_REF)) addRef(found, `${match[1]}/${match[2]}`, match[3]);
+  if (bare && own.includes('/')) {
+    for (const match of source.matchAll(BARE_REF)) addRef(found, own, match[1]);
+  }
+}
+
+function isTaskIssueLine(line) {
+  return /^\s*任务\s*issue\s*[:：]/i.test(line);
+}
+
+/** 行首，或冒号紧后面，才算声明行。返回从关键字开始的那一段。 */
+function keywordSpan(line) {
+  const atStart = /^\s*(closes|fixes|refs)\b/i.exec(line);
+  if (atStart) return line.slice(atStart.index + atStart[0].length - atStart[1].length);
+  const afterColon = /[:：]\s*(closes|fixes|refs)\b/i.exec(line);
+  if (afterColon) return line.slice(afterColon.index + afterColon[0].length - afterColon[1].length);
+  return null;
+}
+
 /** 这条 PR 点名的 issue，形如 owner/repo#n，按 repo、再按号排序。同一条只出现一次。 */
 export function prIssueRefs(pr) {
   const found = new Map();
   const own = String(pr?.repo || '').trim();
-  const text = `${pr?.title || ''}\n${pr?.body || ''}`;
-  for (const match of text.matchAll(ISSUE_URL)) addRef(found, `${match[1]}/${match[2]}`, match[3]);
-  for (const match of text.matchAll(EXPLICIT_REF)) addRef(found, `${match[1]}/${match[2]}`, match[3]);
+  const body = String(pr?.body || '');
+  for (const line of body.split(/\r?\n/)) {
+    if (isTaskIssueLine(line)) {
+      const explicit = new Map();
+      collectTextRefs(explicit, line, own, { bare: false });
+      if (explicit.size) {
+        for (const [key, value] of explicit) found.set(key, value);
+      } else {
+        collectTextRefs(found, line, own, { bare: true });
+      }
+      continue;
+    }
+    const span = keywordSpan(line);
+    if (span) collectTextRefs(found, span, own, { bare: true });
+  }
   if (own.includes('/')) {
-    for (const match of text.matchAll(BARE_REF)) addRef(found, own, match[1]);
     const branch = String(pr?.headRefName || pr?.branch || '').trim();
     const acceptance = ACCEPTANCE_BRANCH.exec(branch);
     if (acceptance) {
