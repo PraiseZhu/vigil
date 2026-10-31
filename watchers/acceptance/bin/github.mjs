@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // GitHub 读写的唯一出口：本文件才允许 spawn / 触网。
 // 读：配了 appConfigPath 走 App 安装令牌，否则走账号令牌。
+// 配了 appTokenCommand（外部命令打印 App 安装令牌）：落在 appOwners 名下单个仓上的只读查询优先走 App 令牌，
+// 取不到令牌、或 App 读到 401/403/404 时回退账号令牌重试一次，并在宿主 loop.log 记一行（不含令牌）。
 // 写：一律走账号令牌；配了 writeCommand 则整段交给写闸，绝不回落直接写。
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -37,6 +39,8 @@ export const GATE_ACTION_WRITE_TYPES = Object.freeze(['pr.update-branch', 'ci.re
 
 const WRITE_TYPE_SET = new Set([...WRITE_TYPES, ...GATE_ACTION_WRITE_TYPES]);
 const BOARD_FIELDS = new Set(['验收', '裁决']);
+/** 优先级写回只许这两个字段。不能和「验收」「裁决」写在同一次动作里。 */
+export const PRIO_BOARD_FIELDS = new Set(['优先级', '关联 PR']);
 
 export class WriteBusyError extends Error {
   constructor(message = '外发忙') {
@@ -70,14 +74,39 @@ export class WriteFailedError extends Error {
   }
 }
 
-export function defaultRun(cmd, args, { env, input, timeoutMs } = {}) {
+export function defaultRun(cmd, args, { env, input, timeoutMs, killGroup = false } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
-    // 超时就杀掉（取镜像这种可能卡很久的命令才传 timeoutMs）。
-    const timer = Number(timeoutMs) > 0 ? setTimeout(() => child.kill('SIGKILL'), Number(timeoutMs)) : null;
-    child.on('close', () => timer && clearTimeout(timer));
+    const group = Boolean(killGroup) && Number(timeoutMs) > 0;
+    const child = spawn(cmd, args, { env, stdio: ['pipe', 'pipe', 'pipe'], detached: group });
+    const kill = (signal) => {
+      if (group && child.pid) {
+        try {
+          process.kill(-child.pid, signal);
+          return;
+        } catch {
+          // 组已经没了，退回只杀直接子进程。
+        }
+      }
+      child.kill(signal);
+    };
     let stdout = '';
     let stderr = '';
+    let timer = null;
+    let killed = false;
+    const stop = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+    };
+    // 超时就杀掉（取镜像、取 App 令牌这种可能卡很久的命令才传 timeoutMs）。
+    // killGroup：子进程起在自己的新进程组里，超时对整组发信号，避免孙进程拿着 stdout/stderr 把 close 拖住。
+    if (Number(timeoutMs) > 0) {
+      timer = setTimeout(() => {
+        killed = true;
+        kill('SIGTERM');
+        setTimeout(() => kill('SIGKILL'), 2000).unref?.();
+      }, Number(timeoutMs));
+      timer.unref?.();
+    }
     // 按 UTF-8 流式解码：输出大于一个管道块（约 64 KiB）时，多字节字符可能被切在两块之间，
     // 逐块 `+=` 会把它拼成乱码（比如正文里的「。」变成两个 U+FFFD），正文版本随之变掉，
     // 已验过的总 issue 每拍都被误判「正文变了」。setEncoding 交给 StringDecoder 跨块拼好。
@@ -89,9 +118,17 @@ export function defaultRun(cmd, args, { env, input, timeoutMs } = {}) {
     child.stderr.on('data', (chunk) => {
       stderr += chunk;
     });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      resolve({ code: code ?? 1, stdout, stderr });
+    child.on('error', (error) => {
+      stop();
+      if (killed) {
+        resolve({ code: 124, stdout, stderr: `${stderr}${error.message}` });
+        return;
+      }
+      reject(error);
+    });
+    child.on('close', (code, signal) => {
+      stop();
+      resolve({ code: code ?? (signal || killed ? 124 : 1), stdout, stderr, signal: signal || undefined });
     });
     if (input != null) child.stdin.write(input);
     child.stdin.end();
@@ -273,7 +310,53 @@ function parseJson(stdout, label) {
   }
 }
 
-export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
+/** 取 App 令牌的外部命令最多等多久（超时整组杀掉，按取不到处理、回退账号令牌）。 */
+export const APP_TOKEN_TIMEOUT_MS = 30000;
+
+/**
+ * App 令牌读失败时，要不要回退账号令牌：401 / 凭证坏 → auth-401；403 / 无权限 → auth-403；
+ * 404 / 找不到仓（App 没覆盖这个仓）→ not-found。超时、5xx 等不回退（照旧走只读重试规则）。
+ */
+export function appFallbackKind(result) {
+  let text = `${result?.stderr || ''}\n`;
+  if (result?.code === 0) {
+    try {
+      const parsed = JSON.parse(result.stdout);
+      if (!parsed?.errors?.length) return null;
+      text += parsed.errors.map((err) => `${err?.type || ''} ${err?.message || ''}`).join('\n');
+    } catch {
+      return null;
+    }
+  } else {
+    text += String(result?.stdout || '');
+  }
+  if (/\bHTTP 401\b|Bad credentials/i.test(text)) return 'auth-401';
+  if (/\bHTTP 403\b|Resource not accessible by integration|\bFORBIDDEN\b/.test(text)) return 'auth-403';
+  if (/\bHTTP 404\b|Could not resolve to a (Repository|node)|\bNOT_FOUND\b/.test(text)) return 'not-found';
+  return null;
+}
+
+const FALLBACK_TEXT = {
+  'token-failed': 'App 令牌取不到',
+  'auth-401': 'App 令牌被拒（401）',
+  'auth-403': 'App 令牌没权限（403）',
+  'not-found': 'App 读不到这个仓（404，可能没装 App）',
+};
+
+function defaultFallbackLog(profile) {
+  return (line) => {
+    if (!profile?.profilePath) return;
+    try {
+      const hostDir = path.join(path.dirname(path.dirname(profile.profilePath)), 'state', 'host');
+      fs.mkdirSync(hostDir, { recursive: true });
+      fs.appendFileSync(path.join(hostDir, 'loop.log'), `${line}\n`);
+    } catch {
+      // 日志写不下去不影响读。
+    }
+  };
+}
+
+export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog, ownerToken } = {}) {
   if (!profile) throw new Error('createGithub 需要 profile');
   const runCmd = run || defaultRun;
   const fetchFn = fetchImpl || globalThis.fetch;
@@ -282,8 +365,48 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
 
   let ownerTokenCache;
   let appTokenCache;
+  let cmdTokenCache;
+  let cmdTokenFailed = false;
+  const writeFallback = fallbackLog || defaultFallbackLog(profile);
+
+  /** 这条查询落在 App 覆盖的单个仓上吗：是就返回 owner/name，不是（跨仓清单、搜索、viewer、别的组织）返回 null。 */
+  function appRepoFor(variables) {
+    if (!profile.appTokenCommand || profile.appConfigPath) return null;
+    const owner = variables?.owner;
+    const name = variables?.name;
+    if (typeof owner !== 'string' || typeof name !== 'string' || !owner || !name) return null;
+    const owners = profile.appOwners || [profile.ownerLogin];
+    if (!owners.some((entry) => String(entry).toLowerCase() === owner.toLowerCase())) return null;
+    return `${owner}/${name}`;
+  }
+
+  /** 跑外部命令取 App 令牌：只放进这次读的那个 gh 子进程；取不到就记住，这个实例里不再反复试。 */
+  async function getCommandAppToken() {
+    if (cmdTokenCache) return cmdTokenCache;
+    if (cmdTokenFailed) return null;
+    const argv = profile.appTokenCommand;
+    let result = null;
+    try {
+      result = await runCmd(argv[0], argv.slice(1), { env: baseEnv(), timeoutMs: APP_TOKEN_TIMEOUT_MS, killGroup: true });
+    } catch {
+      result = null;
+    }
+    const token = result?.code === 0 ? String(result.stdout || '').trim() : '';
+    if (!token || /\s/.test(token)) {
+      cmdTokenFailed = true;
+      return null;
+    }
+    cmdTokenCache = token;
+    return token;
+  }
+
+  function logFallback(kind, repo) {
+    writeFallback(`${new Date(nowFn()).toISOString()} app-token-fallback kind=${kind} repo=${repo} ${FALLBACK_TEXT[kind] || 'App 令牌读失败'}，已改用原令牌重试一次`);
+  }
 
   function getOwnerToken() {
+    // 调用方已经从令牌文件读出内容时，只放在内存里，不再读一遍文件。
+    if (typeof ownerToken === 'string' && ownerToken) return ownerToken;
     if (!ownerTokenCache) ownerTokenCache = readGithubToken(profile);
     return ownerTokenCache;
   }
@@ -322,7 +445,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
   }
 
   function failFrom(result, token) {
-    const detail = redact(result.stderr || result.stdout || `exit ${result.code}`, [token, ownerTokenCache, appTokenCache]);
+    const detail = redact(result.stderr || result.stdout || `exit ${result.code}`, [token, ownerTokenCache, appTokenCache, cmdTokenCache]);
     throw new Error(detail);
   }
 
@@ -337,27 +460,91 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
     return runCmd('gh', args, opts);
   }
 
-  async function graphql(query, variables) {
-    const token = await getReadToken();
+  async function sendGraphql(token, query, variables) {
     const opts = { env: ghEnv(token), input: JSON.stringify({ query, variables }) };
     const args = ['api', 'graphql', '--input', '-'];
     // 只有纯查询才重试；mutation 哪怕走到这里也只发一次。
-    const result = isReadOnlyGraphql(query) ? await runRead(args, opts) : await runCmd('gh', args, opts);
+    return isReadOnlyGraphql(query) ? runRead(args, opts) : runCmd('gh', args, opts);
+  }
+
+  function finishGraphql(result, token) {
     if (result.code !== 0) failFrom(result, token);
     const parsed = parseJson(result.stdout, 'GraphQL');
+    if (parsed.errors?.length) {
+      throw new Error(redact(parsed.errors.map((err) => err.message).join('; '), [token, ownerTokenCache, appTokenCache, cmdTokenCache]));
+    }
+    return parsed.data ?? parsed;
+  }
+
+  async function graphql(query, variables) {
+    const appRepo = isReadOnlyGraphql(query) ? appRepoFor(variables) : null;
+    if (appRepo) {
+      const appToken = await getCommandAppToken();
+      if (appToken) {
+        const first = await sendGraphql(appToken, query, variables);
+        const kind = appFallbackKind(first);
+        if (!kind) return finishGraphql(first, appToken);
+        // 401：令牌本身坏了，这个实例里不再用它。
+        if (kind === 'auth-401') {
+          cmdTokenFailed = true;
+          cmdTokenCache = undefined;
+        }
+        logFallback(kind, appRepo);
+      } else {
+        logFallback('token-failed', appRepo);
+      }
+      const ownerToken = getOwnerToken();
+      return finishGraphql(await sendGraphql(ownerToken, query, variables), ownerToken);
+    }
+    const token = await getReadToken();
+    return finishGraphql(await sendGraphql(token, query, variables), token);
+  }
+
+  async function graphqlFetch(token, query, variables) {
+    // 优先级写令牌只放在请求头里，不放进进程环境变量。失败信息先抹掉令牌再抛。
+    let res;
+    try {
+      res = await fetchFn('https://api.github.com/graphql', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query, variables }),
+      });
+    } catch {
+      throw new Error('GraphQL 请求失败');
+    }
+    const raw = typeof res?.text === 'function' ? await res.text() : '';
+    if (res && res.ok === false) {
+      throw new Error(redact(raw, [token]) || `GraphQL HTTP ${res.status}`);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error('GraphQL 返回的不是 JSON');
+    }
     if (parsed.errors?.length) {
       throw new Error(redact(parsed.errors.map((err) => err.message).join('; '), [token]));
     }
     return parsed.data ?? parsed;
   }
 
+  function usesPriorityToken() {
+    return typeof ownerToken === 'string' && ownerToken.length > 0;
+  }
+
   /**
    * 用账号令牌的只读查询（doctor 查看板 viewerCanUpdate 用：App 令牌看不到个人账号下的看板，
    * 写看板走的又是账号令牌）。只收 query，mutation 一律拒绝。
+   * 优先级写令牌走请求头，不进环境变量。
    */
   async function ownerGraphql(query, variables) {
     if (/^\s*mutation\b/.test(String(query || ''))) throw new Error('ownerGraphql 只做只读查询');
     if (!isReadOnlyGraphql(query)) return graphqlWrite(query, variables);
+    if (usesPriorityToken()) return graphqlFetch(ownerToken, query, variables);
     const token = getOwnerToken();
     const result = await runRead(['api', 'graphql', '--input', '-'], {
       env: ghEnv(token),
@@ -386,6 +573,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
 
   async function graphqlWrite(query, variables) {
     const token = getOwnerToken();
+    if (usesPriorityToken()) return graphqlFetch(token, query, variables);
     const result = await runCmd('gh', ['api', 'graphql', '--input', '-'], {
       env: ghEnv(token),
       input: JSON.stringify({ query, variables }),
@@ -400,10 +588,16 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
 
   async function setProjectFields(action) {
     const { repo, issue, fields = {}, ownerLogin, projectNumber } = action;
-    for (const name of Object.keys(fields)) {
-      if (!BOARD_FIELDS.has(name)) {
+    const names = Object.keys(fields);
+    for (const name of names) {
+      if (!BOARD_FIELDS.has(name) && !PRIO_BOARD_FIELDS.has(name)) {
         throw new Error(`拒绝写入看板字段「${name}」`);
       }
+    }
+    const usesPrio = names.some((name) => PRIO_BOARD_FIELDS.has(name));
+    const usesBoard = names.some((name) => BOARD_FIELDS.has(name));
+    if (usesPrio && usesBoard) {
+      throw new Error('拒绝写入看板字段：优先级写回不能和验收、裁决一起写');
     }
     const [owner, name] = String(repo).split('/');
     const login = ownerLogin || profile.ownerLogin;
@@ -495,6 +689,58 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
         }`,
         { projectId: project.id, itemId: item.id, fieldId: field.id, text: String(fields['裁决']) },
       );
+    }
+    const clearField = async (fieldId) => {
+      await graphqlWrite(
+        `mutation ($projectId: ID!, $itemId: ID!, $fieldId: ID!) {
+          clearProjectV2ItemFieldValue(input: {
+            projectId: $projectId, itemId: $itemId, fieldId: $fieldId
+          }) { projectV2Item { id } }
+        }`,
+        { projectId: project.id, itemId: item.id, fieldId },
+      );
+    };
+    if (Object.hasOwn(fields, '优先级')) {
+      const field = fieldByName.get('优先级');
+      if (!field?.id) throw new Error('看板没有「优先级」字段');
+      if (field.dataType !== 'SINGLE_SELECT') throw new Error('「优先级」字段必须是单选');
+      const value = fields['优先级'];
+      if (value == null || value === '') {
+        await clearField(field.id);
+      } else {
+        const option = (field.options || []).find((entry) => entry.name === value);
+        if (!option?.id) throw new Error(`优先级字段没有选项「${value}」`);
+        await graphqlWrite(
+          `mutation ($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+            updateProjectV2ItemFieldValue(input: {
+              projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
+              value: { singleSelectOptionId: $optionId }
+            }) { projectV2Item { id } }
+          }`,
+          { projectId: project.id, itemId: item.id, fieldId: field.id, optionId: option.id },
+        );
+      }
+    }
+    if (Object.hasOwn(fields, '关联 PR')) {
+      const field = fieldByName.get('关联 PR');
+      if (!field?.id) throw new Error('看板没有「关联 PR」字段');
+      if (field.dataType !== 'TEXT') {
+        throw new Error('「关联 PR」字段必须是文本');
+      }
+      const value = fields['关联 PR'];
+      if (value == null || value === '') {
+        await clearField(field.id);
+      } else {
+        await graphqlWrite(
+          `mutation ($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+            updateProjectV2ItemFieldValue(input: {
+              projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
+              value: { text: $text }
+            }) { projectV2Item { id } }
+          }`,
+          { projectId: project.id, itemId: item.id, fieldId: field.id, text: String(value) },
+        );
+      }
     }
     return { itemId: item.id, projectId: project.id };
   }

@@ -13,6 +13,7 @@
 | 验收会话 | `bin/helper.mjs` 与步骤文档 | [`docs/acceptance-session.md`](../../docs/acceptance-session.md)、[`SESSION.md`](SESSION.md) |
 | 宿主接入、写闸、部署检查 | `host/`、`bin/doctor.mjs` | [`docs/acceptance-operations.md`](../../docs/acceptance-operations.md) |
 | 修正轮 prbot | `host/prbot.mjs`、`host/gate-actions/` | [`docs/acceptance-prbot.md`](../../docs/acceptance-prbot.md) |
+| 舰队任务标准 | `bin/fleet-standard.mjs` | [`docs/fleet-standard.md`](../../docs/fleet-standard.md) |
 
 对应 issue：#44（盘点与触发）、#45（调度接口）、#46（验收会话）、#47（宿主接入、写闸与首跑）。
 
@@ -43,6 +44,8 @@
 | `stallMinutes` | 否 | 卡住判定阈值，默认 30 |
 | `writeCommand` | 否 | 写操作出口 argv；没配则直接用 `gh`/`git` |
 | `appConfigPath` | 否 | GitHub App 配置 JSON；配了读请求走 App 令牌 |
+| `appTokenCommand` | 否 | 打印 App 安装令牌的外部命令（argv 数组）；`appOwners` 名下单仓只读查询优先走它，失败或 401/403/404 回退账号令牌并记 loop.log |
+| `appOwners` | 否 | 装了该 App 的 owner 列表，默认 `[ownerLogin]` |
 | `slackBotTokenFile` | 否 | Slack bot 令牌文件（绝对路径）；配了就检查权限是 600，只有 `host/slack-notify.mjs` 读它 |
 | `slackChannelId` | 否 | Slack 频道 id（`C` / `G` 开头）；没配就不发通知（当前部署不配：通报已关闭，告警只写 `alerts.jsonl`，心跳 `slack.reason=not-configured` 属正常） |
 | `slackMentionUserId` | 否 | 立即发（ping）时 @ 的用户 id（`U` 开头）；摘要不 @ |
