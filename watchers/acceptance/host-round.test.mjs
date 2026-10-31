@@ -756,16 +756,17 @@ test('build 项 CI 口径开着：派发消息末尾追加 CI 事实；查 CI �
 });
 
 // #149：pi.log 不长、写闸没请求，但沙箱里在跑长命令（npm → vitest）时不该判卡住。
-function stallRun(fixture, { spawnPi, probeActivity, statusIntervalMs = 10 }) {
+function stallRun(fixture, { spawnPi, probeActivity, statusIntervalMs = 10, now, runRound = fixture.runRoundFake }) {
   return runHostRound({
     home: fixture.home,
     issue: ROOT_REF,
     run: BWRAP_OK,
-    runRound: fixture.runRoundFake,
+    runRound,
     startGate: fixture.startGateFake,
     prefetch: fixture.prefetchFake,
     spawnPi,
     probeActivity,
+    now,
     meminfoPath: writeMeminfo(),
     statusIntervalMs,
     killGraceMs: 20,
@@ -786,24 +787,48 @@ function watchProgress(fixture) {
   return { seen, stop: () => clearInterval(timer) };
 }
 
-test('#149 SC1 pi.log 不长、写闸没请求，但 pi 进程树 CPU 在涨：不判卡住，activitySource=cpu；CPU 停了才判', { timeout: 10000 }, async () => {
+test('#149 SC1 pi.log 不长、写闸没请求，但 pi 进程树 CPU 在涨：不判卡住，activitySource=cpu；CPU 停了才判（#158：假时钟，不靠墙钟）', { timeout: 10000 }, async () => {
   const fixture = roundFixture({ profile: { stallMinutes: 0.003 } });
   const pi = hangingPi(fixture.calls);
-  const startedAt = Date.now();
-  let ticks = 0;
+  // #158：以前按墙钟断言「至少 600+180ms」，最后一拍可能落在 600ms 前一个间隔（如 591ms），
+  // CI 稍慢就会 773/778ms < 780ms 偶发红。这里让注入时钟只在探针里走，最后一拍和 stallMinutes
+  // 都按同一套逻辑时间算，和 CI 调度快慢无关。
+  let clock = Date.parse('2026-11-01T00:00:00.000Z');
+  let activeTicks = 0;
+  let lastActiveMs = null;
+  let abortedMs = null;
+  const progressFile = progressFileFor(hostPaths(fixture.home), ROOT_REF, 1);
+  const sources = new Set();
+  let lastProgress = null;
   const probeActivity = ({ piPid }) => {
     assert.equal(piPid, 555001);
-    if (Date.now() - startedAt < 600) ticks += 1;
-    return { cpuTicks: ticks, filesMtimeMs: 1 };
+    clock += 10;
+    try {
+      const written = JSON.parse(fs.readFileSync(progressFile, 'utf8'));
+      lastProgress = written;
+      if (written.activitySource) sources.add(written.activitySource);
+    } catch {
+      // 这一拍还没写（第一拍只记基线）。
+    }
+    if (activeTicks < 50) {
+      activeTicks += 1;
+      lastActiveMs = clock;
+      return { cpuTicks: activeTicks, filesMtimeMs: 1 };
+    }
+    return { cpuTicks: activeTicks, filesMtimeMs: 1 };
   };
-  const watch = watchProgress(fixture);
-  const code = await stallRun(fixture, { spawnPi: pi.spawnPi, probeActivity });
-  watch.stop();
+  const runRound = async (argv) => {
+    if (argv[0] === 'abort') abortedMs = clock;
+    return fixture.runRoundFake(argv);
+  };
+  const code = await stallRun(fixture, { spawnPi: pi.spawnPi, probeActivity, now: () => clock, runRound });
   assert.equal(code, 1);
-  assert.ok(Date.now() - startedAt >= 600 + 180, `卡住判得太早：${Date.now() - startedAt}ms`);
-  assert.ok(watch.seen.some((entry) => entry.activitySource === 'cpu'), '进度文件记了活动来源 cpu');
-  assert.equal(watch.seen.at(-1).piLogBytes, 0);
-  assert.equal(watch.seen.at(-1).gateRequests, 0);
+  assert.ok(sources.has('cpu'), '进度文件记了活动来源 cpu');
+  assert.equal(lastProgress?.piLogBytes, 0);
+  assert.equal(lastProgress?.gateRequests, 0);
+  assert.ok(lastActiveMs != null, '探针看到过 CPU 活动');
+  assert.ok(abortedMs != null, 'CPU 停了之后要判卡住');
+  assert.ok(abortedMs - lastActiveMs > 180, `最后活动后超过 stallMinutes 才判卡住：${abortedMs - lastActiveMs}ms`);
   const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
   assert.match(abort[abort.indexOf('--reason') + 1], /卡住：超过 stallMinutes 没有进度/);
   assert.ok(readAlerts(hostPaths(fixture.home)).some((entry) => entry.kind === 'round-stalled'));
