@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { assertSocketPath } from './egress-proxy.mjs';
 import { isVerdictOnly, loadAcceptanceProfile, watcherHome } from '../bin/profile.mjs';
 import { recordScope } from './scope-snapshot.mjs';
-import { createGithub, WRITE_TYPES } from '../bin/github.mjs';
+import { createGithub, PRIO_BOARD_FIELDS, WRITE_TYPES } from '../bin/github.mjs';
 import { bodyVersion, latestRound, parseRef, parseRounds } from '../bin/rounds.mjs';
 import {
   ISSUE_BODY_QUERY,
@@ -532,6 +532,15 @@ export function createGate({
         const target = refOf(action.repo, action.issue);
         if (!treeRefs.has(target)) {
           return reject('not-in-tree', `${target} 不在本轮任务树`);
+        }
+        if (action.type === 'project.field.set') {
+          // 优先级和关联 PR 只由 prio-sync 用自己的令牌写。修正轮只放行「验收=修正中」，
+          // exec 只放行「验收=验收中」，这里把验收会话剩下的口也堵上。
+          const fields = action.fields && typeof action.fields === 'object' && !Array.isArray(action.fields) ? action.fields : {};
+          const blocked = Object.keys(fields).filter((name) => PRIO_BOARD_FIELDS.has(name));
+          if (blocked.length) {
+            return reject('not-allowed', '验收会话不能写「优先级」「关联 PR」，这两个字段只由 prio-sync 写');
+          }
         }
         if (action.type === 'issue.edit') {
           // 只许勾选或取消验收项（- [ ] ↔ - [x]）、给验收项行尾补「 人工手测」，不许改正文的任何其它字。
