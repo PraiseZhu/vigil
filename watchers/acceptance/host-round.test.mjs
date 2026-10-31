@@ -855,7 +855,7 @@ test('#149 SC2 沙箱 home/.npm/_logs 有新文件（默认探针、真目录）
   clearInterval(timer);
   watch.stop();
   assert.equal(code, 1);
-  assert.ok(Date.now() - startedAt >= 600 + 180 - 40, `卡住判得太早：${Date.now() - startedAt}ms`);
+  assert.ok(Date.now() - startedAt >= 600 + 180, `卡住判得太早：${Date.now() - startedAt}ms`);
   assert.ok(watch.seen.some((entry) => entry.activitySource === 'files'), '进度文件记了活动来源 files');
 });
 
