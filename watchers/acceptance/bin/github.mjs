@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // GitHub 读写的唯一出口：本文件才允许 spawn / 触网。
 // 读：配了 appConfigPath 走 App 安装令牌，否则走账号令牌。
+// 配了 appTokenCommand（外部命令打印 App 安装令牌）：落在 appOwners 名下单个仓上的只读查询优先走 App 令牌，
+// 取不到令牌、或 App 读到 401/403/404 时回退账号令牌重试一次，并在宿主 loop.log 记一行（不含令牌）。
 // 写：一律走账号令牌；配了 writeCommand 则整段交给写闸，绝不回落直接写。
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -273,7 +275,53 @@ function parseJson(stdout, label) {
   }
 }
 
-export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
+/** 取 App 令牌的外部命令最多等多久（超时整组杀掉，按取不到处理、回退账号令牌）。 */
+export const APP_TOKEN_TIMEOUT_MS = 30000;
+
+/**
+ * App 令牌读失败时，要不要回退账号令牌：401 / 凭证坏 → auth-401；403 / 无权限 → auth-403；
+ * 404 / 找不到仓（App 没覆盖这个仓）→ not-found。超时、5xx 等不回退（照旧走只读重试规则）。
+ */
+export function appFallbackKind(result) {
+  let text = `${result?.stderr || ''}\n`;
+  if (result?.code === 0) {
+    try {
+      const parsed = JSON.parse(result.stdout);
+      if (!parsed?.errors?.length) return null;
+      text += parsed.errors.map((err) => `${err?.type || ''} ${err?.message || ''}`).join('\n');
+    } catch {
+      return null;
+    }
+  } else {
+    text += String(result?.stdout || '');
+  }
+  if (/\bHTTP 401\b|Bad credentials/i.test(text)) return 'auth-401';
+  if (/\bHTTP 403\b|Resource not accessible by integration|\bFORBIDDEN\b/.test(text)) return 'auth-403';
+  if (/\bHTTP 404\b|Could not resolve to a (Repository|node)|\bNOT_FOUND\b/.test(text)) return 'not-found';
+  return null;
+}
+
+const FALLBACK_TEXT = {
+  'token-failed': 'App 令牌取不到',
+  'auth-401': 'App 令牌被拒（401）',
+  'auth-403': 'App 令牌没权限（403）',
+  'not-found': 'App 读不到这个仓（404，可能没装 App）',
+};
+
+function defaultFallbackLog(profile) {
+  return (line) => {
+    if (!profile?.profilePath) return;
+    try {
+      const hostDir = path.join(path.dirname(path.dirname(profile.profilePath)), 'state', 'host');
+      fs.mkdirSync(hostDir, { recursive: true });
+      fs.appendFileSync(path.join(hostDir, 'loop.log'), `${line}\n`);
+    } catch {
+      // 日志写不下去不影响读。
+    }
+  };
+}
+
+export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog } = {}) {
   if (!profile) throw new Error('createGithub 需要 profile');
   const runCmd = run || defaultRun;
   const fetchFn = fetchImpl || globalThis.fetch;
@@ -282,6 +330,44 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
 
   let ownerTokenCache;
   let appTokenCache;
+  let cmdTokenCache;
+  let cmdTokenFailed = false;
+  const writeFallback = fallbackLog || defaultFallbackLog(profile);
+
+  /** 这条查询落在 App 覆盖的单个仓上吗：是就返回 owner/name，不是（跨仓清单、搜索、viewer、别的组织）返回 null。 */
+  function appRepoFor(variables) {
+    if (!profile.appTokenCommand || profile.appConfigPath) return null;
+    const owner = variables?.owner;
+    const name = variables?.name;
+    if (typeof owner !== 'string' || typeof name !== 'string' || !owner || !name) return null;
+    const owners = profile.appOwners || [profile.ownerLogin];
+    if (!owners.some((entry) => String(entry).toLowerCase() === owner.toLowerCase())) return null;
+    return `${owner}/${name}`;
+  }
+
+  /** 跑外部命令取 App 令牌：只放进这次读的那个 gh 子进程；取不到就记住，这个实例里不再反复试。 */
+  async function getCommandAppToken() {
+    if (cmdTokenCache) return cmdTokenCache;
+    if (cmdTokenFailed) return null;
+    const argv = profile.appTokenCommand;
+    let result = null;
+    try {
+      result = await runCmd(argv[0], argv.slice(1), { env: baseEnv(), timeoutMs: APP_TOKEN_TIMEOUT_MS, killGroup: true });
+    } catch {
+      result = null;
+    }
+    const token = result?.code === 0 ? String(result.stdout || '').trim() : '';
+    if (!token || /\s/.test(token)) {
+      cmdTokenFailed = true;
+      return null;
+    }
+    cmdTokenCache = token;
+    return token;
+  }
+
+  function logFallback(kind, repo) {
+    writeFallback(`${new Date(nowFn()).toISOString()} app-token-fallback kind=${kind} repo=${repo} ${FALLBACK_TEXT[kind] || 'App 令牌读失败'}，已改用原令牌重试一次`);
+  }
 
   function getOwnerToken() {
     if (!ownerTokenCache) ownerTokenCache = readGithubToken(profile);
@@ -322,7 +408,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
   }
 
   function failFrom(result, token) {
-    const detail = redact(result.stderr || result.stdout || `exit ${result.code}`, [token, ownerTokenCache, appTokenCache]);
+    const detail = redact(result.stderr || result.stdout || `exit ${result.code}`, [token, ownerTokenCache, appTokenCache, cmdTokenCache]);
     throw new Error(detail);
   }
 
@@ -337,18 +423,44 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
     return runCmd('gh', args, opts);
   }
 
-  async function graphql(query, variables) {
-    const token = await getReadToken();
+  async function sendGraphql(token, query, variables) {
     const opts = { env: ghEnv(token), input: JSON.stringify({ query, variables }) };
     const args = ['api', 'graphql', '--input', '-'];
     // 只有纯查询才重试；mutation 哪怕走到这里也只发一次。
-    const result = isReadOnlyGraphql(query) ? await runRead(args, opts) : await runCmd('gh', args, opts);
+    return isReadOnlyGraphql(query) ? runRead(args, opts) : runCmd('gh', args, opts);
+  }
+
+  function finishGraphql(result, token) {
     if (result.code !== 0) failFrom(result, token);
     const parsed = parseJson(result.stdout, 'GraphQL');
     if (parsed.errors?.length) {
-      throw new Error(redact(parsed.errors.map((err) => err.message).join('; '), [token]));
+      throw new Error(redact(parsed.errors.map((err) => err.message).join('; '), [token, ownerTokenCache, appTokenCache, cmdTokenCache]));
     }
     return parsed.data ?? parsed;
+  }
+
+  async function graphql(query, variables) {
+    const appRepo = isReadOnlyGraphql(query) ? appRepoFor(variables) : null;
+    if (appRepo) {
+      const appToken = await getCommandAppToken();
+      if (appToken) {
+        const first = await sendGraphql(appToken, query, variables);
+        const kind = appFallbackKind(first);
+        if (!kind) return finishGraphql(first, appToken);
+        // 401：令牌本身坏了，这个实例里不再用它。
+        if (kind === 'auth-401') {
+          cmdTokenFailed = true;
+          cmdTokenCache = undefined;
+        }
+        logFallback(kind, appRepo);
+      } else {
+        logFallback('token-failed', appRepo);
+      }
+      const ownerToken = getOwnerToken();
+      return finishGraphql(await sendGraphql(ownerToken, query, variables), ownerToken);
+    }
+    const token = await getReadToken();
+    return finishGraphql(await sendGraphql(token, query, variables), token);
   }
 
   /**
