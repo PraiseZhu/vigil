@@ -139,6 +139,13 @@ CI 结论由宿主在代码预取、依赖预装之后、起 pi 之前只读查�
 再跑一次 `doctor`（第 6 节）确认「令牌账号」「仓可读」「看板」「看板写回」都过。
 `appConfigPath` 配了的话读请求走 GitHub App 令牌，写仍然走账号令牌。
 
+`appTokenCommand`（argv 数组，例如 `["python3", "/path/to/print-app-token.py"]`）是另一种分流只读轮询的办法：
+外部命令把 App 安装令牌打印到标准输出，验收机只把它放进那一次读 GitHub 的 gh 子进程的 `GH_TOKEN`，不进常驻进程环境、不落盘、不进日志。
+只有落在 `appOwners`（默认只有 `ownerLogin`）名下**单个仓**上的只读查询走 App；跨仓清单、搜索、viewer 和别的组织的仓照旧走账号令牌（App 看不到没装它的组织，换了会漏单）。
+取令牌失败（非 0 退出、超时 30 秒、输出为空），或 App 读到 401 / 403 / 404，就改用账号令牌重试一次，并在 `<home>/state/host/loop.log` 记一行：
+`<UTC 时间> app-token-fallback kind=<token-failed|auth-401|auth-403|not-found> repo=<owner/name> <人话>，已改用原令牌重试一次`。
+超时、5xx 不回退，照旧按只读超时 / 重试规则处理；写操作和 mutation 一律账号令牌，不回退、不重试。沙箱里的 profile 副本删掉 `appTokenCommand` 和 `appOwners`。
+
 ## 3. 写闸
 
 所有 GitHub 写操作和推送都经 `bin/github.mjs` 的 `write()`。验收轮里它被接成
@@ -265,7 +272,7 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 - 沙箱里的 `gh` 是 `host/sandbox-bin/gh`：只认 `gh api graphql --input -`，转成只读动作交给写闸；
   其它调用直接报「沙箱里只允许经写闸读」。它不看 `GH_TOKEN`。
 - 沙箱里的 watcher home 是 profile 的副本：`writeCommand` 换成 `gate-client.mjs`，
-  `githubTokenFile` 换成占位文件，`appConfigPath` 和所有 `…TokenFile` 键删掉。
+  `githubTokenFile` 换成占位文件，`appConfigPath`、`appTokenCommand`、`appOwners` 和所有 `…TokenFile` 键删掉。
 - 宿主 `HOME` 默认遮掉：`--tmpfs $HOME` 在只读根之后、可写绑定之前，白名单（`homeAllowDirs` + 代码仓 +
   node 安装目录）只读挂回。不在白名单上的 `HOME` 文件（比如各工具自己的配置、`.env` 文件）不用逐个列名单
   也读不到。拼参数时拿不到宿主 `HOME` 就直接拒绝，不退回「只遮名单」的老做法。

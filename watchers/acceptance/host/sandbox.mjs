@@ -442,7 +442,7 @@ export function prepareSandboxProfile({ profile, roundDir, repoRoot, socketPath 
   const raw = JSON.parse(fs.readFileSync(profile.profilePath, 'utf8'));
   const copy = { ...raw };
   for (const key of Object.keys(copy)) {
-    if (KEY_PATTERN.test(key) || key === 'appConfigPath') delete copy[key];
+    if (KEY_PATTERN.test(key) || key === 'appConfigPath' || key === 'appTokenCommand' || key === 'appOwners') delete copy[key];
   }
   const placeholderToken = path.join(sandboxHome, 'placeholder.token');
   copy.githubTokenFile = placeholderToken;
