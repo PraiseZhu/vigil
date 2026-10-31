@@ -807,7 +807,7 @@ test('#157 依据写进变更日志和 dry-run，并优先用打分结果里的 
   assert.equal(readJsonl(live)[0].field, '优先级');
 });
 
-test('#157 闲置仓情形档 P0 保持 P0', async () => {
+test('#157 闲置仓情形档 P0 再低一档记成 P1', async () => {
   const dir = tmpDir();
   const gate = recorder();
   const io = capture();
@@ -823,9 +823,56 @@ test('#157 闲置仓情形档 P0 保持 P0', async () => {
     stdout: io.stdout,
   });
   assert.equal(gate.writes.length, 1);
-  assert.deepEqual(gate.writes[0].fields, { 优先级: 'P0' });
-  assert.match(io.text(), /保持 P0/);
+  assert.deepEqual(gate.writes[0].fields, { 优先级: 'P1' });
+  assert.match(io.text(), /为 P1/);
+  assert.doesNotMatch(io.text(), /保持 P0/);
   assert.match(readJsonl(dir)[0].basis, /idle/);
+});
+
+test('#180 未分类仓仍按 daily-tool，注释标待 Praise 确认', async () => {
+  const { classifyRepo } = await import('./bin/prio-sync.mjs');
+  const source = fs.readFileSync(fileURLToPath(new URL('./bin/prio-sync.mjs', import.meta.url)), 'utf8');
+  const unlisted = classifyRepo('example-owner/unlisted');
+  assert.equal(unlisted.repoClass, 'daily-tool');
+  assert.equal(unlisted.unlisted, true);
+  assert.match(source, /待 Praise 确认/);
+});
+
+test('#180 看板「情形档」不参与组装，带这个字段和不带打分相同', async () => {
+  const { mapItem, factsForScore } = await import('./bin/prio-sync.mjs');
+  const { scorePriority } = await import('./bin/prio-score.mjs');
+  const source = fs.readFileSync(fileURLToPath(new URL('./bin/prio-sync.mjs', import.meta.url)), 'utf8');
+  const repo = 'example-owner/idle-repo';
+  const table = { mivo: [], idle: [repo], 'daily-tool': [] };
+  function node(number, situation) {
+    const nodes = [{ name: 'Todo', field: { name: 'Status' } }];
+    if (situation) nodes.push({ name: situation, field: { name: '情形档' } });
+    return {
+      id: `PVTI_${number}`,
+      isArchived: false,
+      updatedAt: new Date(T0).toISOString(),
+      content: {
+        __typename: 'Issue',
+        number,
+        state: 'OPEN',
+        updatedAt: new Date(T0).toISOString(),
+        repository: { nameWithOwner: repo },
+        labels: { nodes: [] },
+      },
+      fieldValues: { nodes },
+    };
+  }
+  const withField = mapItem(node(1, 'P0'), table);
+  const without = mapItem(node(2, null), table);
+  assert.equal(withField.situationTier, without.situationTier);
+  assert.equal(withField.situationKnown, without.situationKnown);
+  assert.equal(withField.situationTier, null);
+  assert.equal(withField.repoClass, 'idle');
+  assert.equal(without.repoClass, 'idle');
+  const score = (mapped) => scorePriority(factsForScore(mapped, []), T0);
+  assert.deepEqual(score(withField), score(without));
+  assert.equal(source.includes("fields.get('情形档')"), false);
+  assert.equal(source.includes('fields.get("情形档")'), false);
 });
 
 test('#157 mapItem 填最近事件后，超过 60 天会提醒；缺情形档写明缺信息', async () => {
@@ -854,7 +901,8 @@ test('#157 mapItem 填最近事件后，超过 60 天会提醒；缺情形档写
   const table = { mivo: [REPO], idle: [], 'daily-tool': [] };
   const mapped = mapItem(node, table);
   assert.equal(mapped.issueState, 'open');
-  assert.equal(mapped.situationTier, 'P3');
+  assert.equal(mapped.situationTier, null);
+  assert.equal(mapped.situationKnown, false);
   assert.equal(mapped.repoClass, 'mivo');
   assert.equal(mapped.repoUnlisted, false);
   assert.equal(mapped.lastEventAt, Date.parse(staleAt));
