@@ -294,6 +294,23 @@ export function loadAcceptanceProfile(env = process.env) {
   const appConfigPath = optionalAbsolute(raw, 'appConfigPath', file);
   const appPrivateKeyFile = appConfigPath ? loadAppConfig(appConfigPath, file).privateKeyFile : undefined;
 
+  // App 安装令牌分流只读轮询：appTokenCommand 是一条外部命令（argv 数组），标准输出打印安装令牌；
+  // 只在宿主上、只给读 GitHub 的那一个 gh 子进程用。appOwners：装了这个 App 的 owner（默认只有 ownerLogin）。
+  let appTokenCommand;
+  if (Object.hasOwn(raw, 'appTokenCommand') && raw.appTokenCommand !== undefined && raw.appTokenCommand !== null) {
+    if (!Array.isArray(raw.appTokenCommand) || raw.appTokenCommand.length === 0 || raw.appTokenCommand.some((item) => typeof item !== 'string' || !item)) {
+      throw invalid('appTokenCommand', file, '应为非空字符串数组（命令和参数分开写）');
+    }
+    appTokenCommand = [...raw.appTokenCommand];
+  }
+  let appOwners = [ownerLogin];
+  if (Object.hasOwn(raw, 'appOwners') && raw.appOwners !== undefined && raw.appOwners !== null) {
+    if (!Array.isArray(raw.appOwners) || raw.appOwners.some((item) => typeof item !== 'string' || !/^[A-Za-z0-9-]+$/.test(item))) {
+      throw invalid('appOwners', file, '应为 owner 登录名数组');
+    }
+    appOwners = [...raw.appOwners];
+  }
+
   // #61 复审决定：Slack 令牌文件权限不对 / 读不到不能让整台验收机停下，所以这里只校验路径是绝对路径，
   // 不做 checkSecretFile（那会抛错，loadAcceptanceProfile 失败整拍就停）。权限 / 属主 / 符号链接 / 空文件
   // 由 host/slack-notify.mjs 在读之前检查：不满足就不读令牌、跳过通知、原因写进心跳；doctor 照样报出来。
@@ -319,6 +336,8 @@ export function loadAcceptanceProfile(env = process.env) {
     writeCommand: writeCommand ? Object.freeze(writeCommand) : undefined,
     appConfigPath,
     appPrivateKeyFile,
+    appTokenCommand: appTokenCommand ? Object.freeze(appTokenCommand) : undefined,
+    appOwners: Object.freeze(appOwners),
     slackBotTokenFile,
     slackChannelId,
     slackMentionUserId,
