@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { createGithub } from './bin/github.mjs';
+import { createGithub, defaultRun } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { prepareSandboxProfile } from './host/sandbox.mjs';
 import { OWNER, createFakeRun, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
@@ -33,6 +33,21 @@ function tokenCmd({ code = 0, token = APP_TOKEN } = {}) {
 }
 
 const readLog = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '');
+
+test('#163 SC1 取令牌命令超时整组杀掉：命令起的孙进程不能拖着这次读不返回', async () => {
+  const dir = tmpDir();
+  const pidFile = path.join(dir, 'token-command-child.pid');
+  // 命令自己忽略 SIGTERM，并起一个同样忽略 SIGTERM 的孙进程。只杀直接子进程时，孙进程会继续拿着
+  // stdout/stderr，close 迟迟不来；整组杀掉才能按 30 秒超时回退账号令牌。
+  const script = `trap '' TERM; sh -c 'trap "" TERM; echo $$ > ${pidFile}; sleep 3' & wait`;
+  const started = Date.now();
+  const result = await defaultRun('sh', ['-c', script], { timeoutMs: 300, killGroup: true });
+  assert.equal(result.code, 124, '超时按 124 收尾，交给回退逻辑');
+  assert.ok(Date.now() - started < 4000, 'SIGTERM 宽限 + SIGKILL 内收尾');
+  const pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.throws(() => process.kill(pid, 0), /ESRCH/, `孙进程 ${pid} 应已随进程组一起被杀`);
+});
 
 test('App 成功：App 覆盖的 owner 读走 App 令牌，取令牌命令带超时和进程组', async () => {
   const { profile, loopLog } = setup();
