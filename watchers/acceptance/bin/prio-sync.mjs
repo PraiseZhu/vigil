@@ -26,6 +26,14 @@ export const STALE_REMIND_MS = 60 * 24 * 60 * 60 * 1000;
 const LINK_BASIS = 'link 关联 PR 文本与看板不一致';
 const RESTORE_BASIS = 'restore 按变更日志改回';
 const LINK_HOLD = '不写关联 PR：没有 .prio/mac-mini-stopped，要等确认 Mac mini 已停写\n';
+const RESTORE_SKIP = '跳过：当前值不是上次写入的值';
+
+/** 默认分类表是空的。真实仓名放在配置文件里，不写进源码。 */
+export const DEFAULT_REPO_CLASS_TABLE = Object.freeze({
+  mivo: Object.freeze([]),
+  idle: Object.freeze([]),
+  'daily-tool': Object.freeze([]),
+});
 
 export const BOARD_ITEMS_QUERY = `query ($login: String!, $projectNumber: Int!, $after: String) {
   user(login: $login) {
@@ -35,10 +43,13 @@ export const BOARD_ITEMS_QUERY = `query ($login: String!, $projectNumber: Int!, 
         nodes {
           id
           isArchived
+          updatedAt
           content {
             __typename
             ... on Issue {
               number
+              state
+              updatedAt
               repository { nameWithOwner }
               labels(first: 50) { nodes { name } }
             }
@@ -303,7 +314,50 @@ function valuesOf(node) {
   return out;
 }
 
-function mapItem(node) {
+function listOf(value) {
+  return Array.isArray(value) ? value.map((entry) => String(entry)) : [];
+}
+
+export function readRepoClassTable(file) {
+  if (!file || !fs.existsSync(file)) {
+    return {
+      mivo: [...DEFAULT_REPO_CLASS_TABLE.mivo],
+      idle: [...DEFAULT_REPO_CLASS_TABLE.idle],
+      'daily-tool': [...DEFAULT_REPO_CLASS_TABLE['daily-tool']],
+    };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    throw new Error('仓分类表不是合法 JSON');
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('仓分类表不是合法 JSON');
+  return {
+    mivo: listOf(parsed.mivo),
+    idle: listOf(parsed.idle),
+    'daily-tool': listOf(parsed['daily-tool'] || parsed.dailyTool),
+  };
+}
+
+/** 表里点名的用该档；没点名的按 daily-tool，并记「不在分类表里」。 */
+export function classifyRepo(repo, table = DEFAULT_REPO_CLASS_TABLE) {
+  const key = String(repo || '').toLowerCase();
+  const has = (names) => (names || []).some((entry) => String(entry).toLowerCase() === key);
+  if (has(table.mivo)) return { repoClass: 'mivo', unlisted: false };
+  if (has(table.idle)) return { repoClass: 'idle', unlisted: false };
+  if (has(table['daily-tool'])) return { repoClass: 'daily-tool', unlisted: false };
+  return { repoClass: 'daily-tool', unlisted: true };
+}
+
+function timeMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string' || !value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function mapItem(node, table = DEFAULT_REPO_CLASS_TABLE) {
   if (!node || node.isArchived) return null;
   const content = node.content;
   if (!content || content.__typename !== 'Issue') return null;
@@ -315,6 +369,13 @@ function mapItem(node) {
     .map((label) => label?.name)
     .filter((name) => typeof name === 'string' && name);
   const priority = fields.get('优先级');
+  const situationRaw = fields.get('情形档');
+  const situationKnown = situationRaw === 'P0' || situationRaw === 'P1' || situationRaw === 'P2' || situationRaw === 'P3';
+  const stateRaw = String(content.state || '').toUpperCase();
+  const issueState = stateRaw === 'OPEN' ? 'open' : stateRaw === 'CLOSED' ? 'closed' : null;
+  const times = [timeMs(node.updatedAt), timeMs(content.updatedAt)].filter((value) => value != null);
+  const lastEventAt = times.length ? Math.max(...times) : null;
+  const classified = classifyRepo(repo, table);
   return {
     id: node.id,
     repo,
@@ -324,6 +385,14 @@ function mapItem(node) {
     linkedPr: fields.get('关联 PR') ?? '',
     status: fields.get('状态') || fields.get('Status') || null,
     acceptance: fields.get('验收') || null,
+    situationTier: situationKnown ? situationRaw : null,
+    situationKnown,
+    issueState,
+    issueStateKnown: issueState != null,
+    lastEventAt,
+    lastEventKnown: lastEventAt != null,
+    repoClass: classified.repoClass,
+    repoUnlisted: classified.unlisted,
   };
 }
 
@@ -353,7 +422,7 @@ function mapPr(node) {
   return pr;
 }
 
-export async function loadBoardItems(github, profile) {
+export async function loadBoardItems(github, profile, table = DEFAULT_REPO_CLASS_TABLE) {
   const items = [];
   let after = null;
   do {
@@ -365,7 +434,7 @@ export async function loadBoardItems(github, profile) {
     const conn = data?.user?.projectV2?.items;
     if (!conn) throw new Error(`找不到看板 #${profile.projectNumber}`);
     for (const node of conn.nodes || []) {
-      const mapped = mapItem(node);
+      const mapped = mapItem(node, table);
       if (mapped) items.push(mapped);
     }
     after = conn.pageInfo?.hasNextPage ? conn.pageInfo.endCursor : null;
@@ -411,7 +480,7 @@ function isCiRed(pr) {
   return ['fail', 'failed', 'failure', 'red', 'error'].includes(ci);
 }
 
-/** 交给 W1 的事实。situationTier / repoClass / lowConfidence 先传过去，现行打分不读它们。 */
+/** 交给 W1。缺字段不填成「故意的空」，由 annotateScore 在依据里写「缺信息」。 */
 export function factsForScore(item, related = []) {
   return {
     labels: Array.isArray(item.labels) ? item.labels : [],
@@ -427,11 +496,34 @@ export function factsForScore(item, related = []) {
     prChangesRequested: item.prChangesRequested === true,
     hasPr: item.hasPr === true || related.length > 0,
     fixRequestedAt: item.fixRequestedAt ?? null,
-    lastEventAt: item.lastEventAt ?? null,
-    situationTier: item.situationTier ?? null,
+    lastEventAt: item.lastEventKnown === false ? null : item.lastEventAt ?? null,
+    situationTier: item.situationKnown === false ? null : item.situationTier ?? null,
     repoClass: item.repoClass ?? null,
+    issueState: item.issueState ?? null,
     lowConfidence: item.lowConfidence === true,
   };
+}
+
+function annotateScore(item, scored) {
+  const notes = [];
+  if (item.situationKnown === false) notes.push('情形档缺信息');
+  if (item.issueStateKnown === false) notes.push('issue 开关缺信息');
+  if (item.lastEventKnown === false) notes.push('最近事件缺信息');
+  if (item.repoUnlisted) notes.push(`仓 ${item.repo} 不在分类表里，按 daily-tool`);
+  if (!notes.length) return scored;
+  const extra = notes.join('；');
+  if (scored?.pinned === true || scored?.rule === 'clear' || scored?.rule === 'pin') {
+    return { ...scored, basis: `${scored.basis}；${extra}` };
+  }
+  if (item.situationKnown === false && scored?.rule === 'fallback') {
+    return {
+      ...scored,
+      priority: 'P2',
+      lowConfidence: true,
+      basis: `${extra}，低置信记 P2`,
+    };
+  }
+  return { ...scored, basis: `${scored.basis}；${extra}` };
 }
 
 function inputState(saved, boardPriority) {
@@ -523,7 +615,7 @@ export async function runPrioSync({
     }
     const related = knownPrs ? prsFor(item, knownPrs) : [];
     const boardPriority = item.priority ?? null;
-    const scored = scorePriority(factsForScore(item, related), now);
+    const scored = annotateScore(item, scorePriority(factsForScore(item, related), now));
     if (!priorityWritable(history, ref, boardPriority) && !sameValue(boardPriority, scored.priority)) {
       remindOnce(dir, reminded, stdout, now, {
         item: ref,
@@ -618,6 +710,15 @@ export async function runPrioSync({
 }
 
 /** 把 since 这个时间点之后的变更改回当时的旧值。默认仍是 dry-run。 */
+function liveValue(items, row) {
+  if (!Array.isArray(items)) return undefined;
+  const item = items.find((entry) => `${entry?.repo}#${entry?.number}` === row.item);
+  if (!item) return undefined;
+  if (row.field === '优先级') return item.priority ?? null;
+  if (row.field === '关联 PR') return item.linkedPr ?? '';
+  return undefined;
+}
+
 export async function restorePrio({
   dir,
   since,
@@ -627,6 +728,7 @@ export async function restorePrio({
   projectNumber,
   write,
   stdout,
+  items,
 } = {}) {
   if (!dir) throw new Error('缺少状态目录');
   const at = Date.parse(since);
@@ -642,10 +744,17 @@ export async function restorePrio({
     if (!prev || Date.parse(row.at) < Date.parse(prev.at)) earliest.set(key, row);
   }
   const planned = [];
+  const skipped = [];
   for (const row of earliest.values()) {
     const history = rows.filter((entry) => entry.item === row.item && entry.field === row.field);
     const latest = history[history.length - 1];
-    const current = latest ? latest.new : row.new;
+    const lastWritten = latest ? latest.new : row.new;
+    const live = liveValue(items, row);
+    const current = Array.isArray(items) ? live : lastWritten;
+    if (Array.isArray(items) && !sameValue(live, lastWritten)) {
+      skipped.push({ item: row.item, field: row.field, current: live, last: lastWritten });
+      continue;
+    }
     const target = row.old == null || row.old === '' ? null : row.old;
     if (sameValue(current, target)) continue;
     planned.push({
@@ -657,6 +766,12 @@ export async function restorePrio({
       new: target,
       basis: RESTORE_BASIS,
     });
+  }
+  for (const skip of skipped) {
+    outWrite(
+      stdout,
+      `${skip.item} ${skip.field} ${RESTORE_SKIP}（当前 ${show(skip.current)}，上次写入 ${show(skip.last)}）\n`,
+    );
   }
   const linkAllowed = macMiniStopped(dir);
   let written = 0;
@@ -711,7 +826,9 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     const token = deps.readToken ? deps.readToken() : readPriorityWriterToken(priorityTokenPath());
     const github = createPriorityGithub({ profile, token, run: deps.run });
     if (!write) write = (action) => github.write(action);
-    if (!args.restore && items == null) items = await loadBoardItems(github, profile);
+    if (items == null) {
+      items = await loadBoardItems(github, profile, readRepoClassTable(path.join(dir, 'repo-class.json')));
+    }
     if (!args.restore && prs == null) {
       prs = await loadPullRequests(github, [...new Set((items || []).map((entry) => entry.repo))]);
     }
@@ -726,6 +843,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       projectNumber: profile.projectNumber,
       write,
       stdout,
+      items: items || [],
     });
   }
   return runPrioSync({

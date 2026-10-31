@@ -85,7 +85,8 @@ test('#157 SC1 dry-run 跑 84 条有输出且 0 次写入', async () => {
   assert.equal(gate.writes.length, 0);
   assert.match(io.text(), /dry-run：84 条，变更 84，写入 0，钉住 0/);
   assert.equal(io.text().split('\n').filter((line) => line.includes('优先级')).length, 84);
-  assert.match(io.text(), new RegExp(`${REPO.replaceAll('/', '\\/')}#1 优先级 （空） → P3`));
+  assert.match(io.text(), new RegExp(`${REPO.replaceAll('/', '\\/')}#1 优先级 （空） → P2`));
+  assert.match(io.text(), /低置信记 P2/);
   assert.equal(fs.existsSync(path.join(dir, 'changes.jsonl')), false);
 });
 
@@ -350,14 +351,19 @@ test('#157 带 prio:pin 的项不写优先级，也不写关联 PR', async () =>
   assert.equal(readState(dir).items[`${REPO}#3`], undefined);
 });
 
-test('#157 Done 或验收通过要连续确认后才清空优先级', async () => {
+test('#157 Done 或验收通过但 issue 开着不清空；关闭后才清空', async () => {
+  const open = {
+    situationTier: 'P1',
+    repoClass: 'mivo',
+    issueState: 'open',
+  };
   const dir = tmpDir();
   seedOwned(dir, 1, 'P1');
-  seedOwned(dir, 2, 'P2');
+  seedOwned(dir, 2, 'P1');
   const gate = recorder();
   const items = [
-    item(1, { priority: 'P1', status: 'Done' }),
-    item(2, { priority: 'P2', status: 'In Progress', acceptance: '通过' }),
+    item(1, { priority: 'P1', status: 'Done', acceptance: '通过', ...open }),
+    item(2, { priority: 'P1', status: 'In Progress', acceptance: '通过', ...open }),
   ];
   const base = {
     dir,
@@ -368,13 +374,23 @@ test('#157 Done 或验收通过要连续确认后才清空优先级', async () =
     write: gate.write,
   };
   await runPrioSync({ ...base, nowMs: T0, apply: true, stdout: capture().stdout });
-  assert.equal(gate.writes.length, 0);
   await runPrioSync({ ...base, nowMs: T0 + DOWNGRADE_MIN_GAP_MS, apply: true, stdout: capture().stdout });
-  assert.equal(gate.writes.length, 2);
+  assert.equal(gate.writes.length, 0, 'issue 还开着，Done 和验收通过都不清空');
+
+  seedOwned(dir, 3, 'P1');
+  const closed = [item(3, { priority: 'P1', status: 'Done', acceptance: '通过', situationTier: 'P1', repoClass: 'mivo', issueState: 'closed' })];
+  await runPrioSync({ ...base, items: closed, nowMs: T0, apply: true, stdout: capture().stdout });
+  assert.equal(gate.writes.length, 0, '清空是降级，第一次只记防抖');
+  await runPrioSync({
+    ...base,
+    items: closed,
+    nowMs: T0 + DOWNGRADE_MIN_GAP_MS,
+    apply: true,
+    stdout: capture().stdout,
+  });
+  assert.equal(gate.writes.length, 1);
+  assert.equal(gate.writes[0].issue, 3);
   assert.equal(gate.writes[0].fields['优先级'], null);
-  assert.equal(gate.writes[1].fields['优先级'], null);
-  assert.equal(gate.writes[0].issue, 1);
-  assert.equal(gate.writes[1].issue, 2);
 });
 
 test('#157 降级先落盘防抖，未满 15 分钟不写；真写之后看板上的新值不再写', async () => {
@@ -394,16 +410,16 @@ test('#157 降级先落盘防抖，未满 15 分钟不写；真写之后看板�
   };
   await runPrioSync({ ...base, nowMs: T0 });
   assert.equal(gate.writes.length, 0);
-  assert.equal(readState(dir).items[`${REPO}#6`].pending, 'P3');
+  assert.equal(readState(dir).items[`${REPO}#6`].pending, 'P2');
   await runPrioSync({ ...base, nowMs: T0 + DOWNGRADE_MIN_GAP_MS - 1 });
   assert.equal(gate.writes.length, 0);
   await runPrioSync({ ...base, nowMs: T0 + DOWNGRADE_MIN_GAP_MS });
   assert.equal(gate.writes.length, 1);
-  assert.deepEqual(gate.writes[0].fields, { 优先级: 'P3' });
+  assert.deepEqual(gate.writes[0].fields, { 优先级: 'P2' });
   await runPrioSync({
     ...base,
     nowMs: T0 + DOWNGRADE_MIN_GAP_MS + 1000,
-    items: [item(6, { priority: 'P3', status: 'Todo' })],
+    items: [item(6, { priority: 'P2', status: 'Todo' })],
   });
   assert.equal(gate.writes.length, 1);
 });
@@ -662,10 +678,11 @@ test('#157 60 天没动静只提醒一次「还要不要」，不写看板、不
   const { STALE_REMIND_MS } = await import('./bin/prio-sync.mjs');
   const dir = tmpDir();
   const gate = recorder();
+  const held = { priority: 'P3', status: 'Todo', situationTier: 'P3', repoClass: 'mivo', issueState: 'open' };
   const items = [
-    item(1, { priority: 'P3', status: 'Todo', lastEventAt: T0 - STALE_REMIND_MS - 1 }),
-    item(2, { priority: 'P3', status: 'Todo', lastEventAt: T0 - STALE_REMIND_MS }),
-    item(3, { priority: 'P3', status: 'Todo' }),
+    item(1, { ...held, lastEventAt: T0 - STALE_REMIND_MS - 1 }),
+    item(2, { ...held, lastEventAt: T0 - STALE_REMIND_MS }),
+    item(3, { ...held }),
   ];
   const first = capture();
   await runPrioSync({
@@ -712,7 +729,7 @@ test('#157 标记缺失时不写关联 PR 且不调用写闸；标记在且非 d
   const blocked = capture();
   await runPrioSync({
     dir,
-    items: [item(5, { priority: 'P3', linkedPr: '' })],
+    items: [item(5, { priority: 'P3', linkedPr: '', situationTier: 'P3', repoClass: 'mivo', issueState: 'open' })],
     prs,
     nowMs: T0,
     apply: true,
@@ -731,7 +748,7 @@ test('#157 标记缺失时不写关联 PR 且不调用写闸；标记在且非 d
   const allowed = capture();
   await runPrioSync({
     dir,
-    items: [item(5, { priority: 'P3', linkedPr: '' })],
+    items: [item(5, { priority: 'P3', linkedPr: '', situationTier: 'P3', repoClass: 'mivo', issueState: 'open' })],
     prs,
     nowMs: T0,
     apply: true,
@@ -751,16 +768,15 @@ test('#157 标记缺失时不写关联 PR 且不调用写闸；标记在且非 d
 test('#157 依据写进变更日志和 dry-run，并优先用打分结果里的 basis', async () => {
   const { basisFor, factsForScore } = await import('./bin/prio-sync.mjs');
   const { RULES } = await import('./bin/prio-score.mjs');
-  const s6 = RULES.find((rule) => rule.id === 'S6');
-  assert.equal(basisFor({ rule: 'S6' }), `${s6.id} ${s6.when}`);
-  assert.equal(basisFor({ rule: 'S6', basis: '低置信，先记 P2' }), '低置信，先记 P2');
+  const fallback = RULES.find((rule) => rule.id === 'fallback');
+  assert.equal(basisFor({ rule: 'fallback' }), `${fallback.id} ${fallback.when}`);
+  assert.equal(basisFor({ rule: 'fallback', basis: '低置信，先记 P2' }), '低置信，先记 P2');
   const facts = factsForScore(item(1, { situationTier: 'P1', repoClass: 'daily', lowConfidence: true, lastEventAt: T0 }), []);
   assert.equal(facts.situationTier, 'P1');
   assert.equal(facts.repoClass, 'daily');
   assert.equal(facts.lowConfidence, true);
   assert.equal(facts.lastEventAt, T0);
 
-  const s1 = RULES.find((rule) => rule.id === 'S1');
   const dry = tmpDir();
   const dryOut = capture();
   await runPrioSync({
@@ -773,7 +789,7 @@ test('#157 依据写进变更日志和 dry-run，并优先用打分结果里的 
     write: recorder().write,
     stdout: dryOut.stdout,
   });
-  assert.match(dryOut.text(), new RegExp(`依据：${s1.id} ${s1.when}`));
+  assert.match(dryOut.text(), /依据：没给情形档，机器信号 S1 升到 P0/);
   const live = tmpDir();
   const gate = recorder();
   await runPrioSync({
@@ -787,8 +803,161 @@ test('#157 依据写进变更日志和 dry-run，并优先用打分结果里的 
     write: gate.write,
     stdout: capture().stdout,
   });
-  assert.equal(readJsonl(live)[0].basis, `${s1.id} ${s1.when}`);
+  assert.equal(readJsonl(live)[0].basis, '没给情形档，机器信号 S1 升到 P0');
   assert.equal(readJsonl(live)[0].field, '优先级');
+});
+
+test('#157 闲置仓情形档 P0 保持 P0', async () => {
+  const dir = tmpDir();
+  const gate = recorder();
+  const io = capture();
+  await runPrioSync({
+    dir,
+    items: [item(1, { situationTier: 'P0', repoClass: 'idle', issueState: 'open' })],
+    prs: [],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: io.stdout,
+  });
+  assert.equal(gate.writes.length, 1);
+  assert.deepEqual(gate.writes[0].fields, { 优先级: 'P0' });
+  assert.match(io.text(), /保持 P0/);
+  assert.match(readJsonl(dir)[0].basis, /idle/);
+});
+
+test('#157 mapItem 填最近事件后，超过 60 天会提醒；缺情形档写明缺信息', async () => {
+  const { mapItem, classifyRepo, readRepoClassTable, STALE_REMIND_MS } = await import('./bin/prio-sync.mjs');
+  const staleAt = new Date(T0 - STALE_REMIND_MS - 1).toISOString();
+  const node = {
+    id: 'PVTI_9',
+    isArchived: false,
+    updatedAt: staleAt,
+    content: {
+      __typename: 'Issue',
+      number: 9,
+      state: 'OPEN',
+      updatedAt: staleAt,
+      repository: { nameWithOwner: REPO },
+      labels: { nodes: [] },
+    },
+    fieldValues: {
+      nodes: [
+        { name: 'P3', field: { name: '优先级' } },
+        { name: 'P3', field: { name: '情形档' } },
+        { name: 'Todo', field: { name: 'Status' } },
+      ],
+    },
+  };
+  const table = { mivo: [REPO], idle: [], 'daily-tool': [] };
+  const mapped = mapItem(node, table);
+  assert.equal(mapped.issueState, 'open');
+  assert.equal(mapped.situationTier, 'P3');
+  assert.equal(mapped.repoClass, 'mivo');
+  assert.equal(mapped.repoUnlisted, false);
+  assert.equal(mapped.lastEventAt, Date.parse(staleAt));
+
+  const dir = tmpDir();
+  const gate = recorder();
+  const io = capture();
+  await runPrioSync({
+    dir,
+    items: [mapped],
+    prs: [],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: io.stdout,
+  });
+  assert.match(io.text(), new RegExp(`${REPO.replaceAll('/', '\\/')}#9 还要不要`));
+  assert.equal(gate.writes.length, 0);
+
+  const bare = mapItem({
+    id: 'PVTI_10',
+    isArchived: false,
+    content: {
+      __typename: 'Issue',
+      number: 10,
+      state: 'OPEN',
+      updatedAt: new Date(T0).toISOString(),
+      repository: { nameWithOwner: 'example-owner/unlisted' },
+      labels: { nodes: [] },
+    },
+    fieldValues: { nodes: [{ name: 'Todo', field: { name: 'Status' } }] },
+  });
+  assert.equal(bare.situationKnown, false);
+  assert.equal(bare.repoClass, 'daily-tool');
+  assert.equal(bare.repoUnlisted, true);
+  const missing = capture();
+  await runPrioSync({
+    dir: tmpDir(),
+    items: [bare],
+    prs: [],
+    nowMs: T0,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: recorder().write,
+    stdout: missing.stdout,
+  });
+  assert.match(missing.text(), /情形档缺信息/);
+  assert.match(missing.text(), /低置信记 P2/);
+  assert.match(missing.text(), /不在分类表里/);
+
+  const file = path.join(tmpDir(), 'repo-class.json');
+  fs.writeFileSync(file, JSON.stringify({ idle: [REPO] }));
+  const loaded = readRepoClassTable(file);
+  assert.equal(classifyRepo(REPO, loaded).repoClass, 'idle');
+  assert.equal(classifyRepo('example-owner/other', loaded).unlisted, true);
+});
+
+test('#157 restore 当前值不是上次写入时跳过，不改手动值', async () => {
+  const dir = tmpDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'changes.jsonl'), `${JSON.stringify({
+    at: new Date(T0).toISOString(),
+    item: `${REPO}#4`,
+    repo: REPO,
+    issue: 4,
+    field: '优先级',
+    old: null,
+    new: 'P0',
+    basis: 'seed',
+  })}\n`);
+  const gate = recorder();
+  const skipped = capture();
+  await restorePrio({
+    dir,
+    since: new Date(T0).toISOString(),
+    nowMs: T0 + 1000,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: skipped.stdout,
+    items: [item(4, { priority: 'P2' })],
+  });
+  assert.equal(gate.writes.length, 0);
+  assert.match(skipped.text(), /跳过：当前值不是上次写入的值/);
+  assert.match(skipped.text(), /当前 P2/);
+
+  const kept = capture();
+  await restorePrio({
+    dir,
+    since: new Date(T0).toISOString(),
+    nowMs: T0 + 2000,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: kept.stdout,
+    items: [item(4, { priority: 'P0' })],
+  });
+  assert.equal(gate.writes.length, 1);
+  assert.deepEqual(gate.writes[0].fields, { 优先级: null });
 });
 
 test('#157 看板条目和 PR 映射：归档和非 issue 跳过，查询是只读', async () => {
@@ -857,16 +1026,15 @@ test('#157 看板条目和 PR 映射：归档和非 issue 跳过，查询是只�
     },
   };
   const items = await loadBoardItems(github, { ownerLogin: OWNER, projectNumber: PROJECT });
-  assert.deepEqual(items, [{
-    id: 'PVTI_1',
-    repo: REPO,
-    number: 12,
-    labels: ['blocker'],
-    priority: 'P2',
-    linkedPr: '#1(open)',
-    status: 'In Progress',
-    acceptance: '验收中',
-  }]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].priority, 'P2');
+  assert.equal(items[0].status, 'In Progress');
+  assert.equal(items[0].acceptance, '验收中');
+  assert.equal(items[0].situationKnown, false);
+  assert.equal(items[0].issueState, null);
+  assert.equal(items[0].lastEventKnown, false);
+  assert.equal(items[0].repoClass, 'daily-tool');
+  assert.equal(items[0].repoUnlisted, true);
   const prs = await loadPullRequests(github, [REPO]);
   assert.deepEqual(prs, [{
     repo: REPO,
