@@ -468,6 +468,73 @@ test('#157 SC2 写闸白名单只有「优先级」「关联 PR」，写其它�
   assert.equal(mutations.some((entry) => entry.variables?.fieldId === 'F_KIND'), false);
 });
 
+test('#157 关联 PR 只接受文本，数字和日期拒绝；优先级没有对应选项也拒绝', async () => {
+  const profile = loadHome();
+  const writes = [];
+  const run = createFakeRun({
+    onGraphql: (payload) => {
+      const query = String(payload.query);
+      if (query.includes('mutation')) {
+        writes.push(query);
+        return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM1' } } };
+      }
+      const asked = payload.variables?.text !== undefined ? 'TEXT' : null;
+      return boardLookup([
+        PRIO_FIELD,
+        { id: 'F_NUM', name: '关联 PR', dataType: 'NUMBER' },
+        { id: 'F_DATE', name: '关联 PR', dataType: 'DATE' },
+      ].filter((field) => asked !== 'split'));
+    },
+  });
+  const github = createGithub({ profile, run });
+  const base = {
+    type: 'project.field.set',
+    repo: REPO,
+    issue: 1,
+    ownerLogin: 'ExampleUser',
+    projectNumber: 7,
+  };
+  await assert.rejects(
+    () => github.write({ ...base, dedupeKey: 'link-number', fields: { '关联 PR': '#1(open)' } }),
+    /「关联 PR」字段必须是文本/,
+  );
+  const dateRun = createFakeRun({
+    onGraphql: (payload) => {
+      if (String(payload.query).includes('mutation')) {
+        writes.push(payload.query);
+        return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM1' } } };
+      }
+      return boardLookup([{ id: 'F_DATE', name: '关联 PR', dataType: 'DATE' }]);
+    },
+  });
+  await assert.rejects(
+    () => createGithub({ profile, run: dateRun }).write({
+      ...base,
+      dedupeKey: 'link-date',
+      fields: { '关联 PR': '#2(merged)' },
+    }),
+    /「关联 PR」字段必须是文本/,
+  );
+  const missing = createFakeRun({
+    onGraphql: (payload) => {
+      if (String(payload.query).includes('mutation')) {
+        writes.push(payload.query);
+        return { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM1' } } };
+      }
+      return boardLookup([PRIO_FIELD]);
+    },
+  });
+  await assert.rejects(
+    () => createGithub({ profile, run: missing }).write({
+      ...base,
+      dedupeKey: 'prio-missing',
+      fields: { 优先级: 'P9' },
+    }),
+    /优先级字段没有选项「P9」/,
+  );
+  assert.equal(writes.length, 0, '类型不对或选项不存在时不能发写入');
+});
+
 test('默认执行器按 UTF-8 流式解码：大输出里跨块的多字节字符不变乱码（#43 正文版本每拍误判「变了」）', async () => {
   // 20 万个「。」（每个 3 字节，约 600 KiB）必然跨过管道块边界；逐块 `+=` 会在边界处拼出 U+FFFD。
   const script = "process.stdout.write('。'.repeat(200000))";

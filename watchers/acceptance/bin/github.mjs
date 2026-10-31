@@ -691,8 +691,8 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     if (Object.hasOwn(fields, '关联 PR')) {
       const field = fieldByName.get('关联 PR');
       if (!field?.id) throw new Error('看板没有「关联 PR」字段');
-      if (field.dataType === 'SINGLE_SELECT') {
-        throw new Error('「关联 PR」字段必须是文本，不能是单选');
+      if (field.dataType !== 'TEXT') {
+        throw new Error('「关联 PR」字段必须是文本');
       }
       const value = fields['关联 PR'];
       if (value == null || value === '') {
