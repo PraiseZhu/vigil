@@ -275,7 +275,7 @@ function parseJson(stdout, label) {
   }
 }
 
-export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
+export function createGithub({ profile, run, fetchImpl, sleep, now, ownerToken } = {}) {
   if (!profile) throw new Error('createGithub 需要 profile');
   const runCmd = run || defaultRun;
   const fetchFn = fetchImpl || globalThis.fetch;
@@ -286,6 +286,8 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
   let appTokenCache;
 
   function getOwnerToken() {
+    // 调用方已经从令牌文件读出内容时，只放在内存里，不再读一遍文件。
+    if (typeof ownerToken === 'string' && ownerToken) return ownerToken;
     if (!ownerTokenCache) ownerTokenCache = readGithubToken(profile);
     return ownerTokenCache;
   }
@@ -353,13 +355,51 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
     return parsed.data ?? parsed;
   }
 
+  async function graphqlFetch(token, query, variables) {
+    // 优先级写令牌只放在请求头里，不放进进程环境变量。失败信息先抹掉令牌再抛。
+    let res;
+    try {
+      res = await fetchFn('https://api.github.com/graphql', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query, variables }),
+      });
+    } catch {
+      throw new Error('GraphQL 请求失败');
+    }
+    const raw = typeof res?.text === 'function' ? await res.text() : '';
+    if (res && res.ok === false) {
+      throw new Error(redact(raw, [token]) || `GraphQL HTTP ${res.status}`);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error('GraphQL 返回的不是 JSON');
+    }
+    if (parsed.errors?.length) {
+      throw new Error(redact(parsed.errors.map((err) => err.message).join('; '), [token]));
+    }
+    return parsed.data ?? parsed;
+  }
+
+  function usesPriorityToken() {
+    return typeof ownerToken === 'string' && ownerToken.length > 0;
+  }
+
   /**
    * 用账号令牌的只读查询（doctor 查看板 viewerCanUpdate 用：App 令牌看不到个人账号下的看板，
    * 写看板走的又是账号令牌）。只收 query，mutation 一律拒绝。
+   * 优先级写令牌走请求头，不进环境变量。
    */
   async function ownerGraphql(query, variables) {
     if (/^\s*mutation\b/.test(String(query || ''))) throw new Error('ownerGraphql 只做只读查询');
     if (!isReadOnlyGraphql(query)) return graphqlWrite(query, variables);
+    if (usesPriorityToken()) return graphqlFetch(ownerToken, query, variables);
     const token = getOwnerToken();
     const result = await runRead(['api', 'graphql', '--input', '-'], {
       env: ghEnv(token),
@@ -388,6 +428,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now } = {}) {
 
   async function graphqlWrite(query, variables) {
     const token = getOwnerToken();
+    if (usesPriorityToken()) return graphqlFetch(token, query, variables);
     const result = await runCmd('gh', ['api', 'graphql', '--input', '-'], {
       env: ghEnv(token),
       input: JSON.stringify({ query, variables }),
