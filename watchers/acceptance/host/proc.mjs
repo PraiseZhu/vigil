@@ -6,14 +6,30 @@ import { spawn } from 'node:child_process';
 /**
  * 跑一条命令，等它结束：{code, stdout, stderr}。
  * timeoutMs 到了先 SIGTERM，2 秒后还在就 SIGKILL。
+ * killGroup（T23，只给读 GitHub 的调用用）：子进程起在自己的新进程组里，超时对整组发信号——
+ * 只杀直接子进程时，它起的 gh 会被收养成孤儿、挂着半死的连接继续活着（2026-10-30 实测）。
+ * 默认 false：写闸、bwrap、git 等其余调用点的行为不变。
  */
-export function run(cmd, args, { env, input, raw = false, cwd, timeoutMs } = {}) {
+export function run(cmd, args, { env, input, raw = false, cwd, timeoutMs, killGroup = false } = {}) {
   return new Promise((resolve, reject) => {
+    const group = Boolean(killGroup) && typeof timeoutMs === 'number' && timeoutMs > 0;
     const child = spawn(cmd, Array.isArray(args) ? args : [], {
       env,
       cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: group,
     });
+    const kill = (signal) => {
+      if (group && child.pid) {
+        try {
+          process.kill(-child.pid, signal);
+          return;
+        } catch {
+          // 组已经没了，退回只杀直接子进程。
+        }
+      }
+      child.kill(signal);
+    };
     // raw：stdout 按字节原样收（cat-file --batch 要按字节数切），不按 UTF-8 拼成字符串。
     const outChunks = [];
     let stderr = '';
@@ -26,8 +42,8 @@ export function run(cmd, args, { env, input, raw = false, cwd, timeoutMs } = {})
     if (typeof timeoutMs === 'number' && timeoutMs > 0) {
       timer = setTimeout(() => {
         killed = true;
-        child.kill('SIGTERM');
-        setTimeout(() => child.kill('SIGKILL'), 2000).unref?.();
+        kill('SIGTERM');
+        setTimeout(() => kill('SIGKILL'), 2000).unref?.();
       }, timeoutMs);
       timer.unref?.();
     }
