@@ -86,6 +86,24 @@ export function priorityTokenPath(homeDir = os.homedir()) {
   return path.join(homeDir, 'acceptance', 'secrets', 'gh-priority-writer-token');
 }
 
+/** 状态目录。不传 home 时用当前用户主目录，不写死主机名。 */
+export function defaultStateDir(homeDir = os.homedir()) {
+  return path.join(homeDir, 'acceptance', 'tools', '.prio');
+}
+
+/** disabled、变更、提醒、延迟、停写标记都在这个目录里。latency.jsonl 只占位，这里不写。 */
+export function stateFiles(dir = defaultStateDir()) {
+  return {
+    dir,
+    disabled: path.join(dir, 'disabled'),
+    changes: path.join(dir, 'changes.jsonl'),
+    reminded: path.join(dir, 'reminded.jsonl'),
+    latency: path.join(dir, 'latency.jsonl'),
+    marker: path.join(dir, 'mac-mini-stopped'),
+    debounce: path.join(dir, 'debounce.json'),
+  };
+}
+
 /** 只读这个文件。错误信息只说原因，不带文件内容。 */
 export function readPriorityWriterToken(file) {
   checkSecretFile(file, 'gh-priority-writer-token');
@@ -117,7 +135,7 @@ export function createPriorityGithub({ profile, token, run, fetchImpl }) {
 }
 
 export function parsePrioArgs(argv) {
-  const out = { write: false, restore: null, dir: null };
+  const out = { write: false, restore: null, stateDir: null };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--write') {
@@ -132,10 +150,10 @@ export function parsePrioArgs(argv) {
       i += 1;
       continue;
     }
-    if (arg === '--dir') {
+    if (arg === '--state-dir') {
       const value = argv[i + 1];
-      if (typeof value !== 'string' || !value || value.startsWith('--')) throw new Error('缺少 --dir 的路径');
-      out.dir = value;
+      if (typeof value !== 'string' || !value || value.startsWith('--')) throw new Error('缺少 --state-dir 的路径');
+      out.stateDir = value;
       i += 1;
       continue;
     }
@@ -164,15 +182,15 @@ function refOf(item) {
 }
 
 function changesFile(dir) {
-  return path.join(dir, 'changes.jsonl');
+  return stateFiles(dir).changes;
 }
 
 function stateFile(dir) {
-  return path.join(dir, 'debounce.json');
+  return stateFiles(dir).debounce;
 }
 
 function disabledFile(dir) {
-  return path.join(dir, 'disabled');
+  return stateFiles(dir).disabled;
 }
 
 function loadDebounce(dir) {
@@ -222,12 +240,12 @@ function readChanges(dir) {
 }
 
 function remindedFile(dir) {
-  return path.join(dir, 'reminded.jsonl');
+  return stateFiles(dir).reminded;
 }
 
 function macMiniStopped(dir) {
   // 只由人在确认 Mac mini 停写之后创建。这里只看它在不在，不创建。
-  return fs.existsSync(path.join(dir, 'mac-mini-stopped'));
+  return fs.existsSync(stateFiles(dir).marker);
 }
 
 /** 打分结果若自带 basis（W1 修订）就用它，否则用规则编号和规则说明。 */
@@ -681,7 +699,7 @@ export async function restorePrio({
 
 export async function main(argv = process.argv.slice(2), deps = {}) {
   const args = parsePrioArgs(argv);
-  const dir = args.dir || deps.dir || '.prio';
+  const dir = args.stateDir || deps.dir || defaultStateDir();
   const stdout = deps.stdout || process.stdout;
   const nowMs = deps.now ? deps.now() : Date.now();
   const profile = deps.loadProfile ? deps.loadProfile() : loadAcceptanceProfile();

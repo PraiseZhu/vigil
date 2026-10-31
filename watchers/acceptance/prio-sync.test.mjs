@@ -512,6 +512,39 @@ test('#157 每小时已经变更 4 次时再升级只冻结、不写', async () 
   assert.equal(readJsonl(dir).some((row) => row.new === 'P0'), false);
 });
 
+test('#157 状态目录默认是 HOME/acceptance/tools/.prio，--state-dir 才能改', async () => {
+  const { defaultStateDir, stateFiles } = await import('./bin/prio-sync.mjs');
+  const home = path.join(tmpDir(), 'home');
+  const expected = path.join(home, 'acceptance', 'tools', '.prio');
+  assert.equal(defaultStateDir(home), expected);
+  assert.equal(fs.existsSync(expected), false, '算默认路径时不能把目录建出来');
+  const files = stateFiles(expected);
+  assert.equal(files.disabled, path.join(expected, 'disabled'));
+  assert.equal(files.changes, path.join(expected, 'changes.jsonl'));
+  assert.equal(files.reminded, path.join(expected, 'reminded.jsonl'));
+  assert.equal(files.latency, path.join(expected, 'latency.jsonl'));
+  assert.equal(files.marker, path.join(expected, 'mac-mini-stopped'));
+  const source = fs.readFileSync(fileURLToPath(new URL('./bin/prio-sync.mjs', import.meta.url)), 'utf8');
+  assert.equal(source.includes('/home/box'), false);
+  assert.equal(parsePrioArgs(['--state-dir', expected]).stateDir, expected);
+  assert.throws(() => parsePrioArgs(['--state-dir']), /--state-dir/);
+
+  const custom = path.join(tmpDir(), 'custom-prio');
+  const gate = recorder();
+  await main(['--state-dir', custom], {
+    now: () => T0,
+    stdout: capture().stdout,
+    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    loadItems: async () => [item(1, { labels: ['blocker'] })],
+    loadPrs: async () => [],
+    write: gate.write,
+    readToken: () => 'unused-token',
+  });
+  assert.equal(gate.writes.length, 0);
+  assert.equal(fs.existsSync(path.join(custom, 'debounce.json')), true);
+  assert.equal(fs.existsSync(expected), false);
+});
+
 test('#157 命令默认 dry-run，注入看板时不读令牌', async () => {
   assert.equal(parsePrioArgs([]).write, false);
   assert.equal(parsePrioArgs(['--write']).write, true);
