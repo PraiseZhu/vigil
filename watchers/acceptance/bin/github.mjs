@@ -72,14 +72,39 @@ export class WriteFailedError extends Error {
   }
 }
 
-export function defaultRun(cmd, args, { env, input, timeoutMs } = {}) {
+export function defaultRun(cmd, args, { env, input, timeoutMs, killGroup = false } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
-    // 超时就杀掉（取镜像这种可能卡很久的命令才传 timeoutMs）。
-    const timer = Number(timeoutMs) > 0 ? setTimeout(() => child.kill('SIGKILL'), Number(timeoutMs)) : null;
-    child.on('close', () => timer && clearTimeout(timer));
+    const group = Boolean(killGroup) && Number(timeoutMs) > 0;
+    const child = spawn(cmd, args, { env, stdio: ['pipe', 'pipe', 'pipe'], detached: group });
+    const kill = (signal) => {
+      if (group && child.pid) {
+        try {
+          process.kill(-child.pid, signal);
+          return;
+        } catch {
+          // 组已经没了，退回只杀直接子进程。
+        }
+      }
+      child.kill(signal);
+    };
     let stdout = '';
     let stderr = '';
+    let timer = null;
+    let killed = false;
+    const stop = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+    };
+    // 超时就杀掉（取镜像、取 App 令牌这种可能卡很久的命令才传 timeoutMs）。
+    // killGroup：子进程起在自己的新进程组里，超时对整组发信号，避免孙进程拿着 stdout/stderr 把 close 拖住。
+    if (Number(timeoutMs) > 0) {
+      timer = setTimeout(() => {
+        killed = true;
+        kill('SIGTERM');
+        setTimeout(() => kill('SIGKILL'), 2000).unref?.();
+      }, Number(timeoutMs));
+      timer.unref?.();
+    }
     // 按 UTF-8 流式解码：输出大于一个管道块（约 64 KiB）时，多字节字符可能被切在两块之间，
     // 逐块 `+=` 会把它拼成乱码（比如正文里的「。」变成两个 U+FFFD），正文版本随之变掉，
     // 已验过的总 issue 每拍都被误判「正文变了」。setEncoding 交给 StringDecoder 跨块拼好。
@@ -91,9 +116,17 @@ export function defaultRun(cmd, args, { env, input, timeoutMs } = {}) {
     child.stderr.on('data', (chunk) => {
       stderr += chunk;
     });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      resolve({ code: code ?? 1, stdout, stderr });
+    child.on('error', (error) => {
+      stop();
+      if (killed) {
+        resolve({ code: 124, stdout, stderr: `${stderr}${error.message}` });
+        return;
+      }
+      reject(error);
+    });
+    child.on('close', (code, signal) => {
+      stop();
+      resolve({ code: code ?? (signal || killed ? 124 : 1), stdout, stderr, signal: signal || undefined });
     });
     if (input != null) child.stdin.write(input);
     child.stdin.end();
