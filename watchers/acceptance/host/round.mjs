@@ -486,11 +486,12 @@ export async function runHostRound({
   // 1. 内存门：放在认领之前，不够就什么都不写。
   const available = readMemAvailable(meminfoPath);
   if (available == null) {
-    log('内存门：读不到 MemAvailable，按不够处理');
+    log(`${new Date(now()).toISOString()} mem-gate-defer availKiB=unknown 内存门：读不到 MemAvailable，按不够处理`);
     return 3;
   }
   if (available < MEMORY_GATE_BYTES) {
-    log(`内存门：MemAvailable ${available} 字节 < ${MEMORY_GATE_BYTES}，这一拍不认领`);
+    // #147：带 UTC 时间和固定标记，统计近 24 小时推迟次数用 grep mem-gate-defer。
+    log(`${new Date(now()).toISOString()} mem-gate-defer availKiB=${Math.floor(available / 1024)} 内存门：MemAvailable ${available} 字节 < ${MEMORY_GATE_BYTES}，这一拍不认领`);
     return 3;
   }
 
