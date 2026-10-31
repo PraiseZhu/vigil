@@ -1127,6 +1127,7 @@ function openPr(number, issueNumber) {
     repo: REPO,
     number,
     title: `fix #${issueNumber}`,
+    body: `Closes #${issueNumber}\n`,
     state: 'open',
     ci: 'pass',
     headRefName: 'fix',
