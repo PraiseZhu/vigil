@@ -1224,3 +1224,71 @@ test('#179 SC3 空值或上次由 prio-sync 写入才更新；算出为空则保
   assert.match(kept.text(), /变更 0，写入 0/);
   assert.equal(readJsonl(dir).filter((row) => row.item === `${REPO}#23` && row.field === '关联 PR').length, 1);
 });
+
+test('#179 上次写入 A、看板被改成 B、算出 C 时不改，只提醒', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  seedLink(dir, 31, '#1(open)');
+  const gate = recorder();
+  const io = capture();
+  await runPrioSync({
+    dir,
+    items: [stableItem(31, { linkedPr: '#2(merged)' })],
+    prs: [openPr(9, 31)],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: io.stdout,
+  });
+  assert.equal(gate.writes.length, 0);
+  assert.doesNotMatch(io.text(), /关联 PR .+→/);
+  assert.match(io.text(), new RegExp(`${REPO.replaceAll('/', '\\/')}#31 关联 PR 手动值与规则不一致，提醒一次`));
+  const reminded = fs.readFileSync(path.join(dir, 'reminded.jsonl'), 'utf8').split('\n').filter(Boolean);
+  assert.equal(reminded.length, 1);
+  assert.equal(JSON.parse(reminded[0]).target, '#9(open,CI✓)');
+  const logged = readJsonl(dir).filter((row) => row.field === '关联 PR');
+  assert.equal(logged.length, 1);
+  assert.equal(logged[0].new, '#1(open)');
+});
+
+test('#179 多条关联 PR 记录只看最后一条，中间一条等于当前值也不可写', async () => {
+  const dir = tmpDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const rows = [
+    { at: new Date(T0 - 3 * DAY_MS).toISOString(), value: '#1(open)' },
+    { at: new Date(T0 - 2 * DAY_MS).toISOString(), value: '#4(merged)' },
+    { at: new Date(T0 - DAY_MS).toISOString(), value: '#8(open)' },
+  ];
+  for (const row of rows) {
+    fs.appendFileSync(path.join(dir, 'changes.jsonl'), `${JSON.stringify({
+      at: row.at,
+      item: `${REPO}#32`,
+      repo: REPO,
+      issue: 32,
+      field: '关联 PR',
+      old: '',
+      new: row.value,
+      basis: 'link 关联 PR 文本与看板不一致',
+    })}\n`);
+  }
+  const gate = recorder();
+  const io = capture();
+  await runPrioSync({
+    dir,
+    items: [stableItem(32, { linkedPr: '#4(merged)' })],
+    prs: [openPr(9, 32)],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: io.stdout,
+  });
+  assert.equal(gate.writes.length, 0);
+  assert.doesNotMatch(io.text(), /关联 PR .+→/);
+  assert.match(io.text(), new RegExp(`${REPO.replaceAll('/', '\\/')}#32 关联 PR 手动值与规则不一致，提醒一次`));
+  assert.equal(readJsonl(dir).filter((row) => row.field === '关联 PR').length, 3);
+});
