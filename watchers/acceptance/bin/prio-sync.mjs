@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // 看板优先级写回（#157，规则以 #62 为准）。默认 dry-run：只打印将要改的字段，不调用写闸。
 // 真写要显式 --write。目录里有 disabled 文件时，哪种模式都不写。
-// 「优先级」只在当前值为空，或 changes.jsonl 里该字段最后一条新值等于看板当前值时才写；否则提醒一次。
-// 「关联 PR」也由这里写，但真写前必须已有 mac-mini-stopped（人确认 Mac mini 停写后自建，本文件不创建）。
+// 「优先级」和「关联 PR」只在当前值为空，或 changes.jsonl 里该字段最后一条新值等于看板当前值时才写；否则提醒一次。
+// 算不出关联（空串）时，不清空看板上已有的「关联 PR」。
+// 「关联 PR」真写前必须已有 mac-mini-stopped（人确认 Mac mini 停写后自建，本文件不创建）。
 // 依据只写进 changes.jsonl，不新增看板字段。60 天没动静只提醒「还要不要」，不关 issue。
 // 令牌只从 ~/acceptance/secrets/gh-priority-writer-token 读，不读环境变量，不写进日志和错误信息。
 import fs from 'node:fs';
@@ -285,7 +286,7 @@ function remindOnce(dir, keys, stdout, now, row) {
   fs.mkdirSync(dir, { recursive: true });
   fs.appendFileSync(remindedFile(dir), `${JSON.stringify({ at: new Date(now).toISOString(), ...row })}\n`);
   if (row.kind === 'stale') outWrite(stdout, `${row.item} ${row.text}\n`);
-  else outWrite(stdout, `${row.item} 优先级 ${row.text}\n`);
+  else outWrite(stdout, `${row.item} ${row.field || '优先级'} ${row.text}\n`);
 }
 
 function lastPriorityWrite(rows, itemRef) {
@@ -654,14 +655,28 @@ export async function runPrioSync({
     if (knownPrs) {
       const next = linkedPrField({ issues: [{ repo: item.repo, number: item.number }], prs: knownPrs })[ref] ?? '';
       const current = item.linkedPr ?? '';
-      if (!sameValue(current, next)) {
+      let lastLink = null;
+      for (const row of history) {
+        if (row?.item === ref && row?.field === '关联 PR') lastLink = row;
+      }
+      // 与 priorityWritable 同一条：空值，或上次写入的新值就是看板当前值，才允许改。
+      const linkWritable = current === '' || (Boolean(lastLink) && sameValue(lastLink.new, current));
+      if (!linkWritable && !sameValue(current, next)) {
+        remindOnce(dir, reminded, stdout, now, {
+          item: ref,
+          kind: 'manual',
+          field: '关联 PR',
+          target: next,
+          text: '手动值与规则不一致，提醒一次',
+        });
+      } else if (!sameValue(current, next) && next !== '') {
         changes.push({
           item: ref,
           repo: item.repo,
           issue: item.number,
           field: '关联 PR',
           old: current,
-          new: next === '' ? null : next,
+          new: next,
           basis: LINK_BASIS,
         });
       }
