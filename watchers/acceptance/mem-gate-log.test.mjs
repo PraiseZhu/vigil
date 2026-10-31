@@ -38,12 +38,12 @@ test('#147 SC1 内存不够：一行以 ISO 时间开头、带 mem-gate-defer av
   assert.equal(r.code, 3);
   assert.deepEqual(r.calls, []);
   assert.equal(r.lines.length, 1);
-  assert.match(r.lines[0], /^2026-10-31T20:00:00\.000Z mem-gate-defer availKiB=1024 内存门：MemAvailable 1048576 字节 < 3221225472，这一拍不认领$/);
+  assert.match(r.lines[0], /^2026-10-31T20:00:00\.000Z mem-gate-defer issue=PraiseZhu\/vigil#1 availKiB=1024 thresholdMiB=3072 内存门：MemAvailable 1048576 字节 < 3221225472，这一拍不认领$/);
 });
 
 test('#147 SC2 读不到 MemAvailable：同样一行，availKiB=unknown', async () => {
   const r = await gate(path.join(tmp(), 'missing'));
   assert.equal(r.code, 3);
   assert.equal(r.lines.length, 1);
-  assert.match(r.lines[0], /^2026-10-31T20:00:00\.000Z mem-gate-defer availKiB=unknown 内存门：读不到 MemAvailable，按不够处理$/);
+  assert.match(r.lines[0], /^2026-10-31T20:00:00\.000Z mem-gate-defer issue=PraiseZhu\/vigil#1 availKiB=unknown thresholdMiB=3072 内存门：读不到 MemAvailable，按不够处理$/);
 });
