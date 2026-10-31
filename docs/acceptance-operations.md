@@ -17,7 +17,7 @@
 |---|---|---|
 | 常驻调度 | `watchers/acceptance/host/loop` | 单实例（flock），**每分钟**跑一拍 `host/tick.mjs`，顺序照 `docs/acceptance-scheduler.md` |
 | 每小时巡检 | `watchers/acceptance/host/ensure.sh` | 给每小时一次的 routine 调用：心跳不超过 180 秒就不做事；心跳过期但原循环进程还在、单实例锁还占着，只记一条「心跳延迟」（`heartbeat-delayed`，进摘要），不补起；其中墙钟跳了很久、按机器实际运行时间心跳还在 180 秒内的，记 `host-frozen`（整机冻结），也不补起；其余情况把 `loop` 拉起来并写一条提醒（`stop.sh` 主动停过的记成部署重启 `loop-deploy-restarted`，进摘要；整机冻结后原循环已经不在的记 `heartbeat-stale-after-freeze`） |
-| 资源门 | `host/round.mjs` | 认领**之前**过内存门（MemAvailable ≥ 3 GiB）和测试锁（mivo 同时只跑一轮；`host.json` 的 `serialRepos` 名单里的仓同样各自同时只跑一轮）；最多 2 轮同时跑 |
+| 资源门 | `host/round.mjs` | 认领**之前**过内存门（MemAvailable ≥ 3 GiB），不够时在 `state/host/rounds.log` 留一行 `<UTC 时间> mem-gate-defer availKiB=<KiB 或 unknown> 内存门：…，这一拍不认领`（统计用 `grep mem-gate-defer`，按行首时间筛近 24 小时；#147 之前的老行没有时间，不回填）和测试锁（mivo 同时只跑一轮；`host.json` 的 `serialRepos` 名单里的仓同样各自同时只跑一轮）；最多 2 轮同时跑 |
 | 写闸 | `host/write-gate.mjs` | 所有写动作在沙箱外再查一遍，以它为准（见第 3 节） |
 | 模型 | `host/round.mjs` + `<home>/config/host.json` | pi 用 **DeepSeek V4.1 Flash**，推理 **max**；有争议条目的裁决运行（`host/adjudicate.mjs`）用 `anthropic/claude-opus-5-5`，推理 **medium**（`adjudicateCommand`） |
 | 卡住 | `host/tick.mjs`、`host/round.mjs` | 按**宿主观察到的活动**判卡住（见第 4 节「轮次生命周期」）；卡住时**先结束进程，再 `round.mjs abort`** |
