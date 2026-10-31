@@ -20,11 +20,21 @@ import { POLL_BEAT_MS, startTickBeat } from './poll-beat.mjs';
 import { isReadOnlyGraphql } from '../bin/github.mjs';
 
 /**
- * 这一拍里读 GitHub 的超时（T20）：120 秒，和拉取（poll）的超时同一口径。正常一次 GraphQL 读几秒内就回来，
- * 120 秒足够慢网络；又小于心跳上限 180 秒，掐掉后体检不会报红。超时退出码 124、没有「瞬时故障」字样，
- * 所以 github.mjs 的读重试（只认 502/503/504、连接重置等）不会再叠一次，单次读最多约 122 秒。
+ * 这一拍里单次读 GitHub 的超时（T20 定 120 秒，T23 降到 45 秒）。正常一次读不到 1 秒；挂住的读是平台快照恢复后
+ * 连接半死（对端不回也不断），等多久都不会回来，所以早掐、用新进程重试一次更划算。
+ * 总耗时上限：(45 + 5 兜底) × 2 次 = 100 秒 < 体检 180 秒。超时退出码 124、没有「瞬时故障」字样，
+ * github.mjs 自己的读重试（只认 502/503/504、连接重置等）不会再叠一层。
  */
-export const TICK_READ_TIMEOUT_MS = 120000;
+export const TICK_READ_TIMEOUT_MS = 45000;
+
+/**
+ * 拉取（poll.mjs 整盘点）的单次超时（T23）：60 秒。实测正常一次约 7 秒（2026-10-31 连跑 3 次共 21 秒），
+ * 60 秒约 8 倍余量；挂住时整组杀掉（poll 的 node 和它起的 gh 一起）、重试一次。
+ * 总耗时上限：(60 + 2 SIGKILL 宽限) × 2 次 = 124 秒 < 体检 180 秒。
+ */
+export const POLL_TIMEOUT_MS = 60000;
+
+const RETRIED = '（已重试一次）';
 
 /** gh 这条命令是不是只读：只读 GraphQL 查询，或 gh api 不带 -X / -X GET。拿不准一律当写，不加超时。 */
 function isGhRead(cmd, args, opts) {
@@ -42,13 +52,14 @@ function isGhRead(cmd, args, opts) {
 }
 
 /**
- * 给传进 createGithub 的 run 包一层（T20）：只给读加超时，写（含经写闸的）原样放过、不加超时、不重试。
- * 除了把 timeoutMs 交给 run（proc.run 到点 SIGTERM、2 秒后 SIGKILL），再兜一层计时：run 自己不认超时时也按读失败
- * （退出码 124）收尾，不让这一拍挂住。onRead 在每次读开始时调用（用来刷新心跳阶段）。
+ * 给传进 createGithub 的 run 包一层（T20 / T23）：只给读加超时，写（含经写闸的）原样放过、不加超时、不重试。
+ * 读超时（退出码 124）时：proc.run 已对整个进程组 SIGTERM、2 秒后 SIGKILL（killGroup，不留 gh 孤儿），
+ * 再用新进程（新连接）重试一次；重试也超时才按读失败收尾，文字注明已重试一次。读是幂等的，重试不会多写任何东西。
+ * 再兜一层计时：run 自己不认超时时也按 124 收尾。onRead 在每次读（含重试）开始时调用（刷新心跳阶段）。
  */
 export function withReadTimeout(run, timeoutMs = TICK_READ_TIMEOUT_MS, { onRead } = {}) {
-  return async (cmd, args, opts = {}) => {
-    if (!isGhRead(cmd, args, opts) || Number(opts?.timeoutMs) > 0) return run(cmd, args, opts);
+  const message = () => `读 GitHub 超过 ${Math.round(timeoutMs / 1000)} 秒没返回，已掐掉（exit 124）`;
+  const once = async (cmd, args, opts) => {
     try {
       onRead?.();
     } catch {
@@ -56,21 +67,24 @@ export function withReadTimeout(run, timeoutMs = TICK_READ_TIMEOUT_MS, { onRead 
     }
     let timer;
     const guard = new Promise((resolve) => {
-      timer = setTimeout(
-        () => resolve({ code: 124, stdout: '', stderr: `读 GitHub 超过 ${Math.round(timeoutMs / 1000)} 秒没返回，已掐掉（exit 124）` }),
-        timeoutMs + Math.min(5000, timeoutMs),
-      );
+      timer = setTimeout(() => resolve({ code: 124, stdout: '', stderr: message() }), timeoutMs + Math.min(5000, timeoutMs));
       // 不 unref：兜底计时本身要撑住这一拍，读真挂住时也一定按时以读失败收尾（finally 里会清掉）。
     });
     try {
-      const result = await Promise.race([Promise.resolve(run(cmd, args, { ...opts, timeoutMs })), guard]);
-      if (result && result.code === 124 && !String(result.stderr || '').trim()) {
-        return { ...result, stderr: `读 GitHub 超过 ${Math.round(timeoutMs / 1000)} 秒没返回，已掐掉（exit 124）` };
-      }
+      const result = await Promise.race([Promise.resolve(run(cmd, args, { ...opts, timeoutMs, killGroup: true })), guard]);
+      if (result && result.code === 124 && !String(result.stderr || '').trim()) return { ...result, stderr: message() };
       return result;
     } finally {
       clearTimeout(timer);
     }
+  };
+  return async (cmd, args, opts = {}) => {
+    if (!isGhRead(cmd, args, opts) || Number(opts?.timeoutMs) > 0) return run(cmd, args, opts);
+    const first = await once(cmd, args, opts);
+    if (!first || first.code !== 124) return first;
+    const second = await once(cmd, args, opts);
+    if (second && second.code === 124) return { ...second, stderr: `${String(second.stderr || '').trim()}${RETRIED}` };
+    return second;
   };
 }
 
@@ -386,12 +400,24 @@ export async function runTick({
     const gateEnabled = fs.existsSync(paths.enabledFile);
     heartbeat.gate = gateEnabled ? 'enabled' : 'disabled';
     tickBeat.setPhase('poll');
-    const poll = await run('node', [path.join(repoRoot, 'watchers', 'acceptance', 'bin', 'poll.mjs'), '--json'], {
-      env: { ...env, ACCEPTANCE_WATCHER_HOME: home },
-      timeoutMs: 120000,
-    });
+    // T23：拉取是只读盘点。超时（124）时 proc.run 整组杀掉 poll 和它起的 gh（不留孤儿），再用新进程重试一次；
+    // 重试成功不写提醒，重试也超时才按这一拍失败处理。其余失败（非 124）不重试，照旧。
+    const pollOnce = () =>
+      run('node', [path.join(repoRoot, 'watchers', 'acceptance', 'bin', 'poll.mjs'), '--json'], {
+        env: { ...env, ACCEPTANCE_WATCHER_HOME: home },
+        timeoutMs: POLL_TIMEOUT_MS,
+        killGroup: true,
+      });
+    let poll = await pollOnce();
+    let pollRetried = false;
+    if (poll && poll.code === 124) {
+      pollRetried = true;
+      poll = await pollOnce();
+    }
     if (!poll || poll.code !== 0) {
-      throw new Error(`poll 失败（退出码 ${poll?.code ?? '未知'}）：${String(poll?.stderr || '').trim().split('\n')[0] || ''}`);
+      throw new Error(
+        `poll 失败（退出码 ${poll?.code ?? '未知'}）${pollRetried ? RETRIED : ''}：${String(poll?.stderr || '').trim().split('\n')[0] || ''}`,
+      );
     }
     let entries;
     try {
@@ -490,7 +516,7 @@ export async function runTick({
       try {
         const prbotProfile = loadAcceptanceProfile({ ...env, ACCEPTANCE_WATCHER_HOME: home });
         // T20：这一段读 GitHub 原先没有超时，对端不回包时整拍挂住（2026-10-30 卡了约 14 分钟）。只给读加超时，
-        // 每次读开始重新记阶段时长（一次读最多约 122 秒，远小于 180 秒上限）。
+        // 每次读开始重新记阶段时长（T23：一次读最多约 50 秒，连同重试最多约 100 秒，远小于 180 秒上限）。
         const prbotRun = withReadTimeout(run, prbotReadTimeoutMs, { onRead: () => tickBeat.setPhase('prbot') });
         const prbotGithub = createGithub({ profile: { ...prbotProfile, writeCommand: undefined }, run: prbotRun });
         const discover =
