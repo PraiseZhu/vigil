@@ -72,7 +72,7 @@ test('#153 情形档 × repoClass 全表，没有信号时不升档', () => {
   const table = {
     mivo: { P0: 'P0', P1: 'P1', P2: 'P2', P3: 'P3' },
     'daily-tool': { P0: 'P0', P1: 'P2', P2: 'P2', P3: 'P3' },
-    idle: { P0: 'P0', P1: 'P3', P2: 'P3', P3: 'P3' },
+    idle: { P0: 'P1', P1: 'P3', P2: 'P3', P3: 'P3' },
   };
   for (const [repoClass, row] of Object.entries(table)) {
     for (const [situationTier, priority] of Object.entries(row)) {
@@ -88,7 +88,7 @@ test('#153 情形档 × repoClass 全表，没有信号时不升档', () => {
   }
 });
 
-test('#153 basis 写明按仓降档；idle 的 P0 保持 P0，P1 及以下再低一档', () => {
+test('#153 basis 写明按仓降档；idle 在 daily-tool 结果上再低一档，P0 记成 P1', () => {
   const daily = scorePriority(facts({ situationTier: 'P1', repoClass: 'daily-tool' }), T0);
   assert.equal(daily.priority, 'P2');
   assert.match(daily.basis, /情形档 P1/);
@@ -96,12 +96,11 @@ test('#153 basis 写明按仓降档；idle 的 P0 保持 P0，P1 及以下再低
   assert.match(daily.basis, /P2/);
 
   const idleTop = scorePriority(facts({ situationTier: 'P0', repoClass: 'idle' }), T0);
-  assert.equal(idleTop.priority, 'P0');
+  assert.equal(idleTop.priority, 'P1');
   assert.equal(idleTop.rule, 'situation');
   assert.match(idleTop.basis, /情形档 P0/);
-  assert.match(idleTop.basis, /idle/);
-  assert.match(idleTop.basis, /保持 P0/);
-  assert.doesNotMatch(idleTop.basis, /为 P1/);
+  assert.match(idleTop.basis, /idle 在每天在用的结果 P0 上再低一档为 P1/);
+  assert.doesNotMatch(idleTop.basis, /保持 P0/);
 
   const idleMid = scorePriority(facts({ situationTier: 'P1', repoClass: 'idle' }), T0);
   assert.equal(idleMid.priority, 'P3');
@@ -112,12 +111,113 @@ test('#153 basis 写明按仓降档；idle 的 P0 保持 P0，P1 及以下再低
   assert.equal(idleFeature.rule, 'situation');
 });
 
+test('#180 文件头按 #62 写 idle 降档，不再写已确认或 P0 保持', () => {
+  const source = readFileSync(fileURLToPath(new URL('./bin/prio-score.mjs', import.meta.url)), 'utf8');
+  assert.equal(source.includes('idle 的 P0 保持'), false);
+  assert.equal(source.includes('已确认'), false);
+  assert.match(source, /https:\/\/github\.com\/PraiseZhu\/vigil\/issues\/62/);
+});
+
 test('#153 没给 repoClass 时不降档，和 mivo 一样', () => {
   const named = scorePriority(facts({ situationTier: 'P1', repoClass: 'mivo' }), T0);
   const omitted = scorePriority(facts({ situationTier: 'P1' }), T0);
   assert.equal(named.priority, 'P1');
   assert.equal(omitted.priority, 'P1');
   assert.equal(omitted.rule, 'situation');
+});
+
+test('#180 标签线索判情形档后再按仓降档；没有这类标签就是无线索', () => {
+  const rows = [
+    ['线上坏了', 'mivo', 'P0'],
+    ['main坏了', 'daily-tool', 'P0'],
+    ['人被卡', 'idle', 'P1'],
+    ['数据安全', 'mivo', 'P0'],
+    ['影响发布', 'mivo', 'P1'],
+    ['影响审查', 'daily-tool', 'P2'],
+    ['有任务在等', 'idle', 'P3'],
+    ['只差合并', 'mivo', 'P1'],
+    ['体验改进', 'mivo', 'P2'],
+    ['功能改进', 'idle', 'P3'],
+    ['清理', 'mivo', 'P3'],
+    ['重构', 'idle', 'P3'],
+  ];
+  for (const [label, repoClass, priority] of rows) {
+    const result = scorePriority(facts({ labels: [label], repoClass, issueState: 'open' }), T0);
+    const name = `${repoClass} ${label}`;
+    assert.equal(result.priority, priority, name);
+    assert.equal(result.rule, 'situation', name);
+    assert.equal(result.lowConfidence, false, name);
+    assert.match(result.basis, new RegExp(`情形档`), name);
+  }
+
+  const explicit = scorePriority(
+    facts({ situationTier: 'P3', labels: ['线上坏了'], repoClass: 'mivo', issueState: 'open' }),
+    T0,
+  );
+  assert.equal(explicit.priority, 'P3');
+  assert.equal(explicit.rule, 'situation');
+
+  const unknown = scorePriority(facts({ labels: ['bug'], repoClass: 'idle', issueState: 'open' }), T0);
+  assert.equal(unknown.priority, 'P2');
+  assert.equal(unknown.rule, 'fallback');
+  assert.equal(unknown.lowConfidence, true);
+});
+
+test('#180 信号低于或等于情形档时不降档、不推翻；高于才升。无线索是低置信 P2', () => {
+  const signalOf = {
+    P0: { heartbeatTimeout: true },
+    P1: { prCiRed: true },
+    P2: { acceptance: '修正中' },
+    none: {},
+  };
+  const rankOf = { P0: 0, P1: 1, P2: 2, P3: 3 };
+  for (const situation of ['P0', 'P1', 'P2', 'P3']) {
+    for (const [signal, extra] of Object.entries(signalOf)) {
+      const result = scorePriority(
+        facts({ situationTier: situation, repoClass: 'mivo', issueState: 'open', ...extra }),
+        T0,
+      );
+      const raised = signal !== 'none' && rankOf[signal] < rankOf[situation];
+      const name = `情形档 ${situation} × 信号 ${signal}`;
+      assert.equal(result.priority, raised ? signal : situation, name);
+      assert.equal(result.lowConfidence, false, name);
+      if (raised) {
+        assert.notEqual(result.rule, 'situation', name);
+        assert.match(result.basis, new RegExp(`情形档 ${situation}`), name);
+      } else {
+        assert.equal(result.rule, 'situation', name);
+        assert.match(result.basis, /没有机器信号升档/, name);
+      }
+    }
+  }
+  assert.equal(RULES.some((rule) => rule.priority === 'P3'), false);
+
+  const equalToBaseline = scorePriority(facts({ acceptance: '修正中', issueState: 'open' }), T0);
+  assert.equal(equalToBaseline.priority, 'P2');
+  assert.equal(equalToBaseline.rule, 'fallback');
+  assert.equal(equalToBaseline.lowConfidence, true);
+
+  const raisedFromBaseline = scorePriority(facts({ prCiRed: true, issueState: 'open' }), T0);
+  assert.equal(raisedFromBaseline.priority, 'P1');
+  assert.equal(raisedFromBaseline.rule, 'S3');
+  assert.equal(raisedFromBaseline.lowConfidence, false);
+  assert.match(raisedFromBaseline.basis, /没给情形档，机器信号 S3 升到 P1/);
+
+  const clueBeatsLowerSignal = scorePriority(
+    facts({ labels: ['线上坏了'], acceptance: '修正中', repoClass: 'mivo', issueState: 'open' }),
+    T0,
+  );
+  assert.equal(clueBeatsLowerSignal.priority, 'P0');
+  assert.equal(clueBeatsLowerSignal.rule, 'situation');
+  assert.equal(clueBeatsLowerSignal.lowConfidence, false);
+
+  const clueRaised = scorePriority(
+    facts({ labels: ['重构'], heartbeatTimeout: true, repoClass: 'mivo', issueState: 'open' }),
+    T0,
+  );
+  assert.equal(clueRaised.priority, 'P0');
+  assert.equal(clueRaised.rule, 'S1');
+  assert.match(clueRaised.basis, /情形档 P3/);
 });
 
 test('#153 没给情形档且没有机器信号时返回 P2，并标低置信', () => {
@@ -180,12 +280,12 @@ test('#153 机器信号能把换算结果往上升，取更高的那一档', () 
   assert.match(aboveAdjusted.basis, /daily-tool/);
   assert.match(aboveAdjusted.basis, /S3/);
 
-  const idleKept = scorePriority(
+  const idleRaisedFromP0 = scorePriority(
     facts({ situationTier: 'P0', repoClass: 'idle', labels: ['blocker'] }),
     T0,
   );
-  assert.equal(idleKept.priority, 'P0');
-  assert.equal(idleKept.rule, 'situation');
+  assert.equal(idleRaisedFromP0.priority, 'P0');
+  assert.equal(idleRaisedFromP0.rule, 'S1');
 
   const idleRaised = scorePriority(
     facts({ situationTier: 'P1', repoClass: 'idle', labels: ['blocker'] }),

@@ -49,6 +49,52 @@ function workerEnv() {
   return { WEBHOOK_SECRET: SECRET, PULL_TOKEN: TOKEN };
 }
 
+function ackRequest(ids, token = TOKEN) {
+  return new Request('https://example.invalid/ack', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ ids }),
+  });
+}
+
+async function enqueueDelivery(worker, env, delivery) {
+  const body = JSON.stringify({ created_at: '2026-10-31T00:00:00.000Z', action: 'opened' });
+  const response = await worker.fetch(webhookRequest(body, { delivery }), env);
+  assert.equal(response.status, 204);
+  return body;
+}
+
+// 和 Durable Object storage 一样的最小接口。两个 Worker 实例拿同一份，模拟请求落到不同实例。
+function sharedStorage() {
+  const map = new Map();
+  const storage = {
+    async get(key) {
+      if (!map.has(key)) return undefined;
+      return structuredClone(map.get(key));
+    },
+    async put(key, value) {
+      map.set(key, structuredClone(value));
+    },
+    async delete(key) {
+      map.delete(key);
+    },
+    async transaction(fn) {
+      return fn(storage);
+    },
+  };
+  return storage;
+}
+
+async function pullIds(worker, env) {
+  const response = await worker.fetch(pullRequest(TOKEN), env);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  return body.events.map((event) => event.deliveryId);
+}
+
 test('SC1 签名不对返回 401 且不入队；签名对上才入队；拉取令牌不对不把队列取走', async () => {
   const worker = createEventWorker();
   const env = workerEnv();
@@ -100,6 +146,8 @@ test('SC1 签名不对返回 401 且不入队；签名对上才入队；拉取�
   assert.equal(events[0].event, 'issues');
   assert.equal(events[0].created_at, '2026-10-31T00:00:01.000Z');
 
+  const acked = await worker.fetch(ackRequest(['delivery-good']), env);
+  assert.equal(acked.status, 204);
   const drained = await worker.fetch(pullRequest(TOKEN), env);
   assert.deepEqual((await drained.json()).events, []);
 });
@@ -115,6 +163,8 @@ test('SC2 同一个 delivery id 只入队一次，拉取和轮询也只处理一
   const queued = (await (await worker.fetch(pullRequest(TOKEN), env)).json()).events;
   assert.equal(queued.length, 1);
   assert.equal(queued[0].deliveryId, 'delivery-same');
+  const acked = await worker.fetch(ackRequest(['delivery-same']), env);
+  assert.equal(acked.status, 204);
   assert.deepEqual((await (await worker.fetch(pullRequest(TOKEN), env)).json()).events, []);
 
   let t = 0;
@@ -304,4 +354,226 @@ test('SC5 Worker 源码只读 WEBHOOK_SECRET 和 PULL_TOKEN，没有 GitHub 令�
   assert.doesNotMatch(worker, /node:fs/);
   assert.doesNotMatch(worker, /node:child_process/);
   assert.doesNotMatch(worker, /from 'child_process'/);
+});
+
+test('SC1 拉取响应丢失时不确认就不清队列，第二次 /pull 仍拿到同一批事件', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  await enqueueDelivery(worker, env, 'keep');
+
+  const first = await worker.fetch(pullRequest(TOKEN), env);
+  assert.equal(first.status, 200);
+  assert.deepEqual((await first.json()).events.map((event) => event.deliveryId), ['keep']);
+
+  const second = await worker.fetch(pullRequest(TOKEN), env);
+  assert.equal(second.status, 200);
+  assert.deepEqual((await second.json()).events.map((event) => event.deliveryId), ['keep']);
+
+  const sneaky = await worker.fetch(ackRequest(['keep'], 'wrong-pull-token'), env);
+  assert.equal(sneaky.status, 401);
+  assert.deepEqual(await pullIds(worker, env), ['keep']);
+
+  const acked = await worker.fetch(ackRequest(['keep']), env);
+  assert.equal(acked.status, 204);
+  assert.deepEqual(await pullIds(worker, env), []);
+});
+
+test('SC1 runEventChannel 第一次拉取响应丢失后，下一次拉取仍处理到同一事件并在确认后清队列', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  await enqueueDelivery(worker, env, 'd-lost');
+
+  let pullGets = 0;
+  const fetchImpl = async (url, init = {}) => {
+    const response = await worker.fetch(new Request(url, init), env);
+    const pathname = new URL(url).pathname;
+    if (pathname === '/pull' && (init.method || 'GET') === 'GET') {
+      pullGets += 1;
+      if (pullGets === 1) {
+        const peeked = await response.clone().json();
+        assert.deepEqual(peeked.events.map((event) => event.deliveryId), ['d-lost']);
+        throw new Error('response lost');
+      }
+    }
+    return response;
+  };
+
+  const handled = [];
+  let t = 0;
+  const started = Date.now();
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 61000,
+    pull: () => pullFromWorker({
+      url: 'https://example.invalid/pull',
+      token: TOKEN,
+      fetchImpl,
+    }),
+    confirm: async (ids) => {
+      const { confirmPulledEvents } = await import('./bin/event-pull.mjs');
+      assert.equal(typeof confirmPulledEvents, 'function');
+      await confirmPulledEvents({
+        url: 'https://example.invalid/pull',
+        token: TOKEN,
+        ids,
+        fetchImpl,
+      });
+    },
+    poll: async () => [],
+    onEvent: async (event) => {
+      handled.push(event.deliveryId);
+    },
+    latencyFile: path.join(tmpDir(), '.prio', 'latency.jsonl'),
+  });
+  assert.ok(Date.now() - started < 2000, '假时钟不应真的等');
+  assert.deepEqual(handled, ['d-lost']);
+  assert.ok(pullGets >= 2);
+  assert.deepEqual(await pullIds(worker, env), []);
+});
+
+test('SC2 onEvent 抛错不当成 Worker 挂了，同批其余事件照常处理且下一拍仍按 2 秒拉取', async () => {
+  let t = 0;
+  const pullCalls = [];
+  const confirmed = [];
+  const handled = [];
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const started = Date.now();
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 6000,
+    pull: async () => {
+      pullCalls.push(t);
+      if (t !== 0) return [];
+      return [
+        { deliveryId: 'ok-1', created_at: '2026-10-31T00:00:00.000Z' },
+        { deliveryId: 'bad', created_at: '2026-10-31T00:00:01.000Z' },
+        { deliveryId: 'ok-2', created_at: '2026-10-31T00:00:02.000Z' },
+      ];
+    },
+    confirm: async (ids) => {
+      confirmed.push(...ids);
+    },
+    poll: async () => [],
+    onEvent: async (event) => {
+      handled.push(event.deliveryId);
+      if (event.deliveryId === 'bad') throw new Error('handler failed');
+    },
+    latencyFile,
+  });
+  assert.ok(Date.now() - started < 2000, '假时钟不应真的等');
+  assert.deepEqual(pullCalls, [0, 2000, 4000]);
+  assert.deepEqual(handled, ['ok-1', 'bad', 'ok-2']);
+  assert.deepEqual(confirmed, ['ok-1', 'ok-2']);
+  const rows = readLatencyLog(latencyFile);
+  assert.deepEqual(rows.map((row) => row.deliveryId), ['ok-1', 'ok-2']);
+  assert.ok(rows.every((row) => row.source === 'worker'));
+});
+
+test('SC3 两个 Worker 实例共享存储时，webhook 和 /pull 落在不同实例仍能拉到事件', async () => {
+  const storage = sharedStorage();
+  const env = workerEnv();
+  const webhookWorker = createEventWorker({ storage });
+  const pullWorker = createEventWorker({ storage });
+  await enqueueDelivery(webhookWorker, env, 'shared-1');
+  assert.deepEqual(await pullIds(pullWorker, env), ['shared-1']);
+  await enqueueDelivery(pullWorker, env, 'shared-1');
+  assert.deepEqual(await pullIds(pullWorker, env), ['shared-1']);
+});
+
+test('SC3 EventChannelDurableObject 两个实例共享同一存储时，一边收 webhook 另一边 /pull 仍能拉到', async () => {
+  const { EventChannelDurableObject } = await import('./bin/event-worker.mjs');
+  assert.equal(typeof EventChannelDurableObject, 'function');
+  const storage = sharedStorage();
+  const env = workerEnv();
+  const receiver = new EventChannelDurableObject({ storage });
+  const reader = new EventChannelDurableObject({ storage });
+  await enqueueDelivery(receiver, env, 'from-other-instance');
+  assert.deepEqual(await pullIds(reader, env), ['from-other-instance']);
+});
+
+test('SC3 去重表超过上限后最旧的条目被清掉', async () => {
+  const worker = createEventWorker({ now: () => 5_000, seenLimit: 2, seenTtlMs: 60_000 });
+  const env = workerEnv();
+  await enqueueDelivery(worker, env, 'd1');
+  await enqueueDelivery(worker, env, 'd2');
+  await enqueueDelivery(worker, env, 'd3');
+  await enqueueDelivery(worker, env, 'd1');
+  await enqueueDelivery(worker, env, 'd3');
+  assert.deepEqual(await pullIds(worker, env), ['d1', 'd2', 'd3', 'd1']);
+});
+
+test('SC3 去重表过期后条目被清掉', async () => {
+  let now = 10_000;
+  const worker = createEventWorker({
+    now: () => now,
+    seenTtlMs: 1000,
+    seenLimit: 10,
+  });
+  const env = workerEnv();
+  await enqueueDelivery(worker, env, 'd-old');
+  now = 11_001;
+  await enqueueDelivery(worker, env, 'd-fresh');
+  await enqueueDelivery(worker, env, 'd-old');
+  await enqueueDelivery(worker, env, 'd-fresh');
+  assert.deepEqual(await pullIds(worker, env), ['d-old', 'd-fresh', 'd-old']);
+});
+
+test('SC4 空令牌配置时 /pull 返回 401 且不清队列', async () => {
+  const worker = createEventWorker();
+  const seedEnv = workerEnv();
+  await enqueueDelivery(worker, seedEnv, 'stay-empty-token');
+  const denied = await worker.fetch(pullRequest(TOKEN), { WEBHOOK_SECRET: SECRET, PULL_TOKEN: '' });
+  assert.equal(denied.status, 401);
+  assert.deepEqual(await pullIds(worker, seedEnv), ['stay-empty-token']);
+});
+
+test('SC4 缺 authorization 头时 /pull 返回 401 且不清队列', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  await enqueueDelivery(worker, env, 'stay-missing-header');
+  const denied = await worker.fetch(new Request('https://example.invalid/pull', { method: 'GET' }), env);
+  assert.equal(denied.status, 401);
+  assert.deepEqual(await pullIds(worker, env), ['stay-missing-header']);
+});
+
+test('SC4 authorization 前缀不是 Bearer 时 /pull 返回 401 且不清队列', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  await enqueueDelivery(worker, env, 'stay-prefix');
+  const denied = await worker.fetch(
+    new Request('https://example.invalid/pull', {
+      method: 'GET',
+      headers: { authorization: `Token ${TOKEN}` },
+    }),
+    env,
+  );
+  assert.equal(denied.status, 401);
+  assert.deepEqual(await pullIds(worker, env), ['stay-prefix']);
+});
+
+test('SC4 令牌长度不同时 /pull 返回 401 且不清队列', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  await enqueueDelivery(worker, env, 'stay-length');
+  const denied = await worker.fetch(pullRequest(TOKEN.slice(0, -1)), env);
+  assert.equal(denied.status, 401);
+  assert.deepEqual(await pullIds(worker, env), ['stay-length']);
+});
+
+test('SC4 authorization 多值头时 /pull 返回 401 且不清队列', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  await enqueueDelivery(worker, env, 'stay-multi');
+  const headers = new Headers();
+  headers.append('authorization', `Bearer ${TOKEN}`);
+  headers.append('authorization', 'Bearer other-token');
+  const denied = await worker.fetch(new Request('https://example.invalid/pull', { method: 'GET', headers }), env);
+  assert.equal(denied.status, 401);
+  assert.deepEqual(await pullIds(worker, env), ['stay-multi']);
 });
