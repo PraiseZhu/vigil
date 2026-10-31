@@ -1,6 +1,7 @@
-// 本机拉取端：每 2 秒向 Worker 拉一次队列；Worker 不可用时不抛出循环，改走 60 秒轮询，
-// 把 Worker 漏掉的事件补回来。恢复后回到 2 秒。每处理完一个事件，把
-// created_at 到处理完成的时间差追加到 .prio/latency.jsonl。
+// 本机拉取端：每 2 秒向 Worker 拉一次队列。队列要等本机确认后 Worker 才删。
+// 拉取抛错视为 Worker 不可用：不抛出循环，改走 60 秒轮询，把漏掉的事件补回来。恢复后回到 2 秒。
+// onEvent 抛错不算 Worker 挂了：同批其余事件照常处理，下一拍仍按 2 秒拉。
+// 每处理完一个事件，把 created_at 到处理完成的时间差追加到 .prio/latency.jsonl。
 // 目标：Worker 路径 p95 ≤ 10 秒，兜底轮询 ≤ 90 秒（60 秒一轮，留处理余量）。
 // 轮询函数由调用方注入（现有 60 秒轮询留在外面，这里不替换它）。不读令牌。
 import fs from 'node:fs';
@@ -17,6 +18,23 @@ export async function pullFromWorker({ url, token, fetchImpl = fetch }) {
   if (!response.ok) throw new Error(`worker status ${response.status}`);
   const body = await response.json();
   return Array.isArray(body?.events) ? body.events : [];
+}
+
+/** 拉取端确认已经拿到这些事件。Worker 收到后才把它们从队列删掉。 */
+export async function confirmPulledEvents({ url, token, ids, fetchImpl = fetch } = {}) {
+  if (!Array.isArray(ids) || ids.length === 0) return;
+  const ack = new URL(url);
+  ack.pathname = '/ack';
+  ack.search = '';
+  const response = await fetchImpl(ack.href, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ ids }),
+  });
+  if (!response.ok) throw new Error(`worker status ${response.status}`);
 }
 
 export function readLatencyLog(file) {
@@ -61,7 +79,9 @@ function appendLatency(file, event, processedAtMs, source) {
 /**
  * 拉到 `until`（now() >= until 就停）或 signal abort 为止。
  * sleep / now 可注入：测试里 sleep 只把假时钟往前拨。
- * pull 抛错视为 Worker 不可用：这一拍不再按 2 秒打，下一拍轮询时再试一次。
+ * pull 抛错视为 Worker 不可用：这一拍不再按 2 秒打，下一拍轮询到点时再试一次。
+ * onEvent 抛错不算不可用：这条不确认，同批剩下的照常处理，下一拍仍按 2 秒拉。
+ * confirm 在处理成功之后调用，Worker 才清掉对应事件。
  */
 export async function runEventChannel({
   now = () => Date.now(),
@@ -70,6 +90,7 @@ export async function runEventChannel({
   signal,
   pull,
   poll,
+  confirm,
   onEvent = async () => {},
   latencyFile = path.join('.prio', 'latency.jsonl'),
   pullIntervalMs = PULL_INTERVAL_MS,
@@ -82,10 +103,24 @@ export async function runEventChannel({
 
   async function handle(event, source) {
     const id = event?.deliveryId;
-    if (!id || seen.has(id)) return;
+    if (!id) return false;
+    if (seen.has(id)) return true;
     await onEvent(event, { source });
     seen.add(id);
     if (latencyFile) appendLatency(latencyFile, event, now(), source);
+    return true;
+  }
+
+  async function acceptBatch(events, source, { confirmEvents = false } = {}) {
+    const confirmed = [];
+    for (const event of events || []) {
+      try {
+        if (await handle(event, source)) confirmed.push(event.deliveryId);
+      } catch {
+        // 处理出错：这条不确认，同批剩下的照常处理。不要记成 Worker 挂了。
+      }
+    }
+    if (confirmEvents && confirmed.length && typeof confirm === 'function') await confirm(confirmed);
   }
 
   const running = () => !signal?.aborted && (until == null || now() < until);
@@ -98,7 +133,7 @@ export async function runEventChannel({
       try {
         const events = await pull();
         nextPullAt = t + pullIntervalMs;
-        for (const event of events || []) await handle(event, 'worker');
+        await acceptBatch(events, 'worker', { confirmEvents: true });
       } catch {
         workerUp = false;
         failedThisTick = true;
@@ -111,7 +146,7 @@ export async function runEventChannel({
         const events = await pull();
         workerUp = true;
         nextPullAt = t + pullIntervalMs;
-        for (const event of events || []) await handle(event, 'worker');
+        await acceptBatch(events, 'worker', { confirmEvents: true });
       } catch {
         workerUp = false;
       }
@@ -120,7 +155,7 @@ export async function runEventChannel({
     if (t >= nextPollAt) {
       try {
         const events = await poll();
-        for (const event of events || []) await handle(event, 'poll');
+        await acceptBatch(events, 'poll');
       } catch {
         // 轮询失败也不让循环退出。
       }
