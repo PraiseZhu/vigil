@@ -58,7 +58,7 @@ export function progressFileFor(paths, issue, round) {
   return key ? path.join(paths.progressDir, `${key}.json`) : null;
 }
 
-/** 写宿主进度（原子替换）。`lastActivityAt` 是宿主最近一次看到 pi 输出增长或写闸请求的时间。 */
+/** 写宿主进度（原子替换）。`lastActivityAt` 是宿主最近一次看到 pi 输出增长、写闸请求或沙箱活动（进程树 CPU、目录 mtime，#149）的时间；`activitySource` 是来源。 */
 export function writeRoundProgress(paths, entry) {
   const file = progressFileFor(paths, entry?.issue, entry?.round);
   if (!file) throw new Error('writeRoundProgress 需要 issue 和轮次');

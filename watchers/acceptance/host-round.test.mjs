@@ -754,3 +754,117 @@ test('build 项 CI 口径开着：派发消息末尾追加 CI 事实；查 CI �
     if (mode === 'throws') assert.match(message, /意外出错/);
   }
 });
+
+// #149：pi.log 不长、写闸没请求，但沙箱里在跑长命令（npm → vitest）时不该判卡住。
+function stallRun(fixture, { spawnPi, probeActivity, statusIntervalMs = 10 }) {
+  return runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: BWRAP_OK,
+    runRound: fixture.runRoundFake,
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    spawnPi,
+    probeActivity,
+    meminfoPath: writeMeminfo(),
+    statusIntervalMs,
+    killGraceMs: 20,
+    log: () => {},
+  });
+}
+
+function watchProgress(fixture) {
+  const progress = progressFileFor(hostPaths(fixture.home), ROOT_REF, 1);
+  const seen = [];
+  const timer = setInterval(() => {
+    try {
+      seen.push(JSON.parse(fs.readFileSync(progress, 'utf8')));
+    } catch {
+      // 还没写或已删。
+    }
+  }, 15);
+  return { seen, stop: () => clearInterval(timer) };
+}
+
+test('#149 SC1 pi.log 不长、写闸没请求，但 pi 进程树 CPU 在涨：不判卡住，activitySource=cpu；CPU 停了才判', { timeout: 10000 }, async () => {
+  const fixture = roundFixture({ profile: { stallMinutes: 0.003 } });
+  const pi = hangingPi(fixture.calls);
+  const startedAt = Date.now();
+  let ticks = 0;
+  const probeActivity = ({ piPid }) => {
+    assert.equal(piPid, 555001);
+    if (Date.now() - startedAt < 600) ticks += 1;
+    return { cpuTicks: ticks, filesMtimeMs: 1 };
+  };
+  const watch = watchProgress(fixture);
+  const code = await stallRun(fixture, { spawnPi: pi.spawnPi, probeActivity });
+  watch.stop();
+  assert.equal(code, 1);
+  assert.ok(Date.now() - startedAt >= 600 + 180, `卡住判得太早：${Date.now() - startedAt}ms`);
+  assert.ok(watch.seen.some((entry) => entry.activitySource === 'cpu'), '进度文件记了活动来源 cpu');
+  assert.equal(watch.seen.at(-1).piLogBytes, 0);
+  assert.equal(watch.seen.at(-1).gateRequests, 0);
+  const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
+  assert.match(abort[abort.indexOf('--reason') + 1], /卡住：超过 stallMinutes 没有进度/);
+  assert.ok(readAlerts(hostPaths(fixture.home)).some((entry) => entry.kind === 'round-stalled'));
+});
+
+test('#149 SC2 沙箱 home/.npm/_logs 有新文件（默认探针、真目录）：不判卡住，activitySource=files', { timeout: 10000 }, async () => {
+  const fixture = roundFixture({ profile: { stallMinutes: 0.003 } });
+  const pi = hangingPi(fixture.calls);
+  let timer;
+  const spawnPi = (options) => {
+    const handle = pi.spawnPi(options);
+    const logs = path.join(options.cwd, 'home', '.npm', '_logs');
+    fs.mkdirSync(logs, { recursive: true });
+    let n = 0;
+    timer = setInterval(() => {
+      n += 1;
+      if (n <= 20) fs.writeFileSync(path.join(logs, `debug-${n}.log`), 'x');
+    }, 30);
+    return handle;
+  };
+  const watch = watchProgress(fixture);
+  const startedAt = Date.now();
+  const code = await stallRun(fixture, { spawnPi, probeActivity: undefined });
+  clearInterval(timer);
+  watch.stop();
+  assert.equal(code, 1);
+  assert.ok(Date.now() - startedAt >= 600 + 180, `卡住判得太早：${Date.now() - startedAt}ms`);
+  assert.ok(watch.seen.some((entry) => entry.activitySource === 'files'), '进度文件记了活动来源 files');
+});
+
+test('#149 SC3 所有信号都不变：仍按 stallMinutes 判卡住、停 pi、abort、round-stalled', { timeout: 5000 }, async () => {
+  const fixture = roundFixture({ profile: { stallMinutes: 0.003 } });
+  const pi = hangingPi(fixture.calls);
+  const startedAt = Date.now();
+  const code = await stallRun(fixture, { spawnPi: pi.spawnPi, probeActivity: () => ({ cpuTicks: 42, filesMtimeMs: 7 }) });
+  assert.equal(code, 1);
+  assert.ok(Date.now() - startedAt < 2000, '静止时按时判卡住');
+  assert.deepEqual(pi.state.killed, ['SIGTERM']);
+  assert.ok(readAlerts(hostPaths(fixture.home)).some((entry) => entry.kind === 'round-stalled'));
+});
+
+test('#149 SC4 CPU 一直在涨（空转）也挡不住总时长上限：到点 round-timeout', { timeout: 5000 }, async () => {
+  const fixture = roundFixture({ profile: { stallMinutes: 0.003 } });
+  fs.writeFileSync(path.join(fixture.home, 'config', 'host.json'), JSON.stringify({ piCommand: ['pi'], maxRoundMinutes: 0.01 }));
+  const pi = hangingPi(fixture.calls);
+  let ticks = 0;
+  const startedAt = Date.now();
+  const code = await stallRun(fixture, { spawnPi: pi.spawnPi, probeActivity: () => ({ cpuTicks: (ticks += 1), filesMtimeMs: 1 }) });
+  assert.equal(code, 1);
+  assert.ok(Date.now() - startedAt >= 600);
+  const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
+  assert.equal(abort[abort.indexOf('--reason') + 1], '超过总时长上限（0.01 分钟）');
+  const kinds = readAlerts(hostPaths(fixture.home)).map((entry) => entry.kind);
+  assert.ok(kinds.includes('round-timeout'));
+  assert.ok(!kinds.includes('round-stalled'));
+});
+
+test('#149 探针抛异常：不影响这一轮，静止时照常判卡住', { timeout: 5000 }, async () => {
+  const fixture = roundFixture({ profile: { stallMinutes: 0.003 } });
+  const pi = hangingPi(fixture.calls);
+  const code = await stallRun(fixture, { spawnPi: pi.spawnPi, probeActivity: () => { throw new Error('boom'); } });
+  assert.equal(code, 1);
+  assert.ok(readAlerts(hostPaths(fixture.home)).some((entry) => entry.kind === 'round-stalled'));
+});

@@ -316,6 +316,10 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 
 - **卡住**以宿主观察到的活动为准：宿主每个查进度的间隔看一次 `pi.log` 有没有长，并经一层转发 socket 数本轮写闸请求
   （沙箱里看到的 `<roundDir>/gate/gate.sock` 是宿主这一层，原样转给 `state/host/gates/` 下的写闸 serve，放行与否仍只由写闸决定）。
+  另外，沙箱里跑长命令（如 `npm run test:unit`）时 pi.log 不长、写闸也没请求，所以还看 pi 进程树（宿主看得见的 bwrap 及全部后代）
+  的累计 CPU 时间、本轮目录下沙箱 `home/.npm/_logs`、`home`、`tmp` 及一层子项的最新 mtime（#149），任一变化都算活动。
+  进度文件的 `activitySource` 记最近一次刷新的来源（`start`/`prepare`/`gate`/`pi-log`/`cpu`/`files`）。pi 空转吃 CPU 时
+  卡住判定抓不到，靠总时长上限 `maxRoundMinutes` 兜底。
   有活动就刷新 `state/host/progress/<owner>__<repo>__<issue 号>__<轮次>.json`。超过 `stallMinutes` 没有活动：先结束 pi，
   再 `abort`（原因「卡住：超过 stallMinutes 没有进度」），提醒 `round-stalled`。`stateDir` 里模型写的 `lastProgressAt`
   只作参考，延不了期；tick 的卡死判定（`poll` 的 `stale`）用的也是这份宿主时间。
