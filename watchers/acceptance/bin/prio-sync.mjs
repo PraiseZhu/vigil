@@ -369,8 +369,6 @@ export function mapItem(node, table = DEFAULT_REPO_CLASS_TABLE) {
     .map((label) => label?.name)
     .filter((name) => typeof name === 'string' && name);
   const priority = fields.get('优先级');
-  const situationRaw = fields.get('情形档');
-  const situationKnown = situationRaw === 'P0' || situationRaw === 'P1' || situationRaw === 'P2' || situationRaw === 'P3';
   const stateRaw = String(content.state || '').toUpperCase();
   const issueState = stateRaw === 'OPEN' ? 'open' : stateRaw === 'CLOSED' ? 'closed' : null;
   const times = [timeMs(node.updatedAt), timeMs(content.updatedAt)].filter((value) => value != null);
@@ -385,8 +383,8 @@ export function mapItem(node, table = DEFAULT_REPO_CLASS_TABLE) {
     linkedPr: fields.get('关联 PR') ?? '',
     status: fields.get('状态') || fields.get('Status') || null,
     acceptance: fields.get('验收') || null,
-    situationTier: situationKnown ? situationRaw : null,
-    situationKnown,
+    situationTier: null,
+    situationKnown: false,
     issueState,
     issueStateKnown: issueState != null,
     lastEventAt,

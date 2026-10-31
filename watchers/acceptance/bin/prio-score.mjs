@@ -1,10 +1,10 @@
 // 看板优先级打分（#153，规则以 #62 为准）。纯函数：事实、当前时间和防抖状态都由调用方传入。
 // 不联网、不读环境变量、不读写看板。返回 write 只表示「调用方可以写」；本模块自己不写。
 //
-// 情形档 situationTier（P0–P3）由调用方按四条语义给出。再按 repoClass 换算：
+// 情形档 situationTier（P0–P3）由调用方按四条语义给出。再按 repoClass 换算
+// （https://github.com/PraiseZhu/vigil/issues/62 方案 B 第 2 条）：
 // mivo 用情形档；daily-tool 低半档（P0 不变，P1 记成 P2，P2 和 P3 不变）；
-// idle 的情形档 P0 保持 P0（已确认：线上坏了、数据或安全问题不因项目闲置降档）。
-// 情形档 P1 及以下才在 daily-tool 的结果上再低一档，最低 P3。
+// idle 在 daily-tool 的结果上再低一档，最低 P3（情形档 P0 记成 P1）。
 // 机器信号 S1–S5 只能升档。最终档是换算结果和信号档里更高的那个，信号不能把档降下来。
 // 没给情形档、也没有信号时，低置信记 P2。
 // 只有 issueState === 'closed' 才清空。Done 或验收通过但 issue 仍开着时，保留算出来的档。
@@ -46,7 +46,7 @@ const RANK = new Map([
 
 // daily-tool 比 mivo 低半档：P0 保持，P1 记成 P2，P2 和 P3 不变。
 const DAILY_TOOL = Object.freeze({ P0: 'P0', P1: 'P2', P2: 'P2', P3: 'P3' });
-// 再低一档，最低 P3。idle 只对情形档 P1 及以下使用，并且用在 daily-tool 的结果上。
+// 在 daily-tool 的结果上再低一档，最低 P3。idle 对每个情形档都用这一步。
 const STEP_DOWN = Object.freeze({ P0: 'P1', P1: 'P2', P2: 'P3', P3: 'P3' });
 
 function priorityOf(id) {
@@ -81,10 +81,7 @@ function olderThan(at, nowMs, limitMs) {
 
 function adjustTier(situation, repoClass) {
   if (repoClass === 'daily-tool') return DAILY_TOOL[situation];
-  if (repoClass === 'idle') {
-    if (situation === 'P0') return 'P0';
-    return STEP_DOWN[DAILY_TOOL[situation]];
-  }
+  if (repoClass === 'idle') return STEP_DOWN[DAILY_TOOL[situation]];
   return situation;
 }
 
@@ -93,7 +90,6 @@ function describeRepo(situation, repoClass, adjusted) {
     return adjusted === situation ? `daily-tool 不降档，仍是 ${adjusted}` : `daily-tool 降半档为 ${adjusted}`;
   }
   if (repoClass === 'idle') {
-    if (situation === 'P0') return 'idle 的 P0 保持 P0';
     const daily = DAILY_TOOL[situation];
     return adjusted === daily
       ? `idle 再低一档，最低仍是 ${adjusted}`
