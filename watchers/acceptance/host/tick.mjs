@@ -36,6 +36,18 @@ export const POLL_TIMEOUT_MS = 60000;
 
 const RETRIED = '（已重试一次）';
 
+/**
+ * 重试成功不写告警，只在 loop.log 留一行（T23），方便统计超时次数。格式固定：
+ * `<UTC ISO 时间> read-retry-ok kind=<poll|prbot-read> totalMs=<两次合计毫秒> 读取超时已重试成功`
+ */
+export function logReadRetryOk(paths, kind, totalMs, now = () => Date.now()) {
+  try {
+    fs.appendFileSync(paths.loopLog, `${new Date(now()).toISOString()} read-retry-ok kind=${kind} totalMs=${Math.round(totalMs)} 读取超时已重试成功\n`);
+  } catch {
+    // 日志写不下去不影响这一拍。
+  }
+}
+
 /** gh 这条命令是不是只读：只读 GraphQL 查询，或 gh api 不带 -X / -X GET。拿不准一律当写，不加超时。 */
 function isGhRead(cmd, args, opts) {
   if (cmd !== 'gh' || !Array.isArray(args) || args[0] !== 'api') return false;
@@ -57,7 +69,7 @@ function isGhRead(cmd, args, opts) {
  * 再用新进程（新连接）重试一次；重试也超时才按读失败收尾，文字注明已重试一次。读是幂等的，重试不会多写任何东西。
  * 再兜一层计时：run 自己不认超时时也按 124 收尾。onRead 在每次读（含重试）开始时调用（刷新心跳阶段）。
  */
-export function withReadTimeout(run, timeoutMs = TICK_READ_TIMEOUT_MS, { onRead } = {}) {
+export function withReadTimeout(run, timeoutMs = TICK_READ_TIMEOUT_MS, { onRead, onRetryOk } = {}) {
   const message = () => `读 GitHub 超过 ${Math.round(timeoutMs / 1000)} 秒没返回，已掐掉（exit 124）`;
   const once = async (cmd, args, opts) => {
     try {
@@ -80,10 +92,16 @@ export function withReadTimeout(run, timeoutMs = TICK_READ_TIMEOUT_MS, { onRead 
   };
   return async (cmd, args, opts = {}) => {
     if (!isGhRead(cmd, args, opts) || Number(opts?.timeoutMs) > 0) return run(cmd, args, opts);
+    const startedAt = Date.now();
     const first = await once(cmd, args, opts);
     if (!first || first.code !== 124) return first;
     const second = await once(cmd, args, opts);
     if (second && second.code === 124) return { ...second, stderr: `${String(second.stderr || '').trim()}${RETRIED}` };
+    try {
+      onRetryOk?.({ totalMs: Date.now() - startedAt });
+    } catch {
+      // 留日志失败不影响读。
+    }
     return second;
   };
 }
@@ -408,11 +426,13 @@ export async function runTick({
         timeoutMs: POLL_TIMEOUT_MS,
         killGroup: true,
       });
+    const pollStartedAt = Date.now();
     let poll = await pollOnce();
     let pollRetried = false;
     if (poll && poll.code === 124) {
       pollRetried = true;
       poll = await pollOnce();
+      if (poll && poll.code === 0) logReadRetryOk(paths, 'poll', Date.now() - pollStartedAt, now);
     }
     if (!poll || poll.code !== 0) {
       throw new Error(
@@ -517,7 +537,10 @@ export async function runTick({
         const prbotProfile = loadAcceptanceProfile({ ...env, ACCEPTANCE_WATCHER_HOME: home });
         // T20：这一段读 GitHub 原先没有超时，对端不回包时整拍挂住（2026-10-30 卡了约 14 分钟）。只给读加超时，
         // 每次读开始重新记阶段时长（T23：一次读最多约 50 秒，连同重试最多约 100 秒，远小于 180 秒上限）。
-        const prbotRun = withReadTimeout(run, prbotReadTimeoutMs, { onRead: () => tickBeat.setPhase('prbot') });
+        const prbotRun = withReadTimeout(run, prbotReadTimeoutMs, {
+          onRead: () => tickBeat.setPhase('prbot'),
+          onRetryOk: ({ totalMs }) => logReadRetryOk(paths, 'prbot-read', totalMs, now),
+        });
         const prbotGithub = createGithub({ profile: { ...prbotProfile, writeCommand: undefined }, run: prbotRun });
         const discover =
           discoverPrbot || ((options) => discoverCorrections({ ...options, github: prbotGithub, profile: prbotProfile, hostConfig: prbotSettings }));

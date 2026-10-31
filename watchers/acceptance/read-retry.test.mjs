@@ -123,3 +123,22 @@ test('T23 拉取重试仍失败：只写一条 tick-failed，注明已重试一�
   await second.promise;
   assert.equal(second.seen.length, 1, '非超时失败（退出码 1）不重试');
 });
+
+test('T23 重试成功不告警，但在 loop.log 留一行：读取超时已重试成功、类别、耗时', async () => {
+  const lines = [];
+  const wrapped = withReadTimeout(
+    async (cmd, args, opts) => (lines.length === 0 && !wrapped.done ? ((wrapped.done = true), { code: 124, stdout: '', stderr: '' }) : { code: 0, stdout: '{}', stderr: '' }),
+    200,
+    { onRetryOk: (info) => lines.push(info) },
+  );
+  await wrapped('gh', ['api', 'repos/o/r'], {});
+  assert.equal(lines.length, 1);
+  assert.ok(Number.isFinite(lines[0].totalMs));
+
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const { promise } = pollTick(home, [{ code: 124, stdout: '', stderr: '' }, { code: 0, stdout: '[]', stderr: '' }]);
+  await promise;
+  const log = fs.readFileSync(hostPaths(home).loopLog, 'utf8');
+  assert.match(log, /^\S+Z read-retry-ok kind=poll totalMs=\d+ 读取超时已重试成功$/m);
+  assert.equal(readAlerts(hostPaths(home)).filter((a) => a.kind === 'tick-failed').length, 0);
+});
