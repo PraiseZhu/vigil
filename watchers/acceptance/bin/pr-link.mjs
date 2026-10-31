@@ -2,8 +2,9 @@
 // 纯函数。只看调用方传入的字符串。
 //
 // 命中：
-// - 正文「任务 issue：」行上的 owner/repo#n、issue 链接；这一行没有这两种写法时才取裸 #n
-//   （所以「#147（#148 的补充）」里的 #148 不算，那是在说上一个 PR）
+// - 正文「任务 issue：」行上的 owner/repo#n、issue 链接；这一行没有这两种写法时才取全部裸 #n
+//   有完整引用时，仍认顿号或英文逗号并列的裸 #n（「#147、#149」两个都算）
+//   括号里的裸 #n 不算（「#147（#148 的补充）」里的 #148 是在说上一个 PR）
 // - 行首，或冒号后面，的 Closes / Fixes / Refs（大小写不敏感）之后的 #n、owner/repo#n、issue 链接
 // - Resolves、Close、Fixed，以及写在句子中间的关闭字，不算
 // - 标题里的 #n 不算；正文其它地方顺手提到的 #n、owner/repo#n、issue 链接不算
@@ -19,6 +20,7 @@ const NUM = '[1-9]\\d*';
 const ISSUE_URL = new RegExp(`https?:\\/\\/(?:www\\.)?github\\.com\\/(${NAME})\\/(${NAME})\\/issues\\/(${NUM})\\b`, 'gi');
 const EXPLICIT_REF = new RegExp(`(?:^|[^A-Za-z0-9_./])(${NAME})\\/(${NAME})#(${NUM})\\b`, 'g');
 const BARE_REF = new RegExp(`(?:^|[^A-Za-z0-9_#/])#(${NUM})\\b`, 'g');
+const LIST_BARE = new RegExp(`(?:[、,]\\s*)#(${NUM})\\b`, 'g');
 const ACCEPTANCE_BRANCH = new RegExp(`(?:^|\\/)acceptance\\/(${NUM})-(${NUM})-sc${NUM}$`);
 const BRANCH_ISSUE = new RegExp(`(?:^|[\\/_.-])issues?[-\\/](${NUM})(?=$|[\\/_.-])`, 'gi');
 const BRANCH_HASH = new RegExp(`(?:^|[\\/_.-])#(${NUM})(?=$|[\\/_.-])`, 'g');
@@ -79,6 +81,9 @@ export function prIssueRefs(pr) {
       collectTextRefs(explicit, line, own, { bare: false });
       if (explicit.size) {
         for (const [key, value] of explicit) found.set(key, value);
+        if (own.includes('/')) {
+          for (const match of line.matchAll(LIST_BARE)) addRef(found, own, match[1]);
+        }
       } else {
         collectTextRefs(found, line, own, { bare: true });
       }

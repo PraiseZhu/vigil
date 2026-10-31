@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import { linkedPrField, prIssueRefs } from './bin/pr-link.mjs';
+import { repoACorpus } from './repo-a-corpus.fixture.mjs';
 import {
   caseFold,
   crossRepo,
@@ -104,6 +105,7 @@ test('SC4 跑匹配时不调用 fetch', () => {
     for (const item of patternCases) prIssueRefs(item.pr);
     for (const item of formatCases) linkedPrField({ issues: item.issues, prs: item.prs });
     for (const item of vigilCorpus) prIssueRefs(item.pr);
+    for (const item of repoACorpus) prIssueRefs(item.pr);
   } finally {
     globalThis.fetch = previous;
   }
@@ -169,6 +171,17 @@ test('#178 SC2 分支 #<号>', () => {
   assert.deepEqual(prIssueRefs(samplePr({ headRefName: 'bugfix/#42' })), [`${VIGIL}#42`]);
 });
 
+test('#178 任务 issue 行用顿号或英文逗号并列的裸 #n 都算', () => {
+  assert.deepEqual(
+    prIssueRefs(samplePr({ body: `任务 issue：${VIGIL}#147、#149\n` })),
+    [`${VIGIL}#147`, `${VIGIL}#149`],
+  );
+  assert.deepEqual(
+    prIssueRefs(samplePr({ body: `任务 issue：${VIGIL}#147, #149\n` })),
+    [`${VIGIL}#147`, `${VIGIL}#149`],
+  );
+});
+
 test('#178 SC2 「任务 issue：」行已有 owner/repo#n 时，同行括号里的裸 #n 不算', () => {
   assert.deepEqual(
     prIssueRefs(samplePr({ body: `任务 issue：${VIGIL}#147（#148 的补充）\n` })),
@@ -187,6 +200,31 @@ test('#178 SC3 vigil 最近 15 个已合并 PR 全文，误配 0、漏配 0', ()
   let missingRefs = 0;
   let extraPrs = 0;
   for (const item of vigilCorpus) {
+    const got = prIssueRefs(item.pr);
+    const extra = got.filter((ref) => !item.expect.includes(ref));
+    const missing = item.expect.filter((ref) => !got.includes(ref));
+    extraRefs += extra.length;
+    missingRefs += missing.length;
+    if (extra.length) extraPrs += 1;
+    if (extra.length || missing.length) {
+      lines.push(`${item.id} 多配 ${extra.join(' ') || '无'}；漏配 ${missing.join(' ') || '无'}`);
+    }
+  }
+  assert.equal(lines.length, 0, `误配引用 ${extraRefs}（${extraPrs} 条 PR）漏配引用 ${missingRefs}\n${lines.join('\n')}`);
+});
+
+test('#178 SC3 repo-a 脱敏全文，误配 0、漏配 0', () => {
+  // 样本是产品仓近 15 条已合并 PR 的脱敏夹具，pr.repo 统一 ExampleOrg/repo-a。
+  // 旧规则是 main 的 prIssueRefs（标题和整段正文里的 #n 都算）。
+  // 2026-10-31 用 origin/main 的 watchers/acceptance/bin/pr-link.mjs 对这份夹具实测：
+  // 误配 54、漏配 0、15 条全部多配。
+  assert.equal(repoACorpus.length, 15);
+  assert.ok(repoACorpus.every((item) => item.pr.repo === 'ExampleOrg/repo-a'));
+  const lines = [];
+  let extraRefs = 0;
+  let missingRefs = 0;
+  let extraPrs = 0;
+  for (const item of repoACorpus) {
     const got = prIssueRefs(item.pr);
     const extra = got.filter((ref) => !item.expect.includes(ref));
     const missing = item.expect.filter((ref) => !got.includes(ref));
