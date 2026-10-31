@@ -39,6 +39,8 @@ export const GATE_ACTION_WRITE_TYPES = Object.freeze(['pr.update-branch', 'ci.re
 
 const WRITE_TYPE_SET = new Set([...WRITE_TYPES, ...GATE_ACTION_WRITE_TYPES]);
 const BOARD_FIELDS = new Set(['验收', '裁决']);
+/** 优先级写回只许这两个字段。不能和「验收」「裁决」写在同一次动作里。 */
+export const PRIO_BOARD_FIELDS = new Set(['优先级', '关联 PR']);
 
 export class WriteBusyError extends Error {
   constructor(message = '外发忙') {
@@ -354,7 +356,7 @@ function defaultFallbackLog(profile) {
   };
 }
 
-export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog } = {}) {
+export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog, ownerToken } = {}) {
   if (!profile) throw new Error('createGithub 需要 profile');
   const runCmd = run || defaultRun;
   const fetchFn = fetchImpl || globalThis.fetch;
@@ -403,6 +405,8 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog 
   }
 
   function getOwnerToken() {
+    // 调用方已经从令牌文件读出内容时，只放在内存里，不再读一遍文件。
+    if (typeof ownerToken === 'string' && ownerToken) return ownerToken;
     if (!ownerTokenCache) ownerTokenCache = readGithubToken(profile);
     return ownerTokenCache;
   }
@@ -496,13 +500,51 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog 
     return finishGraphql(await sendGraphql(token, query, variables), token);
   }
 
+  async function graphqlFetch(token, query, variables) {
+    // 优先级写令牌只放在请求头里，不放进进程环境变量。失败信息先抹掉令牌再抛。
+    let res;
+    try {
+      res = await fetchFn('https://api.github.com/graphql', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query, variables }),
+      });
+    } catch {
+      throw new Error('GraphQL 请求失败');
+    }
+    const raw = typeof res?.text === 'function' ? await res.text() : '';
+    if (res && res.ok === false) {
+      throw new Error(redact(raw, [token]) || `GraphQL HTTP ${res.status}`);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error('GraphQL 返回的不是 JSON');
+    }
+    if (parsed.errors?.length) {
+      throw new Error(redact(parsed.errors.map((err) => err.message).join('; '), [token]));
+    }
+    return parsed.data ?? parsed;
+  }
+
+  function usesPriorityToken() {
+    return typeof ownerToken === 'string' && ownerToken.length > 0;
+  }
+
   /**
    * 用账号令牌的只读查询（doctor 查看板 viewerCanUpdate 用：App 令牌看不到个人账号下的看板，
    * 写看板走的又是账号令牌）。只收 query，mutation 一律拒绝。
+   * 优先级写令牌走请求头，不进环境变量。
    */
   async function ownerGraphql(query, variables) {
     if (/^\s*mutation\b/.test(String(query || ''))) throw new Error('ownerGraphql 只做只读查询');
     if (!isReadOnlyGraphql(query)) return graphqlWrite(query, variables);
+    if (usesPriorityToken()) return graphqlFetch(ownerToken, query, variables);
     const token = getOwnerToken();
     const result = await runRead(['api', 'graphql', '--input', '-'], {
       env: ghEnv(token),
@@ -531,6 +573,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog 
 
   async function graphqlWrite(query, variables) {
     const token = getOwnerToken();
+    if (usesPriorityToken()) return graphqlFetch(token, query, variables);
     const result = await runCmd('gh', ['api', 'graphql', '--input', '-'], {
       env: ghEnv(token),
       input: JSON.stringify({ query, variables }),
@@ -545,10 +588,16 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog 
 
   async function setProjectFields(action) {
     const { repo, issue, fields = {}, ownerLogin, projectNumber } = action;
-    for (const name of Object.keys(fields)) {
-      if (!BOARD_FIELDS.has(name)) {
+    const names = Object.keys(fields);
+    for (const name of names) {
+      if (!BOARD_FIELDS.has(name) && !PRIO_BOARD_FIELDS.has(name)) {
         throw new Error(`拒绝写入看板字段「${name}」`);
       }
+    }
+    const usesPrio = names.some((name) => PRIO_BOARD_FIELDS.has(name));
+    const usesBoard = names.some((name) => BOARD_FIELDS.has(name));
+    if (usesPrio && usesBoard) {
+      throw new Error('拒绝写入看板字段：优先级写回不能和验收、裁决一起写');
     }
     const [owner, name] = String(repo).split('/');
     const login = ownerLogin || profile.ownerLogin;
@@ -640,6 +689,58 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog 
         }`,
         { projectId: project.id, itemId: item.id, fieldId: field.id, text: String(fields['裁决']) },
       );
+    }
+    const clearField = async (fieldId) => {
+      await graphqlWrite(
+        `mutation ($projectId: ID!, $itemId: ID!, $fieldId: ID!) {
+          clearProjectV2ItemFieldValue(input: {
+            projectId: $projectId, itemId: $itemId, fieldId: $fieldId
+          }) { projectV2Item { id } }
+        }`,
+        { projectId: project.id, itemId: item.id, fieldId },
+      );
+    };
+    if (Object.hasOwn(fields, '优先级')) {
+      const field = fieldByName.get('优先级');
+      if (!field?.id) throw new Error('看板没有「优先级」字段');
+      if (field.dataType !== 'SINGLE_SELECT') throw new Error('「优先级」字段必须是单选');
+      const value = fields['优先级'];
+      if (value == null || value === '') {
+        await clearField(field.id);
+      } else {
+        const option = (field.options || []).find((entry) => entry.name === value);
+        if (!option?.id) throw new Error(`优先级字段没有选项「${value}」`);
+        await graphqlWrite(
+          `mutation ($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+            updateProjectV2ItemFieldValue(input: {
+              projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
+              value: { singleSelectOptionId: $optionId }
+            }) { projectV2Item { id } }
+          }`,
+          { projectId: project.id, itemId: item.id, fieldId: field.id, optionId: option.id },
+        );
+      }
+    }
+    if (Object.hasOwn(fields, '关联 PR')) {
+      const field = fieldByName.get('关联 PR');
+      if (!field?.id) throw new Error('看板没有「关联 PR」字段');
+      if (field.dataType !== 'TEXT') {
+        throw new Error('「关联 PR」字段必须是文本');
+      }
+      const value = fields['关联 PR'];
+      if (value == null || value === '') {
+        await clearField(field.id);
+      } else {
+        await graphqlWrite(
+          `mutation ($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+            updateProjectV2ItemFieldValue(input: {
+              projectId: $projectId, itemId: $itemId, fieldId: $fieldId,
+              value: { text: $text }
+            }) { projectV2Item { id } }
+          }`,
+          { projectId: project.id, itemId: item.id, fieldId: field.id, text: String(value) },
+        );
+      }
     }
     return { itemId: item.id, projectId: project.id };
   }

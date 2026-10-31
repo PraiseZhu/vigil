@@ -66,3 +66,6 @@ watchers/acceptance/.sandbox-real-test-*/
 
 # acceptance #60 真 bwrap 预检测试的临时目录（同样放在 /tmp 之外）
 watchers/acceptance/.prbot-sandbox-real-test-*/
+
+# 优先级写回的本地状态、变更日志和停用开关（不入库）
+.prio/

@@ -417,6 +417,56 @@ test('SC9 修正 issue / 挂子 issue / 看板：标记不对、挂错总 issue�
   assert.equal(ownProject.code, 0);
 });
 
+test('#157 验收会话写「优先级」「关联 PR」被拒，验收和裁决仍放行', async () => {
+  const { home, profile } = setupEnvironment();
+  const world = defaultTree();
+  let calls = 0;
+  const github = gateGithub(world);
+  const inner = github.write.bind(github);
+  github.write = async (action) => {
+    calls += 1;
+    return inner(action);
+  };
+  const gate = createGate({
+    home,
+    profile,
+    github,
+    run: procRun,
+    binding: bindingFor(world),
+    which: async () => false,
+  });
+  const base = {
+    type: 'project.field.set',
+    repo: REPO,
+    issue: 2,
+    ownerLogin: profile.ownerLogin,
+    projectNumber: profile.projectNumber,
+  };
+  for (const [fields, key] of [
+    [{ 优先级: 'P0' }, 'prio'],
+    [{ '关联 PR': '#1(open)' }, 'link'],
+    [{ 验收: '验收中', 优先级: 'P1' }, 'mixed'],
+  ]) {
+    const outcome = await gate.handle({ ...base, fields, dedupeKey: key });
+    assert.equal(outcome.code, 4, JSON.stringify(outcome));
+    assert.equal(outcome.body.reason, 'not-allowed', JSON.stringify(outcome));
+  }
+  assert.equal(calls, 0, '被拒的字段不能打到 GitHub');
+  assert.equal(world.writes.length, 0);
+
+  const acceptance = await gate.handle({ ...base, fields: { 验收: '验收中' }, dedupeKey: 'acc' });
+  assert.equal(acceptance.code, 0, JSON.stringify(acceptance));
+  const verdict = await gate.handle({
+    ...base,
+    fields: { 裁决: 'https://example.invalid/c/1' },
+    dedupeKey: 'verdict',
+  });
+  assert.equal(verdict.code, 0, JSON.stringify(verdict));
+  assert.equal(calls, 2);
+  assert.equal(world.get(`${REPO}#2`).project['验收'], '验收中');
+  assert.equal(world.get(`${REPO}#2`).project['裁决'], 'https://example.invalid/c/1');
+});
+
 test('SC9 静态：写闸放行的类型里没有 pr.merge', async () => {
   const source = fs.readFileSync(path.join(HERE_HOST, 'write-gate.mjs'), 'utf8');
   assert.doesNotMatch(source, /pr\.merge/);
