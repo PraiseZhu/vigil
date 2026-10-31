@@ -338,7 +338,7 @@ test('#157 带 prio:pin 的项不写优先级，也不写关联 PR', async () =>
   await runPrioSync({
     dir,
     items: [item(3, { labels: ['prio:pin'], priority: 'P3', status: 'Done', linkedPr: '' })],
-    prs: [{ repo: REPO, number: 9, title: 'fix #3', state: 'open', ci: 'fail', headRefName: 'fix' }],
+    prs: [{ repo: REPO, number: 9, title: 'fix #3', body: 'Closes #3\n', state: 'open', ci: 'fail', headRefName: 'fix' }],
     nowMs: T0,
     apply: true,
     ownerLogin: OWNER,
@@ -455,8 +455,8 @@ test('#157 关联 PR 用 W3 的文本，CI 失败同时升级优先级', async (
     dir,
     items: [item(5, { priority: 'P3', linkedPr: '' })],
     prs: [
-      { repo: 'example-owner/other-repo', number: 8, title: 'fix #5', state: 'open', ci: 'fail' },
-      { repo: REPO, number: 9, title: 'fix #5', state: 'open', ci: 'fail', headRefName: 'fix' },
+      { repo: 'example-owner/other-repo', number: 8, title: 'fix #5', body: 'Closes #5\n', state: 'open', ci: 'fail' },
+      { repo: REPO, number: 9, title: 'fix #5', body: 'Closes #5\n', state: 'open', ci: 'fail', headRefName: 'fix' },
     ],
     nowMs: T0,
     apply: true,
@@ -725,7 +725,7 @@ test('#157 标记缺失时不写关联 PR 且不调用写闸；标记在且非 d
   const dir = tmpDir();
   seedOwned(dir, 5, 'P3');
   const gate = recorder();
-  const prs = [{ repo: REPO, number: 9, title: 'fix #5', state: 'open', ci: 'pass', headRefName: 'fix' }];
+  const prs = [{ repo: REPO, number: 9, title: 'fix #5', body: 'Closes #5\n', state: 'open', ci: 'pass', headRefName: 'fix' }];
   const blocked = capture();
   await runPrioSync({
     dir,
@@ -1127,6 +1127,7 @@ function openPr(number, issueNumber) {
     repo: REPO,
     number,
     title: `fix #${issueNumber}`,
+    body: `Closes #${issueNumber}\n`,
     state: 'open',
     ci: 'pass',
     headRefName: 'fix',
