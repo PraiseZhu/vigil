@@ -825,6 +825,27 @@ export async function restorePrio({
   return { written, planned: planned.length, mode };
 }
 
+/** 运行日志：<stateDir>/run-YYYY-MM-DD.log。日期取注入时钟的 UTC 日历日。不轮转、不清理、不设大小上限。 */
+function runLogFile(dir, nowMs) {
+  const day = new Date(nowMs).toISOString().slice(0, 10);
+  return path.join(dir, `run-${day}.log`);
+}
+
+function appendRunLog(file, text) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, text, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+}
+
+function teeRunLog(stdout, file) {
+  return {
+    write(text) {
+      outWrite(stdout, text);
+      appendRunLog(file, text);
+    },
+  };
+}
+
 export async function main(argv = process.argv.slice(2), deps = {}) {
   const args = parsePrioArgs(argv);
   const dir = args.stateDir || deps.dir || defaultStateDir();
@@ -846,6 +867,11 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       prs = await loadPullRequests(github, [...new Set((items || []).map((entry) => entry.repo))]);
     }
   }
+  const loaded = items || [];
+  const logFile = runLogFile(dir, nowMs);
+  const modeLabel = args.write === true ? 'apply' : 'dry-run';
+  appendRunLog(logFile, `${new Date(nowMs).toISOString()} ${modeLabel} ${loaded.length}\n`);
+  const loggedStdout = teeRunLog(stdout, logFile);
   if (args.restore) {
     return restorePrio({
       dir,
@@ -855,20 +881,20 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       ownerLogin: profile.ownerLogin,
       projectNumber: profile.projectNumber,
       write,
-      stdout,
-      items: items || [],
+      stdout: loggedStdout,
+      items: loaded,
     });
   }
   return runPrioSync({
     dir,
-    items: items || [],
+    items: loaded,
     prs,
     nowMs,
     apply: args.write === true,
     ownerLogin: profile.ownerLogin,
     projectNumber: profile.projectNumber,
     write,
-    stdout,
+    stdout: loggedStdout,
   });
 }
 

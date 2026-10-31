@@ -1341,3 +1341,141 @@ test('#179 多条关联 PR 记录只看最后一条，中间一条等于当前�
   assert.match(io.text(), new RegExp(`${REPO.replaceAll('/', '\\/')}#32 关联 PR 手动值与规则不一致，提醒一次`));
   assert.equal(readJsonl(dir).filter((row) => row.field === '关联 PR').length, 3);
 });
+
+function runLogName(nowMs) {
+  return `run-${new Date(nowMs).toISOString().slice(0, 10)}.log`;
+}
+
+function prioMain(dir, nowMs, extra = {}) {
+  const io = capture();
+  return main(['--state-dir', dir, ...(extra.argv || [])], {
+    now: () => nowMs,
+    stdout: io.stdout,
+    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    loadItems: async () => extra.items || [item(1)],
+    loadPrs: async () => extra.prs || [],
+    write: extra.write,
+    readToken: extra.readToken,
+  }).then(() => io.text());
+}
+
+test('#181 SC1 dry-run 把运行头和与 stdout 相同的行追加进当天 run-YYYY-MM-DD.log，权限 600', async () => {
+  const dir = tmpDir();
+  const items = [item(1, { labels: ['blocker'] }), item(2)];
+  const stdout = await prioMain(dir, T0, {
+    items,
+    write: async () => {
+      throw new Error('dry-run 不应写');
+    },
+    readToken: () => {
+      throw new Error('注入了看板，不应读令牌');
+    },
+  });
+  const file = path.join(dir, runLogName(T0));
+  assert.equal(fs.existsSync(file), true);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  const log = fs.readFileSync(file, 'utf8');
+  const header = `2026-10-31T12:00:00.000Z dry-run ${items.length}\n`;
+  assert.equal(log, `${header}${stdout}`);
+  assert.match(stdout, /dry-run：2 条，变更 2，写入 0，钉住 0/);
+  assert.equal(stdout.includes(header.trim()), false);
+  assert.equal(fs.readdirSync(dir).filter((name) => name.startsWith('run-')).length, 1);
+});
+
+test('#181 SC2 同一天两次追加进同一个文件；换到第二天写新文件，前一天的文件不变', async () => {
+  const dir = tmpDir();
+  const day1a = Date.parse('2026-10-31T22:00:00.000Z');
+  const day1b = Date.parse('2026-10-31T23:15:00.000Z');
+  const day2 = Date.parse('2026-11-01T00:05:00.000Z');
+  const deps = {
+    write: async () => {
+      throw new Error('dry-run 不应写');
+    },
+    readToken: () => {
+      throw new Error('注入了看板，不应读令牌');
+    },
+  };
+  const first = await prioMain(dir, day1a, deps);
+  const second = await prioMain(dir, day1b, deps);
+  const file1 = path.join(dir, 'run-2026-10-31.log');
+  assert.equal(fs.existsSync(file1), true);
+  assert.equal(fs.readFileSync(file1, 'utf8'), [
+    `2026-10-31T22:00:00.000Z dry-run 1\n${first}`,
+    `2026-10-31T23:15:00.000Z dry-run 1\n${second}`,
+  ].join(''));
+  assert.equal(fs.existsSync(path.join(dir, 'run-2026-11-01.log')), false);
+  const snapshot = fs.readFileSync(file1);
+  const third = await prioMain(dir, day2, deps);
+  assert.deepEqual(fs.readFileSync(file1), snapshot);
+  assert.equal(
+    fs.readFileSync(path.join(dir, 'run-2026-11-01.log'), 'utf8'),
+    `2026-11-01T00:05:00.000Z dry-run 1\n${third}`,
+  );
+});
+
+test('#181 SC3 运行日志不含 readToken 返回的假令牌', async () => {
+  const dir = tmpDir();
+  const token = 'prio-log-fixture-token';
+  let reads = 0;
+  const stdout = await prioMain(dir, T0, {
+    readToken: () => {
+      reads += 1;
+      return token;
+    },
+  });
+  assert.equal(reads, 1);
+  const file = path.join(dir, runLogName(T0));
+  assert.equal(fs.existsSync(file), true);
+  const log = fs.readFileSync(file, 'utf8');
+  assert.equal(log.includes(token), false);
+  assert.equal(stdout.includes(token), false);
+});
+
+test('#181 --write 的运行头模式是 apply，stdout 仍是原来的汇总行', async () => {
+  const dir = tmpDir();
+  const gate = recorder();
+  const stdout = await prioMain(dir, T0, {
+    argv: ['--write'],
+    items: [item(1, { priority: 'P2' })],
+    write: gate.write,
+    readToken: () => 'prio-log-fixture-token',
+  });
+  assert.equal(gate.writes.length, 0);
+  const file = path.join(dir, runLogName(T0));
+  assert.equal(fs.existsSync(file), true);
+  const log = fs.readFileSync(file, 'utf8');
+  assert.equal(log, `2026-10-31T12:00:00.000Z apply 1\n${stdout}`);
+  assert.match(stdout, /写入：1 条，变更 0，写入 0，钉住 0/);
+  assert.equal(stdout.includes('apply'), false);
+});
+
+test('#181 --restore 也把运行头和 stdout 追加进当天日志', async () => {
+  const dir = tmpDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(path.join(dir, 'changes.jsonl'), `${JSON.stringify({
+    at: new Date(T0).toISOString(),
+    item: `${REPO}#1`,
+    repo: REPO,
+    issue: 1,
+    field: '优先级',
+    old: null,
+    new: 'P0',
+    basis: 'seed',
+  })}\n`);
+  const since = new Date(T0).toISOString();
+  const now = T0 + 1000;
+  const stdout = await prioMain(dir, now, {
+    argv: ['--restore', since],
+    items: [item(1, { priority: 'P0' })],
+    write: async () => {
+      throw new Error('restore dry-run 不应写');
+    },
+    readToken: () => {
+      throw new Error('注入了看板，不应读令牌');
+    },
+  });
+  assert.match(stdout, /dry-run：还原 1 条，写入 0/);
+  const log = fs.readFileSync(path.join(dir, runLogName(now)), 'utf8');
+  assert.equal(log, `${new Date(now).toISOString()} dry-run 1\n${stdout}`);
+  assert.equal(stdout.includes('dry-run 1'), false);
+});
