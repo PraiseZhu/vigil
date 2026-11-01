@@ -7,7 +7,10 @@
 // 依据只写进 changes.jsonl，不新增看板字段。60 天没动静只提醒「还要不要」，不关 issue。
 // repo-class.json 的 exclude 数组命中的仓：不打分、不写优先级和关联 PR、不提醒、不搜 PR、不还原。
 // 汇总只在有排除时追加「，排除 N 条」，N 是条数，不写仓名。stderr 不记跳过，只在 exclude 不是数组时警告一次。
-// 令牌只从 ~/acceptance/secrets/gh-priority-writer-token 读，不读环境变量，不写进日志和错误信息。
+// 读看板条目和 PR 走 profile 的 githubTokenFile（验收机读取通道），不用 project 写令牌。
+// 写「优先级」「关联 PR」的令牌只从 ~/acceptance/secrets/gh-priority-writer-token 读，
+// 不读环境变量，不写进日志和错误信息。缺写令牌只在真写时报错。
+// content 为 null 大于 0 时，汇总在「排除」之后再追加「，读不到内容 N 条」。运行日志另写跳过计数和告警。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -147,6 +150,31 @@ export function createPriorityGithub({ profile, token, run, fetchImpl }) {
   const rest = { ...profile };
   delete rest.writeCommand;
   return createGithub({ profile: rest, ownerToken: token, run, fetchImpl });
+}
+
+/** 去掉注释和空白后，必须以 query 或 { 开头，且不含 mutation / subscription。 */
+function assertReadChannelQuery(query) {
+  const text = String(query ?? '').replace(/#[^\n]*/g, '').replace(/\s+/g, '');
+  const lower = text.toLowerCase();
+  const readable = lower.startsWith('query') || text.startsWith('{');
+  if (!readable || lower.includes('mutation') || lower.includes('subscription')) {
+    throw new Error('读通道只做只读查询');
+  }
+}
+
+/**
+ * 读看板和 PR。不传 ownerToken，createGithub 才走 githubTokenFile。
+ * writeCommand 留着，但返回值只有 ownerGraphql，读令牌到不了 write()。
+ */
+export function createReadGithub({ profile, run, fetchImpl } = {}) {
+  if (!profile) throw new Error('createReadGithub 需要 profile');
+  const github = createGithub({ profile, run, fetchImpl });
+  return {
+    async ownerGraphql(query, variables) {
+      assertReadChannelQuery(query);
+      return github.ownerGraphql(query, variables);
+    },
+  };
 }
 
 export function parsePrioArgs(argv) {
@@ -391,6 +419,12 @@ function excludedSuffix(count) {
   return count > 0 ? `，排除 ${count} 条` : '';
 }
 
+function nullContentSuffix(count) {
+  const n = Number(count);
+  if (!Number.isInteger(n) || n <= 0) return '';
+  return `，读不到内容 ${n} 条`;
+}
+
 function repoOfRef(ref) {
   const item = String(ref || '');
   const hash = item.lastIndexOf('#');
@@ -409,13 +443,22 @@ function timeMs(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-export function mapItem(node, table = DEFAULT_REPO_CLASS_TABLE) {
-  if (!node || node.isArchived) return null;
+function skipReason(node) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) return 'invalid';
+  if (node.isArchived) return 'archived';
   const content = node.content;
-  if (!content || content.__typename !== 'Issue') return null;
+  if (content == null) return 'nullContent';
+  if (content.__typename !== 'Issue') return 'notIssue';
   const repo = content.repository?.nameWithOwner;
   const number = Number(content.number);
-  if (!repo || !Number.isInteger(number) || number <= 0) return null;
+  if (typeof repo !== 'string' || !repo || !Number.isInteger(number) || number <= 0) return 'invalid';
+  return null;
+}
+
+function mappedItem(node, table) {
+  const content = node.content;
+  const repo = content.repository.nameWithOwner;
+  const number = Number(content.number);
   const fields = valuesOf(node);
   const labels = (content.labels?.nodes || [])
     .map((label) => label?.name)
@@ -446,6 +489,11 @@ export function mapItem(node, table = DEFAULT_REPO_CLASS_TABLE) {
   };
 }
 
+export function mapItem(node, table = DEFAULT_REPO_CLASS_TABLE) {
+  if (skipReason(node)) return null;
+  return mappedItem(node, table);
+}
+
 function ciOf(node) {
   const state = node?.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state;
   const value = String(state || '').toUpperCase();
@@ -474,6 +522,7 @@ function mapPr(node) {
 
 export async function loadBoardItems(github, profile, table = DEFAULT_REPO_CLASS_TABLE) {
   const items = [];
+  const skipped = { archived: 0, notIssue: 0, nullContent: 0, invalid: 0 };
   let excludedCount = 0;
   let after = null;
   do {
@@ -485,8 +534,16 @@ export async function loadBoardItems(github, profile, table = DEFAULT_REPO_CLASS
     const conn = data?.user?.projectV2?.items;
     if (!conn) throw new Error(`找不到看板 #${profile.projectNumber}`);
     for (const node of conn.nodes || []) {
+      const reason = skipReason(node);
+      if (reason) {
+        skipped[reason] += 1;
+        continue;
+      }
       const mapped = mapItem(node, table);
-      if (!mapped) continue;
+      if (!mapped) {
+        skipped.invalid += 1;
+        continue;
+      }
       if (itemIsExcluded(mapped, table)) {
         excludedCount += 1;
         continue;
@@ -495,8 +552,7 @@ export async function loadBoardItems(github, profile, table = DEFAULT_REPO_CLASS
     }
     after = conn.pageInfo?.hasNextPage ? conn.pageInfo.endCursor : null;
   } while (after);
-  items.excludedCount = excludedCount;
-  return items;
+  return { items, skipped, excludedCount };
 }
 
 export async function loadPullRequests(github, repos, table = DEFAULT_REPO_CLASS_TABLE) {
@@ -649,6 +705,7 @@ export async function runPrioSync({
   stdout,
   table = DEFAULT_REPO_CLASS_TABLE,
   excludedCount: presetExcluded = 0,
+  nullContent = 0,
 } = {}) {
   if (!dir) throw new Error('缺少状态目录');
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
@@ -792,7 +849,7 @@ export async function runPrioSync({
   }
   saveDebounce(dir, nextItems);
   const excludedTotal = (Number.isInteger(presetExcluded) && presetExcluded > 0 ? presetExcluded : 0) + skippedHere;
-  outWrite(stdout, `${headOf(mode)}${items.length - skippedHere} 条，变更 ${changes.length}，写入 ${written}，钉住 ${pinned}${excludedSuffix(excludedTotal)}\n`);
+  outWrite(stdout, `${headOf(mode)}${items.length - skippedHere} 条，变更 ${changes.length}，写入 ${written}，钉住 ${pinned}${excludedSuffix(excludedTotal)}${nullContentSuffix(nullContent)}\n`);
   return { written, planned: changes.length, pinned, mode, excluded: excludedTotal };
 }
 
@@ -817,6 +874,8 @@ export async function restorePrio({
   stdout,
   items,
   table = DEFAULT_REPO_CLASS_TABLE,
+  excludedCount: _presetExcluded = 0,
+  nullContent = 0,
 } = {}) {
   if (!dir) throw new Error('缺少状态目录');
   const at = Date.parse(since);
@@ -902,7 +961,7 @@ export async function restorePrio({
     });
     written += 1;
   }
-  outWrite(stdout, `${headOf(mode)}还原 ${planned.length} 条，写入 ${written}${excludedSuffix(excludedRows)}\n`);
+  outWrite(stdout, `${headOf(mode)}还原 ${planned.length} 条，写入 ${written}${excludedSuffix(excludedRows)}${nullContentSuffix(nullContent)}\n`);
   return { written, planned: planned.length, mode, excluded: excludedRows };
 }
 
@@ -937,26 +996,44 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   let write = deps.write || null;
   let items = deps.loadItems ? await deps.loadItems() : null;
   let prs = deps.loadPrs ? await deps.loadPrs() : null;
-  // 注入 write 也不代替看板。restore 同样要有 items；没注入就自己读。PR 只在非 restore 时读。
-  const needGithub = !write || items == null || (!args.restore && prs == null);
-  if (needGithub) {
+  let skipped = null;
+  let boardExcluded = 0;
+  const needBoard = items == null;
+  const needPrs = !args.restore && prs == null;
+  if (needBoard || needPrs) {
+    const reader = createReadGithub({ profile, run: deps.run, fetchImpl: deps.fetchImpl });
+    if (needBoard) {
+      const board = await loadBoardItems(reader, profile, table);
+      items = board.items;
+      skipped = board.skipped;
+      boardExcluded = board.excludedCount;
+    }
+    if (needPrs) {
+      prs = await loadPullRequests(reader, [...new Set((items || []).map((entry) => entry.repo))], table);
+    }
+  }
+  if (args.write === true && !write && !fs.existsSync(disabledFile(dir))) {
     const token = deps.readToken ? deps.readToken() : readPriorityWriterToken(priorityTokenPath());
-    const github = createPriorityGithub({ profile, token, run: deps.run, fetchImpl: deps.fetchImpl });
-    if (!write) write = (action) => github.write(action);
-    if (items == null) {
-      items = await loadBoardItems(github, profile, table);
-    }
-    if (!args.restore && prs == null) {
-      prs = await loadPullRequests(github, [...new Set((items || []).map((entry) => entry.repo))], table);
-    }
+    const writer = createPriorityGithub({ profile, token, run: deps.run, fetchImpl: deps.fetchImpl });
+    write = (action) => writer.write(action);
   }
   const split = withoutExcludedItems(items || [], table);
   const loaded = split.items;
-  const excluded = (Number.isInteger(items?.excludedCount) ? items.excludedCount : 0) + split.excluded;
+  const excluded = boardExcluded + split.excluded;
   const logFile = runLogFile(dir, nowMs);
   const modeLabel = args.write === true ? 'apply' : 'dry-run';
   appendRunLog(logFile, `${new Date(nowMs).toISOString()} ${modeLabel} ${loaded.length}\n`);
+  if (skipped) {
+    appendRunLog(
+      logFile,
+      `跳过：已归档=${skipped.archived}，非 Issue=${skipped.notIssue}，content 为 null=${skipped.nullContent}，字段不合法=${skipped.invalid}\n`,
+    );
+    if (skipped.nullContent > 0) {
+      appendRunLog(logFile, `告警：content 为 null 的看板条目有 ${skipped.nullContent} 条，读通道没有拿到内容\n`);
+    }
+  }
   const loggedStdout = teeRunLog(stdout, logFile);
+  const nullContent = skipped ? skipped.nullContent : 0;
   if (args.restore) {
     return restorePrio({
       dir,
@@ -969,6 +1046,8 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       stdout: loggedStdout,
       items: loaded,
       table,
+      excludedCount: excluded,
+      nullContent,
     });
   }
   return runPrioSync({
@@ -983,6 +1062,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     stdout: loggedStdout,
     table,
     excludedCount: excluded,
+    nullContent,
   });
 }
 
