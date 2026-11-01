@@ -916,6 +916,7 @@ export async function runPrioSync({
           old: boardPriority,
           new: decision.priority,
           basis: basisFor(scored),
+          ...(typeof item.id === 'string' && item.id ? { itemId: item.id } : {}),
         });
         nextItems[ref] = mode === 'write' ? decision.next : holdUnwritten(input, decision, now);
       } else {
@@ -948,6 +949,7 @@ export async function runPrioSync({
           old: current,
           new: next,
           basis: LINK_BASIS,
+          ...(typeof item.id === 'string' && item.id ? { itemId: item.id } : {}),
         });
       }
     }
@@ -985,6 +987,7 @@ export async function runPrioSync({
       fields: { [change.field]: change.new },
       ref: change.item,
     };
+    if (typeof change.itemId === 'string' && change.itemId) action.itemId = change.itemId;
     assertPrioFields(action.fields);
     try {
       await write(action);
