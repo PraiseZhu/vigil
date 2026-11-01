@@ -12,12 +12,15 @@
 // 读看板条目和 PR 走 profile 的 githubTokenFile（验收机读取通道），不用 project 写令牌。
 // 写「优先级」「关联 PR」的令牌只从 ~/acceptance/secrets/gh-priority-writer-token 读，
 // 不读环境变量，不写进日志和错误信息。缺写令牌只在真写时报错。
+// 真写时，报错原文含 Could not resolve to a Repository 且含本条仓名：本拍跳过该仓（同仓后面的条目不再试），
+// 汇总和运行日志写明仓名、条数和原因（原因先脱敏）。不写入状态文件，下一拍再试。其它写失败仍整拍中止。--restore 不走这条。
 // content 为 null 大于 0 时，汇总在「排除」之后再追加「，读不到内容 N 条」。运行日志另写跳过计数和告警。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createGithub, PRIO_BOARD_FIELDS } from './github.mjs';
+import { redact } from './redact.mjs';
 import { checkSecretFile, loadAcceptanceProfile } from './profile.mjs';
 import { applyDebounce, PIN_LABEL, RULES, scorePriority } from './prio-score.mjs';
 import { linkedPrField, prIssueRefs } from './pr-link.mjs';
@@ -787,6 +790,41 @@ function headOf(mode) {
   return '写入：';
 }
 
+function errorText(error) {
+  if (error instanceof Error) return String(error.message || error);
+  return String(error ?? '');
+}
+
+/** 只认原文里的 Could not resolve to a Repository，且仓名就是本条要写的仓。对不上返回 null，调用方原样再抛。 */
+function unresolvableRepoReason(error, repo) {
+  const text = errorText(error);
+  if (!text.includes('Could not resolve to a Repository')) return null;
+  if (typeof repo !== 'string' || repo.length === 0) return null;
+  const escaped = repo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!new RegExp(`(?:^|[^A-Za-z0-9._/-])${escaped}(?=$|[^A-Za-z0-9._/-])`).test(text)) return null;
+  return text;
+}
+
+function restoreUnwrittenDebounce(nextItems, saved, ref) {
+  if (Object.prototype.hasOwnProperty.call(saved, ref)) nextItems[ref] = saved[ref];
+  else delete nextItems[ref];
+}
+
+function skipReport(skippedRepos) {
+  if (skippedRepos.size === 0) return { lines: [], suffix: '' };
+  const lines = [];
+  const parts = [];
+  for (const [repo, info] of skippedRepos) {
+    const reason = redact(info.reason);
+    lines.push(`跳过 ${repo} ${info.count} 条：${reason}\n`);
+    parts.push(`${repo} ${info.count} 条：${reason}`);
+  }
+  return {
+    lines,
+    suffix: `，跳过 ${skippedRepos.size} 个仓（${parts.join('；')}）`,
+  };
+}
+
 function outWrite(stdout, text) {
   (stdout || { write() {} }).write(text);
 }
@@ -921,12 +959,19 @@ export async function runPrioSync({
   }
 
   let written = 0;
+  const skippedRepos = new Map();
   for (const change of changes) {
     const basis = change.basis ? ` 依据：${change.basis}` : '';
     outWrite(stdout, `${change.item} ${change.field} ${show(change.old)} → ${show(change.new)}${basis}\n`);
     if (mode !== 'write') continue;
     if (change.field === '关联 PR' && !linkAllowed) {
       outWrite(stdout, LINK_HOLD);
+      continue;
+    }
+    const prior = skippedRepos.get(change.repo);
+    if (prior) {
+      prior.count += 1;
+      restoreUnwrittenDebounce(nextItems, saved, change.item);
       continue;
     }
     if (typeof write !== 'function') throw new Error('真写需要写闸');
@@ -941,7 +986,15 @@ export async function runPrioSync({
       ref: change.item,
     };
     assertPrioFields(action.fields);
-    await write(action);
+    try {
+      await write(action);
+    } catch (error) {
+      const reason = unresolvableRepoReason(error, change.repo);
+      if (reason == null) throw error;
+      skippedRepos.set(change.repo, { count: 1, reason });
+      restoreUnwrittenDebounce(nextItems, saved, change.item);
+      continue;
+    }
     appendChange(dir, {
       at: new Date(now).toISOString(),
       item: change.item,
@@ -961,8 +1014,10 @@ export async function runPrioSync({
     prCiOut = loaded.prCi;
   }
   saveDebounce(dir, nextItems, prCiOut);
+  const report = skipReport(skippedRepos);
+  for (const line of report.lines) outWrite(stdout, line);
   const excludedTotal = (Number.isInteger(presetExcluded) && presetExcluded > 0 ? presetExcluded : 0) + skippedHere;
-  outWrite(stdout, `${headOf(mode)}${items.length - skippedHere} 条，变更 ${changes.length}，写入 ${written}，钉住 ${pinned}${excludedSuffix(excludedTotal)}${nullContentSuffix(nullContent)}\n`);
+  outWrite(stdout, `${headOf(mode)}${items.length - skippedHere} 条，变更 ${changes.length}，写入 ${written}，钉住 ${pinned}${report.suffix}${excludedSuffix(excludedTotal)}${nullContentSuffix(nullContent)}\n`);
   return { written, planned: changes.length, pinned, mode, excluded: excludedTotal };
 }
 
