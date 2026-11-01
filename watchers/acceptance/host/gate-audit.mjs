@@ -21,7 +21,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GATE_ACTION_WRITE_TYPES, WRITE_TYPES, createGithub } from '../bin/github.mjs';
 import { isVerdictOnly, loadAcceptanceProfile, watcherHome } from '../bin/profile.mjs';
-import { ISSUE_COMMENTS_QUERY } from '../bin/rounds.mjs';
 import { repoTier } from '../bin/tasks.mjs';
 import { acquireLock, appendAlert, hostPaths, releaseLock } from './paths.mjs';
 import { loadScopes, scopeForEntry } from './scope-snapshot.mjs';
@@ -382,56 +381,116 @@ export function readLedgerLines(file) {
 }
 
 /**
+ * 审计用的只读评论查询。只要 databaseId / createdAt，窗口仍是最后 100 条。
+ * 轮次流程用的 ISSUE_COMMENTS_QUERY（在 bin/rounds.mjs）不改。
+ */
+export const AUDIT_COMMENTS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      comments(last: 100) {
+        nodes {
+          databaseId
+          createdAt
+        }
+      }
+    }
+  }
+}`;
+
+/** 同时在飞的评论查询上限。每个根仍是一次请求，结果按根在账本里出现的顺序合并。 */
+export const AUDIT_COMMENT_CONCURRENCY = 4;
+
+/** 一个根的评论节点 → 缺的轮次评论。满 100 条且窗口没盖住开轮时间时不下结论。 */
+function judgeRoundRoot(root, list, nodes, entries) {
+  const violations = [];
+  const ids = new Set(nodes.map((node) => str(node?.databaseId)));
+  const oldest = nodes.reduce((acc, node) => {
+    const at = Date.parse(node?.createdAt || '');
+    return Number.isFinite(at) && at < acc ? at : acc;
+  }, Infinity);
+  const full = nodes.length >= 100;
+  for (const value of list) {
+    if (ids.has(value.commentId)) continue;
+    const startedAt = Date.parse(entries[value.line - 1]?.at || '');
+    if (full && !(Number.isFinite(startedAt) && startedAt >= oldest)) continue;
+    violations.push(
+      makeFinding(value.line, 'round-comment-missing', {
+        type: 'comment.create',
+        key: str(entries[value.line - 1]?.dedupeKey),
+        root,
+        detail: `轮次评论 ${value.commentId}（${root} 第 ${value.round} 轮）`,
+      }),
+    );
+  }
+  return violations;
+}
+
+/** 固定数量的 worker 跑完 items，按下标放回结果。cursor 的自增发生在 await 之前，不会抢同一个下标。 */
+async function mapLimited(items, limit, worker) {
+  const results = new Array(items.length);
+  if (items.length === 0 || limit < 1) return results;
+  let cursor = 0;
+  const workers = Math.min(limit, items.length);
+  await Promise.all(
+    Array.from({ length: workers }, async () => {
+      while (cursor < items.length) {
+        const index = cursor;
+        cursor += 1;
+        results[index] = await worker(items[index]);
+      }
+    }),
+  );
+  return results;
+}
+
+/**
  * 只读查 GitHub：账本里开过的轮次评论还在不在（固定的只读评论查询，绝不写）。
  * 某个 issue 的评论超过查询窗口（100 条）且窗口没覆盖到那一轮的时间，就不下结论。
+ * 各根同时最多 AUDIT_COMMENT_CONCURRENCY 个请求；违规和错误仍按根的出现顺序排列。
  */
 export async function checkRoundComments({ rounds, entries, github }) {
   const out = [];
   const errors = [];
   if (!github || typeof github.graphql !== 'function') return { violations: out, errors, checked: 0 };
-  let checked = 0;
   const byRoot = new Map();
   for (const value of rounds.values()) {
     const list = byRoot.get(value.root) || [];
     list.push(value);
     byRoot.set(value.root, list);
   }
+  const jobs = [];
   for (const [root, list] of byRoot) {
     const match = REF.exec(root);
     if (!match) continue;
     const [owner, name] = match[1].split('/');
-    let nodes;
+    jobs.push({ root, list, owner, name, number: Number(match[2]) });
+  }
+  const fetched = await mapLimited(jobs, AUDIT_COMMENT_CONCURRENCY, async (job) => {
     try {
-      const data = await github.graphql(ISSUE_COMMENTS_QUERY, { owner, name, number: Number(match[2]) });
-      nodes = data?.repository?.issue?.comments?.nodes;
+      const data = await github.graphql(AUDIT_COMMENTS_QUERY, {
+        owner: job.owner,
+        name: job.name,
+        number: job.number,
+      });
+      return { nodes: data?.repository?.issue?.comments?.nodes };
     } catch (error) {
-      errors.push(`${root}：${str(error?.message || error).split('\n')[0].slice(0, 120)}`);
+      return { error };
+    }
+  });
+  let checked = 0;
+  for (let index = 0; index < jobs.length; index += 1) {
+    const job = jobs[index];
+    const result = fetched[index];
+    if (result?.error) {
+      errors.push(`${job.root}：${str(result.error?.message || result.error).split('\n')[0].slice(0, 120)}`);
       continue;
     }
-    if (!Array.isArray(nodes)) {
-      errors.push(`${root}：读不到评论`);
+    if (!Array.isArray(result?.nodes)) {
+      errors.push(`${job.root}：读不到评论`);
       continue;
     }
     checked += 1;
-    const ids = new Set(nodes.map((node) => str(node?.databaseId)));
-    const oldest = nodes.reduce((acc, node) => {
-      const at = Date.parse(node?.createdAt || '');
-      return Number.isFinite(at) && at < acc ? at : acc;
-    }, Infinity);
-    const full = nodes.length >= 100;
-    for (const value of list) {
-      if (ids.has(value.commentId)) continue;
-      const startedAt = Date.parse(entries[value.line - 1]?.at || '');
-      if (full && !(Number.isFinite(startedAt) && startedAt >= oldest)) continue;
-      out.push(
-        makeFinding(value.line, 'round-comment-missing', {
-          type: 'comment.create',
-          key: str(entries[value.line - 1]?.dedupeKey),
-          root,
-          detail: `轮次评论 ${value.commentId}（${root} 第 ${value.round} 轮）`,
-        }),
-      );
-    }
+    out.push(...judgeRoundRoot(job.root, job.list, result.nodes, entries));
   }
   return { violations: out, errors, checked };
 }

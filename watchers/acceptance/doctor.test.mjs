@@ -14,6 +14,7 @@ import {
   checkMaskConfig,
   probeAction,
   runDoctor,
+  skipGateAuditFromArgv,
 } from './bin/doctor.mjs';
 import { hostPaths } from './host/paths.mjs';
 import { OWNER, REPO, HANDOFF_REPO, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
@@ -454,4 +455,62 @@ test('T20 常驻循环：正在修正轮读取 60 秒、心跳新鲜 → 绿，�
   const check = checkOf(result, '常驻循环');
   assert.equal(check.ok, true, check.detail);
   assert.match(check.detail, /正在修正轮读取（已 60 秒，上限 180 秒）/);
+});
+
+function auditReply() {
+  return {
+    ok: true,
+    checkedLines: 7,
+    sinceBaseline: 0,
+    baseline: { at: '2026-02-01T00:00:00.000Z', lines: 7, violations: 0 },
+    githubErrors: [],
+    newViolations: [],
+    newUncertain: [],
+    uncertain24h: 0,
+  };
+}
+
+test('写闸账本审计：默认调用一次，输出和现在一样；--skip-gate-audit 不调用，项还在', async () => {
+  const fixture = makeFixture();
+  let calls = 0;
+  const once = await runDoctor({
+    profileEnv: fixture.profileEnv,
+    probes: makeProbes(),
+    github: makeGithub(),
+    now: () => NOW,
+    gateAudit: async () => {
+      calls += 1;
+      return auditReply();
+    },
+  });
+  const audit = checkOf(once, '写闸账本审计');
+  assert.equal(calls, 1);
+  assert.equal(audit.ok, true);
+  assert.equal(
+    audit.detail,
+    '核对 7 行；基线 2026-02-01T00:00:00.000Z（基线前 7 条，疑似违规 0 条）；基线后违规 0 条；拿不准 新 0 条、近 24 小时 0 条（只记日志）',
+  );
+  assert.equal(audit.detail.includes('这里跳过'), false);
+
+  let skippedCalls = 0;
+  const skipped = await runDoctor({
+    profileEnv: fixture.profileEnv,
+    probes: makeProbes(),
+    github: makeGithub(),
+    now: () => NOW,
+    skipGateAudit: true,
+    gateAudit: async () => {
+      skippedCalls += 1;
+      throw new Error('已经单独跑过审计，不该再跑');
+    },
+  });
+  const skippedAudit = checkOf(skipped, '写闸账本审计');
+  assert.equal(skippedCalls, 0);
+  assert.equal(skipped.checks.filter((check) => check.name === '写闸账本审计').length, 1);
+  assert.equal(skippedAudit.ok, true);
+  assert.equal(skippedAudit.detail, '本次体检已单独跑过审计，这里跳过');
+  assert.equal(skipped.ok, true, JSON.stringify(skipped.checks, null, 2));
+  assert.equal(skipGateAuditFromArgv(['node', 'doctor.mjs']), false);
+  assert.equal(skipGateAuditFromArgv(['node', 'doctor.mjs', '--skip-gate-audit']), true);
+  assert.equal(skipGateAuditFromArgv(['node', 'doctor.mjs', '--board-item', 'example-owner/example-repo#1']), false);
 });

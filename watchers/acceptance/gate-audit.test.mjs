@@ -14,8 +14,10 @@ import {
   VIEWER_QUERY,
   runDoctor,
 } from './bin/doctor.mjs';
-import { ISSUE_COMMENTS_QUERY } from './bin/rounds.mjs';
+import { READ_RETRY_DELAY_MS } from './bin/github.mjs';
 import {
+  AUDIT_COMMENT_CONCURRENCY,
+  AUDIT_COMMENTS_QUERY,
   AUDIT_RULES_VERSION,
   DEFINITE_RULES,
   RULE_TEXT,
@@ -300,7 +302,7 @@ test('轮次评论被删：只读查 GitHub 发现；评论满 100 条且窗口�
   const ok = await checkRoundComments({ rounds, entries: parsed, github: present });
   assert.deepEqual(ok.violations, []);
   assert.equal(ok.checked, 3);
-  for (const call of present.calls) assert.equal(call.query, ISSUE_COMMENTS_QUERY);
+  for (const call of present.calls) assert.equal(call.query, AUDIT_COMMENTS_QUERY);
 
   // 少了一条：报 round-comment-missing。
   const missing = fake((variables) =>
@@ -450,12 +452,12 @@ test('审计不写 GitHub：只发固定的只读评论查询，write 被调用�
   assert.deepEqual(result.newViolations, []);
   assert.deepEqual(result.githubErrors, []);
   assert.equal(calls.length, 3, '每个有轮次的 issue 各查一次');
-  for (const call of calls) assert.equal(call.query, ISSUE_COMMENTS_QUERY);
+  for (const call of calls) assert.equal(call.query, AUDIT_COMMENTS_QUERY);
 
   // 第二次跑（基线已建好）也一样只查评论，不写。
   const again = await runGateAudit({ home, profile: profile(), github, now: () => NOW, alert: false });
   assert.equal(again.ok, true);
-  for (const call of calls) assert.equal(call.query, ISSUE_COMMENTS_QUERY);
+  for (const call of calls) assert.equal(call.query, AUDIT_COMMENTS_QUERY);
 });
 
 test('Slack：gate-audit-violation 立即发、文案四段、明细转义后只进 blocks', () => {
@@ -840,7 +842,7 @@ test('GitHub 只读：轮次评论缺失报 definite、写提醒，且只发评�
   assert.equal(first.baseline.violations, 0);
   assert.equal(first.baseline.githubChecked, true);
   assert.ok(initial.calls.length > 0);
-  for (const call of initial.calls) assert.equal(call.query, ISSUE_COMMENTS_QUERY);
+  for (const call of initial.calls) assert.equal(call.query, AUDIT_COMMENTS_QUERY);
 
   const missing = roundGithub({ missing: new Set([1003]) });
   const second = await runGateAudit({ home, profile: profile(), github: missing, now: () => NOW });
@@ -851,7 +853,7 @@ test('GitHub 只读：轮次评论缺失报 definite、写提醒，且只发评�
   assert.equal(second.sinceBaseline, 1);
   assert.deepEqual(second.githubErrors, []);
   assert.ok(missing.calls.length > 0);
-  for (const call of missing.calls) assert.equal(call.query, ISSUE_COMMENTS_QUERY, '只许发固定的只读评论查询');
+  for (const call of missing.calls) assert.equal(call.query, AUDIT_COMMENTS_QUERY, '只许发固定的只读评论查询');
   const alerts = readAlerts(hostPaths(home)).filter((alert) => alert.kind === 'gate-audit-violation');
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0].count, 1);
@@ -1325,4 +1327,301 @@ test('规则升级重算：只有误报时清零，ok 变 true，不靠 ack', as
   const after = JSON.parse(fs.readFileSync(paths.auditStateFile, 'utf8'));
   assert.equal(after.acknowledgedAt, undefined, '没有走 ack');
   assert.equal(after.rulesVersion, AUDIT_RULES_VERSION);
+});
+
+// ---- 轮次评论读取：有限并发，结论和逐条串行一致（#191） ----
+
+const AUDIT_ROOT_REF = /^([A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+)#(\d+)$/;
+const COMMENT_AT = '2026-02-01T00:00:00.000Z';
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 改前 checkRoundComments 的逐条参考：判定、错误文案、合并顺序都照原循环。 */
+async function serialCheckRoundComments({ rounds, entries, github }) {
+  const violations = [];
+  const errors = [];
+  if (!github || typeof github.graphql !== 'function') return { violations, errors, checked: 0 };
+  let checked = 0;
+  const byRoot = new Map();
+  for (const value of rounds.values()) {
+    const list = byRoot.get(value.root) || [];
+    list.push(value);
+    byRoot.set(value.root, list);
+  }
+  for (const [root, list] of byRoot) {
+    const match = AUDIT_ROOT_REF.exec(root);
+    if (!match) continue;
+    const [owner, name] = match[1].split('/');
+    let nodes;
+    try {
+      const data = await github.graphql('serial-reference', { owner, name, number: Number(match[2]) });
+      nodes = data?.repository?.issue?.comments?.nodes;
+    } catch (error) {
+      const message = error?.message || error;
+      const text = message === undefined || message === null ? '' : String(message);
+      errors.push(`${root}：${text.split('\n')[0].slice(0, 120)}`);
+      continue;
+    }
+    if (!Array.isArray(nodes)) {
+      errors.push(`${root}：读不到评论`);
+      continue;
+    }
+    checked += 1;
+    const ids = new Set(nodes.map((node) => (node?.databaseId === undefined || node?.databaseId === null ? '' : String(node.databaseId))));
+    const oldest = nodes.reduce((acc, node) => {
+      const at = Date.parse(node?.createdAt || '');
+      return Number.isFinite(at) && at < acc ? at : acc;
+    }, Infinity);
+    const full = nodes.length >= 100;
+    for (const value of list) {
+      if (ids.has(value.commentId)) continue;
+      const startedAt = Date.parse(entries[value.line - 1]?.at || '');
+      if (full && !(Number.isFinite(startedAt) && startedAt >= oldest)) continue;
+      const key = entries[value.line - 1]?.dedupeKey;
+      violations.push({
+        line: value.line,
+        rule: 'round-comment-missing',
+        type: 'comment.create',
+        key: key === undefined || key === null ? '' : String(key),
+        root,
+        text: RULE_TEXT['round-comment-missing'],
+        detail: `轮次评论 ${value.commentId}（${root} 第 ${value.round} 轮）`,
+        level: ruleLevel('round-comment-missing'),
+      });
+    }
+  }
+  return { violations, errors, checked };
+}
+
+/** 每个根两条轮次评论。偶数号缺第二条。另放一个对不上 issue 引用的根（两边都应跳过）。 */
+function manyRoundComments(count) {
+  const rounds = new Map();
+  const entries = [];
+  for (let number = 1; number <= count; number += 1) {
+    const root = `example-org/audit-repo#${number}`;
+    for (let round = 1; round <= 2; round += 1) {
+      entries.push({ at: COMMENT_AT, dedupeKey: `round-start:${root}:${round}` });
+      const commentId = String(100000 + number * 10 + round);
+      rounds.set(`${number}:${round}`, { root, commentId, line: entries.length, round });
+    }
+  }
+  entries.push({ at: COMMENT_AT, dedupeKey: 'not-a-round' });
+  rounds.set('bad', { root: 'not-a-ref', commentId: '1', line: entries.length, round: 1 });
+  return { rounds, entries };
+}
+
+function nodesForMany(variables) {
+  const number = variables.number;
+  const ids = [100000 + number * 10 + 1];
+  if (number % 2 === 1) ids.push(100000 + number * 10 + 2);
+  return ids.map((id) => ({ databaseId: id, createdAt: COMMENT_AT }));
+}
+
+function trackingGithub({ nodesFor, delayMs = 0, delayFor, failFor }) {
+  let inFlight = 0;
+  let peak = 0;
+  const calls = [];
+  return {
+    calls,
+    get peak() {
+      return peak;
+    },
+    async graphql(query, variables) {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      calls.push({ query, variables });
+      try {
+        const wait = delayFor ? delayFor(variables) : delayMs;
+        if (wait > 0) await sleep(wait);
+        if (failFor) {
+          const failed = failFor(variables);
+          if (failed) throw failed;
+        }
+        const nodes = nodesFor(variables);
+        if (nodes === undefined) return { repository: { issue: null } };
+        return { repository: { issue: { comments: { nodes } } } };
+      } finally {
+        inFlight -= 1;
+      }
+    },
+  };
+}
+
+test('轮次评论并发读取：≥70 个根，在飞峰值 >1 且 ≤4，查询不含正文和作者', async () => {
+  const count = 70;
+  const { rounds, entries } = manyRoundComments(count);
+  const github = trackingGithub({ nodesFor: nodesForMany, delayMs: 40 });
+  const result = await checkRoundComments({ rounds, entries, github });
+  const serial = await serialCheckRoundComments({
+    rounds,
+    entries,
+    github: trackingGithub({ nodesFor: nodesForMany }),
+  });
+  assert.deepEqual(result, serial);
+  assert.equal(github.calls.length, count, '每个对得上的根各查一次');
+  assert.ok(AUDIT_COMMENT_CONCURRENCY > 1 && AUDIT_COMMENT_CONCURRENCY <= 4);
+  assert.ok(github.peak > 1, `在飞峰值应大于 1，实际 ${github.peak}`);
+  assert.ok(github.peak <= AUDIT_COMMENT_CONCURRENCY, `在飞峰值应 ≤${AUDIT_COMMENT_CONCURRENCY}，实际 ${github.peak}`);
+  console.log(`checkRoundComments in-flight peak=${github.peak} roots=${count}`);
+  for (const call of github.calls) {
+    assert.equal(call.query.includes('body'), false, call.query);
+    assert.equal(call.query.includes('author'), false, call.query);
+    assert.match(call.query, /databaseId/);
+    assert.match(call.query, /createdAt/);
+    assert.match(call.query, /last:\s*100/);
+    assert.match(call.query, /^\s*query\b/);
+    assert.doesNotMatch(call.query, /\bmutation\b/);
+    assert.equal(call.variables.owner, 'example-org');
+    assert.equal(call.variables.name, 'audit-repo');
+  }
+  const asked = github.calls.map((call) => call.variables.number).sort((a, b) => a - b);
+  assert.deepEqual(asked, Array.from({ length: count }, (_, index) => index + 1));
+});
+
+test('轮次评论乱序返回：违规、错误和 checked 的顺序仍和串行版一致', async () => {
+  const count = 72;
+  const { rounds, entries } = manyRoundComments(count);
+  const github = trackingGithub({
+    nodesFor: nodesForMany,
+    delayFor: (variables) => count - variables.number,
+  });
+  const result = await checkRoundComments({ rounds, entries, github });
+  const serial = await serialCheckRoundComments({
+    rounds,
+    entries,
+    github: trackingGithub({ nodesFor: nodesForMany }),
+  });
+  assert.deepEqual(result.violations, serial.violations);
+  assert.deepEqual(result.errors, serial.errors);
+  assert.equal(result.checked, serial.checked);
+  assert.equal(result.checked, count);
+  assert.ok(result.violations.length >= 36);
+  assert.deepEqual(
+    result.violations.map((item) => item.root),
+    serial.violations.map((item) => item.root),
+  );
+});
+
+test('轮次评论读失败：只记对应的根，格式不变，其余照判；读重试间隔仍是 4000', async () => {
+  assert.equal(READ_RETRY_DELAY_MS, 4000);
+  const rounds = new Map();
+  const entries = [];
+  for (let number = 1; number <= 5; number += 1) {
+    const root = `example-org/audit-repo#${number}`;
+    entries.push({ at: COMMENT_AT, dedupeKey: `round-start:${root}:1` });
+    rounds.set(String(number), { root, commentId: String(3000 + number), line: entries.length, round: 1 });
+  }
+  const longLine = '错'.repeat(130);
+  const github = trackingGithub({
+    nodesFor: (variables) => {
+      if (variables.number === 5) return undefined;
+      if (variables.number === 2 || variables.number === 4) return [{ databaseId: 1, createdAt: COMMENT_AT }];
+      return [{ databaseId: 3000 + variables.number, createdAt: COMMENT_AT }];
+    },
+    failFor: (variables) => (variables.number === 3 ? new Error(`${longLine}\n第二行不该进错误`) : null),
+  });
+  const result = await checkRoundComments({ rounds, entries, github });
+  const serial = await serialCheckRoundComments({
+    rounds,
+    entries,
+    github: trackingGithub({
+      nodesFor: (variables) => {
+        if (variables.number === 5) return undefined;
+        if (variables.number === 2 || variables.number === 4) return [{ databaseId: 1, createdAt: COMMENT_AT }];
+        return [{ databaseId: 3000 + variables.number, createdAt: COMMENT_AT }];
+      },
+      failFor: (variables) => (variables.number === 3 ? new Error(`${longLine}\n第二行不该进错误`) : null),
+    }),
+  });
+  assert.deepEqual(result, serial);
+  assert.deepEqual(result.errors, [
+    `example-org/audit-repo#3：${'错'.repeat(120)}`,
+    'example-org/audit-repo#5：读不到评论',
+  ]);
+  assert.deepEqual(
+    result.violations.map((item) => item.root),
+    ['example-org/audit-repo#2', 'example-org/audit-repo#4'],
+  );
+  assert.equal(result.checked, 3);
+});
+
+test('评论满 100 条：开轮早于最老一条不下结论，晚于最老一条照报', async () => {
+  const oldest = '2026-06-01T00:00:00.000Z';
+  const newer = '2026-08-01T00:00:00.000Z';
+  const rounds = new Map();
+  const entries = [];
+  const cases = [
+    { number: 1, at: '2026-01-01T00:00:00.000Z', length: 100, expect: false },
+    { number: 2, at: '2026-07-01T00:00:00.000Z', length: 100, expect: true },
+    { number: 3, at: '2026-01-01T00:00:00.000Z', length: 99, expect: true },
+    { number: 4, at: '', length: 100, expect: false },
+  ];
+  for (const item of cases) {
+    const root = `example-org/audit-repo#${item.number}`;
+    entries.push({ at: item.at, dedupeKey: `round-start:${root}:1` });
+    rounds.set(String(item.number), { root, commentId: '9999', line: entries.length, round: 1 });
+  }
+  const nodesFor = (variables) => {
+    const item = cases.find((entry) => entry.number === variables.number);
+    return Array.from({ length: item.length }, (_, index) => ({
+      databaseId: 8000 + index,
+      createdAt: index === 0 ? newer : oldest,
+    }));
+  };
+  const result = await checkRoundComments({
+    rounds,
+    entries,
+    github: trackingGithub({ nodesFor }),
+  });
+  const serial = await serialCheckRoundComments({
+    rounds,
+    entries,
+    github: trackingGithub({ nodesFor }),
+  });
+  assert.deepEqual(result, serial);
+  assert.deepEqual(
+    result.violations.map((item) => item.root),
+    ['example-org/audit-repo#2', 'example-org/audit-repo#3'],
+  );
+});
+
+test('旧状态文件：version 1、没有新字段，再跑审计不报错，cursor、seen、baseline 不变', async () => {
+  const home = homeWithLedger(compliantEntries());
+  await runGateAudit({ home, profile: profile(), now: () => NOW });
+  const paths = auditPaths(home);
+  const planted = JSON.parse(fs.readFileSync(paths.auditStateFile, 'utf8'));
+  const oldKeys = ['version', 'baseline', 'cursor', 'prefixHash', 'rulesVersion', 'sinceBaseline', 'uncertainSinceBaseline', 'lastRunAt', 'seen'];
+  const oldState = {};
+  for (const key of oldKeys) oldState[key] = planted[key];
+  assert.equal(oldState.version, 1);
+  assert.equal(Object.hasOwn(oldState, 'commentCache'), false);
+  fs.writeFileSync(paths.auditStateFile, `${JSON.stringify(oldState, null, 2)}\n`);
+  const result = await runGateAudit({ home, profile: profile(), now: () => NOW + 1000 });
+  assert.equal(result.ok, true);
+  const after = JSON.parse(fs.readFileSync(paths.auditStateFile, 'utf8'));
+  assert.equal(after.cursor, oldState.cursor);
+  assert.deepEqual(after.seen, oldState.seen);
+  assert.deepEqual(after.baseline, oldState.baseline);
+});
+
+test('假 GitHub 每请求 200ms、70 个根：并发耗时低于串行的 50%', { timeout: 180000 }, async () => {
+  const count = 70;
+  const delayMs = 200;
+  const { rounds, entries } = manyRoundComments(count);
+  const serialGithub = trackingGithub({ nodesFor: nodesForMany, delayMs });
+  const serialStarted = performance.now();
+  await serialCheckRoundComments({ rounds, entries, github: serialGithub });
+  const serialMs = performance.now() - serialStarted;
+  const concurrentGithub = trackingGithub({ nodesFor: nodesForMany, delayMs });
+  const concurrentStarted = performance.now();
+  const result = await checkRoundComments({ rounds, entries, github: concurrentGithub });
+  const concurrentMs = performance.now() - concurrentStarted;
+  console.log(
+    `checkRoundComments timing: serial=${serialMs.toFixed(0)}ms concurrent=${concurrentMs.toFixed(0)}ms roots=${count} delay=${delayMs}ms`,
+  );
+  assert.equal(result.checked, count);
+  assert.ok(concurrentGithub.peak > 1 && concurrentGithub.peak <= 4, `peak=${concurrentGithub.peak}`);
+  assert.ok(concurrentMs < serialMs * 0.5, `concurrent ${concurrentMs.toFixed(0)}ms serial ${serialMs.toFixed(0)}ms`);
 });

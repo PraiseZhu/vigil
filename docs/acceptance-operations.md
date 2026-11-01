@@ -454,6 +454,7 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 - `写闸账本审计`：只读跑一次写闸账本审计（第 3 节的 `state/write-gate/ledger.jsonl`），看有没有越规写入；
   明细报「核对了多少行、基线是什么、基线后违规几条、拿不准几条、这次新发现哪几条」。只有**明确违规**让这一项变红；
   「拿不准」只记日志（明细里报出来），GitHub 只读核对没做成也照旧写进明细但不改变红绿。审计内部出错只报这一项失败。
+  这一轮已经单独跑过审计时，加 `--skip-gate-audit`：这一项仍在，明细写「本次体检已单独跑过审计，这里跳过」，算通过，不再查 GitHub。不传则照旧跑一遍。
 - `令牌文件`：`…TokenFile` / App 私钥文件全部通过 600、属主当前用户、非空检查。
 - `Slack 频道`：只读——bot 令牌能过 `auth.test`，bot 在 `slackChannelId` 那个频道里（`conversations.info`
   的 `is_member`；令牌没有 `channels:read` / `groups:read` 就退到 `conversations.history limit=1`，bot 不在频道里
@@ -496,6 +497,8 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 - 常驻循环每拍跑一次（只读本地账本，**不查 GitHub**），结果写进 `heartbeat.lastTick.gateAudit`
   （`checked` / `found` / `sinceBaseline` / `uncertain`）；出错只写 `heartbeat.lastTick.gateAuditError`，不影响这一拍。
 - `doctor` 的「写闸账本审计」和手动运行会带上 `--github` 的只读评论核对。
+  已经单独跑过时：`node watchers/acceptance/bin/doctor.mjs --skip-gate-audit`（项名不变，算通过，不再查一遍）。默认不跳过。
+  评论按 issue 根有限并发读取（同时最多 4 个请求），只取 `databaseId` 和 `createdAt`，窗口仍是最后 100 条。
 - 单独跑：`node watchers/acceptance/host/gate-audit.mjs [--github] [--no-alert] [--json]`
   （`--no-alert` 只写审计日志、不写提醒；`--json` 只打一行 JSON）。
 - 只想看最近出了些啥：`node watchers/acceptance/host/gate-audit.mjs --summary [--hours N] [--json]`。
