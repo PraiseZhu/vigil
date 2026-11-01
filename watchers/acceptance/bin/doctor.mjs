@@ -157,6 +157,7 @@ export async function runDoctor({
   hostConfig,
   slackCheck = checkSlackAccess,
   gateAudit = (options) => runGateAudit(options),
+  skipGateAudit = false,
 } = {}) {
   const checks = [];
   const add = (name, ok, detail = '') => {
@@ -384,29 +385,34 @@ export async function runDoctor({
 
   // 写闸账本审计（只读）：旁路核对写闸账本里已执行的写入，看有没有越规的。只读本地账本 + 只读查轮次评论。
   // 只有明确违规才让这一项变红；「拿不准」只记日志（detail 里报出来），GitHub 没查成也照旧写进 detail 但不改变红绿。
-  try {
-    const audit = await gateAudit({ home, profile, github: api, now });
-    const parts = [];
-    if (audit?.busy) {
-      parts.push('另一处审计正在跑，这次跳过');
-    } else {
-      parts.push(`核对 ${Number(audit?.checkedLines) || 0} 行`);
-      if (audit?.baseline) {
-        parts.push(
-          `基线 ${audit.baseline.at}（基线前 ${Number(audit.baseline.lines) || 0} 条，疑似违规 ${Number(audit.baseline.violations) || 0} 条）`,
-        );
+  // skipGateAudit：调用方这一轮已经单独跑过审计，这里不再查一遍。项名不变，算通过。
+  if (skipGateAudit) {
+    add('写闸账本审计', true, '本次体检已单独跑过审计，这里跳过');
+  } else {
+    try {
+      const audit = await gateAudit({ home, profile, github: api, now });
+      const parts = [];
+      if (audit?.busy) {
+        parts.push('另一处审计正在跑，这次跳过');
+      } else {
+        parts.push(`核对 ${Number(audit?.checkedLines) || 0} 行`);
+        if (audit?.baseline) {
+          parts.push(
+            `基线 ${audit.baseline.at}（基线前 ${Number(audit.baseline.lines) || 0} 条，疑似违规 ${Number(audit.baseline.violations) || 0} 条）`,
+          );
+        }
+        parts.push(`基线后违规 ${Number(audit?.sinceBaseline) || 0} 条`);
+        const uncertainNew = Array.isArray(audit?.newUncertain) ? audit.newUncertain.length : 0;
+        parts.push(`拿不准 新 ${uncertainNew} 条、近 24 小时 ${Number(audit?.uncertain24h) || 0} 条（只记日志）`);
       }
-      parts.push(`基线后违规 ${Number(audit?.sinceBaseline) || 0} 条`);
-      const uncertainNew = Array.isArray(audit?.newUncertain) ? audit.newUncertain.length : 0;
-      parts.push(`拿不准 新 ${uncertainNew} 条、近 24 小时 ${Number(audit?.uncertain24h) || 0} 条（只记日志）`);
+      const githubErrors = Array.isArray(audit?.githubErrors) ? audit.githubErrors : [];
+      if (githubErrors.length > 0) parts.push(`GitHub 只读核对没做成：${githubErrors.join('；')}`);
+      const fresh = Array.isArray(audit?.newViolations) ? audit.newViolations : [];
+      if (fresh.length > 0) parts.push(`这次新发现：${fresh.slice(0, 3).map(describeViolation).join('；')}`);
+      add('写闸账本审计', audit?.ok, parts.join('；'));
+    } catch (error) {
+      add('写闸账本审计', false, firstLine(error?.message));
     }
-    const githubErrors = Array.isArray(audit?.githubErrors) ? audit.githubErrors : [];
-    if (githubErrors.length > 0) parts.push(`GitHub 只读核对没做成：${githubErrors.join('；')}`);
-    const fresh = Array.isArray(audit?.newViolations) ? audit.newViolations : [];
-    if (fresh.length > 0) parts.push(`这次新发现：${fresh.slice(0, 3).map(describeViolation).join('；')}`);
-    add('写闸账本审计', audit?.ok, parts.join('；'));
-  } catch (error) {
-    add('写闸账本审计', false, firstLine(error?.message));
   }
 
   // 令牌文件从原始 profile.json 算（loadAcceptanceProfile 只回白名单键，新增的 …TokenFile 键看不到）。
@@ -458,8 +464,14 @@ export async function runDoctor({
   return { ok: checks.every((check) => check.ok), checks };
 }
 
+/** 命令行显式跳过写闸账本审计。不传则照旧跑。 */
+export function skipGateAuditFromArgv(argv = process.argv) {
+  return argv.includes('--skip-gate-audit');
+}
+
 async function main() {
   // --board-item 已不需要（看板写回改成只读判断）；还传的话忽略。
+  // --skip-gate-audit：这一轮体检已经单独跑过写闸账本审计，doctor 里不再查一遍。
   let probes;
   let hostConfig;
   try {
@@ -474,7 +486,12 @@ async function main() {
   } catch {
     probes = undefined;
   }
-  const result = await runDoctor({ profileEnv: process.env, probes, hostConfig });
+  const result = await runDoctor({
+    profileEnv: process.env,
+    probes,
+    hostConfig,
+    skipGateAudit: skipGateAuditFromArgv(process.argv),
+  });
   for (const check of result.checks) {
     if (check.ok) process.stdout.write(`✓ ${check.name}\n`);
     else process.stdout.write(`✗ ${check.name}：${check.detail}\n`);
