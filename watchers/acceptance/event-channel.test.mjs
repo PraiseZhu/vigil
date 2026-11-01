@@ -81,6 +81,13 @@ function sharedStorage() {
     async delete(key) {
       map.delete(key);
     },
+    async list({ prefix = '' } = {}) {
+      const out = new Map();
+      for (const [key, value] of map) {
+        if (String(key).startsWith(prefix)) out.set(key, structuredClone(value));
+      }
+      return out;
+    },
     async transaction(fn) {
       return fn(storage);
     },
@@ -93,6 +100,68 @@ async function pullIds(worker, env) {
   assert.equal(response.status, 200);
   const body = await response.json();
   return body.events.map((event) => event.deliveryId);
+}
+
+// 单个值的字节上限。用来模拟 Durable Object 存储拒绝超限写入；上限本身比文档上的 128 KiB 更小。
+function limitedStorage(maxBytes) {
+  const map = new Map();
+  const storage = {
+    async get(key) {
+      if (!map.has(key)) return undefined;
+      return structuredClone(map.get(key));
+    },
+    async put(key, value) {
+      const bytes = new TextEncoder().encode(JSON.stringify(value)).byteLength;
+      if (bytes > maxBytes) throw new Error(`value for ${key} exceeds ${maxBytes} bytes (${bytes})`);
+      map.set(key, structuredClone(value));
+    },
+    async delete(key) {
+      map.delete(key);
+    },
+    async list({ prefix = '' } = {}) {
+      const out = new Map();
+      for (const [key, value] of map) {
+        if (String(key).startsWith(prefix)) out.set(key, structuredClone(value));
+      }
+      return out;
+    },
+    async transaction(fn) {
+      return fn(storage);
+    },
+  };
+  return storage;
+}
+
+const VALUE_LIMIT_BYTES = 32 * 1024;
+
+function smallPayload(extra = {}) {
+  return JSON.stringify({
+    created_at: '2026-10-31T00:00:00.000Z',
+    action: 'opened',
+    repository: { full_name: 'example-org/example-repo' },
+    issue: { number: 7 },
+    ...extra,
+  });
+}
+
+function largePayload(number) {
+  return JSON.stringify({
+    created_at: '2026-10-31T00:00:00.000Z',
+    action: 'opened',
+    repository: { full_name: 'example-org/example-repo' },
+    issue: { number },
+    padding: `PADDING-186-${'x'.repeat(48 * 1024)}`,
+  });
+}
+
+async function postWebhook(worker, env, body, delivery, event = 'issues') {
+  let response;
+  try {
+    response = await worker.fetch(webhookRequest(body, { delivery, event }), env);
+  } catch (err) {
+    assert.fail(`写入 ${delivery} 失败: ${err.message}`);
+  }
+  assert.equal(response.status, 204, delivery);
 }
 
 test('SC1 签名不对返回 401 且不入队；签名对上才入队；拉取令牌不对不把队列取走', async () => {
@@ -576,4 +645,242 @@ test('SC4 authorization 多值头时 /pull 返回 401 且不清队列', async ()
   const denied = await worker.fetch(new Request('https://example.invalid/pull', { method: 'GET', headers }), env);
   assert.equal(denied.status, 401);
   assert.deepEqual(await pullIds(worker, env), ['stay-multi']);
+});
+
+test('#186 SC1 单值上限下 4096 条去重和大 payload 仍能全部拉取，去重仍生效', async () => {
+  assert.ok(VALUE_LIMIT_BYTES < 128 * 1024);
+  const storage = limitedStorage(VALUE_LIMIT_BYTES);
+  const worker = createEventWorker({ storage, now: () => 1_700_000_000_000 });
+  const env = workerEnv();
+  const pending = [];
+  for (let i = 0; i < 4096; i += 1) {
+    const delivery = `seen-${i}`;
+    await postWebhook(worker, env, smallPayload(), delivery);
+    pending.push(delivery);
+    if (pending.length === 200) {
+      const acked = await worker.fetch(ackRequest(pending), env);
+      assert.equal(acked.status, 204);
+      pending.length = 0;
+    }
+  }
+  if (pending.length) {
+    const acked = await worker.fetch(ackRequest(pending), env);
+    assert.equal(acked.status, 204);
+    pending.length = 0;
+  }
+
+  await postWebhook(worker, env, smallPayload({ marker: 'small-payload' }), 'small-keep');
+  await postWebhook(worker, env, largePayload(186), 'large-1');
+  await postWebhook(worker, env, largePayload(187), 'large-2');
+  await postWebhook(worker, env, largePayload(188), 'large-3');
+
+  await postWebhook(worker, env, smallPayload(), 'seen-100');
+  await postWebhook(worker, env, largePayload(186), 'large-1');
+  await postWebhook(worker, env, smallPayload({ marker: 'small-payload' }), 'small-keep');
+
+  const pulled = await worker.fetch(pullRequest(TOKEN), env);
+  assert.equal(pulled.status, 200);
+  const body = await pulled.json();
+  assert.deepEqual(body.events.map((event) => event.deliveryId), ['small-keep', 'large-1', 'large-2', 'large-3']);
+
+  const small = body.events[0];
+  assert.equal(small.payload.marker, 'small-payload');
+  assert.equal(small.payloadOmitted, undefined);
+
+  for (const event of body.events.slice(1)) {
+    assert.equal(event.event, 'issues');
+    assert.equal(event.repo, 'example-org/example-repo');
+    assert.equal(event.payloadOmitted, true);
+    assert.equal(event.payload, undefined);
+    assert.equal(JSON.stringify(event).includes('PADDING-186'), false);
+  }
+  assert.equal(body.events[1].number, 186);
+  assert.equal(body.events[2].number, 187);
+  assert.equal(body.events[3].number, 188);
+
+  const keys = [...(await storage.list({ prefix: '' })).keys()];
+  assert.equal(keys.includes('queue'), false);
+  assert.equal(keys.includes('seen'), false);
+  assert.equal(keys.filter((key) => key.startsWith('s:')).length, 4096);
+  assert.equal(keys.filter((key) => key.startsWith('q:')).length, 4);
+  for (const [, value] of await storage.list({ prefix: 'q:' })) {
+    assert.equal(JSON.stringify(value).includes('PADDING-186'), false);
+  }
+
+  const hydrated = [];
+  let fetches = 0;
+  let t = 0;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 1,
+    pull: async () => body.events,
+    poll: async () => [],
+    loadPayload: async (event) => {
+      fetches += 1;
+      assert.equal(event.payloadOmitted, true);
+      return { marker: 'fetched-from-github', repo: event.repo, number: event.number };
+    },
+    onEvent: async (event) => {
+      hydrated.push(event);
+    },
+    latencyFile: path.join(tmpDir(), '.prio', 'latency.jsonl'),
+  });
+  assert.equal(fetches, 3);
+  assert.deepEqual(hydrated.map((event) => event.deliveryId), ['small-keep', 'large-1', 'large-2', 'large-3']);
+  assert.equal(hydrated[0].payload.marker, 'small-payload');
+  assert.ok(hydrated.slice(1).every((event) => event.payload.marker === 'fetched-from-github'));
+});
+
+test('#186 SC2 同一事件连续失败 5 次后被确认移出，留下放弃记录，同批其他事件照常处理', async () => {
+  const worker = createEventWorker({ now: () => 1_700_000_000_000 });
+  const env = workerEnv();
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  await postWebhook(worker, env, smallPayload(), 'ok-1');
+  await postWebhook(worker, env, smallPayload(), 'bad-186', 'pull_request');
+  await postWebhook(worker, env, smallPayload(), 'ok-2');
+
+  const fetchImpl = (url, init = {}) => worker.fetch(new Request(url, init), env);
+  async function reportFailure(event, error) {
+    const { reportEventFailure } = await import('./bin/event-pull.mjs');
+    return reportEventFailure({
+      url: 'https://example.invalid/pull',
+      token: TOKEN,
+      id: event.deliveryId,
+      error: error?.message || String(error),
+      fetchImpl,
+    });
+  }
+
+  const handled = [];
+  const confirmed = [];
+  const pulled = [];
+  let t = 0;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 4000,
+    pull: async () => {
+      const events = await pullFromWorker({
+        url: 'https://example.invalid/pull',
+        token: TOKEN,
+        fetchImpl,
+      });
+      pulled.push(events.map((event) => event.deliveryId));
+      return events;
+    },
+    confirm: async (ids) => {
+      confirmed.push(ids);
+      const { confirmPulledEvents } = await import('./bin/event-pull.mjs');
+      await confirmPulledEvents({
+        url: 'https://example.invalid/pull',
+        token: TOKEN,
+        ids,
+        fetchImpl,
+      });
+    },
+    reportFailure,
+    poll: async () => [],
+    onEvent: async (event) => {
+      handled.push(event.deliveryId);
+      if (event.deliveryId === 'bad-186') throw new Error('handler failed: boom-186');
+    },
+    latencyFile,
+  });
+
+  assert.deepEqual(pulled, [
+    ['ok-1', 'bad-186', 'ok-2'],
+    ['bad-186'],
+  ]);
+  assert.deepEqual(handled, ['ok-1', 'bad-186', 'ok-2', 'bad-186']);
+  assert.deepEqual(confirmed, [['ok-1', 'ok-2']]);
+  assert.equal(fs.readFileSync(latencyFile, 'utf8').includes('放弃'), false);
+  assert.deepEqual(await pullIds(worker, env), ['bad-186']);
+
+  const handledAgain = [];
+  const confirmedAgain = [];
+  const pulledAgain = [];
+  let pulls = 0;
+  t = 0;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 8000,
+    pull: async () => {
+      pulls += 1;
+      if (pulls === 3) await postWebhook(worker, env, smallPayload(), 'ok-3');
+      const events = await pullFromWorker({
+        url: 'https://example.invalid/pull',
+        token: TOKEN,
+        fetchImpl,
+      });
+      pulledAgain.push(events.map((event) => event.deliveryId));
+      return events;
+    },
+    confirm: async (ids) => {
+      confirmedAgain.push(ids);
+      const { confirmPulledEvents } = await import('./bin/event-pull.mjs');
+      await confirmPulledEvents({
+        url: 'https://example.invalid/pull',
+        token: TOKEN,
+        ids,
+        fetchImpl,
+      });
+    },
+    reportFailure,
+    poll: async () => [],
+    onEvent: async (event) => {
+      handledAgain.push(event.deliveryId);
+      if (event.deliveryId === 'bad-186') throw new Error('handler failed: boom-186');
+    },
+    latencyFile,
+  });
+
+  assert.deepEqual(pulledAgain, [
+    ['bad-186'],
+    ['bad-186'],
+    ['bad-186', 'ok-3'],
+    [],
+  ]);
+  assert.deepEqual(handledAgain, ['bad-186', 'bad-186', 'bad-186', 'ok-3']);
+  assert.deepEqual(confirmedAgain, [['bad-186', 'ok-3']]);
+  assert.deepEqual(await pullIds(worker, env), []);
+
+  const text = fs.readFileSync(latencyFile, 'utf8');
+  assert.match(text, /放弃/);
+  const abandoned = readLatencyLog(latencyFile).filter((row) => row.outcome === '放弃');
+  assert.equal(abandoned.length, 1);
+  assert.equal(abandoned[0].deliveryId, 'bad-186');
+  assert.equal(abandoned[0].event, 'pull_request');
+  assert.equal(abandoned[0].failures, 5);
+  assert.match(abandoned[0].error, /boom-186/);
+});
+
+test('#186 SC3 队列超过 1000 时拒绝新事件，队列不超上限，写入不失败', async () => {
+  const worker = createEventWorker({ now: () => 1_700_000_000_000 });
+  const env = workerEnv();
+  const body = smallPayload();
+  for (let i = 0; i < 1000; i += 1) {
+    await postWebhook(worker, env, body, `q-${i}`);
+  }
+  await postWebhook(worker, env, body, 'q-overflow');
+
+  const response = await worker.fetch(pullRequest(TOKEN), env);
+  assert.equal(response.status, 200);
+  const pulled = await response.json();
+  assert.equal(pulled.events.length, 1000);
+  assert.equal(pulled.events[0].deliveryId, 'q-0');
+  assert.equal(pulled.events[999].deliveryId, 'q-999');
+  assert.equal(pulled.events.some((event) => event.deliveryId === 'q-overflow'), false);
+  assert.ok(Array.isArray(pulled.alerts));
+  const line = pulled.alerts.join('\n');
+  assert.match(line, /告警/);
+  assert.match(line, /1000/);
+  assert.match(line, /q-overflow/);
 });

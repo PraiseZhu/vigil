@@ -1,6 +1,8 @@
 // 本机拉取端：每 2 秒向 Worker 拉一次队列。队列要等本机确认后 Worker 才删。
 // 拉取抛错视为 Worker 不可用：不抛出循环，改走 60 秒轮询，把漏掉的事件补回来。恢复后回到 2 秒。
 // onEvent 抛错不算 Worker 挂了：同批其余事件照常处理，下一拍仍按 2 秒拉。
+// 失败次数记在 Worker 上。同一条达到上限后确认移出，并在延迟记录里追加一行「放弃」。
+// 事件若只有元数据，调用方用 loadPayload 按需去取正文。这里不读令牌。
 // 每处理完一个事件，把 created_at 到处理完成的时间差追加到 .prio/latency.jsonl。
 // 目标：Worker 路径 p95 ≤ 10 秒，兜底轮询 ≤ 90 秒（60 秒一轮，留处理余量）。
 // 轮询函数由调用方注入（现有 60 秒轮询留在外面，这里不替换它）。不读令牌。
@@ -37,6 +39,23 @@ export async function confirmPulledEvents({ url, token, ids, fetchImpl = fetch }
   if (!response.ok) throw new Error(`worker status ${response.status}`);
 }
 
+/** 告诉 Worker 这条事件处理失败了一次。返回值里的 failures / abandoned 以 Worker 上的计数为准。 */
+export async function reportEventFailure({ url, token, id, error, fetchImpl = fetch } = {}) {
+  const fail = new URL(url);
+  fail.pathname = '/fail';
+  fail.search = '';
+  const response = await fetchImpl(fail.href, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ id, error: String(error ?? '').slice(0, 200) }),
+  });
+  if (!response.ok) throw new Error(`worker status ${response.status}`);
+  return response.json();
+}
+
 export function readLatencyLog(file) {
   if (!file || !fs.existsSync(file)) return [];
   const rows = [];
@@ -62,18 +81,26 @@ export function latencyPercentiles(rows) {
   return { p50: at(0.5), p95: at(0.95), n: values.length };
 }
 
+function appendRow(file, row) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, `${JSON.stringify(row)}\n`, { mode: 0o600 });
+}
+
 function appendLatency(file, event, processedAtMs, source) {
   const createdAt = event.created_at || event.createdAt || null;
   const delta = typeof createdAt === 'string' ? processedAtMs - Date.parse(createdAt) : null;
-  const row = {
+  appendRow(file, {
     deliveryId: event.deliveryId,
     createdAt,
     processedAt: new Date(processedAtMs).toISOString(),
     latencyMs: Number.isFinite(delta) ? delta : null,
     source,
-  };
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.appendFileSync(file, `${JSON.stringify(row)}\n`, { mode: 0o600 });
+  });
+}
+
+function errorSummary(err) {
+  const text = err instanceof Error ? err.message : String(err ?? '');
+  return text.slice(0, 200);
 }
 
 /**
@@ -81,7 +108,10 @@ function appendLatency(file, event, processedAtMs, source) {
  * sleep / now 可注入：测试里 sleep 只把假时钟往前拨。
  * pull 抛错视为 Worker 不可用：这一拍不再按 2 秒打，下一拍轮询到点时再试一次。
  * onEvent 抛错不算不可用：这条不确认，同批剩下的照常处理，下一拍仍按 2 秒拉。
- * confirm 在处理成功之后调用，Worker 才清掉对应事件。
+ * 传了 reportFailure 时，把这次失败记到 Worker。返回 abandoned 后改成确认移出，
+ * 并在延迟记录里追加一行 outcome 为「放弃」。没传时，失败仍不确认。
+ * payloadOmitted 的事件先交给 loadPayload，由调用方按需取回正文，再交给 onEvent。
+ * confirm 在处理成功（或放弃）之后调用，Worker 才清掉对应事件。
  */
 export async function runEventChannel({
   now = () => Date.now(),
@@ -91,6 +121,8 @@ export async function runEventChannel({
   pull,
   poll,
   confirm,
+  reportFailure,
+  loadPayload,
   onEvent = async () => {},
   latencyFile = path.join('.prio', 'latency.jsonl'),
   pullIntervalMs = PULL_INTERVAL_MS,
@@ -101,13 +133,30 @@ export async function runEventChannel({
   let nextPullAt = now();
   let nextPollAt = now();
 
+  function appendAbandon(file, event, result, err, source) {
+    appendRow(file, {
+      deliveryId: event?.deliveryId ?? null,
+      event: event?.event ?? null,
+      failures: result?.failures ?? null,
+      error: result?.error || errorSummary(err),
+      outcome: '放弃',
+      processedAt: new Date(now()).toISOString(),
+      source,
+    });
+  }
+
   async function handle(event, source) {
     const id = event?.deliveryId;
     if (!id) return false;
     if (seen.has(id)) return true;
-    await onEvent(event, { source });
+    let current = event;
+    if (current.payloadOmitted && typeof loadPayload === 'function') {
+      const payload = await loadPayload(current);
+      current = { ...current, payload };
+    }
+    await onEvent(current, { source });
     seen.add(id);
-    if (latencyFile) appendLatency(latencyFile, event, now(), source);
+    if (latencyFile) appendLatency(latencyFile, current, now(), source);
     return true;
   }
 
@@ -116,8 +165,18 @@ export async function runEventChannel({
     for (const event of events || []) {
       try {
         if (await handle(event, source)) confirmed.push(event.deliveryId);
-      } catch {
-        // 处理出错：这条不确认，同批剩下的照常处理。不要记成 Worker 挂了。
+      } catch (err) {
+        // 处理出错：这条先不确认，同批剩下的照常处理。不要记成 Worker 挂了。
+        if (typeof reportFailure !== 'function') continue;
+        try {
+          const result = await reportFailure(event, err);
+          if (result?.abandoned) {
+            confirmed.push(event.deliveryId);
+            if (latencyFile) appendAbandon(latencyFile, event, result, err, source);
+          }
+        } catch {
+          // 上报失败也留在队列里，下一拍再试。
+        }
       }
     }
     if (confirmEvents && confirmed.length && typeof confirm === 'function') await confirm(confirmed);

@@ -1,16 +1,22 @@
 // Cloudflare Worker 入口：收 GitHub webhook，校验 X-Hub-Signature-256，按 delivery id 去重后入队。
 // 只读 env.WEBHOOK_SECRET（签名）和 env.PULL_TOKEN（拉取）。不读 GitHub 令牌，也不出站。
-// 队列和去重表只通过 storage（get / put / transaction，对齐 Durable Object storage）读写。
+// 队列和去重表只通过 storage（get / put / delete / list / transaction，对齐 Durable Object storage）读写。
+// 每条事件一个键 q:<seq>，每条去重记录一个键 s:<deliveryId>，用 list({prefix}) 读。两种后端都能用。
+// 单个值默认不超过 128 KiB。再大的 payload 只留元数据（delivery id、事件类型、仓库、编号），
+// 存储若直接拒绝写入，也同样改存元数据。拉取端再按需去取正文。
+// 队列最多 1000 条。超过就拒绝新事件并记一条告警，不丢掉最旧的。
+// 失败次数记在事件上。同一条失败 5 次后，拉取端确认（POST /ack）才移出队列。
 // EventChannelDurableObject 用一份持久存储；两个 Worker 实例共用它时，webhook 和 /pull 才不会各看各的内存。
-// /pull 只读队列。拉取端确认（POST /ack）之后才删掉对应事件。
-// 本文件不部署；默认导出的 fetch 就是以后挂到 Worker 上的处理函数。不要在这里加部署配置。
+// /pull 只读队列。本文件不部署；默认导出的 fetch 就是以后挂到 Worker 上的处理函数。不要在这里加部署配置。
 
 export const SEEN_LIMIT = 4096;
 export const SEEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const QUEUE_LIMIT = 1000;
+export const FAILURE_LIMIT = 5;
+export const MAX_VALUE_BYTES = 128 * 1024;
 
-const QUEUE_KEY = 'queue';
-const SEEN_KEY = 'seen';
 const SEQ_KEY = 'seq';
+const ERROR_SUMMARY_LIMIT = 200;
 
 function bytesToHex(buffer) {
   return [...new Uint8Array(buffer)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
@@ -99,6 +105,13 @@ export function createMemoryStorage() {
     async delete(key) {
       map.delete(key);
     },
+    async list({ prefix = '' } = {}) {
+      const out = new Map();
+      for (const [key, value] of map) {
+        if (String(key).startsWith(prefix)) out.set(key, structuredClone(value));
+      }
+      return out;
+    },
     async transaction(fn) {
       return fn(storage);
     },
@@ -106,30 +119,124 @@ export function createMemoryStorage() {
   return storage;
 }
 
-function pruneSeen(seen, nowMs, limit, ttlMs) {
-  const cutoff = nowMs - ttlMs;
-  const entries = Object.entries(seen).filter(([, row]) => {
-    return row && typeof row.at === 'number' && row.at >= cutoff && typeof row.seq === 'number';
-  });
-  entries.sort((left, right) => left[1].seq - right[1].seq);
-  const kept = entries.length > limit ? entries.slice(entries.length - limit) : entries;
-  const next = {};
-  for (const [id, row] of kept) next[id] = row;
+function queueKey(seq) {
+  return `q:${seq}`;
+}
+
+function seenKey(id) {
+  return `s:${id}`;
+}
+
+function alertKey(id) {
+  return `a:${id}`;
+}
+
+function byteLength(value) {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+function repoOf(payload) {
+  const repo = payload?.repository;
+  if (!repo || typeof repo !== 'object') return null;
+  if (typeof repo.full_name === 'string') return repo.full_name;
+  if (typeof repo.owner?.login === 'string' && typeof repo.name === 'string') {
+    return `${repo.owner.login}/${repo.name}`;
+  }
+  return null;
+}
+
+function numberOf(payload) {
+  const candidates = [payload?.issue?.number, payload?.pull_request?.number, payload?.number];
+  return candidates.find((value) => Number.isInteger(value)) ?? null;
+}
+
+function omitPayload(record) {
+  const payload = record.payload;
+  const next = { ...record, payloadOmitted: true };
+  delete next.payload;
+  if (!Object.hasOwn(record, 'repo')) next.repo = repoOf(payload);
+  if (!Object.hasOwn(record, 'number')) next.number = numberOf(payload);
   return next;
 }
 
-async function readState(txn) {
+function eventRecord(seq, deliveryId, eventName, payload) {
   return {
-    queue: (await txn.get(QUEUE_KEY)) ?? [],
-    seen: (await txn.get(SEEN_KEY)) ?? {},
-    seq: (await txn.get(SEQ_KEY)) ?? 0,
+    seq,
+    deliveryId,
+    event: eventName,
+    created_at: eventCreatedAt(payload),
+    payload,
+    failures: 0,
+    lastError: null,
   };
 }
 
-async function writeState(txn, state) {
-  await txn.put(QUEUE_KEY, state.queue);
-  await txn.put(SEEN_KEY, state.seen);
-  await txn.put(SEQ_KEY, state.seq);
+function toPublicEvent(stored) {
+  const event = {
+    deliveryId: stored.deliveryId,
+    event: stored.event,
+    created_at: stored.created_at ?? null,
+  };
+  if (stored.payloadOmitted) {
+    event.repo = stored.repo ?? null;
+    event.number = stored.number ?? null;
+    event.payloadOmitted = true;
+    return event;
+  }
+  event.payload = stored.payload;
+  return event;
+}
+
+async function listMap(txn, prefix) {
+  const listed = await txn.list({ prefix });
+  if (listed instanceof Map) return listed;
+  return new Map(Object.entries(listed ?? {}));
+}
+
+async function readQueue(txn) {
+  const listed = await listMap(txn, 'q:');
+  return [...listed.values()].sort((left, right) => left.seq - right.seq);
+}
+
+async function readSeen(txn) {
+  const seen = {};
+  for (const [key, row] of await listMap(txn, 's:')) seen[key.slice(2)] = row;
+  return seen;
+}
+
+async function readAlerts(txn) {
+  const listed = [...(await listMap(txn, 'a:')).entries()];
+  listed.sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0));
+  return listed.map(([, value]) => (typeof value === 'string' ? value : String(value?.line ?? '')));
+}
+
+function pruneSeen(seen, nowMs, limit, ttlMs) {
+  const cutoff = nowMs - ttlMs;
+  const fresh = [];
+  for (const [id, row] of Object.entries(seen)) {
+    if (row && typeof row.at === 'number' && row.at >= cutoff && typeof row.seq === 'number') fresh.push([id, row]);
+  }
+  fresh.sort((left, right) => left[1].seq - right[1].seq);
+  const keptEntries = fresh.length > limit ? fresh.slice(fresh.length - limit) : fresh;
+  const keptIds = new Set(keptEntries.map(([id]) => id));
+  const kept = {};
+  for (const [id, row] of keptEntries) kept[id] = row;
+  const dropped = Object.keys(seen).filter((id) => !keptIds.has(id));
+  return { kept, dropped };
+}
+
+async function dropSeen(txn, ids) {
+  for (const id of ids) await txn.delete(seenKey(id));
+}
+
+async function putQueueEvent(txn, record, maxValueBytes) {
+  let stored = record.payload !== undefined && byteLength(record) > maxValueBytes ? omitPayload(record) : record;
+  try {
+    await txn.put(queueKey(stored.seq), stored);
+  } catch (err) {
+    if (stored.payload === undefined) throw err;
+    await txn.put(queueKey(stored.seq), omitPayload(stored));
+  }
 }
 
 async function handleRequest(request, env, durable) {
@@ -138,10 +245,12 @@ async function handleRequest(request, env, durable) {
   if (request.method === 'GET' && url.pathname === '/pull') {
     if (!(await pullAuthorized(request, env.PULL_TOKEN))) return unauthorized();
     let events = [];
+    let alerts = [];
     await storage.transaction(async (txn) => {
-      events = (await readState(txn)).queue;
+      events = (await readQueue(txn)).map(toPublicEvent);
+      alerts = await readAlerts(txn);
     });
-    return Response.json({ events });
+    return Response.json({ events, alerts });
   }
   if (request.method === 'POST' && url.pathname === '/ack') {
     if (!(await pullAuthorized(request, env.PULL_TOKEN))) return unauthorized();
@@ -154,14 +263,33 @@ async function handleRequest(request, env, durable) {
     if (!body || !Array.isArray(body.ids)) return new Response('bad ack', { status: 400 });
     const drop = new Set(body.ids.filter((id) => typeof id === 'string'));
     await storage.transaction(async (txn) => {
-      const state = await readState(txn);
-      await writeState(txn, {
-        queue: state.queue.filter((event) => !drop.has(event.deliveryId)),
-        seen: state.seen,
-        seq: state.seq,
-      });
+      for (const event of await readQueue(txn)) {
+        if (drop.has(event.deliveryId)) await txn.delete(queueKey(event.seq));
+      }
     });
     return new Response(null, { status: 204 });
+  }
+  if (request.method === 'POST' && url.pathname === '/fail') {
+    if (!(await pullAuthorized(request, env.PULL_TOKEN))) return unauthorized();
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response('bad json', { status: 400 });
+    }
+    if (!body || typeof body.id !== 'string' || !body.id) return new Response('bad fail', { status: 400 });
+    const error = String(body.error ?? '').slice(0, ERROR_SUMMARY_LIMIT);
+    const failureLimit = durable.failureLimit;
+    let result = null;
+    await storage.transaction(async (txn) => {
+      const event = (await readQueue(txn)).find((item) => item.deliveryId === body.id);
+      if (!event) return;
+      const next = { ...event, failures: (event.failures || 0) + 1, lastError: error };
+      await putQueueEvent(txn, next, durable.maxValueBytes);
+      result = { failures: next.failures, abandoned: next.failures >= failureLimit, error };
+    });
+    if (!result) return new Response('not queued', { status: 404 });
+    return Response.json(result);
   }
   if (request.method !== 'POST' || url.pathname !== '/webhook') {
     return new Response('not found', { status: 404 });
@@ -175,12 +303,13 @@ async function handleRequest(request, env, durable) {
   const nowMs = durable.now();
   const limit = durable.seenLimit;
   const ttlMs = durable.seenTtlMs;
+  const maxValueBytes = durable.maxValueBytes;
+  const queueLimit = durable.queueLimit;
   let badJson = false;
   await storage.transaction(async (txn) => {
-    const state = await readState(txn);
-    let seen = pruneSeen(state.seen, nowMs, limit, ttlMs);
-    if (Object.hasOwn(seen, deliveryId)) {
-      await writeState(txn, { queue: state.queue, seen, seq: state.seq });
+    const pruned = pruneSeen(await readSeen(txn), nowMs, limit, ttlMs);
+    if (Object.hasOwn(pruned.kept, deliveryId)) {
+      await dropSeen(txn, pruned.dropped);
       return;
     }
     let payload;
@@ -190,18 +319,18 @@ async function handleRequest(request, env, durable) {
       badJson = true;
       return;
     }
-    const seq = state.seq + 1;
-    seen = pruneSeen({ ...seen, [deliveryId]: { seq, at: nowMs } }, nowMs, limit, ttlMs);
-    await writeState(txn, {
-      queue: state.queue.concat([{
-        deliveryId,
-        event: eventName,
-        created_at: eventCreatedAt(payload),
-        payload,
-      }]),
-      seen,
-      seq,
-    });
+    const seq = ((await txn.get(SEQ_KEY)) ?? 0) + 1;
+    const again = pruneSeen({ ...pruned.kept, [deliveryId]: { seq, at: nowMs } }, nowMs, limit, ttlMs);
+    await dropSeen(txn, pruned.dropped);
+    await dropSeen(txn, again.dropped);
+    if (Object.hasOwn(again.kept, deliveryId)) await txn.put(seenKey(deliveryId), again.kept[deliveryId]);
+    await txn.put(SEQ_KEY, seq);
+    if (!Object.hasOwn(again.kept, deliveryId)) return;
+    if ((await readQueue(txn)).length >= queueLimit) {
+      await txn.put(alertKey(deliveryId), `告警 队列已满 ${queueLimit}，拒绝新事件 ${deliveryId}`);
+      return;
+    }
+    await putQueueEvent(txn, eventRecord(seq, deliveryId, eventName, payload), maxValueBytes);
   });
   if (badJson) return new Response('bad json', { status: 400 });
   return new Response(null, { status: 204 });
@@ -215,6 +344,9 @@ export class EventChannelDurableObject {
     this.now = typeof ctx.now === 'function' ? ctx.now : () => Date.now();
     this.seenLimit = ctx.seenLimit ?? SEEN_LIMIT;
     this.seenTtlMs = ctx.seenTtlMs ?? SEEN_TTL_MS;
+    this.maxValueBytes = ctx.maxValueBytes ?? MAX_VALUE_BYTES;
+    this.queueLimit = ctx.queueLimit ?? QUEUE_LIMIT;
+    this.failureLimit = ctx.failureLimit ?? FAILURE_LIMIT;
   }
 
   async fetch(request, env = this.env) {
@@ -228,6 +360,9 @@ export function createEventWorker(options = {}) {
     now: options.now,
     seenLimit: options.seenLimit,
     seenTtlMs: options.seenTtlMs,
+    maxValueBytes: options.maxValueBytes,
+    queueLimit: options.queueLimit,
+    failureLimit: options.failureLimit,
   });
   return {
     async fetch(request, env) {
