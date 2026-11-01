@@ -132,6 +132,44 @@ function limitedStorage(maxBytes) {
   return storage;
 }
 
+// 数 list 调用。入队路径不该按条数去列 q: / s:。
+function countingStorage() {
+  const map = new Map();
+  const listCalls = [];
+  const storage = {
+    async get(key) {
+      if (!map.has(key)) return undefined;
+      return structuredClone(map.get(key));
+    },
+    async put(key, value) {
+      map.set(key, structuredClone(value));
+    },
+    async delete(key) {
+      map.delete(key);
+    },
+    async list({ prefix = '' } = {}) {
+      listCalls.push(prefix);
+      const out = new Map();
+      for (const [key, value] of map) {
+        if (String(key).startsWith(prefix)) out.set(key, structuredClone(value));
+      }
+      return out;
+    },
+    async transaction(fn) {
+      return fn(storage);
+    },
+  };
+  return { storage, listCalls };
+}
+
+function prefixListCount(listCalls, prefixes) {
+  return listCalls.filter((prefix) => prefixes.some((item) => prefix === item || String(prefix).startsWith(item))).length;
+}
+
+function alertMentions(alerts, deliveryId) {
+  return alerts.some((line) => String(line).endsWith(`拒绝新事件 ${deliveryId}`));
+}
+
 const VALUE_LIMIT_BYTES = 32 * 1024;
 
 function smallPayload(extra = {}) {
@@ -883,4 +921,317 @@ test('#186 SC3 队列超过 1000 时拒绝新事件，队列不超上限，写�
   assert.match(line, /告警/);
   assert.match(line, /1000/);
   assert.match(line, /q-overflow/);
+});
+
+test('#189 SC1 告警只保留最近 50 条，/pull 和存储里的 a: 键都不超过上限，最新的还在', async () => {
+  const ALERT_CAP = 50;
+  const storage = sharedStorage();
+  const worker = createEventWorker({ storage, queueLimit: 1, now: () => 1_700_000_000_000 });
+  const env = workerEnv();
+  await postWebhook(worker, env, smallPayload(), 'held-189');
+  const overflow = ALERT_CAP + 10;
+  for (let i = 1; i <= overflow; i += 1) {
+    await postWebhook(worker, env, smallPayload(), `z-${i}`);
+  }
+
+  const response = await worker.fetch(pullRequest(TOKEN), env);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(body.events.map((event) => event.deliveryId), ['held-189']);
+  assert.ok(body.alerts.length <= ALERT_CAP, `alerts ${body.alerts.length} 超过上限 ${ALERT_CAP}`);
+  assert.equal(body.alerts.length, ALERT_CAP);
+  assert.equal(alertMentions(body.alerts, `z-${overflow}`), true);
+  assert.equal(alertMentions(body.alerts, 'z-2'), false);
+  assert.equal(alertMentions(body.alerts, 'z-11'), true);
+
+  const stored = await storage.list({ prefix: 'a:' });
+  assert.ok(stored.size <= ALERT_CAP, `a: 键 ${stored.size} 超过上限 ${ALERT_CAP}`);
+  assert.equal(stored.size, ALERT_CAP);
+  const lines = [...stored.values()].map((value) => (typeof value === 'string' ? value : value?.line));
+  assert.equal(alertMentions(lines, `z-${overflow}`), true);
+  assert.equal(alertMentions(lines, 'z-2'), false);
+  assert.equal(alertMentions(lines, 'z-11'), true);
+});
+
+test('#189 SC2 入队和去重不按条数 list q: 与 s:，去重仍生效，满 1000 仍拒绝并记告警', async () => {
+  const ENQUEUE_PREFIX_LIST_CAP = 0;
+  const { storage, listCalls } = countingStorage();
+  const worker = createEventWorker({ storage, now: () => 1_700_000_000_000 });
+  const env = workerEnv();
+  const body = smallPayload();
+  const qAndS = () => prefixListCount(listCalls, ['q:', 's:']);
+
+  for (let i = 0; i < 100; i += 1) {
+    await postWebhook(worker, env, body, `n-${i}`);
+  }
+  await postWebhook(worker, env, body, 'n-0');
+  assert.ok(
+    qAndS() <= ENQUEUE_PREFIX_LIST_CAP,
+    `入队 100 条后 q:/s: list 调用 ${qAndS()}，上限 ${ENQUEUE_PREFIX_LIST_CAP}`,
+  );
+
+  const afterHundred = await worker.fetch(pullRequest(TOKEN), env);
+  const hundred = await afterHundred.json();
+  assert.equal(hundred.events.length, 100);
+  assert.equal(hundred.events.filter((event) => event.deliveryId === 'n-0').length, 1);
+
+  const listsBeforeFill = qAndS();
+  for (let i = 100; i < 1000; i += 1) {
+    await postWebhook(worker, env, body, `n-${i}`);
+  }
+  await postWebhook(worker, env, body, 'n-full');
+  const added = qAndS() - listsBeforeFill;
+  assert.ok(
+    added <= ENQUEUE_PREFIX_LIST_CAP,
+    `再入队到 1000 后 q:/s: list 新增 ${added}，上限 ${ENQUEUE_PREFIX_LIST_CAP}`,
+  );
+
+  const response = await worker.fetch(pullRequest(TOKEN), env);
+  const pulled = await response.json();
+  assert.equal(pulled.events.length, 1000);
+  assert.equal(pulled.events[0].deliveryId, 'n-0');
+  assert.equal(pulled.events[999].deliveryId, 'n-999');
+  assert.equal(pulled.events.some((event) => event.deliveryId === 'n-full'), false);
+  const line = pulled.alerts.join('\n');
+  assert.match(line, /告警/);
+  assert.match(line, /1000/);
+  assert.match(line, /n-full/);
+});
+
+test('#189 SC3 被省略的事件没有 loadPayload 时按失败放弃并写明正文被省略，有则取回后确认，抛错也算失败', async () => {
+  const env = workerEnv();
+
+  async function omittedWorker(delivery) {
+    const worker = createEventWorker({ now: () => 1_700_000_000_000, maxValueBytes: 1 });
+    await postWebhook(worker, env, smallPayload(), delivery, 'issues');
+    const fetched = await worker.fetch(pullRequest(TOKEN), env);
+    const queued = await fetched.json();
+    assert.equal(queued.events[0].payloadOmitted, true);
+    assert.equal(queued.events[0].deliveryId, delivery);
+    return worker;
+  }
+
+  function bind(worker) {
+    const fetchImpl = (url, init = {}) => worker.fetch(new Request(url, init), env);
+    return {
+      pull: () => pullFromWorker({ url: 'https://example.invalid/pull', token: TOKEN, fetchImpl }),
+      confirm: async (ids) => {
+        const { confirmPulledEvents } = await import('./bin/event-pull.mjs');
+        await confirmPulledEvents({
+          url: 'https://example.invalid/pull',
+          token: TOKEN,
+          ids,
+          fetchImpl,
+        });
+      },
+      reportFailure: async (event, error) => {
+        const { reportEventFailure } = await import('./bin/event-pull.mjs');
+        return reportEventFailure({
+          url: 'https://example.invalid/pull',
+          token: TOKEN,
+          id: event.deliveryId,
+          error: error?.message || String(error),
+          fetchImpl,
+        });
+      },
+    };
+  }
+
+  const bare = await omittedWorker('omit-bare');
+  const bareApi = bind(bare);
+  const handledBare = [];
+  const reportsBare = [];
+  const bareLog = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  let t = 0;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 10000,
+    pull: bareApi.pull,
+    confirm: bareApi.confirm,
+    reportFailure: async (event, error) => {
+      const result = await bareApi.reportFailure(event, error);
+      reportsBare.push(result);
+      return result;
+    },
+    poll: async () => [],
+    onEvent: async (event) => {
+      handledBare.push(event);
+    },
+    latencyFile: bareLog,
+  });
+  assert.deepEqual(handledBare, []);
+  assert.equal(reportsBare.length, 5);
+  assert.equal(reportsBare[4].failures, 5);
+  assert.equal(reportsBare[4].abandoned, true);
+  assert.deepEqual(await pullIds(bare, env), []);
+  const abandonedBare = readLatencyLog(bareLog).filter((row) => row.outcome === '放弃');
+  assert.equal(abandonedBare.length, 1);
+  assert.equal(abandonedBare[0].deliveryId, 'omit-bare');
+  assert.equal(abandonedBare[0].failures, 5);
+  assert.match(JSON.stringify(abandonedBare[0]), /正文被省略/);
+
+  const loaded = await omittedWorker('omit-load');
+  const loadApi = bind(loaded);
+  const handledLoad = [];
+  const confirmedLoad = [];
+  let fetches = 0;
+  t = 0;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 1,
+    pull: loadApi.pull,
+    confirm: async (ids) => {
+      confirmedLoad.push(...ids);
+      await loadApi.confirm(ids);
+    },
+    reportFailure: loadApi.reportFailure,
+    loadPayload: async (event) => {
+      fetches += 1;
+      assert.equal(event.payloadOmitted, true);
+      assert.equal(event.deliveryId, 'omit-load');
+      return { marker: 'body-189' };
+    },
+    poll: async () => [],
+    onEvent: async (event) => {
+      handledLoad.push(event);
+    },
+    latencyFile: path.join(tmpDir(), '.prio', 'latency.jsonl'),
+  });
+  assert.equal(fetches, 1);
+  assert.equal(handledLoad.length, 1);
+  assert.equal(handledLoad[0].payload.marker, 'body-189');
+  assert.deepEqual(confirmedLoad, ['omit-load']);
+  assert.deepEqual(await pullIds(loaded, env), []);
+
+  const thrown = await omittedWorker('omit-throw');
+  const throwApi = bind(thrown);
+  const handledThrow = [];
+  const confirmedThrow = [];
+  const reportsThrow = [];
+  t = 0;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 1,
+    pull: throwApi.pull,
+    confirm: async (ids) => {
+      confirmedThrow.push(...ids);
+      await throwApi.confirm(ids);
+    },
+    reportFailure: async (event, error) => {
+      const result = await throwApi.reportFailure(event, error);
+      reportsThrow.push(result);
+      return result;
+    },
+    loadPayload: async () => {
+      throw new Error('fetch-failed-189');
+    },
+    poll: async () => [],
+    onEvent: async (event) => {
+      handledThrow.push(event.deliveryId);
+    },
+    latencyFile: path.join(tmpDir(), '.prio', 'latency.jsonl'),
+  });
+  assert.deepEqual(handledThrow, []);
+  assert.deepEqual(confirmedThrow, []);
+  assert.equal(reportsThrow.length, 1);
+  assert.equal(reportsThrow[0].failures, 1);
+  assert.equal(reportsThrow[0].abandoned, false);
+  assert.match(reportsThrow[0].error, /fetch-failed-189/);
+  assert.deepEqual(await pullIds(thrown, env), ['omit-throw']);
+});
+
+test('#189 SC4 同一份存储重建 Worker 后失败次数接着数，第 5 次仍放弃', async () => {
+  const storage = sharedStorage();
+  let worker = createEventWorker({ storage, now: () => 1_700_000_000_000 });
+  const env = workerEnv();
+  await postWebhook(worker, env, smallPayload(), 'retry-189', 'pull_request');
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const fetchImpl = (url, init = {}) => worker.fetch(new Request(url, init), env);
+
+  async function reportFailure(event, error) {
+    const { reportEventFailure } = await import('./bin/event-pull.mjs');
+    return reportEventFailure({
+      url: 'https://example.invalid/pull',
+      token: TOKEN,
+      id: event.deliveryId,
+      error: error?.message || String(error),
+      fetchImpl,
+    });
+  }
+  async function confirm(ids) {
+    const { confirmPulledEvents } = await import('./bin/event-pull.mjs');
+    await confirmPulledEvents({
+      url: 'https://example.invalid/pull',
+      token: TOKEN,
+      ids,
+      fetchImpl,
+    });
+  }
+  const pull = () => pullFromWorker({ url: 'https://example.invalid/pull', token: TOKEN, fetchImpl });
+
+  const pulled = [];
+  let t = 0;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 4000,
+    pull: async () => {
+      const events = await pull();
+      pulled.push(events.map((event) => event.deliveryId));
+      return events;
+    },
+    confirm,
+    reportFailure,
+    poll: async () => [],
+    onEvent: async () => {
+      throw new Error('boom-189');
+    },
+    latencyFile,
+  });
+  assert.deepEqual(pulled, [['retry-189'], ['retry-189']]);
+  assert.deepEqual(await pullIds(worker, env), ['retry-189']);
+  assert.equal(readLatencyLog(latencyFile).some((row) => row.outcome === '放弃'), false);
+
+  worker = createEventWorker({ storage, now: () => 1_700_000_000_000 });
+  assert.deepEqual(await pullIds(worker, env), ['retry-189']);
+
+  const pulledAgain = [];
+  t = 0;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 8000,
+    pull: async () => {
+      const events = await pull();
+      pulledAgain.push(events.map((event) => event.deliveryId));
+      return events;
+    },
+    confirm,
+    reportFailure,
+    poll: async () => [],
+    onEvent: async () => {
+      throw new Error('boom-189');
+    },
+    latencyFile,
+  });
+  assert.deepEqual(pulledAgain, [['retry-189'], ['retry-189'], ['retry-189'], []]);
+  assert.deepEqual(await pullIds(worker, env), []);
+  const abandoned = readLatencyLog(latencyFile).filter((row) => row.outcome === '放弃');
+  assert.equal(abandoned.length, 1);
+  assert.equal(abandoned[0].deliveryId, 'retry-189');
+  assert.equal(abandoned[0].failures, 5);
+  assert.match(abandoned[0].error, /boom-189/);
 });
