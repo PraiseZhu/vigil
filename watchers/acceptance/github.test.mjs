@@ -535,6 +535,257 @@ test('#157 关联 PR 只接受文本，数字和日期拒绝；优先级没有�
   assert.equal(writes.length, 0, '类型不对或选项不存在时不能发写入');
 });
 
+const WRITER_TOKEN = `writer-${'x'.repeat(12)}`;
+
+function boardProject(extraFields = []) {
+  return {
+    id: 'PROJ',
+    fields: { nodes: [PRIO_FIELD, LINK_FIELD, ...extraFields] },
+  };
+}
+
+function legacyBoard({ onBoard = true, archived = false, itemId = 'ITEM1' } = {}) {
+  return {
+    user: { projectV2: boardProject() },
+    repository: {
+      issue: {
+        id: 'ISSUE',
+        projectItems: {
+          nodes: onBoard ? [{ id: itemId, isArchived: archived, project: { id: 'PROJ' } }] : [],
+        },
+      },
+    },
+  };
+}
+
+function directBoard({ itemId, archived = false, projectId = 'PROJ', node = 'item' } = {}) {
+  const payload = { user: { projectV2: boardProject() } };
+  if (node === 'missing') payload.node = null;
+  else if (node === 'other') payload.node = {};
+  else payload.node = { id: itemId, isArchived: archived, project: { id: projectId } };
+  return payload;
+}
+
+function mutationData(query, variables) {
+  if (query.includes('addProjectV2ItemById')) {
+    return { addProjectV2ItemById: { item: { id: 'ITEM_ADDED' } } };
+  }
+  if (query.includes('unarchiveProjectV2Item')) {
+    return { unarchiveProjectV2Item: { item: { id: variables.itemId } } };
+  }
+  if (query.includes('clearProjectV2ItemFieldValue')) {
+    return { clearProjectV2ItemFieldValue: { projectV2Item: { id: variables.itemId } } };
+  }
+  return { updateProjectV2ItemFieldValue: { projectV2Item: { id: variables.itemId } } };
+}
+
+function priorityWriter(profile, shape) {
+  const requests = [];
+  const fetchImpl = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    const query = String(body.query);
+    requests.push({ query, variables: body.variables });
+    const data = query.includes('mutation')
+      ? mutationData(query, body.variables)
+      : (query.includes('repository') ? legacyBoard(shape) : directBoard(shape));
+    return { ok: true, status: 200, text: async () => JSON.stringify({ data }) };
+  };
+  const github = createGithub({
+    profile,
+    ownerToken: WRITER_TOKEN,
+    fetchImpl,
+    run: async () => {
+      throw new Error('写令牌路径不应调用 gh');
+    },
+  });
+  return { github, requests };
+}
+
+function prioAction(extra = {}) {
+  return {
+    type: 'project.field.set',
+    repo: REPO,
+    issue: 1,
+    ownerLogin: 'ExampleUser',
+    projectNumber: 7,
+    fields: { 优先级: 'P0' },
+    ...extra,
+  };
+}
+
+function writeMutations(requests) {
+  return requests.filter((entry) => entry.query.includes('mutation'));
+}
+
+test('#210 SC1 带条目 id 时没有任何请求文本含 repository', async () => {
+  const profile = loadHome();
+  const { github, requests } = priorityWriter(profile, { itemId: 'PVTI_ok' });
+  await github.write(prioAction({ itemId: 'PVTI_ok' }));
+  assert.ok(requests.length >= 2);
+  for (const entry of requests) {
+    assert.equal(entry.query.includes('repository'), false);
+  }
+  const mutations = writeMutations(requests);
+  assert.equal(mutations.length, 1);
+  assert.match(mutations[0].query, /updateProjectV2ItemFieldValue/);
+  assert.equal(mutations[0].variables.itemId, 'PVTI_ok');
+  assert.equal(mutations[0].variables.projectId, 'PROJ');
+  assert.equal(mutations[0].variables.fieldId, 'F_PRIO');
+  assert.equal(mutations[0].variables.optionId, 'O_P0');
+  assert.equal(requests.some((entry) => entry.query.includes('addProjectV2ItemById')), false);
+  assert.equal(requests.some((entry) => entry.query.includes('unarchiveProjectV2Item')), false);
+  const lookup = requests.find((entry) => !entry.query.includes('mutation'));
+  assert.match(lookup.query, /projectV2/);
+  assert.match(lookup.query, /node\(id:/);
+
+  const link = priorityWriter(profile, { itemId: 'PVTI_link' });
+  await link.github.write(prioAction({ itemId: 'PVTI_link', fields: { '关联 PR': '#3(open)' } }));
+  for (const entry of link.requests) {
+    assert.equal(entry.query.includes('repository'), false);
+  }
+  const linkWrite = writeMutations(link.requests);
+  assert.equal(linkWrite.length, 1);
+  assert.equal(linkWrite[0].variables.text, '#3(open)');
+  assert.equal(linkWrite[0].variables.itemId, 'PVTI_link');
+});
+
+test('#210 SC2 没带条目 id 时请求序列与现有路径一致', async () => {
+  const profile = loadHome();
+  const baseVars = {
+    login: 'ExampleUser',
+    projectNumber: 7,
+    owner: 'example-owner',
+    name: 'example-repo',
+    issue: 1,
+  };
+
+  const onBoard = priorityWriter(profile, { onBoard: true, archived: false, itemId: 'ITEM1' });
+  await onBoard.github.write(prioAction());
+  assert.equal(onBoard.requests.length, 2);
+  assert.match(onBoard.requests[0].query, /repository\(owner: \$owner, name: \$name\)/);
+  assert.match(onBoard.requests[0].query, /projectItems\(first: 20, includeArchived: true\)/);
+  assert.deepEqual(onBoard.requests[0].variables, baseVars);
+  assert.match(onBoard.requests[1].query, /updateProjectV2ItemFieldValue/);
+  assert.deepEqual(onBoard.requests[1].variables, {
+    projectId: 'PROJ',
+    itemId: 'ITEM1',
+    fieldId: 'F_PRIO',
+    optionId: 'O_P0',
+  });
+  assert.equal(onBoard.requests.some((entry) => entry.query.includes('addProjectV2ItemById')), false);
+  assert.equal(onBoard.requests.some((entry) => entry.query.includes('unarchiveProjectV2Item')), false);
+
+  const missing = priorityWriter(profile, { onBoard: false });
+  await missing.github.write(prioAction());
+  assert.equal(missing.requests.length, 3);
+  assert.match(missing.requests[0].query, /repository\(owner: \$owner, name: \$name\)/);
+  assert.deepEqual(missing.requests[0].variables, baseVars);
+  assert.match(missing.requests[1].query, /addProjectV2ItemById/);
+  assert.deepEqual(missing.requests[1].variables, { projectId: 'PROJ', contentId: 'ISSUE' });
+  assert.match(missing.requests[2].query, /updateProjectV2ItemFieldValue/);
+  assert.equal(missing.requests[2].variables.itemId, 'ITEM_ADDED');
+  assert.equal(missing.requests.some((entry) => entry.query.includes('unarchiveProjectV2Item')), false);
+
+  const archived = priorityWriter(profile, { onBoard: true, archived: true, itemId: 'ITEM1' });
+  await archived.github.write(prioAction());
+  assert.equal(archived.requests.length, 3);
+  assert.match(archived.requests[0].query, /repository\(owner: \$owner, name: \$name\)/);
+  assert.deepEqual(archived.requests[0].variables, baseVars);
+  assert.match(archived.requests[1].query, /unarchiveProjectV2Item/);
+  assert.deepEqual(archived.requests[1].variables, { projectId: 'PROJ', itemId: 'ITEM1' });
+  assert.match(archived.requests[2].query, /updateProjectV2ItemFieldValue/);
+  assert.equal(archived.requests[2].variables.itemId, 'ITEM1');
+  assert.equal(archived.requests.some((entry) => entry.query.includes('addProjectV2ItemById')), false);
+});
+
+test('#210 SC3 条目 id 为空、类型不对或不属于本看板时拒绝且不发写请求', async () => {
+  const profile = loadHome();
+  const cases = [
+    { itemId: '', message: /条目 id 为空/ },
+    { itemId: 41, message: /条目 id 类型不对/ },
+    { itemId: { id: 'PVTI_obj' }, message: /条目 id 类型不对/ },
+  ];
+  for (const entry of cases) {
+    const { github, requests } = priorityWriter(profile, { itemId: 'PVTI_ok' });
+    await assert.rejects(() => github.write(prioAction({ itemId: entry.itemId })), entry.message);
+    assert.equal(requests.length, 0, `itemId=${JSON.stringify(entry.itemId)} 不应发请求`);
+    assert.equal(writeMutations(requests).length, 0);
+  }
+
+  const wrongBoard = priorityWriter(profile, { itemId: 'PVTI_other', projectId: 'OTHER_PROJ' });
+  await assert.rejects(
+    () => wrongBoard.github.write(prioAction({ itemId: 'PVTI_other' })),
+    /条目不属于本看板/,
+  );
+  assert.equal(writeMutations(wrongBoard.requests).length, 0);
+  assert.equal(wrongBoard.requests.some((entry) => entry.query.includes('repository')), false);
+
+  const missing = priorityWriter(profile, { node: 'missing' });
+  await assert.rejects(
+    () => missing.github.write(prioAction({ itemId: 'PVTI_gone' })),
+    /条目不属于本看板/,
+  );
+  assert.equal(writeMutations(missing.requests).length, 0);
+
+  const otherType = priorityWriter(profile, { node: 'other' });
+  await assert.rejects(
+    () => otherType.github.write(prioAction({ itemId: 'PVTI_user' })),
+    /条目不属于本看板/,
+  );
+  assert.equal(writeMutations(otherType.requests).length, 0);
+});
+
+test('#210 SC4 带条目 id 时仍只允许优先级和关联 PR', async () => {
+  const profile = loadHome();
+  const fields = [
+    { 验收: '通过' },
+    { 裁决: '记下' },
+  ];
+  for (const entry of fields) {
+    const { github, requests } = priorityWriter(profile, { itemId: 'PVTI_ok' });
+    const name = Object.keys(entry)[0];
+    await assert.rejects(
+      () => github.write(prioAction({ itemId: 'PVTI_ok', fields: entry })),
+      new RegExp(`拒绝写入看板字段「${name}」`),
+    );
+    assert.equal(requests.length, 0);
+    assert.equal(writeMutations(requests).length, 0);
+  }
+  const mixed = priorityWriter(profile, { itemId: 'PVTI_ok' });
+  await assert.rejects(
+    () => mixed.github.write(prioAction({ itemId: 'PVTI_ok', fields: { 优先级: 'P0', 验收: '通过' } })),
+    /拒绝写入看板字段/,
+  );
+  assert.equal(mixed.requests.length, 0);
+});
+
+test('#210 SC5 已归档条目退回现有路径，不新增取消归档', async () => {
+  const profile = loadHome();
+  const plain = priorityWriter(profile, { onBoard: true, archived: true, itemId: 'ITEM1' });
+  await plain.github.write(prioAction({ fields: { 优先级: 'P1' } }));
+  assert.deepEqual(
+    plain.requests.map((entry) => entry.query.includes('repository') ? 'lookup' : entry.query.includes('unarchive') ? 'unarchive' : 'update'),
+    ['lookup', 'unarchive', 'update'],
+  );
+
+  const withId = priorityWriter(profile, {
+    onBoard: true,
+    archived: true,
+    itemId: 'ITEM1',
+    directArchived: true,
+  });
+  await withId.github.write(prioAction({ itemId: 'PVTI_arch', fields: { 优先级: 'P1' } }));
+  assert.equal(withId.requests[0].query.includes('repository'), false);
+  assert.match(withId.requests[0].query, /node\(id:/);
+  assert.deepEqual(withId.requests.slice(1), plain.requests);
+  const unarchives = withId.requests.filter((entry) => entry.query.includes('unarchiveProjectV2Item'));
+  assert.equal(unarchives.length, 1);
+  assert.equal(
+    unarchives[0].query,
+    plain.requests.find((entry) => entry.query.includes('unarchiveProjectV2Item')).query,
+  );
+});
+
 test('默认执行器按 UTF-8 流式解码：大输出里跨块的多字节字符不变乱码（#43 正文版本每拍误判「变了」）', async () => {
   // 20 万个「。」（每个 3 字节，约 600 KiB）必然跨过管道块边界；逐块 `+=` 会在边界处拼出 U+FFFD。
   const script = "process.stdout.write('。'.repeat(200000))";

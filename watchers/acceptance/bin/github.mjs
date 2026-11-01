@@ -602,62 +602,115 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     const [owner, name] = String(repo).split('/');
     const login = ownerLogin || profile.ownerLogin;
     const number = projectNumber ?? profile.projectNumber;
-    // 写路径上的查找也用账号令牌：App 令牌看不到个人账号下的看板。
-    const data = await graphqlWrite(
-      `query ($login: String!, $projectNumber: Int!, $owner: String!, $name: String!, $issue: Int!) {
-        user(login: $login) {
-          projectV2(number: $projectNumber) {
-            id
-            fields(first: 50) {
-              nodes {
-                __typename
-                ... on ProjectV2FieldCommon { id name dataType }
-                ... on ProjectV2SingleSelectField { options { id name } }
+    let project;
+    let item;
+    let fieldByName;
+    const fieldsByName = (source) => {
+      const map = new Map();
+      for (const node of source?.fields?.nodes || []) {
+        if (node?.name) map.set(node.name, node);
+      }
+      return map;
+    };
+    // 读通道已经给出未归档条目 id 时，不再为改字段去解析仓。
+    let directReady = false;
+    if (Object.hasOwn(action, 'itemId')) {
+      for (const fieldName of names) {
+        if (!PRIO_BOARD_FIELDS.has(fieldName)) {
+          throw new Error(`拒绝写入看板字段「${fieldName}」`);
+        }
+      }
+      const directId = action.itemId;
+      if (typeof directId !== 'string') throw new Error('条目 id 类型不对');
+      if (directId.length === 0) throw new Error('条目 id 为空');
+      const direct = await graphqlWrite(
+        `query ($login: String!, $projectNumber: Int!, $itemId: ID!) {
+          user(login: $login) {
+            projectV2(number: $projectNumber) {
+              id
+              fields(first: 50) {
+                nodes {
+                  __typename
+                  ... on ProjectV2FieldCommon { id name dataType }
+                  ... on ProjectV2SingleSelectField { options { id name } }
+                }
               }
             }
           }
-        }
-        repository(owner: $owner, name: $name) {
-          issue(number: $issue) {
-            id
-            projectItems(first: 20, includeArchived: true) {
-              nodes { id isArchived project { id } }
+          node(id: $itemId) {
+            ... on ProjectV2Item { id isArchived project { id } }
+          }
+        }`,
+        { login, projectNumber: number, itemId: directId },
+      );
+      const directProject = direct.user?.projectV2;
+      if (!directProject?.id) throw new Error(`找不到看板 #${number}`);
+      const directNode = direct.node;
+      if (!directNode?.id || directNode.project?.id !== directProject.id) {
+        throw new Error('条目不属于本看板');
+      }
+      if (!directNode.isArchived) {
+        project = directProject;
+        fieldByName = fieldsByName(project);
+        item = { id: directNode.id, isArchived: false };
+        directReady = true;
+      }
+    }
+    if (!directReady) {
+      // 写路径上的查找也用账号令牌：App 令牌看不到个人账号下的看板。
+      const data = await graphqlWrite(
+        `query ($login: String!, $projectNumber: Int!, $owner: String!, $name: String!, $issue: Int!) {
+          user(login: $login) {
+            projectV2(number: $projectNumber) {
+              id
+              fields(first: 50) {
+                nodes {
+                  __typename
+                  ... on ProjectV2FieldCommon { id name dataType }
+                  ... on ProjectV2SingleSelectField { options { id name } }
+                }
+              }
             }
           }
-        }
-      }`,
-      { login, projectNumber: number, owner, name, issue: Number(issue) },
-    );
-    const project = data.user?.projectV2;
-    if (!project?.id) throw new Error(`找不到看板 #${number}`);
-    const issueNode = data.repository?.issue;
-    if (!issueNode?.id) throw new Error(`找不到 issue ${repo}#${issue}`);
-    const fieldByName = new Map();
-    for (const node of project.fields?.nodes || []) {
-      if (node?.name) fieldByName.set(node.name, node);
-    }
-    let item = (issueNode.projectItems?.nodes || []).find((node) => node.project?.id === project.id);
-    if (!item) {
-      const added = await graphqlWrite(
-        `mutation ($projectId: ID!, $contentId: ID!) {
-          addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
-            item { id }
+          repository(owner: $owner, name: $name) {
+            issue(number: $issue) {
+              id
+              projectItems(first: 20, includeArchived: true) {
+                nodes { id isArchived project { id } }
+              }
+            }
           }
         }`,
-        { projectId: project.id, contentId: issueNode.id },
+        { login, projectNumber: number, owner, name, issue: Number(issue) },
       );
-      item = { id: added.addProjectV2ItemById?.item?.id, isArchived: false };
-    }
-    if (!item?.id) throw new Error('无法把条目加入看板');
-    if (item.isArchived) {
-      await graphqlWrite(
-        `mutation ($projectId: ID!, $itemId: ID!) {
-          unarchiveProjectV2Item(input: { projectId: $projectId, itemId: $itemId }) {
-            item { id }
-          }
-        }`,
-        { projectId: project.id, itemId: item.id },
-      );
+      project = data.user?.projectV2;
+      if (!project?.id) throw new Error(`找不到看板 #${number}`);
+      const issueNode = data.repository?.issue;
+      if (!issueNode?.id) throw new Error(`找不到 issue ${repo}#${issue}`);
+      fieldByName = fieldsByName(project);
+      item = (issueNode.projectItems?.nodes || []).find((node) => node.project?.id === project.id);
+      if (!item) {
+        const added = await graphqlWrite(
+          `mutation ($projectId: ID!, $contentId: ID!) {
+            addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+              item { id }
+            }
+          }`,
+          { projectId: project.id, contentId: issueNode.id },
+        );
+        item = { id: added.addProjectV2ItemById?.item?.id, isArchived: false };
+      }
+      if (!item?.id) throw new Error('无法把条目加入看板');
+      if (item.isArchived) {
+        await graphqlWrite(
+          `mutation ($projectId: ID!, $itemId: ID!) {
+            unarchiveProjectV2Item(input: { projectId: $projectId, itemId: $itemId }) {
+              item { id }
+            }
+          }`,
+          { projectId: project.id, itemId: item.id },
+        );
+      }
     }
     if (Object.hasOwn(fields, '验收')) {
       const field = fieldByName.get('验收');

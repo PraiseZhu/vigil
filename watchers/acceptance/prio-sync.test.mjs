@@ -2116,6 +2116,7 @@ function classifyQuery(query) {
   if (text.includes('search(query:')) return 'search';
   if (/\bmutation\b/.test(text)) return 'mutation';
   if (text.includes('repository(owner:')) return 'lookup';
+  if (text.includes('node(id:') && !text.includes('repository')) return 'item';
   return 'other';
 }
 
@@ -2176,6 +2177,14 @@ function scriptGithub({ nodes = [], searchNodes = [], fail = null } = {}) {
     if (kind === 'board') return { data: boardPayload(nodes, !variables?.after && fail === 'board-page-2') };
     if (kind === 'search') return { data: searchPayload(searchNodes) };
     if (kind === 'lookup') return { data: lookupPayload() };
+    if (kind === 'item') {
+      return {
+        data: {
+          user: lookupPayload().user,
+          node: { id: variables.itemId, isArchived: false, project: { id: 'PVT_test' } },
+        },
+      };
+    }
     if (kind === 'mutation') {
       if (fail === 'write') return { error: `write failed ${WRITE_TOKEN}` };
       return { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM_test' } } } };
@@ -2184,7 +2193,7 @@ function scriptGithub({ nodes = [], searchNodes = [], fail = null } = {}) {
   }
   const run = async (_cmd, _args, opts) => {
     const body = JSON.parse(opts.input);
-    seen.push({ via: 'run', token: opts?.env?.GH_TOKEN, kind: classifyQuery(body.query) });
+    seen.push({ via: 'run', token: opts?.env?.GH_TOKEN, kind: classifyQuery(body.query), query: body.query });
     const result = reply(body.query, body.variables);
     if (result.error) return { code: 1, stdout: '', stderr: result.error };
     return { code: 0, stdout: JSON.stringify({ data: result.data }), stderr: '' };
@@ -2192,7 +2201,7 @@ function scriptGithub({ nodes = [], searchNodes = [], fail = null } = {}) {
   const fetchImpl = async (_url, init) => {
     const body = JSON.parse(init.body);
     const header = String(init?.headers?.Authorization || '');
-    seen.push({ via: 'fetch', token: header.replace(/^Bearer\s+/i, ''), kind: classifyQuery(body.query) });
+    seen.push({ via: 'fetch', token: header.replace(/^Bearer\s+/i, ''), kind: classifyQuery(body.query), query: body.query });
     const result = reply(body.query, body.variables);
     if (result.error) return { ok: false, status: 500, text: async () => result.error };
     return { ok: true, status: 200, text: async () => JSON.stringify({ data: result.data }) };
@@ -3191,6 +3200,161 @@ test('#209 --restore 遇到解析不到的仓仍整拍中止', async () => {
   }
   assert.equal(thrown, error);
   assert.deepEqual(calls, [REPO_A, REPO_B]);
+});
+
+test('#210 真写动作带上读通道已有的条目 id', async () => {
+  const dir = tmpDir();
+  const calls = [];
+  const result = await runThreeRepos(dir, {
+    items: [
+      { ...repoItem(REPO_A, 1), id: 'PVTI_alpha' },
+      { ...repoItem(REPO_C, 4), id: 'PVTI_gamma' },
+    ],
+    writeFn: async (action) => {
+      calls.push(action);
+    },
+  });
+  assert.equal(result.error, null, result.error?.message);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].itemId, 'PVTI_alpha');
+  assert.equal(calls[1].itemId, 'PVTI_gamma');
+  assert.equal(calls[0].type, 'project.field.set');
+  assert.deepEqual(calls[0].fields, { 优先级: 'P0' });
+  assert.equal(result.changes.length, calls.length);
+  assert.equal(result.changes.some((row) => Object.hasOwn(row, 'itemId')), false);
+
+  const bare = [];
+  const bareResult = await runThreeRepos(tmpDir(), {
+    items: [repoItem(REPO_A, 1)],
+    writeFn: async (action) => {
+      bare.push(action);
+    },
+  });
+  assert.equal(bareResult.error, null, bareResult.error?.message);
+  assert.equal(Object.hasOwn(bare[0], 'itemId'), false);
+
+  const linkDir = tmpDir();
+  fs.writeFileSync(path.join(linkDir, 'mac-mini-stopped'), '');
+  const linkCalls = [];
+  await runPrioSync({
+    dir: linkDir,
+    items: [item(5, {
+      id: 'PVTI_link',
+      priority: 'P3',
+      linkedPr: '',
+      situationTier: 'P3',
+      repoClass: 'mivo',
+      issueState: 'open',
+    })],
+    prs: [{ repo: REPO, number: 9, title: 'fix #5', body: 'Closes #5\n', state: 'open', ci: 'pass', headRefName: 'fix' }],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: async (action) => {
+      linkCalls.push(action);
+    },
+    stdout: capture().stdout,
+  });
+  assert.equal(linkCalls.length, 1);
+  assert.equal(linkCalls[0].itemId, 'PVTI_link');
+  assert.deepEqual(linkCalls[0].fields, { '关联 PR': '#9(open,CI✓)' });
+});
+
+test('#210 读通道条目 id 经 main --write 进入动作，写请求不再解析仓', async () => {
+  const dir = tmpDir();
+  const node = readBoardNode({ id: 'PVTI_from_board', repo: OTHER_ORG_REPO, number: 41, labels: ['blocker'] });
+  const script = scriptGithub({ nodes: [node] });
+  const calls = [];
+  const injected = await runPrioMain(dir, ['--write'], {
+    loadProfile: () => profileWithReadToken(),
+    run: script.run,
+    fetchImpl: script.fetchImpl,
+    readToken: () => WRITE_TOKEN,
+    write: async (action) => {
+      calls.push(action);
+    },
+  });
+  assert.equal(injected.error, null, injected.error?.message);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].itemId, 'PVTI_from_board');
+  assert.equal(calls[0].repo, OTHER_ORG_REPO);
+  assert.equal(calls[0].issue, 41);
+
+  const directDir = tmpDir();
+  const direct = scriptGithub({ nodes: [node] });
+  const written = await runPrioMain(directDir, ['--write'], {
+    loadProfile: () => profileWithReadToken(),
+    run: direct.run,
+    fetchImpl: direct.fetchImpl,
+    readToken: () => WRITE_TOKEN,
+  });
+  assert.equal(written.error, null, written.error?.message);
+  const fetches = direct.seen.filter((entry) => entry.via === 'fetch');
+  assert.ok(fetches.length >= 1);
+  for (const entry of fetches) {
+    assert.equal(String(entry.query).includes('repository'), false);
+  }
+  assert.ok(fetches.some((entry) => entry.kind === 'mutation'));
+  assert.match(written.changes, /"field":"优先级"/);
+  assert.equal(written.changes.split('\n').filter(Boolean).length, 1);
+});
+
+test('#210 SC6 写失败的条目不进 changes.jsonl，行数等于实际写入数', async () => {
+  const dir = tmpDir();
+  const calls = [];
+  const boom = new Error('改字段不放行');
+  const result = await runThreeRepos(dir, {
+    items: [
+      { ...repoItem(REPO_A, 1), id: 'PVTI_a' },
+      { ...repoItem(REPO_B, 2), id: 'PVTI_b' },
+      { ...repoItem(REPO_C, 4), id: 'PVTI_c' },
+    ],
+    writeFn: async (action) => {
+      calls.push(action);
+      if (action.itemId === 'PVTI_b') throw boom;
+    },
+  });
+  assert.equal(result.error, boom);
+  assert.deepEqual(calls.map((action) => action.itemId), ['PVTI_a', 'PVTI_b']);
+  assert.equal(result.changes.length, 1);
+  assert.equal(result.changes[0].repo, REPO_A);
+  assert.equal(result.changes.some((row) => row.repo === REPO_B), false);
+  const raw = fs.readFileSync(path.join(dir, 'changes.jsonl'), 'utf8');
+  assert.equal(raw.split('\n').filter(Boolean).length, result.changes.length);
+});
+
+test('#210 SC7 干跑输出和状态文件不因条目 id 改变，不发写请求', async () => {
+  const plainItems = [repoItem(REPO_A, 1), repoItem(REPO_B, 2)];
+  const taggedItems = plainItems.map((entry, index) => ({ ...entry, id: `PVTI_${index}` }));
+  let plainWrites = 0;
+  let taggedWrites = 0;
+  const plain = await runThreeRepos(tmpDir(), {
+    write: false,
+    items: plainItems,
+    writeFn: async () => {
+      plainWrites += 1;
+    },
+  });
+  const tagged = await runThreeRepos(tmpDir(), {
+    write: false,
+    items: taggedItems,
+    writeFn: async () => {
+      taggedWrites += 1;
+    },
+  });
+  assert.equal(plain.error, null, plain.error?.message);
+  assert.equal(tagged.error, null, tagged.error?.message);
+  assert.equal(plainWrites, 0);
+  assert.equal(taggedWrites, 0);
+  assert.equal(tagged.stdout, plain.stdout);
+  assert.equal(tagged.debounceText, plain.debounceText);
+  assert.equal(tagged.reminded, '');
+  assert.equal(plain.reminded, '');
+  assert.equal(tagged.changes.length, 0);
+  assert.match(tagged.stdout, /dry-run：2 条，变更 2，写入 0，钉住 0/);
+  assert.equal(tagged.stdout.includes('PVTI_'), false);
+  assert.equal(tagged.debounceText.includes('PVTI_'), false);
 });
 
 test('#209 SC8 白名单仍只有优先级和关联 PR，同步模块不引用写闸', () => {
