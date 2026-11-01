@@ -5,6 +5,8 @@
 // 算不出关联（空串）时，不清空看板上已有的「关联 PR」。
 // 「关联 PR」真写前必须已有 mac-mini-stopped（人确认 Mac mini 停写后自建，本文件不创建）。
 // 依据只写进 changes.jsonl，不新增看板字段。60 天没动静只提醒「还要不要」，不关 issue。
+// repo-class.json 的 exclude 数组命中的仓：不打分、不写优先级和关联 PR、不提醒、不搜 PR、不还原。
+// 汇总只在有排除时追加「，排除 N 条」，N 是条数，不写仓名。stderr 不记跳过，只在 exclude 不是数组时警告一次。
 // 令牌只从 ~/acceptance/secrets/gh-priority-writer-token 读，不读环境变量，不写进日志和错误信息。
 import fs from 'node:fs';
 import os from 'node:os';
@@ -29,11 +31,12 @@ const RESTORE_BASIS = 'restore 按变更日志改回';
 const LINK_HOLD = '不写关联 PR：没有 .prio/mac-mini-stopped，要等确认 Mac mini 已停写\n';
 const RESTORE_SKIP = '跳过：当前值不是上次写入的值';
 
-/** 默认分类表是空的。真实仓名放在配置文件里，不写进源码。 */
+/** 默认分类表是空的。真实仓名放在配置文件里，不写进源码。exclude 命中的仓整仓跳过。 */
 export const DEFAULT_REPO_CLASS_TABLE = Object.freeze({
   mivo: Object.freeze([]),
   idle: Object.freeze([]),
   'daily-tool': Object.freeze([]),
+  exclude: Object.freeze([]),
 });
 
 export const BOARD_ITEMS_QUERY = `query ($login: String!, $projectNumber: Int!, $after: String) {
@@ -319,14 +322,23 @@ function listOf(value) {
   return Array.isArray(value) ? value.map((entry) => String(entry)) : [];
 }
 
+function emptyClassTable() {
+  return {
+    mivo: [...DEFAULT_REPO_CLASS_TABLE.mivo],
+    idle: [...DEFAULT_REPO_CLASS_TABLE.idle],
+    'daily-tool': [...DEFAULT_REPO_CLASS_TABLE['daily-tool']],
+    exclude: [...DEFAULT_REPO_CLASS_TABLE.exclude],
+  };
+}
+
+/** 只留字符串。不是数组时返回 null，调用方整键忽略并记一条警告。 */
+function excludeNames(value) {
+  if (!Array.isArray(value)) return null;
+  return value.filter((entry) => typeof entry === 'string');
+}
+
 export function readRepoClassTable(file) {
-  if (!file || !fs.existsSync(file)) {
-    return {
-      mivo: [...DEFAULT_REPO_CLASS_TABLE.mivo],
-      idle: [...DEFAULT_REPO_CLASS_TABLE.idle],
-      'daily-tool': [...DEFAULT_REPO_CLASS_TABLE['daily-tool']],
-    };
-  }
+  if (!file || !fs.existsSync(file)) return emptyClassTable();
   let parsed;
   try {
     parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -334,21 +346,60 @@ export function readRepoClassTable(file) {
     throw new Error('仓分类表不是合法 JSON');
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('仓分类表不是合法 JSON');
+  let exclude = [];
+  if (Object.prototype.hasOwnProperty.call(parsed, 'exclude')) {
+    const names = excludeNames(parsed.exclude);
+    if (names) exclude = names;
+    else {
+      process.stderr.write('仓分类表的 exclude 不是数组，已忽略\n');
+      exclude = [];
+    }
+  }
   return {
     mivo: listOf(parsed.mivo),
     idle: listOf(parsed.idle),
     'daily-tool': listOf(parsed['daily-tool'] || parsed.dailyTool),
+    exclude,
   };
 }
 
-/** 表里点名的用该档；没点名的按 daily-tool（待 Praise 确认），并记「不在分类表里」。 */
+/**
+ * 先看 exclude（只比较字符串；大小写与下面三档一样，折成小写再比）。
+ * 表里点名的用该档；没点名的按 daily-tool（待 Praise 确认），并记「不在分类表里」。
+ */
 export function classifyRepo(repo, table = DEFAULT_REPO_CLASS_TABLE) {
   const key = String(repo || '').toLowerCase();
   const has = (names) => (names || []).some((entry) => String(entry).toLowerCase() === key);
+  const excluded = (table?.exclude || []).some((entry) => typeof entry === 'string' && entry.toLowerCase() === key);
+  if (excluded) return { repoClass: 'exclude', unlisted: false };
   if (has(table.mivo)) return { repoClass: 'mivo', unlisted: false };
   if (has(table.idle)) return { repoClass: 'idle', unlisted: false };
   if (has(table['daily-tool'])) return { repoClass: 'daily-tool', unlisted: false };
   return { repoClass: 'daily-tool', unlisted: true };
+}
+
+function isExcludedRepo(repo, table) {
+  return classifyRepo(repo, table || DEFAULT_REPO_CLASS_TABLE).repoClass === 'exclude';
+}
+
+function itemIsExcluded(item, table) {
+  if (!item?.repo || !Number.isInteger(item.number) || item.number <= 0) return false;
+  return item.repoClass === 'exclude' || isExcludedRepo(item.repo, table);
+}
+
+function excludedSuffix(count) {
+  return count > 0 ? `，排除 ${count} 条` : '';
+}
+
+function repoOfRef(ref) {
+  const item = String(ref || '');
+  const hash = item.lastIndexOf('#');
+  return hash > 0 ? item.slice(0, hash) : '';
+}
+
+function repoOfChange(row) {
+  if (typeof row?.repo === 'string' && row.repo) return row.repo;
+  return repoOfRef(row?.item);
 }
 
 function timeMs(value) {
@@ -423,6 +474,7 @@ function mapPr(node) {
 
 export async function loadBoardItems(github, profile, table = DEFAULT_REPO_CLASS_TABLE) {
   const items = [];
+  let excludedCount = 0;
   let after = null;
   do {
     const data = await github.ownerGraphql(BOARD_ITEMS_QUERY, {
@@ -434,19 +486,26 @@ export async function loadBoardItems(github, profile, table = DEFAULT_REPO_CLASS
     if (!conn) throw new Error(`找不到看板 #${profile.projectNumber}`);
     for (const node of conn.nodes || []) {
       const mapped = mapItem(node, table);
-      if (mapped) items.push(mapped);
+      if (!mapped) continue;
+      if (itemIsExcluded(mapped, table)) {
+        excludedCount += 1;
+        continue;
+      }
+      items.push(mapped);
     }
     after = conn.pageInfo?.hasNextPage ? conn.pageInfo.endCursor : null;
   } while (after);
+  items.excludedCount = excludedCount;
   return items;
 }
 
-export async function loadPullRequests(github, repos) {
+export async function loadPullRequests(github, repos, table = DEFAULT_REPO_CLASS_TABLE) {
   const prs = [];
   const seen = new Set();
   for (const repo of repos || []) {
     const name = String(repo || '');
     if (!name.includes('/') || seen.has(name)) continue;
+    if (isExcludedRepo(name, table)) continue;
     seen.add(name);
     let after = null;
     do {
@@ -588,6 +647,8 @@ export async function runPrioSync({
   projectNumber,
   write,
   stdout,
+  table = DEFAULT_REPO_CLASS_TABLE,
+  excludedCount: presetExcluded = 0,
 } = {}) {
   if (!dir) throw new Error('缺少状态目录');
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
@@ -598,11 +659,18 @@ export async function runPrioSync({
   const nextItems = {};
   const changes = [];
   let pinned = 0;
-  const knownPrs = Array.isArray(prs) ? prs : null;
+  let skippedHere = 0;
+  const knownPrs = Array.isArray(prs) ? prs.filter((pr) => !isExcludedRepo(pr?.repo, table)) : null;
   const linkAllowed = macMiniStopped(dir);
 
   for (const item of items) {
     if (!item?.repo || !Number.isInteger(item.number) || item.number <= 0) continue;
+    if (itemIsExcluded(item, table)) {
+      skippedHere += 1;
+      const kept = refOf(item);
+      if (Object.prototype.hasOwnProperty.call(saved, kept)) nextItems[kept] = saved[kept];
+      continue;
+    }
     const ref = refOf(item);
     const labels = Array.isArray(item.labels) ? item.labels : [];
     if (Number.isFinite(item.lastEventAt) && now - item.lastEventAt > STALE_REMIND_MS) {
@@ -683,6 +751,11 @@ export async function runPrioSync({
     }
   }
 
+  for (const [ref, state] of Object.entries(saved)) {
+    if (Object.prototype.hasOwnProperty.call(nextItems, ref)) continue;
+    if (isExcludedRepo(repoOfRef(ref), table)) nextItems[ref] = state;
+  }
+
   let written = 0;
   for (const change of changes) {
     const basis = change.basis ? ` 依据：${change.basis}` : '';
@@ -718,8 +791,9 @@ export async function runPrioSync({
     written += 1;
   }
   saveDebounce(dir, nextItems);
-  outWrite(stdout, `${headOf(mode)}${items.length} 条，变更 ${changes.length}，写入 ${written}，钉住 ${pinned}\n`);
-  return { written, planned: changes.length, pinned, mode };
+  const excludedTotal = (Number.isInteger(presetExcluded) && presetExcluded > 0 ? presetExcluded : 0) + skippedHere;
+  outWrite(stdout, `${headOf(mode)}${items.length - skippedHere} 条，变更 ${changes.length}，写入 ${written}，钉住 ${pinned}${excludedSuffix(excludedTotal)}\n`);
+  return { written, planned: changes.length, pinned, mode, excluded: excludedTotal };
 }
 
 /** 把 since 这个时间点之后的变更改回当时的旧值。默认仍是 dry-run。 */
@@ -742,6 +816,7 @@ export async function restorePrio({
   write,
   stdout,
   items,
+  table = DEFAULT_REPO_CLASS_TABLE,
 } = {}) {
   if (!dir) throw new Error('缺少状态目录');
   const at = Date.parse(since);
@@ -758,7 +833,13 @@ export async function restorePrio({
   }
   const planned = [];
   const skipped = [];
+  let excludedRows = 0;
   for (const row of earliest.values()) {
+    const repo = repoOfChange(row);
+    if (isExcludedRepo(repo, table)) {
+      excludedRows += 1;
+      continue;
+    }
     const history = rows.filter((entry) => entry.item === row.item && entry.field === row.field);
     const latest = history[history.length - 1];
     const lastWritten = latest ? latest.new : row.new;
@@ -821,8 +902,8 @@ export async function restorePrio({
     });
     written += 1;
   }
-  outWrite(stdout, `${headOf(mode)}还原 ${planned.length} 条，写入 ${written}\n`);
-  return { written, planned: planned.length, mode };
+  outWrite(stdout, `${headOf(mode)}还原 ${planned.length} 条，写入 ${written}${excludedSuffix(excludedRows)}\n`);
+  return { written, planned: planned.length, mode, excluded: excludedRows };
 }
 
 /** 运行日志：<stateDir>/run-YYYY-MM-DD.log。日期取注入时钟的 UTC 日历日。不轮转、不清理、不设大小上限。 */
@@ -852,22 +933,26 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const stdout = deps.stdout || process.stdout;
   const nowMs = deps.now ? deps.now() : Date.now();
   const profile = deps.loadProfile ? deps.loadProfile() : loadAcceptanceProfile();
+  const table = readRepoClassTable(path.join(dir, 'repo-class.json'));
   let write = deps.write || null;
   let items = deps.loadItems ? await deps.loadItems() : null;
   let prs = deps.loadPrs ? await deps.loadPrs() : null;
-  const needGithub = !write || (!args.restore && (items == null || prs == null));
+  // 注入 write 也不代替看板。restore 同样要有 items；没注入就自己读。PR 只在非 restore 时读。
+  const needGithub = !write || items == null || (!args.restore && prs == null);
   if (needGithub) {
     const token = deps.readToken ? deps.readToken() : readPriorityWriterToken(priorityTokenPath());
-    const github = createPriorityGithub({ profile, token, run: deps.run });
+    const github = createPriorityGithub({ profile, token, run: deps.run, fetchImpl: deps.fetchImpl });
     if (!write) write = (action) => github.write(action);
     if (items == null) {
-      items = await loadBoardItems(github, profile, readRepoClassTable(path.join(dir, 'repo-class.json')));
+      items = await loadBoardItems(github, profile, table);
     }
     if (!args.restore && prs == null) {
-      prs = await loadPullRequests(github, [...new Set((items || []).map((entry) => entry.repo))]);
+      prs = await loadPullRequests(github, [...new Set((items || []).map((entry) => entry.repo))], table);
     }
   }
-  const loaded = items || [];
+  const split = withoutExcludedItems(items || [], table);
+  const loaded = split.items;
+  const excluded = (Number.isInteger(items?.excludedCount) ? items.excludedCount : 0) + split.excluded;
   const logFile = runLogFile(dir, nowMs);
   const modeLabel = args.write === true ? 'apply' : 'dry-run';
   appendRunLog(logFile, `${new Date(nowMs).toISOString()} ${modeLabel} ${loaded.length}\n`);
@@ -883,6 +968,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       write,
       stdout: loggedStdout,
       items: loaded,
+      table,
     });
   }
   return runPrioSync({
@@ -895,7 +981,22 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     projectNumber: profile.projectNumber,
     write,
     stdout: loggedStdout,
+    table,
+    excludedCount: excluded,
   });
+}
+
+function withoutExcludedItems(list, table) {
+  const kept = [];
+  let excluded = 0;
+  for (const item of list || []) {
+    if (itemIsExcluded(item, table)) {
+      excluded += 1;
+      continue;
+    }
+    kept.push(item);
+  }
+  return { items: kept, excluded };
 }
 
 const invoked = process.argv[1] ? path.resolve(process.argv[1]) : '';
