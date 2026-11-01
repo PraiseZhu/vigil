@@ -2674,3 +2674,247 @@ test('#205 SC11 排除表里 2 条时 --restore 汇总写排除 2，与同一输
   assert.doesNotMatch(dry.text(), /abandoned|other-excluded/i);
   assert.doesNotMatch(restored.text(), /abandoned|other-excluded/i);
 });
+
+function ghPr(number, issueNumber, rollup, { state = 'OPEN', merged = false } = {}) {
+  const pr = {
+    repo: REPO,
+    number,
+    title: `fix #${issueNumber}`,
+    body: `Closes #${issueNumber}\n`,
+    state,
+    merged,
+    headRefName: 'fix',
+  };
+  if (rollup) pr.commits = { nodes: [{ commit: { statusCheckRollup: { state: rollup } } }] };
+  return pr;
+}
+
+function writeDebounce(dir, { items = {}, prCi } = {}) {
+  fs.mkdirSync(dir, { recursive: true });
+  const body = { items };
+  if (prCi !== undefined) body.prCi = prCi;
+  fs.writeFileSync(path.join(dir, 'debounce.json'), `${JSON.stringify(body)}\n`);
+}
+
+test('#207 SC1 检查在跑一拍后文本仍带上一拍 ✓', async () => {
+  const dir = tmpDir();
+  const key = `${REPO}#9`;
+  writeDebounce(dir, { prCi: { [key]: { mark: 'pass', pending: 0 } } });
+  const github = {
+    async ownerGraphql(query) {
+      if (String(query).includes('projectV2')) {
+        return { user: { projectV2: { items: { pageInfo: { hasNextPage: false }, nodes: [] } } } };
+      }
+      return {
+        search: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [{
+            number: 9,
+            title: 'fix #5',
+            body: 'Closes #5\n',
+            state: 'OPEN',
+            merged: false,
+            headRefName: 'fix',
+            repository: { nameWithOwner: REPO },
+            commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] },
+          }],
+        },
+      };
+    },
+  };
+  const prs = await loadPullRequests(github, [REPO]);
+  assert.equal(prs.length, 1);
+  assert.equal(prs[0].ci, undefined);
+  assert.equal(prs[0].ciPending, true);
+  const io = capture();
+  await runPrioSync({
+    dir,
+    items: [stableItem(5, { linkedPr: '' })],
+    prs,
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: recorder().write,
+    stdout: io.stdout,
+  });
+  assert.match(io.text(), /关联 PR （空） → #9\(open,CI✓\)/);
+  assert.doesNotMatch(io.text(), /→ #9\(open\) 依据/);
+  assert.doesNotMatch(io.text(), /检查超时/);
+});
+
+test('#207 SC2 终态变化才改：✓→✗，✗→✓', async () => {
+  const key = `${REPO}#9`;
+  const downDir = tmpDir();
+  writeDebounce(downDir, { prCi: { [key]: { mark: 'pass', pending: 2 } } });
+  const down = capture();
+  await runPrioSync({
+    dir: downDir,
+    items: [stableItem(5, { linkedPr: '' })],
+    prs: [ghPr(9, 5, 'FAILURE')],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: recorder().write,
+    stdout: down.stdout,
+  });
+  assert.match(down.text(), /#9\(open,CI✗\)/);
+  assert.equal(readState(downDir).prCi[key].mark, 'fail');
+  assert.equal(readState(downDir).prCi[key].pending, 0);
+
+  const upDir = tmpDir();
+  writeDebounce(upDir, { prCi: { [key]: { mark: 'fail', pending: 0 } } });
+  const up = capture();
+  await runPrioSync({
+    dir: upDir,
+    items: [stableItem(5, { linkedPr: '' })],
+    prs: [ghPr(9, 5, 'SUCCESS')],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: recorder().write,
+    stdout: up.stdout,
+  });
+  assert.match(up.text(), /#9\(open,CI✓\)/);
+  assert.equal(readState(upDir).prCi[key].mark, 'pass');
+  assert.equal(readState(upDir).prCi[key].pending, 0);
+});
+
+test('#207 SC3 连续两拍文本相同时第二拍不写、变更行不增加', async () => {
+  const twoTicks = async (argv) => {
+    const dir = tmpDir();
+    seedLink(dir, 5, '#9(open,CI✓)');
+    writeDebounce(dir, { prCi: { [`${REPO}#9`]: { mark: 'pass', pending: 0 } } });
+    const gate = recorder();
+    const deps = {
+      dir,
+      loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+      loadItems: async () => [stableItem(5, { linkedPr: '#9(open,CI✓)' })],
+      loadPrs: async () => [ghPr(9, 5, 'PENDING')],
+      write: gate.write,
+      readToken: () => {
+        throw new Error('不应读令牌');
+      },
+    };
+    const first = capture();
+    await main(argv, { ...deps, now: () => T0, stdout: first.stdout });
+    const beforeWrites = gate.writes.length;
+    const beforeRows = readJsonl(dir).filter((row) => row.field === '关联 PR').length;
+    const second = capture();
+    await main(argv, { ...deps, now: () => T0 + 1000, stdout: second.stdout });
+    assert.equal(gate.writes.length - beforeWrites, 0);
+    assert.equal(readJsonl(dir).filter((row) => row.field === '关联 PR').length - beforeRows, 0);
+    assert.doesNotMatch(second.text(), /关联 PR .+→/);
+    assert.doesNotMatch(first.text(), /关联 PR .+→/);
+  };
+  await twoTicks([]);
+  await twoTicks(['--write']);
+});
+
+test('#207 SC4 第一次见到且检查在跑时文本只剩 (open)', async () => {
+  const dir = tmpDir();
+  const io = capture();
+  await runPrioSync({
+    dir,
+    items: [stableItem(5, { linkedPr: '' })],
+    prs: [ghPr(9, 5, 'PENDING')],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: recorder().write,
+    stdout: io.stdout,
+  });
+  assert.match(io.text(), /→ #9\(open\) 依据/);
+  assert.doesNotMatch(io.text(), /CI✓|CI✗|检查超时/);
+  assert.equal(Object.hasOwn(readState(dir), 'prCi'), false);
+});
+
+test('#207 SC5 连续 PENDING 沿用 6 拍，第 7 拍退回 (open)', async () => {
+  const dir = tmpDir();
+  const key = `${REPO}#9`;
+  let prCi = { [key]: { mark: 'pass', pending: 0 } };
+  for (let tick = 1; tick <= 7; tick += 1) {
+    const items = fs.existsSync(path.join(dir, 'debounce.json')) ? readState(dir).items : {};
+    writeDebounce(dir, { items, prCi });
+    const io = capture();
+    await runPrioSync({
+      dir,
+      items: [stableItem(5, { linkedPr: '' })],
+      prs: [ghPr(9, 5, 'PENDING')],
+      nowMs: T0 + tick * 1000,
+      apply: true,
+      ownerLogin: OWNER,
+      projectNumber: PROJECT,
+      write: recorder().write,
+      stdout: io.stdout,
+    });
+    assert.doesNotMatch(io.text(), /检查超时/, `第 ${tick} 拍`);
+    if (tick <= 6) assert.match(io.text(), /→ #9\(open,CI✓\)/, `第 ${tick} 拍`);
+    else {
+      assert.match(io.text(), /→ #9\(open\) 依据/, `第 ${tick} 拍`);
+      assert.doesNotMatch(io.text(), /CI✓|CI✗/, `第 ${tick} 拍`);
+    }
+    prCi = readState(dir).prCi;
+  }
+});
+
+test('#207 SC9 干跑不新增也不修改上一拍标注', async () => {
+  const dir = tmpDir();
+  const deps = {
+    dir,
+    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    loadItems: async () => [stableItem(5, { linkedPr: '#9(open,CI✓)' })],
+    loadPrs: async () => [ghPr(9, 5, 'FAILURE')],
+    write: recorder().write,
+    readToken: () => {
+      throw new Error('不应读令牌');
+    },
+  };
+  await main([], { ...deps, now: () => T0, stdout: capture().stdout });
+  const created = readState(dir);
+  assert.equal(Object.hasOwn(created, 'prCi'), false);
+  assert.equal(created.items[`${REPO}#5`].priority, 'P3');
+
+  const seeded = { [`${REPO}#9`]: { mark: 'pass', pending: 0 } };
+  writeDebounce(dir, { items: created.items, prCi: structuredClone(seeded) });
+  await main([], { ...deps, now: () => T0 + 1000, stdout: capture().stdout });
+  assert.deepEqual(readState(dir).prCi, seeded);
+  assert.equal(readState(dir).items[`${REPO}#5`].priority, 'P3');
+});
+
+test('#207 SC10 合并或关闭后清掉该 PR 标注，其它开着的 PR 不动', async () => {
+  for (const state of ['MERGED', 'CLOSED']) {
+    const dir = tmpDir();
+    const gone = `${REPO}#9`;
+    const kept = `${REPO}#10`;
+    const keptEntry = { mark: 'fail', pending: 0 };
+    writeDebounce(dir, {
+      prCi: {
+        [gone]: { mark: 'pass', pending: 0 },
+        [kept]: keptEntry,
+      },
+    });
+    await main(['--write'], {
+      dir,
+      now: () => T0,
+      stdout: capture().stdout,
+      loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+      loadItems: async () => [stableItem(5, { linkedPr: '#9(open,CI✓) #10(open,CI✗)' })],
+      loadPrs: async () => [
+        ghPr(9, 5, 'SUCCESS', { state, merged: state === 'MERGED' }),
+        ghPr(10, 5, 'FAILURE'),
+      ],
+      write: recorder().write,
+      readToken: () => {
+        throw new Error('不应读令牌');
+      },
+    });
+    const prCi = readState(dir).prCi;
+    assert.ok(prCi, state);
+    assert.equal(Object.hasOwn(prCi, gone), false, state);
+    assert.deepEqual(prCi[kept], keptEntry, state);
+  }
+});
