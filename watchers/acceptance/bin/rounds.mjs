@@ -123,17 +123,35 @@ export function parseRounds(comments, ownerLogin) {
   return rounds;
 }
 
-/** 按创建时间最新的那条轮次评论。 */
+function positiveInt(value) {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : null;
+}
+
+/**
+ * 轮次号最大的一轮。同一轮有多条评论时取 commentId（GitHub databaseId）最大的一条。
+ * createdAt 不参与：评论创建时间会受时钟偏差影响，轮次号由验收机单调递增写入。
+ * 轮次号不是正整数的条目不参与比较；没有合法条目时返回 null。
+ * 同轮 commentId 不是正整数的排在有 commentId 的前面；都没有时取输入顺序里的最后一条。
+ */
 export function latestRound(rounds) {
   if (!rounds?.length) return null;
-  return [...rounds]
-    .sort((a, b) => {
-      const ta = Date.parse(a.createdAt || 0);
-      const tb = Date.parse(b.createdAt || 0);
-      if (ta !== tb) return ta - tb;
-      return a.round - b.round;
-    })
-    .at(-1);
+  const eligible = [];
+  for (let index = 0; index < rounds.length; index += 1) {
+    const item = rounds[index];
+    if (positiveInt(item?.round) == null) continue;
+    eligible.push({ item, index });
+  }
+  if (!eligible.length) return null;
+  eligible.sort((a, b) => {
+    if (a.item.round !== b.item.round) return a.item.round - b.item.round;
+    const ia = positiveInt(a.item.commentId);
+    const ib = positiveInt(b.item.commentId);
+    if (ia == null && ib != null) return -1;
+    if (ia != null && ib == null) return 1;
+    if (ia != null && ib != null && ia !== ib) return ia - ib;
+    return a.index - b.index;
+  });
+  return eligible.at(-1).item;
 }
 
 function formatStartBody(n, version, startedAt) {

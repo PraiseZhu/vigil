@@ -321,3 +321,115 @@ test('安全 rounds.check / finish：别人伪造的更新轮次评论不顶掉�
   const forgedAfter = store.get().comments.nodes.find((c) => c.databaseId === 3003);
   assert.match(forgedAfter.body, /第 3 轮：通过/);
 });
+
+function roundRow(round, status, createdAt, commentId) {
+  return { round, status, createdAt, commentId };
+}
+
+test('latestRound 按轮次号：createdAt 反序', () => {
+  const rounds = [
+    roundRow(1, '要修', '2026-11-01T12:00:00.000Z', 11),
+    roundRow(2, '通过', '2026-11-01T11:00:00.000Z', 22),
+    roundRow(3, '验收中', '2026-11-01T10:00:00.000Z', 33),
+  ];
+  const latest = latestRound(rounds);
+  assert.equal(latest.round, 3);
+  assert.equal(latest.status, '验收中');
+  assert.equal(latest.commentId, 33);
+});
+
+test('latestRound 一小时偏差下第 3 轮仍最新', () => {
+  // #191：第 3 轮 createdAt 09:07:54Z，第 2 轮 09:58:00Z。时钟偏差让第 3 轮显得更早。
+  const rounds = [
+    roundRow(2, '通过', '2026-11-01T09:58:00.000Z', 202),
+    roundRow(3, '验收中', '2026-11-01T09:07:54.000Z', 303),
+  ];
+  const latest = latestRound(rounds);
+  assert.equal(latest.round, 3);
+  assert.equal(latest.status, '验收中');
+  assert.equal(latest.commentId, 303);
+});
+
+test('latestRound 输入乱序', () => {
+  const rounds = [
+    roundRow(2, '通过', '2026-11-01T08:00:00.000Z', 2),
+    roundRow(3, '验收中', '2026-11-01T07:00:00.000Z', 3),
+    roundRow(1, '要修', '2026-11-01T09:00:00.000Z', 1),
+  ];
+  const latest = latestRound(rounds);
+  assert.equal(latest.round, 3);
+  assert.equal(latest.status, '验收中');
+});
+
+test('latestRound 同轮重复评论取 databaseId 最大', () => {
+  const comments = [
+    roundComment({
+      round: 2,
+      status: '验收中',
+      databaseId: 50,
+      createdAt: '2026-11-01T10:00:00.000Z',
+      id: 'IC_early_id',
+    }),
+    roundComment({
+      round: 2,
+      status: '通过',
+      databaseId: 80,
+      createdAt: '2026-11-01T09:00:00.000Z',
+      id: 'IC_late_id',
+    }),
+  ];
+  const latest = latestRound(parseRounds(comments, OWNER));
+  assert.equal(latest.commentId, 80);
+  assert.equal(latest.status, '通过');
+  assert.equal(latest.round, 2);
+});
+
+test('latestRound 同轮 commentId 缺失时有 id 的优先，都缺失取输入最后一条', () => {
+  const withId = latestRound(parseRounds([
+    roundComment({
+      round: 2,
+      status: '通过',
+      databaseId: null,
+      createdAt: '2026-11-01T12:00:00.000Z',
+      id: 'IC_no_id',
+    }),
+    roundComment({
+      round: 2,
+      status: '要修',
+      databaseId: 10,
+      createdAt: '2026-11-01T08:00:00.000Z',
+      id: 'IC_has_id',
+    }),
+  ], OWNER));
+  assert.equal(withId.commentId, 10);
+  assert.equal(withId.status, '要修');
+
+  const bothMissing = latestRound([
+    roundRow(4, '验收中', '2026-11-01T12:00:00.000Z', null),
+    roundRow(4, '通过', '2026-11-01T08:00:00.000Z', undefined),
+  ]);
+  assert.equal(bothMissing.status, '通过');
+  assert.equal(bothMissing.round, 4);
+});
+
+test('latestRound 不合法轮次号', () => {
+  const valid = roundRow(4, '要修', '2026-11-01T01:00:00.000Z', 4);
+  const illegal = [
+    { status: '通过', createdAt: '2026-11-01T09:00:00.000Z', commentId: 91 },
+    roundRow(undefined, '通过', '2026-11-01T09:00:00.000Z', 92),
+    roundRow(null, '通过', '2026-11-01T09:00:00.000Z', 93),
+    roundRow(NaN, '通过', '2026-11-01T09:00:00.000Z', 94),
+    roundRow(0, '通过', '2026-11-01T09:00:00.000Z', 95),
+    roundRow(-3, '通过', '2026-11-01T09:00:00.000Z', 96),
+    roundRow(1.5, '通过', '2026-11-01T09:00:00.000Z', 97),
+    roundRow(Number.POSITIVE_INFINITY, '通过', '2026-11-01T09:00:00.000Z', 98),
+    roundRow('3', '通过', '2026-11-01T09:00:00.000Z', 99),
+  ];
+  const latest = latestRound([...illegal, valid]);
+  assert.equal(latest.round, 4);
+  assert.equal(latest.status, '要修');
+  assert.equal(latestRound(illegal), null);
+  assert.equal(latestRound([]), null);
+  assert.equal(latestRound(null), null);
+  assert.equal(latestRound(undefined), null);
+});
