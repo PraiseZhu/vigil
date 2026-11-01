@@ -9,6 +9,7 @@ import { isReadOnlyGraphql } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import {
   assertPrioFields,
+  classifyRepo,
   createPriorityGithub,
   loadBoardItems,
   loadPullRequests,
@@ -16,8 +17,10 @@ import {
   parsePrioArgs,
   priorityTokenPath,
   readPriorityWriterToken,
+  readRepoClassTable,
   restorePrio,
   runPrioSync,
+  STALE_REMIND_MS,
 } from './bin/prio-sync.mjs';
 import { REPO, createFakeRun, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 
@@ -1478,4 +1481,560 @@ test('#181 --restore 也把运行头和 stdout 追加进当天日志', async () 
   const log = fs.readFileSync(path.join(dir, runLogName(now)), 'utf8');
   assert.equal(log, `${new Date(now).toISOString()} dry-run 1\n${stdout}`);
   assert.equal(stdout.includes('dry-run 1'), false);
+});
+
+const ABANDONED = 'example-owner/abandoned';
+const ABANDONED_LISTED = 'Example-Owner/Abandoned';
+
+function classTable(extra = {}) {
+  return {
+    mivo: [],
+    idle: [],
+    'daily-tool': [],
+    exclude: [],
+    ...extra,
+  };
+}
+
+function writeClassFile(dir, extra = {}) {
+  fs.writeFileSync(path.join(dir, 'repo-class.json'), `${JSON.stringify(classTable(extra))}\n`);
+}
+
+function issueNode({ id, repo, number, updatedAt, labels = [], fields = [] }) {
+  return {
+    id,
+    isArchived: false,
+    updatedAt,
+    content: {
+      __typename: 'Issue',
+      number,
+      state: 'OPEN',
+      updatedAt,
+      repository: { nameWithOwner: repo },
+      labels: { nodes: labels.map((name) => ({ name })) },
+    },
+    fieldValues: { nodes: fields },
+  };
+}
+
+function graphqlFetch(handler) {
+  const queries = [];
+  const fetchImpl = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    queries.push(body);
+    const data = await handler(body);
+    return { ok: true, text: async () => JSON.stringify({ data }) };
+  };
+  return { queries, fetchImpl };
+}
+
+async function withStderr(fn) {
+  const chunks = [];
+  const orig = process.stderr.write;
+  process.stderr.write = (chunk, encoding, cb) => {
+    chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+    const done = typeof encoding === 'function' ? encoding : cb;
+    if (typeof done === 'function') done();
+    return true;
+  };
+  try {
+    return { result: await fn(), stderr: chunks.join('') };
+  } finally {
+    process.stderr.write = orig;
+  }
+}
+
+function searchQueries(queries) {
+  return queries
+    .filter((body) => String(body.query).includes('search('))
+    .map((body) => String(body.variables?.query || ''));
+}
+
+test('#198 classifyRepo 的 exclude 大小写与既有分档一致，且先于其他档', () => {
+  const listed = classTable({
+    mivo: ['example-owner/mivo-repo'],
+    idle: ['example-owner/idle-repo'],
+    'daily-tool': ['example-owner/daily-repo'],
+    exclude: [ABANDONED_LISTED],
+  });
+  assert.equal(classifyRepo(ABANDONED, listed).repoClass, 'exclude');
+  assert.equal(classifyRepo(ABANDONED, listed).unlisted, false);
+  assert.equal(classifyRepo('EXAMPLE-OWNER/ABANDONED', listed).repoClass, 'exclude');
+  assert.equal(classifyRepo('Example-Owner/Mivo-Repo', classTable({ mivo: ['example-owner/mivo-repo'] })).repoClass, 'mivo');
+  assert.equal(classifyRepo('Example-Owner/Idle-Repo', classTable({ idle: ['example-owner/idle-repo'] })).repoClass, 'idle');
+  assert.equal(classifyRepo('Example-Owner/Daily-Repo', classTable({ 'daily-tool': ['example-owner/daily-repo'] })).repoClass, 'daily-tool');
+  assert.equal(classifyRepo('Example-Owner/Daily-Repo', classTable({ 'daily-tool': ['example-owner/daily-repo'] })).unlisted, false);
+  const unlisted = classifyRepo('example-owner/unlisted', classTable());
+  assert.equal(unlisted.repoClass, 'daily-tool');
+  assert.equal(unlisted.unlisted, true);
+  assert.equal(classifyRepo('example-owner/mivo-repo', classTable({
+    mivo: ['example-owner/mivo-repo'],
+    exclude: ['EXAMPLE-OWNER/MIVO-REPO'],
+  })).repoClass, 'exclude');
+});
+
+test('#198 SC1 exclude 仓在看板上时不打分、不写、不提醒、不进汇总、不搜 PR', async () => {
+  const dir = tmpDir();
+  writeClassFile(dir, { exclude: [ABANDONED_LISTED] });
+  const stale = new Date(T0 - STALE_REMIND_MS - 1).toISOString();
+  const fresh = new Date(T0).toISOString();
+  const { queries, fetchImpl } = graphqlFetch(async (body) => {
+    if (String(body.query).includes('projectV2')) {
+      return {
+        user: {
+          projectV2: {
+            items: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                issueNode({
+                  id: 'PVTI_EX',
+                  repo: ABANDONED,
+                  number: 4,
+                  updatedAt: stale,
+                  fields: [
+                    { name: 'P0', field: { name: '优先级' } },
+                    { text: '#1(open)', field: { name: '关联 PR' } },
+                  ],
+                }),
+                issueNode({
+                  id: 'PVTI_KEEP',
+                  repo: REPO,
+                  number: 8,
+                  updatedAt: fresh,
+                  labels: ['prio:pin'],
+                  fields: [{ name: 'P3', field: { name: '优先级' } }],
+                }),
+              ],
+            },
+          },
+        },
+      };
+    }
+    const asked = String(body.variables?.query || '');
+    if (asked.toLowerCase().includes('abandoned')) {
+      return {
+        search: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [{
+            number: 9,
+            title: 'fix #4',
+            body: 'Closes #4\n',
+            state: 'OPEN',
+            merged: false,
+            headRefName: 'fix',
+            repository: { nameWithOwner: ABANDONED },
+            commits: { nodes: [{ commit: { statusCheckRollup: { state: 'SUCCESS' } } }] },
+          }],
+        },
+      };
+    }
+    return { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+  });
+  const gate = recorder();
+  const io = capture();
+  const { stderr } = await withStderr(() => main(['--state-dir', dir, '--write'], {
+    now: () => T0,
+    stdout: io.stdout,
+    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    readToken: () => 'prio-writer-fixture-value',
+    write: gate.write,
+    fetchImpl,
+  }));
+  const text = io.text();
+  assert.equal(gate.writes.length, 0);
+  assert.equal(fs.existsSync(path.join(dir, 'changes.jsonl')), false);
+  assert.equal(fs.existsSync(path.join(dir, 'reminded.jsonl')), false);
+  assert.doesNotMatch(text, /abandoned/i);
+  assert.doesNotMatch(text, /还要不要/);
+  assert.doesNotMatch(text, /手动值与规则不一致/);
+  assert.doesNotMatch(text, /优先级 .+→/);
+  assert.doesNotMatch(text, /关联 PR .+→/);
+  assert.match(text, /写入：1 条，变更 0，写入 0，钉住 1，排除 1 条/);
+  const log = fs.readFileSync(path.join(dir, runLogName(T0)), 'utf8');
+  assert.match(log, /apply 1\n/);
+  assert.match(log, /排除 1 条/);
+  assert.equal(log.toLowerCase().includes('abandoned'), false);
+  const searched = searchQueries(queries);
+  assert.equal(searched.some((query) => query.toLowerCase().includes('abandoned')), false);
+  assert.equal(searched.some((query) => query.includes(`repo:${REPO}`)), true);
+  assert.equal(stderr, '');
+  assert.equal(stderr.includes('跳过：exclude'), false);
+
+  const directDir = tmpDir();
+  const direct = capture();
+  const directGate = recorder();
+  await runPrioSync({
+    dir: directDir,
+    items: [
+      item(4, {
+        repo: ABANDONED,
+        priority: 'P0',
+        linkedPr: '#1(open)',
+        lastEventAt: T0 - STALE_REMIND_MS - 1,
+        lastEventKnown: true,
+      }),
+      item(8, { repo: REPO }),
+    ],
+    prs: [{
+      repo: ABANDONED,
+      number: 9,
+      title: 'fix #4',
+      body: 'Closes #4\n',
+      state: 'open',
+      ci: 'pass',
+      headRefName: 'fix',
+    }],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: directGate.write,
+    stdout: direct.stdout,
+    table: classTable({ exclude: [ABANDONED_LISTED] }),
+  });
+  assert.equal(directGate.writes.length, 1);
+  assert.equal(directGate.writes[0].repo, REPO);
+  assert.equal(directGate.writes[0].issue, 8);
+  assert.match(direct.text(), /写入：1 条，变更 1，写入 1，钉住 0，排除 1 条/);
+  assert.doesNotMatch(direct.text(), /abandoned/i);
+  assert.doesNotMatch(direct.text(), /还要不要/);
+  assert.equal(readJsonl(directDir).some((row) => String(row.repo).toLowerCase() === ABANDONED), false);
+  assert.equal(fs.existsSync(path.join(directDir, 'reminded.jsonl')), false);
+});
+
+test('#198 SC2 exclude 仓没有看板条目时也不搜 PR', async () => {
+  const dir = tmpDir();
+  writeClassFile(dir, { exclude: [ABANDONED_LISTED] });
+  const fresh = new Date(T0).toISOString();
+  const { queries, fetchImpl } = graphqlFetch(async (body) => {
+    if (String(body.query).includes('projectV2')) {
+      return {
+        user: {
+          projectV2: {
+            items: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                issueNode({
+                  id: 'PVTI_KEEP',
+                  repo: REPO,
+                  number: 8,
+                  updatedAt: fresh,
+                  labels: ['prio:pin'],
+                  fields: [{ name: 'P3', field: { name: '优先级' } }],
+                }),
+              ],
+            },
+          },
+        },
+      };
+    }
+    return { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+  });
+  const io = capture();
+  await main(['--state-dir', dir], {
+    now: () => T0,
+    stdout: io.stdout,
+    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    readToken: () => 'prio-writer-fixture-value',
+    write: recorder().write,
+    fetchImpl,
+  });
+  const searched = searchQueries(queries);
+  assert.equal(searched.some((query) => query.toLowerCase().includes('abandoned')), false);
+  assert.equal(searched.some((query) => query.includes(`repo:${REPO}`)), true);
+  assert.doesNotMatch(io.text(), /abandoned/i);
+
+  const directQueries = [];
+  const github = {
+    async ownerGraphql(query, variables) {
+      directQueries.push({ query, variables });
+      return { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+    },
+  };
+  const prs = await loadPullRequests(
+    github,
+    [ABANDONED_LISTED, REPO, ABANDONED],
+    classTable({ exclude: [ABANDONED] }),
+  );
+  assert.deepEqual(prs, []);
+  assert.equal(directQueries.length, 1);
+  assert.equal(String(directQueries[0].variables.query).includes(`repo:${REPO}`), true);
+  assert.equal(directQueries.some((entry) => String(entry.variables.query).toLowerCase().includes('abandoned')), false);
+});
+
+test('#198 restore 不改 exclude 仓；条目仍在列表里也不写回', async () => {
+  const dir = tmpDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const seed = (repo, number, itemRef) => ({
+    at: new Date(T0).toISOString(),
+    item: itemRef,
+    repo,
+    issue: number,
+    field: '优先级',
+    old: null,
+    new: 'P0',
+    basis: 'seed',
+  });
+  fs.writeFileSync(path.join(dir, 'changes.jsonl'), `${JSON.stringify(seed('EXAMPLE-OWNER/ABANDONED', 4, `${ABANDONED}#4`))}\n${JSON.stringify(seed(REPO, 8, `${REPO}#8`))}\n`);
+  const gate = recorder();
+  const io = capture();
+  await restorePrio({
+    dir,
+    since: new Date(T0).toISOString(),
+    nowMs: T0 + 1000,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: io.stdout,
+    table: classTable({ exclude: [ABANDONED_LISTED] }),
+    items: [
+      item(4, { repo: ABANDONED, priority: 'P0' }),
+      item(8, { priority: 'P0' }),
+    ],
+  });
+  assert.equal(gate.writes.length, 1);
+  assert.equal(gate.writes[0].repo, REPO);
+  assert.equal(gate.writes[0].issue, 8);
+  assert.deepEqual(gate.writes[0].fields, { 优先级: null });
+  assert.match(io.text(), /还原 1 条，写入 1，排除 1 条/);
+  assert.doesNotMatch(io.text(), /abandoned/i);
+  assert.doesNotMatch(io.text(), /跳过：当前值不是上次写入的值/);
+  const rows = readJsonl(dir);
+  assert.equal(rows.filter((row) => String(row.repo).toLowerCase() === ABANDONED).length, 1);
+  assert.equal(rows.filter((row) => row.repo === REPO).length, 2);
+
+  const state = tmpDir();
+  writeClassFile(state, { exclude: [ABANDONED_LISTED] });
+  fs.writeFileSync(path.join(state, 'changes.jsonl'), `${JSON.stringify(seed(ABANDONED, 4, `${ABANDONED}#4`))}\n${JSON.stringify(seed(REPO, 8, `${REPO}#8`))}\n`);
+  const fresh = new Date(T0).toISOString();
+  const { queries, fetchImpl } = graphqlFetch(async (body) => {
+    if (!String(body.query).includes('projectV2')) {
+      return { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+    }
+    return {
+      user: {
+        projectV2: {
+          items: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [
+              issueNode({
+                id: 'PVTI_EX',
+                repo: ABANDONED,
+                number: 4,
+                updatedAt: fresh,
+                fields: [{ name: 'P0', field: { name: '优先级' } }],
+              }),
+              issueNode({
+                id: 'PVTI_KEEP',
+                repo: REPO,
+                number: 8,
+                updatedAt: fresh,
+                fields: [{ name: 'P0', field: { name: '优先级' } }],
+              }),
+            ],
+          },
+        },
+      },
+    };
+  });
+  const live = recorder();
+  const out = capture();
+  await main(['--state-dir', state, '--restore', new Date(T0).toISOString(), '--write'], {
+    now: () => T0 + 2000,
+    stdout: out.stdout,
+    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    readToken: () => 'prio-writer-fixture-value',
+    write: live.write,
+    fetchImpl,
+  });
+  assert.equal(live.writes.length, 1);
+  assert.equal(live.writes[0].issue, 8);
+  assert.equal(live.writes[0].repo, REPO);
+  assert.doesNotMatch(out.text(), /abandoned/i);
+  assert.doesNotMatch(out.text(), /跳过：当前值不是上次写入的值/);
+  assert.match(out.text(), /还原 1 条，写入 1，排除 1 条/);
+  const restoreLog = fs.readFileSync(path.join(state, runLogName(T0 + 2000)), 'utf8');
+  assert.match(restoreLog, /apply 1\n/);
+  assert.match(restoreLog, /排除 1 条/);
+  assert.equal(restoreLog.toLowerCase().includes('abandoned'), false);
+  assert.equal(searchQueries(queries).length, 0);
+  assert.equal(readJsonl(state).filter((row) => String(row.repo).toLowerCase() === ABANDONED).length, 1);
+});
+
+test('#198 SC4 分类表缺失或没有 exclude 键时行为不变', async () => {
+  const missingPath = path.join(tmpDir(), 'repo-class.json');
+  const missing = await withStderr(() => readRepoClassTable(missingPath));
+  assert.equal(missing.stderr, '');
+  assert.deepEqual(missing.result.mivo, []);
+  assert.deepEqual(missing.result.idle, []);
+  assert.deepEqual(missing.result['daily-tool'], []);
+  assert.deepEqual(missing.result.exclude, []);
+  const unlisted = classifyRepo('example-owner/unlisted', missing.result);
+  assert.equal(unlisted.repoClass, 'daily-tool');
+  assert.equal(unlisted.unlisted, true);
+
+  const file = path.join(tmpDir(), 'repo-class.json');
+  fs.writeFileSync(file, `${JSON.stringify({ idle: [REPO], dailyTool: ['example-owner/daily-repo'] })}\n`);
+  const present = await withStderr(() => readRepoClassTable(file));
+  assert.equal(present.stderr, '');
+  assert.deepEqual(present.result.exclude, []);
+  assert.equal(classifyRepo(REPO, present.result).repoClass, 'idle');
+  assert.equal(classifyRepo('example-owner/daily-repo', present.result).repoClass, 'daily-tool');
+  assert.equal(classifyRepo('example-owner/daily-repo', present.result).unlisted, false);
+  assert.equal(classifyRepo('example-owner/other', present.result).unlisted, true);
+});
+
+test('#198 SC4 exclude 不是数组时整键忽略并记一条警告，不抛错', async () => {
+  for (const value of ['example-owner/abandoned', 3, null, { bad: true }, false]) {
+    const file = path.join(tmpDir(), 'repo-class.json');
+    fs.writeFileSync(file, `${JSON.stringify({ mivo: [REPO], idle: [1], exclude: value })}\n`);
+    const { result, stderr } = await withStderr(() => readRepoClassTable(file));
+    assert.deepEqual(result.exclude, []);
+    assert.equal(classifyRepo(REPO, result).repoClass, 'mivo');
+    assert.equal(classifyRepo('1', result).repoClass, 'idle');
+    assert.equal(classifyRepo(ABANDONED, result).repoClass, 'daily-tool');
+    const warnings = stderr.split('\n').filter((line) => line.includes('不是数组'));
+    assert.equal(warnings.length, 1);
+    assert.equal(stderr.includes('example-owner/abandoned'), false);
+    assert.equal(stderr.includes('prio-writer-fixture-value'), false);
+  }
+});
+
+test('#198 SC4 exclude 数组里的非字符串忽略，字符串项大小写照常生效', async () => {
+  const file = path.join(tmpDir(), 'repo-class.json');
+  fs.writeFileSync(file, `${JSON.stringify({
+    mivo: [1],
+    exclude: [ABANDONED_LISTED, 1, null, false, { repo: 'example-owner/other' }, ''],
+  })}\n`);
+  const { result, stderr } = await withStderr(() => readRepoClassTable(file));
+  assert.equal(stderr, '');
+  assert.deepEqual(result.exclude, [ABANDONED_LISTED, '']);
+  assert.equal(classifyRepo(ABANDONED, result).repoClass, 'exclude');
+  assert.equal(classifyRepo('EXAMPLE-OWNER/ABANDONED', result).repoClass, 'exclude');
+  assert.equal(classifyRepo('1', result).repoClass, 'mivo');
+  assert.equal(classifyRepo('example-owner/other', result).unlisted, true);
+
+  const node = issueNode({
+    id: 'PVTI_EX',
+    repo: 'EXAMPLE-OWNER/ABANDONED',
+    number: 4,
+    updatedAt: new Date(T0).toISOString(),
+  });
+  const mapped = (await import('./bin/prio-sync.mjs')).mapItem(node, result);
+  assert.equal(mapped.repoClass, 'exclude');
+  assert.equal(mapped.repoUnlisted, false);
+  const github = {
+    async ownerGraphql() {
+      return {
+        user: {
+          projectV2: {
+            items: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                node,
+                issueNode({
+                  id: 'PVTI_KEEP',
+                  repo: REPO,
+                  number: 8,
+                  updatedAt: new Date(T0).toISOString(),
+                }),
+              ],
+            },
+          },
+        },
+      };
+    },
+  };
+  const items = await loadBoardItems(github, { ownerLogin: OWNER, projectNumber: PROJECT }, result);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].repo, REPO);
+  assert.equal(items.excludedCount, 1);
+});
+
+test('#198 注入的 items 运行头条数与汇总条数都是滤完的条数，日志只写数量', async () => {
+  const dir = tmpDir();
+  writeClassFile(dir, { exclude: [ABANDONED_LISTED] });
+  const io = capture();
+  const { stderr } = await withStderr(() => main(['--state-dir', dir], {
+    now: () => T0,
+    stdout: io.stdout,
+    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    loadItems: async () => [
+      item(4, { repo: ABANDONED, priority: 'P0', lastEventAt: T0 - STALE_REMIND_MS - 1, lastEventKnown: true }),
+      item(8, { labels: ['prio:pin'], priority: 'P3' }),
+    ],
+    loadPrs: async () => [],
+    write: async () => {
+      throw new Error('不应写');
+    },
+    readToken: () => {
+      throw new Error('不应读令牌');
+    },
+  }));
+  const text = io.text();
+  assert.match(text, /dry-run：1 条，变更 0，写入 0，钉住 1，排除 1 条/);
+  assert.doesNotMatch(text, /abandoned/i);
+  assert.doesNotMatch(text, /还要不要/);
+  assert.equal(stderr, '');
+  const log = fs.readFileSync(path.join(dir, runLogName(T0)), 'utf8');
+  assert.match(log, /dry-run 1\n/);
+  assert.match(log, /排除 1 条/);
+  assert.equal(log.toLowerCase().includes('abandoned'), false);
+});
+
+test('#198 exclude 仓的 PR 不进其他仓的关联 PR', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const keep = 'example-owner/keep';
+  const gate = recorder();
+  const io = capture();
+  const { stderr } = await withStderr(() => runPrioSync({
+    dir,
+    items: [item(1, {
+      repo: keep,
+      priority: 'P3',
+      linkedPr: '',
+      situationTier: 'P3',
+      situationKnown: true,
+      repoClass: 'daily-tool',
+      issueState: 'open',
+      status: 'Todo',
+    })],
+    prs: [
+      {
+        repo: ABANDONED,
+        number: 77,
+        title: 'from excluded',
+        body: 'Closes example-owner/keep#1\n',
+        state: 'open',
+        ci: 'pass',
+        headRefName: 'fix',
+      },
+      {
+        repo: keep,
+        number: 3,
+        title: 'fix #1',
+        body: 'Closes #1\n',
+        state: 'open',
+        ci: 'pass',
+        headRefName: 'fix',
+      },
+    ],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: io.stdout,
+    table: classTable({ exclude: [ABANDONED_LISTED], 'daily-tool': [keep] }),
+  }));
+  assert.equal(stderr, '');
+  assert.equal(gate.writes.length, 1);
+  assert.equal(gate.writes[0].issue, 1);
+  assert.equal(gate.writes[0].repo, keep);
+  assert.equal(String(gate.writes[0].fields['关联 PR']).includes('#77'), false);
+  assert.match(gate.writes[0].fields['关联 PR'], /^#3\(open,CI✓\)$/);
+  assert.doesNotMatch(io.text(), /#77/);
+  assert.doesNotMatch(io.text(), /abandoned/i);
 });
