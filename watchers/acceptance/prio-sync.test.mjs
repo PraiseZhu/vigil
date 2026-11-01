@@ -2918,3 +2918,285 @@ test('#207 SC10 合并或关闭后清掉该 PR 标注，其它开着的 PR 不�
     assert.deepEqual(prCi[kept], keptEntry, state);
   }
 });
+
+const REPO_A = 'example-org/alpha';
+const REPO_B = 'example-org/beta';
+const REPO_C = 'example-org/gamma';
+const UNRESOLVABLE_B = `Could not resolve to a Repository with the name '${REPO_B}'`;
+
+function repoItem(repo, number) {
+  return {
+    repo,
+    number,
+    priority: null,
+    linkedPr: '',
+    labels: ['blocker'],
+    status: 'Todo',
+    acceptance: null,
+  };
+}
+
+function threeRepoItems() {
+  return [repoItem(REPO_A, 1), repoItem(REPO_B, 2), repoItem(REPO_B, 3), repoItem(REPO_C, 4)];
+}
+
+function dryRunSnapshot() {
+  const line = (repo, number) => `${repo}#${number} 优先级 （空） → P0 依据：没给情形档，机器信号 S1 升到 P0`;
+  const stdout = [
+    line(REPO_A, 1),
+    line(REPO_B, 2),
+    line(REPO_B, 3),
+    line(REPO_C, 4),
+    'dry-run：4 条，变更 4，写入 0，钉住 0',
+    '',
+  ].join('\n');
+  const hold = {
+    priority: null,
+    pending: null,
+    pendingHeld: false,
+    lastRecalcAt: null,
+    consecutive: 0,
+    changes: [],
+  };
+  const debounce = `${JSON.stringify({
+    items: {
+      [`${REPO_A}#1`]: hold,
+      [`${REPO_B}#2`]: hold,
+      [`${REPO_B}#3`]: hold,
+      [`${REPO_C}#4`]: hold,
+    },
+  })}\n`;
+  return { stdout, debounce };
+}
+
+async function runThreeRepos(dir, { write = true, writeFn, items = threeRepoItems() } = {}) {
+  const io = capture();
+  let error = null;
+  const argv = write ? ['--state-dir', dir, '--write'] : ['--state-dir', dir];
+  try {
+    await main(argv, {
+      now: () => T0,
+      stdout: io.stdout,
+      loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+      loadItems: async () => items,
+      loadPrs: async () => [],
+      write: writeFn,
+      readToken: () => {
+        throw new Error('已注入 write，不应读令牌');
+      },
+    });
+  } catch (err) {
+    error = err;
+  }
+  const logPath = path.join(dir, runLogName(T0));
+  const debouncePath = path.join(dir, 'debounce.json');
+  const remindedPath = path.join(dir, 'reminded.jsonl');
+  return {
+    stdout: io.text(),
+    error,
+    log: fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '',
+    changes: readJsonl(dir),
+    debounceText: fs.existsSync(debouncePath) ? fs.readFileSync(debouncePath, 'utf8') : '',
+    reminded: fs.existsSync(remindedPath) ? fs.readFileSync(remindedPath, 'utf8') : '',
+  };
+}
+
+function gateFor(repoError) {
+  const calls = [];
+  return {
+    calls,
+    write: async (action) => {
+      calls.push(action.repo);
+      if (action.repo === REPO_B) throw repoError;
+    },
+  };
+}
+
+test('#209 SC1 SC2 SC3 SC4 SC5 SC10 解析不到的仓整仓跳过，其余照写，下拍再试', async () => {
+  const dir = tmpDir();
+  const boom = new Error(UNRESOLVABLE_B);
+  const first = gateFor(boom);
+  const result = await runThreeRepos(dir, { writeFn: first.write });
+  assert.equal(result.error, null, result.error?.message);
+  assert.deepEqual(first.calls, [REPO_A, REPO_B, REPO_C]);
+  assert.equal(first.calls.filter((repo) => repo === REPO_B).length, 1);
+  assert.equal(result.changes.length, 2);
+  assert.deepEqual(result.changes.map((row) => row.repo), [REPO_A, REPO_C]);
+  assert.equal(result.changes.some((row) => row.repo === REPO_B), false);
+  const summary = result.stdout.split('\n').filter(Boolean).at(-1);
+  assert.equal(
+    summary,
+    `写入：4 条，变更 4，写入 2，钉住 0，跳过 1 个仓（${REPO_B} 2 条：${UNRESOLVABLE_B}）`,
+  );
+  const skipLine = `跳过 ${REPO_B} 2 条：${UNRESOLVABLE_B}`;
+  assert.equal(result.stdout.split('\n').filter((line) => line === skipLine).length, 1);
+  assert.match(result.log, new RegExp(skipLine.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const state = JSON.parse(result.debounceText);
+  assert.deepEqual(Object.keys(state).sort(), ['items']);
+  assert.equal(Object.hasOwn(state.items, `${REPO_B}#2`), false);
+  assert.equal(Object.hasOwn(state.items, `${REPO_B}#3`), false);
+  assert.equal(state.items[`${REPO_A}#1`].priority, 'P0');
+  assert.equal(state.items[`${REPO_C}#4`].priority, 'P0');
+  const stateBlob = `${result.debounceText}\n${result.reminded}\n${JSON.stringify(result.changes)}`;
+  assert.equal(stateBlob.includes('Could not resolve'), false);
+  assert.equal(stateBlob.includes('skipped'), false);
+
+  const second = gateFor(boom);
+  const again = await runThreeRepos(dir, { writeFn: second.write });
+  assert.equal(again.error, null, again.error?.message);
+  assert.equal(second.calls.filter((repo) => repo === REPO_B).length, 1);
+  assert.deepEqual(second.calls, [REPO_A, REPO_B, REPO_C]);
+  assert.equal(again.changes.filter((row) => row.repo === REPO_B).length, 0);
+  const againState = JSON.parse(again.debounceText);
+  assert.equal(Object.hasOwn(againState, 'skipped'), false);
+  assert.equal(Object.hasOwn(againState.items, `${REPO_B}#2`), false);
+  assert.equal(Object.hasOwn(againState.items, `${REPO_B}#3`), false);
+});
+
+test('#209 SC6 网络错误 ECONNRESET 仍整拍中止', async () => {
+  const dir = tmpDir();
+  const error = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+  const gate = gateFor(error);
+  const result = await runThreeRepos(dir, { writeFn: gate.write });
+  assert.equal(result.error, error);
+  assert.deepEqual(gate.calls, [REPO_A, REPO_B]);
+  assert.deepEqual(result.changes.map((row) => row.repo), [REPO_A]);
+  assert.doesNotMatch(result.stdout, /跳过 \d+ 个仓/);
+});
+
+test('#209 SC6 整体 401 仍整拍中止', async () => {
+  const dir = tmpDir();
+  const error = new Error('GraphQL HTTP 401');
+  const gate = gateFor(error);
+  const result = await runThreeRepos(dir, { writeFn: gate.write });
+  assert.equal(result.error, error);
+  assert.deepEqual(gate.calls, [REPO_A, REPO_B]);
+  assert.deepEqual(result.changes.map((row) => row.repo), [REPO_A]);
+  assert.doesNotMatch(result.stdout, /跳过 \d+ 个仓/);
+});
+
+test('#209 SC6 FORBIDDEN 仍整拍中止', async () => {
+  const dir = tmpDir();
+  const error = new Error('FORBIDDEN');
+  const gate = gateFor(error);
+  const result = await runThreeRepos(dir, { writeFn: gate.write });
+  assert.equal(result.error, error);
+  assert.deepEqual(gate.calls, [REPO_A, REPO_B]);
+  assert.deepEqual(result.changes.map((row) => row.repo), [REPO_A]);
+  assert.doesNotMatch(result.stdout, /跳过 \d+ 个仓/);
+});
+
+test('#209 SC6 白名单外字段 assertPrioFields 拒绝时仍整拍中止', async () => {
+  assert.throws(() => assertPrioFields({ 状态: 'Done' }), /拒绝写入看板字段「状态」/);
+  const dir = tmpDir();
+  const error = new Error('拒绝写入看板字段「状态」');
+  const gate = gateFor(error);
+  const result = await runThreeRepos(dir, { writeFn: gate.write });
+  assert.equal(result.error, error);
+  assert.deepEqual(gate.calls, [REPO_A, REPO_B]);
+  assert.deepEqual(result.changes.map((row) => row.repo), [REPO_A]);
+  assert.doesNotMatch(result.stdout, /跳过 \d+ 个仓/);
+  const source = fs.readFileSync(fileURLToPath(new URL('./bin/prio-sync.mjs', import.meta.url)), 'utf8');
+  const loopStart = source.indexOf('let written = 0;');
+  const loopEnd = source.indexOf('let prCiOut;', loopStart);
+  const loop = source.slice(loopStart, loopEnd);
+  const assertAt = loop.indexOf('assertPrioFields(action.fields);');
+  const tryAt = loop.indexOf('try {');
+  assert.ok(assertAt !== -1 && tryAt !== -1 && assertAt < tryAt, '白名单检查在跳过用的 try 之前');
+  assert.match(loop, /throw error;/);
+});
+
+test('#209 SC6 仓名不符的 Could not resolve 仍整拍中止', async () => {
+  const dir = tmpDir();
+  const error = new Error("Could not resolve to a Repository with the name 'example-org/other-repo'");
+  const gate = gateFor(error);
+  const result = await runThreeRepos(dir, { writeFn: gate.write });
+  assert.equal(result.error, error);
+  assert.deepEqual(gate.calls, [REPO_A, REPO_B]);
+  assert.deepEqual(result.changes.map((row) => row.repo), [REPO_A]);
+  assert.doesNotMatch(result.stdout, /跳过 \d+ 个仓/);
+});
+
+test('#209 SC7 干跑输出和状态文件与改动前一致，不调用写闸', async () => {
+  const dir = tmpDir();
+  let writes = 0;
+  const result = await runThreeRepos(dir, {
+    write: false,
+    writeFn: async () => {
+      writes += 1;
+    },
+  });
+  const expected = dryRunSnapshot();
+  assert.equal(result.error, null, result.error?.message);
+  assert.equal(writes, 0);
+  assert.equal(result.stdout, expected.stdout);
+  assert.equal(result.debounceText, expected.debounce);
+  assert.equal(result.reminded, '');
+  assert.equal(result.changes.length, 0);
+  assert.doesNotMatch(result.stdout, /跳过/);
+});
+
+test('#209 SC3 跳过原因里的令牌样式先脱敏再写进汇总和日志', async () => {
+  const token = `ghp_${'a'.repeat(40)}`;
+  const dir = tmpDir();
+  const error = new Error(`${UNRESOLVABLE_B} ${token}`);
+  const gate = gateFor(error);
+  const result = await runThreeRepos(dir, { writeFn: gate.write });
+  assert.equal(result.error, null, result.error?.message);
+  assert.equal(result.stdout.includes(token), false);
+  assert.equal(result.log.includes(token), false);
+  assert.match(result.stdout, /（已隐去）/);
+  assert.match(result.stdout, new RegExp(`跳过 ${REPO_B.replace('/', '\\/')} 2 条：`));
+  assert.equal(JSON.stringify(result.changes).includes(token), false);
+});
+
+test('#209 --restore 遇到解析不到的仓仍整拍中止', async () => {
+  const dir = tmpDir();
+  const row = (repo, issue) => ({
+    at: new Date(T0).toISOString(),
+    item: `${repo}#${issue}`,
+    repo,
+    issue,
+    field: '优先级',
+    old: null,
+    new: 'P0',
+    basis: 'seed',
+  });
+  fs.writeFileSync(path.join(dir, 'changes.jsonl'), `${[row(REPO_A, 1), row(REPO_B, 2), row(REPO_C, 4)].map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+  const items = [
+    repoItem(REPO_A, 1),
+    repoItem(REPO_B, 2),
+    repoItem(REPO_C, 4),
+  ].map((entry) => ({ ...entry, labels: [], priority: 'P0' }));
+  const calls = [];
+  const error = new Error(UNRESOLVABLE_B);
+  let thrown = null;
+  try {
+    await main(['--state-dir', dir, '--restore', new Date(T0).toISOString(), '--write'], {
+      now: () => T0 + 1000,
+      stdout: capture().stdout,
+      loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+      loadItems: async () => items,
+      loadPrs: async () => [],
+      write: async (action) => {
+        calls.push(action.repo);
+        if (action.repo === REPO_B) throw error;
+      },
+      readToken: () => {
+        throw new Error('已注入 write，不应读令牌');
+      },
+    });
+  } catch (err) {
+    thrown = err;
+  }
+  assert.equal(thrown, error);
+  assert.deepEqual(calls, [REPO_A, REPO_B]);
+});
+
+test('#209 SC8 白名单仍只有优先级和关联 PR，同步模块不引用写闸', () => {
+  const github = fs.readFileSync(fileURLToPath(new URL('./bin/github.mjs', import.meta.url)), 'utf8');
+  assert.match(github, /export const PRIO_BOARD_FIELDS = new Set\(\['优先级', '关联 PR'\]\);/);
+  const sync = fs.readFileSync(fileURLToPath(new URL('./bin/prio-sync.mjs', import.meta.url)), 'utf8');
+  assert.equal(sync.includes('write-gate.mjs'), false);
+  assert.equal(sync.includes(REPO_A), false);
+});
