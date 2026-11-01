@@ -2621,3 +2621,56 @@ test('#200 排除和读不到内容同时出现在 apply 汇总行', async () =>
   assert.match(log, /^2026-10-31T12:00:00\.000Z apply 0$/m);
   assert.match(log, /^跳过：已归档=0，非 Issue=0，content 为 null=1，字段不合法=0$/m);
 });
+
+test('#205 SC10 loadBoardItems 不再有走不到的 if (!mapped)', () => {
+  const source = fs.readFileSync(fileURLToPath(new URL('./bin/prio-sync.mjs', import.meta.url)), 'utf8');
+  assert.doesNotMatch(source, /if\s*\(\s*!mapped\s*\)/);
+});
+
+test('#205 SC11 排除表里 2 条时 --restore 汇总写排除 2，与同一输入的 dry-run 相同', async () => {
+  const source = fs.readFileSync(fileURLToPath(new URL('./bin/prio-sync.mjs', import.meta.url)), 'utf8');
+  assert.equal(source.includes('_presetExcluded'), false);
+  const start = source.indexOf('export async function restorePrio');
+  const end = source.indexOf('function runLogFile', start);
+  const body = source.slice(start, end);
+  assert.equal(body.includes('excludedCount'), false);
+
+  const dir = tmpDir();
+  const second = 'example-owner/other-excluded';
+  writeClassFile(dir, { exclude: [ABANDONED_LISTED, second] });
+  fs.writeFileSync(path.join(dir, 'changes.jsonl'), '');
+  const items = [
+    item(4, { repo: ABANDONED, priority: 'P0' }),
+    item(5, { repo: second, priority: 'P1' }),
+    item(8, { labels: ['prio:pin'], priority: 'P3' }),
+  ];
+  const deps = {
+    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    loadItems: async () => items,
+    loadPrs: async () => [],
+    write: async () => {
+      throw new Error('不应写');
+    },
+    readToken: () => {
+      throw new Error('不应读令牌');
+    },
+  };
+  const dry = capture();
+  await main(['--state-dir', dir], { ...deps, now: () => T0, stdout: dry.stdout });
+  const restored = capture();
+  await main(['--state-dir', dir, '--restore', new Date(T0).toISOString()], {
+    ...deps,
+    now: () => T0 + 1000,
+    stdout: restored.stdout,
+  });
+  const countOf = (text) => {
+    const match = text.match(/排除 (\d+) 条/);
+    assert.ok(match, text);
+    return Number(match[1]);
+  };
+  assert.equal(countOf(dry.text()), 2);
+  assert.equal(countOf(restored.text()), 2);
+  assert.match(restored.text(), /还原 0 条，写入 0，排除 2 条/);
+  assert.doesNotMatch(dry.text(), /abandoned|other-excluded/i);
+  assert.doesNotMatch(restored.text(), /abandoned|other-excluded/i);
+});

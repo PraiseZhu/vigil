@@ -7,8 +7,10 @@
 // 已关闭、已排除的 item 本函数不判断，由调用方过滤。
 // 运行日志跨 UTC 日时，调用方要把前一天的日志拼在前面。
 //
-// 停更：最后一个运行头距 nowMs 超过阈值才报。默认 10 分钟（cron 两个周期）。
-// 恰好等于阈值不报。这是待 Issue Inspector 改定的默认值，调用方可以传 staleAfterMs。
+// 停更：最后一个运行头距 nowMs 超过阈值才报。默认 10 分钟（两个 5 分钟节拍）。
+// 恰好等于阈值不报。调用方可以传 staleAfterMs。
+// 不传 timeZone 时，解冻时刻仍是 UTC 的 HH:MM，停更行里的运行头仍是原来的 ISO。
+// 传入 IANA 时区时，这两处按该时区显示并带短时区名。阈值比较用的是绝对时间，不受时区影响。
 // 运行头是读完看板之后才写入的，红条只说明这段时间没有新的一拍开始，不说明上一拍成功。
 //
 // 冻结只数 CHANGE_WINDOW_MS（1 小时）内、且不晚于 nowMs 的 changes。
@@ -16,7 +18,7 @@
 
 import { CHANGE_WINDOW_MS, MAX_CHANGES_PER_HOUR } from './prio-score.mjs';
 
-/** 停更阈值默认值。待 Issue Inspector 改定。 */
+/** 停更阈值默认值：10 分钟。调用方可传 staleAfterMs 覆盖。 */
 export const DEFAULT_STALE_MS = 10 * 60 * 1000;
 
 /** 与 prio-score.mjs 的 MAX_CHANGES_PER_HOUR 相同。窗口用那边的 CHANGE_WINDOW_MS。 */
@@ -96,18 +98,60 @@ function recentChangeTimes(changes, nowMs) {
   return changes.filter((at) => Number.isFinite(at) && at <= nowMs && nowMs - at < CHANGE_WINDOW_MS);
 }
 
-function clock(ms) {
-  const date = new Date(ms);
-  const hh = String(date.getUTCHours()).padStart(2, '0');
-  const mm = String(date.getUTCMinutes()).padStart(2, '0');
-  return `${hh}:${mm}`;
+function offsetMinutes(date, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+  const pick = (type) => Number(parts.find((part) => part.type === type)?.value);
+  const zoned = Date.UTC(pick('year'), pick('month') - 1, pick('day'), pick('hour'), pick('minute'), pick('second'));
+  return Math.round((zoned - date.getTime()) / 60000);
 }
 
-function freezeText(changes, nowMs) {
+function zoneLabel(date, timeZone, shortName) {
+  if (timeZone !== 'America/Los_Angeles') return shortName;
+  if (shortName === 'PST' || shortName === 'PDT') return shortName;
+  if (!/^(?:GMT|UTC)[+-]/.test(shortName)) return shortName;
+  const offset = offsetMinutes(date, timeZone);
+  if (offset === -480) return 'PST';
+  if (offset === -420) return 'PDT';
+  return shortName;
+}
+
+/** 不传 timeZone 时是 UTC 的 HH:MM。传入 IANA 时区时附上短时区名。 */
+export function formatPrioClock(ms, timeZone) {
+  if (!Number.isFinite(ms)) return '（无）';
+  const date = new Date(ms);
+  if (!timeZone) {
+    const hh = String(date.getUTCHours()).padStart(2, '0');
+    const mm = String(date.getUTCMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  }
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+    timeZoneName: 'short',
+  }).formatToParts(date);
+  const pick = (type) => parts.find((part) => part.type === type)?.value ?? '';
+  const hour = pick('hour').padStart(2, '0');
+  const minute = pick('minute').padStart(2, '0');
+  const zone = zoneLabel(date, timeZone, pick('timeZoneName'));
+  return zone ? `${hour}:${minute} ${zone}` : `${hour}:${minute}`;
+}
+
+function freezeText(changes, nowMs, timeZone) {
   const recent = recentChangeTimes(changes, nowMs).sort((left, right) => left - right);
   if (recent.length < FREEZE_AT_CHANGES) return '';
   const oldestStillNeeded = recent[recent.length - FREEZE_AT_CHANGES];
-  return `冻结（1 小时内 ${recent.length} 次，约 ${clock(oldestStillNeeded + CHANGE_WINDOW_MS)} 解冻）`;
+  return `冻结（1 小时内 ${recent.length} 次，约 ${formatPrioClock(oldestStillNeeded + CHANGE_WINDOW_MS, timeZone)} 解冻）`;
 }
 
 function percentiles(rows) {
@@ -179,6 +223,7 @@ function compareItems(left, right) {
  * @param {string} [input.latency] latency.jsonl 全文。缺省或没有样本时 p50/p95 为「无数据」。
  * @param {number} input.nowMs 当前时间（毫秒）。调用方传入，本函数不调用 Date.now。
  * @param {number} [input.staleAfterMs] 停更阈值。默认 10 分钟。距离恰好等于阈值不算停更。
+ * @param {string} [input.timeZone] IANA 时区。传入后解冻时刻和停更行里的运行头按该时区显示。
  */
 export function viewPrio({
   changes = '',
@@ -188,6 +233,7 @@ export function viewPrio({
   latency = '',
   nowMs,
   staleAfterMs = DEFAULT_STALE_MS,
+  timeZone,
 } = {}) {
   const notices = [];
   const byItem = new Map();
@@ -232,7 +278,7 @@ export function viewPrio({
     if (!row.prioritySeen && 'priority' in state) row.priority = state.priority ?? null;
     row.pendingHeld = state.pendingHeld === true;
     row.pending = state.pending ?? null;
-    row.freezeText = freezeText(state.changes, nowMs);
+    row.freezeText = freezeText(state.changes, nowMs, timeZone);
     row.frozen = row.freezeText !== '';
   }
 
@@ -278,7 +324,9 @@ export function viewPrio({
 
   const lines = [];
   if (stale) {
-    lines.push(lastRunAt ? `停更红条：最近运行头 ${lastRunAt}` : '停更红条：没有运行头');
+    if (!lastRunAt) lines.push('停更红条：没有运行头');
+    else if (timeZone) lines.push(`停更红条：最近运行头 ${formatPrioClock(Date.parse(lastRunAt), timeZone)}`);
+    else lines.push(`停更红条：最近运行头 ${lastRunAt}`);
   }
   for (const row of rows) lines.push(rowLine(row, lastRunMode));
   lines.push(latencyLine(latencyStats));

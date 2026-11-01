@@ -540,10 +540,6 @@ export async function loadBoardItems(github, profile, table = DEFAULT_REPO_CLASS
         continue;
       }
       const mapped = mapItem(node, table);
-      if (!mapped) {
-        skipped.invalid += 1;
-        continue;
-      }
       if (itemIsExcluded(mapped, table)) {
         excludedCount += 1;
         continue;
@@ -874,7 +870,7 @@ export async function restorePrio({
   stdout,
   items,
   table = DEFAULT_REPO_CLASS_TABLE,
-  excludedCount: _presetExcluded = 0,
+  excluded = null,
   nullContent = 0,
 } = {}) {
   if (!dir) throw new Error('缺少状态目录');
@@ -961,8 +957,11 @@ export async function restorePrio({
     });
     written += 1;
   }
-  outWrite(stdout, `${headOf(mode)}还原 ${planned.length} 条，写入 ${written}${excludedSuffix(excludedRows)}${nullContentSuffix(nullContent)}\n`);
-  return { written, planned: planned.length, mode, excluded: excludedRows };
+  const excludedShown = excluded == null
+    ? excludedRows
+    : (Number.isInteger(excluded) && excluded > 0 ? excluded : 0);
+  outWrite(stdout, `${headOf(mode)}还原 ${planned.length} 条，写入 ${written}${excludedSuffix(excludedShown)}${nullContentSuffix(nullContent)}\n`);
+  return { written, planned: planned.length, mode, excluded: excludedShown };
 }
 
 /** 运行日志：<stateDir>/run-YYYY-MM-DD.log。日期取注入时钟的 UTC 日历日。不轮转、不清理、不设大小上限。 */
@@ -1046,7 +1045,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       stdout: loggedStdout,
       items: loaded,
       table,
-      excludedCount: excluded,
+      excluded,
       nullContent,
     });
   }
