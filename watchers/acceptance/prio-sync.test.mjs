@@ -11,6 +11,7 @@ import {
   assertPrioFields,
   classifyRepo,
   createPriorityGithub,
+  createReadGithub,
   loadBoardItems,
   loadPullRequests,
   main,
@@ -1076,7 +1077,11 @@ test('#157 看板条目和 PR 映射：归档和非 issue 跳过，查询是只�
       };
     },
   };
-  const items = await loadBoardItems(github, { ownerLogin: OWNER, projectNumber: PROJECT });
+  const loadedBoard = await loadBoardItems(github, { ownerLogin: OWNER, projectNumber: PROJECT });
+  assert.equal(Array.isArray(loadedBoard), false);
+  const items = loadedBoard.items;
+  assert.deepEqual(loadedBoard.skipped, { archived: 1, notIssue: 1, nullContent: 0, invalid: 0 });
+  assert.equal(loadedBoard.excludedCount, 0);
   assert.equal(items.length, 1);
   assert.equal(items[0].priority, 'P2');
   assert.equal(items[0].status, 'In Progress');
@@ -1426,7 +1431,7 @@ test('#181 SC3 运行日志不含 readToken 返回的假令牌', async () => {
       return token;
     },
   });
-  assert.equal(reads, 1);
+  assert.equal(reads, 0);
   const file = path.join(dir, runLogName(T0));
   assert.equal(fs.existsSync(file), true);
   const log = fs.readFileSync(file, 'utf8');
@@ -1517,15 +1522,25 @@ function issueNode({ id, repo, number, updatedAt, labels = [], fields = [] }) {
   };
 }
 
+function readProfile() {
+  return writeProfile(tmpDir(), { tokenContent: 'prio-read-fixture-token\n' }).profile;
+}
+
 function graphqlFetch(handler) {
   const queries = [];
-  const fetchImpl = async (_url, init) => {
-    const body = JSON.parse(init.body);
+  async function reply(body) {
     queries.push(body);
-    const data = await handler(body);
+    return handler(body);
+  }
+  const fetchImpl = async (_url, init) => {
+    const data = await reply(JSON.parse(init.body));
     return { ok: true, text: async () => JSON.stringify({ data }) };
   };
-  return { queries, fetchImpl };
+  const run = async (_cmd, _args, opts) => {
+    const data = await reply(JSON.parse(opts.input));
+    return { code: 0, stdout: JSON.stringify({ data }), stderr: '' };
+  };
+  return { queries, fetchImpl, run };
 }
 
 async function withStderr(fn) {
@@ -1578,7 +1593,7 @@ test('#198 SC1 exclude 仓在看板上时不打分、不写、不提醒、不进
   writeClassFile(dir, { exclude: [ABANDONED_LISTED] });
   const stale = new Date(T0 - STALE_REMIND_MS - 1).toISOString();
   const fresh = new Date(T0).toISOString();
-  const { queries, fetchImpl } = graphqlFetch(async (body) => {
+  const { queries, fetchImpl, run } = graphqlFetch(async (body) => {
     if (String(body.query).includes('projectV2')) {
       return {
         user: {
@@ -1635,9 +1650,10 @@ test('#198 SC1 exclude 仓在看板上时不打分、不写、不提醒、不进
   const { stderr } = await withStderr(() => main(['--state-dir', dir, '--write'], {
     now: () => T0,
     stdout: io.stdout,
-    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    loadProfile: () => readProfile(),
     readToken: () => 'prio-writer-fixture-value',
     write: gate.write,
+    run,
     fetchImpl,
   }));
   const text = io.text();
@@ -1706,7 +1722,7 @@ test('#198 SC2 exclude 仓没有看板条目时也不搜 PR', async () => {
   const dir = tmpDir();
   writeClassFile(dir, { exclude: [ABANDONED_LISTED] });
   const fresh = new Date(T0).toISOString();
-  const { queries, fetchImpl } = graphqlFetch(async (body) => {
+  const { queries, fetchImpl, run } = graphqlFetch(async (body) => {
     if (String(body.query).includes('projectV2')) {
       return {
         user: {
@@ -1734,9 +1750,10 @@ test('#198 SC2 exclude 仓没有看板条目时也不搜 PR', async () => {
   await main(['--state-dir', dir], {
     now: () => T0,
     stdout: io.stdout,
-    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    loadProfile: () => readProfile(),
     readToken: () => 'prio-writer-fixture-value',
     write: recorder().write,
+    run,
     fetchImpl,
   });
   const searched = searchQueries(queries);
@@ -1808,7 +1825,7 @@ test('#198 restore 不改 exclude 仓；条目仍在列表里也不写回', asyn
   writeClassFile(state, { exclude: [ABANDONED_LISTED] });
   fs.writeFileSync(path.join(state, 'changes.jsonl'), `${JSON.stringify(seed(ABANDONED, 4, `${ABANDONED}#4`))}\n${JSON.stringify(seed(REPO, 8, `${REPO}#8`))}\n`);
   const fresh = new Date(T0).toISOString();
-  const { queries, fetchImpl } = graphqlFetch(async (body) => {
+  const { queries, fetchImpl, run } = graphqlFetch(async (body) => {
     if (!String(body.query).includes('projectV2')) {
       return { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
     }
@@ -1843,9 +1860,10 @@ test('#198 restore 不改 exclude 仓；条目仍在列表里也不写回', asyn
   await main(['--state-dir', state, '--restore', new Date(T0).toISOString(), '--write'], {
     now: () => T0 + 2000,
     stdout: out.stdout,
-    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    loadProfile: () => readProfile(),
     readToken: () => 'prio-writer-fixture-value',
     write: live.write,
+    run,
     fetchImpl,
   });
   assert.equal(live.writes.length, 1);
@@ -1946,10 +1964,11 @@ test('#198 SC4 exclude 数组里的非字符串忽略，字符串项大小写照
       };
     },
   };
-  const items = await loadBoardItems(github, { ownerLogin: OWNER, projectNumber: PROJECT }, result);
-  assert.equal(items.length, 1);
-  assert.equal(items[0].repo, REPO);
-  assert.equal(items.excludedCount, 1);
+  const loaded = await loadBoardItems(github, { ownerLogin: OWNER, projectNumber: PROJECT }, result);
+  assert.equal(loaded.items.length, 1);
+  assert.equal(loaded.items[0].repo, REPO);
+  assert.equal(loaded.excludedCount, 1);
+  assert.deepEqual(loaded.skipped, { archived: 0, notIssue: 0, nullContent: 0, invalid: 0 });
 });
 
 test('#198 注入的 items 运行头条数与汇总条数都是滤完的条数，日志只写数量', async () => {
@@ -2037,4 +2056,568 @@ test('#198 exclude 仓的 PR 不进其他仓的关联 PR', async () => {
   assert.match(gate.writes[0].fields['关联 PR'], /^#3\(open,CI✓\)$/);
   assert.doesNotMatch(io.text(), /#77/);
   assert.doesNotMatch(io.text(), /abandoned/i);
+});
+const READ_TOKEN = 'prio-read-fixture-token';
+const WRITE_TOKEN = 'prio-write-fixture-token';
+const OTHER_ORG_REPO = 'example/org-a';
+
+function assertNoTokens(text, where) {
+  const body = String(text ?? '');
+  assert.equal(body.includes(READ_TOKEN), false, `${where} 含读令牌`);
+  assert.equal(body.includes(WRITE_TOKEN), false, `${where} 含写令牌`);
+}
+
+function profileWithReadToken() {
+  const written = writeProfile(tmpDir(), { tokenContent: `${READ_TOKEN}\n` });
+  return written.profile;
+}
+
+function profileMissingReadToken() {
+  const written = writeProfile(tmpDir(), { tokenContent: `${READ_TOKEN}\n` });
+  fs.rmSync(written.tokenFile);
+  return written.profile;
+}
+
+function readBoardNode({
+  id,
+  repo = REPO,
+  number = 1,
+  labels = [],
+  state = 'OPEN',
+  archived = false,
+  content = 'issue',
+  typename = 'Issue',
+  includeRepo = true,
+}) {
+  const node = {
+    id,
+    isArchived: archived,
+    updatedAt: new Date(T0).toISOString(),
+    fieldValues: { nodes: [] },
+  };
+  if (content === null) {
+    node.content = null;
+    return node;
+  }
+  node.content = {
+    __typename: typename,
+    number,
+    state,
+    updatedAt: new Date(T0).toISOString(),
+    labels: { nodes: labels.map((name) => ({ name })) },
+  };
+  if (includeRepo) node.content.repository = { nameWithOwner: repo };
+  return node;
+}
+
+function classifyQuery(query) {
+  const text = String(query || '');
+  if (text.includes('items(first: 100')) return 'board';
+  if (text.includes('search(query:')) return 'search';
+  if (/\bmutation\b/.test(text)) return 'mutation';
+  if (text.includes('repository(owner:')) return 'lookup';
+  return 'other';
+}
+
+function boardPayload(nodes, more) {
+  return {
+    user: {
+      projectV2: {
+        items: {
+          pageInfo: { hasNextPage: more, endCursor: more ? 'NEXT' : null },
+          nodes,
+        },
+      },
+    },
+  };
+}
+
+function searchPayload(nodes) {
+  return { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes } };
+}
+
+function lookupPayload() {
+  return {
+    user: {
+      projectV2: {
+        id: 'PVT_test',
+        fields: {
+          nodes: [
+            {
+              __typename: 'ProjectV2SingleSelectField',
+              id: 'FIELD_PRIO',
+              name: '优先级',
+              dataType: 'SINGLE_SELECT',
+              options: ['P0', 'P1', 'P2', 'P3'].map((name) => ({ id: `OPT_${name}`, name })),
+            },
+            { __typename: 'ProjectV2Field', id: 'FIELD_LINK', name: '关联 PR', dataType: 'TEXT' },
+          ],
+        },
+      },
+    },
+    repository: {
+      issue: {
+        id: 'ISSUE_test',
+        projectItems: { nodes: [{ id: 'ITEM_test', isArchived: false, project: { id: 'PVT_test' } }] },
+      },
+    },
+  };
+}
+
+/** run 和 fetch 都能答同一套查询。修复前读走 fetch（写令牌）；修复后读走 run（读令牌）。 */
+function scriptGithub({ nodes = [], searchNodes = [], fail = null } = {}) {
+  const seen = [];
+  function reply(query, variables) {
+    const kind = classifyQuery(query);
+    if (kind === 'board' && variables?.after && fail === 'board-page-2') {
+      return { error: `board page 2 failed ${READ_TOKEN}` };
+    }
+    if (kind === 'search' && fail === 'search') return { error: `pr search failed ${READ_TOKEN}` };
+    if (kind === 'board') return { data: boardPayload(nodes, !variables?.after && fail === 'board-page-2') };
+    if (kind === 'search') return { data: searchPayload(searchNodes) };
+    if (kind === 'lookup') return { data: lookupPayload() };
+    if (kind === 'mutation') {
+      if (fail === 'write') return { error: `write failed ${WRITE_TOKEN}` };
+      return { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: 'ITEM_test' } } } };
+    }
+    return { error: 'unexpected query' };
+  }
+  const run = async (_cmd, _args, opts) => {
+    const body = JSON.parse(opts.input);
+    seen.push({ via: 'run', token: opts?.env?.GH_TOKEN, kind: classifyQuery(body.query) });
+    const result = reply(body.query, body.variables);
+    if (result.error) return { code: 1, stdout: '', stderr: result.error };
+    return { code: 0, stdout: JSON.stringify({ data: result.data }), stderr: '' };
+  };
+  const fetchImpl = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    const header = String(init?.headers?.Authorization || '');
+    seen.push({ via: 'fetch', token: header.replace(/^Bearer\s+/i, ''), kind: classifyQuery(body.query) });
+    const result = reply(body.query, body.variables);
+    if (result.error) return { ok: false, status: 500, text: async () => result.error };
+    return { ok: true, status: 200, text: async () => JSON.stringify({ data: result.data }) };
+  };
+  return { run, fetchImpl, seen };
+}
+
+async function runPrioMain(dir, argv, deps) {
+  const io = capture();
+  const previous = globalThis.fetch;
+  if (deps.fetchImpl) globalThis.fetch = deps.fetchImpl;
+  let error = null;
+  try {
+    await main(['--state-dir', dir, ...argv], {
+      now: () => T0,
+      stdout: io.stdout,
+      dir,
+      ...deps,
+    });
+  } catch (err) {
+    error = err;
+  } finally {
+    globalThis.fetch = previous;
+  }
+  const logPath = path.join(dir, runLogName(T0));
+  const changesPath = path.join(dir, 'changes.jsonl');
+  return {
+    stdout: io.text(),
+    error,
+    log: fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '',
+    changes: fs.existsSync(changesPath) ? fs.readFileSync(changesPath, 'utf8') : '',
+  };
+}
+
+function otherOrgNode() {
+  return readBoardNode({ id: 'PVTI_other', repo: OTHER_ORG_REPO, number: 41, labels: ['blocker'] });
+}
+
+test('#200 SC1 另一组织仓的条目走读令牌进入打分，读请求不带写令牌', async () => {
+  const dir = tmpDir();
+  const script = scriptGithub({ nodes: [otherOrgNode()] });
+  let tokenReads = 0;
+  const result = await runPrioMain(dir, [], {
+    loadProfile: () => profileWithReadToken(),
+    run: script.run,
+    fetchImpl: script.fetchImpl,
+    readToken: () => {
+      tokenReads += 1;
+      return WRITE_TOKEN;
+    },
+  });
+  assert.equal(result.error, null, result.error?.message);
+  assert.match(result.stdout, /example\/org-a#41 优先级 （空） → P0/);
+  assert.equal(tokenReads, 0);
+  const reads = script.seen.filter((entry) => entry.kind === 'board' || entry.kind === 'search');
+  assert.ok(reads.length >= 2);
+  assert.ok(reads.every((entry) => entry.via === 'run' && entry.token === READ_TOKEN));
+  assert.equal(script.seen.some((entry) => entry.token === WRITE_TOKEN), false);
+  assert.equal(script.seen.some((entry) => entry.kind === 'mutation'), false);
+  assert.match(result.log, /content 为 null=0/);
+  assert.equal(result.log.includes('告警'), false);
+  assert.equal(result.stdout.includes('读不到内容'), false);
+  assertNoTokens(`${result.stdout}\n${result.log}\n${result.changes}`, 'SC1');
+});
+
+test('#200 SC2 写动作用写令牌，读查询不带写令牌，读通道不发 mutation', async () => {
+  const dir = tmpDir();
+  const script = scriptGithub({ nodes: [otherOrgNode()] });
+  let tokenReads = 0;
+  const result = await runPrioMain(dir, ['--write'], {
+    loadProfile: () => profileWithReadToken(),
+    run: script.run,
+    fetchImpl: script.fetchImpl,
+    readToken: () => {
+      tokenReads += 1;
+      return WRITE_TOKEN;
+    },
+  });
+  assert.equal(result.error, null, result.error?.message);
+  assert.equal(tokenReads, 1);
+  const reads = script.seen.filter((entry) => entry.kind === 'board' || entry.kind === 'search');
+  assert.ok(reads.length >= 2);
+  assert.ok(reads.every((entry) => entry.via === 'run' && entry.token === READ_TOKEN));
+  const writes = script.seen.filter((entry) => entry.via === 'fetch');
+  assert.ok(writes.length >= 1);
+  assert.ok(writes.every((entry) => entry.token === WRITE_TOKEN));
+  assert.ok(writes.some((entry) => entry.kind === 'mutation'));
+  assert.equal(script.seen.some((entry) => entry.via === 'run' && entry.kind === 'mutation'), false);
+  assert.equal(script.seen.some((entry) => entry.via === 'run' && entry.token === WRITE_TOKEN), false);
+  assert.equal(script.seen.some((entry) => entry.via === 'fetch' && entry.token === READ_TOKEN), false);
+  assert.match(result.changes, /"field":"优先级"/);
+  assertNoTokens(`${result.stdout}\n${result.log}\n${result.changes}`, 'SC2');
+});
+
+test('#200 SC3 读失败、写失败、令牌缺失的输出都不含令牌', async () => {
+  const readFail = scriptGithub({ nodes: [otherOrgNode()], fail: 'board-page-2' });
+  const readDir = tmpDir();
+  const readResult = await runPrioMain(readDir, ['--write'], {
+    loadProfile: () => profileWithReadToken(),
+    run: readFail.run,
+    fetchImpl: readFail.fetchImpl,
+    readToken: () => WRITE_TOKEN,
+    write: async () => {
+      throw new Error('读失败不应写');
+    },
+  });
+  assert.ok(readResult.error);
+  assert.equal(readResult.changes, '');
+  assertNoTokens(`${readResult.error.message}\n${readResult.stdout}\n${readResult.log}\n${readResult.changes}`, '读失败');
+
+  const writeFail = scriptGithub({ nodes: [otherOrgNode()], fail: 'write' });
+  const writeDir = tmpDir();
+  const writeResult = await runPrioMain(writeDir, ['--write'], {
+    loadProfile: () => profileWithReadToken(),
+    run: writeFail.run,
+    fetchImpl: writeFail.fetchImpl,
+    readToken: () => WRITE_TOKEN,
+  });
+  assert.ok(writeResult.error);
+  assert.equal(writeResult.changes, '');
+  assertNoTokens(`${writeResult.error.message}\n${writeResult.stdout}\n${writeResult.log}\n${writeResult.changes}`, '写失败');
+
+  const missingRead = tmpDir();
+  const missingReadResult = await runPrioMain(missingRead, [], {
+    loadProfile: () => profileMissingReadToken(),
+    run: async () => ({ code: 1, stdout: '', stderr: WRITE_TOKEN }),
+    fetchImpl: async () => ({ ok: false, status: 500, text: async () => WRITE_TOKEN }),
+    readToken: () => WRITE_TOKEN,
+  });
+  assert.ok(missingReadResult.error);
+  assert.match(missingReadResult.error.message, /githubTokenFile/);
+  assert.equal(missingReadResult.changes, '');
+  assertNoTokens(
+    `${missingReadResult.error.message}\n${missingReadResult.stdout}\n${missingReadResult.log}\n${missingReadResult.changes}`,
+    '读令牌缺失',
+  );
+
+  const missingWrite = tmpDir();
+  const missingWriteResult = await runPrioMain(missingWrite, ['--write'], {
+    loadProfile: () => profileWithReadToken(),
+    loadItems: async () => [item(1, { labels: ['blocker'] })],
+    loadPrs: async () => [],
+    readToken: () => readPriorityWriterToken(path.join(missingWrite, 'missing-writer-token')),
+  });
+  assert.ok(missingWriteResult.error);
+  assert.match(missingWriteResult.error.message, /文件不存在|写令牌/);
+  assert.equal(missingWriteResult.changes, '');
+  assertNoTokens(
+    `${missingWriteResult.error.message}\n${missingWriteResult.stdout}\n${missingWriteResult.log}\n${missingWriteResult.changes}`,
+    '写令牌缺失',
+  );
+});
+
+test('#200 SC4 写白名单仍只有优先级和关联 PR', () => {
+  const github = fs.readFileSync(fileURLToPath(new URL('./bin/github.mjs', import.meta.url)), 'utf8');
+  assert.match(github, /export const PRIO_BOARD_FIELDS = new Set\(\['优先级', '关联 PR'\]\);/);
+  assert.throws(() => assertPrioFields({ 状态: 'Done' }), /拒绝写入看板字段「状态」/);
+  assert.throws(() => assertPrioFields({ 备注: 'x' }), /拒绝写入看板字段「备注」/);
+  assert.doesNotThrow(() => assertPrioFields({ 优先级: 'P2' }));
+  assert.doesNotThrow(() => assertPrioFields({ '关联 PR': '#1(open)' }));
+});
+
+test('#200 SC5 看板第 2 页或 PR 搜索失败时整拍不写', async () => {
+  for (const fail of ['board-page-2', 'search']) {
+    const dir = tmpDir();
+    const script = scriptGithub({ nodes: [otherOrgNode()], fail });
+    let writes = 0;
+    const result = await runPrioMain(dir, ['--write'], {
+      loadProfile: () => profileWithReadToken(),
+      run: script.run,
+      fetchImpl: script.fetchImpl,
+      readToken: () => WRITE_TOKEN,
+      write: async () => {
+        writes += 1;
+      },
+    });
+    assert.ok(result.error, fail);
+    assert.equal(writes, 0, fail);
+    assert.equal(result.changes, '', fail);
+    assert.equal(script.seen.some((entry) => entry.kind === 'mutation'), false, fail);
+    assertNoTokens(`${result.error.message}\n${result.stdout}\n${result.log}\n${result.changes}`, fail);
+  }
+});
+
+test('#200 SC6 丢弃条目按原因计数，content 为 null 大于 0 时运行日志告警', async () => {
+  const dir = tmpDir();
+  const nodes = [
+    readBoardNode({ id: 'N1', content: null }),
+    readBoardNode({ id: 'N2', content: null }),
+    readBoardNode({ id: 'N3', content: null }),
+    readBoardNode({ id: 'PR', typename: 'PullRequest', repo: OTHER_ORG_REPO, number: 9 }),
+    readBoardNode({ id: 'ARCH', archived: true, repo: OTHER_ORG_REPO, number: 8 }),
+  ];
+  const script = scriptGithub({ nodes });
+  const result = await runPrioMain(dir, [], {
+    loadProfile: () => profileWithReadToken(),
+    run: script.run,
+    fetchImpl: script.fetchImpl,
+    readToken: () => WRITE_TOKEN,
+  });
+  assert.equal(result.error, null, result.error?.message);
+  assert.match(result.log, /^2026-10-31T12:00:00\.000Z dry-run 0$/m);
+  assert.match(result.log, /^跳过：已归档=1，非 Issue=1，content 为 null=3，字段不合法=0$/m);
+  assert.match(result.log, /^告警：content 为 null 的看板条目有 3 条，读通道没有拿到内容$/m);
+  const summary = result.stdout.split('\n').filter(Boolean).at(-1);
+  assert.equal(summary, 'dry-run：0 条，变更 0，写入 0，钉住 0，读不到内容 3 条');
+  assert.equal(result.changes, '');
+  assertNoTokens(`${result.stdout}\n${result.log}`, 'SC6');
+
+  const counted = await loadBoardItems({
+    async ownerGraphql() {
+      return {
+        user: {
+          projectV2: {
+            items: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                null,
+                readBoardNode({ id: 'BAD', includeRepo: false, number: 4 }),
+                readBoardNode({ id: 'DRAFT', typename: 'DraftIssue', repo: OTHER_ORG_REPO, number: 5 }),
+              ],
+            },
+          },
+        },
+      };
+    },
+  }, { ownerLogin: OWNER, projectNumber: PROJECT });
+  assert.equal(counted.items.length, 0);
+  assert.equal(counted.skipped.invalid, 2);
+  assert.equal(counted.skipped.notIssue, 1);
+  assert.equal(counted.skipped.nullContent, 0);
+  assert.equal(counted.skipped.archived, 0);
+});
+
+test('#200 读客户端没有 write，mutation 文本在发请求前被拒绝', async () => {
+  const { profile } = writeProfile(tmpDir(), { tokenContent: `${READ_TOKEN}\n` });
+  const seen = [];
+  const run = async () => {
+    seen.push('run');
+    return { code: 0, stdout: '{"data":{"viewer":{"login":"ExampleUser"}}}', stderr: '' };
+  };
+  const fetchImpl = async () => {
+    seen.push('fetch');
+    return { ok: true, status: 200, text: async () => '{"data":{}}' };
+  };
+  const reader = createReadGithub({
+    profile: { ...profile, writeCommand: [process.execPath, '-e', 'process.exit(9)'] },
+    run,
+    fetchImpl,
+  });
+  assert.equal(reader.write, undefined);
+  assert.equal(reader.graphql, undefined);
+  assert.equal(reader.fetchBranch, undefined);
+  assert.equal(typeof reader.ownerGraphql, 'function');
+  assert.deepEqual(Object.keys(reader), ['ownerGraphql']);
+  const rejected = [
+    'mutation { x }',
+    '  \n\t mutation { x }',
+    '# 前置注释\nmutation { x }',
+    '  # 注释\n\n  Mutation { x }',
+    'MUTATION { addProjectV2ItemById(input:{}) { clientMutationId } }',
+    'subscription { x }',
+    'Subscription { x }',
+    'query { viewer { mutation } }',
+  ];
+  for (const query of rejected) {
+    await assert.rejects(() => reader.ownerGraphql(query, {}), /只做只读查询/);
+  }
+  assert.deepEqual(seen, []);
+  await reader.ownerGraphql('# 只读\n  query { viewer { login } }', {});
+  await reader.ownerGraphql('  { viewer { login } }', {});
+  assert.deepEqual(seen, ['run', 'run']);
+});
+
+test('#200 SC7 读令牌缺失整拍退出；写令牌缺失只在 --write 报错；disabled 仍是已停用且 0 写入', async () => {
+  const missingReadDir = tmpDir();
+  let missingReadWrites = 0;
+  const missingRead = await runPrioMain(missingReadDir, ['--write'], {
+    loadProfile: () => profileMissingReadToken(),
+    run: async () => ({ code: 0, stdout: '{}', stderr: '' }),
+    fetchImpl: async () => ({ ok: false, status: 500, text: async () => WRITE_TOKEN }),
+    readToken: () => WRITE_TOKEN,
+    write: async () => {
+      missingReadWrites += 1;
+    },
+  });
+  assert.ok(missingRead.error);
+  assert.match(missingRead.error.message, /githubTokenFile/);
+  assert.equal(missingReadWrites, 0);
+  assert.equal(missingRead.changes, '');
+  assertNoTokens(`${missingRead.error.message}\n${missingRead.stdout}\n${missingRead.log}`, 'SC7 读令牌');
+
+  const dryDir = tmpDir();
+  const dryScript = scriptGithub({ nodes: [otherOrgNode()] });
+  let dryTokenReads = 0;
+  const dry = await runPrioMain(dryDir, [], {
+    loadProfile: () => profileWithReadToken(),
+    run: dryScript.run,
+    fetchImpl: dryScript.fetchImpl,
+    readToken: () => {
+      dryTokenReads += 1;
+      throw new Error('dry-run 不应读取写令牌');
+    },
+  });
+  assert.equal(dry.error, null, dry.error?.message);
+  assert.equal(dryTokenReads, 0);
+  assert.match(dry.stdout, /example\/org-a#41/);
+  assert.match(dry.stdout, /写入 0/);
+  assert.equal(dry.changes, '');
+
+  const writeDir = tmpDir();
+  const writeMissing = await runPrioMain(writeDir, ['--write'], {
+    loadProfile: () => profileWithReadToken(),
+    loadItems: async () => [item(1, { labels: ['blocker'] })],
+    loadPrs: async () => [],
+    readToken: () => readPriorityWriterToken(path.join(writeDir, 'missing-writer-token')),
+  });
+  assert.ok(writeMissing.error);
+  assert.match(writeMissing.error.message, /文件不存在/);
+  assert.equal(writeMissing.changes, '');
+  assertNoTokens(`${writeMissing.error.message}\n${writeMissing.stdout}\n${writeMissing.log}`, 'SC7 写令牌');
+
+  const disabledDir = tmpDir();
+  fs.writeFileSync(path.join(disabledDir, 'disabled'), '');
+  let disabledWrites = 0;
+  const disabled = await runPrioMain(disabledDir, ['--write'], {
+    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    loadItems: async () => [item(1, { labels: ['blocker'] })],
+    loadPrs: async () => [],
+    readToken: () => {
+      throw new Error('disabled 不应读取写令牌');
+    },
+    write: async () => {
+      disabledWrites += 1;
+    },
+  });
+  assert.equal(disabled.error, null, disabled.error?.message);
+  assert.match(disabled.stdout, /已停用：1 条，变更 1，写入 0，钉住 0/);
+  assert.equal(disabledWrites, 0);
+  assert.equal(disabled.changes, '');
+});
+
+test('#200 排除和读不到内容同时出现在 dry-run 汇总行，排除不计入 skipped', async () => {
+  const dir = tmpDir();
+  writeClassFile(dir, { exclude: [ABANDONED_LISTED] });
+  const fresh = new Date(T0).toISOString();
+  const { run } = graphqlFetch(async (body) => {
+    if (String(body.query).includes('projectV2')) {
+      return {
+        user: {
+          projectV2: {
+            items: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                issueNode({ id: 'PVTI_EX', repo: ABANDONED, number: 4, updatedAt: fresh }),
+                { id: 'PVTI_NULL', isArchived: false, updatedAt: fresh, content: null, fieldValues: { nodes: [] } },
+              ],
+            },
+          },
+        },
+      };
+    }
+    return { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+  });
+  const io = capture();
+  await main(['--state-dir', dir], {
+    now: () => T0,
+    stdout: io.stdout,
+    loadProfile: () => readProfile(),
+    run,
+    write: async () => {
+      throw new Error('dry-run 不应写');
+    },
+    readToken: () => {
+      throw new Error('dry-run 不应读写令牌');
+    },
+  });
+  const summary = io.text().split('\n').filter(Boolean).at(-1);
+  assert.equal(summary, 'dry-run：0 条，变更 0，写入 0，钉住 0，排除 1 条，读不到内容 1 条');
+  const log = fs.readFileSync(path.join(dir, runLogName(T0)), 'utf8');
+  assert.match(log, /^2026-10-31T12:00:00\.000Z dry-run 0$/m);
+  assert.match(log, /^跳过：已归档=0，非 Issue=0，content 为 null=1，字段不合法=0$/m);
+  assert.match(log, /^告警：/m);
+});
+
+test('#200 排除和读不到内容同时出现在 apply 汇总行', async () => {
+  const dir = tmpDir();
+  writeClassFile(dir, { exclude: [ABANDONED_LISTED] });
+  const fresh = new Date(T0).toISOString();
+  const { run } = graphqlFetch(async (body) => {
+    if (String(body.query).includes('projectV2')) {
+      return {
+        user: {
+          projectV2: {
+            items: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [
+                issueNode({ id: 'PVTI_EX', repo: ABANDONED, number: 4, updatedAt: fresh }),
+                { id: 'PVTI_NULL', isArchived: false, updatedAt: fresh, content: null, fieldValues: { nodes: [] } },
+              ],
+            },
+          },
+        },
+      };
+    }
+    return { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+  });
+  const io = capture();
+  let writes = 0;
+  await main(['--state-dir', dir, '--write'], {
+    now: () => T0,
+    stdout: io.stdout,
+    loadProfile: () => readProfile(),
+    run,
+    write: async () => {
+      writes += 1;
+    },
+    readToken: () => {
+      throw new Error('已注入 write，不应读写令牌');
+    },
+  });
+  assert.equal(writes, 0);
+  const summary = io.text().split('\n').filter(Boolean).at(-1);
+  assert.equal(summary, '写入：0 条，变更 0，写入 0，钉住 0，排除 1 条，读不到内容 1 条');
+  const log = fs.readFileSync(path.join(dir, runLogName(T0)), 'utf8');
+  assert.match(log, /^2026-10-31T12:00:00\.000Z apply 0$/m);
+  assert.match(log, /^跳过：已归档=0，非 Issue=0，content 为 null=1，字段不合法=0$/m);
 });
