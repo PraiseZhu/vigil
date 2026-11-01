@@ -326,3 +326,126 @@ test('#140 SC3 没有登记的任务和以前一样：子 issue 全关就触发'
     { trigger: true, reason: 'no-verdict' },
   );
 });
+
+// #193：pr-merged-after-verdict 只比 GitHub 一侧。正文「完成：」是验收机本机时钟，故意和 createdAt 错开，用来证明不再读它。
+const ISSUE193_PROFILE = { startAt: START_AT };
+const ISSUE193_NOW = nowAt('2026-11-01T12:00:00.000Z');
+const ISSUE193_CREATED = '2026-11-01T09:46:39Z';
+const ISSUE193_BODY_FINISHED = '2026-11-01T16:55:46+08:00';
+
+function issue193Task({ finishedAt = ISSUE193_BODY_FINISHED, mergedAt, body = 'standalone', state = 'closed', ...rest } = {}) {
+  return standaloneTask({
+    body,
+    state,
+    closedAt: state === 'closed' ? '2026-11-01T10:00:00Z' : null,
+    linkedPrs: [{ ref: `${REPO}#9`, mergedAt }],
+    rounds: [{
+      round: 1,
+      status: '通过',
+      bodyVersion: bodyVersion('standalone'),
+      createdAt: Object.hasOwn(rest, 'createdAt') ? rest.createdAt : ISSUE193_CREATED,
+      finishedAt,
+    }],
+  });
+}
+
+test('#193 本机时钟偏 1 小时：合并早于轮次评论的 GitHub 创建时间时不再触发', () => {
+  const task = issue193Task({ mergedAt: '2026-11-01T09:45:03Z' });
+  assert.deepEqual(shouldTrigger(task, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE }), { trigger: false, reason: 'up-to-date' });
+});
+
+test('#193 合并比轮次评论的 GitHub 创建时间晚 10 分钟时仍触发', () => {
+  const task = issue193Task({
+    mergedAt: '2026-11-01T09:56:39Z',
+    finishedAt: '2026-11-01T18:00:00+08:00',
+  });
+  assert.deepEqual(shouldTrigger(task, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE }), { trigger: true, reason: 'pr-merged-after-verdict' });
+});
+
+test('#193 合并早于创建时间 1 秒或相等不触发，晚 1 秒仍触发', () => {
+  const earlier = issue193Task({ mergedAt: '2026-11-01T09:46:38Z' });
+  assert.deepEqual(shouldTrigger(earlier, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE }), { trigger: false, reason: 'up-to-date' });
+  const equal = issue193Task({ mergedAt: ISSUE193_CREATED });
+  assert.deepEqual(shouldTrigger(equal, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE }), { trigger: false, reason: 'up-to-date' });
+  // 正文完成时间更晚：只有按 createdAt 比，晚 1 秒才会触发。
+  const later = issue193Task({
+    createdAt: '2026-11-01T09:46:39Z',
+    mergedAt: '2026-11-01T09:46:40Z',
+    finishedAt: '2026-11-01T18:00:00+08:00',
+  });
+  assert.deepEqual(shouldTrigger(later, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE }), { trigger: true, reason: 'pr-merged-after-verdict' });
+});
+
+test('#193 旧轮次只有正文完成时间、没有 createdAt：不触发，且不挡住后面的触发', () => {
+  const legacyRound = {
+    round: 1,
+    status: '通过',
+    bodyVersion: bodyVersion('standalone'),
+    finishedAt: '2026-11-01T16:55:46+08:00',
+  };
+  assert.equal(Object.hasOwn(legacyRound, 'createdAt'), false);
+  const legacy = standaloneTask({
+    state: 'closed',
+    closedAt: '2026-11-01T10:00:00Z',
+    linkedPrs: [{ ref: `${REPO}#9`, mergedAt: '2026-11-01T09:45:03Z' }],
+    rounds: [legacyRound],
+  });
+  assert.deepEqual(shouldTrigger(legacy, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE }), {
+    trigger: false,
+    reason: 'merged-after-verdict-unknown',
+  });
+
+  const changed = standaloneTask({
+    body: 'edited after verdict',
+    state: 'closed',
+    closedAt: '2026-11-01T10:00:00Z',
+    linkedPrs: [{ ref: `${REPO}#9`, mergedAt: '2026-11-01T09:45:03Z' }],
+    rounds: [{ ...legacyRound, bodyVersion: bodyVersion('standalone') }],
+  });
+  assert.deepEqual(shouldTrigger(changed, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE }), { trigger: true, reason: 'body-changed' });
+
+  const stillOpen = standaloneTask({
+    state: 'open',
+    linkedPrs: [{ ref: `${REPO}#9`, mergedAt: '2026-11-01T09:45:03Z' }],
+    rounds: [legacyRound],
+  });
+  assert.deepEqual(shouldTrigger(stillOpen, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE }), { trigger: true, reason: 'passed-but-open' });
+});
+
+test('#193 创建时间或合并时间解析不出时不触发，原因可识别，且不挡住后面的触发', () => {
+  for (const createdAt of [undefined, 'garbage']) {
+    const task = issue193Task({ createdAt, mergedAt: '2026-11-01T09:45:03Z' });
+    const decision = shouldTrigger(task, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE });
+    assert.equal(decision.trigger, false);
+    assert.equal(decision.reason, 'merged-after-verdict-unknown');
+  }
+  const badMerge = issue193Task({ mergedAt: 'garbage' });
+  const bad = shouldTrigger(badMerge, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE });
+  assert.equal(bad.trigger, false);
+  assert.equal(bad.reason, 'merged-after-verdict-unknown');
+
+  const changed = issue193Task({ createdAt: 'garbage', mergedAt: '2026-11-01T09:45:03Z', body: 'edited after verdict' });
+  assert.deepEqual(shouldTrigger(changed, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE }), { trigger: true, reason: 'body-changed' });
+  const stillOpen = issue193Task({ createdAt: undefined, mergedAt: '2026-11-01T09:45:03Z', state: 'open' });
+  assert.deepEqual(shouldTrigger(stillOpen, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE }), { trigger: true, reason: 'passed-but-open' });
+
+  const mixed = standaloneTask({
+    state: 'closed',
+    closedAt: '2026-11-01T10:00:00Z',
+    linkedPrs: [
+      { ref: `${REPO}#8`, mergedAt: 'garbage' },
+      { ref: `${REPO}#9`, mergedAt: '2026-11-01T09:56:39Z' },
+    ],
+    rounds: [{
+      round: 1,
+      status: '通过',
+      bodyVersion: bodyVersion('standalone'),
+      createdAt: ISSUE193_CREATED,
+      finishedAt: '2026-11-01T18:00:00+08:00',
+    }],
+  });
+  assert.deepEqual(
+    shouldTrigger(mixed, { now: ISSUE193_NOW, profile: ISSUE193_PROFILE }),
+    { trigger: true, reason: 'pr-merged-after-verdict' },
+  );
+});

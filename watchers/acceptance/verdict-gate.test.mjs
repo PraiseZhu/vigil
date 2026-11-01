@@ -900,7 +900,13 @@ test('北京时间：beijingIso 带 +08:00、不带毫秒；trigger 新旧格式
     bodyVersion: bodyVersion(body),
     children: [],
     linkedPrs: [{ ref: `${REPO}#3`, mergedAt: '2026-10-24T03:00:00Z' }],
-    rounds: parseRounds([roundComment({ round: 1, status: '通过', bodyVersion: bodyVersion(body), finishedAt })], OWNER),
+    rounds: parseRounds([roundComment({
+      round: 1,
+      status: '通过',
+      bodyVersion: bodyVersion(body),
+      finishedAt,
+      createdAt: finishedAt,
+    })], OWNER),
   });
   const profile = { startAt: '2026-01-01T00:00:00Z' };
   // 北京时间 10:00 = UTC 02:00，PR 03:00 才合并 → 合并在裁决之后，重验。

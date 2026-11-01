@@ -93,6 +93,26 @@ function awaitingLeadHandoff(task, f, nowMs, readyAt) {
   return nowMs - readyAt < LEAD_HANDOFF_WAIT_HOURS * 60 * 60 * 1000;
 }
 
+/**
+ * PR 的 GitHub mergedAt 是否严格晚于最后一次裁决轮次评论的 GitHub createdAt。
+ * 不读正文「完成：」（那是验收机本机时钟）。解析不出的时间不算晚于；
+ * 有一条能解析且严格更晚就是 after，否则只要有解析不出的时间就是 unknown。
+ */
+function prMergedVersusVerdict(merged, createdAt) {
+  const createdMs = Date.parse(createdAt || '');
+  if (!Number.isFinite(createdMs)) return 'unknown';
+  let unknown = false;
+  for (const pr of merged) {
+    const mergedMs = Date.parse(pr.mergedAt || '');
+    if (!Number.isFinite(mergedMs)) {
+      unknown = true;
+      continue;
+    }
+    if (mergedMs > createdMs) return 'after';
+  }
+  return unknown ? 'unknown' : 'not-after';
+}
+
 export function shouldTrigger(task, { now, profile }) {
   if (!task?.tier) return { trigger: false, reason: 'no-tier' };
   if (task.closedAt && Date.parse(task.closedAt) < Date.parse(profile.startAt)) {
@@ -129,11 +149,13 @@ export function shouldTrigger(task, { now, profile }) {
   }
   if (!f) return { trigger: true, reason: 'no-verdict' };
   if (dispute) return { trigger: true, reason: 'adjudicated' };
-  if (merged.some((pr) => f.finishedAt && Date.parse(pr.mergedAt) > Date.parse(f.finishedAt))) {
-    return { trigger: true, reason: 'pr-merged-after-verdict' };
-  }
+  const mergedVersusVerdict = prMergedVersusVerdict(merged, f.createdAt);
+  if (mergedVersusVerdict === 'after') return { trigger: true, reason: 'pr-merged-after-verdict' };
   if (f.bodyVersion !== task.bodyVersion) return { trigger: true, reason: 'body-changed' };
-  return passedButOpenRetry(task, f, profile) || { trigger: false, reason: 'up-to-date' };
+  const openRetry = passedButOpenRetry(task, f, profile);
+  if (openRetry) return openRetry;
+  if (mergedVersusVerdict === 'unknown') return { trigger: false, reason: 'merged-after-verdict-unknown' };
+  return { trigger: false, reason: 'up-to-date' };
 }
 
 /**
