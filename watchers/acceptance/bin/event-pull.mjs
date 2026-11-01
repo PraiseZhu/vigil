@@ -2,7 +2,9 @@
 // 拉取抛错视为 Worker 不可用：不抛出循环，改走 60 秒轮询，把漏掉的事件补回来。恢复后回到 2 秒。
 // onEvent 抛错不算 Worker 挂了：同批其余事件照常处理，下一拍仍按 2 秒拉。
 // 失败次数记在 Worker 上。同一条达到上限后确认移出，并在延迟记录里追加一行「放弃」。
-// 事件若只有元数据，调用方用 loadPayload 按需去取正文。这里不读令牌。
+// 事件若只有元数据，调用方用 loadPayload 按需去取正文。这里不读令牌，也不自己发 GitHub 请求。
+// 没有 loadPayload 时不算处理成功：记一次失败，不交给 onEvent。满 5 次后确认移出，延迟记录写「正文被省略」。
+// loadPayload 抛错同样记一次失败。
 // 每处理完一个事件，把 created_at 到处理完成的时间差追加到 .prio/latency.jsonl。
 // 目标：Worker 路径 p95 ≤ 10 秒，兜底轮询 ≤ 90 秒（60 秒一轮，留处理余量）。
 // 轮询函数由调用方注入（现有 60 秒轮询留在外面，这里不替换它）。不读令牌。
@@ -111,6 +113,7 @@ function errorSummary(err) {
  * 传了 reportFailure 时，把这次失败记到 Worker。返回 abandoned 后改成确认移出，
  * 并在延迟记录里追加一行 outcome 为「放弃」。没传时，失败仍不确认。
  * payloadOmitted 的事件先交给 loadPayload，由调用方按需取回正文，再交给 onEvent。
+ * 没有 loadPayload 时抛出「正文被省略」，走失败计数，不交给 onEvent。loadPayload 抛错同样算失败。
  * confirm 在处理成功（或放弃）之后调用，Worker 才清掉对应事件。
  */
 export async function runEventChannel({
@@ -150,7 +153,8 @@ export async function runEventChannel({
     if (!id) return false;
     if (seen.has(id)) return true;
     let current = event;
-    if (current.payloadOmitted && typeof loadPayload === 'function') {
+    if (current.payloadOmitted) {
+      if (typeof loadPayload !== 'function') throw new Error('正文被省略');
       const payload = await loadPayload(current);
       current = { ...current, payload };
     }

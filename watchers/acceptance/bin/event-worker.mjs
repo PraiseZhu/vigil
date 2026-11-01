@@ -1,10 +1,13 @@
 // Cloudflare Worker 入口：收 GitHub webhook，校验 X-Hub-Signature-256，按 delivery id 去重后入队。
 // 只读 env.WEBHOOK_SECRET（签名）和 env.PULL_TOKEN（拉取）。不读 GitHub 令牌，也不出站。
 // 队列和去重表只通过 storage（get / put / delete / list / transaction，对齐 Durable Object storage）读写。
-// 每条事件一个键 q:<seq>，每条去重记录一个键 s:<deliveryId>，用 list({prefix}) 读。两种后端都能用。
+// 每条事件一个键 q:<seq>，每条去重记录一个键 s:<deliveryId>。两种后端都能用。
+// 去重只读这一个 s: 键。队列长度用 queueCount，入队加一，确认减一。
+// 去重条数用 seenCount。只有超过上限时才 list s:，删掉过期的和最旧的。
+// /pull、/ack、/fail 仍按前缀 list 队列。
 // 单个值默认不超过 128 KiB。再大的 payload 只留元数据（delivery id、事件类型、仓库、编号），
 // 存储若直接拒绝写入，也同样改存元数据。拉取端再按需去取正文。
-// 队列最多 1000 条。超过就拒绝新事件并记一条告警，不丢掉最旧的。
+// 队列最多 1000 条。超过就拒绝新事件并记一条告警，不丢掉最旧的。告警键 a:<deliveryId>，只留最近 50 条。
 // 失败次数记在事件上。同一条失败 5 次后，拉取端确认（POST /ack）才移出队列。
 // EventChannelDurableObject 用一份持久存储；两个 Worker 实例共用它时，webhook 和 /pull 才不会各看各的内存。
 // /pull 只读队列。本文件不部署；默认导出的 fetch 就是以后挂到 Worker 上的处理函数。不要在这里加部署配置。
@@ -14,8 +17,13 @@ export const SEEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const QUEUE_LIMIT = 1000;
 export const FAILURE_LIMIT = 5;
 export const MAX_VALUE_BYTES = 128 * 1024;
+export const ALERT_LIMIT = 50;
 
 const SEQ_KEY = 'seq';
+const QUEUE_COUNT_KEY = 'queueCount';
+const SEEN_COUNT_KEY = 'seenCount';
+const ALERT_SEQ_KEY = 'alertSeq';
+const ALERT_COUNT_KEY = 'alertCount';
 const ERROR_SUMMARY_LIMIT = 200;
 
 function bytesToHex(buffer) {
@@ -204,10 +212,43 @@ async function readSeen(txn) {
   return seen;
 }
 
+function alertSeq(value) {
+  return value && typeof value === 'object' && Number.isFinite(value.seq) ? value.seq : 0;
+}
+
+function alertLine(value) {
+  return typeof value === 'string' ? value : String(value?.line ?? '');
+}
+
 async function readAlerts(txn) {
   const listed = [...(await listMap(txn, 'a:')).entries()];
-  listed.sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0));
-  return listed.map(([, value]) => (typeof value === 'string' ? value : String(value?.line ?? '')));
+  listed.sort((left, right) => alertSeq(left[1]) - alertSeq(right[1]) || (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0));
+  const capped = listed.length > ALERT_LIMIT ? listed.slice(listed.length - ALERT_LIMIT) : listed;
+  return capped.map(([, value]) => alertLine(value));
+}
+
+async function putAlert(txn, deliveryId, line) {
+  const key = alertKey(deliveryId);
+  const prev = await txn.get(key);
+  const seq = ((await txn.get(ALERT_SEQ_KEY)) ?? 0) + 1;
+  await txn.put(ALERT_SEQ_KEY, seq);
+  await txn.put(key, { seq, line });
+  let count = ((await txn.get(ALERT_COUNT_KEY)) ?? 0) + (prev == null ? 1 : 0);
+  if (count > ALERT_LIMIT) {
+    const listed = [...(await listMap(txn, 'a:')).entries()];
+    listed.sort((left, right) => alertSeq(left[1]) - alertSeq(right[1]) || (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0));
+    while (listed.length > ALERT_LIMIT) {
+      const [oldKey] = listed.shift();
+      await txn.delete(oldKey);
+    }
+    count = listed.length;
+  }
+  await txn.put(ALERT_COUNT_KEY, count);
+}
+
+function seenFresh(row, nowMs, ttlMs) {
+  if (!row || typeof row.at !== 'number' || typeof row.seq !== 'number') return false;
+  return row.at >= nowMs - ttlMs;
 }
 
 function pruneSeen(seen, nowMs, limit, ttlMs) {
@@ -263,8 +304,15 @@ async function handleRequest(request, env, durable) {
     if (!body || !Array.isArray(body.ids)) return new Response('bad ack', { status: 400 });
     const drop = new Set(body.ids.filter((id) => typeof id === 'string'));
     await storage.transaction(async (txn) => {
+      let removed = 0;
       for (const event of await readQueue(txn)) {
-        if (drop.has(event.deliveryId)) await txn.delete(queueKey(event.seq));
+        if (!drop.has(event.deliveryId)) continue;
+        await txn.delete(queueKey(event.seq));
+        removed += 1;
+      }
+      if (removed > 0) {
+        const queueCount = (await txn.get(QUEUE_COUNT_KEY)) ?? 0;
+        await txn.put(QUEUE_COUNT_KEY, Math.max(0, queueCount - removed));
       }
     });
     return new Response(null, { status: 204 });
@@ -307,11 +355,8 @@ async function handleRequest(request, env, durable) {
   const queueLimit = durable.queueLimit;
   let badJson = false;
   await storage.transaction(async (txn) => {
-    const pruned = pruneSeen(await readSeen(txn), nowMs, limit, ttlMs);
-    if (Object.hasOwn(pruned.kept, deliveryId)) {
-      await dropSeen(txn, pruned.dropped);
-      return;
-    }
+    const prior = await txn.get(seenKey(deliveryId));
+    if (seenFresh(prior, nowMs, ttlMs)) return;
     let payload;
     try {
       payload = JSON.parse(body);
@@ -320,17 +365,23 @@ async function handleRequest(request, env, durable) {
       return;
     }
     const seq = ((await txn.get(SEQ_KEY)) ?? 0) + 1;
-    const again = pruneSeen({ ...pruned.kept, [deliveryId]: { seq, at: nowMs } }, nowMs, limit, ttlMs);
-    await dropSeen(txn, pruned.dropped);
-    await dropSeen(txn, again.dropped);
-    if (Object.hasOwn(again.kept, deliveryId)) await txn.put(seenKey(deliveryId), again.kept[deliveryId]);
     await txn.put(SEQ_KEY, seq);
-    if (!Object.hasOwn(again.kept, deliveryId)) return;
-    if ((await readQueue(txn)).length >= queueLimit) {
-      await txn.put(alertKey(deliveryId), `告警 队列已满 ${queueLimit}，拒绝新事件 ${deliveryId}`);
+    await txn.put(seenKey(deliveryId), { seq, at: nowMs });
+    let seenCount = ((await txn.get(SEEN_COUNT_KEY)) ?? 0) + (prior == null ? 1 : 0);
+    if (seenCount > limit) {
+      const pruned = pruneSeen(await readSeen(txn), nowMs, limit, ttlMs);
+      await dropSeen(txn, pruned.dropped);
+      seenCount = Object.keys(pruned.kept).length;
+    }
+    await txn.put(SEEN_COUNT_KEY, seenCount);
+    if (!(await txn.get(seenKey(deliveryId)))) return;
+    const queueCount = (await txn.get(QUEUE_COUNT_KEY)) ?? 0;
+    if (queueCount >= queueLimit) {
+      await putAlert(txn, deliveryId, `告警 队列已满 ${queueLimit}，拒绝新事件 ${deliveryId}`);
       return;
     }
     await putQueueEvent(txn, eventRecord(seq, deliveryId, eventName, payload), maxValueBytes);
+    await txn.put(QUEUE_COUNT_KEY, queueCount + 1);
   });
   if (badJson) return new Response('bad json', { status: 400 });
   return new Response(null, { status: 204 });
