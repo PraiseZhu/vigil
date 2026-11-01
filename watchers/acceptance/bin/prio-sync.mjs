@@ -4,6 +4,8 @@
 // 「优先级」和「关联 PR」只在当前值为空，或 changes.jsonl 里该字段最后一条新值等于看板当前值时才写；否则提醒一次。
 // 算不出关联（空串）时，不清空看板上已有的「关联 PR」。
 // 「关联 PR」真写前必须已有 mac-mini-stopped（人确认 Mac mini 停写后自建，本文件不创建）。
+// 检查还在跑（PENDING）时，关联 PR 文本沿用 debounce.json 的 prCi 里该 PR 上一拍的 ✓/✗，最多 CI_CARRY_TICKS 拍。
+// 这份标注只在 --write 且内容真变化时改；干跑整段原样保留，所以干跑日志里文本仍会在没有存档时跳。
 // 依据只写进 changes.jsonl，不新增看板字段。60 天没动静只提醒「还要不要」，不关 issue。
 // repo-class.json 的 exclude 数组命中的仓：不打分、不写优先级和关联 PR、不提醒、不搜 PR、不还原。
 // 汇总只在有排除时追加「，排除 N 条」，N 是条数，不写仓名。stderr 不记跳过，只在 exclude 不是数组时警告一次。
@@ -30,6 +32,8 @@ const EMPTY = '（空）';
 /** 最近一次事件早于这个间隔，只提醒「还要不要」，不写看板、不关 issue。 */
 export const STALE_REMIND_MS = 60 * 24 * 60 * 60 * 1000;
 const LINK_BASIS = 'link 关联 PR 文本与看板不一致';
+/** 检查连续 PENDING 时，关联 PR 文本最多沿用上一拍 ✓/✗ 的拍数。调用 runPrioSync 可改。 */
+export const CI_CARRY_TICKS = 6;
 const RESTORE_BASIS = 'restore 按变更日志改回';
 const LINK_HOLD = '不写关联 PR：没有 .prio/mac-mini-stopped，要等确认 Mac mini 已停写\n';
 const RESTORE_SKIP = '跳过：当前值不是上次写入的值';
@@ -236,9 +240,9 @@ function disabledFile(dir) {
   return stateFiles(dir).disabled;
 }
 
-function loadDebounce(dir) {
+function loadDebounceState(dir) {
   const file = stateFile(dir);
-  if (!fs.existsSync(file)) return {};
+  if (!fs.existsSync(file)) return { items: {}, prCiPresent: false, prCi: undefined };
   let parsed;
   try {
     parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -247,14 +251,16 @@ function loadDebounce(dir) {
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('防抖状态不是合法 JSON');
   const items = parsed.items;
-  if (items == null) return {};
-  if (typeof items !== 'object' || Array.isArray(items)) throw new Error('防抖状态不是合法 JSON');
-  return items;
+  if (items != null && (typeof items !== 'object' || Array.isArray(items))) throw new Error('防抖状态不是合法 JSON');
+  const prCiPresent = Object.prototype.hasOwnProperty.call(parsed, 'prCi');
+  return { items: items ?? {}, prCiPresent, prCi: prCiPresent ? parsed.prCi : undefined };
 }
 
-function saveDebounce(dir, items) {
+function saveDebounce(dir, items, prCi) {
+  const body = { items };
+  if (prCi !== undefined) body.prCi = prCi;
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(stateFile(dir), `${JSON.stringify({ items })}\n`);
+  fs.writeFileSync(stateFile(dir), `${JSON.stringify(body)}\n`);
 }
 
 function appendChange(dir, row) {
@@ -494,9 +500,12 @@ export function mapItem(node, table = DEFAULT_REPO_CLASS_TABLE) {
   return mappedItem(node, table);
 }
 
+function rollupState(node) {
+  return String(node?.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state || '').toUpperCase();
+}
+
 function ciOf(node) {
-  const state = node?.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state;
-  const value = String(state || '').toUpperCase();
+  const value = rollupState(node);
   if (value === 'SUCCESS') return 'pass';
   if (value === 'FAILURE' || value === 'ERROR') return 'fail';
   return '';
@@ -517,7 +526,104 @@ function mapPr(node) {
   };
   const ci = ciOf(node);
   if (ci) pr.ci = ci;
+  else if (rollupState(node) === 'PENDING') pr.ciPending = true;
   return pr;
+}
+
+function prRefOf(pr) {
+  const repo = String(pr?.repo || pr?.repository?.nameWithOwner || '').trim();
+  const number = Number(pr?.number);
+  if (!repo.includes('/') || !Number.isInteger(number) || number <= 0) return '';
+  return `${repo}#${number}`;
+}
+
+function prIsClosed(pr) {
+  if (pr?.merged === true) return true;
+  const state = String(pr?.state || '').toLowerCase();
+  return state === 'merged' || state === 'closed' || state === 'close';
+}
+
+function observedCi(pr) {
+  const rolled = rollupState(pr);
+  if (rolled === 'SUCCESS') return { kind: 'terminal', mark: 'pass' };
+  if (rolled === 'FAILURE' || rolled === 'ERROR') return { kind: 'terminal', mark: 'fail' };
+  if (rolled === 'PENDING' || pr?.ciPending === true) return { kind: 'pending' };
+  const ci = String(pr?.ci || '').toLowerCase();
+  if (['pass', 'passed', 'success', 'green', 'ok'].includes(ci)) return { kind: 'terminal', mark: 'pass' };
+  if (['fail', 'failed', 'failure', 'red', 'error'].includes(ci)) return { kind: 'terminal', mark: 'fail' };
+  return { kind: 'none' };
+}
+
+function withMark(pr, mark) {
+  if (mark === 'pass' || mark === 'fail') return pr.ci === mark ? pr : { ...pr, ci: mark };
+  if (pr.ci == null || pr.ci === '') return pr;
+  const copy = { ...pr };
+  delete copy.ci;
+  return copy;
+}
+
+function labelEntry(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (value.mark !== 'pass' && value.mark !== 'fail') return null;
+  const pending = Number.isInteger(value.pending) && value.pending > 0 ? value.pending : 0;
+  return { mark: value.mark, pending };
+}
+
+/**
+ * 关联 PR 文本用的 PR 副本，以及这一拍若落盘时的 prCi。
+ * 不改调用方传入的 pr / prCi。打分仍看原来的 ci，不把沿用的标注算进优先级。
+ * 终态照实记。PENDING 且已有标注、沿用未满 limit 拍时文本仍用上一拍，计数加一。
+ * 再下一拍文本退回不带 ✓/✗。合并或关闭的 PR 从 prCi 去掉。
+ */
+function carryLinkedPrCi(prs, stored, limit) {
+  const prev = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+  const next = { ...prev };
+  let changed = false;
+  const seen = new Set();
+  const adjusted = [];
+  for (const pr of prs) {
+    const key = prRefOf(pr);
+    if (!key) {
+      adjusted.push(pr);
+      continue;
+    }
+    const first = !seen.has(key);
+    if (first) seen.add(key);
+    if (prIsClosed(pr)) {
+      if (first && Object.prototype.hasOwnProperty.call(next, key)) {
+        delete next[key];
+        changed = true;
+      }
+      adjusted.push(pr);
+      continue;
+    }
+    const observed = observedCi(pr);
+    const entry = labelEntry(prev[key]);
+    if (observed.kind === 'terminal') {
+      if (!(entry && entry.mark === observed.mark && entry.pending === 0)) {
+        if (first) {
+          next[key] = { mark: observed.mark, pending: 0 };
+          changed = true;
+        }
+      }
+      adjusted.push(withMark(pr, observed.mark));
+      continue;
+    }
+    if (observed.kind === 'pending' && entry && entry.pending < limit) {
+      adjusted.push(withMark(pr, entry.mark));
+      if (first) {
+        next[key] = { mark: entry.mark, pending: entry.pending + 1 };
+        changed = true;
+      }
+      continue;
+    }
+    if (observed.kind === 'pending') {
+      adjusted.push(withMark(pr, ''));
+      continue;
+    }
+    adjusted.push(pr);
+  }
+  return { prs: adjusted, prCi: next, changed };
 }
 
 export async function loadBoardItems(github, profile, table = DEFAULT_REPO_CLASS_TABLE) {
@@ -702,11 +808,14 @@ export async function runPrioSync({
   table = DEFAULT_REPO_CLASS_TABLE,
   excludedCount: presetExcluded = 0,
   nullContent = 0,
+  carryTicks = CI_CARRY_TICKS,
 } = {}) {
   if (!dir) throw new Error('缺少状态目录');
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
   const mode = modeOf(dir, apply);
-  const saved = loadDebounce(dir);
+  const loaded = loadDebounceState(dir);
+  const saved = loaded.items;
+  const carryLimit = Number.isInteger(carryTicks) && carryTicks > 0 ? carryTicks : CI_CARRY_TICKS;
   const history = readJsonLines(changesFile(dir), '变更日志');
   const reminded = loadReminderKeys(dir);
   const nextItems = {};
@@ -714,6 +823,8 @@ export async function runPrioSync({
   let pinned = 0;
   let skippedHere = 0;
   const knownPrs = Array.isArray(prs) ? prs.filter((pr) => !isExcludedRepo(pr?.repo, table)) : null;
+  const carried = knownPrs ? carryLinkedPrCi(knownPrs, loaded.prCi, carryLimit) : null;
+  const linkPrs = carried ? carried.prs : null;
   const linkAllowed = macMiniStopped(dir);
 
   for (const item of items) {
@@ -773,8 +884,8 @@ export async function runPrioSync({
         nextItems[ref] = decision.next;
       }
     }
-    if (knownPrs) {
-      const next = linkedPrField({ issues: [{ repo: item.repo, number: item.number }], prs: knownPrs })[ref] ?? '';
+    if (linkPrs) {
+      const next = linkedPrField({ issues: [{ repo: item.repo, number: item.number }], prs: linkPrs })[ref] ?? '';
       const current = item.linkedPr ?? '';
       let lastLink = null;
       for (const row of history) {
@@ -843,7 +954,13 @@ export async function runPrioSync({
     });
     written += 1;
   }
-  saveDebounce(dir, nextItems);
+  let prCiOut;
+  if (mode === 'write' && carried?.changed) {
+    prCiOut = Object.keys(carried.prCi).length > 0 ? carried.prCi : undefined;
+  } else if (loaded.prCiPresent) {
+    prCiOut = loaded.prCi;
+  }
+  saveDebounce(dir, nextItems, prCiOut);
   const excludedTotal = (Number.isInteger(presetExcluded) && presetExcluded > 0 ? presetExcluded : 0) + skippedHere;
   outWrite(stdout, `${headOf(mode)}${items.length - skippedHere} 条，变更 ${changes.length}，写入 ${written}，钉住 ${pinned}${excludedSuffix(excludedTotal)}${nullContentSuffix(nullContent)}\n`);
   return { written, planned: changes.length, pinned, mode, excluded: excludedTotal };
