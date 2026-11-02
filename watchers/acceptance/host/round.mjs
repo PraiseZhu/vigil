@@ -38,6 +38,8 @@ export const VERDICT_GRACE_MS = 2 * 60 * 1000;
 export const DEFAULT_MAX_ROUND_MINUTES = 120;
 /** 沙箱坏了（bwrap 探针不过）时 sandbox-down 提醒的节流窗口。 */
 export const SANDBOX_DOWN_ALERT_MS = 60 * 60 * 1000;
+/** 认领失败提醒里 stderr 的上限。先脱敏再截断，令牌不会卡在截断边界上漏出去。 */
+export const CLAIM_FAILED_DETAIL_LIMIT = 500;
 /** mivo 的仓名（`/` 后面那段）以 mivo 开头就占测试锁。 */
 export const TEST_LOCK_PATTERN = /^mivo/i;
 const SERIAL_REPO_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
@@ -445,10 +447,24 @@ function defaultSpawnPi({ cmd, args, env, cwd, logFile }) {
   };
 }
 
+/** 认领失败的 stderr：先按 profile 脱敏，再截到 CLAIM_FAILED_DETAIL_LIMIT。空串不写 detail。 */
+function claimFailedDetail(stderr, profile) {
+  const text = redact(String(stderr ?? '').trim(), profile);
+  if (!text) return undefined;
+  return text.slice(0, CLAIM_FAILED_DETAIL_LIMIT);
+}
+
+/** tick 把 host/round.mjs 的 stderr 接到这份文件；这里直接追加，测试吞掉 log 时也不会丢。 */
+function appendRoundsLog(paths, line) {
+  fs.mkdirSync(paths.hostDir, { recursive: true, mode: 0o700 });
+  fs.appendFileSync(path.join(paths.hostDir, 'rounds.log'), `${line}\n`, { mode: 0o600 });
+}
+
 /**
  * 跑一轮验收。返回退出码：
- * 0 跑完（裁决已写）；1 出错（含沙箱起不来、卡住、超时、pi 退出但没写裁决）；
- * 3 什么都不做（内存不够 / 槽满 / 测试锁被占 / 写闸总开关关着 / 不该认领）；4 写闸拒绝（已写提醒）。
+ * 0 跑完（裁决已写）；1 出错（含沙箱起不来、卡住、超时、pi 退出但没写裁决，以及 start 退出 1）；
+ * 3 什么都不做（内存不够 / 槽满 / 测试锁被占 / 写闸总开关关着 / start 返回 3）；4 写闸拒绝（已写提醒）。
+ * start 的其它非 0 退出码照抄，并写 claim-failed。
  */
 export async function runHostRound({
   home,
@@ -586,11 +602,24 @@ export async function runHostRound({
       return 1;
     }
 
-    // 5. 认领（经写闸 exec）：退出码照抄；4 还要写一条提醒。
+    // 5. 认领（经写闸 exec）：退出码照抄。
+    // 4 = 写闸拒绝，只写 write-rejected；3 = 这一拍不该认领，不写提醒、不写 rounds.log；
+    // 其它非 0：认领没完成，写 claim-failed（stderr 脱敏后截断放 detail）和一行 rounds.log。
     const claimed = await callRound(['start', '--issue', issue]);
     if (claimed.code !== 0) {
       if (claimed.code === 4) {
         appendAlert(paths, { kind: 'write-rejected', issue, reason: '认领被写闸拒绝', detail: String(claimed.stderr || '').trim(), now, profile });
+      } else if (claimed.code !== 3) {
+        const detail = claimFailedDetail(claimed.stderr, profile);
+        appendAlert(paths, {
+          kind: 'claim-failed',
+          issue,
+          reason: `认领失败（退出码 ${claimed.code}）`,
+          detail,
+          now,
+          profile,
+        });
+        appendRoundsLog(paths, `${new Date(now()).toISOString()} claim-failed issue=${issue} code=${claimed.code}`);
       }
       return claimed.code;
     }

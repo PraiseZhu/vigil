@@ -469,6 +469,70 @@ test('SC11 tick：写闸总开关关着 → 验收轮、修正轮都不起，不
   assert.deepEqual(readAlerts(hostPaths(home)), []);
 });
 
+function roundsLog(home) {
+  return path.join(hostPaths(home).hostDir, 'rounds.log');
+}
+
+async function startWithCode(fixture, code, stderr) {
+  return runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: async () => ({ code: 0, stdout: '', stderr: '' }),
+    prefetch: fixture.prefetchFake,
+    runRound: async (argv) => {
+      fixture.calls.round.push(argv);
+      if (argv[0] === 'start') return { code, stdout: '', stderr };
+      return { code: 0, stdout: '{}\n', stderr: '' };
+    },
+    startGate: fixture.startGateFake,
+    spawnPi: hangingPi(fixture.calls).spawnPi,
+    meminfoPath: writeMeminfo(),
+    log: () => {},
+    now: () => Date.parse('2026-10-24T02:00:00.000Z'),
+  });
+}
+
+test('#228 SC3 start 返回 1：写 claim-failed，detail 是脱敏并截断后的 stderr，rounds.log 多一行，返回码仍是 1', async () => {
+  const fixture = roundFixture();
+  const token = `ghp_${'a'.repeat(36)}`;
+  const stderr = `${'说明'.repeat(80)} ${token} ${'尾'.repeat(400)}`;
+  const code = await startWithCode(fixture, 1, stderr);
+  assert.equal(code, 1);
+  assert.equal(fixture.calls.pi.length, 0, '认领失败不起模型');
+  const alerts = readAlerts(hostPaths(fixture.home));
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0].kind, 'claim-failed');
+  assert.equal(alerts[0].issue, ROOT_REF);
+  assert.match(alerts[0].reason, /退出码 1/);
+  assert.equal(alerts[0].detail.length, 500);
+  assert.match(alerts[0].detail, /^说明/);
+  assert.equal(alerts[0].detail.includes(token), false);
+  assert.equal(alerts[0].detail.includes('ghp_'), false);
+  const lines = fs.readFileSync(roundsLog(fixture.home), 'utf8').split('\n').filter(Boolean);
+  assert.deepEqual(lines, [`2026-10-24T02:00:00.000Z claim-failed issue=${ROOT_REF} code=1`]);
+  assert.equal(lines[0].includes(token), false);
+});
+
+test('#228 SC4 start 返回 4 仍只写 write-rejected，不写 claim-failed，也不写 rounds.log', async () => {
+  const fixture = roundFixture();
+  const code = await startWithCode(fixture, 4, '写闸拒绝：gate-disabled');
+  assert.equal(code, 4);
+  assert.equal(fixture.calls.pi.length, 0);
+  const alerts = readAlerts(hostPaths(fixture.home));
+  assert.deepEqual(alerts.map((entry) => entry.kind), ['write-rejected']);
+  assert.equal(fs.existsSync(roundsLog(fixture.home)), false);
+});
+
+test('#228 SC4 start 返回 3 不写任何告警，也不写 rounds.log', async () => {
+  const fixture = roundFixture();
+  const code = await startWithCode(fixture, 3, '任务现在不该验收\n');
+  assert.equal(code, 3);
+  assert.equal(fixture.calls.pi.length, 0);
+  assert.deepEqual(fixture.calls.round.map((argv) => argv[0]), ['start']);
+  assert.deepEqual(readAlerts(hostPaths(fixture.home)), []);
+  assert.equal(fs.existsSync(roundsLog(fixture.home)), false);
+});
+
 test('SC11 认领被写闸拒绝（4）：不跑模型，写一条提醒', async () => {
   const fixture = roundFixture();
   const code = await runHostRound({

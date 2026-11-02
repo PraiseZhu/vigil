@@ -9,9 +9,12 @@ import { hostPaths, progressFileFor, readAlerts } from './host/paths.mjs';
 import { roundDirFor, runHostRound } from './host/round.mjs';
 import { probeBwrap } from './host/sandbox.mjs';
 import { run as procRun } from './host/proc.mjs';
-import { cachePath } from './bin/rounds.mjs';
+import { loadAcceptanceProfile } from './bin/profile.mjs';
+import { runHelper } from './bin/helper.mjs';
+import { bodyVersion, cachePath } from './bin/rounds.mjs';
 import { ROOT_REF, createRoundWorld, roundComments, writeMeminfo } from './round-world.fixture.mjs';
-import { OTHER_REPO, REPO } from './fake-gh.fixture.mjs';
+import { OTHER_REPO, REPO, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
+import { ALL_RAN, CLOCK, createFakeGithub, createWorld, writeJsonFile } from './session.fixture.mjs';
 
 const bwrapAvailable = await probeBwrap(procRun);
 const skip = bwrapAvailable ? false : 'bwrap 不可用（探针起不来），跳过真沙箱测试';
@@ -234,4 +237,91 @@ test('SC11 真实路径：写闸总开关关着 → 不认领、不写任何提�
   assert.deepEqual(readAlerts(world.paths), []);
   const roundsDir = hostPaths(world.home).roundsDir;
   assert.deepEqual(fs.existsSync(roundsDir) ? fs.readdirSync(roundsDir) : [], []);
+});
+
+test('#228 SC10 已关闭且 PR 已合并的 child 走完 collect → close → verdict：写结论评论，关单至多一次且不重开，看板只写 child，不勾父清单', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const parentBody = '- [ ] SC1 父清单不要勾 验证：unit';
+  const childBody = '- [ ] SC1 子项单独验 验证：unit';
+  const childRef = `${REPO}#2`;
+  const parentRef = `${REPO}#1`;
+  const world = createWorld({ now: () => Date.parse(CLOCK) });
+  const parent = world.addIssue({
+    repo: REPO,
+    number: 1,
+    title: '父任务',
+    body: parentBody,
+    state: 'open',
+  });
+  const child = world.addIssue({
+    repo: REPO,
+    number: 2,
+    title: '已关闭的子 issue',
+    body: childBody,
+    state: 'closed',
+    closedAt: '2026-10-20T00:00:00.000Z',
+    prs: [{ number: 20, url: `https://github.com/${REPO}/pull/20`, mergedAt: '2026-10-20T01:00:00.000Z' }],
+  });
+  world.addChild(parent.ref, child.ref);
+  world.addComment(child.ref, roundComment({ round: 1, status: '验收中', bodyVersion: bodyVersion(childBody) }));
+
+  const out = { text: '' };
+  const err = { text: '' };
+  const sink = (bucket) => ({
+    write(chunk) {
+      bucket.text += chunk;
+      return true;
+    },
+  });
+  async function run(argv) {
+    out.text = '';
+    err.text = '';
+    const code = await runHelper(argv, {
+      github: createFakeGithub(world),
+      profile,
+      now: () => Date.parse(CLOCK),
+      stdout: sink(out),
+      stderr: sink(err),
+    });
+    return { code, out: out.text, err: err.text };
+  }
+
+  const collected = await run(['collect', '--issue', childRef]);
+  assert.equal(collected.code, 0, collected.err);
+  const tree = JSON.parse(collected.out);
+  assert.equal(tree.root.ref, childRef);
+  assert.equal(tree.root.kind, 'standalone', '没有子节点的 child 在 collect 里按 standalone 走');
+  assert.equal(tree.root.state, 'closed');
+  assert.deepEqual(tree.issues.map((entry) => entry.ref), [childRef]);
+
+  const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN, items: [{ ref: childRef, sc: 1 }] });
+  const verdictFile = writeJsonFile(home, 'verdict.json', {
+    checks: ALL_RAN,
+    items: [{ ref: childRef, sc: 1, result: '通过', evidence: 'node --test 通过' }],
+  });
+  const closed = await run(['close', '--issue', childRef, '--round', '1', '--verified', verified, '--verdict', verdictFile]);
+  assert.equal(closed.code, 0, closed.err);
+  const judged = await run(['verdict', '--issue', childRef, '--round', '1', '--file', verdictFile]);
+  assert.equal(judged.code, 0, judged.err);
+  assert.equal(JSON.parse(judged.out).status, '通过');
+
+  const closes = world.writes.filter((action) => action.type === 'issue.close');
+  assert.equal(closes.length, 1);
+  assert.equal(closes[0].repo, REPO);
+  assert.equal(closes[0].issue, 2);
+  assert.equal(world.writes.filter((action) => action.type === 'issue.reopen').length, 0);
+  assert.equal(world.get(childRef).state, 'closed');
+  assert.equal(world.get(parentRef).state, 'open');
+  assert.match(world.get(childRef).comments[0].body, /^\[验收机\] 第 1 轮：通过/);
+  assert.match(world.get(childRef).body, /- \[x\] SC1 子项单独验/);
+
+  const boards = world.writes.filter((action) => action.type === 'project.field.set');
+  assert.ok(boards.length >= 1);
+  assert.ok(boards.every((action) => action.repo === REPO && action.issue === 2), JSON.stringify(boards));
+  assert.equal(world.get(childRef).project['验收'], '通过');
+  assert.equal(world.get(parentRef).project['验收'], undefined);
+  assert.match(world.get(parentRef).body, /- \[ \] SC1 父清单不要勾/);
+  assert.doesNotMatch(world.get(parentRef).body, /- \[x\]/);
+  assert.equal(world.writes.filter((action) => action.type === 'issue.edit' && action.issue === 1).length, 0);
 });
