@@ -1,5 +1,6 @@
 // #157 prio-sync：默认 dry-run，经 project.field.set 写「优先级」「关联 PR」。
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -17,6 +18,7 @@ import {
   loadPullRequests,
   main,
   parsePrioArgs,
+  PRIO_LIMIT_MAX,
   PR_SEARCH_QUERY,
   priorityTokenPath,
   readPriorityWriterToken,
@@ -3413,4 +3415,464 @@ test('#204 读通道按 token 判定只读：绕过和其它边界不发请求�
   }
   assert.deepEqual(seen, allowed.map(() => 'run'));
   assert.equal(seen.includes('fetch'), false);
+});
+
+const MINE = 'example/repo';
+const OTHER = 'example/other';
+const BASIS_P0 = '没给情形档，机器信号 S1 升到 P0';
+
+function batchItem(repo, number, extra = {}) {
+  return {
+    repo,
+    number,
+    priority: null,
+    linkedPr: '',
+    labels: ['blocker'],
+    status: 'Todo',
+    acceptance: null,
+    ...extra,
+  };
+}
+
+function linkPr(repo, number, issue) {
+  return {
+    repo,
+    number,
+    title: `fix #${issue}`,
+    body: `Closes #${issue}\n`,
+    state: 'open',
+    ci: 'pass',
+    headRefName: 'fix',
+  };
+}
+
+async function runBatch(dir, items, extra = {}) {
+  const gate = extra.gate || recorder();
+  const io = capture();
+  const result = await runPrioSync({
+    dir,
+    items,
+    prs: extra.prs || [],
+    nowMs: extra.nowMs ?? T0,
+    apply: extra.apply !== false,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: io.stdout,
+    table: extra.table,
+    onlyRepo: extra.onlyRepo,
+    limit: extra.limit,
+  });
+  return { gate, io, result };
+}
+
+function assertNoPrioStateFiles(dir) {
+  assert.equal(fs.existsSync(path.join(dir, 'changes.jsonl')), false);
+  assert.equal(fs.existsSync(path.join(dir, 'debounce.json')), false);
+  const names = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+  assert.equal(names.some((name) => name.startsWith('run-')), false);
+}
+
+async function assertMainRejectsClean(argv, pattern) {
+  const dir = tmpDir();
+  const calls = { readToken: 0, write: 0, loadItems: 0 };
+  await assert.rejects(() => main(['--state-dir', dir, ...argv], {
+    dir,
+    now: () => T0,
+    stdout: capture().stdout,
+    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    loadItems: async () => {
+      calls.loadItems += 1;
+      return [batchItem(MINE, 1)];
+    },
+    loadPrs: async () => [],
+    write: async () => {
+      calls.write += 1;
+    },
+    readToken: () => {
+      calls.readToken += 1;
+      return 'unused-token';
+    },
+  }), pattern);
+  assert.equal(calls.readToken, 0);
+  assert.equal(calls.write, 0);
+  assert.equal(calls.loadItems, 0);
+  assertNoPrioStateFiles(dir);
+}
+
+test('#222 SC1 只处理 --only-repo 指定的仓，其它仓不打分不写不提醒', async () => {
+  const dir = tmpDir();
+  const stale = T0 - STALE_REMIND_MS - 1;
+  const { gate, io, result } = await runBatch(dir, [
+    batchItem(OTHER, 1, { lastEventAt: stale }),
+    batchItem('EXAMPLE/OTHER', 2, { lastEventAt: stale }),
+    batchItem(MINE, 3),
+  ], { onlyRepo: 'Example/Repo' });
+  assert.deepEqual(gate.writes.map((action) => action.repo), [MINE]);
+  assert.equal(gate.writes[0].issue, 3);
+  assert.equal(result.filteredByRepo, 2);
+  assert.equal(io.text().includes(OTHER), false);
+  assert.equal(io.text().includes('EXAMPLE/OTHER'), false);
+  assert.equal(io.text().includes('还要不要'), false);
+  assert.equal(fs.existsSync(path.join(dir, 'reminded.jsonl')), false);
+  assert.match(io.text(), /按仓过滤掉 2 条/);
+});
+
+test('#222 SC2 被过滤仓的防抖状态逐字段保持不变，不在本拍条目里的也保留', async () => {
+  const dir = tmpDir();
+  const otherLive = {
+    priority: 'P2',
+    pending: 'P3',
+    pendingHeld: true,
+    lastRecalcAt: 111,
+    consecutive: 2,
+    changes: [1, 2],
+  };
+  const otherAbsent = {
+    priority: 'P1',
+    pending: null,
+    pendingHeld: false,
+    lastRecalcAt: 222,
+    consecutive: 0,
+    changes: [9],
+  };
+  writeDebounce(dir, {
+    items: {
+      [`${OTHER}#1`]: otherLive,
+      [`${OTHER}#9`]: otherAbsent,
+      [`${MINE}#4`]: {
+        priority: null,
+        pending: null,
+        pendingHeld: false,
+        lastRecalcAt: null,
+        consecutive: 0,
+        changes: [],
+      },
+    },
+  });
+  const before = fs.readFileSync(path.join(dir, 'debounce.json'), 'utf8');
+  const { gate } = await runBatch(dir, [
+    batchItem(OTHER, 1),
+    batchItem(MINE, 4),
+  ], { onlyRepo: MINE });
+  assert.deepEqual(gate.writes.map((action) => `${action.repo}#${action.issue}`), [`${MINE}#4`]);
+  const after = readState(dir);
+  assert.deepEqual(after.items[`${OTHER}#1`], otherLive);
+  assert.deepEqual(after.items[`${OTHER}#9`], otherAbsent);
+  assert.equal(before.includes(`${OTHER}#9`), true);
+  assert.equal(JSON.stringify(after.items[`${OTHER}#1`]), JSON.stringify(otherLive));
+});
+
+test('#222 SC3 --limit 按仓名、issue 数值、字段名稳定截取，打乱顺序写同样的 N 条', async () => {
+  const orders = [
+    [[MINE, 10], [OTHER, 1], [MINE, 2], [OTHER, 3]],
+    [[OTHER, 3], [MINE, 2], [MINE, 10], [OTHER, 1]],
+  ];
+  const written = [];
+  for (const order of orders) {
+    const dir = tmpDir();
+    const { gate } = await runBatch(dir, order.map(([repo, number]) => batchItem(repo, number)), { limit: 2 });
+    written.push(gate.writes.map((action) => `${action.repo}#${action.issue}:${Object.keys(action.fields)[0]}`));
+  }
+  assert.deepEqual(written[0], [`${OTHER}#1:优先级`, `${OTHER}#3:优先级`]);
+  assert.deepEqual(written[1], written[0]);
+
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const { gate, io } = await runBatch(dir, [batchItem(MINE, 5)], {
+    limit: 2,
+    prs: [linkPr(MINE, 9, 5)],
+  });
+  assert.deepEqual(gate.writes.map((action) => Object.keys(action.fields)[0]), ['优先级', '关联 PR']);
+  const priorityAt = io.text().indexOf(`${MINE}#5 优先级`);
+  const linkAt = io.text().indexOf(`${MINE}#5 关联 PR`);
+  assert.ok(priorityAt >= 0 && linkAt > priorityAt);
+});
+
+test('#222 SC4 截掉的变更不写闸、不进日志，防抖按未写入退回，下一拍还能再算出', async () => {
+  const dir = tmpDir();
+  const prior = {
+    priority: 'P1',
+    pending: 'P2',
+    pendingHeld: true,
+    lastRecalcAt: 123,
+    consecutive: 2,
+    changes: [100],
+  };
+  writeDebounce(dir, { items: { [`${MINE}#2`]: prior } });
+  const first = await runBatch(dir, [batchItem(MINE, 2), batchItem(MINE, 1)], { limit: 1 });
+  assert.deepEqual(first.gate.writes.map((action) => action.issue), [1]);
+  assert.equal(readJsonl(dir).some((row) => row.issue === 2), false);
+  assert.match(first.io.text(), new RegExp(`${MINE.replaceAll('/', '\\/')}#2 优先级 .+（本拍上限截掉）`));
+  assert.equal(first.result.truncatedByLimit, 1);
+  assert.deepEqual(readState(dir).items[`${MINE}#2`], prior);
+
+  const second = await runBatch(dir, [
+    batchItem(MINE, 1, { priority: 'P0' }),
+    batchItem(MINE, 2),
+  ], { limit: 1 });
+  assert.deepEqual(second.gate.writes.map((action) => action.issue), [2]);
+  assert.equal(readJsonl(dir).filter((row) => row.issue === 2).length, 1);
+});
+
+test('#222 SC5 只打印 hold 的关联 PR 不占 --limit 名额', async () => {
+  const dir = tmpDir();
+  const { gate, io, result } = await runBatch(dir, [
+    batchItem(MINE, 1),
+    batchItem(MINE, 2, {
+      labels: [],
+      priority: 'P3',
+      situationTier: 'P3',
+      repoClass: 'mivo',
+      issueState: 'open',
+    }),
+    batchItem(MINE, 3),
+  ], {
+    limit: 1,
+    prs: [linkPr(MINE, 9, 2)],
+  });
+  assert.deepEqual(gate.writes.map((action) => action.issue), [1]);
+  assert.match(io.text(), /不写关联 PR/);
+  const linkLine = io.text().split('\n').find((line) => line.includes(`${MINE}#2 关联 PR`) && line.includes('→'));
+  assert.ok(linkLine);
+  assert.equal(linkLine.includes('本拍上限截掉'), false);
+  assert.match(io.text(), new RegExp(`${MINE.replaceAll('/', '\\/')}#3 优先级 .+（本拍上限截掉）`));
+  assert.equal(result.truncatedByLimit, 1);
+  assert.equal(readJsonl(dir).some((row) => row.field === '关联 PR'), false);
+});
+
+test('#222 SC6 不带新参数时 stdout、changes.jsonl、debounce.json 与改动前逐字节一致', async () => {
+  const items = [repoItem(REPO_B, 3), repoItem(REPO_A, 1), repoItem(REPO_A, 2)];
+  const line = (repo, number) => `${repo}#${number} 优先级 （空） → P0 依据：${BASIS_P0}`;
+  const expectedStdout = `${[line(REPO_B, 3), line(REPO_A, 1), line(REPO_A, 2)].join('\n')}\n写入：3 条，变更 3，写入 3，钉住 0\n`;
+  const writtenState = {
+    priority: 'P0',
+    pending: null,
+    pendingHeld: false,
+    lastRecalcAt: null,
+    consecutive: 0,
+    changes: [T0],
+  };
+  const expectedDebounce = `${JSON.stringify({
+    items: {
+      [`${REPO_B}#3`]: writtenState,
+      [`${REPO_A}#1`]: writtenState,
+      [`${REPO_A}#2`]: writtenState,
+    },
+  })}\n`;
+  const changeRow = (repo, number) => JSON.stringify({
+    at: new Date(T0).toISOString(),
+    item: `${repo}#${number}`,
+    repo,
+    issue: number,
+    field: '优先级',
+    old: null,
+    new: 'P0',
+    basis: BASIS_P0,
+  });
+  const expectedChanges = `${[changeRow(REPO_B, 3), changeRow(REPO_A, 1), changeRow(REPO_A, 2)].join('\n')}\n`;
+
+  async function once() {
+    const dir = tmpDir();
+    const { io } = await runBatch(dir, items);
+    return {
+      stdout: io.text(),
+      changes: fs.readFileSync(path.join(dir, 'changes.jsonl'), 'utf8'),
+      debounce: fs.readFileSync(path.join(dir, 'debounce.json'), 'utf8'),
+    };
+  }
+  const baseline = await once();
+  const again = await once();
+  assert.equal(again.stdout, baseline.stdout);
+  assert.equal(again.changes, baseline.changes);
+  assert.equal(again.debounce, baseline.debounce);
+  assert.equal(baseline.stdout, expectedStdout);
+  assert.equal(baseline.changes, expectedChanges);
+  assert.equal(baseline.debounce, expectedDebounce);
+  assert.equal(baseline.stdout.includes('按仓过滤掉'), false);
+  assert.equal(baseline.stdout.includes('按上限截掉'), false);
+  assert.equal(parsePrioArgs([]).onlyRepo, null);
+  assert.equal(parsePrioArgs([]).limit, null);
+});
+
+test('#222 SC7 --limit 空、0、负数、小数、非数字、超过 1000 都拒绝，且什么都不写', async () => {
+  const cases = [
+    ['', '（空）'],
+    ['0', '0'],
+    ['-1', '-1'],
+    ['1.5', '1.5'],
+    ['3a', '3a'],
+    ['1001', '1001'],
+  ];
+  for (const [value, shown] of cases) {
+    assert.throws(
+      () => parsePrioArgs(['--limit', value]),
+      new RegExp(`--limit 期望 1 到 ${PRIO_LIMIT_MAX} 的整数，实际：${shown.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`),
+    );
+    await assertMainRejectsClean(['--limit', value], /--limit 期望/);
+  }
+  assert.equal(parsePrioArgs(['--limit', '1']).limit, 1);
+  assert.equal(parsePrioArgs(['--limit', String(PRIO_LIMIT_MAX)]).limit, PRIO_LIMIT_MAX);
+  assert.equal(PRIO_LIMIT_MAX, 1000);
+
+  const dir = tmpDir();
+  const bin = fileURLToPath(new URL('./bin/prio-sync.mjs', import.meta.url));
+  const child = spawnSync(process.execPath, [bin, '--state-dir', dir, '--limit', '0'], { encoding: 'utf8' });
+  assert.notEqual(child.status, 0);
+  assert.match(child.stderr, /期望 1 到 1000 的整数，实际：0/);
+  assertNoPrioStateFiles(dir);
+});
+
+test('#222 SC8 --only-repo 不是 owner/repo 两段时退出，什么都不写', async () => {
+  const cases = [
+    ['', '（空）'],
+    ['repo', 'repo'],
+    ['a/b/c', 'a/b/c'],
+    ['/a/b', '/a/b'],
+    ['a/b/', 'a/b/'],
+    ['a b/c', 'a b/c'],
+  ];
+  for (const [value, shown] of cases) {
+    assert.throws(
+      () => parsePrioArgs(['--only-repo', value]),
+      new RegExp(`--only-repo 期望 owner/repo，实际：${shown.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`),
+    );
+    await assertMainRejectsClean(['--only-repo', value], /--only-repo 期望/);
+  }
+  assert.equal(parsePrioArgs(['--only-repo', MINE]).onlyRepo, MINE);
+});
+
+test('#222 SC9 参数重复或紧跟另一个选项时退出，什么都不写', async () => {
+  assert.throws(() => parsePrioArgs(['--limit', '1', '--limit', '2']), /重复的参数：--limit/);
+  assert.throws(() => parsePrioArgs(['--only-repo', MINE, '--only-repo', OTHER]), /重复的参数：--only-repo/);
+  assert.throws(() => parsePrioArgs(['--limit']), /缺少 --limit 的取值/);
+  assert.throws(() => parsePrioArgs(['--only-repo']), /缺少 --only-repo 的取值/);
+  assert.throws(() => parsePrioArgs(['--limit', '--write']), /缺少 --limit 的取值/);
+  assert.throws(() => parsePrioArgs(['--only-repo', '--write']), /缺少 --only-repo 的取值/);
+  await assertMainRejectsClean(['--limit', '1', '--limit', '1'], /重复的参数：--limit/);
+  await assertMainRejectsClean(['--only-repo', MINE, '--only-repo', MINE], /重复的参数：--only-repo/);
+  await assertMainRejectsClean(['--limit', '--write'], /缺少 --limit 的取值/);
+  await assertMainRejectsClean(['--only-repo', '--limit', '1'], /缺少 --only-repo 的取值/);
+});
+
+test('#222 SC10 --only-repo 或 --limit 与 --restore 同用时拒绝，不执行还原', async () => {
+  const iso = new Date(T0).toISOString();
+  assert.throws(() => parsePrioArgs(['--restore', iso, '--only-repo', MINE]), /--only-repo \/ --limit 不能和 --restore 同用/);
+  assert.throws(() => parsePrioArgs(['--limit', '1', '--restore', iso]), /--only-repo \/ --limit 不能和 --restore 同用/);
+  await assertMainRejectsClean(['--restore', iso, '--only-repo', MINE, '--write'], /不能和 --restore 同用/);
+  await assertMainRejectsClean(['--write', '--limit', '1', '--restore', iso], /不能和 --restore 同用/);
+});
+
+test('#222 SC11 dry-run 和 apply 都写出过滤与截掉，不给参数时汇总行没有这两段', async () => {
+  const items = [batchItem(OTHER, 1), batchItem(MINE, 3), batchItem(MINE, 2)];
+  const dry = await runBatch(tmpDir(), items, { apply: false, onlyRepo: MINE, limit: 1 });
+  assert.equal(dry.gate.writes.length, 0);
+  assert.equal(dry.result.mode, 'dry-run');
+  assert.equal(dry.result.filteredByRepo, 1);
+  assert.equal(dry.result.truncatedByLimit, 1);
+  assert.match(dry.io.text(), /dry-run：3 条，变更 2，写入 0，钉住 0，按仓过滤掉 1 条，按上限截掉 1 条/);
+  assert.match(dry.io.text(), /（本拍上限截掉）/);
+  assert.equal(dry.result.written, 0);
+
+  const liveDir = tmpDir();
+  const live = await runBatch(liveDir, items, { onlyRepo: MINE, limit: 1 });
+  assert.equal(live.gate.writes.length, 1);
+  assert.match(live.io.text(), /写入：3 条，变更 2，写入 1，钉住 0，按仓过滤掉 1 条，按上限截掉 1 条/);
+  assert.equal(readJsonl(liveDir).length, 1);
+
+  const plain = await runBatch(tmpDir(), items, { apply: false });
+  assert.match(plain.io.text(), /dry-run：3 条，变更 3，写入 0，钉住 0\n$/);
+  assert.equal(plain.io.text().includes('按仓过滤掉'), false);
+  assert.equal(plain.io.text().includes('按上限截掉'), false);
+  assert.equal(plain.result.filteredByRepo, 0);
+  assert.equal(plain.result.truncatedByLimit, 0);
+
+  const wired = tmpDir();
+  const gate = recorder();
+  const io = capture();
+  await main(['--state-dir', wired, '--only-repo', MINE, '--limit', '1', '--write'], {
+    now: () => T0,
+    stdout: io.stdout,
+    loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+    loadItems: async () => items,
+    loadPrs: async () => [],
+    write: gate.write,
+    readToken: () => {
+      throw new Error('已注入 write，不应读令牌');
+    },
+  });
+  assert.deepEqual(gate.writes.map((action) => action.issue), [2]);
+  assert.match(io.text(), /按仓过滤掉 1 条，按上限截掉 1 条/);
+});
+
+test('#222 SC12 disabled 时带两个参数仍是已停用且 0 写入', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'disabled'), '');
+  const { gate, io, result } = await runBatch(dir, [batchItem(OTHER, 1), batchItem(MINE, 2)], {
+    onlyRepo: MINE,
+    limit: 1,
+  });
+  assert.equal(gate.writes.length, 0);
+  assert.equal(result.mode, 'disabled');
+  assert.equal(result.written, 0);
+  assert.match(io.text(), /已停用：2 条，变更 1，写入 0，钉住 0，按仓过滤掉 1 条，按上限截掉 0 条/);
+  assert.equal(fs.existsSync(path.join(dir, 'changes.jsonl')), false);
+});
+
+test('#222 SC13 prio:pin、手动值和排除档不写，也不占 --limit 名额', async () => {
+  const dir = tmpDir();
+  const { gate, io, result } = await runBatch(dir, [
+    batchItem(MINE, 1, { labels: ['prio:pin', 'blocker'] }),
+    batchItem(MINE, 2, { priority: 'P2' }),
+    batchItem(MINE, 3, { repoClass: 'exclude' }),
+    batchItem(MINE, 4),
+    batchItem(MINE, 5),
+  ], { onlyRepo: MINE, limit: 1 });
+  assert.deepEqual(gate.writes.map((action) => action.issue), [4]);
+  assert.equal(result.written, 1);
+  assert.equal(result.truncatedByLimit, 1);
+  assert.match(io.text(), /手动值与规则不一致，提醒一次/);
+  assert.match(io.text(), new RegExp(`${MINE.replaceAll('/', '\\/')}#5 优先级 .+（本拍上限截掉）`));
+  assert.equal(readJsonl(dir).every((row) => row.issue === 4), true);
+  assert.equal(gate.writes.some((action) => action.issue === 1 || action.issue === 2 || action.issue === 3), false);
+});
+
+test('#222 SC14 运维文档写明分批写的用法、排序、上限和汇总行', () => {
+  const doc = fs.readFileSync(fileURLToPath(new URL('../../docs/acceptance-operations.md', import.meta.url)), 'utf8');
+  assert.match(doc, /## 12\. prio-sync 分批写/);
+  assert.match(doc, /--only-repo example\/repo/);
+  assert.match(doc, /--limit 1/);
+  assert.match(doc, /1000/);
+  assert.match(doc, /PRIO_LIMIT_MAX/);
+  assert.match(doc, /按仓过滤掉/);
+  assert.match(doc, /按上限截掉/);
+  assert.match(doc, /本拍上限截掉/);
+  assert.match(doc, /不能和 `--restore` 一起用/);
+  assert.match(doc, /退出码非 0/);
+  assert.match(doc, /下一次运行还会再算出同样的变更/);
+});
+
+test('#222 SC15 改动文件不含令牌、本机绝对路径或外部仓库全名', () => {
+  const files = [
+    new URL('./bin/prio-sync.mjs', import.meta.url),
+    import.meta.url,
+    new URL('../../docs/acceptance-operations.md', import.meta.url),
+  ];
+  const banned = [
+    /\/Users\/[A-Za-z0-9._-]+/,
+    /gh[pousr]_[A-Za-z0-9]{20,}/,
+    /AKIA[0-9A-Z]{16}/,
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  ];
+  for (const file of files) {
+    const text = fs.readFileSync(fileURLToPath(file), 'utf8');
+    for (const pattern of banned) {
+      assert.equal(pattern.test(text), false, `${file.pathname} ${pattern}`);
+    }
+  }
+});
+
+test('#222 SC16 本测试文件不依赖 origin 与 main 拼成的 ref', () => {
+  const source = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  assert.equal(source.includes(['origin', 'main'].join('/')), false);
 });

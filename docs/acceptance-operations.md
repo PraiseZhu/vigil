@@ -616,3 +616,24 @@ node watchers/acceptance/deploy-ff.mjs \
 落后：本地比目标多超过 5 个提交，或最早一个未部署提交距今超过 2 小时，人话里带 `lagging`，并给 lead 一句。同一次落后（以当前本地 HEAD 为键）只在第一次把 `reportLag` 设为 true。快进成功后这份记忆清掉。
 
 提醒写到调用方传入的 `alerts.jsonl`，本脚本自己追加，不引用宿主目录里的模块。一行一个 JSON：`ts`、`kind`、`reason`、`detail`，另带 `head`、`target`。`kind` 以 `deploy-` 开头，例如 `deploy-needs-approval`、`deploy-blocked-dirty`、`deploy-doctor-failed`、`deploy-pull-failed`、`deploy-blocked-diverged`、`deploy-ci-red`、`deploy-ci-unknown`，首次落后另写 `deploy-lagging`。同一个本地 HEAD、目标 sha 和 kind 只写一行。`waiting`、`ci-pending`、`up-to-date`、`deployed` 不写；`locked` 和 `fetch-failed` 只出现在标准输出，不写提醒。状态文件用临时文件加 rename 写入，记下落后是否报过、以及已经写过的提醒键。
+
+## 12. prio-sync 分批写
+
+`watchers/acceptance/bin/prio-sync.mjs` 一次 `--write` 默认把这一拍所有计划变更都写出去。要先只写一个仓、并且一次只写前几条，加上 `--only-repo` 和 `--limit`。两个参数都可以单独用，不带 `--write` 时同样生效，只是不调用写闸。
+
+```sh
+node watchers/acceptance/bin/prio-sync.mjs \
+  --only-repo example/repo \
+  --limit 1 \
+  --write \
+  --state-dir <state-dir>
+```
+
+- `--only-repo` 的取值必须是 `owner/repo` 两段，字符只允许字母、数字、`_`、`.`、`-`，不能有空格，首尾不能有 `/`。比较仓名时不分大小写。其它仓的条目不打分、不进变更、不写、不提醒。它们在 `debounce.json` 里的状态原样保留，包括这一拍条目列表里没出现、但状态文件里已经有的条目。
+- `--limit` 只保留前 N 条真会调用写闸的变更。顺序固定，和条目原来的先后无关：先按仓名小写，再按 issue 号的数值，再按字段名的 Unicode 码点（「优先级」在「关联 PR」前面）。同一批输入打乱顺序跑两次，写入的是同样的 N 条。N 至少是 1，最大是 1000（源码里的 `PRIO_LIMIT_MAX`）。看板目前大约一百条，1000 留足余量，同时挡住一次写得过多。
+- 名额只数真会落闸的变更。没有 `.prio/mac-mini-stopped` 时，「关联 PR」只打印 hold、不调用写闸，不占名额。`prio:pin`、看板上的手动值、排除档都不进变更列表，也不占名额。
+- 名额用完之后的变更不调用写闸，也不追加 `changes.jsonl`。标准输出仍打印这一行，行尾加上「（本拍上限截掉）」。防抖按没写过退回（和写失败时的 `restoreUnwrittenDebounce` 一样）。下一次运行还会再算出同样的变更。dry-run 也按这个顺序排序、按「将会写」计数，截掉的条数照样记进汇总；dry-run 本来就不写。
+- 汇总行只在给了对应参数时多两段。给了 `--only-repo` 就追加「，按仓过滤掉 X 条」，X 是其它仓被跳过的条数。给了 `--limit` 就追加「，按上限截掉 Y 条」，Y 是这一拍因为名额不够而没写的变更数。两个参数都不给时，汇总行和以前完全一样，不会出现这两段。
+- 取值不合法就退出码非 0，一条都不写：不读写令牌，不读看板，不创建 `changes.jsonl`、`debounce.json` 和 `run-*.log`。`--limit` 的空值、`0`、负数、小数、夹着非数字、大于 1000，以及 `--only-repo` 的空值、只有一段、三段、首尾带 `/`、含空格，报错里都会写上期望格式和实际值。同一个参数出现两次，或者取值的位置是另一个以 `--` 开头的参数，同样退出码非 0。
+- `--only-repo` 或 `--limit` 不能和 `--restore` 一起用。一起出现时退出码非 0，报错是「--only-repo / --limit 不能和 --restore 同用」，还原不会执行。
+- 状态目录里已经有 `disabled` 时，带上这两个参数也还是已停用，写入数是 0。
