@@ -34,6 +34,12 @@ export const TICK_READ_TIMEOUT_MS = 45000;
  */
 export const POLL_TIMEOUT_MS = 60000;
 
+/**
+ * 已合并子 issue 的补验限速（#224）：每一拍最多新认领 1 个 kind=child。
+ * 槽位满或 runHostRound 内存门拦住时不起新轮、不写评论、不算一轮，下一拍再试。这里不另写提醒。
+ */
+export const MAX_CHILD_CLAIMS_PER_TICK = 1;
+
 const RETRIED = '（已重试一次）';
 
 /**
@@ -591,8 +597,11 @@ export async function runTick({
     let free = gateEnabled ? Math.max(0, MAX_ROUNDS - liveSlotCount(paths)) : 0;
     const serialWaiting = [];
     const claimedThisTick = new Set();
+    let childClaims = 0;
     for (const entry of entries.filter((item) => item && !item.stale && !item.outOfScope && !item.passedButOpen && !item.adjudicate)) {
       if (free <= 0) break;
+      const isChild = entry.kind === 'child';
+      if (isChild && childClaims >= MAX_CHILD_CLAIMS_PER_TICK) continue;
       const record = byIssue.get(entry.issue);
       if (record && isAlive(Number(record.pid))) continue;
       const lockFiles = lockFilesFor(entry.issue);
@@ -604,6 +613,7 @@ export async function runTick({
       const pid = startRound(entry.issue);
       heartbeat.lastTick.started.push({ issue: entry.issue, pid: pid ?? null });
       free -= 1;
+      if (isChild) childClaims += 1;
     }
     // 只在有 issue 等同仓锁时才写进心跳（心跳的形状平时不变）。
     if (serialWaiting.length > 0) heartbeat.lastTick.serialWaiting = serialWaiting;

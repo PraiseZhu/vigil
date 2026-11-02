@@ -449,3 +449,146 @@ test('#193 创建时间或合并时间解析不出时不触发，原因可识别
     { trigger: true, reason: 'pr-merged-after-verdict' },
   );
 });
+
+function childTask(extra = {}) {
+  const body = extra.body ?? 'child body';
+  return {
+    ref: `${REPO}#2`,
+    repo: REPO,
+    number: 2,
+    kind: 'child',
+    tier: 'auto',
+    fork: false,
+    state: extra.state ?? 'closed',
+    closedAt: Object.hasOwn(extra, 'closedAt') ? extra.closedAt : '2026-10-20T00:00:00.000Z',
+    body,
+    bodyVersion: bodyVersion(body),
+    children: [],
+    linkedPrs: extra.linkedPrs ?? [{ ref: `${REPO}#20`, mergedAt: '2026-10-20T01:00:00.000Z' }],
+    rounds: extra.rounds ?? [],
+    parentRef: `${REPO}#1`,
+    parentLatestStatus: extra.parentLatestStatus ?? null,
+    parentFinalFinishedAt: Object.hasOwn(extra, 'parentFinalFinishedAt') ? extra.parentFinalFinishedAt : null,
+  };
+}
+
+const CHILD_NOW = nowAt('2026-10-24T00:00:00.000Z');
+const CHILD_PROFILE = { startAt: START_AT };
+const CHILD_VERDICT_AT = '2026-10-21T00:00:00.000Z';
+
+function childVerdict(extra = {}) {
+  return {
+    round: 1,
+    status: '通过',
+    bodyVersion: bodyVersion('child body'),
+    createdAt: CHILD_VERDICT_AT,
+    finishedAt: '2026-10-21T01:00:00.000Z',
+    ...extra,
+  };
+}
+
+test('#224 SC1 已关闭且 PR 已合并、没有结论的子 issue 触发 child-merged', () => {
+  const decision = shouldTrigger(childTask(), { now: CHILD_NOW, profile: CHILD_PROFILE });
+  assert.deepEqual(decision, { trigger: true, reason: 'child-merged' });
+});
+
+test('#224 SC2 子 issue 未关闭不触发，reason child-open', () => {
+  for (const state of ['open', 'OPEN']) {
+    const decision = shouldTrigger(childTask({ state, closedAt: null }), { now: CHILD_NOW, profile: CHILD_PROFILE });
+    assert.deepEqual(decision, { trigger: false, reason: 'child-open' });
+  }
+});
+
+test('#224 SC3 已关闭但没有已合并 PR 不触发，含 PR 关闭未合并', () => {
+  const none = shouldTrigger(childTask({ linkedPrs: [] }), { now: CHILD_NOW, profile: CHILD_PROFILE });
+  assert.deepEqual(none, { trigger: false, reason: 'no-merged-pr' });
+  const closedUnmerged = shouldTrigger(
+    childTask({ linkedPrs: [{ ref: `${REPO}#20`, mergedAt: null }] }),
+    { now: CHILD_NOW, profile: CHILD_PROFILE },
+  );
+  assert.deepEqual(closedUnmerged, { trigger: false, reason: 'no-merged-pr' });
+});
+
+test('#224 SC4 已有结论且之后没有新合并、正文未变时不触发；同一拍和连续调用都不重开', () => {
+  const task = childTask({ rounds: [childVerdict()] });
+  const once = shouldTrigger(task, { now: CHILD_NOW, profile: CHILD_PROFILE });
+  const twice = shouldTrigger(task, { now: CHILD_NOW, profile: CHILD_PROFILE });
+  assert.deepEqual(once, { trigger: false, reason: 'up-to-date' });
+  assert.deepEqual(twice, once);
+});
+
+test('#224 SC5 多个 PR 至少一个已合并就触发一次；结论后另一个合并只再开一轮', () => {
+  const first = childTask({
+    linkedPrs: [
+      { ref: `${REPO}#20`, mergedAt: '2026-10-20T01:00:00.000Z' },
+      { ref: `${REPO}#21`, mergedAt: null },
+    ],
+  });
+  assert.deepEqual(shouldTrigger(first, { now: CHILD_NOW, profile: CHILD_PROFILE }), { trigger: true, reason: 'child-merged' });
+
+  const after = childTask({
+    linkedPrs: [
+      { ref: `${REPO}#20`, mergedAt: '2026-10-20T01:00:00.000Z' },
+      { ref: `${REPO}#21`, mergedAt: '2026-10-22T00:00:00.000Z' },
+    ],
+    rounds: [childVerdict()],
+  });
+  assert.deepEqual(shouldTrigger(after, { now: CHILD_NOW, profile: CHILD_PROFILE }), {
+    trigger: true,
+    reason: 'pr-merged-after-verdict',
+  });
+
+  const settled = childTask({
+    linkedPrs: after.linkedPrs,
+    rounds: [childVerdict({ round: 2, createdAt: '2026-10-23T00:00:00.000Z', finishedAt: '2026-10-23T01:00:00.000Z' })],
+  });
+  assert.deepEqual(shouldTrigger(settled, { now: CHILD_NOW, profile: CHILD_PROFILE }), { trigger: false, reason: 'up-to-date' });
+  assert.deepEqual(shouldTrigger(settled, { now: CHILD_NOW, profile: CHILD_PROFILE }), { trigger: false, reason: 'up-to-date' });
+});
+
+test('#224 SC6 父最新轮次验收中时子 issue 不触发', () => {
+  const decision = shouldTrigger(childTask({ parentLatestStatus: '验收中' }), { now: CHILD_NOW, profile: CHILD_PROFILE });
+  assert.deepEqual(decision, { trigger: false, reason: 'parent-in-progress' });
+});
+
+test('#224 SC7 父结论晚于子 issue 关闭不触发；早于或相等照常触发', () => {
+  const covered = shouldTrigger(
+    childTask({ parentFinalFinishedAt: '2026-10-21T00:00:00.000Z' }),
+    { now: CHILD_NOW, profile: CHILD_PROFILE },
+  );
+  assert.deepEqual(covered, { trigger: false, reason: 'parent-covered' });
+  const earlier = shouldTrigger(
+    childTask({ parentFinalFinishedAt: '2026-10-19T00:00:00.000Z' }),
+    { now: CHILD_NOW, profile: CHILD_PROFILE },
+  );
+  assert.deepEqual(earlier, { trigger: true, reason: 'child-merged' });
+  const same = shouldTrigger(
+    childTask({ parentFinalFinishedAt: '2026-10-20T00:00:00.000Z' }),
+    { now: CHILD_NOW, profile: CHILD_PROFILE },
+  );
+  assert.deepEqual(same, { trigger: true, reason: 'child-merged' });
+});
+
+test('#224 SC8 回归：总 issue 仍因 children-open 不触发，独立 issue 仍因 no-verdict 触发', () => {
+  const parent = parentTask({
+    children: [{ ref: `${REPO}#2`, state: 'open', closedAt: null }],
+  });
+  assert.deepEqual(shouldTrigger(parent, { now: CHILD_NOW, profile: CHILD_PROFILE }), { trigger: false, reason: 'children-open' });
+  const alone = standaloneTask({ linkedPrs: [{ ref: `${REPO}#9`, mergedAt: '2026-10-21T00:00:00.000Z' }] });
+  assert.deepEqual(shouldTrigger(alone, { now: CHILD_NOW, profile: CHILD_PROFILE }), { trigger: true, reason: 'no-verdict' });
+});
+
+test('#224 SC15 带修正标记不触发；同样条件不带标记照常触发', () => {
+  const marked = childTask({
+    body: `说明\n[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#2 SC3 · 第 1 轮\n`,
+  });
+  assert.deepEqual(shouldTrigger(marked, { now: CHILD_NOW, profile: CHILD_PROFILE }), {
+    trigger: false,
+    reason: 'correction-issue',
+  });
+  const plain = childTask({ body: '普通子 issue' });
+  assert.deepEqual(shouldTrigger(plain, { now: CHILD_NOW, profile: CHILD_PROFILE }), {
+    trigger: true,
+    reason: 'child-merged',
+  });
+});

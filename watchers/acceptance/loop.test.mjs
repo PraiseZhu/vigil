@@ -7,8 +7,9 @@ import path from 'node:path';
 import test, { after } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { hostPaths, isAlive, readAlerts } from './host/paths.mjs';
-import { runTick } from './host/tick.mjs';
-import { tmpDir, writeProfile } from './fake-gh.fixture.mjs';
+import { runHostRound } from './host/round.mjs';
+import { MAX_CHILD_CLAIMS_PER_TICK, runTick } from './host/tick.mjs';
+import { REPO, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOST_DIR = path.join(HERE, 'host');
@@ -884,4 +885,149 @@ test('T20 读超时只加在读上：只读 graphql、GET 带超时；mutation�
   await wrapped('gh', ['api', '-X', 'PATCH', 'repos/o/r/issues/1'], {});
   await wrapped('git', ['push'], {});
   assert.deepEqual(calls, [120000, 120000, 120000, undefined, undefined, undefined, undefined]);
+});
+
+function enableGate(home) {
+  const paths = hostPaths(home);
+  fs.mkdirSync(paths.gateDir, { recursive: true });
+  fs.writeFileSync(paths.enabledFile, '1\n');
+  return paths;
+}
+
+function childPollEntry(number) {
+  return {
+    issue: `${REPO}#${number}`,
+    kind: 'child',
+    tier: 'auto',
+    fork: false,
+    nextRound: 1,
+    bodyVersion: 'sha256:abc',
+  };
+}
+
+function rememberRunning(home, issue) {
+  const paths = hostPaths(home);
+  fs.mkdirSync(paths.roundsDir, { recursive: true });
+  const name = `${issue.replace(/[^\w.-]+/g, '__')}.json`;
+  fs.writeFileSync(path.join(paths.roundsDir, name), JSON.stringify({ issue, pid: process.pid, round: 1 }));
+}
+
+function tickPoll(home, entries, spawnRound) {
+  return runTick({
+    home,
+    env: { ...process.env },
+    run: async () => ({ code: 0, stdout: JSON.stringify(entries), stderr: '' }),
+    spawnRound,
+    runRound: async () => {
+      throw new Error('不该写轮次评论');
+    },
+    notify: async () => ({ ok: true, reason: 'not-configured' }),
+    now: () => Date.parse('2026-10-24T02:00:00.000Z'),
+  });
+}
+
+test('#224 SC4 同一子 issue 连续多拍不重开', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  enableGate(home);
+  const entry = childPollEntry(2);
+  const started = [];
+  const spawnRound = (issue) => {
+    started.push(issue);
+    rememberRunning(home, issue);
+    return process.pid;
+  };
+  for (let n = 0; n < 3; n += 1) {
+    const heartbeat = await tickPoll(home, [entry], spawnRound);
+    assert.equal(heartbeat.lastTick.ok, true);
+  }
+  assert.deepEqual(started, [entry.issue]);
+  assert.equal(readAlerts(hostPaths(home)).length, 0);
+});
+
+test('#224 SC9 34 个存量子 issue 每拍只开 1 个，N 拍正好开 N 个', async () => {
+  assert.equal(MAX_CHILD_CLAIMS_PER_TICK, 1);
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  enableGate(home);
+  const entries = Array.from({ length: 34 }, (_, index) => childPollEntry(index + 2));
+  const started = [];
+  const spawnRound = (issue) => {
+    started.push(issue);
+    rememberRunning(home, issue);
+    return process.pid;
+  };
+  const ticks = 3;
+  for (let n = 0; n < ticks; n += 1) {
+    const heartbeat = await tickPoll(home, entries, spawnRound);
+    assert.equal(heartbeat.lastTick.started.length, 1, `第 ${n + 1} 拍只能开 1 个`);
+    assert.equal(heartbeat.lastTick.started[0].issue, entries[n].issue);
+  }
+  assert.equal(started.length, ticks);
+  assert.equal(new Set(started).size, ticks);
+  assert.equal(readAlerts(hostPaths(home)).length, 0, '限速跳过的不写提醒');
+});
+
+test('#224 SC9 槽满时不认领、不写评论；下一拍槽空了再开', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  const paths = enableGate(home);
+  fs.mkdirSync(paths.slotsDir, { recursive: true });
+  for (const name of ['slot-0', 'slot-1']) {
+    fs.writeFileSync(path.join(paths.slotsDir, name), JSON.stringify({ pid: process.pid, startedAt: '2026-10-24T00:00:00.000Z' }));
+  }
+  const started = [];
+  const blocked = await tickPoll(home, [childPollEntry(2), childPollEntry(3)], (issue) => {
+    started.push(issue);
+    return process.pid;
+  });
+  assert.deepEqual(started, []);
+  assert.deepEqual(blocked.lastTick.started, []);
+  assert.equal(readAlerts(paths).length, 0);
+
+  for (const name of ['slot-0', 'slot-1']) fs.rmSync(path.join(paths.slotsDir, name), { force: true });
+  const retried = await tickPoll(home, [childPollEntry(2), childPollEntry(3)], (issue) => {
+    started.push(issue);
+    rememberRunning(home, issue);
+    return process.pid;
+  });
+  assert.deepEqual(started, [`${REPO}#2`]);
+  assert.deepEqual(retried.lastTick.started.map((entry) => entry.issue), [`${REPO}#2`]);
+});
+
+test('#224 SC9 内存门拦住时不写评论、不算一轮，下一拍再试', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  enableGate(home);
+  fs.mkdirSync(path.join(home, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'config', 'host.json'), JSON.stringify({ piCommand: ['pi'] }));
+  const meminfo = path.join(tmpDir(), 'meminfo');
+  fs.writeFileSync(meminfo, ['MemTotal: 16384 kB', 'MemAvailable: 1024 kB', ''].join('\n'));
+  const ghCalls = [];
+  const roundCalls = [];
+  const logs = [];
+  const code = await runHostRound({
+    home,
+    issue: `${REPO}#2`,
+    run: async (cmd, args) => {
+      ghCalls.push({ cmd, args });
+      return { code: 0, stdout: '', stderr: '' };
+    },
+    runRound: async (argv) => {
+      roundCalls.push(argv);
+      return { code: 0, stdout: '', stderr: '' };
+    },
+    meminfoPath: meminfo,
+    log: (message) => logs.push(message),
+    now: () => Date.parse('2026-10-24T02:00:00.000Z'),
+  });
+  assert.equal(code, 3);
+  assert.deepEqual(roundCalls, [], '内存门在认领之前，不写轮次评论');
+  assert.deepEqual(ghCalls, [], '内存门不发 gh，也没有 PR 写调用');
+  assert.match(logs.join('\n'), /mem-gate-defer/);
+  assert.equal(readAlerts(hostPaths(home)).length, 0, '被拦不另写提醒');
+
+  const started = [];
+  const heartbeat = await tickPoll(home, [childPollEntry(2), childPollEntry(3)], (issue) => {
+    started.push(issue);
+    return process.pid;
+  });
+  assert.deepEqual(started, [`${REPO}#2`]);
+  assert.equal(heartbeat.lastTick.started.length, 1);
 });

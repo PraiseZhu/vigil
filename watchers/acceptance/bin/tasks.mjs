@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // 盘点：一次 GraphQL 拉开放/关闭 issue，组成我建的任务树，并按名单分档。
-import { bodyVersion, parseRounds } from './rounds.mjs';
+import { parseMarker } from './collect.mjs';
+import { bodyVersion, latestRound, parseRounds } from './rounds.mjs';
+import { lastFinal } from './trigger.mjs';
 import { taskDispute } from '../host/adjudication-store.mjs';
 
 const ISSUE_FIELDS = `id
@@ -164,12 +166,78 @@ function isRoot(issue, ownerLogin) {
   return !sameLogin(loginOf(parent.author), ownerLogin);
 }
 
-function toTask(issue, profile) {
+/**
+ * 父作者是 owner 的子 issue：已关闭、至少一个关联 PR 已合并、正文不是修正标记时，
+ * 单独成 kind=child。父的最新轮次和最后结论从同一份清单里的父节点算，不再发请求。
+ * 其余子 issue 仍丢弃。父节点不在这份清单里时，父状态留空，不把「没看到」当成验收中或已覆盖。
+ */
+function toChildTask(issue, profile, ranked, repo, byKey) {
+  if (issue.state !== 'CLOSED') return null;
+  if (issue.closedAt && Date.parse(issue.closedAt) < Date.parse(profile.startAt)) return null;
+  const linkedPrs = (issue.closedByPullRequestsReferences?.nodes || []).map((pr) => ({
+    ref: issueRef(pr.repository?.nameWithOwner || repo, pr.number),
+    mergedAt: pr.mergedAt || null,
+    url: pr.url,
+  }));
+  if (!linkedPrs.some((pr) => pr.mergedAt)) return null;
+  if (parseMarker(issue.body) != null) return null;
+
+  const ownerChildren = (issue.subIssues?.nodes || []).filter((child) =>
+    sameLogin(loginOf(child.author), profile.ownerLogin),
+  );
+  const outOfScope = [
+    ...new Set(
+      ownerChildren
+        .map((child) => child.repository?.nameWithOwner || repo)
+        .filter((childRepo) => !repoTier(childRepo, profile)),
+    ),
+  ];
+  const ref = issueRef(repo, issue.number);
+  const rounds = parseRounds(issue.comments?.nodes || [], profile.ownerLogin);
+  const lead = leadHandoffOf(issue.comments?.nodes, profile.ownerLogin);
+  const parent = issue.parent || {};
+  const parentRepo = parent.repository?.nameWithOwner || repo;
+  const parentRef = parent.number ? issueRef(parentRepo, parent.number) : null;
+  const parentIssue = parentRef && byKey ? byKey.get(parentRef) : null;
+  const parentRounds = parentIssue ? parseRounds(parentIssue.comments?.nodes || [], profile.ownerLogin) : [];
+  const parentLatest = latestRound(parentRounds);
+  const parentFinal = lastFinal(parentRounds);
+  return {
+    ref,
+    repo,
+    number: issue.number,
+    kind: 'child',
+    tier: ranked.tier,
+    fork: ranked.fork,
+    state: 'closed',
+    closedAt: issue.closedAt || null,
+    url: issue.url,
+    nodeId: issue.id,
+    body: issue.body || '',
+    bodyVersion: bodyVersion(issue.body),
+    children: ownerChildren.map((child) => ({
+      ref: issueRef(child.repository?.nameWithOwner || repo, child.number),
+      state: child.state === 'CLOSED' ? 'closed' : 'open',
+      closedAt: child.closedAt || null,
+      url: child.url,
+    })),
+    linkedPrs,
+    rounds,
+    outOfScope,
+    leadHandoff: { registeredAt: lead.registeredAt, handoffAt: lead.handoff?.createdAt || null },
+    dispute: taskDispute({ comments: issue.comments?.nodes, rounds, profile, ref }),
+    parentRef,
+    parentLatestStatus: parentLatest?.status || null,
+    parentFinalFinishedAt: parentFinal?.finishedAt || null,
+  };
+}
+
+function toTask(issue, profile, byKey) {
   const repo = issue.repository?.nameWithOwner;
   const ranked = repoTier(repo, profile);
   if (!ranked) return null;
   if (!sameLogin(loginOf(issue.author), profile.ownerLogin)) return null;
-  if (!isRoot(issue, profile.ownerLogin)) return null;
+  if (!isRoot(issue, profile.ownerLogin)) return toChildTask(issue, profile, ranked, repo, byKey);
   if (issue.state === 'CLOSED' && issue.closedAt && Date.parse(issue.closedAt) < Date.parse(profile.startAt)) {
     return null;
   }
@@ -263,7 +331,7 @@ export async function collectTasks(github, profile) {
   }
   const tasks = [];
   for (const issue of seen.values()) {
-    const task = toTask(issue, profile);
+    const task = toTask(issue, profile, seen);
     if (task) tasks.push(task);
   }
   return tasks;

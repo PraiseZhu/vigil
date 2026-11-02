@@ -336,6 +336,38 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 - **总时长上限**：从认领算起超过 `maxRoundMinutes`（默认 120）→ 停 pi、`abort`（原因「超过总时长上限（N 分钟）」），
   提醒 `round-timeout`。pi 一直有输出也逃不过这一条。
 
+### 子 issue 事后验收
+
+总 issue 还有未关子 issue 时，总 issue 自己仍因 `children-open` 不开轮。已经关闭、并且至少一个关联 PR 已合并的子 issue，单独当成 `kind: 'child'` 验收，轮次评论写在子 issue 自己身上。父 issue 作者不是 owner 的，仍按根任务处理，不走这条。
+
+会开轮的子 issue 要同时满足：issue 作者是 owner、父作者也是 owner、状态已关闭、`closedByPullRequestsReferences` 里至少一个 `mergedAt` 有值、正文用 `parseMarker()` 解析不出验收机修正标记。修正子 issue 和普通子 issue 的标签、标题前缀一样，只认正文里的 `[验收机] 修正 · 总 <root> · 项 <item> SC<k> · 第 n 轮`。`startAt` 之前就关闭的，和根任务一样不收。
+
+`shouldTrigger()` 对 `kind: 'child'` 的 reason：
+
+| reason | 含义 |
+|---|---|
+| `child-merged` | 已关闭且 PR 已合并，自己还没有终局结论，开一轮 |
+| `child-open` | 子 issue 还没关（PR 合并了也不开） |
+| `correction-issue` | 正文是修正标记，不开；交给总 issue 在子 issue 都关了之后再验 |
+| `no-merged-pr` | 没有已合并的关联 PR（PR 关掉但没合并也算） |
+| `parent-in-progress` | 父 issue 最新一轮是「验收中」 |
+| `parent-covered` | 父 issue 最后一次终局结论的完成时间晚于子 issue 的 `closedAt`（完成时间是轮次评论里的「完成：」，和总 issue 判 `children-closed-after-verdict` 用的是同一个字段；相等不算晚于） |
+| `pr-merged-after-verdict` | 已有结论之后又有 PR 合并，只再开一轮 |
+| `up-to-date` | 已有结论，之后没有新合并、正文也没变 |
+| `body-changed` | 结论之后正文变了，沿用独立 issue 的判法 |
+
+父 issue 不在同一次盘点清单里时，父状态留空：不把「没看到父节点」当成正在验收或已经覆盖。结论之后的争议裁决、lead 交接等待，也沿用独立 issue 的判法。总 issue（`kind: 'parent'`）和独立 issue（`kind: 'standalone'`）的触发判定不变。
+
+限速：`host/tick.mjs` 每一拍最多新认领 1 个 `kind: 'child'`（`MAX_CHILD_CLAIMS_PER_TICK`）。仍然先过槽位，进了 `runHostRound()` 再过内存门。槽满或内存不够就这一拍不认领：不写轮次评论、不算一轮、不另写提醒，下一拍再试。不对还开着或未合并的 PR 做检查、评论或状态写入。
+
+只读盘点（不写 GitHub）：
+
+```sh
+node watchers/acceptance/bin/poll.mjs --json
+```
+
+输出里 `kind` 为 `child` 的条目数，就是这一拍会开轮的子 issue 数。
+
 ## 5. 提醒与通知的分工
 
 本 issue 的提醒只**发现**：调度循环停摆、轮次卡住或卡死、写闸拒绝、扫到密钥、沙箱起不来，
