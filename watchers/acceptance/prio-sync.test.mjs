@@ -9,6 +9,7 @@ import { isReadOnlyGraphql } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import {
   assertPrioFields,
+  BOARD_ITEMS_QUERY,
   classifyRepo,
   createPriorityGithub,
   createReadGithub,
@@ -16,6 +17,7 @@ import {
   loadPullRequests,
   main,
   parsePrioArgs,
+  PR_SEARCH_QUERY,
   priorityTokenPath,
   readPriorityWriterToken,
   readRepoClassTable,
@@ -2465,7 +2467,6 @@ test('#200 读客户端没有 write，mutation 文本在发请求前被拒绝', 
     'MUTATION { addProjectV2ItemById(input:{}) { clientMutationId } }',
     'subscription { x }',
     'Subscription { x }',
-    'query { viewer { mutation } }',
   ];
   for (const query of rejected) {
     await assert.rejects(() => reader.ownerGraphql(query, {}), /只做只读查询/);
@@ -2473,7 +2474,9 @@ test('#200 读客户端没有 write，mutation 文本在发请求前被拒绝', 
   assert.deepEqual(seen, []);
   await reader.ownerGraphql('# 只读\n  query { viewer { login } }', {});
   await reader.ownerGraphql('  { viewer { login } }', {});
-  assert.deepEqual(seen, ['run', 'run']);
+  // 字段名 mutation 不是顶层操作（#204），读通道放行。
+  await reader.ownerGraphql('query { viewer { mutation } }', {});
+  assert.deepEqual(seen, ['run', 'run', 'run']);
 });
 
 test('#200 SC7 读令牌缺失整拍退出；写令牌缺失只在 --write 报错；disabled 仍是已停用且 0 写入', async () => {
@@ -3363,4 +3366,51 @@ test('#209 SC8 白名单仍只有优先级和关联 PR，同步模块不引用�
   const sync = fs.readFileSync(fileURLToPath(new URL('./bin/prio-sync.mjs', import.meta.url)), 'utf8');
   assert.equal(sync.includes('write-gate.mjs'), false);
   assert.equal(sync.includes(REPO_A), false);
+});
+
+test('#204 读通道按 token 判定只读：绕过和其它边界不发请求，误拦与真实常量放行', async () => {
+  const { profile } = writeProfile(tmpDir(), { tokenContent: `${READ_TOKEN}\n` });
+  const seen = [];
+  const reader = createReadGithub({
+    profile: { ...profile, writeCommand: [process.execPath, '-e', 'process.exit(9)'] },
+    run: async () => {
+      seen.push('run');
+      return { code: 0, stdout: '{"data":{"ok":true}}', stderr: '' };
+    },
+    fetchImpl: async () => {
+      seen.push('fetch');
+      return { ok: true, status: 200, text: async () => '{"data":{}}' };
+    },
+  });
+  const rejected = [
+    'query { a(s:"#") } mutation { y }',
+    'query{x} # c\rmutation{y}',
+    'mutation{y}',
+    'subscription{y}',
+    'query{a} query{b}',
+    '{a} mutation{b}',
+    'query{a} #c\r\nmutation{b}',
+    'query { a(s:"unterminated) }',
+    'query { a { b }',
+    'query { f(s: """#""") { id } } mutation { y }',
+  ];
+  for (const query of rejected) {
+    await assert.rejects(() => reader.ownerGraphql(query, {}), /只做只读查询/);
+  }
+  assert.deepEqual(seen, [], '非只读在发请求前被拒绝');
+  const allowed = [
+    'query { search(query:"mutation label:bug") { issueCount } }',
+    'query { x { mutationCount } }',
+    'query($subscriptionId: ID!) { node(id:$subscriptionId) { id } }',
+    'fragment F on Issue { id } query { node(id:"1") { ...F } }',
+    'query { f(s: """\nmutation }\n""") { id } }',
+    'query { f(s: """#""") { id } }',
+    BOARD_ITEMS_QUERY,
+    PR_SEARCH_QUERY,
+  ];
+  for (const query of allowed) {
+    await reader.ownerGraphql(query, {});
+  }
+  assert.deepEqual(seen, allowed.map(() => 'run'));
+  assert.equal(seen.includes('fetch'), false);
 });

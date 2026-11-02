@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { createGithub, defaultRun, WRITE_TYPES, WriteBusyError, WriteRejectedError } from './bin/github.mjs';
+import { createGithub, defaultRun, isReadOnlyGraphql, WRITE_TYPES, WriteBusyError, WriteRejectedError } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { setAcceptanceFields } from './bin/board.mjs';
+import { BOARD_ITEMS_QUERY, PR_SEARCH_QUERY } from './bin/prio-sync.mjs';
 import { REPO, createFakeRun, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 
 function loadHome(extra = {}) {
@@ -793,4 +794,52 @@ test('默认执行器按 UTF-8 流式解码：大输出里跨块的多字节字�
   assert.equal(result.code, 0);
   assert.equal(result.stdout.includes('\uFFFD'), false);
   assert.equal(result.stdout, '。'.repeat(200000));
+});
+
+test('#204 SC1 两种绕过不是只读查询', () => {
+  const bypasses = [
+    'query { a(s:"#") } mutation { y }',
+    'query{x} # c\rmutation{y}',
+  ];
+  for (const query of bypasses) {
+    assert.equal(isReadOnlyGraphql(query), false, query);
+  }
+});
+
+test('#204 SC2 四种误拦写法是只读查询', () => {
+  const allowed = [
+    'query { search(query:"mutation label:bug") { issueCount } }',
+    'query { x { mutationCount } }',
+    'query($subscriptionId: ID!) { node(id:$subscriptionId) { id } }',
+    'fragment F on Issue { id } query { node(id:"1") { ...F } }',
+  ];
+  for (const query of allowed) {
+    assert.equal(isReadOnlyGraphql(query), true, query);
+  }
+});
+
+test('#204 SC3 其它非只读边界被拒', () => {
+  const rejected = [
+    'mutation{y}',
+    'subscription{y}',
+    'query{a} query{b}',
+    '{a} mutation{b}',
+    'query{a} #c\r\nmutation{b}',
+    'query { a(s:"unterminated) }',
+    'query { a { b }',
+  ];
+  for (const query of rejected) {
+    assert.equal(isReadOnlyGraphql(query), false, query);
+  }
+});
+
+test('#204 SC4 BOARD_ITEMS_QUERY 与 PR_SEARCH_QUERY 是只读查询', () => {
+  assert.equal(isReadOnlyGraphql(BOARD_ITEMS_QUERY), true);
+  assert.equal(isReadOnlyGraphql(PR_SEARCH_QUERY), true);
+});
+
+test('#204 块字符串里的 mutation、右花括号和井号不算关键字或注释', () => {
+  assert.equal(isReadOnlyGraphql('query { f(s: """\nmutation }\n""") { id } }'), true);
+  assert.equal(isReadOnlyGraphql('query { f(s: """#""") { id } }'), true);
+  assert.equal(isReadOnlyGraphql('query { f(s: """#""") { id } } mutation { y }'), false);
 });
