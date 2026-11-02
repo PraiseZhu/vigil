@@ -6,15 +6,15 @@
 
 派发消息（`round.mjs start` 的输出，最后一行 JSON）会给你：
 
-- `issue`：总 issue（独立任务就是它自己），形如 `owner/repo#号`。
-- `kind`：`parent`（有子 issue）或 `standalone`（独立 issue）。
+- `issue`：这一轮要验的 issue（parent 是总 issue，standalone 和 child 都是它自己），形如 `owner/repo#号`。
+- `kind`：`parent`（有子 issue）、`standalone`（独立 issue）或 `child`（已关闭且 PR 已合并的子 issue，单独补验；`--issue` 就是这个子 issue 本身，helper 的 collect / close / verdict / 看板与 standalone 相同，不勾父 issue 清单）。
 - `轮次：第 n 轮` 和 `轮次评论 id`：这一次认领的评论。
-- `正文版本`：派发时总 issue 正文的版本（sha256）。
+- `正文版本`：派发时这一轮 issue 正文的版本（sha256）。
 - `步骤文档`：就是本文件。
 
 所有命令都带上 `--issue <root> --round <n>`（`collect` 除外，它不需要轮次）。下面两种写法不要混：
 
-- `<root>`：**总 issue**，就是派发消息里的 `issue`（独立任务就是它自己）。`--issue` 永远写它。
+- `<root>`：**总 issue**，就是派发消息里的 `issue`（standalone 和 child 都是它自己；child 不改去验父 issue）。`--issue` 永远写它。
 - `<item>`：某条验收项的**出处 issue**（`collect` 里那条 SC 所在的 issue，可能是子 issue、跨仓子 issue，也可能就是总 issue），形如 `owner/repo#号`。逐条结论、`--item`、勾选清单里写的是它。
 
 ## 1. 先收集任务树

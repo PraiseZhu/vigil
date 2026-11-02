@@ -71,13 +71,13 @@ function issueStore(initial) {
   };
 }
 
-function makeRun(store, { inventory = () => [store.get()], onWriteCommand } = {}) {
+function makeRun(store, { inventory = () => [store.get()], closed = () => [], onWriteCommand } = {}) {
   let commentSeq = 7000;
   return createFakeRun({
     onGraphql: (payload) => {
       const query = String(payload.query || '');
       if (query.includes('user(login')) {
-        return inventoryData({ open: inventory() });
+        return inventoryData({ open: inventory(), closed: closed() });
       }
       if (query.includes('repository(owner')) {
         return { repository: { issue: store.get() } };
@@ -325,6 +325,54 @@ test('SC1 start 成功时先打印派发消息，最后一行是 JSON', async ()
   assert.equal(payload.bodyVersion, sha256Body(body));
   assert.equal(typeof payload.commentId, 'number');
   assert.equal(github._writes.filter((action) => action.type === 'comment.create').length, 1);
+  assert.match(store.get().comments.nodes[0].body.split('\n')[0], /第 1 轮：验收中/);
+});
+
+test('#228 SC2 kind=child 的 start 返回 0，最后一行 JSON 含 round 和 commentId', async () => {
+  const { profile } = loadHome();
+  const body = '- [ ] SC1 子项 验证：unit';
+  const child = issueNode({
+    repo: REPO,
+    number: 2,
+    title: 'child task',
+    body,
+    state: 'CLOSED',
+    closedAt: '2026-10-20T00:00:00.000Z',
+    author: OWNER,
+    parent: { number: 1, repository: { nameWithOwner: REPO }, author: { login: OWNER } },
+    prs: [
+      {
+        number: 9,
+        url: 'https://example.test/pull/9',
+        mergedAt: '2026-10-20T01:00:00.000Z',
+        repository: { nameWithOwner: REPO },
+      },
+    ],
+    subIssues: [],
+  });
+  const parent = issueNode({
+    repo: REPO,
+    number: 1,
+    body: '- [ ] SC1 父清单 验证：unit',
+    author: OWNER,
+    subIssues: [childNode({ number: 2, state: 'CLOSED', closedAt: '2026-10-20T00:00:00.000Z' })],
+  });
+  const store = issueStore(child);
+  const github = trackedGithub(store, profile, {
+    inventory: () => [parent],
+    closed: () => [store.get()],
+  });
+  const result = await capture(['start', '--issue', `${REPO}#2`], {
+    github,
+    profile,
+    now: () => Date.parse('2026-10-24T02:00:00.000Z'),
+  });
+  assert.equal(result.code, EXIT.OK, result.stderr);
+  assert.match(result.stdout, /kind：child/);
+  const payload = JSON.parse(result.stdout.trimEnd().split('\n').at(-1));
+  assert.equal(payload.issue, `${REPO}#2`);
+  assert.equal(payload.round, 1);
+  assert.equal(typeof payload.commentId, 'number');
   assert.match(store.get().comments.nodes[0].body.split('\n')[0], /第 1 轮：验收中/);
 });
 

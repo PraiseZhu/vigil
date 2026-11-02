@@ -39,6 +39,28 @@ test('SC2 parent 任务和字符串形式的 id 也能生成', () => {
   assert.match(message, /轮次评论 id：IC_kwDOExample/);
 });
 
+test('#228 SC1 kind=child 能生成派发消息', () => {
+  const message = buildDispatchMessage(valid({ kind: 'child' }));
+  assert.match(message, /kind：child/);
+  assert.match(message, new RegExp(`issue：${REPO}#1`));
+  assert.match(message, /轮次：第 3 轮/);
+});
+
+test('#228 SC1 非法 kind 仍报错，并列 parent / standalone / child', () => {
+  assert.throws(
+    () => buildDispatchMessage(valid({ kind: 'foo' })),
+    /派发消息字段无效：kind 只能是 parent \/ standalone \/ child/,
+  );
+});
+
+test('#228 SC6 SESSION.md 第 10 行写明 child 是已关闭且 PR 已合并的子 issue', () => {
+  const line = fs.readFileSync(new URL('./SESSION.md', import.meta.url), 'utf8').split('\n')[9];
+  assert.match(line, /`child`/);
+  assert.match(line, /已关闭且 PR 已合并的子 issue/);
+  assert.match(line, /单独补验/);
+  assert.match(line, /standalone/);
+});
+
 test('SC2 派发消息不含令牌、profile 路径或绝对路径', () => {
   const home = tmpDir();
   const { stateDir, worktreeDir, tokenFile } = writeProfile(home);

@@ -6,10 +6,22 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { after } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createGithub } from './bin/github.mjs';
+import { loadAcceptanceProfile } from './bin/profile.mjs';
+import { runRound } from './bin/round.mjs';
 import { hostPaths, isAlive, readAlerts } from './host/paths.mjs';
-import { runHostRound } from './host/round.mjs';
+import { roundDirFor, runHostRound } from './host/round.mjs';
 import { MAX_CHILD_CLAIMS_PER_TICK, runTick } from './host/tick.mjs';
-import { REPO, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
+import {
+  OWNER,
+  REPO,
+  childNode,
+  createFakeRun,
+  inventoryData,
+  issueNode,
+  tmpDir,
+  writeProfile,
+} from './fake-gh.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOST_DIR = path.join(HERE, 'host');
@@ -1030,4 +1042,105 @@ test('#224 SC9 内存门拦住时不写评论、不算一轮，下一拍再试',
   });
   assert.deepEqual(started, [`${REPO}#2`]);
   assert.equal(heartbeat.lastTick.started.length, 1);
+});
+
+test('#228 SC5 kind=child 夹具认领成功后创建 roundDir', async () => {
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  enableGate(home);
+  fs.writeFileSync(path.join(home, 'config', 'host.json'), JSON.stringify({ piCommand: ['pi'] }));
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const body = '- [ ] SC1 子项 验证：unit';
+  const childRef = `${REPO}#2`;
+  let child = issueNode({
+    repo: REPO,
+    number: 2,
+    title: 'child task',
+    body,
+    state: 'CLOSED',
+    closedAt: '2026-10-20T00:00:00.000Z',
+    author: OWNER,
+    parent: { number: 1, repository: { nameWithOwner: REPO }, author: { login: OWNER } },
+    prs: [
+      {
+        number: 9,
+        url: 'https://example.test/pull/9',
+        mergedAt: '2026-10-20T01:00:00.000Z',
+        repository: { nameWithOwner: REPO },
+      },
+    ],
+    subIssues: [],
+  });
+  const parent = issueNode({
+    repo: REPO,
+    number: 1,
+    body: '- [ ] SC1 父清单 验证：unit',
+    author: OWNER,
+    subIssues: [childNode({ number: 2, state: 'CLOSED', closedAt: '2026-10-20T00:00:00.000Z' })],
+  });
+  let commentSeq = 7000;
+  const run = createFakeRun({
+    onGraphql: (payload) => {
+      const query = String(payload.query || '');
+      if (query.includes('user(login')) return inventoryData({ open: [parent], closed: [child] });
+      if (query.includes('repository(owner')) return { repository: { issue: child } };
+      return {};
+    },
+    onApi: (args, { input }) => {
+      const request = input ? JSON.parse(input) : {};
+      const apiPath = args.find((item) => String(item).startsWith('repos/')) || '';
+      if (args.includes('POST') && /issues\/\d+\/comments$/.test(apiPath)) {
+        const id = ++commentSeq;
+        const stamp = '2026-10-24T02:00:00.000Z';
+        child.comments.nodes.push({
+          id: `IC_${id}`,
+          databaseId: id,
+          body: request.body,
+          createdAt: stamp,
+          updatedAt: stamp,
+          url: `https://example.test/issues/2#issuecomment-${id}`,
+          author: { login: OWNER },
+        });
+        return { id, html_url: `https://example.test/issues/2#issuecomment-${id}` };
+      }
+      if (args.includes('PATCH') && /issues\/comments\/\d+$/.test(apiPath)) {
+        const id = Number(apiPath.split('/').pop());
+        const found = child.comments.nodes.find((comment) => comment.databaseId === id);
+        if (found) found.body = request.body;
+        return { id, html_url: `https://example.test/issues/2#issuecomment-${id}` };
+      }
+      return { id: 1 };
+    },
+  });
+  const github = createGithub({ profile, run });
+  const meminfo = path.join(tmpDir(), 'meminfo');
+  fs.writeFileSync(meminfo, 'MemTotal: 16777216 kB\nMemAvailable: 8388608 kB\n');
+  const code = await runHostRound({
+    home,
+    issue: childRef,
+    run: async (cmd) => (cmd === 'bwrap' ? { code: 0, stdout: '', stderr: '' } : { code: 1, stdout: '', stderr: 'no' }),
+    runRound: async (argv) => {
+      let stdout = '';
+      let stderr = '';
+      const exit = await runRound(argv, {
+        github,
+        profile,
+        now: () => Date.parse('2026-10-24T02:00:00.000Z'),
+        stdout: { write(chunk) { stdout += chunk; return true; } },
+        stderr: { write(chunk) { stderr += chunk; return true; } },
+      });
+      return { code: exit, stdout, stderr };
+    },
+    prefetch: async () => {
+      throw new Error('stop-after-round-dir');
+    },
+    meminfoPath: meminfo,
+    log: () => {},
+    now: () => Date.parse('2026-10-24T02:00:00.000Z'),
+  });
+  const dir = roundDirFor(hostPaths(home), childRef, 1);
+  assert.equal(fs.existsSync(dir), true, `roundDir 没创建，start 输出：${code}`);
+  assert.equal(code, 1, '预取被夹具打断，目录已经建好');
+  const alerts = readAlerts(hostPaths(home));
+  assert.equal(alerts.some((entry) => entry.kind === 'claim-failed'), false, JSON.stringify(alerts));
+  assert.ok(alerts.some((entry) => entry.kind === 'prefetch-failed'), JSON.stringify(alerts));
 });

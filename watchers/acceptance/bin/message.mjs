@@ -4,7 +4,7 @@
 const ISSUE_PATTERN = /^[^/\s]+\/[^#\s]+#\d+$/;
 const BODY_VERSION_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const COMMENT_ID_PATTERN = /^[0-9A-Za-z_-]+$/;
-const KINDS = new Set(['parent', 'standalone']);
+const KINDS = new Set(['parent', 'standalone', 'child']);
 
 export const SESSION_DOC = 'watchers/acceptance/SESSION.md';
 
@@ -57,7 +57,7 @@ export function buildDispatchMessage({ issue, kind, round, commentId, bodyVersio
   if (typeof issue !== 'string' || !ISSUE_PATTERN.test(issue)) {
     fail('issue 应为 owner/repo#编号');
   }
-  if (!KINDS.has(kind)) fail('kind 只能是 parent 或 standalone');
+  if (!KINDS.has(kind)) fail('kind 只能是 parent / standalone / child');
   if (!Number.isInteger(round) || round <= 0) fail('轮次应为正整数');
   const comment = checkCommentId(commentId);
   if (typeof bodyVersion !== 'string' || !BODY_VERSION_PATTERN.test(bodyVersion)) {
