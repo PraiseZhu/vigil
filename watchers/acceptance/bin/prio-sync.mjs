@@ -7,6 +7,10 @@
 // 检查还在跑（PENDING）时，关联 PR 文本沿用 debounce.json 的 prCi 里该 PR 上一拍的 ✓/✗，最多 CI_CARRY_TICKS 拍。
 // 这份标注只在 --write 且内容真变化时改；干跑整段原样保留，所以干跑日志里文本仍会在没有存档时跳。
 // 依据只写进 changes.jsonl，不新增看板字段。60 天没动静只提醒「还要不要」，不关 issue。
+// --only-repo owner/repo 只处理这一个仓（大小写不敏感）。其它仓不打分、不写、不提醒，防抖原样保留。
+// --limit N 按仓名（小写）、issue 号、字段名只写前 N 条真会落闸的变更，N 最大 PRIO_LIMIT_MAX。
+// 超上限的行仍打印，末尾加「（本拍上限截掉）」，不写闸、不进 changes.jsonl，防抖按未写入退回。
+// 两个参数都不给时输出与以前一致。它们不能和 --restore 同用；参数不合法就在读令牌和写文件之前退出。
 // repo-class.json 的 exclude 数组命中的仓：不打分、不写优先级和关联 PR、不提醒、不搜 PR、不还原。
 // 汇总只在有排除时追加「，排除 N 条」，N 是条数，不写仓名。stderr 不记跳过，只在 exclude 不是数组时警告一次。
 // 读看板条目和 PR 走 profile 的 githubTokenFile（验收机读取通道），不用 project 写令牌。
@@ -37,6 +41,10 @@ export const STALE_REMIND_MS = 60 * 24 * 60 * 60 * 1000;
 const LINK_BASIS = 'link 关联 PR 文本与看板不一致';
 /** 检查连续 PENDING 时，关联 PR 文本最多沿用上一拍 ✓/✗ 的拍数。调用 runPrioSync 可改。 */
 export const CI_CARRY_TICKS = 6;
+/** `--limit` 的上限。看板大约百条，1000 留足余量，又挡住一次写太多。 */
+export const PRIO_LIMIT_MAX = 1000;
+const ONLY_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const LIMIT_RE = /^[1-9][0-9]*$/;
 const RESTORE_BASIS = 'restore 按变更日志改回';
 const LINK_HOLD = '不写关联 PR：没有 .prio/mac-mini-stopped，要等确认 Mac mini 已停写\n';
 const RESTORE_SKIP = '跳过：当前值不是上次写入的值';
@@ -179,8 +187,12 @@ export function createReadGithub({ profile, run, fetchImpl } = {}) {
   };
 }
 
+function showActual(value) {
+  return value === '' ? '（空）' : String(value);
+}
+
 export function parsePrioArgs(argv) {
-  const out = { write: false, restore: null, stateDir: null };
+  const out = { write: false, restore: null, stateDir: null, onlyRepo: null, limit: null };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--write') {
@@ -202,7 +214,33 @@ export function parsePrioArgs(argv) {
       i += 1;
       continue;
     }
+    if (arg === '--only-repo') {
+      if (out.onlyRepo != null) throw new Error('重复的参数：--only-repo');
+      const value = argv[i + 1];
+      if (typeof value !== 'string' || value.startsWith('--')) throw new Error('缺少 --only-repo 的取值');
+      if (!ONLY_REPO_RE.test(value)) {
+        throw new Error(`--only-repo 期望 owner/repo，实际：${showActual(value)}`);
+      }
+      out.onlyRepo = value;
+      i += 1;
+      continue;
+    }
+    if (arg === '--limit') {
+      if (out.limit != null) throw new Error('重复的参数：--limit');
+      const value = argv[i + 1];
+      if (typeof value !== 'string' || value.startsWith('--')) throw new Error('缺少 --limit 的取值');
+      const parsed = LIMIT_RE.test(value) ? Number(value) : Number.NaN;
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > PRIO_LIMIT_MAX) {
+        throw new Error(`--limit 期望 1 到 ${PRIO_LIMIT_MAX} 的整数，实际：${showActual(value)}`);
+      }
+      out.limit = parsed;
+      i += 1;
+      continue;
+    }
     throw new Error(`无法识别的参数：${arg}`);
+  }
+  if (out.restore && (out.onlyRepo != null || out.limit != null)) {
+    throw new Error('--only-repo / --limit 不能和 --restore 同用');
   }
   return out;
 }
@@ -842,6 +880,8 @@ export async function runPrioSync({
   excludedCount: presetExcluded = 0,
   nullContent = 0,
   carryTicks = CI_CARRY_TICKS,
+  onlyRepo = null,
+  limit = null,
 } = {}) {
   if (!dir) throw new Error('缺少状态目录');
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
@@ -855,6 +895,8 @@ export async function runPrioSync({
   const changes = [];
   let pinned = 0;
   let skippedHere = 0;
+  let filteredByRepo = 0;
+  let truncatedByLimit = 0;
   const knownPrs = Array.isArray(prs) ? prs.filter((pr) => !isExcludedRepo(pr?.repo, table)) : null;
   const carried = knownPrs ? carryLinkedPrCi(knownPrs, loaded.prCi, carryLimit) : null;
   const linkPrs = carried ? carried.prs : null;
@@ -862,6 +904,12 @@ export async function runPrioSync({
 
   for (const item of items) {
     if (!item?.repo || !Number.isInteger(item.number) || item.number <= 0) continue;
+    if (onlyRepo && item.repo.toLowerCase() !== onlyRepo.toLowerCase()) {
+      filteredByRepo += 1;
+      const kept = refOf(item);
+      if (Object.prototype.hasOwnProperty.call(saved, kept)) nextItems[kept] = saved[kept];
+      continue;
+    }
     if (itemIsExcluded(item, table)) {
       skippedHere += 1;
       const kept = refOf(item);
@@ -952,16 +1000,48 @@ export async function runPrioSync({
 
   for (const [ref, state] of Object.entries(saved)) {
     if (Object.prototype.hasOwnProperty.call(nextItems, ref)) continue;
-    if (isExcludedRepo(repoOfRef(ref), table)) nextItems[ref] = state;
+    const repo = repoOfRef(ref);
+    if (isExcludedRepo(repo, table) || (onlyRepo && repo.toLowerCase() !== onlyRepo.toLowerCase())) {
+      nextItems[ref] = state;
+    }
+  }
+
+  if (limit != null) {
+    changes.sort((left, right) => {
+      const repoA = String(left.repo || '').toLowerCase();
+      const repoB = String(right.repo || '').toLowerCase();
+      if (repoA < repoB) return -1;
+      if (repoA > repoB) return 1;
+      const issueOrder = Number(left.issue) - Number(right.issue);
+      if (issueOrder !== 0) return issueOrder;
+      const fieldA = String(left.field || '');
+      const fieldB = String(right.field || '');
+      if (fieldA < fieldB) return -1;
+      if (fieldA > fieldB) return 1;
+      return 0;
+    });
   }
 
   let written = 0;
+  let acceptedWrites = 0;
   const skippedRepos = new Map();
   for (const change of changes) {
     const basis = change.basis ? ` 依据：${change.basis}` : '';
-    outWrite(stdout, `${change.item} ${change.field} ${show(change.old)} → ${show(change.new)}${basis}\n`);
+    const line = `${change.item} ${change.field} ${show(change.old)} → ${show(change.new)}${basis}`;
+    const held = change.field === '关联 PR' && !linkAllowed;
+    const repoSkipped = skippedRepos.has(change.repo);
+    // 名额只数真会调用写闸的变更。dry-run 按「将会写」计数；已停用不会写，不占名额。
+    const countsTowardLimit = mode !== 'disabled' && !held && !repoSkipped;
+    if (limit != null && countsTowardLimit && acceptedWrites >= limit) {
+      truncatedByLimit += 1;
+      outWrite(stdout, `${line}（本拍上限截掉）\n`);
+      if (mode === 'write') restoreUnwrittenDebounce(nextItems, saved, change.item);
+      continue;
+    }
+    outWrite(stdout, `${line}\n`);
+    if (limit != null && countsTowardLimit) acceptedWrites += 1;
     if (mode !== 'write') continue;
-    if (change.field === '关联 PR' && !linkAllowed) {
+    if (held) {
       outWrite(stdout, LINK_HOLD);
       continue;
     }
@@ -1015,8 +1095,9 @@ export async function runPrioSync({
   const report = skipReport(skippedRepos);
   for (const line of report.lines) outWrite(stdout, line);
   const excludedTotal = (Number.isInteger(presetExcluded) && presetExcluded > 0 ? presetExcluded : 0) + skippedHere;
-  outWrite(stdout, `${headOf(mode)}${items.length - skippedHere} 条，变更 ${changes.length}，写入 ${written}，钉住 ${pinned}${report.suffix}${excludedSuffix(excludedTotal)}${nullContentSuffix(nullContent)}\n`);
-  return { written, planned: changes.length, pinned, mode, excluded: excludedTotal };
+  const batch = `${onlyRepo ? `，按仓过滤掉 ${filteredByRepo} 条` : ''}${limit != null ? `，按上限截掉 ${truncatedByLimit} 条` : ''}`;
+  outWrite(stdout, `${headOf(mode)}${items.length - skippedHere} 条，变更 ${changes.length}，写入 ${written}，钉住 ${pinned}${report.suffix}${excludedSuffix(excludedTotal)}${nullContentSuffix(nullContent)}${batch}\n`);
+  return { written, planned: changes.length, pinned, mode, excluded: excludedTotal, filteredByRepo, truncatedByLimit };
 }
 
 /** 把 since 这个时间点之后的变更改回当时的旧值。默认仍是 dry-run。 */
@@ -1232,6 +1313,8 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     table,
     excludedCount: excluded,
     nullContent,
+    onlyRepo: args.onlyRepo,
+    limit: args.limit,
   });
 }
 
