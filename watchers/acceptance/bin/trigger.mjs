@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // 触发与退避：纯函数，now 由调用方注入。
+import { parseMarker } from './collect.mjs';
 import { isVerdictOnly } from './profile.mjs';
 import { latestRound } from './rounds.mjs';
 
@@ -113,6 +114,40 @@ function prMergedVersusVerdict(merged, createdAt) {
   return unknown ? 'unknown' : 'not-after';
 }
 
+function issueClosed(state) {
+  return state === 'closed' || state === 'CLOSED';
+}
+
+/**
+ * 已关闭且 PR 已合并的子 issue（kind=child）。
+ * 未关闭、修正标记、没有已合并 PR、父轮次进行中、父结论晚于子 issue 关闭，都不开轮。
+ * 其余和独立 issue 同一套：没结论开一轮（reason 用 child-merged），结论后又合并了 PR 再开一轮。
+ */
+function childDecision(task, { now, profile, f, dispute }) {
+  if (!issueClosed(task.state)) return { trigger: false, reason: 'child-open' };
+  if (parseMarker(task.body) != null) return { trigger: false, reason: 'correction-issue' };
+  const merged = (task.linkedPrs || []).filter((pr) => pr.mergedAt);
+  if (!merged.length) return { trigger: false, reason: 'no-merged-pr' };
+  if (task.parentLatestStatus === '验收中') return { trigger: false, reason: 'parent-in-progress' };
+  const coveredAt = Date.parse(task.parentFinalFinishedAt || '');
+  const closedAt = Date.parse(task.closedAt || '');
+  if (Number.isFinite(coveredAt) && Number.isFinite(closedAt) && coveredAt > closedAt) {
+    return { trigger: false, reason: 'parent-covered' };
+  }
+  if (awaitingLeadHandoff(task, f, now(), latestMs(merged.map((pr) => pr.mergedAt)))) {
+    return { trigger: false, reason: 'awaiting-lead-handoff' };
+  }
+  if (!f) return { trigger: true, reason: 'child-merged' };
+  if (dispute) return { trigger: true, reason: 'adjudicated' };
+  const mergedVersusVerdict = prMergedVersusVerdict(merged, f.createdAt);
+  if (mergedVersusVerdict === 'after') return { trigger: true, reason: 'pr-merged-after-verdict' };
+  if (f.bodyVersion !== task.bodyVersion) return { trigger: true, reason: 'body-changed' };
+  const openRetry = passedButOpenRetry(task, f, profile);
+  if (openRetry) return openRetry;
+  if (mergedVersusVerdict === 'unknown') return { trigger: false, reason: 'merged-after-verdict-unknown' };
+  return { trigger: false, reason: 'up-to-date' };
+}
+
 export function shouldTrigger(task, { now, profile }) {
   if (!task?.tier) return { trigger: false, reason: 'no-tier' };
   if (task.closedAt && Date.parse(task.closedAt) < Date.parse(profile.startAt)) {
@@ -127,6 +162,8 @@ export function shouldTrigger(task, { now, profile }) {
   const f = lastFinal(task.rounds);
   const dispute = disputeOf(task, f);
   if (dispute && !dispute.adjudication) return { trigger: false, reason: 'awaiting-adjudication', dispute };
+
+  if (task.kind === 'child') return childDecision(task, { now, profile, f, dispute });
 
   if (isParent) {
     if ((task.children || []).some(childOpen)) return { trigger: false, reason: 'children-open' };

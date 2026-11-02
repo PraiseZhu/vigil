@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { collectTasks, repoTier, bodyVersion, INVENTORY_QUERY, LEAD_HANDOFF_COMMENT_WINDOW } from './bin/tasks.mjs';
 import { createGithub } from './bin/github.mjs';
+import { shouldTrigger } from './bin/trigger.mjs';
 import {
   OWNER,
   REPO,
@@ -12,6 +13,7 @@ import {
   createFakeRun,
   inventoryData,
   issueNode,
+  roundComment,
   sha256Body,
   tmpDir,
   writeProfile,
@@ -183,4 +185,254 @@ test('#140 反例（review-pr141）：交接早于最后一条登记（之后又
   const run = createFakeRun({ onGraphql: () => inventoryData({ open: [parent] }) });
   const tasks = await collectTasks(createGithub({ profile, run }), profile);
   assert.deepEqual(tasks[0].leadHandoff, { registeredAt: '2026-10-24T00:00:00.000Z', handoffAt: null });
+});
+
+const ROOT_TASK_KEYS = [
+  'ref', 'repo', 'number', 'kind', 'tier', 'fork', 'state', 'closedAt', 'url', 'nodeId',
+  'body', 'bodyVersion', 'children', 'linkedPrs', 'rounds', 'outOfScope', 'leadHandoff', 'dispute',
+];
+
+function prNode(number, mergedAt) {
+  return {
+    number,
+    url: `https://example.test/pull/${number}`,
+    mergedAt,
+    repository: { nameWithOwner: REPO },
+  };
+}
+
+function ownerParent(number, repo = REPO) {
+  return { number, repository: { nameWithOwner: repo }, author: { login: OWNER } };
+}
+
+const CHILD_CLOSED = '2026-10-20T00:00:00.000Z';
+const NOW = () => Date.parse('2026-10-24T00:00:00.000Z');
+
+function correctionBody(root = `${REPO}#1`, item = `${REPO}#2`) {
+  return `修正说明\n[验收机] 修正 · 总 ${root} · 项 ${item} SC3 · 第 1 轮\n`;
+}
+
+async function tasksFrom(open, closed = []) {
+  const profile = profileWith();
+  const run = createFakeRun({ onGraphql: () => inventoryData({ open, closed }) });
+  const github = createGithub({ profile, run });
+  const tasks = await collectTasks(github, profile);
+  return { profile, run, tasks };
+}
+
+test('#224 SC1 已关闭且 PR 已合并、没有结论的子 issue 产出 kind child，父状态来自同一份清单', async () => {
+  const parent = issueNode({
+    number: 1,
+    body: 'parent',
+    subIssues: [childNode({ number: 2, state: 'CLOSED', closedAt: CHILD_CLOSED })],
+  });
+  const child = issueNode({
+    number: 2,
+    state: 'CLOSED',
+    closedAt: CHILD_CLOSED,
+    body: 'child body',
+    parent: ownerParent(1),
+    prs: [prNode(20, '2026-10-20T01:00:00.000Z')],
+  });
+  const { run, tasks, profile } = await tasksFrom([parent], [child]);
+  assert.equal(run.calls.length, 1, '父轮次从同一份清单算，不额外发请求');
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found);
+  assert.equal(found.kind, 'child');
+  assert.equal(found.parentRef, `${REPO}#1`);
+  assert.equal(found.parentLatestStatus, null);
+  assert.equal(found.parentFinalFinishedAt, null);
+  assert.equal(found.linkedPrs[0].mergedAt, '2026-10-20T01:00:00.000Z');
+  assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), { trigger: true, reason: 'child-merged' });
+});
+
+test('#224 SC2 子 issue 未关闭时不产出任务，即使 PR 已合并', async () => {
+  const parent = issueNode({
+    number: 1,
+    subIssues: [childNode({ number: 2, state: 'OPEN', closedAt: null })],
+  });
+  const child = issueNode({
+    number: 2,
+    state: 'OPEN',
+    parent: ownerParent(1),
+    prs: [prNode(20, '2026-10-20T01:00:00.000Z')],
+  });
+  const { tasks } = await tasksFrom([parent, child]);
+  assert.deepEqual(tasks.map((task) => task.ref), [`${REPO}#1`]);
+  assert.equal(tasks.some((task) => task.kind === 'child'), false);
+});
+
+test('#224 SC3 已关闭但没有已合并 PR 的子 issue 不产出任务', async () => {
+  const parent = issueNode({
+    number: 1,
+    subIssues: [
+      childNode({ number: 2, state: 'CLOSED', closedAt: CHILD_CLOSED }),
+      childNode({ number: 3, state: 'CLOSED', closedAt: CHILD_CLOSED }),
+    ],
+  });
+  const unmerged = issueNode({
+    number: 2,
+    state: 'CLOSED',
+    closedAt: CHILD_CLOSED,
+    parent: ownerParent(1),
+    prs: [prNode(20, null)],
+  });
+  const noPr = issueNode({
+    number: 3,
+    state: 'CLOSED',
+    closedAt: CHILD_CLOSED,
+    parent: ownerParent(1),
+    prs: [],
+  });
+  const { tasks } = await tasksFrom([parent], [unmerged, noPr]);
+  assert.deepEqual(tasks.map((task) => task.ref), [`${REPO}#1`]);
+});
+
+test('#224 SC6 父最新轮次验收中时，子任务带上这个状态', async () => {
+  const parent = issueNode({
+    number: 1,
+    body: 'parent',
+    comments: [roundComment({ round: 2, status: '验收中', createdAt: '2026-10-23T00:00:00.000Z' })],
+    subIssues: [childNode({ number: 2, state: 'CLOSED', closedAt: CHILD_CLOSED })],
+  });
+  const child = issueNode({
+    number: 2,
+    state: 'CLOSED',
+    closedAt: CHILD_CLOSED,
+    body: 'child body',
+    parent: ownerParent(1),
+    prs: [prNode(20, '2026-10-20T01:00:00.000Z')],
+  });
+  const { tasks, profile } = await tasksFrom([parent], [child]);
+  const found = tasks.find((task) => task.kind === 'child');
+  assert.equal(found.parentLatestStatus, '验收中');
+  assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), { trigger: false, reason: 'parent-in-progress' });
+});
+
+test('#224 SC7 父结论完成时间晚于子 issue 关闭则记在任务上；早于则照常可触发', async () => {
+  const lateParent = issueNode({
+    number: 1,
+    body: 'parent',
+    comments: [roundComment({
+      round: 1,
+      status: '通过',
+      bodyVersion: bodyVersion('parent'),
+      finishedAt: '2026-10-21T00:00:00.000Z',
+      createdAt: '2026-10-21T00:00:00.000Z',
+    })],
+    subIssues: [childNode({ number: 2, state: 'CLOSED', closedAt: CHILD_CLOSED })],
+  });
+  const lateChild = issueNode({
+    number: 2,
+    state: 'CLOSED',
+    closedAt: CHILD_CLOSED,
+    body: 'child body',
+    parent: ownerParent(1),
+    prs: [prNode(20, '2026-10-20T01:00:00.000Z')],
+  });
+  const late = await tasksFrom([lateParent], [lateChild]);
+  const covered = late.tasks.find((task) => task.kind === 'child');
+  assert.equal(covered.parentFinalFinishedAt, '2026-10-21T00:00:00.000Z');
+  assert.deepEqual(shouldTrigger(covered, { now: NOW, profile: late.profile }), { trigger: false, reason: 'parent-covered' });
+
+  const earlyParent = issueNode({
+    number: 1,
+    body: 'parent',
+    comments: [roundComment({
+      round: 1,
+      status: '要修',
+      bodyVersion: bodyVersion('parent'),
+      finishedAt: '2026-10-19T00:00:00.000Z',
+      createdAt: '2026-10-19T00:00:00.000Z',
+    })],
+    subIssues: [childNode({ number: 2, state: 'CLOSED', closedAt: CHILD_CLOSED })],
+  });
+  const earlyChild = issueNode({
+    number: 2,
+    state: 'CLOSED',
+    closedAt: CHILD_CLOSED,
+    body: 'child body',
+    parent: ownerParent(1),
+    prs: [prNode(20, '2026-10-20T01:00:00.000Z')],
+  });
+  const early = await tasksFrom([earlyParent], [earlyChild]);
+  const openRound = early.tasks.find((task) => task.kind === 'child');
+  assert.equal(openRound.parentFinalFinishedAt, '2026-10-19T00:00:00.000Z');
+  assert.deepEqual(shouldTrigger(openRound, { now: NOW, profile: early.profile }), { trigger: true, reason: 'child-merged' });
+});
+
+test('#224 SC8 回归：parent 和 standalone 的字段与触发不变，startAt 之前的子 issue 仍不收', async () => {
+  const parent = issueNode({
+    number: 1,
+    subIssues: [
+      childNode({ number: 2, state: 'OPEN' }),
+      childNode({ number: 3, state: 'CLOSED', closedAt: CHILD_CLOSED }),
+    ],
+  });
+  const openChild = issueNode({
+    number: 2,
+    state: 'OPEN',
+    parent: ownerParent(1),
+  });
+  const mergedChild = issueNode({
+    number: 3,
+    state: 'CLOSED',
+    closedAt: CHILD_CLOSED,
+    body: 'merged child',
+    parent: ownerParent(1),
+    prs: [prNode(30, '2026-10-20T02:00:00.000Z')],
+  });
+  const standalone = issueNode({ number: 8, body: 'alone' });
+  const adopted = issueNode({
+    number: 9,
+    parent: { number: 100, repository: { nameWithOwner: REPO }, author: { login: 'SomeoneElse' } },
+  });
+  const tooOld = issueNode({
+    number: 4,
+    state: 'CLOSED',
+    closedAt: '2019-01-01T00:00:00.000Z',
+    parent: ownerParent(1),
+    prs: [prNode(40, '2019-01-02T00:00:00.000Z')],
+  });
+  const { tasks, profile } = await tasksFrom([parent, openChild, standalone, adopted], [mergedChild, tooOld]);
+  const byRef = Object.fromEntries(tasks.map((task) => [task.ref, task]));
+  assert.equal(byRef[`${REPO}#1`].kind, 'parent');
+  assert.deepEqual(Object.keys(byRef[`${REPO}#1`]).sort(), [...ROOT_TASK_KEYS].sort());
+  assert.deepEqual(byRef[`${REPO}#1`].children.map((child) => child.ref), [`${REPO}#2`, `${REPO}#3`]);
+  assert.deepEqual(shouldTrigger(byRef[`${REPO}#1`], { now: NOW, profile }), { trigger: false, reason: 'children-open' });
+  assert.equal(byRef[`${REPO}#8`].kind, 'standalone');
+  assert.deepEqual(Object.keys(byRef[`${REPO}#8`]).sort(), [...ROOT_TASK_KEYS].sort());
+  assert.equal(byRef[`${REPO}#9`].kind, 'standalone');
+  assert.equal(byRef[`${REPO}#4`], undefined);
+  assert.equal(byRef[`${REPO}#3`].kind, 'child');
+});
+
+test('#224 SC15 带修正标记的已关闭且 PR 已合并子 issue 不产出；不带标记的照常产出', async () => {
+  const parent = issueNode({
+    number: 1,
+    subIssues: [
+      childNode({ number: 2, state: 'CLOSED', closedAt: CHILD_CLOSED }),
+      childNode({ number: 3, state: 'CLOSED', closedAt: CHILD_CLOSED }),
+    ],
+  });
+  const marked = issueNode({
+    number: 2,
+    state: 'CLOSED',
+    closedAt: CHILD_CLOSED,
+    body: correctionBody(),
+    parent: ownerParent(1),
+    prs: [prNode(20, '2026-10-20T01:00:00.000Z')],
+  });
+  const plain = issueNode({
+    number: 3,
+    state: 'CLOSED',
+    closedAt: CHILD_CLOSED,
+    body: '普通子 issue',
+    parent: ownerParent(1),
+    prs: [prNode(21, '2026-10-20T01:00:00.000Z')],
+  });
+  const { tasks } = await tasksFrom([parent], [marked, plain]);
+  assert.equal(tasks.some((task) => task.ref === `${REPO}#2`), false);
+  const found = tasks.find((task) => task.ref === `${REPO}#3`);
+  assert.equal(found.kind, 'child');
 });

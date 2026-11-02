@@ -368,3 +368,148 @@ test('安全 别人伪造的「中断」不触发退避', async () => {
   assert.ok(entry, '伪造的中断不应让任务进退避');
   assert.equal(entry.nextRound, 2);
 });
+
+function mergedPr(number, mergedAt) {
+  return {
+    number,
+    url: `https://example.test/pull/${number}`,
+    mergedAt,
+    repository: { nameWithOwner: REPO },
+  };
+}
+
+function childBacklogWorld() {
+  const closedAt = '2026-10-20T00:00:00.000Z';
+  const parentLink = { number: 1, repository: { nameWithOwner: REPO }, author: { login: OWNER } };
+  const parent = issueNode({
+    number: 1,
+    body: 'parent still open',
+    subIssues: [
+      childNode({ number: 11, state: 'CLOSED', closedAt }),
+      childNode({ number: 12, state: 'CLOSED', closedAt }),
+      childNode({ number: 14, state: 'OPEN', closedAt: null }),
+    ],
+  });
+  const readyA = issueNode({
+    number: 11,
+    state: 'CLOSED',
+    closedAt,
+    body: 'ready a',
+    parent: parentLink,
+    prs: [mergedPr(110, '2026-10-20T01:00:00.000Z')],
+  });
+  const readyB = issueNode({
+    number: 12,
+    state: 'CLOSED',
+    closedAt,
+    body: 'ready b',
+    parent: parentLink,
+    prs: [mergedPr(120, '2026-10-20T01:00:00.000Z'), mergedPr(121, null)],
+  });
+  const settledBody = 'already accepted';
+  const settled = issueNode({
+    number: 13,
+    state: 'CLOSED',
+    closedAt,
+    body: settledBody,
+    parent: parentLink,
+    prs: [mergedPr(130, '2026-10-20T01:00:00.000Z')],
+    comments: [roundComment({
+      round: 1,
+      status: '通过',
+      bodyVersion: bodyVersion(settledBody),
+      createdAt: '2026-10-21T00:00:00.000Z',
+      finishedAt: '2026-10-21T01:00:00.000Z',
+    })],
+  });
+  const stillOpen = issueNode({
+    number: 14,
+    state: 'OPEN',
+    parent: parentLink,
+    prs: [mergedPr(140, '2026-10-20T01:00:00.000Z')],
+  });
+  const unmerged = issueNode({
+    number: 15,
+    state: 'CLOSED',
+    closedAt,
+    parent: parentLink,
+    prs: [mergedPr(150, null)],
+  });
+  const correction = issueNode({
+    number: 16,
+    state: 'CLOSED',
+    closedAt,
+    body: `[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#16 SC1 · 第 1 轮`,
+    parent: parentLink,
+    prs: [mergedPr(160, '2026-10-20T01:00:00.000Z')],
+  });
+  return {
+    open: [parent, stillOpen],
+    closed: [readyA, readyB, settled, unmerged, correction],
+  };
+}
+
+function assertNoPrWrites(run) {
+  assert.ok(run.calls.length > 0);
+  for (const call of run.calls) {
+    assert.equal(call.cmd, 'gh');
+    assert.ok(call.args.includes('graphql'), JSON.stringify(call.args));
+    assert.equal(call.args.includes('pr'), false);
+    const payload = JSON.parse(call.input || '{}');
+    assert.match(String(payload.query || ''), /^\s*query\b/);
+    assert.doesNotMatch(String(payload.query || ''), /\bmutation\b/i);
+  }
+}
+
+test('#224 SC10 盘点子 issue 时 fake gh 没有对 PR 的写调用', async () => {
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: writeProfile(tmpDir()).home });
+  const world = childBacklogWorld();
+  const run = createFakeRun({
+    onGraphql: () => inventoryData(world),
+    onApi: () => {
+      throw new Error('不该调用 gh api');
+    },
+  });
+  const github = createGithub({ profile, run });
+  await poll({ github, profile, now: () => Date.parse('2026-10-24T00:00:00.000Z') });
+  assertNoPrWrites(run);
+});
+
+test('#224 SC11 dry-run 输出里 kind child 的条目数等于会开轮的子 issue 数，不写任何东西', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const world = childBacklogWorld();
+  const run = createFakeRun({ onGraphql: () => inventoryData(world) });
+  const github = createGithub({ profile, run });
+  const entries = await poll({ github, profile, now: () => Date.parse('2026-10-24T00:00:00.000Z') });
+  assertNoPrWrites(run);
+  const children = entries.filter((entry) => entry.kind === 'child');
+  assert.deepEqual(children.map((entry) => entry.issue).sort(), [`${REPO}#11`, `${REPO}#12`]);
+  assert.equal(entries.some((entry) => entry.issue === `${REPO}#1` && entry.kind), false, '总 issue 还有未关子 issue，不开轮');
+  assert.equal(entries.some((entry) => [`${REPO}#13`, `${REPO}#14`, `${REPO}#15`, `${REPO}#16`].includes(entry.issue)), false);
+
+  const binDir = path.join(home, 'bin');
+  const writeLog = path.join(home, 'pr-writes.log');
+  writeFakeGh(
+    binDir,
+    `if (args.includes('graphql')) {
+  process.stdout.write(JSON.stringify({ data: ${JSON.stringify(inventoryData(world))} }));
+  process.exit(0);
+}
+fs.appendFileSync(${JSON.stringify(writeLog)}, args.join(' ') + '\\n');
+process.stderr.write('pr-write ' + args.join(' '));
+process.exit(2);
+`,
+  );
+  const result = await runChild(process.execPath, [POLL_BIN, '--json'], {
+    env: {
+      ...process.env,
+      PATH: `${binDir}:${process.env.PATH}`,
+      ACCEPTANCE_WATCHER_HOME: home,
+    },
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(fs.existsSync(writeLog), false);
+  const cliChildren = JSON.parse(result.stdout).filter((entry) => entry.kind === 'child');
+  assert.deepEqual(cliChildren.map((entry) => entry.issue).sort(), [`${REPO}#11`, `${REPO}#12`]);
+});
