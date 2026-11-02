@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createGithub, PRIO_BOARD_FIELDS } from './github.mjs';
+import { createGithub, isReadOnlyGraphql, PRIO_BOARD_FIELDS } from './github.mjs';
 import { redact } from './redact.mjs';
 import { checkSecretFile, loadAcceptanceProfile } from './profile.mjs';
 import { applyDebounce, PIN_LABEL, RULES, scorePriority } from './prio-score.mjs';
@@ -159,14 +159,9 @@ export function createPriorityGithub({ profile, token, run, fetchImpl }) {
   return createGithub({ profile: rest, ownerToken: token, run, fetchImpl });
 }
 
-/** 去掉注释和空白后，必须以 query 或 { 开头，且不含 mutation / subscription。 */
+/** 读通道只收恰好一个只读操作。判定与 isReadOnlyGraphql 同一实现。 */
 function assertReadChannelQuery(query) {
-  const text = String(query ?? '').replace(/#[^\n]*/g, '').replace(/\s+/g, '');
-  const lower = text.toLowerCase();
-  const readable = lower.startsWith('query') || text.startsWith('{');
-  if (!readable || lower.includes('mutation') || lower.includes('subscription')) {
-    throw new Error('读通道只做只读查询');
-  }
+  if (!isReadOnlyGraphql(query)) throw new Error('读通道只做只读查询');
 }
 
 /**

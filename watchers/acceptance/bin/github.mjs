@@ -295,11 +295,182 @@ export function isTransientGithubFailure(result) {
   );
 }
 
-/** GraphQL 文本是不是纯查询（不含 mutation / subscription）。拿不准一律当写，不重试。 */
+/**
+ * 整个文档是不是恰好一个只读操作（以 query 或 { 开头）。
+ * 按 token 扫描：跳过空白、逗号、注释（# 到 \r 或 \n）和字符串（含块字符串与转义）。
+ * 只统计花括号深度 0 的操作；fragment 不算操作。
+ * 解析不了、出现 mutation / subscription、零个或多于一个操作，一律当写，不重试。
+ */
 export function isReadOnlyGraphql(query) {
-  const text = String(query || '').replace(/#[^\n]*/g, '');
-  if (!/^\s*(query\b|\{)/.test(text)) return false;
-  return !/\b(mutation|subscription)\b/.test(text);
+  const s = String(query || '');
+  const n = s.length;
+  let i = 0;
+  const ops = [];
+
+  function skipComment() {
+    i += 1;
+    while (i < n && s[i] !== '\n' && s[i] !== '\r') i += 1;
+  }
+
+  function skipIgnorable() {
+    while (i < n) {
+      const c = s[i];
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === ',') {
+        i += 1;
+        continue;
+      }
+      if (c === '#') {
+        skipComment();
+        continue;
+      }
+      break;
+    }
+  }
+
+  function skipString() {
+    if (s[i + 1] === '"' && s[i + 2] === '"') {
+      i += 3;
+      while (i < n) {
+        if (s[i] === '\\' && s[i + 1] === '"' && s[i + 2] === '"' && s[i + 3] === '"') {
+          i += 4;
+          continue;
+        }
+        if (s[i] === '"' && s[i + 1] === '"' && s[i + 2] === '"') {
+          i += 3;
+          return true;
+        }
+        i += 1;
+      }
+      return false;
+    }
+    i += 1;
+    while (i < n) {
+      const c = s[i];
+      if (c === '"') {
+        i += 1;
+        return true;
+      }
+      if (c === '\n' || c === '\r') return false;
+      if (c === '\\') {
+        const esc = s[i + 1];
+        if (esc === '"' || esc === '\\' || esc === '/' || esc === 'b' || esc === 'f' || esc === 'n' || esc === 'r' || esc === 't') {
+          i += 2;
+          continue;
+        }
+        if (esc === 'u' && /^[0-9a-fA-F]{4}$/.test(s.slice(i + 2, i + 6))) {
+          i += 6;
+          continue;
+        }
+        return false;
+      }
+      i += 1;
+    }
+    return false;
+  }
+
+  function readName() {
+    if (!/[A-Za-z_]/.test(s[i] || '')) return '';
+    const start = i;
+    i += 1;
+    while (i < n && /[A-Za-z0-9_]/.test(s[i])) i += 1;
+    return s.slice(start, i);
+  }
+
+  function skipGroup(open) {
+    const closeOf = { '(': ')', '{': '}', '[': ']' };
+    if (s[i] !== open) return false;
+    const stack = [closeOf[open]];
+    i += 1;
+    while (i < n && stack.length > 0) {
+      const c = s[i];
+      if (c === '#') {
+        skipComment();
+        continue;
+      }
+      if (c === '"') {
+        if (!skipString()) return false;
+        continue;
+      }
+      if (c === '(' || c === '{' || c === '[') {
+        stack.push(closeOf[c]);
+        i += 1;
+        continue;
+      }
+      if (c === ')' || c === '}' || c === ']') {
+        if (stack[stack.length - 1] !== c) return false;
+        stack.pop();
+        i += 1;
+        continue;
+      }
+      i += 1;
+    }
+    return stack.length === 0;
+  }
+
+  function skipDirectives() {
+    while (s[i] === '@') {
+      i += 1;
+      if (!readName()) return false;
+      skipIgnorable();
+      if (s[i] === '(') {
+        if (!skipGroup('(')) return false;
+        skipIgnorable();
+      }
+    }
+    return true;
+  }
+
+  function skipOperationTail() {
+    skipIgnorable();
+    if (/[A-Za-z_]/.test(s[i] || '')) {
+      readName();
+      skipIgnorable();
+    }
+    if (s[i] === '(') {
+      if (!skipGroup('(')) return false;
+      skipIgnorable();
+    }
+    if (!skipDirectives()) return false;
+    if (s[i] !== '{') return false;
+    return skipGroup('{');
+  }
+
+  function skipFragment() {
+    skipIgnorable();
+    if (!readName()) return false;
+    skipIgnorable();
+    if (readName() !== 'on') return false;
+    skipIgnorable();
+    if (!readName()) return false;
+    skipIgnorable();
+    if (!skipDirectives()) return false;
+    if (s[i] !== '{') return false;
+    return skipGroup('{');
+  }
+
+  while (i < n) {
+    skipIgnorable();
+    if (i >= n) break;
+    const c = s[i];
+    if (c === '{') {
+      ops.push('query');
+      if (!skipGroup('{')) return false;
+      continue;
+    }
+    if (c === '"') return false;
+    const name = readName();
+    if (name === 'query' || name === 'mutation' || name === 'subscription') {
+      ops.push(name);
+      if (!skipOperationTail()) return false;
+      continue;
+    }
+    if (name === 'fragment') {
+      if (!skipFragment()) return false;
+      continue;
+    }
+    return false;
+  }
+  return ops.length === 1 && ops[0] === 'query';
 }
 
 function parseJson(stdout, label) {
