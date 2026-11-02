@@ -556,3 +556,63 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 | `tick-failed` | `heartbeat.lastTick.error` | 多半是 `poll.mjs` 或配置报错，跑一次 `poll.mjs --json` 看 |
 | 任务一直不再验（最近裁决有「有争议」） | `poll.mjs --json` 的 `adjudicate` 条目、`state/host/adjudications/runs/` | 没配 `adjudicateCommand` 就补上；`adjudicate-needs-human` 后要人工裁决 |
 | `adjudicate-timeout` / `adjudicate-failed` | `<home>/run/adj-*/pi.log`、`out.log` | 会自动重试（最多 3 次）；输出不合格多半是 pi 没按单行 JSON 收尾 |
+
+## 11. 自动快进部署
+
+`watchers/acceptance/deploy-ff.mjs` 每次启动只做一件事：现在能不能把部署目录快进到 `origin/main`。能，就快进并跑语法检查和 `doctor`；不能，就说明为什么然后退出。它不发通知、不装调度、不重启循环。脚本放在 `bin/` 外面，因为要跑 `git`、查进程和 `doctor`。
+
+本 issue 不安装调度，安装需 lead / Praise 批准。已定方案是 cron 每 5 分钟跑一次本脚本、跑完就退出；合并并审过后，由 Issue Inspector 另行批准再安装。在那之前，第 7 节的手工更新步骤不变。
+
+路径都不写死，由参数传入。下面的 `<deploy>` 是部署检出，`<home>` 是宿主家目录：
+
+```sh
+node watchers/acceptance/deploy-ff.mjs \
+  --deploy-dir <deploy> \
+  --host-state <home>/state/host \
+  --self-lock <home>/state/host/deploy-ff.lock \
+  --prio-lock <home>/state/host/prio-drill.lock \
+  --state-file <home>/state/host/deploy-ff.json \
+  --alerts <home>/state/host/alerts.jsonl \
+  --approval-file <home>/state/host/deploy-ff-approval \
+  --doctor-script <deploy>/watchers/acceptance/bin/doctor.mjs
+```
+
+- `--doctor-arg` 可以重复，原样传给 doctor。doctor 要的环境由调用方在启动本脚本前准备好；本脚本不读令牌。
+- `--approve <完整 sha>` 或批准文件里单独一行写着目标提交的完整 sha，才放行敏感改动。批准文件必须在部署目录之外。短 sha、对不上的 sha、仓库里的同名文件、提交说明里的批准字样，都不算数。目标前进后旧批准失效。快进并且检查通过之后，用过的批准文件会删掉。
+- `--prio-lock` 要和 prio-sync 演练用的是同一把锁。两把锁都是非阻塞的，进程退出就放开。
+- 参数缺失时退出码 2，不部署。
+
+每次运行标准输出恰好两行：第一行是 JSON（`status`、`head`、`target`、`behind`、`lagging`、`reportLag`、`files`、`lines`、`reason`、`ts`），第二行是中文人话。落后时人话里带给 lead 的那句。
+
+| 状态 | 退出码 | 类别 |
+|---|---|---|
+| `deployed` | 0 | 已快进且检查通过 |
+| `up-to-date` | 0 | 已经在目标提交 |
+| `waiting` | 30 | 等待空档（轮次目录、锁目录、验收进程或演练锁） |
+| `ci-pending` | 30 | 等待检查跑完 |
+| `locked` | 20 | 另一个实例拿着本脚本的锁 |
+| `blocked-dirty` | 10 | 工作区不干净，不动 |
+| `blocked-diverged` | 11 | 分叉或本地超前，只接受快进 |
+| `fetch-failed` | 12 | 拉取远端失败，不动 |
+| `ci-red` | 13 | 检查失败，不拉 |
+| `ci-unknown` | 14 | 检查读不到、对不上提交或格式不认得，不拉 |
+| `needs-approval` | 15 | 敏感改动还没被点名批准 |
+| `pull-failed` | 16 | 快进失败，不动 |
+| `doctor-failed` | 17 | 已经快进，检查没过，不自动回退 |
+
+`waiting` 和 `ci-pending` 同属等待，不算异常。检查必须全部完成且结论都是 success、neutral 或 skipped，才算绿；全部是 skipped 也算绿。每条 check run 的 `head_sha` 必须等于当时 `origin/main` 的完整 sha，对不上就不拉。只读 check-runs（`/repos/<owner>/<repo>/commits/<sha>/check-runs`），不读 commit statuses。请求不带身份头；仓名从部署目录 `origin` 的配置地址推出。读到结果之后如果轮次空档没了，或者远端又前进了，只合并刚才核对过的那个完整 sha，不会去追新的 `origin/main`。
+
+敏感清单（命中任一就不拉，除非批准了这个完整 sha）：
+
+- `watchers/acceptance/host/` 下的全部文件
+- `watchers/acceptance/bin/trigger.mjs`
+- `watchers/acceptance/bin/profile.mjs`、`github.mjs`、`redact.mjs`、`secretscan.mjs`
+- `watchers/acceptance/bin/prio-sync.mjs`
+- 仓根 `package.json`、仓根 `run-ensure.sh`
+- 任意目录下的 `package-lock.json`、`npm-shrinkwrap.json`、`yarn.lock`、`pnpm-lock.yaml`
+- 本脚本自己 `watchers/acceptance/deploy-ff.mjs`
+- 待拉提交新增的行里出现 `process.env`、`secrets/` 或 `token`（不分大小写）。删掉的行不算。改名用 `--no-renames` 拆开算，挪走旧路径也算命中。
+
+落后：本地比目标多超过 5 个提交，或最早一个未部署提交距今超过 2 小时，人话里带 `lagging`，并给 lead 一句。同一次落后（以当前本地 HEAD 为键）只在第一次把 `reportLag` 设为 true。快进成功后这份记忆清掉。
+
+提醒写到调用方传入的 `alerts.jsonl`，本脚本自己追加，不引用宿主目录里的模块。一行一个 JSON：`ts`、`kind`、`reason`、`detail`，另带 `head`、`target`。`kind` 以 `deploy-` 开头，例如 `deploy-needs-approval`、`deploy-blocked-dirty`、`deploy-doctor-failed`、`deploy-pull-failed`、`deploy-blocked-diverged`、`deploy-ci-red`、`deploy-ci-unknown`，首次落后另写 `deploy-lagging`。同一个本地 HEAD、目标 sha 和 kind 只写一行。`waiting`、`ci-pending`、`up-to-date`、`deployed` 不写；`locked` 和 `fetch-failed` 只出现在标准输出，不写提醒。状态文件用临时文件加 rename 写入，记下落后是否报过、以及已经写过的提醒键。
