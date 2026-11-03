@@ -950,7 +950,9 @@ function outWrite(stdout, text) {
 
 /**
  * 对每条 item 打分、防抖、算关联 PR。apply 不为真时不调用 write。
- * 防抖状态写进 dir/debounce.json；只有真写成功才追加 dir/changes.jsonl。
+ * 防抖状态只在 write（以及已停用）时覆盖 dir/debounce.json。
+ * dry-run 只在内存里算、照常打印计划，不创建、不改写 debounce.json。
+ * 只有真写成功才追加 dir/changes.jsonl。
  */
 export async function runPrioSync({
   dir,
@@ -1257,7 +1259,8 @@ export async function runPrioSync({
   } else if (loaded.prCiPresent) {
     prCiOut = loaded.prCi;
   }
-  saveDebounce(dir, nextItems, prCiOut);
+  // dry-run 的观测不能进下一拍。整文件保持原字节；原来没有就不创建。
+  if (mode !== 'dry-run') saveDebounce(dir, nextItems, prCiOut);
   const report = skipReport(skippedRepos);
   for (const line of report.lines) outWrite(stdout, line);
   const excludedTotal = (Number.isInteger(presetExcluded) && presetExcluded > 0 ? presetExcluded : 0) + skippedHere;

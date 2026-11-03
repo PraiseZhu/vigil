@@ -682,6 +682,8 @@ node watchers/acceptance/bin/prio-sync.mjs \
 node watchers/acceptance/bin/prio-run.mjs --state-dir <state-dir>
 ```
 
+dry-run 不改 `<state-dir>/debounce.json`。文件本来没有，跑完仍然没有。已经记下的降档确认计数（`consecutive`、`pending`、`pendingHeld`、`lastRecalcAt`）不会往前推，看板上没有的条目也不会从状态文件里删掉。`--write` 仍按原来的规则更新这份文件。
+
 Inspector 看过至少 24 小时的 dry-run 之后，才在同一条命令上加 `--write`。`--write` 仍然只自动写「空优先级 → P1 或 P2」，并且只写授权清单里的仓。
 
 停写：
