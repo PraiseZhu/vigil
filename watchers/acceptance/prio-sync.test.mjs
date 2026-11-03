@@ -28,6 +28,7 @@ import {
   runPrioSync,
   STALE_REMIND_MS,
   ITEM_FIELD_QUERY,
+  ONLY_FIELD_NAMES,
   PRIO_HOURLY_MAX,
   PRIO_HOURLY_WINDOW_MS,
   classifyPrioChange,
@@ -3468,6 +3469,9 @@ async function runBatch(dir, items, extra = {}) {
     table: extra.table,
     onlyRepo: extra.onlyRepo,
     limit: extra.limit,
+    onlyField: extra.onlyField,
+    onPlan: extra.onPlan,
+    readBack: extra.readBack,
   });
   return { gate, io, result };
 }
@@ -4270,4 +4274,369 @@ test('#240 SC6 dry-run 的计划行和汇总行与改动前一致', async () => 
   ].join('\n');
   assert.equal(gate.writes.length, 0);
   assert.equal(io.text(), expected);
+});
+
+// ==== #255 --only-field：只写一个字段（白名单「关联 PR」「优先级」）====
+// 边界用例逐条对应 https://github.com/PraiseZhu/vigil/issues/255 的 SC1–SC10。
+
+const ONLY_FIELD_BIN = fileURLToPath(new URL('./bin/prio-sync.mjs', import.meta.url));
+const LINK_TEXT = '#9(open,CI✓)';
+
+function escapeRe(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * 子进程跑真 CLI 的 main，依赖全部注入，用来断言真实退出码与标准输出。
+ * 干跑，不传 --write，所以不会去碰写通道；看板与 PR 也被替身挡住，不碰网络。
+ */
+function runMainChild(dir, argv, items) {
+  const entry = new URL('./bin/prio-sync.mjs', import.meta.url).href;
+  const script = [
+    `import { main } from ${JSON.stringify(entry)};`,
+    `await main(${JSON.stringify(['--state-dir', dir, ...argv])}, {`,
+    `  dir: ${JSON.stringify(dir)},`,
+    `  now: () => ${T0},`,
+    '  stdout: process.stdout,',
+    "  loadProfile: () => ({ ownerLogin: 'ExampleUser', projectNumber: 7 }),",
+    `  loadItems: async () => ${JSON.stringify(items)},`,
+    '  loadPrs: async () => [],',
+    "  write: async () => { throw new Error('干跑不应调用写闸'); },",
+    '});',
+  ].join('\n');
+  return spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+}
+
+test('#255 SC1 --only-field 只认「关联 PR」「优先级」，取值不合法在读令牌和看板之前退出', async () => {
+  const rejected = [
+    ['状态', '状态'],
+    ['优先级 ', '优先级 '],
+    ['关联PR', '关联PR'],
+    ['', '（空）'],
+    ['   ', '   '],
+    ['\t', '\t'],
+  ];
+  for (const [value, shown] of rejected) {
+    assert.throws(
+      () => parsePrioArgs(['--only-field', value]),
+      new RegExp(`--only-field 期望「关联 PR」或「优先级」，实际：${escapeRe(shown)}`),
+    );
+    await assertMainRejectsClean(['--only-field', value], /--only-field 期望/);
+  }
+  assert.deepEqual(ONLY_FIELD_NAMES, ['关联 PR', '优先级']);
+  assert.equal(parsePrioArgs(['--only-field', '关联 PR']).onlyField, '关联 PR');
+  assert.equal(parsePrioArgs(['--only-field', '优先级']).onlyField, '优先级');
+  assert.equal(parsePrioArgs([]).onlyField, null);
+
+  const dir = tmpDir();
+  const child = spawnSync(
+    process.execPath,
+    [ONLY_FIELD_BIN, '--state-dir', dir, '--only-field', '状态'],
+    { encoding: 'utf8' },
+  );
+  assert.notEqual(child.status, 0);
+  assert.match(child.stderr, /--only-field/);
+  assert.match(child.stderr, /关联 PR/);
+  assert.match(child.stderr, /优先级/);
+  assert.match(child.stderr, /实际：状态/);
+  assertNoPrioStateFiles(dir);
+});
+
+test('#255 SC2 过滤在计划算完、写闸之前：被过滤字段 0 次写闸、不进 changes.jsonl，防抖按未写入退回', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const saved = {
+    priority: null,
+    pending: 'P1',
+    pendingHeld: true,
+    lastRecalcAt: 1234,
+    consecutive: 1,
+    changes: [],
+  };
+  writeDebounce(dir, { items: { [`${MINE}#1`]: saved } });
+  let hookFields = [];
+  const { gate, io, result } = await runBatch(dir, [batchItem(MINE, 1)], {
+    prs: [linkPr(MINE, 9, 1)],
+    onlyField: '关联 PR',
+    onPlan(plan) {
+      hookFields = plan.map((change) => change.field);
+      return null;
+    },
+  });
+  assert.deepEqual(hookFields, ['优先级', '关联 PR'], '钩子看到过滤之前的完整计划');
+  assert.deepEqual(gate.writes.map((action) => Object.keys(action.fields)), [['关联 PR']]);
+  assert.equal(result.written, 1);
+  assert.equal(result.filteredByField, 1);
+  assert.equal(result.planned, 1);
+  assert.equal(io.text().includes(`${MINE}#1 优先级`), false, '被过滤的字段不打印');
+  assert.deepEqual(readJsonl(dir).map((row) => row.field), ['关联 PR']);
+  assert.deepEqual(readState(dir).items[`${MINE}#1`], saved, '被过滤字段的防抖状态按未写入退回');
+});
+
+test('#255 SC3 回读只比放行字段：同条目其它字段被改动也不置 readbackMismatch、不触发还原', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const gate = recorder();
+  const seen = [];
+  const result = await runPrioSync({
+    dir,
+    items: [batchItem(MINE, 1)],
+    prs: [linkPr(MINE, 9, 1)],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: capture().stdout,
+    onlyField: '关联 PR',
+    readBack: async (change) => {
+      seen.push(change.field);
+      return change.field === '关联 PR' ? change.new : 'P0';
+    },
+  });
+  assert.deepEqual(seen, ['关联 PR'], '只回读被放行的字段');
+  assert.equal(result.readbackMismatch, null);
+  assert.equal(result.written, 1);
+  assert.deepEqual(gate.writes.map((action) => action.fields), [{ '关联 PR': LINK_TEXT }]);
+  assert.deepEqual(readJsonl(dir).map((row) => row.field), ['关联 PR']);
+});
+
+test('#255 SC4 --only-field 与 --limit 组合：限额只数过滤后的条数，过滤 3 条写 1 条截 1 条', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const { gate, io, result } = await runBatch(dir, [batchItem(MINE, 1), batchItem(MINE, 2), batchItem(MINE, 3)], {
+    prs: [linkPr(MINE, 9, 1), linkPr(MINE, 8, 2)],
+    onlyField: '关联 PR',
+    limit: 1,
+  });
+  assert.deepEqual(
+    gate.writes.map((action) => [action.issue, Object.keys(action.fields)[0]]),
+    [[1, '关联 PR']],
+  );
+  assert.equal(result.filteredByField, 3);
+  assert.equal(result.truncatedByLimit, 1);
+  assert.equal(result.planned, 2);
+  assert.equal(result.written, 1);
+  assert.match(io.text(), /变更 2，写入 1/);
+  assert.match(io.text(), /按字段过滤掉 3 条，按上限截掉 1 条/);
+  assert.deepEqual(readJsonl(dir).map((row) => [row.issue, row.field]), [[1, '关联 PR']]);
+});
+
+test('#255 SC5 --only-field 与 --restore 同用时拒绝，还原一条都不执行', async () => {
+  const iso = new Date(T0).toISOString();
+  assert.throws(
+    () => parsePrioArgs(['--restore', iso, '--only-field', '关联 PR']),
+    /--only-field 不能和 --restore 同用/,
+  );
+  assert.throws(
+    () => parsePrioArgs(['--only-field', '优先级', '--restore', iso]),
+    /--only-field 不能和 --restore 同用/,
+  );
+  assert.throws(
+    () => parsePrioArgs(['--restore', iso, '--only-repo', MINE, '--only-field', '关联 PR']),
+    /不能和 --restore 同用/,
+  );
+  await assertMainRejectsClean(['--restore', iso, '--only-field', '优先级', '--write'], /不能和 --restore 同用/);
+
+  const dir = tmpDir();
+  const row = JSON.stringify({
+    at: iso,
+    item: `${MINE}#1`,
+    repo: MINE,
+    issue: 1,
+    field: '优先级',
+    old: null,
+    new: 'P2',
+    basis: 'seed',
+  });
+  fs.writeFileSync(path.join(dir, 'changes.jsonl'), `${row}\n`);
+  const before = fs.readFileSync(path.join(dir, 'changes.jsonl'), 'utf8');
+  await assert.rejects(
+    () => main(['--state-dir', dir, '--restore', iso, '--only-field', '优先级', '--write'], {
+      dir,
+      now: () => T0,
+      stdout: capture().stdout,
+      loadProfile: () => ({ ownerLogin: OWNER, projectNumber: PROJECT }),
+      loadItems: async () => [batchItem(MINE, 1, { priority: 'P2' })],
+      loadPrs: async () => [],
+      write: async () => {
+        throw new Error('拒绝时不应调用写闸');
+      },
+    }),
+    /不能和 --restore 同用/,
+  );
+  assert.equal(fs.readFileSync(path.join(dir, 'changes.jsonl'), 'utf8'), before);
+});
+
+test('#255 SC6a 未知字段「状态」退出码非 0，什么都不写', async () => {
+  assert.throws(() => parsePrioArgs(['--only-field', '状态']), /--only-field 期望「关联 PR」或「优先级」，实际：状态/);
+  await assertMainRejectsClean(['--only-field', '状态'], /--only-field 期望/);
+  await assertMainRejectsClean(['--only-field', '状态', '--write'], /--only-field 期望/);
+});
+
+test('#255 SC6b 空串取值退出码非 0，报错写实际值「（空）」', async () => {
+  assert.throws(
+    () => parsePrioArgs(['--only-field', '']),
+    /--only-field 期望「关联 PR」或「优先级」，实际：（空）/,
+  );
+  await assertMainRejectsClean(['--only-field', ''], /--only-field 期望/);
+});
+
+test('#255 SC6c 纯空白取值（空格 / 制表符）退出码非 0', async () => {
+  for (const blank of ['  ', '\t', ' \t ']) {
+    assert.throws(() => parsePrioArgs(['--only-field', blank]), /--only-field 期望/);
+    await assertMainRejectsClean(['--only-field', blank], /--only-field 期望/);
+  }
+});
+
+test('#255 SC6d 同一参数重复传入退出码非 0，两次都合法也拒绝', async () => {
+  assert.throws(() => parsePrioArgs(['--only-field', '关联 PR', '--only-field', '优先级']), /重复的参数：--only-field/);
+  assert.throws(() => parsePrioArgs(['--only-field', '优先级', '--only-field', '优先级']), /重复的参数：--only-field/);
+  await assertMainRejectsClean(['--only-field', '优先级', '--only-field', '关联 PR'], /重复的参数：--only-field/);
+  assert.throws(() => parsePrioArgs(['--only-field']), /缺少 --only-field 的取值/);
+  assert.throws(() => parsePrioArgs(['--only-field', '--write']), /缺少 --only-field 的取值/);
+  assert.throws(() => parsePrioArgs(['--only-field', '--limit', '1']), /缺少 --only-field 的取值/);
+  await assertMainRejectsClean(['--only-field'], /缺少 --only-field 的取值/);
+  await assertMainRejectsClean(['--only-field', '--limit', '1'], /缺少 --only-field 的取值/);
+});
+
+test('#255 SC6e 与 --only-repo 同用：只写指定仓里的放行字段', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const { gate, io, result } = await runBatch(dir, [batchItem(OTHER, 1), batchItem(MINE, 2)], {
+    prs: [linkPr(OTHER, 7, 1), linkPr(MINE, 8, 2)],
+    onlyRepo: MINE,
+    onlyField: '关联 PR',
+  });
+  assert.deepEqual(gate.writes.map((action) => `${action.repo}#${action.issue}`), [`${MINE}#2`]);
+  assert.equal(result.filteredByRepo, 1);
+  assert.equal(result.filteredByField, 1);
+  assert.equal(io.text().includes(`${OTHER}#1`), false);
+  assert.match(io.text(), /按仓过滤掉 1 条，按字段过滤掉 1 条/);
+});
+
+test('#255 SC6f 与 --limit 同用：N 只数过滤后真会落闸的条数', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const { gate, io, result } = await runBatch(dir, [batchItem(MINE, 1), batchItem(MINE, 2), batchItem(MINE, 3)], {
+    prs: [linkPr(MINE, 9, 1), linkPr(MINE, 8, 2)],
+    onlyField: '优先级',
+    limit: 2,
+  });
+  assert.deepEqual(
+    gate.writes.map((action) => [action.issue, Object.keys(action.fields)[0]]),
+    [[1, '优先级'], [2, '优先级']],
+  );
+  assert.equal(result.filteredByField, 2);
+  assert.equal(result.truncatedByLimit, 1);
+  assert.equal(result.planned, 3);
+  assert.match(io.text(), /变更 3，写入 2/);
+  assert.match(io.text(), /按字段过滤掉 2 条，按上限截掉 1 条/);
+  assert.equal(readJsonl(dir).every((row) => row.field === '优先级'), true);
+});
+
+test('#255 SC6g 与 --only-repo、--limit 三者同时用，顺序是仓、字段、上限', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const { gate, io, result } = await runBatch(dir, [batchItem(OTHER, 1), batchItem(MINE, 2), batchItem(MINE, 3)], {
+    prs: [linkPr(OTHER, 7, 1), linkPr(MINE, 8, 2), linkPr(MINE, 6, 3)],
+    onlyRepo: MINE,
+    onlyField: '关联 PR',
+    limit: 1,
+  });
+  assert.deepEqual(gate.writes.map((action) => action.issue), [2]);
+  assert.equal(result.filteredByRepo, 1);
+  assert.equal(result.filteredByField, 2);
+  assert.equal(result.truncatedByLimit, 1);
+  assert.match(io.text(), /变更 2，写入 1/);
+  assert.match(io.text(), /按仓过滤掉 1 条，按字段过滤掉 2 条，按上限截掉 1 条/);
+});
+
+test('#255 SC6h 过滤后 0 条：退出码 0，汇总里有「变更 0」「写入 0」和「0 条」的说明', async () => {
+  const dir = tmpDir();
+  const child = runMainChild(dir, ['--only-field', '关联 PR'], [batchItem(MINE, 1)]);
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /变更 0，写入 0/);
+  assert.match(child.stdout, /按字段过滤掉 1 条/);
+  assert.match(child.stdout, /0 条/);
+  assert.equal(fs.existsSync(path.join(dir, 'changes.jsonl')), false);
+  assert.equal(fs.existsSync(path.join(dir, 'debounce.json')), false);
+
+  const second = tmpDir();
+  const { gate, io, result } = await runBatch(second, [batchItem(MINE, 1)], { onlyField: '关联 PR' });
+  assert.equal(gate.writes.length, 0);
+  assert.equal(result.written, 0);
+  assert.equal(result.planned, 0);
+  assert.match(io.text(), /本拍按字段过滤后 0 条变更/);
+  assert.match(io.text(), /1 条，变更 0，写入 0，钉住 0，按字段过滤掉 1 条/);
+  assert.equal(readJsonl(second).length, 0);
+});
+
+test('#255 SC6i 与 --restore 冲突时退出码非 0', async () => {
+  const iso = new Date(T0).toISOString();
+  assert.throws(() => parsePrioArgs(['--only-field', '关联 PR', '--restore', iso]), /--only-field 不能和 --restore 同用/);
+  await assertMainRejectsClean(['--restore', iso, '--only-field', '关联 PR'], /--only-field 不能和 --restore 同用/);
+  await assertMainRejectsClean(['--only-field', '优先级', '--restore', iso], /--only-field 不能和 --restore 同用/);
+});
+
+test('#255 SC6j 干跑也过滤：计划只剩放行字段，写闸 0 次，两个状态文件都不创建', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const { gate, io, result } = await runBatch(dir, [batchItem(MINE, 1)], {
+    apply: false,
+    prs: [linkPr(MINE, 9, 1)],
+    onlyField: '关联 PR',
+  });
+  assert.equal(gate.writes.length, 0);
+  assert.equal(result.mode, 'dry-run');
+  assert.equal(result.filteredByField, 1);
+  assert.match(io.text(), new RegExp(`${escapeRe(MINE)}#1 关联 PR`));
+  assert.equal(io.text().includes(`${MINE}#1 优先级`), false);
+  assert.match(io.text(), /dry-run：1 条，变更 1，写入 0，钉住 0，按字段过滤掉 1 条/);
+  assert.equal(fs.existsSync(path.join(dir, 'changes.jsonl')), false);
+  assert.equal(fs.existsSync(path.join(dir, 'debounce.json')), false);
+});
+
+test('#255 SC6k 状态目录里有 disabled 时仍是已停用：写入 0，过滤照算', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'disabled'), '');
+  const { gate, io, result } = await runBatch(dir, [batchItem(MINE, 1)], {
+    prs: [linkPr(MINE, 9, 1)],
+    onlyField: '关联 PR',
+  });
+  assert.equal(gate.writes.length, 0);
+  assert.equal(result.mode, 'disabled');
+  assert.equal(result.written, 0);
+  assert.equal(result.filteredByField, 1);
+  assert.match(io.text(), /已停用：1 条，变更 1，写入 0，钉住 0，按字段过滤掉 1 条/);
+  assert.equal(fs.existsSync(path.join(dir, 'changes.jsonl')), false);
+});
+
+test('#255 SC7 不带 --only-field 时输出不变；计划只含放行字段时两次 stdout 逐字节相同', async () => {
+  const items = [batchItem(MINE, 1, { priority: 'P2', labels: [] })];
+  const prs = [linkPr(MINE, 9, 1)];
+  const plain = await runBatch(tmpDir(), items, { apply: false, prs });
+  const filtered = await runBatch(tmpDir(), items, { apply: false, prs, onlyField: '关联 PR' });
+  assert.equal(filtered.gate.writes.length, 0);
+  assert.equal(plain.result.filteredByField, 0);
+  assert.equal(filtered.result.filteredByField, 0, '计划里没有别的字段，过滤掉 0 条');
+  assert.match(plain.io.text(), /变更 1，写入 0/);
+  assert.equal(plain.io.text().includes('按字段过滤掉'), false);
+  assert.equal(filtered.io.text(), plain.io.text());
+});
+
+test('#255 SC8 第 12 节写明 --only-field 的取值、过滤位置、计数关系、--restore 冲突与防抖退回', () => {
+  const doc = fs.readFileSync(fileURLToPath(new URL('../../docs/acceptance-operations.md', import.meta.url)), 'utf8');
+  const start = doc.indexOf('## 12. prio-sync 分批写');
+  const section = doc.slice(start, doc.indexOf('## 13. prio 持续运行'));
+  assert.ok(start >= 0 && section.length > 0);
+  assert.match(section, /--only-field '关联 PR'/);
+  assert.match(section, /ONLY_FIELD_NAMES/);
+  assert.match(section, /精确相等/);
+  assert.match(section, /写闸调用之前/);
+  assert.match(section, /按字段过滤掉/);
+  assert.match(section, /--only-field 不能和 --restore 同用/);
+  assert.match(section, /restoreUnwrittenDebounce/);
+  assert.match(section, /只数 `--only-field` 过滤之后真会调用写闸的条数/);
+  assert.match(section, /退出码是 0/);
 });
