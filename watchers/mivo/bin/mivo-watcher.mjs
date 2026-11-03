@@ -279,6 +279,28 @@ function failedRequiredCiItems({ pr, ci }) {
   return items;
 }
 
+// Optional Actions checks that failed on this head (mivo-ci.mjs failedOptionalActions). Mivo's pre-review gate
+// wants every check green before it sends a PR to review, so these are repaired like required failures.
+function failedOptionalCiItems({ pr, ci }) {
+  if (!ci || ci.status === 'unknown' || !Array.isArray(ci.optional)) return [];
+  return ci.optional.filter((rule) => rule?.status === 'failed' && typeof rule.context === 'string').map((rule) => {
+    const evidence = rule.evidence ?? {};
+    const checkId = evidence.id ?? null;
+    const runId = evidence.runId ?? null;
+    const url = evidence.url ?? '';
+    return {
+      source: 'ci',
+      actionable: true,
+      optionalFailure: { verified: true, status: 'failed', headSha: evidence.sha ?? pr.headRefOid ?? null, context: rule.context, checkId, runId },
+      nativeId: `optional:${rule.context}`,
+      revision: `${rule.status}:${checkId ?? ''}`,
+      sha: evidence.sha ?? pr.headRefOid ?? null,
+      body: `${rule.context} failed ${rule.reason ?? ''} (non-required check; Mivo pre-review sends a PR to review only when every check is green) check=${checkId ?? ''} run=${runId ?? ''} ${url}`.trim(),
+      contentHash: digest({ context: rule.context, optional: true, status: rule.status, id: checkId, runId, url }),
+    };
+  });
+}
+
 function withCategory(item, { headSha } = {}) {
   const category = classifyReviewFeedback(item);
   return { ...item, category, repairPolicy: feedbackRepairPolicy(item, { headSha }), ...(category === 'ignore-infra' ? { actionable: false } : {}) };
@@ -300,6 +322,7 @@ function withPublisher(item, comment) {
 export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci, reviews = [], comments = [], threads = [], mergeable, receiptActor }) {
   const items = [];
   for (const item of failedRequiredCiItems({ pr, ci })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
+  for (const item of failedOptionalCiItems({ pr, ci })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
   for (const item of codeScanningFeedbackItems({ pr, scanning: ci?.codeScanning })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
   // Reviewer reviews that carry findings (and their inline threads) are trusted review feedback.
   // Not filtered by head: an unresolved finding thread from an earlier head still blocks the next review.
@@ -831,7 +854,7 @@ export const SNAPSHOT_RULE = 'PR 状态、required checks、失败 check 和未�
 // The owner wants every PR pushed to mergeable without a person in the loop (2026-10-15).
 export const INTENT_RULE = '产品意图：动手前先读 prIntent（PR 正文里作者写明的产品意图；正文没有该节时是正文开头）。某条反馈要求的改法会改变 PR 正文、仓库规格文档或维护者裁定里已经写明的界面、交互或流程时，它不是缺陷：不改代码，记 SC=no-change，evidence 第一条写明引用的是正文或规格的哪一段，watcher 会贴到该 thread 并 resolve，然后继续处理其余反馈。不要为这类反馈 blocked 或等人拍板。只是代码没按写明的设计实现（实现错了）时，照常按严重度修。';
 // Nothing a repair session can settle by reading code and running it waits for a person.
-export const AUTO_ADVANCE_RULE = '全自动推进：目标是把 PR 推到可合并（必需检查全绿、讨论全部 resolve、审查结论通过），不合并。严重度拿不准时在会话里复现和读代码核实；核实后确认是 P0/P1/P2 才改，确认不了的按不成立处理（SC=no-change，evidence 写明核实了什么、为什么不成立），不要因为「严重度未知」而 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账或 Jev 不可用这类会话自己解决不了的情况才 blocked（Jev 不可用按 KEEL_FLOW 一节立即 blocked，原因以 keel-jev-unavailable 开头）。不向用户提问、不等用户确认；拿不准用 Jev，仍低置信就选改动最小、可撤回的做法并写进结果。';
+export const AUTO_ADVANCE_RULE = '全自动推进：目标是把 PR 推到可合并（全部检查全绿——Mivo 前置审查对必需与非必需检查一视同仁，非必需检查红着就不送审；讨论全部 resolve、审查结论通过），不合并。严重度拿不准时在会话里复现和读代码核实；核实后确认是 P0/P1/P2 才改，确认不了的按不成立处理（SC=no-change，evidence 写明核实了什么、为什么不成立），不要因为「严重度未知」而 blocked。只有缺权限、缺环境、外部服务故障、Keel 台账或 Jev 不可用这类会话自己解决不了的情况才 blocked（Jev 不可用按 KEEL_FLOW 一节立即 blocked，原因以 keel-jev-unavailable 开头）。不向用户提问、不等用户确认；拿不准用 Jev，仍低置信就选改动最小、可撤回的做法并写进结果。';
 // Severity comes from one file the reviewer publishes (its repo's mivo/config/severity.md, pinned with the
 // pre-review checkout on the same machine). Two hand-written definitions disagreed on P2 and kept the reviewer
 // and the repair session re-litigating the same finding (2026-10-22). Version = sha256 of the raw file, first

@@ -150,7 +150,7 @@ export function formatNoticeText(events = []) {
     const number = event.number ?? '?';
     const url = event.url ? ` ${event.url}` : '';
     if (event.kind === 'merge-ready') {
-      return `PR #${number}${url} 已经可以合并：必需检查全绿、讨论已处理。请打开链接手动点合并。`;
+      return `PR #${number}${url} 已经可以合并：检查全绿、讨论已处理。请打开链接手动点合并。`;
     }
     if (event.kind === 'keel-unavailable') {
       return `PR #${number}${url} 有待修复的反馈，但 Keel 台账读不到（${event.cause ?? 'ledger unreadable'}），本轮没有派发修复会话、没有扣轮次。请检查 keelLedgerRoot / keelNamespace 配置或 Keel 安装；恢复后盯梢会自动继续。`;

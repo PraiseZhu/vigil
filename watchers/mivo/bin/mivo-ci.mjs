@@ -20,6 +20,30 @@ export function readAll(ghFn, list) {
 }
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
+// Mivo's pre-review gate admits a PR only when every check is green, required or not (maintainer decision
+// 2026-08-04), so a failed optional Actions check blocks review like a required one: #1641 sat on pr-handoff-gate
+// on 2026-11-03 while nothing repaired it. Only the latest Actions run of each name on this head counts; review
+// infrastructure and CodeQL (its alerts come through code scanning) are not the author's to fix.
+const OPTIONAL_EXCLUDED = new Set(['review-pr', 'gate', 'seat1', 'seat2', 'seat3', 'publish', 'native_attestation', 'control_attestation', 'CodeQL']);
+const OPTIONAL_FAILED = new Set(['failure', 'timed_out', 'startup_failure']);
+export function failedOptionalActions({ checks = [], policy, repo, headSha }) {
+  const jobUrl = new RegExp(`^https://github\\.com/${repo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/actions/runs/(\\d+)/job/(\\d+)/?$`);
+  const out = [];
+  for (const item of checks) {
+    if (item?.app?.slug !== 'github-actions' || item.head_sha !== headSha) continue;
+    if (OPTIONAL_EXCLUDED.has(item.name) || /^Analyze \(/.test(item.name ?? '')) continue;
+    if ((policy?.required ?? []).some(rule => rule.context === item.name && (rule.appId === null || rule.appId === item.app?.id))) continue;
+    const time = Date.parse(item.started_at ?? item.created_at);
+    if (checks.some(other => other !== item && other.name === item.name && other.app?.id === item.app?.id
+      && Date.parse(other.started_at ?? other.created_at) > time)) continue;
+    if (item.status !== 'completed' || !OPTIONAL_FAILED.has(item.conclusion)) continue;
+    const match = jobUrl.exec(String(item.details_url ?? ''));
+    if (!match) continue;
+    out.push({ context: item.name, status: 'failed', reason: item.conclusion, evidence: { id: item.id, sha: headSha, runId: Number(match[1]), url: item.details_url } });
+  }
+  return out.sort((a, b) => a.context.localeCompare(b.context));
+}
+
 export function* collectMivoCiSteps({ pr, ghFn, now = Date.now() }) {
   const policy = yield* collectMivoPolicySteps({ repo: pr.repo, number: pr.number, gh: ghFn });
   if (policy.status !== 'verified' || policy.prNodeId !== pr.id || policy.headSha !== pr.headRefOid
@@ -117,7 +141,10 @@ export function* collectMivoCiSteps({ pr, ghFn, now = Date.now() }) {
     const after = parse(yield () => ghFn(['pr', 'view', String(pr.number), '--repo', pr.repo, '--json', 'id,headRefOid,baseRefOid,state,isDraft']));
     check(after.id === pr.id && after.headRefOid === pr.headRefOid && after.baseRefOid === pr.baseRefOid
       && after.state === pr.state && after.isDraft === pr.isDraft, 'PR changed during CI collection');
-    return { ...result, status, policy, checks, statuses, codeScanning, ciHash: digest({ required: result.required, scanning: codeScanning.scanHash }) };
+    const optional = failedOptionalActions({ checks, policy, repo: pr.repo, headSha: pr.headRefOid });
+    // Only a red optional check enters the hash, so PRs without one keep their previous hash.
+    const ciHash = digest({ required: result.required, scanning: codeScanning.scanHash, ...(optional.length ? { optional } : {}) });
+    return { ...result, status, policy, checks, statuses, codeScanning, optional, ciHash };
   } catch (error) { return { status: 'unknown', policy, required: [], reason: error.message }; }
 }
 

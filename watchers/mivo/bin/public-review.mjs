@@ -134,6 +134,8 @@ export function evaluatePublicReview({ snapshot: s, comments = s.comments, check
     }
   }
   const scanning = s.ci?.codeScanning ?? s.codeScanning;
+  // Mivo pre-review keeps a PR out while any check is red, required or not; it is not mergeable for us either.
+  if ((s.ci?.optional ?? s.optionalCi ?? []).length) blockers.push('optional-ci-failed');
   if (!s.requiredChecksGreen) blockers.push(s.ci?.status === 'failed' || scanning?.status === 'failed' ? 'waiting-ci' : 'waiting-ci');
   if (scanning && !['green', 'not-required'].includes(scanning.status) && s.requiredChecksGreen) {
     blockers.push(scanning.status === 'failed' ? 'code-scanning-failed' : scanning.status === 'pending' ? 'code-scanning-pending' : 'code-scanning-unknown');
@@ -195,6 +197,7 @@ export function* collectPublicReview(pr, ghFn, { handledFeedback = [] } = {}) {
   const snapshot = yield* collectPrSnapshot({pr: {...pr, repo: REPO}, ghFn});
   const ci = yield* collectMivoCiSteps({pr:snapshot.pr, ghFn});
   snapshot.requiredChecksGreen = ci.status === 'green';
+  snapshot.optionalCi = Array.isArray(ci.optional) ? ci.optional : [];
   const checks = Array.isArray(ci.checks) ? ci.checks : [];
   const latestCheck = reviewChecks(checks, snapshot.pr.headRefOid)[0];
   const runs = {};
