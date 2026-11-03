@@ -682,6 +682,8 @@ node watchers/acceptance/bin/prio-sync.mjs \
 node watchers/acceptance/bin/prio-run.mjs --state-dir <state-dir>
 ```
 
+dry-run 不改 `<state-dir>/debounce.json`。文件本来没有，跑完仍然没有。已经记下的降档确认计数（`consecutive`、`pending`、`pendingHeld`、`lastRecalcAt`）不会往前推，看板上没有的条目也不会从状态文件里删掉。`--write` 仍按原来的规则更新这份文件。
+
 Inspector 看过至少 24 小时的 dry-run 之后，才在同一条命令上加 `--write`。`--write` 仍然只自动写「空优先级 → P1 或 P2」，并且只写授权清单里的仓。
 
 停写：
@@ -690,7 +692,7 @@ Inspector 看过至少 24 小时的 dry-run 之后，才在同一条命令上加
 touch <state-dir>/disabled
 ```
 
-文件在，这一拍就 0 次写入，dry-run 照跑，输出里有「已停写」，退出码 0。程序自己停写也是写这个文件。要恢复，人看完告警后删掉它。本程序不创建 `mac-mini-stopped`。
+文件在，这一拍就 0 次写入，dry-run 照跑，输出里有「已停写」，退出码 0。这一拍同样不改 `debounce.json`：降档确认计数不往前推，看板上没有的条目也不会被删掉。程序自己停写也是写这个文件。要恢复，人看完告警后删掉它。本程序不创建 `mac-mini-stopped`。
 
 下面两行只是示例，不要执行，本仓库不安装：
 

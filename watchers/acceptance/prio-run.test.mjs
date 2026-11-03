@@ -1,5 +1,6 @@
 // #233 prio-run：持续运行一拍。默认 dry-run，--write 只自动写授权仓的空 → P1/P2。
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -635,4 +636,82 @@ test('#233 默认 dry-run 不读令牌也不写', async () => {
   assert.equal(result.exitCode, 0);
   assert.match(io.text(), /dry-run：/);
   assert.equal(disabled(dir), false);
+});
+
+test('#240 SC1 prio-run 在 disabled 存在时跑一拍，debounce.json 跑前跑后 sha256 相同', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  fs.writeFileSync(path.join(dir, 'disabled'), '');
+  const file = path.join(dir, 'debounce.json');
+  const absent = 'example-owner/other-repo#99';
+  const body = `${JSON.stringify({
+    items: {
+      [absent]: {
+        priority: 'P1',
+        pending: 'P2',
+        pendingHeld: true,
+        lastRecalcAt: T0,
+        consecutive: 1,
+        changes: [],
+      },
+      [`${REPO}#1`]: {
+        priority: null,
+        pending: null,
+        pendingHeld: false,
+        lastRecalcAt: null,
+        consecutive: 0,
+        changes: [],
+      },
+    },
+  })}\n`;
+  fs.writeFileSync(file, body);
+  const before = createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  const { writes, result, io } = await run(dir, [], { items: fills(1, { labels: ['blocker'] }) });
+  const after = createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  assert.equal(writes.length, 0);
+  assert.equal(result.exitCode, 0);
+  assert.match(io.text(), /已停用：/);
+  assert.equal(after, before, '跑前跑后 sha256 相同');
+  assert.equal(fs.readFileSync(file, 'utf8'), body);
+});
+
+test('#240 SC7 prio-run 默认 dry-run 不改 debounce.json，跑前跑后 sha256 相同', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const file = path.join(dir, 'debounce.json');
+  const absent = 'example-owner/other-repo#99';
+  const body = `${JSON.stringify({
+    items: {
+      [absent]: {
+        priority: 'P1',
+        pending: 'P2',
+        pendingHeld: true,
+        lastRecalcAt: T0,
+        consecutive: 1,
+        changes: [],
+      },
+      [`${REPO}#1`]: {
+        priority: null,
+        pending: null,
+        pendingHeld: false,
+        lastRecalcAt: null,
+        consecutive: 0,
+        changes: [],
+      },
+    },
+  })}\n`;
+  fs.writeFileSync(file, body);
+  const before = createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  const { writes, result } = await run(dir, [], { items: fills(1, { labels: ['blocker'] }) });
+  const after = createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  assert.equal(writes.length, 0);
+  assert.equal(result.exitCode, 0);
+  assert.equal(after, before, '跑前跑后 sha256 相同');
+  assert.equal(fs.readFileSync(file, 'utf8'), body);
+
+  const empty = tmpDir();
+  allow(empty, [REPO]);
+  const missing = path.join(empty, 'debounce.json');
+  await run(empty, [], { items: fills(1) });
+  assert.equal(fs.existsSync(missing), false);
 });

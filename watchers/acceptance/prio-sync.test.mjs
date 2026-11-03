@@ -1,6 +1,7 @@
 // #157 prio-sync：默认 dry-run，经 project.field.set 写「优先级」「关联 PR」。
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -79,6 +80,10 @@ function readJsonl(dir) {
 
 function readState(dir) {
   return JSON.parse(fs.readFileSync(path.join(dir, 'debounce.json'), 'utf8'));
+}
+
+function fileSha256(file) {
+  return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
 test('#157 SC1 dry-run 跑 84 条有输出且 0 次写入', async () => {
@@ -571,7 +576,8 @@ test('#157 状态目录默认是 HOME/acceptance/tools/.prio，--state-dir 才�
     readToken: () => 'unused-token',
   });
   assert.equal(gate.writes.length, 0);
-  assert.equal(fs.existsSync(path.join(custom, 'debounce.json')), true);
+  assert.equal(fs.existsSync(path.join(custom, 'debounce.json')), false, 'dry-run 不创建 debounce.json');
+  assert.equal(fs.existsSync(path.join(custom, 'run-2026-10-31.log')), true, '--state-dir 指到的目录会留下运行日志');
   assert.equal(fs.existsSync(expected), false);
 });
 
@@ -2893,14 +2899,23 @@ test('#207 SC9 干跑不新增也不修改上一拍标注', async () => {
       throw new Error('不应读令牌');
     },
   };
+  const file = path.join(dir, 'debounce.json');
   await main([], { ...deps, now: () => T0, stdout: capture().stdout });
-  const created = readState(dir);
-  assert.equal(Object.hasOwn(created, 'prCi'), false);
-  assert.equal(created.items[`${REPO}#5`].priority, 'P3');
+  assert.equal(fs.existsSync(file), false, '干跑不创建防抖文件，也不新增 prCi');
 
   const seeded = { [`${REPO}#9`]: { mark: 'pass', pending: 0 } };
-  writeDebounce(dir, { items: created.items, prCi: structuredClone(seeded) });
+  const kept = {
+    priority: 'P3',
+    pending: null,
+    pendingHeld: false,
+    lastRecalcAt: null,
+    consecutive: 0,
+    changes: [],
+  };
+  writeDebounce(dir, { items: { [`${REPO}#5`]: kept }, prCi: structuredClone(seeded) });
+  const before = fs.readFileSync(file);
   await main([], { ...deps, now: () => T0 + 1000, stdout: capture().stdout });
+  assert.equal(fs.readFileSync(file).equals(before), true);
   assert.deepEqual(readState(dir).prCi, seeded);
   assert.equal(readState(dir).items[`${REPO}#5`].priority, 'P3');
 });
@@ -2970,23 +2985,8 @@ function dryRunSnapshot() {
     'dry-run：4 条，变更 4，写入 0，钉住 0',
     '',
   ].join('\n');
-  const hold = {
-    priority: null,
-    pending: null,
-    pendingHeld: false,
-    lastRecalcAt: null,
-    consecutive: 0,
-    changes: [],
-  };
-  const debounce = `${JSON.stringify({
-    items: {
-      [`${REPO_A}#1`]: hold,
-      [`${REPO_B}#2`]: hold,
-      [`${REPO_B}#3`]: hold,
-      [`${REPO_C}#4`]: hold,
-    },
-  })}\n`;
-  return { stdout, debounce };
+  // dry-run 不创建 debounce.json（#240）。原来没有，跑完文本仍是空。
+  return { stdout, debounce: '' };
 }
 
 async function runThreeRepos(dir, { write = true, writeFn, items = threeRepoItems() } = {}) {
@@ -4025,4 +4025,225 @@ test('#233 钩子 回读查询是只读的，并能从节点上取出优先级',
   assert.equal(readFieldValue(node, '优先级'), 'P2');
   assert.equal(readFieldValue(node, '关联 PR'), 'example#1');
   assert.equal(readFieldValue(node, '状态'), null);
+});
+
+function downgradeItem() {
+  return item(6, { priority: 'P0', status: 'Todo' });
+}
+
+function heldDowngrade(extra = {}) {
+  return {
+    priority: 'P0',
+    pending: 'P2',
+    pendingHeld: true,
+    lastRecalcAt: T0,
+    consecutive: 1,
+    changes: [],
+    ...extra,
+  };
+}
+
+async function drySync(dir, { nowMs = T0, items = [downgradeItem()], apply = false } = {}) {
+  const gate = recorder();
+  const io = capture();
+  await runPrioSync({
+    dir,
+    items,
+    prs: [],
+    nowMs,
+    apply,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: io.stdout,
+  });
+  return { gate, io };
+}
+
+test('#240 SC1 已停用时 dry-run 也不改 debounce.json：跑前跑后 sha256 相同，计数不变，看板外的键还在', async () => {
+  const dir = tmpDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'disabled'), '');
+  seedOwned(dir, 6, 'P0');
+  const file = path.join(dir, 'debounce.json');
+  const absentRef = 'example-owner/other-repo#99';
+  const absent = {
+    priority: 'P3',
+    pending: null,
+    pendingHeld: false,
+    lastRecalcAt: 42,
+    consecutive: 0,
+    changes: [7],
+  };
+  const raw = `${JSON.stringify({ items: { [`${REPO}#6`]: heldDowngrade(), [absentRef]: absent } })} \n`;
+  fs.writeFileSync(file, raw);
+  const before = fileSha256(file);
+  const { gate, io } = await drySync(dir);
+  assert.equal(gate.writes.length, 0);
+  assert.match(io.text(), /已停用：/);
+  assert.equal(fileSha256(file), before, '跑前跑后 sha256 相同');
+  const saved = readState(dir).items[`${REPO}#6`];
+  assert.equal(saved.consecutive, 1);
+  assert.equal(saved.pending, 'P2');
+  assert.equal(saved.pendingHeld, true);
+  assert.equal(saved.lastRecalcAt, T0);
+  assert.deepEqual(readState(dir).items[absentRef], absent);
+
+  const empty = tmpDir();
+  fs.mkdirSync(empty, { recursive: true });
+  fs.writeFileSync(path.join(empty, 'disabled'), '');
+  const missing = path.join(empty, 'debounce.json');
+  assert.equal(fs.existsSync(missing), false);
+  await drySync(empty, { items: [item(1, { labels: ['blocker'] })] });
+  assert.equal(fs.existsSync(missing), false);
+});
+
+test('#240 SC1 dry-run 不改 debounce.json：跑前跑后 sha256 相同，文件不存在时跑完仍然不存在', async () => {
+  const dir = tmpDir();
+  seedOwned(dir, 6, 'P0');
+  const file = path.join(dir, 'debounce.json');
+  const raw = `${JSON.stringify({ items: { [`${REPO}#6`]: heldDowngrade() } })} \n`;
+  fs.writeFileSync(file, raw);
+  const before = fileSha256(file);
+  const { gate } = await drySync(dir);
+  assert.equal(gate.writes.length, 0);
+  assert.equal(fileSha256(file), before, '跑前跑后 sha256 相同');
+  assert.equal(fs.readFileSync(file, 'utf8'), raw);
+
+  const empty = tmpDir();
+  const missing = path.join(empty, 'debounce.json');
+  assert.equal(fs.existsSync(missing), false);
+  await drySync(empty, { items: [item(1, { labels: ['blocker'] })] });
+  assert.equal(fs.existsSync(missing), false);
+});
+
+test('#240 SC2 pending 降档条目的 consecutive、pending、pendingHeld、lastRecalcAt 在 dry-run 后不变', async () => {
+  const dir = tmpDir();
+  seedOwned(dir, 6, 'P0');
+  const file = path.join(dir, 'debounce.json');
+  const held = heldDowngrade();
+  fs.writeFileSync(file, `${JSON.stringify({ items: { [`${REPO}#6`]: held } })}\n`);
+  const before = fileSha256(file);
+  await drySync(dir);
+  assert.equal(fileSha256(file), before, '跑前跑后 sha256 相同');
+  const saved = readState(dir).items[`${REPO}#6`];
+  assert.equal(saved.consecutive, 1);
+  assert.equal(saved.pending, 'P2');
+  assert.equal(saved.pendingHeld, true);
+  assert.equal(saved.lastRecalcAt, T0);
+});
+
+test('#240 SC3 dry-run 两次（间隔不少于 15 分钟）再 write 一次，降档仍是 skip，不写入，changes.jsonl 行数不变', async () => {
+  const dir = tmpDir();
+  seedOwned(dir, 6, 'P0');
+  const file = path.join(dir, 'debounce.json');
+  const beforeLines = readJsonl(dir).length;
+  assert.equal(beforeLines, 1);
+  const gate = recorder();
+  const base = {
+    dir,
+    items: [downgradeItem()],
+    prs: [],
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+  };
+  const dryAt = async (nowMs) => {
+    const existed = fs.existsSync(file);
+    const before = existed ? fileSha256(file) : null;
+    await runPrioSync({ ...base, nowMs, stdout: capture().stdout });
+    if (!existed) assert.equal(fs.existsSync(file), false);
+    else assert.equal(fileSha256(file), before, '跑前跑后 sha256 相同');
+  };
+  await dryAt(T0);
+  await dryAt(T0 + DOWNGRADE_MIN_GAP_MS);
+  const io = capture();
+  await runPrioSync({
+    ...base,
+    nowMs: T0 + DOWNGRADE_MIN_GAP_MS * 2,
+    apply: true,
+    stdout: io.stdout,
+  });
+  assert.equal(gate.writes.length, 0);
+  assert.equal(readJsonl(dir).length, beforeLines);
+  assert.match(io.text(), /写入 0/);
+  const saved = readState(dir).items[`${REPO}#6`];
+  assert.equal(saved.consecutive, 1);
+  assert.equal(saved.pendingHeld, true);
+  assert.equal(saved.pending, 'P2');
+  assert.equal(saved.priority, 'P0');
+  assert.equal(saved.lastRecalcAt, T0 + DOWNGRADE_MIN_GAP_MS * 2);
+});
+
+test('#240 SC4 dry-run 不删看板上没有的键，内容不变，跑前跑后 sha256 相同', async () => {
+  const dir = tmpDir();
+  const absentRef = 'example-owner/other-repo#99';
+  const absent = {
+    priority: 'P3',
+    pending: null,
+    pendingHeld: false,
+    lastRecalcAt: 42,
+    consecutive: 0,
+    changes: [7],
+  };
+  const file = path.join(dir, 'debounce.json');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify({ items: { [absentRef]: absent, [`${REPO}#1`]: heldDowngrade() } })}\n`);
+  const before = fileSha256(file);
+  await drySync(dir, { items: [item(1, { labels: ['blocker'] })] });
+  assert.equal(fileSha256(file), before, '跑前跑后 sha256 相同');
+  assert.deepEqual(readState(dir).items[absentRef], absent);
+});
+
+test('#240 SC5 --write 仍推进未确认降档、确认后写入，并删掉不在看板上的键', async () => {
+  const absentRef = 'example-owner/other-repo#99';
+  const absent = {
+    priority: 'P1',
+    pending: null,
+    pendingHeld: false,
+    lastRecalcAt: 9,
+    consecutive: 0,
+    changes: [],
+  };
+
+  const pendingDir = tmpDir();
+  seedOwned(pendingDir, 6, 'P0');
+  writeDebounce(pendingDir, { items: { [`${REPO}#6`]: heldDowngrade(), [absentRef]: absent } });
+  const pending = await drySync(pendingDir, { apply: true });
+  assert.equal(pending.gate.writes.length, 0);
+  const pendingState = readState(pendingDir).items;
+  assert.equal(pendingState[`${REPO}#6`].consecutive, 2);
+  assert.equal(pendingState[`${REPO}#6`].pending, 'P2');
+  assert.equal(pendingState[`${REPO}#6`].pendingHeld, true);
+  assert.equal(pendingState[`${REPO}#6`].lastRecalcAt, T0);
+  assert.equal(Object.hasOwn(pendingState, absentRef), false);
+
+  const confirmDir = tmpDir();
+  seedOwned(confirmDir, 6, 'P0');
+  writeDebounce(confirmDir, { items: { [`${REPO}#6`]: heldDowngrade() } });
+  const confirmed = await drySync(confirmDir, { apply: true, nowMs: T0 + DOWNGRADE_MIN_GAP_MS });
+  assert.equal(confirmed.gate.writes.length, 1);
+  assert.deepEqual(confirmed.gate.writes[0].fields, { 优先级: 'P2' });
+  assert.equal(readJsonl(confirmDir).filter((row) => row.issue === 6 && row.new === 'P2').length, 1);
+
+  const upgradeDir = tmpDir();
+  const upgraded = await drySync(upgradeDir, {
+    apply: true,
+    items: [item(1, { labels: ['blocker'] })],
+  });
+  assert.equal(upgraded.gate.writes.length, 1);
+  assert.equal(upgraded.gate.writes[0].fields['优先级'], 'P0');
+  assert.equal(readState(upgradeDir).items[`${REPO}#1`].priority, 'P0');
+});
+
+test('#240 SC6 dry-run 的计划行和汇总行与改动前一致', async () => {
+  const dir = tmpDir();
+  const { io, gate } = await drySync(dir, { items: [item(1, { labels: ['blocker'] })] });
+  const expected = [
+    `${REPO}#1 优先级 （空） → P0 依据：没给情形档，机器信号 S1 升到 P0`,
+    'dry-run：1 条，变更 1，写入 0，钉住 0',
+    '',
+  ].join('\n');
+  assert.equal(gate.writes.length, 0);
+  assert.equal(io.text(), expected);
 });
