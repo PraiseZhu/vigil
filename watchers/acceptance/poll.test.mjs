@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { createGithub } from './bin/github.mjs';
-import { poll } from './bin/poll.mjs';
+import { poll, pollInventory } from './bin/poll.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { cachePath, createRounds } from './bin/rounds.mjs';
 import { bodyVersion, collectTasks } from './bin/tasks.mjs';
@@ -512,4 +512,79 @@ process.exit(2);
   assert.equal(fs.existsSync(writeLog), false);
   const cliChildren = JSON.parse(result.stdout).filter((entry) => entry.kind === 'child');
   assert.deepEqual(cliChildren.map((entry) => entry.issue).sort(), [`${REPO}#11`, `${REPO}#12`]);
+});
+
+// ── #247 SC1 / SC6 / SC9：盘点清单交出去；限流不当普通失败；响应头按令牌记账 ──
+
+test('#247 SC1 pollInventory 把这一拍的任务清单一起交出去', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const parent = issueNode({
+    repo: REPO,
+    number: 1,
+    body: 'ready to accept',
+    author: OWNER,
+    subIssues: [childNode({ number: 2, state: 'CLOSED', closedAt: '2026-10-20T00:00:00.000Z' })],
+  });
+  const run = createFakeRun({ onGraphql: () => inventoryData({ open: [parent] }) });
+  const github = createGithub({ profile, run });
+  const { entries, tasks } = await pollInventory({ github, profile, now: () => Date.parse('2026-10-24T00:00:00.000Z') });
+  assert.equal(entries.length, 1, '条目照旧');
+  assert.equal(tasks.length, 1, '任务清单也交出去');
+  assert.equal(tasks[0].ref, `${REPO}#1`);
+  // 清单是同一份对象的形状：能直接喂给 discoverCorrections。
+  assert.equal(typeof tasks[0].rounds, 'object');
+  assert.equal(run.calls.filter((call) => call.args.includes('graphql')).length, 1, '一次盘点只有一页请求');
+});
+
+test('#247 SC6/SC9 CLI poll.mjs 遇限流：退出码 75，不当普通失败；响应头按令牌身份记进状态文件', async () => {
+  const { home } = writeProfile(tmpDir());
+  const binDir = path.join(home, 'bin');
+  writeFakeGh(
+    binDir,
+    `if (args.includes('graphql')) {
+  process.stdout.write('HTTP/2.0 403 Forbidden\\r\\nx-ratelimit-remaining: 0\\r\\nx-ratelimit-reset: 1762299600\\r\\n\\r\\n');
+  process.stderr.write('gh: API rate limit already exceeded (HTTP 403)\\n');
+  process.exit(1);
+}
+process.exit(1);
+`,
+  );
+  const result = await runChild(process.execPath, [POLL_BIN, '--json', '--with-inventory'], {
+    env: { ...process.env, ACCEPTANCE_WATCHER_HOME: home, PATH: `${binDir}:${process.env.PATH}` },
+  });
+  assert.equal(result.code, 75, `限流要用 75 收尾：${result.stderr}`);
+  assert.match(result.stderr, /限流/);
+  const state = JSON.parse(fs.readFileSync(hostPaths(home).rateState, 'utf8'));
+  assert.equal(state.identities.user.remaining, 0, '响应头剩余记在 user 这一枚');
+  assert.equal(state.identities.app, undefined, '没有 App 令牌的记录就不编一条');
+});
+
+test('#247 P2-2 pollInventory 交出这一拍真的发了几次只读请求（用量按它记，不再恒为 1）', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const parent = issueNode({ repo: REPO, number: 1, body: 'ready to accept', author: OWNER });
+  const run = createFakeRun({
+    onGraphql: (payload) => {
+      if (!payload.variables.openAfter) {
+        return inventoryData({
+          open: [parent],
+          closed: [],
+          openPage: { hasNextPage: true, endCursor: 'open-cursor-1' },
+          closedPage: { hasNextPage: false, endCursor: null },
+        });
+      }
+      return inventoryData({
+        open: [],
+        closed: [],
+        openPage: { hasNextPage: false, endCursor: null },
+        closedPage: { hasNextPage: false, endCursor: null },
+      });
+    },
+  });
+  const github = createGithub({ profile, run });
+  const result = await pollInventory({ github, profile, now: () => Date.parse('2026-10-24T00:00:00.000Z') });
+  const graphqlCalls = run.calls.filter((call) => call.args.includes('graphql')).length;
+  assert.equal(graphqlCalls, 2, '两页就该发两次请求');
+  assert.equal(result.reads, graphqlCalls, 'reads 必须是这一拍真的发了几个请求，不能恒为 1');
 });

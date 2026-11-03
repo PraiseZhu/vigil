@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion } from './bin/rounds.mjs';
+import { collectTasks } from './bin/tasks.mjs';
 import { hostPaths } from './host/paths.mjs';
 import { appendPrbotEvent, readPrbotEvents } from './host/prbot-events.mjs';
 import {
@@ -1659,4 +1660,46 @@ test('#60 修正（#79 遗留）：修正轮写动作的 dedupeKey 带修正子 
   const seqOf = (key) => key.split(':comment:')[1].split(':')[0];
   assert.ok(updates.every((action) => /:comment:\d+:[0-9a-f]{16}$/.test(action.dedupeKey)));
   assert.equal(seqOf(updates[0].dedupeKey), '1');
+});
+
+// ── #247 SC1：discoverCorrections 接受同一拍已经拉到的任务清单，不再自己拉一遍全量盘点 ──
+
+test('#247 SC1 传了任务清单就不再发盘点查询；没传才自己拉', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const world = defaultTree({ roundStatus: '要修', roundCommentUrl: 'https://example.invalid/c' });
+  addCorrection(world);
+  const queries = [];
+  const github = {
+    async graphql(query, variables) {
+      queries.push(query);
+      if (query.includes('user(login')) {
+        return {
+          user: {
+            open: { nodes: [inventoryNode(world, `${REPO}#1`)], pageInfo: { hasNextPage: false, endCursor: null } },
+            closed: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        };
+      }
+      return world.graphql({ query, variables });
+    },
+  };
+
+  // 没传清单：自己拉一次盘点（老行为）。
+  queries.length = 0;
+  const pulled = await discoverCorrections({ github, profile });
+  assert.deepEqual(pulled.map((entry) => entry.issue), [CORRECTION_REF]);
+  const inventoryQueries = queries.filter((query) => query.includes('user(login')).length;
+  assert.equal(inventoryQueries, 1, '没传清单时自己拉一次');
+
+  // 传了清单：一次盘点查询都不发，判定结果一样。
+  const tasks = await collectTasks(github, profile);
+  queries.length = 0;
+  const reused = await discoverCorrections({ github, profile, tasks });
+  assert.deepEqual(reused.map((entry) => entry.issue), [CORRECTION_REF], '同样输入得到同样的结果');
+  assert.equal(
+    queries.filter((query) => query.includes('user(login')).length,
+    0,
+    '这一拍已经盘点过，不再发全量盘点',
+  );
 });

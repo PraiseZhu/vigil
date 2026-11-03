@@ -259,12 +259,17 @@ export async function correctionPrecheck({ github, profile, issue, hostConfig })
   return { ...base, action: 'run' };
 }
 
-export async function discoverCorrections({ github, profile, now = () => Date.now(), home, hostConfig } = {}) {
+/**
+ * 发现这一拍该开的修正轮。
+ * `tasks` 是同一拍已经拉到的任务清单（#247 SC1）：传了就直接用，不再自己拉一遍全量盘点；
+ * 没传（或者传了 null）才自己拉。两个调用方式的判定结果必须一样。
+ */
+export async function discoverCorrections({ github, profile, now = () => Date.now(), home, hostConfig, tasks: pulledTasks = null } = {}) {
   const out = [];
   const paths = typeof home === 'string' && path.isAbsolute(home) ? hostPaths(home) : null;
   // PAUSED 在：这一拍一个修正轮都不起（起了也是马上停）。
   if (paths && fs.existsSync(path.join(paths.prbotDir, 'PAUSED'))) return out;
-  const tasks = await collectTasks(github, profile);
+  const tasks = Array.isArray(pulledTasks) ? pulledTasks : await collectTasks(github, profile);
   for (const task of tasks) {
     if (task.tier !== 'auto') continue;
     const latest = latestRound(task.rounds);
@@ -282,7 +287,7 @@ export async function discoverCorrections({ github, profile, now = () => Date.no
       const correctionRepo = parseRef(correction.ref).repo;
       const scope = repoTier(correctionRepo, profile);
       if (!scope || scope.tier !== 'auto') continue;
-      // 已经收尾、或者要报的「需人工处理」已经报过的修正：不再每分钟起一个进程（它会先占槽再发现没事做）。
+      // 已经收尾、或者要报的「需人工处理」已经报过的修正：不再每拍起一个进程（它会先占槽再发现没事做）。
       if (hostConfig !== undefined) {
         let pre;
         try {

@@ -13,6 +13,35 @@ export const POLL_STALL_S = 180;
 export const POLL_BEAT_MS = 30000;
 
 /**
+ * 心跳年龄上限（#247 P2-6 / P2-B）：拍间隔 + 60 秒余量，不写死 180000 ms。
+ * 一拍的心跳时刻是「拍尾写 → sleep(拍间隔) → 下一拍 node 启动后才写」，所以「一个拍间隔」正好压在边界上，
+ * 硬贴 180000 每拍都会经过一次误报窗口。
+ * 但上限不能由心跳内容无限放大（P2-B）：`tickIntervalS` 只认 1..3600 的整数（JSON 数字，不认字符串），
+ * 缺失 / 0 / 负数 / 非整数 / 非数字 / 超上限一律回落默认 180 秒。否则一个写歪的值（例如误填毫秒 180000
+ * 或 86400）就能让看门狗几小时甚至一天不判、体检同时恒绿，而且完全静默。
+ * 写入侧（host/tick.mjs 的 tickIntervalSeconds）用同一组常量夹一次，读取侧（bin/doctor.mjs、
+ * host/ensure.sh）也夹一次：老心跳、手改的心跳、别的写入方都不会放大这个空窗。
+ */
+export const HEARTBEAT_TICK_DEFAULT_S = 180;
+export const HEARTBEAT_TICK_MAX_S = 3600;
+export const HEARTBEAT_MARGIN_MS = 60000;
+export const HEARTBEAT_MAX_AGE_MS = HEARTBEAT_TICK_DEFAULT_S * 1000 + HEARTBEAT_MARGIN_MS;
+
+/** 这份心跳算出来的拍间隔（秒）：不合规就回落默认 180 秒。 */
+export function heartbeatTickSeconds(heartbeat) {
+  const raw = heartbeat?.tickIntervalS;
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw <= 0 || raw > HEARTBEAT_TICK_MAX_S) {
+    return HEARTBEAT_TICK_DEFAULT_S;
+  }
+  return raw;
+}
+
+/** 这份心跳适用的年龄上限（毫秒）：拍间隔 + 60 秒余量。 */
+export function heartbeatMaxAgeMs(heartbeat) {
+  return heartbeatTickSeconds(heartbeat) * 1000 + HEARTBEAT_MARGIN_MS;
+}
+
+/**
  * 拉取已经跑了多少秒：优先按开机时长（uptime）算，整机冻结（墙钟跳了、uptime 没走）不算进拉取时长；
  * uptime 往回走（重启过）或没记 uptime 时退回墙钟。
  */

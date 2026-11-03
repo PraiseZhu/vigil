@@ -3,11 +3,12 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isVerdictOnly, loadAcceptanceProfile } from './profile.mjs';
-import { createGithub } from './github.mjs';
+import { RateLimitError, createGithub } from './github.mjs';
 import { collectTasks } from './tasks.mjs';
 import { createRounds, latestRound } from './rounds.mjs';
 import { lastFinal, shouldTrigger, stalledRounds } from './trigger.mjs';
 import { hostPaths, readRoundProgress } from '../host/paths.mjs';
+import { readRateState, recordHeader, writeRateState } from './rate-budget.mjs';
 
 function nextRoundNumber(rounds) {
   const max = (rounds || []).reduce((acc, round) => Math.max(acc, round.round), 0);
@@ -39,11 +40,59 @@ function defaultHostProgress(profile) {
   return (issue, round) => readRoundProgress(paths, issue, round)?.lastActivityAt || null;
 }
 
+/** 验收机的 home：profile 文件在 `<home>/config/profile.json`。 */
+export function homeOf(profile) {
+  return path.dirname(path.dirname(profile.profilePath));
+}
+
+/**
+ * 把一次响应头的剩余与 reset 记进本地状态（按令牌身份分开，SC9）。
+ * 写不下去不影响这次读：判定那边会写成 rate-unknown。
+ */
+export function rateRecorder(profile) {
+  const file = hostPaths(homeOf(profile)).rateState;
+  return (sample) => {
+    try {
+      writeRateState(file, recordHeader(readRateState(file), sample));
+    } catch {
+      // 记不下就算了，不挡这次读。
+    }
+  };
+}
+
+/**
+ * 数这一拍发了几次只读请求（#247 P2-2）：tick 按它记 loop 组件的本小时用量。
+ * 只包只读入口（graphql / ownerGraphql），写入不走这里，也不会被算成读。
+ */
+export function countReads(github, counter = { reads: 0 }) {
+  const wrapped = { ...github };
+  for (const key of ['graphql', 'ownerGraphql']) {
+    if (typeof github?.[key] !== 'function') continue;
+    wrapped[key] = (...args) => {
+      counter.reads += 1;
+      return github[key](...args);
+    };
+  }
+  wrapped.countedReads = counter;
+  return wrapped;
+}
+
 export async function poll({ github, profile, now = () => Date.now(), hostProgress }) {
   // 只读本地缓存里的 lastProgressAt（模型写的，只作参考）和宿主进度文件；不写缓存、不调 write。
-  const roundsApi = createRounds({ github, profile, now });
+  const { entries } = await pollInventory({ github, profile, now, hostProgress });
+  return entries;
+}
+
+/**
+ * 一拍一次盘点（#247 SC1）：把这一拍拉到的任务清单也交出去，tick 拿它喂给修正轮发现，
+ * 不再让 `discoverCorrections` 自己又拉一遍全量盘点。
+ * 返回值里的 `reads` 是这一拍真的发了几次只读请求（#247 P2-2）：用量记它，不写字面量。
+ */
+export async function pollInventory({ github, profile, now = () => Date.now(), hostProgress }) {
+  const counted = countReads(github);
+  const roundsApi = createRounds({ github: counted, profile, now });
   const hostProgressAt = hostProgress || defaultHostProgress(profile);
-  const tasks = await collectTasks(github, profile);
+  const tasks = await collectTasks(counted, profile);
   const out = [];
   for (const task of tasks) {
     const latest = latestRound(task.rounds);
@@ -76,17 +125,19 @@ export async function poll({ github, profile, now = () => Date.now(), hostProgre
       if (open) out.push(open);
     }
   }
-  return out;
+  return { entries: out, tasks, reads: counted.countedReads.reads };
 }
 
 async function main(argv = process.argv.slice(2)) {
   const asJson = argv.includes('--json');
+  const withInventory = argv.includes('--with-inventory');
   try {
     const profile = loadAcceptanceProfile();
-    const github = createGithub({ profile });
-    const entries = await poll({ github, profile });
+    const github = createGithub({ profile, onRateLimit: rateRecorder(profile) });
+    const { entries, tasks, reads } = await pollInventory({ github, profile });
     if (asJson) {
-      process.stdout.write(`${JSON.stringify(entries)}\n`);
+      const payload = withInventory ? { entries, tasks, reads } : entries;
+      process.stdout.write(`${JSON.stringify(payload)}\n`);
     } else if (!entries.length) {
       process.stdout.write('');
     } else {
@@ -106,7 +157,8 @@ async function main(argv = process.argv.slice(2)) {
     }
   } catch (error) {
     process.stderr.write(`${error.message || error}\n`);
-    process.exitCode = 1;
+    // 限流（#247 SC6）：退出码 75，让 tick 跳过这一拍，不当成普通失败写 tick-failed。
+    process.exitCode = error instanceof RateLimitError ? 75 : 1;
   }
 }
 

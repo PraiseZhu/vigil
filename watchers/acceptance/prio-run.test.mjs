@@ -5,10 +5,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { REPO, tmpDir, writeSecret } from './fake-gh.fixture.mjs';
+import { REPO, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 import { DOWNGRADE_MIN_GAP_MS } from './bin/prio-score.mjs';
 import { PRIO_HOURLY_MAX, PRIO_HOURLY_WINDOW_MS } from './bin/prio-sync.mjs';
-import { alertTextFor, main, parseMaxPerTick } from './bin/prio-run.mjs';
+import { alertTextFor, hostFilesFromEnv, main, parseMaxPerTick } from './bin/prio-run.mjs';
+import { hostPaths } from './host/paths.mjs';
 
 const T0 = Date.parse('2026-10-31T12:00:00.000Z');
 const HOUR = PRIO_HOURLY_WINDOW_MS;
@@ -714,4 +715,259 @@ test('#240 SC7 prio-run 默认 dry-run 不改 debounce.json，跑前跑后 sha25
   const missing = path.join(empty, 'debounce.json');
   await run(empty, [], { items: fills(1) });
   assert.equal(fs.existsSync(missing), false);
+});
+
+// ── #247 SC2：看板每拍只整板读一次，dry-run、写入、仓外读者共用一份快照 ──
+
+const BOARD_ITEMS_MARK = 'projectV2(number: $projectNumber)';
+const PR_SEARCH_MARK = 'search(query: $query, type: ISSUE';
+
+function boardNode(number, { repo = REPO, id = `PVTI_${number}` } = {}) {
+  return {
+    id,
+    isArchived: false,
+    updatedAt: '2026-10-31T10:00:00.000Z',
+    content: {
+      __typename: 'Issue',
+      number,
+      state: 'OPEN',
+      updatedAt: '2026-10-31T10:00:00.000Z',
+      repository: { nameWithOwner: repo },
+      labels: { nodes: [] },
+    },
+    fieldValues: { nodes: [] },
+  };
+}
+
+/** 真走 gh 通道的假 run：记下每次整板查询与 PR 搜索，看板条目按注入的节点返回。 */
+function boardRun({ nodes = [boardNode(1), boardNode(2)], prNodes = [] } = {}) {
+  const calls = [];
+  const run = async (cmd, args, { input } = {}) => {
+    calls.push({ cmd, args, input });
+    const payload = JSON.parse(input || '{}');
+    const query = String(payload.query || '');
+    if (query.includes(BOARD_ITEMS_MARK)) {
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          data: {
+            user: {
+              projectV2: {
+                items: { pageInfo: { hasNextPage: false, endCursor: null }, nodes },
+              },
+            },
+          },
+        }),
+        stderr: '',
+      };
+    }
+    if (query.includes(PR_SEARCH_MARK)) {
+      return {
+        code: 0,
+        stdout: JSON.stringify({ data: { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: prNodes } } }),
+        stderr: '',
+      };
+    }
+    return { code: 1, stdout: '', stderr: `unexpected query: ${query.slice(0, 40)}` };
+  };
+  run.calls = calls;
+  run.boardCalls = () => calls.filter((call) => String(JSON.parse(call.input || '{}').query || '').includes(BOARD_ITEMS_MARK)).length;
+  return run;
+}
+
+function boardSetup() {
+  const { home, profile } = writeProfile(tmpDir());
+  const dir = tmpDir();
+  return {
+    dir,
+    profile,
+    snapshotFile: path.join(home, 'state', 'host', 'board-snapshot.json'),
+    rateFile: path.join(home, 'state', 'host', 'rate-budget.json'),
+    budgetFile: path.join(home, 'config', 'rate-budget.json'),
+  };
+}
+
+function boardDeps(world, ghRun, extra = {}) {
+  return {
+    capture: true,
+    dir: world.dir,
+    stdout: capture().stdout,
+    stderr: { write() {} },
+    now: () => (extra.now == null ? T0 : extra.now),
+    loadProfile: () => world.profile,
+    snapshotFile: world.snapshotFile,
+    rateFile: world.rateFile,
+    budgetFile: world.budgetFile,
+    budgets: extra.budgets === undefined ? { loop: 500, 'prio-run': 300, 'board-live': 140 } : extra.budgets,
+    tickSeconds: 180,
+    readBack: async (change) => change.new,
+    write: extra.write || (async () => {}),
+    run: ghRun,
+    fetchImpl: async () => {
+      throw new Error('network');
+    },
+  };
+}
+
+test('#247 SC2 一拍里整板只读一次：dry-run 与写入共用同一份快照', async () => {
+  const world = boardSetup();
+  allow(world.dir, [REPO]);
+  fs.writeFileSync(path.join(world.dir, 'authorized-repos.json'), `${JSON.stringify({ repos: [REPO] })}\n`);
+
+  const dryRun = boardRun();
+  const dry = await main(['--state-dir', world.dir, '--dry-run'], boardDeps(world, dryRun));
+  assert.equal(dry.exitCode, 0);
+  assert.equal(dryRun.boardCalls(), 1, 'dry-run 整板读一次');
+  assert.equal(dry.boardSource, 'fetched');
+  const snapshot = JSON.parse(fs.readFileSync(world.snapshotFile, 'utf8'));
+  assert.equal(snapshot.items.length, 2);
+  assert.equal(snapshot.at, new Date(T0).toISOString());
+  assert.deepEqual(Object.keys(snapshot).sort(), ['at', 'excludedCount', 'items', 'nullContent', 'version']);
+
+  // 同一拍里的写入路径：快照还新，不再发整板查询。
+  const write = boardRun();
+  const written = await main(['--state-dir', world.dir, '--write'], {
+    ...boardDeps(world, write),
+    readToken: () => 'test-token-not-real',
+  });
+  assert.equal(written.exitCode, 0);
+  assert.equal(write.boardCalls(), 0, '同一拍的第二条路径不再整板读');
+  assert.equal(written.boardSource, 'snapshot');
+});
+
+test('#247 SC2 快照过期就重拉一次并覆盖；缺失时也重拉', async () => {
+  const world = boardSetup();
+  const first = boardRun({ nodes: [boardNode(1)] });
+  const one = await main(['--state-dir', world.dir, '--dry-run'], boardDeps(world, first));
+  assert.equal(one.exitCode, 0);
+  assert.equal(first.boardCalls(), 1);
+
+  // 过了两个拍间隔：快照过期，必须重拉并覆盖。
+  const later = T0 + 2 * 180 * 1000;
+  const second = boardRun({ nodes: [boardNode(1), boardNode(2)] });
+  const refreshed = await main(['--state-dir', world.dir, '--dry-run'], boardDeps(world, second, { now: later }));
+  assert.equal(refreshed.exitCode, 0);
+  assert.equal(second.boardCalls(), 1, '过期快照不用，重拉一次');
+  assert.equal(refreshed.boardSource, 'fetched');
+  assert.equal(refreshed.boardSnapshotReason, 'stale');
+  const snapshot = JSON.parse(fs.readFileSync(world.snapshotFile, 'utf8'));
+  assert.equal(snapshot.items.length, 2, '重拉的条目覆盖了旧快照');
+  assert.equal(snapshot.at, new Date(later).toISOString());
+
+  // 快照文件被删：重拉一次，报 missing。
+  fs.rmSync(world.snapshotFile);
+  const third = boardRun({ nodes: [boardNode(3)] });
+  const rebuilt = await main(['--state-dir', world.dir, '--dry-run'], boardDeps(world, third, { now: later + 1000 }));
+  assert.equal(third.boardCalls(), 1);
+  assert.equal(rebuilt.boardSnapshotReason, 'missing');
+});
+
+test('#247 SC6 剩余低于 1500：这一拍跳过看板读，不发起整板查询、不抛错、写一行「因额度跳过」', async () => {
+  const world = boardSetup();
+  const io = capture();
+  const gh = boardRun();
+  fs.mkdirSync(path.dirname(world.rateFile), { recursive: true });
+  fs.writeFileSync(
+    world.rateFile,
+    JSON.stringify({
+      version: 1,
+      identities: {
+        user: { identity: 'user', known: true, remaining: 1400, remainingRaw: '1400', reset: new Date(T0 + 600_000).toISOString(), at: new Date(T0).toISOString(), source: 'graphql' },
+      },
+      components: {},
+      recovery: null,
+      skips: { count: 0, lastAt: null },
+    }),
+  );
+  const result = await main(['--state-dir', world.dir, '--dry-run'], { ...boardDeps(world, gh), stdout: io.stdout });
+  assert.equal(result.exitCode, 0, '跳过不抛错、退出码还是 0');
+  assert.equal(result.stop, 'rate-budget');
+  assert.equal(result.skipped, 'remaining-below-1500');
+  assert.equal(gh.boardCalls(), 0, '跳过了就不发整板查询');
+  assert.match(io.text(), /rate-skip component=prio-run identity=user remaining=1400 action=remaining-below-1500 因额度跳过/);
+});
+
+test('#247 SC5 预算配置缺失：报可诊断错误、不按默认值猜，只走响应头闸', async () => {
+  const world = boardSetup();
+  const io = capture();
+  const gh = boardRun();
+  const result = await main(['--state-dir', world.dir, '--dry-run'], {
+    ...boardDeps(world, gh, { budgets: null }),
+    stdout: io.stdout,
+  });
+  assert.match(io.text(), /额度预算配置无法使用：读不到额度预算配置/);
+  assert.match(result.budgetError, /读不到额度预算配置/);
+});
+
+// ── 复审 #247 第二轮：P1-1 状态目录、P3-6 用快照不按整板读计费 ──
+
+test('#247 P1-1 宿主状态目录问 host/paths.mjs，不按 --state-dir 的布局猜（部署里两者不同级）', async () => {
+  // 夹具按部署实况摆（rev-247b P2-A）：`run.sh` 里 home 是 `$HOME/acceptance/home`、
+  // `--state-dir` 是 `$HOME/acceptance/tools/.prio`——两者是 <X>/home 与 <X>/tools/.prio，**不同级**。
+  // 老推导是「--state-dir 上两级 + state/host」；若把 state-dir 放在 home 内部（<home>/tools/.prio），
+  // 上两级正好等于 home，老代码与新代码得到同一组路径，用例就抓不住这个回归了。
+  const base = tmpDir();
+  const home = path.join(base, 'acceptance', 'home');
+  const { profile } = writeProfile(home);
+  const stateDir = path.join(base, 'acceptance', 'tools', '.prio');
+  const paths = hostPaths(home);
+  assert.notEqual(
+    path.resolve(stateDir, '..', '..'),
+    home,
+    '夹具前提：--state-dir 上两级不是 home（部署里就是不同级），否则这条用例验不出回归',
+  );
+  const env = { ACCEPTANCE_WATCHER_HOME: home };
+  const files = hostFilesFromEnv(env);
+  assert.equal(files.hostDir, paths.hostDir, '宿主目录要和 paths.mjs 的同一个');
+  assert.equal(files.boardSnapshot, paths.boardSnapshot, '快照要和仓外读者读的是同一个文件');
+  assert.equal(files.rateState, paths.rateState, '额度状态要和主循环写的是同一个文件');
+  assert.equal(files.rateBudgetConfig, paths.rateBudgetConfig, '预算配置要和主循环读的是同一个文件');
+  assert.equal(hostFilesFromEnv({}), null, '没设 ACCEPTANCE_WATCHER_HOME 就返回 null：不猜路径');
+
+  // 端到端：只给 env、不显式给文件时，快照与额度状态要落到 paths.boardSnapshot / paths.rateState，
+  // 不能落回老推导的 <state-dir>/../state/host（那个目录没人读）。
+  fs.mkdirSync(stateDir, { recursive: true });
+  const gh = boardRun({ nodes: [boardNode(1), boardNode(2)] });
+  const io = capture();
+  const result = await main(['--state-dir', stateDir, '--dry-run'], {
+    capture: true,
+    dir: stateDir,
+    env,
+    stdout: io.stdout,
+    stderr: { write() {} },
+    now: () => T0,
+    loadProfile: () => profile,
+    budgets: { loop: 500, 'prio-run': 300, 'board-live': 140 },
+    tickSeconds: 180,
+    readBack: async (change) => change.new,
+    write: async () => {},
+    run: gh,
+    fetchImpl: async () => {
+      throw new Error('network');
+    },
+  });
+  assert.equal(result.exitCode, 0, io.text());
+  assert.equal(fs.existsSync(paths.boardSnapshot), true, '快照要落在 <home>/state/host（仓外看板读者读这份）');
+  assert.equal(fs.existsSync(paths.rateState), true, '额度状态要落在 <home>/state/host/rate-budget.json');
+  const wrongDir = path.join(base, 'acceptance', 'state', 'host');
+  assert.equal(fs.existsSync(path.join(wrongDir, 'board-snapshot.json')), false, '不许落回「上两级 + state/host」的老推导目录');
+  assert.equal(fs.existsSync(path.join(wrongDir, 'rate-budget.json')), false, '额度状态也不许落到老推导目录');
+});
+
+test('#247 P3-6 用同一拍快照的那一次不按整板读记点数（否则会把自己提前停掉）', async () => {
+  const world = boardSetup();
+  const first = boardRun({ nodes: [boardNode(1)] });
+  const one = await main(['--state-dir', world.dir, '--dry-run'], boardDeps(world, first));
+  assert.equal(one.exitCode, 0);
+  assert.equal(one.boardSource, 'fetched');
+  const afterFetch = JSON.parse(fs.readFileSync(world.rateFile, 'utf8'));
+  assert.equal(afterFetch.components['prio-run'].used, 8, '真发了整板读就记 8 点');
+
+  const second = boardRun({ nodes: [boardNode(1)] });
+  const two = await main(['--state-dir', world.dir, '--dry-run'], boardDeps(world, second, { now: T0 + 1000 }));
+  assert.equal(two.exitCode, 0);
+  assert.equal(two.boardSource, 'snapshot', '同一拍用快照');
+  assert.equal(second.boardCalls(), 0, '用快照就不发整板查询');
+  const afterSnapshot = JSON.parse(fs.readFileSync(world.rateFile, 'utf8'));
+  assert.equal(afterSnapshot.components['prio-run'].used, 8, '没发整板读就不该再记 8 点');
 });

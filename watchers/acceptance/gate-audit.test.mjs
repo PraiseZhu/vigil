@@ -18,6 +18,7 @@ import { READ_RETRY_DELAY_MS } from './bin/github.mjs';
 import {
   AUDIT_COMMENT_CONCURRENCY,
   AUDIT_COMMENTS_QUERY,
+  AUDIT_PENDING_LIMIT,
   AUDIT_RULES_VERSION,
   DEFINITE_RULES,
   RULE_TEXT,
@@ -42,6 +43,7 @@ import { OWNER, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = 'example-owner/example-repo';
 const WATCH_REPO = 'example-org/watch-repo';
+const OTHER_ROOT = 'example-owner/other-repo';
 const ROOT = `${REPO}#1`;
 const CORRECTION = `${REPO}#2`;
 const AT = '2026-02-01T00:00:00.000Z';
@@ -833,7 +835,7 @@ test('明确违规照旧发提醒：pr.merge / 范围外仓库 / 越权写 / 轮
   }
 });
 
-test('GitHub 只读：轮次评论缺失报 definite、写提醒，且只发评论查询', async () => {
+test('GitHub 只读：新增轮次的评论缺失报 definite、写提醒；只查新增轮次所在的根（#247 SC4）', async () => {
   const history = compliantEntries();
   const home = homeWithLedger(history);
   const initial = roundGithub();
@@ -844,7 +846,9 @@ test('GitHub 只读：轮次评论缺失报 definite、写提醒，且只发评�
   assert.ok(initial.calls.length > 0);
   for (const call of initial.calls) assert.equal(call.query, AUDIT_COMMENTS_QUERY);
 
-  const missing = roundGithub({ missing: new Set([1003]) });
+  // 账本尾部新增一轮：只审这一轮所在的新增根，历史根不重算（SC4 的增量口径）。
+  appendLedger(home, [roundStart(1011, 5)]);
+  const missing = roundGithub({ missing: new Set([1011]) });
   const second = await runGateAudit({ home, profile: profile(), github: missing, now: () => NOW });
   assert.deepEqual(second.newViolations.map((item) => item.rule), ['round-comment-missing']);
   assert.equal(second.newViolations[0].level, 'violation');
@@ -852,12 +856,33 @@ test('GitHub 只读：轮次评论缺失报 definite、写提醒，且只发评�
   assert.equal(second.status, 'violation');
   assert.equal(second.sinceBaseline, 1);
   assert.deepEqual(second.githubErrors, []);
-  assert.ok(missing.calls.length > 0);
+  assert.equal(missing.calls.length, 1, '只查新增轮次所在的根，不扫全部根');
   for (const call of missing.calls) assert.equal(call.query, AUDIT_COMMENTS_QUERY, '只许发固定的只读评论查询');
   const alerts = readAlerts(hostPaths(home)).filter((alert) => alert.kind === 'gate-audit-violation');
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0].count, 1);
-  assert.match(alerts[0].detail, /第 11 行 round-comment-missing|轮次评论 1003/);
+  assert.match(alerts[0].detail, /第 11 行 round-comment-missing|轮次评论 1011/);
+});
+
+test('#247 SC4 账本没新增时第二轮不再发评论查询；请求数只随新增根增长', async () => {
+  const home = homeWithLedger(compliantEntries());
+  const first = roundGithub();
+  await runGateAudit({ home, profile: profile(), github: first, now: () => NOW });
+  const baselineCalls = first.calls.length;
+  assert.ok(baselineCalls >= 2, `建基线时要查全部根，实际 ${baselineCalls}`);
+
+  const same = roundGithub();
+  const second = await runGateAudit({ home, profile: profile(), github: same, now: () => NOW });
+  assert.equal(same.calls.length, 0, '账本没新增就不发任何评论查询');
+  assert.deepEqual(second.newViolations, []);
+  assert.equal(second.githubErrors.length, 0);
+
+  // 只多一个新根：请求数 +1，不随账本总量增长。
+  appendLedger(home, [roundStart(3001, 1, { root: `${OTHER_ROOT}#7`, repo: OTHER_ROOT, issue: 7 })]);
+  const one = trackingGithub({ nodesFor: () => [{ databaseId: 3001, createdAt: AT }] });
+  await runGateAudit({ home, profile: profile(), github: one, now: () => NOW });
+  assert.equal(one.calls.length, 1, '新增一个根就只查一个根');
+  assert.equal(one.calls[0].variables.number, 7);
 });
 
 test('两类同时出现：提醒的 count/detail/rules 只含 definite，日志两类都记', async () => {
@@ -1338,12 +1363,15 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** 改前 checkRoundComments 的逐条参考：判定、错误文案、合并顺序都照原循环。 */
+/** 改前 checkRoundComments 的逐条参考：判定、错误文案、合并顺序都照原循环（含 P1-2 的待审集合）。 */
 async function serialCheckRoundComments({ rounds, entries, github }) {
   const violations = [];
   const errors = [];
-  if (!github || typeof github.graphql !== 'function') return { violations, errors, checked: 0 };
+  if (!github || typeof github.graphql !== 'function') {
+    return { violations, errors, checked: 0, pending: [], pendingDropped: 0, pendingDroppedFromLine: null };
+  }
   let checked = 0;
+  const pending = new Map();
   const byRoot = new Map();
   for (const value of rounds.values()) {
     const list = byRoot.get(value.root) || [];
@@ -1362,10 +1390,12 @@ async function serialCheckRoundComments({ rounds, entries, github }) {
       const message = error?.message || error;
       const text = message === undefined || message === null ? '' : String(message);
       errors.push(`${root}：${text.split('\n')[0].slice(0, 120)}`);
+      for (const value of list) pending.set(String(value.commentId), value);
       continue;
     }
     if (!Array.isArray(nodes)) {
       errors.push(`${root}：读不到评论`);
+      for (const value of list) pending.set(String(value.commentId), value);
       continue;
     }
     checked += 1;
@@ -1392,7 +1422,17 @@ async function serialCheckRoundComments({ rounds, entries, github }) {
       });
     }
   }
-  return { violations, errors, checked };
+  // 待审集合上限的处理与生产实现同形（#247 P3-2）：只留前 AUDIT_PENDING_LIMIT 条，被丢掉的条数与最早行号一起交出去。
+  const all = [...pending.values()];
+  const dropped = all.slice(AUDIT_PENDING_LIMIT);
+  return {
+    violations,
+    errors,
+    checked,
+    pending: all.slice(0, AUDIT_PENDING_LIMIT).map((value) => String(value.commentId)),
+    pendingDropped: dropped.length,
+    pendingDroppedFromLine: dropped.length ? Math.min(...dropped.map((value) => Number(value.line))) : null,
+  };
 }
 
 /** 每个根两条轮次评论。偶数号缺第二条。另放一个对不上 issue 引用的根（两边都应跳过）。 */
@@ -1624,4 +1664,112 @@ test('假 GitHub 每请求 200ms、70 个根：并发耗时低于串行的 50%',
   assert.equal(result.checked, count);
   assert.ok(concurrentGithub.peak > 1 && concurrentGithub.peak <= 4, `peak=${concurrentGithub.peak}`);
   assert.ok(concurrentMs < serialMs * 0.5, `concurrent ${concurrentMs.toFixed(0)}ms serial ${serialMs.toFixed(0)}ms`);
+});
+
+test('#247 P1-2 某个根的评论查询失败一次：下一轮仍然重查这个根，不漏审、不把缺口固化', async () => {
+  const home = homeWithLedger(compliantEntries());
+  const baseline = await runGateAudit({ home, profile: profile(), github: roundGithub(), now: () => NOW });
+  assert.equal(baseline.baseline.githubChecked, true);
+
+  // 账本尾部新增一轮（根 1）：这一轮查根 1 时抛 502。
+  appendLedger(home, [roundStart(1011, 5)]);
+  const failed = trackingGithub({ nodesFor: () => [], failFor: (vars) => (vars.number === 1 ? new Error('HTTP 502 boom') : null) });
+  const second = await runGateAudit({ home, profile: profile(), github: failed, now: () => NOW });
+  assert.deepEqual(failed.calls.map((call) => call.variables.number), [1], '这一轮要查到根 1 并失败');
+  assert.equal(second.githubErrors.length, 1);
+  assert.deepEqual(second.newViolations, [], '没查成就不下结论');
+
+  // 下一轮账本没有新增：上一轮没查成的根必须重查。评论 1011 已被删 → 报 definite。
+  const retry = trackingGithub({ nodesFor: (vars) => (vars.number === 1 ? [{ databaseId: 1001, createdAt: AT }] : []) });
+  const third = await runGateAudit({ home, profile: profile(), github: retry, now: () => NOW });
+  assert.ok(
+    retry.calls.some((call) => call.variables.number === 1),
+    `失败的根下一轮要重查，不能永久退出审计（实际查了 ${JSON.stringify(retry.calls.map((call) => call.variables.number))}）`,
+  );
+  assert.deepEqual(third.newViolations.map((item) => item.rule), ['round-comment-missing']);
+  assert.match(third.newViolations[0].detail, /1011/);
+
+  // 查成了就不再挂着：再下一轮一个请求也不发。
+  const idle = trackingGithub({ nodesFor: () => [] });
+  await runGateAudit({ home, profile: profile(), github: idle, now: () => NOW });
+  assert.equal(idle.calls.length, 0, '查成之后待审集合要清掉');
+});
+
+// #247 P3-2（复审 rev-247b）：待审集合上限 500 的截断不能静默 —— 丢掉的轮次行号 ≤ from、又不在
+// pending 里，就永久不再被审。超上限时把游标退回到被丢掉的最早一轮之前，下一轮当「新增轮次」重查，
+// 并在审计日志留一行。基线那一轮和之后的增量轮都要这样（两条路径各一条用例）。
+
+/** count 个根各一轮：一次全网失败就会把待审集合撑破（上限 500）。 */
+function overflowRoundStarts(count, { offset = 900000 } = {}) {
+  const entries = [];
+  for (let number = 1; number <= count; number += 1) {
+    entries.push(
+      roundStart(offset + number, 1, { root: `example-org/audit-repo#${number}`, repo: 'example-org/audit-repo', issue: number }),
+    );
+  }
+  return entries;
+}
+
+function pendingOverflowRows(paths) {
+  return fs
+    .readFileSync(paths.auditLogFile, 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line))
+    .filter((row) => row.rule === 'pending-overflow');
+}
+
+test('#247 P3-2 增量轮待审超过上限：被截掉的轮次下一轮一定重查，并在审计日志留一行', async () => {
+  const count = AUDIT_PENDING_LIMIT + 1;
+  const home = homeWithLedger(compliantEntries());
+  await runGateAudit({ home, profile: profile(), github: trackingGithub({ nodesFor: () => [] }), now: () => NOW });
+
+  // 账本尾部一次冒出 501 个新根，评论全查不成 → 待审集合装不下，只能记 500 条。
+  appendLedger(home, overflowRoundStarts(count));
+  const down = trackingGithub({ nodesFor: () => [], failFor: () => new Error('HTTP 502 boom') });
+  const second = await runGateAudit({ home, profile: profile(), github: down, now: () => NOW });
+  assert.equal(down.calls.length, count);
+  const paths = auditPaths(home);
+  const state = JSON.parse(fs.readFileSync(paths.auditStateFile, 'utf8'));
+  assert.equal(state.pendingGithubRounds.length, AUDIT_PENDING_LIMIT, '待审集合仍按上限截断');
+  assert.ok(second.githubErrors.length >= 1);
+  const overflow = pendingOverflowRows(paths);
+  assert.equal(overflow.length, 1, '截断要留一行可查的痕迹，不许静默丢');
+  assert.match(overflow[0].detail, new RegExp(`上限 ${AUDIT_PENDING_LIMIT}，丢掉 1 条`));
+
+  // 下一轮账本没新增：被截掉的那个根仍在审计范围内，必须重查。
+  const retry = trackingGithub({ nodesFor: () => [] });
+  const third = await runGateAudit({ home, profile: profile(), github: retry, now: () => NOW });
+  const asked = retry.calls.map((call) => call.variables.number);
+  assert.equal(asked.includes(count), true, `被截掉的根 ${count} 下一轮要重查（实际查了 ${asked.length} 个根）`);
+  assert.equal(asked.includes(1), true, '待审集合里那 500 个根也照旧重查');
+  assert.equal(
+    third.newViolations.some((item) => item.rule === 'ledger-rewritten'),
+    false,
+    '游标退回不触发「账本被改写」（prefixHash 跟着退回去重算）',
+  );
+
+  // 全部查成之后：待审集合清空，游标回到末尾，再下一轮一个请求也不发。
+  const idle = trackingGithub({ nodesFor: () => [] });
+  await runGateAudit({ home, profile: profile(), github: idle, now: () => NOW });
+  assert.equal(idle.calls.length, 0, '查成之后不该再挂着');
+  const after = JSON.parse(fs.readFileSync(paths.auditStateFile, 'utf8'));
+  assert.deepEqual(after.pendingGithubRounds, []);
+});
+
+test('#247 P3-2 建基线那一轮待审就超过上限：同样退回去重查，不静默丢', async () => {
+  const count = AUDIT_PENDING_LIMIT + 1;
+  const home = homeWithLedger(overflowRoundStarts(count));
+  const down = trackingGithub({ nodesFor: () => [], failFor: () => new Error('HTTP 502 boom') });
+  const first = await runGateAudit({ home, profile: profile(), github: down, now: () => NOW });
+  assert.equal(first.baselineCreated, true);
+  assert.equal(pendingOverflowRows(auditPaths(home)).length, 1);
+
+  const retry = trackingGithub({ nodesFor: () => [] });
+  await runGateAudit({ home, profile: profile(), github: retry, now: () => NOW });
+  assert.equal(
+    retry.calls.map((call) => call.variables.number).includes(count),
+    true,
+    '基线那一轮被截掉的根也要重查',
+  );
 });

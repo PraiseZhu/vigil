@@ -283,6 +283,67 @@ function signJwt(pem, payload) {
 export const READ_RETRY_DELAY_MS = 4000;
 
 /**
+ * 限流被识别出来时抛这个（#247 SC7）：调用方据此跳过这一拍，不再当普通失败抛到整拍。
+ * `remaining` / `reset` 是响应头原值（缺失时为 null），只用来记日志与本地状态。
+ */
+export class RateLimitError extends Error {
+  constructor(message = '触发 GitHub 限流', { remaining = null, reset = null, identity = null } = {}) {
+    super(message);
+    this.name = 'RateLimitError';
+    this.code = 'RATE_LIMITED';
+    this.remaining = remaining;
+    this.reset = reset;
+    this.identity = identity;
+  }
+}
+
+/**
+ * `gh api --include` 的输出拆成响应头与正文。只有真以 HTTP 状态行开头时才拆，
+ * 不然原样返回（老版本 gh、或测试替身只给正文）。
+ */
+export function splitGhHeaders(stdout) {
+  const text = String(stdout ?? '');
+  if (!/^HTTP\/\d/.test(text)) return { headers: {}, body: text };
+  const crlf = text.indexOf('\r\n\r\n');
+  const lf = text.indexOf('\n\n');
+  let cut = -1;
+  if (crlf >= 0 && (lf < 0 || crlf < lf)) cut = crlf + 4;
+  else if (lf >= 0) cut = lf + 2;
+  if (cut < 0) return { headers: {}, body: text };
+  const headers = {};
+  for (const line of text.slice(0, cut).split(/\r?\n/).slice(1)) {
+    const idx = line.indexOf(':');
+    if (idx <= 0) continue;
+    headers[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim();
+  }
+  return { headers, body: text.slice(cut) };
+}
+
+/** 从响应头里取限额相关的两个原值（`x-ratelimit-remaining` / `x-ratelimit-reset`）。 */
+export function rateHeadersOf(headers) {
+  const get = (name) => {
+    if (!headers) return null;
+    if (typeof headers.get === 'function') return headers.get(name) ?? null;
+    const found = Object.keys(headers).find((key) => key.toLowerCase() === name);
+    return found === undefined ? null : headers[found];
+  };
+  return { remaining: get('x-ratelimit-remaining'), reset: get('x-ratelimit-reset') };
+}
+
+/**
+ * 是不是限流错误（#247 SC7）：403 带 rate limit 文案、429、GraphQL 的 `RATE_LIMITED` 错误码。
+ * 只在失败结果上判，不把响应头里的字面量当依据。
+ */
+export function isRateLimitFailure(result) {
+  const text = `${result?.stderr || ''}\n${result?.stdout || ''}`;
+  if (/\bRATE_LIMITED\b/.test(text)) return true;
+  if (/\b429\b/.test(text) && /rate limit|too many requests/i.test(text)) return true;
+  if (/\b403\b/.test(text) && /rate limit/i.test(text)) return true;
+  if (/API rate limit already exceeded|rate limit exceeded|secondary rate limit/i.test(text)) return true;
+  return false;
+}
+
+/**
  * gh 失败输出是不是 GitHub / 网络的瞬时故障：502/503/504、HTTP/2 流被对方断开、连接被重置、超时。
  * 404、401、权限、GraphQL 业务错误等都不算，不重试。
  */
@@ -527,12 +588,26 @@ function defaultFallbackLog(profile) {
   };
 }
 
-export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog, ownerToken } = {}) {
+export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog, ownerToken, onRateLimit } = {}) {
   if (!profile) throw new Error('createGithub 需要 profile');
   const runCmd = run || defaultRun;
   const fetchFn = fetchImpl || globalThis.fetch;
   const sleepFn = sleep || defaultSleep;
   const nowFn = now || (() => Date.now());
+
+  /** 只读通道把限额响应头交给调用方（#247）：带上这枚令牌的身份标记，值给原值，不在这里解释。 */
+  function noteRateHeaders(headers, identity, source) {
+    if (typeof onRateLimit !== 'function') return;
+    const rate = rateHeadersOf(headers);
+    // 没有响应头块（DNS 失败、连接超时、老版本 gh、App 令牌 401 回落）时一个字段都没有：
+    // 这时什么都不记，否则会把上一次的有效剩余覆盖成 unknown，恰好是最需要退避的时候闸门失效（#247 P2-4）。
+    if (rate.remaining == null && rate.reset == null) return;
+    try {
+      onRateLimit({ identity, remaining: rate.remaining, reset: rate.reset, at: nowFn(), source });
+    } catch {
+      // 记录剩余额度失败不影响这次读。
+    }
+  }
 
   let ownerTokenCache;
   let appTokenCache;
@@ -633,16 +708,39 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
 
   async function sendGraphql(token, query, variables) {
     const opts = { env: ghEnv(token), input: JSON.stringify({ query, variables }) };
-    const args = ['api', 'graphql', '--input', '-'];
-    // 只有纯查询才重试；mutation 哪怕走到这里也只发一次。
-    return isReadOnlyGraphql(query) ? runRead(args, opts) : runCmd('gh', args, opts);
+    // 只读查询要带着响应头回来（--include）：限额剩余只能从响应头看，不能从 rate_limit 表看。
+    // 写（mutation）不加 --include，也不重试。
+    const readArgs = ['api', 'graphql', '--include', '--input', '-'];
+    const writeArgs = ['api', 'graphql', '--input', '-'];
+    return isReadOnlyGraphql(query) ? runRead(readArgs, opts) : runCmd('gh', writeArgs, opts);
   }
 
-  function finishGraphql(result, token) {
-    if (result.code !== 0) failFrom(result, token);
-    const parsed = parseJson(result.stdout, 'GraphQL');
+  function finishGraphql(result, token, identity) {
+    const { headers, body } = splitGhHeaders(result?.stdout);
+    if (identity) noteRateHeaders(headers, identity, 'graphql');
+    if (result.code !== 0) {
+      const rate = rateHeadersOf(headers);
+      if (isRateLimitFailure(result)) {
+        throw new RateLimitError('触发 GitHub 限流（响应头剩余 ' + (rate.remaining ?? '未知') + '）', {
+          remaining: rate.remaining,
+          reset: rate.reset,
+          identity,
+        });
+      }
+      failFrom({ ...result, stdout: body }, token);
+    }
+    const parsed = parseJson(body, 'GraphQL');
     if (parsed.errors?.length) {
-      throw new Error(redact(parsed.errors.map((err) => err.message).join('; '), [token, ownerTokenCache, appTokenCache, cmdTokenCache]));
+      const messages = parsed.errors.map((err) => String(err.message || ''));
+      if (parsed.errors.some((err) => String(err.extensions?.code || err.type || '').includes('RATE_LIMITED')) || isRateLimitFailure({ stdout: messages.join('; ') })) {
+        const rate = rateHeadersOf(headers);
+        throw new RateLimitError(`触发 GitHub 限流：${messages.join('; ').slice(0, 200)}`, {
+          remaining: rate.remaining,
+          reset: rate.reset,
+          identity,
+        });
+      }
+      throw new Error(redact(messages.join('; '), [token, ownerTokenCache, appTokenCache, cmdTokenCache]));
     }
     return parsed.data ?? parsed;
   }
@@ -654,7 +752,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
       if (appToken) {
         const first = await sendGraphql(appToken, query, variables);
         const kind = appFallbackKind(first);
-        if (!kind) return finishGraphql(first, appToken);
+        if (!kind) return finishGraphql(first, appToken, 'app');
         // 401：令牌本身坏了，这个实例里不再用它。
         if (kind === 'auth-401') {
           cmdTokenFailed = true;
@@ -665,10 +763,10 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
         logFallback('token-failed', appRepo);
       }
       const ownerToken = getOwnerToken();
-      return finishGraphql(await sendGraphql(ownerToken, query, variables), ownerToken);
+      return finishGraphql(await sendGraphql(ownerToken, query, variables), ownerToken, 'user');
     }
     const token = await getReadToken();
-    return finishGraphql(await sendGraphql(token, query, variables), token);
+    return finishGraphql(await sendGraphql(token, query, variables), token, profile.appConfigPath ? 'app' : 'user');
   }
 
   async function graphqlFetch(token, query, variables) {
@@ -688,8 +786,14 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
       throw new Error('GraphQL 请求失败');
     }
     const raw = typeof res?.text === 'function' ? await res.text() : '';
+    noteRateHeaders(res?.headers, 'user', 'graphql-fetch');
     if (res && res.ok === false) {
-      throw new Error(redact(raw, [token]) || `GraphQL HTTP ${res.status}`);
+      const rate = rateHeadersOf(res?.headers);
+      const text = redact(raw, [token]) || `GraphQL HTTP ${res.status}`;
+      if (isRateLimitFailure({ stdout: text })) {
+        throw new RateLimitError(text, { remaining: rate.remaining, reset: rate.reset, identity: 'user' });
+      }
+      throw new Error(text);
     }
     let parsed;
     try {
@@ -717,12 +821,24 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     if (!isReadOnlyGraphql(query)) return graphqlWrite(query, variables);
     if (usesPriorityToken()) return graphqlFetch(ownerToken, query, variables);
     const token = getOwnerToken();
-    const result = await runRead(['api', 'graphql', '--input', '-'], {
+    const result = await runRead(['api', 'graphql', '--include', '--input', '-'], {
       env: ghEnv(token),
       input: JSON.stringify({ query, variables }),
     });
-    if (result.code !== 0) failFrom(result, token);
-    const parsed = parseJson(result.stdout, 'GraphQL');
+    const { headers, body } = splitGhHeaders(result?.stdout);
+    noteRateHeaders(headers, 'user', 'graphql');
+    if (result.code !== 0) {
+      const rate = rateHeadersOf(headers);
+      if (isRateLimitFailure(result)) {
+        throw new RateLimitError('触发 GitHub 限流（响应头剩余 ' + (rate.remaining ?? '未知') + '）', {
+          remaining: rate.remaining,
+          reset: rate.reset,
+          identity: 'user',
+        });
+      }
+      failFrom({ ...result, stdout: body }, token);
+    }
+    const parsed = parseJson(body, 'GraphQL');
     if (parsed.errors?.length) {
       throw new Error(redact(parsed.errors.map((err) => err.message).join('; '), [token]));
     }

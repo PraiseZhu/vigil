@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 一拍调度（#47 SC12 / SC13）：常驻循环每分钟调一次。
+// 一拍调度（#47 SC12 / SC13）：常驻循环每 180 秒调一次（#247 SC3：60 → 180）。
 // 1) poll.mjs 在沙箱外跑（只读盘点，可以读 GitHub 令牌），不进 bwrap；2) 卡住的轮次先杀进程再 abort；
 // 3) 按空槽起新的 round；4) 写心跳。任何错误都只落进心跳和 alerts.jsonl，绝不抛出循环。
 import fs from 'node:fs';
@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadAcceptanceProfile } from '../bin/profile.mjs';
-import { createGithub } from '../bin/github.mjs';
+import { RateLimitError, createGithub } from '../bin/github.mjs';
 import { runRound as runRoundCommand } from '../bin/round.mjs';
 import { appendAlert, hostPaths, isAlive, readAlerts, readLockPayload } from './paths.mjs';
 import { run as procRun, spawnBackground } from './proc.mjs';
@@ -16,8 +16,21 @@ import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbo
 import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
 import { defaultSpawnAdjudicate, scheduleAdjudications } from './adjudicate.mjs';
 import { runGateAudit } from './gate-audit.mjs';
-import { POLL_BEAT_MS, startTickBeat } from './poll-beat.mjs';
+import { HEARTBEAT_TICK_MAX_S, POLL_BEAT_MS, startTickBeat } from './poll-beat.mjs';
 import { isReadOnlyGraphql } from '../bin/github.mjs';
+import {
+  GRAPHQL_COST_PER_REQUEST,
+  appendRateLog,
+  chargeBudget,
+  decideTick,
+  defaultIdentity,
+  identityRecord,
+  rateLogLine,
+  readBudgetFile,
+  readRateState,
+  recordHeader,
+  writeRateState,
+} from '../bin/rate-budget.mjs';
 
 /**
  * 这一拍里单次读 GitHub 的超时（T20 定 120 秒，T23 降到 45 秒）。正常一次读不到 1 秒；挂住的读是平台快照恢复后
@@ -41,6 +54,39 @@ export const POLL_TIMEOUT_MS = 60000;
 export const MAX_CHILD_CLAIMS_PER_TICK = 1;
 
 const RETRIED = '（已重试一次）';
+
+/**
+ * 主循环的拍间隔（秒，#247 SC3）：60 → 180。改完看板更新延迟仍在几分钟内（实测门槛见
+ * docs/acceptance-operations.md）。`host/loop` 用同一个默认值，并通过 `ACCEPTANCE_TICK_SECONDS`
+ * 把生效值告诉这一拍，心跳里写成 `tickIntervalS` 供体检和测试替身读。
+ */
+export const TICK_INTERVAL_SECONDS = 180;
+
+/**
+ * 拍间隔的上界（秒，#247 P2-B）：与心跳年龄上限同源。`host/loop` 真正 sleep 的也是这个值，写进心跳的不能比它大，
+ * 也不能大到一个看门狗判不了（例如误填毫秒 180000 → 上限 50 小时、86400 → 一天）。
+ */
+export const TICK_INTERVAL_MAX_SECONDS = HEARTBEAT_TICK_MAX_S;
+
+/** 这一拍生效的拍间隔（秒）：`host/loop` 注入的 ACCEPTANCE_TICK_SECONDS，不合法或超出 1..3600 就用默认 180。 */
+export function tickIntervalSeconds(env = {}) {
+  const raw = Number(env?.ACCEPTANCE_TICK_SECONDS);
+  return Number.isInteger(raw) && raw > 0 && raw <= TICK_INTERVAL_MAX_SECONDS ? raw : TICK_INTERVAL_SECONDS;
+}
+
+/**
+ * 限流（poll 退出码 75，#247 SC6）：这一拍跳过，不写 tick-failed、不让看门狗停循环。
+ * poll 已经把「因额度跳过」写进 loop.log。
+ */
+export const POLL_RATE_LIMITED_CODE = 75;
+
+/**
+ * 是不是限流错误（#247 P2-1）：本仓的 RateLimitError，或任何带 RATE_LIMITED 错误码的错误。
+ * 限流不当普通失败：这一段跳过、不写 tick-failed / prbot-tick-failed。
+ */
+export function isRateLimitError(error) {
+  return error instanceof RateLimitError || error?.code === 'RATE_LIMITED';
+}
 
 /**
  * 重试成功不写告警，只在 loop.log 留一行（T23），方便统计超时次数。格式固定：
@@ -362,6 +408,8 @@ export async function runTick({
     at: new Date(now()).toISOString(),
     pid: loopPid(env),
     uptimeS: uptime(),
+    // 生效的拍间隔（秒）：`host/loop` 注入的 ACCEPTANCE_TICK_SECONDS，没注入就用默认 180。
+    tickIntervalS: tickIntervalSeconds(env),
     lastTick: { ok: true, started: [], stale: [], error: null },
     running: [],
   };
@@ -424,10 +472,117 @@ export async function runTick({
     const gateEnabled = fs.existsSync(paths.enabledFile);
     heartbeat.gate = gateEnabled ? 'enabled' : 'disabled';
     tickBeat.setPhase('poll');
+
+    // 额度两道闸（#247 SC5-6-8-9）：预算从 <home>/config/rate-budget.json 读，剩余只看响应头记录。
+    // 预算配置缺了或不对：只记进心跳、不猜默认值（这一拍照跑，但完全不带预算闸）。
+    let rateBudgets = null;
+    try {
+      rateBudgets = readBudgetFile(paths.rateBudgetConfig);
+    } catch (error) {
+      heartbeat.lastTick.rateBudgetError = String(error?.message || error);
+    }
+
+    /** 判定一次读能不能发；日志行（因额度跳过 / rate-unknown / 重置后限速）写 loop.log。 */
+    const rateGate = ({ component, purpose = 'non-essential', cost = 0, reserve = 0, tickId } = {}) => {
+      try {
+        const decided = decideTick({
+          component,
+          purpose,
+          state: readRateState(paths.rateState),
+          now: now(),
+          tickId,
+          budgets: rateBudgets,
+          cost,
+          reserve,
+        });
+        appendRateLog(paths.loopLog, decided.log);
+        writeRateState(paths.rateState, decided.state);
+        return decided;
+      } catch (error) {
+        // 判定自身出错不把这一拍弄挂，但必须留痕（#247 P3-1）：心跳 + loop.log，不然 SC5/SC6 整条链断了没人知道。
+        const message = String(error?.message || error);
+        heartbeat.lastTick.rateGateError = message;
+        appendRateLog(
+          paths.loopLog,
+          `${new Date(now()).toISOString()} rate-unknown component=${component} identity=${defaultIdentity(component)} remaining=unknown reason=rate-gate-error 判定或写状态出错，这一拍放行`,
+        );
+        return { allowed: true, reason: 'rate-gate-error', error: message };
+      }
+    };
+
+    /**
+     * 记一次「因额度跳过」（#247 SC6 / P2-3）：心跳只写一个字段名（`rateSkipped`），
+     * 连续跳过超过 N 拍时再写一条提醒——心跳 ok:true 不会让看门狗发现「整小时没在推进」。
+     */
+    const noteRateSkip = (decided, { component, purpose }) => {
+      if (!decided) return;
+      if (!decided.allowed) heartbeat.lastTick.rateSkipped = decided.reason || 'rate-skip';
+      if (!decided.escalate) return;
+      try {
+        appendAlert(paths, {
+          kind: 'rate-skip-escalate',
+          reason: `连续 ${decided.skipStreak} 拍因额度跳过`,
+          detail: [component, purpose, decided.reason].filter(Boolean).join(' '),
+          count: decided.skipStreak,
+          component,
+          now,
+        });
+      } catch {
+        // 提醒写不下去就只留日志。
+      }
+    };
+
+    /**
+     * 限流（#247 SC6 / P2-1）：这一段这一拍跳过，不当成普通失败写 tick-failed / prbot-tick-failed。
+     * 限流带上来的响应头也记进状态文件，下一拍的闸才看得见真实剩余。
+     */
+    const noteRateLimited = (stage, error) => {
+      const identity = error?.identity === 'app' ? 'app' : defaultIdentity('loop');
+      try {
+        if (error?.remaining != null || error?.reset != null) {
+          writeRateState(
+            paths.rateState,
+            recordHeader(readRateState(paths.rateState), {
+              identity,
+              remaining: error.remaining ?? null,
+              reset: error.reset ?? null,
+              at: now(),
+              source: 'graphql',
+            }),
+          );
+        }
+      } catch {
+        // 记不下不挡这一拍。
+      }
+      const record = identityRecord(readRateState(paths.rateState), identity);
+      appendRateLog(
+        paths.loopLog,
+        rateLogLine({
+          kind: 'rate-skip',
+          now: now(),
+          component: 'loop',
+          identity,
+          remaining: record?.known ? record.remaining : null,
+          action: 'github-rate-limited',
+        }),
+      );
+      // 跳过原因统一一个值（外部只认一个字段、一个词），具体是哪一段看 rateSkippedStage。
+      heartbeat.lastTick.rateSkipped = 'github-rate-limited';
+      heartbeat.lastTick.rateSkippedStage = stage;
+    };
+
+    // 主循环 poll 是必要读（低额度时优先），但预算超了也要跳过这一拍（#247 SC5）。
+    // `reserve` 只在预算比较时算上这一次读的估计点数：预算刚好剩一点时提前止步（P3-2 的 cost 也不再恒为 0）。
+    const pollGate = rateGate({ component: 'loop', purpose: 'essential', reserve: GRAPHQL_COST_PER_REQUEST });
+    noteRateSkip(pollGate, { component: 'loop', purpose: 'essential' });
+    if (!pollGate.allowed) {
+      tickBeat.stop();
+      return writeHeartbeat();
+    }
     // T23：拉取是只读盘点。超时（124）时 proc.run 整组杀掉 poll 和它起的 gh（不留孤儿），再用新进程重试一次；
     // 重试成功不写提醒，重试也超时才按这一拍失败处理。其余失败（非 124）不重试，照旧。
     const pollOnce = () =>
-      run('node', [path.join(repoRoot, 'watchers', 'acceptance', 'bin', 'poll.mjs'), '--json'], {
+      run('node', [path.join(repoRoot, 'watchers', 'acceptance', 'bin', 'poll.mjs'), '--json', '--with-inventory'], {
         env: { ...env, ACCEPTANCE_WATCHER_HOME: home },
         timeoutMs: POLL_TIMEOUT_MS,
         killGroup: true,
@@ -440,18 +595,47 @@ export async function runTick({
       poll = await pollOnce();
       if (poll && poll.code === 0) logReadRetryOk(paths, 'poll', Date.now() - pollStartedAt, now);
     }
+    if (poll && poll.code === POLL_RATE_LIMITED_CODE) {
+      // 限流（#247 SC6）：这一拍跳过，不写 tick-failed。心跳照旧写，看门狗不会停循环。
+      // 日志里的剩余用 poll 刚记下的真实值（P3-2），不写死 unknown。
+      noteRateLimited('poll', { identity: defaultIdentity('loop') });
+      tickBeat.stop();
+      return writeHeartbeat();
+    }
     if (!poll || poll.code !== 0) {
       throw new Error(
         `poll 失败（退出码 ${poll?.code ?? '未知'}）${pollRetried ? RETRIED : ''}：${String(poll?.stderr || '').trim().split('\n')[0] || ''}`,
       );
     }
     let entries;
+    let inventoryTasks = null;
+    let pollReads = 1;
     try {
-      entries = JSON.parse(poll.stdout || '[]');
+      const parsedPoll = JSON.parse(poll.stdout || '[]');
+      // poll --with-inventory 给 `{entries, tasks, reads}`；老形状（数组）也照旧认。
+      if (Array.isArray(parsedPoll)) entries = parsedPoll;
+      else if (parsedPoll && Array.isArray(parsedPoll.entries)) {
+        entries = parsedPoll.entries;
+        inventoryTasks = Array.isArray(parsedPoll.tasks) ? parsedPoll.tasks : null;
+        // reads=0 是「这一拍没发只读请求」，照实记 0；缺这个字段才按老形状当 1 次（P2-2）。
+        if (Number.isInteger(parsedPoll.reads) && parsedPoll.reads >= 0) pollReads = parsedPoll.reads;
+      } else throw new Error('poll 输出不是数组，也不是 {entries, tasks}');
     } catch (error) {
       throw new Error(`poll 输出不是 JSON：${error.message}`);
     }
     if (!Array.isArray(entries)) throw new Error('poll 输出不是数组');
+
+    // 这一拍的实际花费记进 loop 组件的本小时用量（#247 SC5）：按响应头个数 × 单次点数。
+    try {
+      const charged = chargeBudget(readRateState(paths.rateState), {
+        component: 'loop',
+        cost: pollReads * GRAPHQL_COST_PER_REQUEST,
+        now: now(),
+      });
+      writeRateState(paths.rateState, charged);
+    } catch (error) {
+      heartbeat.lastTick.rateError = String(error?.message || error);
+    }
 
     const registry = readRegistry(paths);
     const byIssue = new Map(registry.map((entry) => [entry.issue, entry]));
@@ -547,10 +731,38 @@ export async function runTick({
           onRead: () => tickBeat.setPhase('prbot'),
           onRetryOk: ({ totalMs }) => logReadRetryOk(paths, 'prbot-read', totalMs, now),
         });
-        const prbotGithub = createGithub({ profile: { ...prbotProfile, writeCommand: undefined }, run: prbotRun });
+        const prbotGithub = createGithub({
+          profile: { ...prbotProfile, writeCommand: undefined },
+          run: prbotRun,
+          // 修正轮的每次只读也把响应头记进同一份分令牌账（#247 SC9），并计入 loop 组件的本小时用量。
+          onRateLimit: (sample) => {
+            try {
+              const recorded = recordHeader(readRateState(paths.rateState), sample);
+              writeRateState(
+                paths.rateState,
+                chargeBudget(recorded, { component: 'loop', cost: GRAPHQL_COST_PER_REQUEST, now: now() }),
+              );
+            } catch {
+              // 记不下不挡这次读。
+            }
+          },
+        });
         const discover =
           discoverPrbot || ((options) => discoverCorrections({ ...options, github: prbotGithub, profile: prbotProfile, hostConfig: prbotSettings }));
-        const found = await discover({ now, home, github: prbotGithub });
+        // 修正轮发现与卡住检查都是非必要读（#247 SC6）：真实剩余低于暂停线时这一拍不拉、不查，只写一行日志。
+        let found = [];
+        const discoverGate = rateGate({ component: 'loop', purpose: 'non-essential', reserve: GRAPHQL_COST_PER_REQUEST });
+        noteRateSkip(discoverGate, { component: 'loop', purpose: 'non-essential' });
+        if (discoverGate.allowed) {
+          try {
+            found = await discover({ now, home, github: prbotGithub, tasks: inventoryTasks });
+          } catch (error) {
+            // 限流（#247 P2-1）：这一拍跳过发现，不写 prbot-tick-failed。
+            if (!isRateLimitError(error)) throw error;
+            noteRateLimited('prbot-discover', error);
+            found = [];
+          }
+        }
         // 修正轮和验收轮共用 2 个槽：先给这一拍该开始的验收轮留位（同仓锁被占、起不来的 mivo / serialRepos 验收轮不算），剩下的才给修正轮。
         const pendingAcceptance = entries.filter((item) => {
           if (!item || item.stale) return false;
@@ -570,7 +782,19 @@ export async function runTick({
           heartbeat.lastTick.prbotStarted.push({ issue: entry.issue, pid: pid ?? null });
         }
         const checkStalled = checkPrbotStalled || ((options) => checkReadyStalled({ ...options, github: prbotGithub, profile: prbotProfile }));
-        const stalled = await checkStalled({ home, now, github: prbotGithub, reviewCheckPattern: prbotSettings.reviewCheckPattern });
+        // 卡住检查也是非必要读（#247 P2-1）：低额度 / 超预算时同样跳过，不当成「没卡住」。
+        const stalledGate = rateGate({ component: 'loop', purpose: 'non-essential' });
+        noteRateSkip(stalledGate, { component: 'loop', purpose: 'non-essential' });
+        let stalled = [];
+        if (stalledGate.allowed) {
+          try {
+            stalled = await checkStalled({ home, now, github: prbotGithub, reviewCheckPattern: prbotSettings.reviewCheckPattern });
+          } catch (error) {
+            if (!isRateLimitError(error)) throw error;
+            noteRateLimited('prbot-stalled', error);
+            stalled = [];
+          }
+        }
         heartbeat.lastTick.prbotStalled = (stalled || []).map((entry) => ({ issue: entry.issue, pr: entry.pr }));
         const clean = cleanupPrbot || ((options) => cleanupWorktrees({ ...options, profile: prbotProfile }));
         heartbeat.lastTick.prbotCleaned = clean({ home }) || [];

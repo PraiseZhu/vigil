@@ -13,9 +13,12 @@ PLANNED="$HOME_DIR/state/host/planned-stop.json"
 PLANNED_MAX_MS=7200000
 mkdir -p "$HOME_DIR/state/host"
 
-# 输出 "<ageMs> <alive 0|1> <frozenMs> <monoAgeMs>"；心跳读不出时输出 "missing"。
+# 输出 "<ageMs> <alive 0|1> <frozenMs> <monoAgeMs> <maxAgeMs>"；心跳读不出时输出 "missing"。
 # frozenMs / monoAgeMs：心跳里有 uptimeS、且机器没重启过（现在 uptime >= 心跳 uptime）才算；
 # 否则都是 -1，后面当没有冻结信息，行为和改之前一样。ACCEPTANCE_UPTIME_S 只给测试用。
+# maxAgeMs 是心跳年龄上限（#247 P2-6）：按心跳里的 tickIntervalS（拍间隔）+ 60 秒余量算，
+# 且拍间隔只认 1..3600 的整数（#247 P2-B）：缺失 / 0 / 负数 / 非整数 / 字符串 / 超大值回落 180 秒（上限 240 秒）。
+# 一拍的心跳是「拍尾写 → sleep(拍间隔) → 下一拍启动才写」，硬贴 180000 会让每拍都经过一次边界。
 read_heartbeat() {
   node -e '
     const os = require("node:os");
@@ -41,7 +44,12 @@ read_heartbeat() {
       monoAgeMs = Math.round((nowUptime - hbUptime) * 1000);
       frozenMs = Math.max(0, age - monoAgeMs);
     }
-    process.stdout.write(age + " " + alive + " " + frozenMs + " " + monoAgeMs);
+    const tickRaw = hb.tickIntervalS;
+    // 拍间隔只认 1..3600 的整数（#247 P2-B）：缺失 / 0 / 负数 / 非整数 / 字符串 / 超大值一律回落 180 秒，
+    // 上限 240 秒。上限不能由心跳内容无限放大，否则一个写歪的值就让看门狗几小时不判。
+    const tickS = typeof tickRaw === "number" && Number.isInteger(tickRaw) && tickRaw > 0 && tickRaw <= 3600 ? tickRaw : 180;
+    const maxAge = tickS * 1000 + 60000;
+    process.stdout.write(age + " " + alive + " " + frozenMs + " " + monoAgeMs + " " + maxAge);
   ' "$HB" "${ACCEPTANCE_NOW_MS:-}" "${ACCEPTANCE_UPTIME_S:-}"
 }
 
@@ -91,6 +99,7 @@ report_slack_failing
 pid_alive=0
 frozenMs=-1
 monoAgeMs=-1
+maxAgeMs=240000
 case "$state" in
   missing)
     reason=heartbeat-stale
@@ -102,10 +111,11 @@ case "$state" in
     pid_alive="$2"
     frozenMs="${3:--1}"
     monoAgeMs="${4:--1}"
-    if [ "$pid_alive" = "1" ] && [ "$age" -le 180000 ]; then
+    maxAgeMs="${5:-240000}"
+    if [ "$pid_alive" = "1" ] && [ "$age" -le "$maxAgeMs" ]; then
       exit 0
     fi
-    if [ "$age" -le 180000 ]; then
+    if [ "$age" -le "$maxAgeMs" ]; then
       reason=loop-not-running
     else
       reason=heartbeat-stale
@@ -119,7 +129,7 @@ esac
 # 任何一条不成立都按原来的方式拉起并提醒，真挂掉的循环不会被漏掉。
 if [ "$reason" = "heartbeat-stale" ] && [ "$pid_alive" = "1" ] && lock_held; then
   secs=$((age / 1000))
-  if [ "$frozenMs" -ge 60000 ] && [ "$monoAgeMs" -ge 0 ] && [ "$monoAgeMs" -le 180000 ]; then
+  if [ "$frozenMs" -ge 60000 ] && [ "$monoAgeMs" -ge 0 ] && [ "$monoAgeMs" -le "$maxAgeMs" ]; then
     frozenSecs=$((frozenMs / 1000))
     monoSecs=$((monoAgeMs / 1000))
     log_line "整机冻结 ${frozenSecs} 秒，循环无异常（按机器实际运行时间算心跳只隔了 ${monoSecs} 秒），没有补起新循环"

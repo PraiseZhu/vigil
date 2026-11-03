@@ -1,11 +1,11 @@
 # 验收调度：宿主调用约定
 
-对应本仓 issue #45。合入后，宿主调度器（2026-10-24 起是本仓 `watchers/acceptance/host/loop`，#47）每分钟按下面的顺序调几条命令，就能把验收跑起来。本 issue 只提供命令和调用约定，**不自带调度循环、进程管理、重试和告警**。
+对应本仓 issue #45。合入后，宿主调度器（2026-10-24 起是本仓 `watchers/acceptance/host/loop`，#47）每 180 秒（#247 SC3，原为每分钟）按下面的顺序调几条命令，就能把验收跑起来。本 issue 只提供命令和调用约定，**不自带调度循环、进程管理、重试和告警**。
 
-## 1. 每分钟的顺序
+## 1. 每 180 秒的顺序
 
 1. `node watchers/acceptance/bin/poll.mjs --json`：拿到该开始的任务和卡死的轮次（#44）。
-2. 过宿主**资源门**（内存门 + 测试锁）。**资源门放在认领之前**：资源不够就等下一分钟，不认领、不发评论。
+2. 过宿主**资源门**（内存门 + 测试锁）。**资源门放在认领之前**：资源不够就等下一拍（180 秒），不认领、不发评论。
 3. `node watchers/acceptance/bin/round.mjs start --issue <owner/repo#n>`：认领一轮，拿到派发消息。
 4. 用 pi（模型见 #46/#47）跑这条消息；消息从标准输入交给 agent。
 5. 跑的过程中定期 `node watchers/acceptance/bin/round.mjs status --issue <owner/repo#n> --json` 看有没有卡住。卡住时**先结束进程再 abort**：先 kill 掉 agent 进程，等它退出，再 `round.mjs abort`。
