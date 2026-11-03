@@ -12,7 +12,9 @@
 // --only-repo owner/repo 只处理这一个仓（大小写不敏感）。其它仓不打分、不写、不提醒，防抖原样保留。
 // --limit N 按仓名（小写）、issue 号、字段名只写前 N 条真会落闸的变更，N 最大 PRIO_LIMIT_MAX。
 // 超上限的行仍打印，末尾加「（本拍上限截掉）」，不写闸、不进 changes.jsonl，防抖按未写入退回。
-// 两个参数都不给时输出与以前一致。它们不能和 --restore 同用；参数不合法就在读令牌和写文件之前退出。
+// --only-field 字段名 只写这一个字段（白名单：「关联 PR」「优先级」，精确相等）。其它字段一条都不写。
+// 过滤在计划算完、onPlan 看过之后、写闸之前；被过滤的变更不占 --limit 名额，防抖按未写入退回。
+// 三个参数都不给时输出与以前一致。它们都不能和 --restore 同用；参数不合法就在读令牌和写文件之前退出。
 // repo-class.json 的 exclude 数组命中的仓：不打分、不写优先级和关联 PR、不提醒、不搜 PR、不还原。
 // 汇总只在有排除时追加「，排除 N 条」，N 是条数，不写仓名。stderr 不记跳过，只在 exclude 不是数组时警告一次。
 // 读看板条目和 PR 走 profile 的 githubTokenFile（验收机读取通道），不用 project 写令牌。
@@ -50,6 +52,8 @@ export const PRIO_HOURLY_MAX = 50;
 export const PRIO_HOURLY_WINDOW_MS = 60 * 60 * 1000;
 const ONLY_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const LIMIT_RE = /^[1-9][0-9]*$/;
+/** `--only-field` 的白名单，正好是看板可写的两个字段。精确相等比较：不 trim，不折大小写。 */
+export const ONLY_FIELD_NAMES = Object.freeze(['关联 PR', '优先级']);
 const RESTORE_BASIS = 'restore 按变更日志改回';
 const LINK_HOLD = '不写关联 PR：没有 .prio/mac-mini-stopped，扣住，要等确认 Mac mini 已停写\n';
 const RESTORE_SKIP = '跳过：当前值不是上次写入的值';
@@ -197,7 +201,7 @@ function showActual(value) {
 }
 
 export function parsePrioArgs(argv) {
-  const out = { write: false, restore: null, stateDir: null, onlyRepo: null, limit: null };
+  const out = { write: false, restore: null, stateDir: null, onlyRepo: null, limit: null, onlyField: null };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--write') {
@@ -230,6 +234,17 @@ export function parsePrioArgs(argv) {
       i += 1;
       continue;
     }
+    if (arg === '--only-field') {
+      if (out.onlyField != null) throw new Error('重复的参数：--only-field');
+      const value = argv[i + 1];
+      if (typeof value !== 'string' || value.startsWith('--')) throw new Error('缺少 --only-field 的取值');
+      if (!ONLY_FIELD_NAMES.includes(value)) {
+        throw new Error(`--only-field 期望「关联 PR」或「优先级」，实际：${showActual(value)}`);
+      }
+      out.onlyField = value;
+      i += 1;
+      continue;
+    }
     if (arg === '--limit') {
       if (out.limit != null) throw new Error('重复的参数：--limit');
       const value = argv[i + 1];
@@ -246,6 +261,9 @@ export function parsePrioArgs(argv) {
   }
   if (out.restore && (out.onlyRepo != null || out.limit != null)) {
     throw new Error('--only-repo / --limit 不能和 --restore 同用');
+  }
+  if (out.restore && out.onlyField != null) {
+    throw new Error('--only-field 不能和 --restore 同用');
   }
   return out;
 }
@@ -970,6 +988,7 @@ export async function runPrioSync({
   carryTicks = CI_CARRY_TICKS,
   onlyRepo = null,
   limit = null,
+  onlyField = null,
   onPlan = null,
   readBack = null,
 } = {}) {
@@ -1125,6 +1144,22 @@ export async function runPrioSync({
     else if (typeof decided?.allow === 'function') gate = { abort: false, allow: decided.allow };
   }
 
+  // 按字段过滤：计划算完、onPlan 看过之后，写闸、changes.jsonl 和 --limit 名额都只看放行的字段。
+  // 被过滤的变更按「没写过」退回防抖（和 --limit 截掉、写失败同一条路径），下一拍还能再算出来。
+  let filteredByField = 0;
+  let writes = changes;
+  if (onlyField != null) {
+    writes = [];
+    for (const change of changes) {
+      if (change.field === onlyField) {
+        writes.push(change);
+        continue;
+      }
+      filteredByField += 1;
+      if (mode === 'write') restoreUnwrittenDebounce(nextItems, saved, change.item);
+    }
+  }
+
   let written = 0;
   let acceptedWrites = 0;
   const skippedRepos = new Map();
@@ -1134,12 +1169,12 @@ export async function runPrioSync({
   let stoppedByDisabled = false;
   let outOfScopeHit = null;
   const restoreFrom = (start) => {
-    for (let cursor = start; cursor < changes.length; cursor += 1) {
-      restoreUnwrittenDebounce(nextItems, saved, changes[cursor].item);
+    for (let cursor = start; cursor < writes.length; cursor += 1) {
+      restoreUnwrittenDebounce(nextItems, saved, writes[cursor].item);
     }
   };
-  for (let index = 0; index < changes.length; index += 1) {
-    const change = changes[index];
+  for (let index = 0; index < writes.length; index += 1) {
+    const change = writes[index];
     const basis = change.basis ? ` 依据：${change.basis}` : '';
     const line = `${change.item} ${change.field} ${show(change.old)} → ${show(change.new)}${basis}`;
     const held = change.field === '关联 PR' && !linkAllowed;
@@ -1264,15 +1299,18 @@ export async function runPrioSync({
   const report = skipReport(skippedRepos);
   for (const line of report.lines) outWrite(stdout, line);
   const excludedTotal = (Number.isInteger(presetExcluded) && presetExcluded > 0 ? presetExcluded : 0) + skippedHere;
-  const batch = `${onlyRepo ? `，按仓过滤掉 ${filteredByRepo} 条` : ''}${limit != null ? `，按上限截掉 ${truncatedByLimit} 条` : ''}`;
-  outWrite(stdout, `${headOf(mode)}${items.length - skippedHere} 条，变更 ${changes.length}，写入 ${written}，钉住 ${pinned}${report.suffix}${excludedSuffix(excludedTotal)}${nullContentSuffix(nullContent)}${batch}\n`);
+  const batch = `${onlyRepo ? `，按仓过滤掉 ${filteredByRepo} 条` : ''}${filteredByField > 0 ? `，按字段过滤掉 ${filteredByField} 条` : ''}${limit != null ? `，按上限截掉 ${truncatedByLimit} 条` : ''}`;
+  // 过滤后一条不剩单独说一句，免得「变更 0」看着像读不到看板。
+  if (onlyField != null && writes.length === 0) outWrite(stdout, '本拍按字段过滤后 0 条变更\n');
+  outWrite(stdout, `${headOf(mode)}${items.length - skippedHere} 条，变更 ${writes.length}，写入 ${written}，钉住 ${pinned}${report.suffix}${excludedSuffix(excludedTotal)}${nullContentSuffix(nullContent)}${batch}\n`);
   return {
     written,
-    planned: changes.length,
+    planned: writes.length,
     pinned,
     mode,
     excluded: excludedTotal,
     filteredByRepo,
+    filteredByField,
     truncatedByLimit,
     plan,
     readbacks,
@@ -1499,6 +1537,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     nullContent,
     onlyRepo: args.onlyRepo,
     limit: args.limit,
+    onlyField: args.onlyField,
   });
 }
 
