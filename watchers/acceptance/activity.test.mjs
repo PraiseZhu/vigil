@@ -5,11 +5,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { activityChange, newestMtimeMs, processTreeCpuTicks } from './host/activity.mjs';
-import { tmpDir } from './fake-gh.fixture.mjs';
+import { PROCFS_SKIP, tmpDir } from './fake-gh.fixture.mjs';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-test('#149 SC5 进程树 CPU：孙进程空转时根进程这棵树的时钟数在涨；进程没了返回 null', { timeout: 15000 }, async () => {
+test('#149 SC5 进程树 CPU：孙进程空转时根进程这棵树的时钟数在涨；进程没了返回 null', { timeout: 15000, skip: PROCFS_SKIP }, async () => {
   // 根进程自己只 sleep，干活的是它的子进程（像 pi → bash → npm → vitest）。
   const inner = 'const end = Date.now() + 8000; while (Date.now() < end) {}';
   const outer = `const c = require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(inner)}], { stdio: 'ignore' }); setTimeout(() => c.kill(), 9000);`;

@@ -39,6 +39,20 @@ test('默认遮 HOME：白名单是 HOME 本身、落在遮罩目录里，或可
   assert.throws(() => buildBwrapArgs(baseArgs({ hostHome, homeAllow: ['relative'] })), /绝对路径/);
 });
 
+// The whitelist entry is compared as a real path; a mask handed in through a symlink (as macOS /tmp is) must still
+// refuse a whitelist inside it. Before 2026-11-03 this held only when the caller passed real mask paths.
+test('默认遮 HOME：遮罩目录经符号链接传入，白名单落在里面照样拒绝', () => {
+  const hostHome = tmpDir();
+  const cred = path.join(hostHome, '.ssh');
+  fs.mkdirSync(path.join(cred, 'inner'), { recursive: true });
+  const link = path.join(tmpDir(), 'ssh-link');
+  fs.symlinkSync(cred, link);
+  assert.throws(
+    () => buildBwrapArgs(baseArgs({ hostHome, homeAllow: [path.join(cred, 'inner')], masks: { files: [], dirs: [link] } })),
+    /落在遮罩目录/,
+  );
+});
+
 test('默认遮 HOME：HOME 的上级不挂（挂了会把 HOME 露出来），不存在的白名单跳过，HOME 之外的不重复挂', () => {
   const hostHome = path.join(tmpDir(), 'home');
   const allowed = path.join(hostHome, 'tools');

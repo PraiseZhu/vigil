@@ -164,7 +164,9 @@ function resolveHomeAllow(hostHomeReal, homeAllow, maskDirs) {
     if (isInside(hostHomeReal, real)) continue;
     if (!isInside(real, hostHomeReal)) continue;
     for (const maskDir of maskDirs) {
-      if (isInside(real, maskDir)) {
+      // The whitelist entry is a real path; compare with the mask's real path too, so a mask handed in through a
+      // symlinked path (macOS /tmp → /private/tmp) still refuses a whitelist inside it.
+      if (isInside(real, maskDir) || isInside(real, realExisting(maskDir) ?? maskDir)) {
         throw new Error(`沙箱拒绝：HOME 白名单 ${entry} 落在遮罩目录 ${maskDir} 里`);
       }
     }

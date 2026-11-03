@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { createGithub, defaultRun, isReadOnlyGraphql, WRITE_TYPES, WriteBusyError, WriteRejectedError } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { setAcceptanceFields } from './bin/board.mjs';
@@ -311,7 +312,7 @@ test('SC10 条目不在看板上则 addProjectV2ItemById', async () => {
 });
 
 test('SC15 除 github.mjs 和 localgit.mjs（#46，只跑本地 git/gitleaks）外 bin 下没有 spawn/execFile/child_process', () => {
-  const bin = path.join(path.dirname(new URL(import.meta.url).pathname), 'bin');
+  const bin = path.join(path.dirname(fileURLToPath(import.meta.url)), 'bin');
   for (const name of fs.readdirSync(bin)) {
     if (!name.endsWith('.mjs')) continue;
     if (name === 'github.mjs' || name === 'localgit.mjs') continue;

@@ -1,7 +1,14 @@
+import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+
+// The acceptance host is Linux-only: the loop and deploy-ff hold flock, activity reads /proc. On a machine without
+// them (macOS) the tests that need them are skipped with this reason instead of failing; CI asserts both are present.
+export const FLOCK_SKIP = spawnSync('flock', ['--version'], { stdio: 'ignore' }).error?.code === 'ENOENT'
+  ? 'flock 不可用（验收机宿主只在 Linux 上跑，见 docs/acceptance-operations.md）' : false;
+export const PROCFS_SKIP = fs.existsSync('/proc/self/stat') ? false : '/proc 不可用（验收机宿主只在 Linux 上跑）';
 
 export const OWNER = 'ExampleUser';
 export const REPO = 'example-owner/example-repo';

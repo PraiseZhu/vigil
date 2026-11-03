@@ -653,7 +653,7 @@ test('resolvePnpm：PATH 里的独立 pnpm 直接用；corepack 垫片改用 cor
   fs.mkdirSync(binA, { recursive: true });
   fs.writeFileSync(path.join(binA, 'pnpm'), '#!/bin/sh\n', { mode: 0o755 });
   const a = resolvePnpm({ env: { PATH: binA }, execPath, corepackHomes: [] });
-  assert.equal(a.command, path.join(binA, 'pnpm'));
+  assert.equal(a.command, fs.realpathSync(path.join(binA, 'pnpm')));
   assert.deepEqual(a.args, []);
   // 2) npm 全局装的 pnpm（bin 是 .cjs 的符号链接）：用 node 跑。
   const binB = path.join(root, 'b', 'bin');

@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { isVerdictOnly, loadAcceptanceProfile } from './bin/profile.mjs';
 import { beijingIso, bodyVersion, createRounds, parseRounds } from './bin/rounds.mjs';
 import { createGithub, isReadOnlyGraphql, WriteFailedError, WriteRejectedError } from './bin/github.mjs';
@@ -185,7 +186,7 @@ test('verdictOnlyIssues：格式校验（owner/repo#号，不收通配）、默�
 
 test('配置模板里有 verdictOnlyIssues 占位，而且模板本身能过校验的格式', () => {
   const example = JSON.parse(
-    fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname), '..', '..', 'config', 'examples', 'acceptance.profile.example.json'), 'utf8'),
+    fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'config', 'examples', 'acceptance.profile.example.json'), 'utf8'),
   );
   assert.ok(Array.isArray(example.verdictOnlyIssues));
   for (const item of example.verdictOnlyIssues) assert.match(item, /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/);

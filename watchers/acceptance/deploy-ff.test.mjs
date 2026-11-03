@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { tmpDir } from './fake-gh.fixture.mjs';
+import { FLOCK_SKIP, tmpDir } from './fake-gh.fixture.mjs';
 import {
   BUSY_PROCESS_RE,
   EXIT,
@@ -307,7 +307,7 @@ test('#215 SC9 每种状态两行，退出码和运维说明一致', () => {
   assert.equal(EXIT.waiting, EXIT['ci-pending']);
 });
 
-test('#215 SC1 已跟踪改动输出 blocked-dirty，连续跑不新增提醒', async () => {
+test('#215 SC1 已跟踪改动输出 blocked-dirty，连续跑不新增提醒', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   fs.appendFileSync(path.join(world.deploy, 'README.md'), 'changed\n');
   const first = await deploy(world);
@@ -326,7 +326,7 @@ test('#215 SC1 已跟踪改动输出 blocked-dirty，连续跑不新增提醒', 
   assert.equal(rows[0].head, first.before);
 });
 
-test('#215 SC1 未忽略的未跟踪文件输出 blocked-dirty', async () => {
+test('#215 SC1 未忽略的未跟踪文件输出 blocked-dirty', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   fs.writeFileSync(path.join(world.deploy, 'UNTRACKED.txt'), 'x\n');
   const result = await deploy(world);
@@ -336,7 +336,7 @@ test('#215 SC1 未忽略的未跟踪文件输出 blocked-dirty', async () => {
   assert.equal(mutations(result.calls).some((args) => args[0] === 'fetch'), false);
 });
 
-test('#215 SC1 被忽略的未跟踪文件不挡快进', async () => {
+test('#215 SC1 被忽略的未跟踪文件不挡快进', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   fs.mkdirSync(path.join(world.deploy, '.git', 'info'), { recursive: true });
   fs.writeFileSync(path.join(world.deploy, '.git', 'info', 'exclude'), 'ignored.txt\n');
@@ -346,7 +346,7 @@ test('#215 SC1 被忽略的未跟踪文件不挡快进', async () => {
   assert.equal(readAlerts(world.alertsFile).length, 0);
 });
 
-test('#215 SC1 分叉输出 blocked-diverged 且不动', async () => {
+test('#215 SC1 分叉输出 blocked-diverged 且不动', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   commitAndPush(world, [{ path: 'docs/remote.md', content: 'remote\n' }], 'remote');
   fs.writeFileSync(path.join(world.deploy, 'local.md'), 'local\n');
@@ -363,7 +363,7 @@ test('#215 SC1 分叉输出 blocked-diverged 且不动', async () => {
   assert.equal(readAlerts(world.alertsFile).filter((row) => row.kind === 'deploy-blocked-diverged').length, 1);
 });
 
-test('#215 SC1 本地超前输出 blocked-diverged', async () => {
+test('#215 SC1 本地超前输出 blocked-diverged', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   fs.writeFileSync(path.join(world.deploy, 'local.md'), 'ahead\n');
   git(world.deploy, ['add', 'local.md']);
@@ -375,7 +375,7 @@ test('#215 SC1 本地超前输出 blocked-diverged', async () => {
   assert.equal(result.calls.some((args) => args[0] === 'merge'), false);
 });
 
-test('#215 SC2 检查失败不拉', async () => {
+test('#215 SC2 检查失败不拉', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'docs/a.md', content: 'a\n' }], 'a');
   const result = await deploy(world, { fetchImpl: red(sha) });
@@ -386,7 +386,7 @@ test('#215 SC2 检查失败不拉', async () => {
   assert.equal(readAlerts(world.alertsFile).some((row) => row.kind === 'deploy-ci-red'), true);
 });
 
-test('#215 SC2 检查还在跑就等待且不写提醒', async () => {
+test('#215 SC2 检查还在跑就等待且不写提醒', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'docs/a.md', content: 'a\n' }], 'a');
   const result = await deploy(world, {
@@ -399,7 +399,7 @@ test('#215 SC2 检查还在跑就等待且不写提醒', async () => {
   assert.equal(readAlerts(world.alertsFile).length, 0);
 });
 
-test('#215 SC2 读检查报错、超时、零条、格式不认得都不拉', async () => {
+test('#215 SC2 读检查报错、超时、零条、格式不认得都不拉', { skip: FLOCK_SKIP }, async () => {
   const cases = [
     ['throw', { throwError: true }],
     ['hang', { hang: true, timeoutMs: 40 }],
@@ -418,7 +418,7 @@ test('#215 SC2 读检查报错、超时、零条、格式不认得都不拉', as
   }
 });
 
-test('#215 SC2 success、neutral、skipped 都算绿并部署', async () => {
+test('#215 SC2 success、neutral、skipped 都算绿并部署', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'docs/ok.md', content: 'ok\n' }], 'ok');
   const result = await deploy(world, { fetchImpl: green(sha) });
@@ -427,7 +427,7 @@ test('#215 SC2 success、neutral、skipped 都算绿并部署', async () => {
   assert.equal(readAlerts(world.alertsFile).length, 0);
 });
 
-test('#215 SC3 rounds 不空就等待，不 fetch', async () => {
+test('#215 SC3 rounds 不空就等待，不 fetch', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   fs.writeFileSync(path.join(world.host, 'rounds', 'active.json'), '{}\n');
   const result = await deploy(world);
@@ -438,7 +438,7 @@ test('#215 SC3 rounds 不空就等待，不 fetch', async () => {
   assert.equal(readAlerts(world.alertsFile).length, 0);
 });
 
-test('#215 SC3 locks 不空就等待', async () => {
+test('#215 SC3 locks 不空就等待', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   fs.writeFileSync(path.join(world.host, 'locks', 'round.lock'), '{}\n');
   const result = await deploy(world);
@@ -447,7 +447,7 @@ test('#215 SC3 locks 不空就等待', async () => {
   assert.equal(readAlerts(world.alertsFile).length, 0);
 });
 
-test('#215 SC3 验收进程在跑就等待', async () => {
+test('#215 SC3 验收进程在跑就等待', { skip: FLOCK_SKIP }, async () => {
   for (const name of ['round', 'prbot', 'adjudicate']) {
     const world = makeWorld();
     const result = await deploy(world, {
@@ -462,7 +462,7 @@ test('#215 SC3 验收进程在跑就等待', async () => {
   assertRun(quiet, 'up-to-date');
 });
 
-test('#215 SC3 演练锁被占就等待', async () => {
+test('#215 SC3 演练锁被占就等待', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const release = await holdLock(world.prioLock);
   try {
@@ -475,7 +475,7 @@ test('#215 SC3 演练锁被占就等待', async () => {
   }
 });
 
-test('#215 SC8 本脚本的锁被占时直接 locked 且不跑 git', async () => {
+test('#215 SC8 本脚本的锁被占时直接 locked 且不跑 git', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const release = await holdLock(world.selfLock);
   try {
@@ -489,7 +489,7 @@ test('#215 SC8 本脚本的锁被占时直接 locked 且不跑 git', async () =>
   }
 });
 
-test('#215 SC4 落后 6 个提交只在第一次 reportLag，部署成功后重新计', async () => {
+test('#215 SC4 落后 6 个提交只在第一次 reportLag，部署成功后重新计', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   let sha = '';
   for (let i = 0; i < 6; i += 1) {
@@ -523,7 +523,7 @@ test('#215 SC4 落后 6 个提交只在第一次 reportLag，部署成功后重�
   assert.equal(freshJson.lagging, true);
 });
 
-test('#215 SC4 最早未部署提交超过 2 小时算落后，正好 2 小时或正好 5 个不算', async () => {
+test('#215 SC4 最早未部署提交超过 2 小时算落后，正好 2 小时或正好 5 个不算', { skip: FLOCK_SKIP }, async () => {
   const oldWorld = makeWorld();
   const oldSha = commitAndPush(
     oldWorld,
@@ -579,7 +579,7 @@ const SENSITIVE_CASES = [
 ];
 
 for (const [name, file, content] of SENSITIVE_CASES) {
-  test(name, async () => {
+  test(name, { skip: FLOCK_SKIP }, async () => {
     const world = makeWorld();
     const sha = commitAndPush(world, [{ path: file, content }], 'sensitive');
     const result = await deploy(world, { fetchImpl: green(sha) });
@@ -591,7 +591,7 @@ for (const [name, file, content] of SENSITIVE_CASES) {
   });
 }
 
-test('#215 SC5 只改文档会继续部署', async () => {
+test('#215 SC5 只改文档会继续部署', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'docs/guide.md', content: 'hello\n' }], 'docs');
   const seen = {};
@@ -610,7 +610,7 @@ test('#215 SC5 只改文档会继续部署', async () => {
   assert.match(seen.url, new RegExp(sha));
 });
 
-test('#215 SC15 子目录的 package.json 和 run-ensure.sh 不算仓根', async () => {
+test('#215 SC15 子目录的 package.json 和 run-ensure.sh 不算仓根', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [
     { path: 'sub/package.json', content: '{"name":"sub"}\n' },
@@ -621,7 +621,7 @@ test('#215 SC15 子目录的 package.json 和 run-ensure.sh 不算仓根', async
   assert.equal(result.after, sha);
 });
 
-test('#215 SC6 完整且相等的 --approve 才放行，用过的批准文件会删', async () => {
+test('#215 SC6 完整且相等的 --approve 才放行，用过的批准文件会删', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
   fs.writeFileSync(world.approvalFile, `${sha}\n`);
@@ -631,7 +631,7 @@ test('#215 SC6 完整且相等的 --approve 才放行，用过的批准文件会
   assert.equal(fs.existsSync(world.approvalFile), false);
 });
 
-test('#215 SC6 sha 不匹配、短 sha、旧批准都不放行', async () => {
+test('#215 SC6 sha 不匹配、短 sha、旧批准都不放行', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'watchers/acceptance/bin/trigger.mjs', content: 'export const t = 1;\n' }], 'gate');
   const mismatch = await deploy(world, { fetchImpl: green(sha), approve: 'b'.repeat(40) });
@@ -645,7 +645,7 @@ test('#215 SC6 sha 不匹配、短 sha、旧批准都不放行', async () => {
   assert.equal(fs.readFileSync(world.approvalFile, 'utf8').trim(), 'c'.repeat(40));
 });
 
-test('#215 SC6 仓库里的同名文件和提交说明都不算批准', async () => {
+test('#215 SC6 仓库里的同名文件和提交说明都不算批准', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [
     { path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' },
@@ -659,7 +659,7 @@ test('#215 SC6 仓库里的同名文件和提交说明都不算批准', async ()
   assert.equal(result.calls.some((args) => args[0] === 'merge'), false);
 });
 
-test('#215 SC6 批准文件指向部署目录内部时忽略，待拉提交里的副本也不算', async () => {
+test('#215 SC6 批准文件指向部署目录内部时忽略，待拉提交里的副本也不算', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [
     { path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' },
@@ -673,7 +673,7 @@ test('#215 SC6 批准文件指向部署目录内部时忽略，待拉提交里�
   assert.equal(result.after, result.before);
 });
 
-test('#215 SC6 命令行批准放行时，内容对不上的批准文件留着', async () => {
+test('#215 SC6 命令行批准放行时，内容对不上的批准文件留着', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'package.json', content: '{"private":true}\n' }], 'pkg');
   fs.writeFileSync(world.approvalFile, `${'e'.repeat(40)}\n`);
@@ -686,7 +686,7 @@ test('#215 SC6 命令行批准放行时，内容对不上的批准文件留着',
   assert.equal(fs.readFileSync(world.approvalFile, 'utf8').trim(), 'e'.repeat(40));
 });
 
-test('#215 SC6 检查没过时不删除已用的批准文件，也不回退', async () => {
+test('#215 SC6 检查没过时不删除已用的批准文件，也不回退', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
   fs.writeFileSync(world.approvalFile, `${sha}\n`);
@@ -701,7 +701,7 @@ test('#215 SC6 检查没过时不删除已用的批准文件，也不回退', as
   assert.equal(result.calls.some((args) => args[0] === 'reset'), false);
 });
 
-test('#215 SC7 语法检查失败时 doctor-failed 且不回退', async () => {
+test('#215 SC7 语法检查失败时 doctor-failed 且不回退', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'watchers/acceptance/broken.mjs', content: 'export function (\n' }], 'bad');
   const result = await deploy(world, {
@@ -721,7 +721,7 @@ test('#215 SC7 语法检查失败时 doctor-failed 且不回退', async () => {
   assert.ok(rows[0].ts && rows[0].reason);
 });
 
-test('#215 SC7 doctor 非 0 时 doctor-failed 且不回退', async () => {
+test('#215 SC7 doctor 非 0 时 doctor-failed 且不回退', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'watchers/acceptance/ok-note.mjs', content: 'export const ok = 1;\n' }], 'ok');
   let checked = [];
@@ -740,7 +740,7 @@ test('#215 SC7 doctor 非 0 时 doctor-failed 且不回退', async () => {
   assert.equal(result.calls.some((args) => args[0] === 'reset'), false);
 });
 
-test('#215 SC7 语法和 doctor 都过才是 deployed', async () => {
+test('#215 SC7 语法和 doctor 都过才是 deployed', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'watchers/acceptance/ok-note.mjs', content: 'export const ok = 1;\n' }], 'ok');
   let checked = 0;
@@ -763,7 +763,7 @@ test('#215 SC7 语法和 doctor 都过才是 deployed', async () => {
   assert.equal(readAlerts(world.alertsFile).length, 0);
 });
 
-test('#215 SC13 检查全绿但 sha 不是目标完整 sha 时不拉，请求不带身份头', async () => {
+test('#215 SC13 检查全绿但 sha 不是目标完整 sha 时不拉，请求不带身份头', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const parent = git(world.deploy, ['rev-parse', 'HEAD']);
   const sha = commitAndPush(world, [{ path: 'docs/ci.md', content: 'ci\n' }], 'ci');
@@ -790,7 +790,7 @@ test('#215 SC13 检查全绿但 sha 不是目标完整 sha 时不拉，请求不
   assert.match(bag.url, new RegExp(`/repos/example-org/demo-repo/commits/${sha}/check-runs`));
 });
 
-test('#215 SC13 合并状态的 sha 对不上就不拉，对得上才部署', async () => {
+test('#215 SC13 合并状态的 sha 对不上就不拉，对得上才部署', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'docs/status.md', content: 's\n' }], 'status');
   const bad = await deploy(world, {
@@ -804,7 +804,7 @@ test('#215 SC13 合并状态的 sha 对不上就不拉，对得上才部署', as
   assertRun(good, 'deployed');
 });
 
-test('#215 SC14 needs-approval 连续 3 次只有 1 行，目标变了再写 1 行', async () => {
+test('#215 SC14 needs-approval 连续 3 次只有 1 行，目标变了再写 1 行', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const firstSha = commitAndPush(world, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'one');
   for (let i = 0; i < 3; i += 1) {
@@ -826,7 +826,7 @@ test('#215 SC14 needs-approval 连续 3 次只有 1 行，目标变了再写 1 �
   assert.equal(more[1].kind, 'deploy-needs-approval');
 });
 
-test('#215 SC14 waiting、up-to-date、deployed 不写提醒', async () => {
+test('#215 SC14 waiting、up-to-date、deployed 不写提醒', { skip: FLOCK_SKIP }, async () => {
   const waiting = makeWorld();
   fs.writeFileSync(path.join(waiting.host, 'rounds', 'x.json'), '{}\n');
   await deploy(waiting);
@@ -842,7 +842,7 @@ test('#215 SC14 waiting、up-to-date、deployed 不写提醒', async () => {
   assert.equal(readAlerts(shipped.alertsFile).length, 0);
 });
 
-test('#215 SC16 新增行含 process.env 需要批准并列出行', async () => {
+test('#215 SC16 新增行含 process.env 需要批准并列出行', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'docs/note.md', content: 'const x = process.env.PATH\n' }], 'env');
   const result = await deploy(world, { fetchImpl: green(sha) });
@@ -852,7 +852,7 @@ test('#215 SC16 新增行含 process.env 需要批准并列出行', async () => 
   assert.equal(result.after, result.before);
 });
 
-test('#215 SC16 新增行含 secrets/ 需要批准', async () => {
+test('#215 SC16 新增行含 secrets/ 需要批准', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'docs/note.md', content: 'see secrets/demo\n' }], 'path');
   const result = await deploy(world, { fetchImpl: green(sha) });
@@ -861,7 +861,7 @@ test('#215 SC16 新增行含 secrets/ 需要批准', async () => {
   assert.equal(result.after, result.before);
 });
 
-test('#215 SC16 新增行含 TOKEN 需要批准', async () => {
+test('#215 SC16 新增行含 TOKEN 需要批准', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'docs/note.md', content: 'const NAME = "TOKEN"\n' }], 'word');
   const result = await deploy(world, { fetchImpl: green(sha) });
@@ -870,7 +870,7 @@ test('#215 SC16 新增行含 TOKEN 需要批准', async () => {
   assert.equal(result.after, result.before);
 });
 
-test('#215 SC16 这些词只出现在删除行时照常部署', async () => {
+test('#215 SC16 这些词只出现在删除行时照常部署', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   commitAndPush(world, [{ path: 'docs/note.md', content: 'process.env\nsecrets/\nTOKEN\n' }], 'add words');
   fastForward(world);
@@ -880,7 +880,7 @@ test('#215 SC16 这些词只出现在删除行时照常部署', async () => {
   assert.equal(result.after, sha);
 });
 
-test('#215 SC17 把写闸改名挪走仍然需要批准', async () => {
+test('#215 SC17 把写闸改名挪走仍然需要批准', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   commitAndPush(world, [{ path: 'watchers/acceptance/host/write-gate.mjs', content: 'export const gate = 1;\n' }], 'seed');
   fastForward(world);
@@ -896,7 +896,7 @@ test('#215 SC17 把写闸改名挪走仍然需要批准', async () => {
   assert.equal(result.after, before);
 });
 
-test('#215 SC17 把 trigger 改名挪走仍然需要批准', async () => {
+test('#215 SC17 把 trigger 改名挪走仍然需要批准', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   commitAndPush(world, [{ path: 'watchers/acceptance/bin/trigger.mjs', content: 'export const t = 1;\n' }], 'seed');
   fastForward(world);
@@ -911,7 +911,7 @@ test('#215 SC17 把 trigger 改名挪走仍然需要批准', async () => {
   assert.equal(result.after, result.before);
 });
 
-test('#215 拉取远端失败不写提醒也不改 HEAD', async () => {
+test('#215 拉取远端失败不写提醒也不改 HEAD', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const result = await deploy(world, {
     runGit: (cwd, args) => {
@@ -924,7 +924,7 @@ test('#215 拉取远端失败不写提醒也不改 HEAD', async () => {
   assert.equal(readAlerts(world.alertsFile).length, 0);
 });
 
-test('#215 快进失败写提醒且不动 HEAD', async () => {
+test('#215 快进失败写提醒且不动 HEAD', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'docs/ff.md', content: 'ff\n' }], 'ff');
   const result = await deploy(world, {
@@ -939,7 +939,7 @@ test('#215 快进失败写提醒且不动 HEAD', async () => {
   assert.equal(readAlerts(world.alertsFile)[0].kind, 'deploy-pull-failed');
 });
 
-test('#215 SC8 两个进程抢同一把锁，只有一个进入检查', async () => {
+test('#215 SC8 两个进程抢同一把锁，只有一个进入检查', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   fs.writeFileSync(path.join(world.deploy, 'UNTRACKED.txt'), 'dirty\n');
   const log = path.join(world.root, 'git.log');
@@ -966,7 +966,7 @@ exec "$REAL_GIT" "$@"
   assert.match(text, /status/);
 });
 
-test('#215 SC9 命令行入口标准输出恰好两行', async () => {
+test('#215 SC9 命令行入口标准输出恰好两行', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const result = await spawnCli(world);
   assert.equal(result.code, EXIT['up-to-date']);
@@ -977,7 +977,7 @@ test('#215 SC9 命令行入口标准输出恰好两行', async () => {
   assert.equal(parts[2], '');
 });
 
-test('#215 SC10 SC14 SC17 源码静态约束', () => {
+test('#215 SC10 SC14 SC17 源码静态约束', { skip: FLOCK_SKIP }, () => {
   const hostImport = spawnSync('grep', ['-nE', String.raw`from '\./host/|from '\.\./host/|host/[a-z-]+\.mjs`, SCRIPT], { encoding: 'utf8' });
   assert.equal(hostImport.status, 1, hostImport.stdout);
   const banned = spawnSync('grep', ['-niE', 'crontab|systemctl|--write|authorization|slack', SCRIPT], { encoding: 'utf8' });
@@ -1011,7 +1011,7 @@ test('#215 SC10 SC14 SC17 源码静态约束', () => {
   }
 });
 
-test('#215 M1 检查期间远端又前进时只合并第一次的目标提交', async () => {
+test('#215 M1 检查期间远端又前进时只合并第一次的目标提交', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'docs/m1.md', content: 'first\n' }], 'first');
   const result = await deploy(world, {
@@ -1026,7 +1026,7 @@ test('#215 M1 检查期间远端又前进时只合并第一次的目标提交', 
   assert.notEqual(git(world.worker, ['rev-parse', 'HEAD']), sha);
 });
 
-test('#215 M2 合并前 rounds 出现文件就等待且 HEAD 不动', async () => {
+test('#215 M2 合并前 rounds 出现文件就等待且 HEAD 不动', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'docs/m2.md', content: 'm2\n' }], 'm2');
   const result = await deploy(world, {
@@ -1040,7 +1040,7 @@ test('#215 M2 合并前 rounds 出现文件就等待且 HEAD 不动', async () =
   assert.equal(result.calls.some((args) => args[0] === 'merge'), false);
 });
 
-test('#215 L1 宿主状态目录不存在就等待', async () => {
+test('#215 L1 宿主状态目录不存在就等待', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const result = await deploy(world, { hostStateDir: path.join(world.root, 'no-such-host') });
   assertRun(result, 'waiting');
@@ -1048,7 +1048,7 @@ test('#215 L1 宿主状态目录不存在就等待', async () => {
   assert.equal(result.calls.some((args) => args[0] === 'fetch'), false);
 });
 
-test('#215 L2 相对路径启动的轮次进程也算非空档', async () => {
+test('#215 L2 相对路径启动的轮次进程也算非空档', { skip: FLOCK_SKIP }, async () => {
   for (const name of ['round', 'prbot', 'adjudicate']) {
     const world = makeWorld();
     const result = await deploy(world, { listProcesses: () => [`node ${name}.mjs`] });
@@ -1065,7 +1065,7 @@ test('#215 L2 相对路径启动的轮次进程也算非空档', async () => {
   assertRun(self, 'up-to-date');
 });
 
-test('#215 L2 列不出进程就等待', async () => {
+test('#215 L2 列不出进程就等待', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const result = await deploy(world, { listProcesses: () => null });
   assertRun(result, 'waiting');
@@ -1073,7 +1073,7 @@ test('#215 L2 列不出进程就等待', async () => {
   assert.equal(result.calls.some((args) => args[0] === 'fetch'), false);
 });
 
-test('#215 L3 新增行内容以两个加号开头仍要批准', async () => {
+test('#215 L3 新增行内容以两个加号开头仍要批准', { skip: FLOCK_SKIP }, async () => {
   const diff = [
     'diff --git a/docs/plus.md b/docs/plus.md',
     '--- /dev/null',

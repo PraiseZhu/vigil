@@ -13,6 +13,7 @@ import { hostPaths, isAlive, readAlerts } from './host/paths.mjs';
 import { roundDirFor, runHostRound } from './host/round.mjs';
 import { MAX_CHILD_CLAIMS_PER_TICK, runTick } from './host/tick.mjs';
 import {
+  FLOCK_SKIP,
   OWNER,
   REPO,
   childNode,
@@ -145,7 +146,7 @@ after(() => {
   }
 });
 
-test('SC12 loop 是单实例：第二个实例拿不到 flock 就退出，不跑 tick', async () => {
+test('SC12 loop 是单实例：第二个实例拿不到 flock 就退出，不跑 tick', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -209,7 +210,7 @@ test('#61 ensure.sh：心跳里有 slackFailing（Slack 发送重试用完）就
   assert.deepEqual(readAlerts(paths), []);
 });
 
-test('SC12 ensure.sh：心跳过期的拉起循环并写一条提醒；连跑两次也只有一个循环', async () => {
+test('SC12 ensure.sh：心跳过期的拉起循环并写一条提醒；连跑两次也只有一个循环', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -271,7 +272,7 @@ function loopLogText(paths) {
   return fs.existsSync(paths.loopLog) ? fs.readFileSync(paths.loopLog, 'utf8') : '';
 }
 
-test('ensure.sh：心跳过期但原循环进程还在、锁还占着 → 只记「心跳延迟」，不补起新循环、不发 loop-restarted', async () => {
+test('ensure.sh：心跳过期但原循环进程还在、锁还占着 → 只记「心跳延迟」，不补起新循环、不发 loop-restarted', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -300,7 +301,7 @@ test('ensure.sh：心跳过期但原循环进程还在、锁还占着 → 只记
   }
 });
 
-test('ensure.sh：心跳过期且原循环进程已不在 → 照常拉起并发 loop-restarted(heartbeat-stale)', async () => {
+test('ensure.sh：心跳过期且原循环进程已不在 → 照常拉起并发 loop-restarted(heartbeat-stale)', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -328,7 +329,7 @@ test('ensure.sh：心跳过期且原循环进程已不在 → 照常拉起并发
   }
 });
 
-test('ensure.sh：心跳过期、pid 碰巧活着但锁没人占（pid 被别的进程复用）→ 保守起见照常拉起', async () => {
+test('ensure.sh：心跳过期、pid 碰巧活着但锁没人占（pid 被别的进程复用）→ 保守起见照常拉起', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -352,7 +353,7 @@ test('ensure.sh：心跳过期、pid 碰巧活着但锁没人占（pid 被别的
   }
 });
 
-test('部署重启：stop.sh 留标记 → ensure.sh 拉起时记 loop-deploy-restarted（不是 loop-restarted），标记用完即删；新循环起来也清标记', async () => {
+test('部署重启：stop.sh 留标记 → ensure.sh 拉起时记 loop-deploy-restarted（不是 loop-restarted），标记用完即删；新循环起来也清标记', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -395,7 +396,7 @@ test('部署重启：stop.sh 留标记 → ensure.sh 拉起时记 loop-deploy-re
   await manual.exited;
 });
 
-test('部署重启：标记超过 2 小时就不算，按意外重启发 loop-restarted 并删掉旧标记', async () => {
+test('部署重启：标记超过 2 小时就不算，按意外重启发 loop-restarted 并删掉旧标记', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -417,7 +418,7 @@ test('部署重启：标记超过 2 小时就不算，按意外重启发 loop-re
   }
 });
 
-test('SC12 停掉 loop 后，残留的子进程（在跑的轮次、sleep）不占单实例锁：ensure.sh 马上能拉起新循环', async () => {
+test('SC12 停掉 loop 后，残留的子进程（在跑的轮次、sleep）不占单实例锁：ensure.sh 马上能拉起新循环', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -451,7 +452,7 @@ test('SC12 停掉 loop 后，残留的子进程（在跑的轮次、sleep）不�
   }
 });
 
-test('#T9 ensure.sh：墙钟过期 2000 秒、uptime 只差 30 秒、pid 活着锁占着 → 记 host-frozen，不补起', async () => {
+test('#T9 ensure.sh：墙钟过期 2000 秒、uptime 只差 30 秒、pid 活着锁占着 → 记 host-frozen，不补起', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -490,7 +491,7 @@ test('#T9 ensure.sh：墙钟过期 2000 秒、uptime 只差 30 秒、pid 活着�
   }
 });
 
-test('#T9 ensure.sh：不设 ACCEPTANCE_UPTIME_S 时用机器真实 uptime 判冻结（正式部署走这条）', async () => {
+test('#T9 ensure.sh：不设 ACCEPTANCE_UPTIME_S 时用机器真实 uptime 判冻结（正式部署走这条）', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -522,7 +523,7 @@ test('#T9 ensure.sh：不设 ACCEPTANCE_UPTIME_S 时用机器真实 uptime 判�
   }
 });
 
-test('#T9 ensure.sh：墙钟过期 2000 秒、uptime 也差 2000 秒（真慢）、pid 活着锁占着 → 仍是 heartbeat-delayed', async () => {
+test('#T9 ensure.sh：墙钟过期 2000 秒、uptime 也差 2000 秒（真慢）、pid 活着锁占着 → 仍是 heartbeat-delayed', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -559,7 +560,7 @@ test('#T9 ensure.sh：墙钟过期 2000 秒、uptime 也差 2000 秒（真慢）
   }
 });
 
-test('#T9 ensure.sh：墙钟过期 2000 秒、uptime 差 30 秒、pid 已死 → 拉起并记 heartbeat-stale-after-freeze', async () => {
+test('#T9 ensure.sh：墙钟过期 2000 秒、uptime 差 30 秒、pid 已死 → 拉起并记 heartbeat-stale-after-freeze', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -596,7 +597,7 @@ test('#T9 ensure.sh：墙钟过期 2000 秒、uptime 差 30 秒、pid 已死 →
   }
 });
 
-test('#T9 ensure.sh：旧心跳没有 uptimeS、pid 已死 → 仍是 loop-restarted(heartbeat-stale)', async () => {
+test('#T9 ensure.sh：旧心跳没有 uptimeS、pid 已死 → 仍是 loop-restarted(heartbeat-stale)', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -628,7 +629,7 @@ test('#T9 ensure.sh：旧心跳没有 uptimeS、pid 已死 → 仍是 loop-resta
   }
 });
 
-test('#T9 loop 收到 SIGTERM：2 秒内 loop.log 记下退出，锁立刻释放，ensure.sh 能拉起新循环', async () => {
+test('#T9 loop 收到 SIGTERM：2 秒内 loop.log 记下退出，锁立刻释放，ensure.sh 能拉起新循环', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
