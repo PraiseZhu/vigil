@@ -72,6 +72,18 @@ function runIdOf(check) {
   } catch { return null; }
 }
 
+// A protected-path change is released, not reviewed: when the author is a maintainer, or a maintainer released
+// it, review-pr.yml completes the check as success titled 「受保护路径:…」 with 「放行凭据:…」 in the summary and
+// posts no report review. That check is the verdict for its head; callers have already verified its producer.
+const PROTECTED_RELEASE_TITLE = /^受保护路径:/;
+export function protectedReleaseOf(check) {
+  const title = String(check?.output?.title ?? '');
+  const summary = String(check?.output?.summary ?? '');
+  if (!PROTECTED_RELEASE_TITLE.test(title) || !summary.includes('放行凭据:')) return null;
+  const completed = Date.parse(check.completed_at ?? check.completedAt ?? '');
+  return Number.isFinite(completed) ? { at: completed, title } : null;
+}
+
 function handledComment(comment, handledFeedback, head) {
   // replyToMemberFeedback stores receipts keyed by feedback key (`comment:<id>`); keep that key.
   const records = Array.isArray(handledFeedback) ? handledFeedback
@@ -97,6 +109,7 @@ export function evaluatePublicReview({ snapshot: s, comments = s.comments, check
   const latestCheck = reviewChecks(checks, head)[0];
   let run = null;
   let current = null;
+  let released = null;
   let reports = [];
   if (!latestCheck) blockers.push('waiting-review');
   else {
@@ -108,10 +121,12 @@ export function evaluatePublicReview({ snapshot: s, comments = s.comments, check
     reports = (s.reviews ?? []).map(reviewerReport).filter(Boolean).filter(r => r.commit === head).sort((a, b) => b.at - a.at);
     current = reports.find(r => cleanReportFor(r, head, base));
     if (latestCheck.status === 'completed' && producerOk && latestCheck.conclusion === 'success') {
-      if (!current) blockers.push(reports.some(r => r.findings) ? 'review-findings' : 'review-report-missing');
-      else if (reports.some(r => r.findings && r.at > current.at)) blockers.push('review-findings');
+      released = current ? null : protectedReleaseOf(latestCheck);
+      const verdictAt = current?.at ?? released?.at ?? null;
+      if (verdictAt == null) blockers.push(reports.some(r => r.findings) ? 'review-findings' : 'review-report-missing');
+      else if (reports.some(r => r.findings && r.at > verdictAt)) blockers.push('review-findings');
       const epoch = /(\d{4}-\d\d-\d\dT[^:]+:\d\d:[^:]+)$/.exec(s.pr.releaseEpoch ?? '')?.[1];
-      if (current && (!epoch || current.at < Date.parse(epoch))) blockers.push('review-before-release');
+      if (verdictAt != null && (!epoch || verdictAt < Date.parse(epoch))) blockers.push('review-before-release');
     } else if (producerOk && reports.some(r => r.findings)) {
       if (!blockers.includes('review-findings') && latestCheck.conclusion !== 'success') {
         /* keep the check conclusion as the primary blocker; findings remain in evidence */
@@ -141,7 +156,8 @@ export function evaluatePublicReview({ snapshot: s, comments = s.comments, check
   }
   if (s.reviewDecision === 'CHANGES_REQUESTED' || [...latest.values()].some(r => r.state === 'CHANGES_REQUESTED')) blockers.push('review-veto');
   if ((s.labels ?? []).includes('awaiting-discussion')) blockers.push('discussion-hold');
-  if (current && comments.some(c => at(c) > current.at && c.user?.login !== s.pr.author.login && c.body?.trim() && !handledComment(c, handledFeedback, head))) {
+  const verdict = current ?? released;
+  if (verdict && comments.some(c => at(c) > verdict.at && c.user?.login !== s.pr.author.login && c.body?.trim() && !handledComment(c, handledFeedback, head))) {
     blockers.push('new-feedback');
   }
   const evidence = {
@@ -154,12 +170,14 @@ export function evaluatePublicReview({ snapshot: s, comments = s.comments, check
     tier: /档位\s+(light|standard|heavy)/.exec(current ? String(s.reviews?.find(r => r.id === current.id)?.body ?? '') : String(s.reviews?.find(r => reviewerReport(r)?.findings)?.body ?? ''))?.[1] ?? null,
     mergeStateStatus: mergeState,
     producerUnverified: blockers.includes('producer-unverified'),
+    protectedRelease: released?.title ?? null,
   };
   const unique = [...new Set(blockers)];
   const behindOnly = unique.length === 1 && unique[0] === 'behind';
   const baseUpdateEligible = behindOnly && s.pr.baseRefName === 'main' && s.mergeable === 'MERGEABLE';
   if (!unique.length) {
-    return { ready: true, reason: current.state === 'APPROVED' ? 'current-approve' : 'current-report', blockers: [], baseUpdateEligible: false, ...evidence };
+    const reason = released ? 'protected-release' : current.state === 'APPROVED' ? 'current-approve' : 'current-report';
+    return { ready: true, reason, blockers: [], baseUpdateEligible: false, ...evidence };
   }
   return { ready: false, reason: unique[0], blockers: unique, baseUpdateEligible, ...evidence };
 }

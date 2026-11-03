@@ -681,6 +681,57 @@ export function alignWatchWorktree({ task, checkout, remoteHead, gitFn = command
     realigned: { from: checkout.head, to: head, backup: null, backupRef: preservation?.backupRef ?? null } };
 }
 
+// GitHub rejects a push whose commits carry an email the account keeps private (GH007; the Mivo watcher hit it on
+// 2026-11-02/03). Watch worktrees inherit the plugin checkout's identity (or none), so prepare gives each one the
+// account's noreply identity in its own worktree config, and validate refuses unpushed commits that still carry
+// the inherited email, before any time is spent validating them.
+const NOREPLY_EMAIL = /@users\.noreply\.github\.com$/i;
+function configValue(args, gitFn) {
+  try { return gitOutput(args, gitFn).trim(); }
+  catch (error) { if (error?.status === 1) return ''; throw error; }
+}
+export function ensureCommitIdentity({ worktree, gitFn = command, ghFn = command }) {
+  let user;
+  try { user = ghJson(['api', 'user'], ghFn); } catch { return { configured: false, reason: 'gh-user-unavailable' }; }
+  const login = user?.login;
+  const id = user?.id;
+  if (typeof login !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(login) || !Number.isSafeInteger(id) || id <= 0) {
+    return { configured: false, reason: 'gh-user-invalid' };
+  }
+  gitOutput(['-C', worktree, 'config', 'extensions.worktreeConfig', 'true'], gitFn);
+  gitOutput(['-C', worktree, 'config', '--worktree', 'user.name', login], gitFn);
+  gitOutput(['-C', worktree, 'config', '--worktree', 'user.email', `${id}+${login}@users.noreply.github.com`], gitFn);
+  return { configured: true };
+}
+/**
+ * Unpushed commits (not on any remote-tracking ref) whose author or committer is the inherited non-noreply email.
+ * Only a worktree that prepare gave the noreply identity is checked: there the session can rewrite them. Without
+ * extensions.worktreeConfig there is no worktree identity (and --worktree refuses to run beside other worktrees).
+ */
+export function privateIdentityCommits({ worktree, head, gitFn = command }) {
+  if (configValue(['-C', worktree, 'config', '--bool', '--get', 'extensions.worktreeConfig'], gitFn) !== 'true') return [];
+  const own = configValue(['-C', worktree, 'config', '--worktree', '--get', 'user.email'], gitFn);
+  if (!NOREPLY_EMAIL.test(own)) return [];
+  const inherited = new Set([
+    configValue(['-C', worktree, 'config', '--global', '--get', 'user.email'], gitFn),
+    configValue(['-C', worktree, 'config', '--local', '--get', 'user.email'], gitFn),
+  ].map((value) => value.toLowerCase()).filter((value) => value && !NOREPLY_EMAIL.test(value)));
+  if (!inherited.size) return [];
+  const log = gitOutput(['-C', worktree, 'log', '--format=%H%x09%ae%x09%ce', head, '--not', '--remotes'], gitFn);
+  return log.split('\n').map((line) => line.trim().split('\t'))
+    .filter(([sha, author = '', committer = '']) => isSha(sha)
+      && (inherited.has(author.toLowerCase()) || inherited.has(committer.toLowerCase())))
+    .map(([sha]) => sha);
+}
+function assertPushableIdentity({ worktree, head, gitFn }) {
+  const leaked = privateIdentityCommits({ worktree, head, gitFn });
+  if (!leaked.length) return;
+  const oldest = leaked[leaked.length - 1];
+  fail(`GH007: ${leaked.length} unpushed commit(s) carry this checkout's private Git email and GitHub would reject the push `
+    + `(${leaked.map((sha) => sha.slice(0, 12)).join(', ')}). Rewrite them with the worktree identity (git -C ${worktree} config user.email `
+    + `shows the noreply address), e.g. git -C ${worktree} rebase -r --exec "git commit --amend --no-edit --reset-author -s" ${oldest}^ , then validate the new HEAD.`);
+}
+
 export function prepare({ home, taskPath, ghFn = command, gitFn = command, cloneUrl, originUrl, viewer, keelRoot = keelLedgerRoot() } = {}) {
   return withHelperOp(home, peekTaskNumber(taskPath), () => {
   const { paths, task } = taskFrom(home, taskPath);
@@ -708,7 +759,8 @@ export function prepare({ home, taskPath, ghFn = command, gitFn = command, clone
   if (!strict || strict.head !== pr.headRefOid) fail('watch worktree was not aligned to the PR head');
   const repairPolicy = assertTaskRepairScope(task, pr.headRefOid);
   const needsSync = task.headRefOid !== pr.headRefOid;
-  return { ...identity(task, sessionId), repairPolicy, status: needsSync ? 'needs-sync' : 'prepared', needsSync,
+  const commitIdentity = ensureCommitIdentity({ worktree: aligned.worktree, gitFn, ghFn });
+  return { ...identity(task, sessionId), repairPolicy, status: needsSync ? 'needs-sync' : 'prepared', needsSync, commitIdentity,
     worktree: aligned.worktree, head: pr.headRefOid, remoteHead: pr.headRefOid, sourceHead: task.headRefOid,
     origin: forkUrl, headRepo, created: checkout.created, preservation: aligned.preservation ?? null,
     realigned: aligned.realigned, ciErrors: ciErrorExcerpts(task, ghFn) };
@@ -980,6 +1032,7 @@ export async function validate({ home, taskPath, validatedHead, gitFn = command,
   const forkUrl = originUrl ?? githubRepoUrl(resolveHeadRepo(task));
   const checkout = assertWorktree(worktree, task, gitFn, forkUrl);
   if (!checkout || checkout.head !== validatedHead) fail('worktree HEAD does not match validated-head');
+  assertPushableIdentity({ worktree, head: validatedHead, gitFn });
   assertDco(worktree, task.headRefOid, validatedHead, gitFn);
   const exception = validationException(paths, task, sessionId, validatedHead, worktree, gitFn);
   const policy = exception ? null : validationPolicy(worktree, task, gitFn, env);

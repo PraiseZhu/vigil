@@ -874,13 +874,17 @@ export function severityRule(standard = severityStandard()) {
     standard.text,
   ].join('\n');
 }
+// The repair session may run on codex or pi; its model stays the schedule's. Worker routing is pinned to
+// the codex lead entries so changing the session harness does not change the reviewer or arbiter model.
+export const HARNESS_RULE = '本会话的执行框架可能是 codex 或 pi（由发现器调度决定），模型与推理档不变。盯梢修复轮的审查、e2e、裁决 Worker 路由固定按 codex 主控解析，不随本会话实际执行框架变化。本会话若是 Pi：本消息提到的 Cindy 工具（ghost_call、ghost_info、ghost_manual、start_team、create_worker、archive_worker 等）经 cindy_mcp_list_tools / cindy_mcp_call_tool 网关调用，参数照本消息原样传。';
 // Review/e2e go to Orca Workers because a Codex native subagent cannot pin a provider, and the
 // global routing rule then leaves the session no allowed reviewer. Consult workers are read-only
 // and capped so one stuck PR cannot keep opening workers.
 export const WORKER_RULE = [
-  '审查与 e2e 用 Orca Worker（create_worker），不用原生子代理：原生子代理不能指定通道，达不到路由要求。模型现读 ~/.claude/skills/orca-fanout/routing.json：审查取 review 档、e2e 取 e2e 档；本会话是 codex，审查取 review.when_lead.codex ?? review（不取 when_lead.claude-code），带上 provider_id；主选报 NO_PROVIDER_FOR_AGENT / PROVIDER_ROUTE_UNAVAILABLE / BUDGET_MODEL_REQUIRES_API_MODE 才按该档 fallbacks 顺序降级。本条是盯梢修复轮对全局「native subagent 锁定 Luna、不得用 Orca worker」要求的例外。',
+  HARNESS_RULE,
+  '审查与 e2e 用 Orca Worker（create_worker），不用原生子代理：原生子代理不能指定通道，达不到路由要求。模型现读 ~/.claude/skills/orca-fanout/routing.json：审查取 review 档、e2e 取 e2e 档；审查取 review.when_lead.codex ?? review（不取 when_lead.claude-code），带上 provider_id；主选报 NO_PROVIDER_FOR_AGENT / PROVIDER_ROUTE_UNAVAILABLE / BUDGET_MODEL_REQUIRES_API_MODE 才按该档 fallbacks 顺序降级。本条是盯梢修复轮对全局「native subagent 锁定 Luna、不得用 Orca worker」要求的例外。',
   '审查/e2e Worker 只读、只交报告：不改文件、不 commit/push、不回复或 resolve thread；修复与受控 push 仍由本会话完成。本条是 AUTO_ADVANCE_RULE 与派单后段「缺环境/外部服务故障 blocked」的局部例外，仅适用于本地审查/e2e Worker 的可用性。本机缺 routing.json 或开不了 Orca Worker 时不 blocked：没有 routing.json 就记录具体缺项并跳过本地审查/e2e，不猜模型、不写配置。路由可读且工具存在时，在本轮首次派本地审查/e2e Worker 前调用一次 start_team({worker_permission_mode:"bypassPermissions"}) 并核对返回模式仍是 bypassPermissions；已有可用 team 复用，无活动 team 就由这一次调用初始化。未提供工具、初始化失败/模式不符、或后续 Worker 仍不能创建时，不反复初始化，跳过尚未运行的本地审查/e2e。不要改用原生子代理。skip 写在受影响 SC.evidence 的第二条及以后，至少包括步骤 review/e2e、原因（missing-routing / no-tool / start-team-error / create-worker-error）、实际尝试与错误码、未运行事实和后续门禁；第一条仍写 thread 的人话问题结论。不要写出 token、个人路径或内部调度信息。workers 数组只记实际创建的 Worker，可以省略或为空，禁止伪造 skipped Worker。主会话的仓库预检、受影响测试、validate 收据、required CI、服务器审查要求不豁免。Worker 创建成功后发现的真实 P0/P1/P2 仍须处理。',
-  '各执一词裁决（测试、文档类意见不适用，按 TEST_DOC 规则直接修）：已被审查看的版本之后的提交修掉的意见除外：在该 SC.evidence 写一条 already-fixed: <提交 SHA>，helper 核实该提交在当前 HEAD 且不在审查看的版本（Mivo 取 finding marker 的 head，缺失时取反馈条目的 sha；Cindy 取反馈条目的 sha）后，不用开裁决；取不到审查看的版本仍按本条开裁决或写 adjudicate-skipped。本会话核实后准备把审查机、Greptile 或仓库成员提的 P0/P1/P2（canChangeCode=true 的 code-fix 项）判为不成立、记 SC=no-change 时，不能自己定，必须先开一个只读裁决 Worker（purpose=adjudicate）。模型现读 ~/.claude/skills/orca-fanout/routing.json 的 adjudicate 档：本会话是 codex，取 adjudicate.when_lead.codex ?? adjudicate，带上 provider_id；条目带 agent_device_id 时原样传给 create_worker 的 agent_device_id（它指定裁决者跑在哪个远程网关，漏传会派到本机通路而开不出来）；主选报 NO_PROVIDER_FOR_AGENT / PROVIDER_ROUTE_UNAVAILABLE / BUDGET_MODEL_REQUIRES_API_MODE，或带 agent_device_id 的条目报 REMOTE_AGENT_DEVICE_UNREACHABLE / REMOTE_AGENT_SHARE_* 时，按该对象 fallbacks 顺序降级，每个备选同样原样带上它自己的 provider_id 与 agent_device_id。裁决材料由 helper 生成：运行同一 helper adjudication-brief --keys <争议的反馈 key，逗号分隔> --claim <你复现与反驳的证据>，把返回的 brief 原样交给裁决者（里面有意见原文、审查机问题 key、相关文件的改动、你的说法、本任务的统一分级全文和交回格式）；不得改写或删减 brief。裁决者只按 brief 里的统一分级判级（KEEL J4 等其他分级说法不算），亲自读代码或复现，不改文件、不 commit/push、不回复，交回 {"rulings":[{"feedbackKey","verdict":"valid|invalid|p3","reason"}]}；你把它原样记进该裁决 Worker 的 workers[].rulings。valid＝成立，必须修并记 SC=pass，helper 会拒绝把 valid 的项记成 no-change；invalid（不成立）或 p3（属实但只到 P3）才记 no-change，evidence 第一条仍写给评论人的人话结论并说明经裁决。审查账号的 P1/P2 判 invalid/p3 后，watcher 回帖会附一行裁决记录，审查机核对后采信放行，不再来回重审；P0 审查机不按裁决放行。同一轮多条争议可交给同一个裁决者一并判。统一分级读不到时，审查账号（source=mivo-review）的 P0/P1/P2 不开裁决，直接修。缺 adjudicate 档、没有 Orca 工具，或主选和全部备选都创建失败时，不 blocked、不改用原生子代理，也不换顾问顶替：在该 SC.evidence 加一条以 adjudicate-skipped: 开头的原因（missing-routing / no-tool / start-team-error / create-worker-error 与错误码），helper 会拒绝既没有裁决结论也没有这条说明的 no-change。审查账号的 P1/P2 走这条说明记 no-change 时，watcher 会把它转成 issue 跟进、登记到 PR 说明，审查机按问题 key 认这个 issue、不再阻断，由人在 issue 里确认；P0 不转。',
+  '各执一词裁决（测试、文档类意见不适用，按 TEST_DOC 规则直接修）：已被审查看的版本之后的提交修掉的意见除外：在该 SC.evidence 写一条 already-fixed: <提交 SHA>，helper 核实该提交在当前 HEAD 且不在审查看的版本（Mivo 取 finding marker 的 head，缺失时取反馈条目的 sha；Cindy 取反馈条目的 sha）后，不用开裁决；取不到审查看的版本仍按本条开裁决或写 adjudicate-skipped。本会话核实后准备把审查机、Greptile 或仓库成员提的 P0/P1/P2（canChangeCode=true 的 code-fix 项）判为不成立、记 SC=no-change 时，不能自己定，必须先开一个只读裁决 Worker（purpose=adjudicate）。模型现读 ~/.claude/skills/orca-fanout/routing.json 的 adjudicate 档：取 adjudicate.when_lead.codex ?? adjudicate（按上文固定按 codex 主控解析），带上 provider_id；条目带 agent_device_id 时原样传给 create_worker 的 agent_device_id（它指定裁决者跑在哪个远程网关，漏传会派到本机通路而开不出来）；主选报 NO_PROVIDER_FOR_AGENT / PROVIDER_ROUTE_UNAVAILABLE / BUDGET_MODEL_REQUIRES_API_MODE，或带 agent_device_id 的条目报 REMOTE_AGENT_DEVICE_UNREACHABLE / REMOTE_AGENT_SHARE_* 时，按该对象 fallbacks 顺序降级，每个备选同样原样带上它自己的 provider_id 与 agent_device_id。裁决材料由 helper 生成：运行同一 helper adjudication-brief --keys <争议的反馈 key，逗号分隔> --claim <你复现与反驳的证据>，把返回的 brief 原样交给裁决者（里面有意见原文、审查机问题 key、相关文件的改动、你的说法、本任务的统一分级全文和交回格式）；不得改写或删减 brief。裁决者只按 brief 里的统一分级判级（KEEL J4 等其他分级说法不算），亲自读代码或复现，不改文件、不 commit/push、不回复，交回 {"rulings":[{"feedbackKey","verdict":"valid|invalid|p3","reason"}]}；你把它原样记进该裁决 Worker 的 workers[].rulings。valid＝成立，必须修并记 SC=pass，helper 会拒绝把 valid 的项记成 no-change；invalid（不成立）或 p3（属实但只到 P3）才记 no-change，evidence 第一条仍写给评论人的人话结论并说明经裁决。审查账号的 P1/P2 判 invalid/p3 后，watcher 回帖会附一行裁决记录，审查机核对后采信放行，不再来回重审；P0 审查机不按裁决放行。同一轮多条争议可交给同一个裁决者一并判。统一分级读不到时，审查账号（source=mivo-review）的 P0/P1/P2 不开裁决，直接修。缺 adjudicate 档、没有 Orca 工具，或主选和全部备选都创建失败时，不 blocked、不改用原生子代理，也不换顾问顶替：在该 SC.evidence 加一条以 adjudicate-skipped: 开头的原因（missing-routing / no-tool / start-team-error / create-worker-error 与错误码），helper 会拒绝既没有裁决结论也没有这条说明的 no-change。审查账号的 P1/P2 走这条说明记 no-change 时，watcher 会把它转成 issue 跟进、登记到 PR 说明，审查机按问题 key 认这个 issue、不再阻断，由人在 issue 里确认；P0 不转。',
   '卡住求助：同一问题验证两次仍失败、或判断拿不准且 Jev 低置信时，可开只读顾问 Worker 诊断并给修法（各执一词走上一条裁决，不走顾问）。首选 agent=codex model=gpt-6.1-sol effort=medium provider_id=art-cindy；首选报不可用才用 agent=codex model=grok-4.6 effort=high。顾问禁止 max/ultra 档，禁止改文件、push、回复。同一 PR 同一 head 最多 2 个顾问（首选与备选合计）；用完仍卡住按 blocked 收口。',
   '每个 Worker 交回结论后立即 archive_worker。SC JSON 里用 workers:[{purpose:"review"|"e2e"|"consult"|"adjudicate",agent,model,effort,providerId,workerId,verdict}] 记下本轮开过的每个 Worker，adjudicate 另带 rulings；helper 会拒绝超过 2 个顾问或顾问用 max/ultra 的报告。',
 ].join('');
@@ -1714,8 +1718,15 @@ function needsCiRecheck(active) {
     || (active?.status === 'blocked' && ['required-ci', 'optional-ci', 'ci-transport'].includes(active.blockedKind));
 }
 
-export const INFRA_BLOCK_REASON = /preflight|submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge/i;
+// GH007 (push carries the account's private email) is an environment fault the repair helper now fixes itself:
+// prepare gives the watch worktree the noreply identity and validate refuses commits that still carry the old one.
+export const INFRA_BLOCK_REASON = /preflight|submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge|GH007|private e-?mail|邮箱隐私|私有的?邮箱/i;
 export const INFRA_REOPEN_LIMIT = 3;
+// GitHub rate limits and gateway errors pass on their own; an external block for one of them used to wait for a
+// new head or a new watcher version (#1648/#1674 on 2026-11-03). It is handed back after a back-off, counted with
+// the infra reopens, so a GitHub that stays down is retried a few times per admission epoch and then left alone.
+export const TRANSIENT_BLOCK_REASON = /rate.?limit|速率限制|限流|abuse detection|HTTP 50[0234]|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|Gateway Time-?out|ETIMEDOUT|ECONNRESET|EAI_AGAIN|socket hang up|i\/o timeout/i;
+export const TRANSIENT_RETRY_BACKOFF_MS = 30 * 60 * 1000;
 export const KEEL_LEDGER_HELD = 'keel-ledger-unavailable';
 export function reopenExternalBlocked({ previous, paths, now, head }) {
   const active = previous?.activeTask;
@@ -1745,12 +1756,14 @@ export function reopenExternalBlocked({ previous, paths, now, head }) {
 
 const VALIDATE_BLOCK_REASON = /preflight|validat/i;
 // 这些是环境/配置故障，不是「validate 失败」：保持原有重开规则。
-const NON_VALIDATE_INFRA_REASON = /submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge/i;
+const NON_VALIDATE_INFRA_REASON = /submodule|pathspec|worktree HEAD|validated-head|watch (?:tree|worktree)|subagent|spawn_agent|provider_id|invalid model|model .*invalid|needs-sync|diverge|GH007|private e-?mail|邮箱隐私|私有的?邮箱/i;
 // 「validate 类阻塞」的唯一分类：reason 属于环境/配置故障的一律不算（即使挂着 validationBlock）；
+// GitHub 限流、网关错误且没有失败收据的也不算（原因里常顺带提到「再跑 validate」）；
 // 其余的，挂了失败收据（validationBlock）或 reason 指向 preflight/validate 的才算。
 export function isValidateClassBlock(active) {
   const reason = String(active?.reason ?? '');
   if (NON_VALIDATE_INFRA_REASON.test(reason)) return false;
+  if (!active?.validationBlock && TRANSIENT_BLOCK_REASON.test(reason)) return false;
   return Boolean(active?.validationBlock) || VALIDATE_BLOCK_REASON.test(reason);
 }
 
@@ -1857,8 +1870,15 @@ export function validationReopenDecision({ previous, active, observe }) {
 
 export function reopenInfraBlocked({ previous, paths, now, observe, currentBase = null }) {
   const active = previous?.activeTask;
-  if (active?.status !== 'blocked' || active.blockedKind === AUTHOR_RECLAIMED || KEEL_BLOCK_REASON.test(String(active.reason ?? ''))
-    || !(INFRA_BLOCK_REASON.test(String(active.reason ?? '')) || isValidateClassBlock(active))) return previous;
+  const reason = String(active?.reason ?? '');
+  const transient = active?.blockedKind === 'external' && !INFRA_BLOCK_REASON.test(reason) && !isValidateClassBlock(active)
+    && TRANSIENT_BLOCK_REASON.test(reason);
+  if (active?.status !== 'blocked' || active.blockedKind === AUTHOR_RECLAIMED || KEEL_BLOCK_REASON.test(reason)
+    || !(INFRA_BLOCK_REASON.test(reason) || isValidateClassBlock(active) || transient)) return previous;
+  if (transient) {
+    const observed = Date.parse(active.observedAt ?? active.at ?? '');
+    if (!Number.isFinite(observed) || Date.parse(now) - observed < TRANSIENT_RETRY_BACKOFF_MS) return previous;
+  }
   let parserReceipt = null;
   if (isValidateClassBlock(active)) {
     const read = observe ?? (() => observeValidationContext({ previous, paths, currentBase }));
