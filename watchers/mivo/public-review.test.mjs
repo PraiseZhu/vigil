@@ -108,3 +108,43 @@ test('a member comment already answered for this head does not count as new feed
   const handledFeedback = { 'comment:15': { resultHead: h, replyCommentId: 99, actionKey: 'x' } };
   assert.equal(evaluatePublicReview({ ...s, handledFeedback }).ready, true);
 });
+
+// 2026-11-03 #1635/#1638/#1682: a maintainer-authored protected-path PR got a successful review-pr check with no
+// report review and sat at review-report-missing although GitHub showed it CLEAN.
+function protectedFixture({ title = '受保护路径:作者为维护者,自动放行', summary = '作者 owner 是维护者,受保护路径改动按规则自动放行,不绑定提交。放行凭据:author-maintainer:owner', completed = '2026-09-10T00:06:00Z' } = {}) {
+  const f = fixture();
+  f.snapshot.reviews = [{ id: 'R0', author: { login: reviewer }, state: 'COMMENTED', submittedAt: '2026-09-10T00:07:00Z', commit: { oid: h }, body: '' }];
+  Object.assign(f.checks[0], { completed_at: completed, output: { title, summary } });
+  return f;
+}
+test('a protected-path release check is the review verdict for its head', () => {
+  const v = evaluatePublicReview(protectedFixture());
+  assert.equal(v.ready, true, v.reason);
+  assert.equal(v.reason, 'protected-release');
+  assert.equal(v.protectedRelease, '受保护路径:作者为维护者,自动放行');
+});
+test('a maintainer release by approval is also a verdict', () => {
+  const v = evaluatePublicReview(protectedFixture({ title: '受保护路径:由 owner 人工审核放行(GitHub Approve)', summary: '维护者 owner 通过 GitHub Approve 放行,批一次一直有效,不绑定提交。放行凭据:approve:1' }));
+  assert.equal(v.reason, 'protected-release');
+});
+test('a protected title without release credentials is not a verdict', () => {
+  assert.equal(evaluatePublicReview(protectedFixture({ summary: '受保护路径改动' })).reason, 'review-report-missing');
+});
+test('a protected release from an unverified producer is not a verdict', () => {
+  const f = protectedFixture();
+  f.runs[3].event = 'push';
+  assert.equal(evaluatePublicReview(f).reason, 'producer-unverified');
+});
+test('a protected release completed before the PR was released for review does not count', () => {
+  assert.equal(evaluatePublicReview(protectedFixture({ completed: '2026-09-09T23:59:00Z' })).reason, 'review-before-release');
+});
+test('findings posted after a protected release still block', () => {
+  const f = protectedFixture();
+  f.snapshot.reviews.push({ id: 'R2', author: { login: reviewer }, state: 'COMMENTED', submittedAt: '2026-09-10T00:30:00Z', commit: { oid: h }, body: findingsBody() });
+  assert.equal(evaluatePublicReview(f).reason, 'review-findings');
+});
+test('new member feedback after a protected release blocks until handled', () => {
+  const f = protectedFixture();
+  f.snapshot.comments.push({ id: 16, user: { login: 'teammate' }, created_at: '2026-09-10T00:12:00Z', body: 'one more thing' });
+  assert.equal(evaluatePublicReview(f).reason, 'new-feedback');
+});

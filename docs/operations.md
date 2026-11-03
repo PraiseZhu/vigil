@@ -50,7 +50,7 @@ Vigil 的两个 watcher **不是**可以配进任意 cron 的无状态脚本—�
 | `workingDir` | `<watcher home>` 的绝对路径 | script 模式下作为 `scriptConfig.command` 的 cwd |
 | `useWorktree` | `false` | script 模式不支持 ephemeral worktree |
 | `notify` | `{"desktop": false, "feishu": false}` | discover 建议静默;失败轮仍会记进调度日志 |
-| `agentKind` / `model` / `providerId` / `effort` / `fastMode` | 修复会话要用的 Agent、模型、模型来源、推理档和速度 | script 模式本身不调模型,但 discover 用 `sessions.dispatch` 新建的修复会话不带模型参数,直接沿用这几项;不填就落到宿主默认模型。派发消息按 `codex` 会话写,`agentKind` 填 `codex`。改这几项只影响之后新建的会话,已存在的修复会话要逐个改(Cindy 的 `set_session_runtime`) |
+| `agentKind` / `model` / `providerId` / `effort` / `fastMode` | 修复会话要用的 Agent、模型、模型来源、推理档和速度 | script 模式本身不调模型,但 discover 用 `sessions.dispatch` 新建的修复会话不带模型参数,直接沿用这几项;不填就落到宿主默认模型。`agentKind` 填 `codex` 或 `pi`:派发消息对两者通用,Pi 会话经 `cindy_mcp_*` 网关调用其中的 Cindy 工具,审查、e2e、裁决 Worker 路由固定按 codex 主控解析,换执行框架不换 Worker 模型。从 `codex` 换成 `pi` 时一次带上 `model` / `providerId` / `effort` / `fastMode`(换 `agentKind` 会丢掉旧引擎的 `model`)。改这几项只影响之后新建的会话,已存在的修复会话要逐个改(Cindy 的 `set_session_runtime`,带 `harness` 与 `model`) |
 
 discover 一次调用会扫描 `targetRepo` 下你自己的所有 open PR,不需要"每个 PR 一个调度项"。
 

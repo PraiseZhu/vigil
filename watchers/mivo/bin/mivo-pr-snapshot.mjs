@@ -76,7 +76,10 @@ export function* collectPrSnapshot({ pr, ghFn }) {
   for (const key of ['id', 'headRefOid', 'headRefName', 'baseRefOid', 'baseRefName']) {
     if (pr[key] !== undefined) requireValue(pr[key] === before[key], `listed ${key} drift`);
   }
-  const tipQuery = `query{node(id:${quote(before.id)}){... on PullRequest{mergeStateStatus baseRef{name target{oid}}}}}`;
+  // mergeStateStatus is computed for the caller: a read-only GitHub App token always gets BLOCKED, so no PR
+  // read through the gh App router was ever merge-ready or BEHIND (last merge-ready notice #1170, 2026-10-20).
+  // Selecting viewer keeps this one small query on the user identity (the router sends viewer queries there).
+  const tipQuery = `query{viewer{login} node(id:${quote(before.id)}){... on PullRequest{mergeStateStatus baseRef{name target{oid}}}}}`;
   const tipPayload = parse(yield () => ghFn(['api', 'graphql', '-f', `query=${tipQuery}`]));
   requireValue(tipPayload && !tipPayload.errors?.length && tipPayload.data?.node, 'missing base tip');
   const liveMergeState = typeof tipPayload.data.node.mergeStateStatus === 'string' && tipPayload.data.node.mergeStateStatus

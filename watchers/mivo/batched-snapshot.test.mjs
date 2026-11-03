@@ -56,3 +56,14 @@ test('snapshot records mergeStateStatus and live base tip', () => {
   assert.equal(s.mergeStateStatus,'CLEAN');
   assert.equal(s.baseTipOid,basic.baseRefOid);
 });
+// 2026-11-03: through the gh App router every PR read BLOCKED (#1635/#1638/#1682 were CLEAN for the user).
+test('the merge-state query selects viewer so it is answered for the user, not a read-only App', () => {
+  const f=fixture(),queries=[];
+  collectPrSnapshotSync({pr:{number:1},ghFn:(args)=>{
+    const q=args.find(a=>typeof a==='string'&&a.startsWith('query='));
+    if(q&&q.includes('mergeStateStatus'))queries.push(q);
+    return f.ghFn(args);
+  }});
+  assert.equal(queries.length,1);
+  assert.match(queries[0],/^query=query\{viewer\{login\} node\(id:/);
+});
