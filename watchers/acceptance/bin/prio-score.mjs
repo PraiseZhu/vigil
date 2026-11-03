@@ -13,9 +13,10 @@
 // 只有 issueState === 'closed' 才清空。Done 或验收通过但 issue 仍开着时，保留算出来的档。
 // 标签 prio:pin 原样返回当前优先级。
 //
-// 防抖状态（上次重算时间 lastRecalcAt、连续次数 consecutive，以及 pending / changes）
-// 由调用方保存并在下次传入。升级立刻生效。降级要同一目标连续出现至少 2 次，
-// 且距离这条目标第一次出现不少于 15 分钟；中间更早的重算不把起始时间往后推。
+// 防抖状态（上次被计入的观测时间 lastRecalcAt、连续次数 consecutive，以及 pending / changes）
+// 由调用方保存并在下次传入。升级立刻生效。降级要同一目标在 60 分钟窗口内、
+// 彼此间隔不少于 15 分钟地被计入至少 2 次。窗口从最近一次被计入的观测算起，
+// 距上次计入超过 60 分钟就过期，计数回到 1。间隔不到 15 分钟的观测不计入。
 // 值没变不记变更。滚动 1 小时内已经变更 4 次时，再变更返回 freeze 并 alert。
 
 const MINUTE_MS = 60 * 1000;
@@ -24,6 +25,7 @@ export const PROGRESS_STALE_MS = 30 * MINUTE_MS;
 export const FIX_WITHOUT_PR_MS = 4 * 60 * MINUTE_MS;
 export const IDLE_EVENT_MS = 24 * 60 * MINUTE_MS;
 export const DOWNGRADE_MIN_GAP_MS = 15 * MINUTE_MS;
+export const DOWNGRADE_WINDOW_MS = 60 * MINUTE_MS;
 export const CHANGE_WINDOW_MS = 60 * MINUTE_MS;
 export const MAX_CHANGES_PER_HOUR = 4;
 
@@ -193,6 +195,11 @@ function recentChanges(changes, nowMs) {
   return changes.filter((at) => Number.isFinite(at) && at <= nowMs && nowMs - at < CHANGE_WINDOW_MS);
 }
 
+function countedRecalcAt(value, nowMs) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > nowMs) return null;
+  return value;
+}
+
 function emptyHold(priority, changes) {
   return {
     priority,
@@ -232,19 +239,21 @@ export function applyDebounce(state, scored, nowMs) {
   if (!upgrading) {
     const pendingHeld = state?.pendingHeld === true;
     const pending = pendingHeld ? normalizePriority(state.pending) : null;
-    const since = Number.isFinite(state?.lastRecalcAt) ? state.lastRecalcAt : null;
+    const since = countedRecalcAt(state?.lastRecalcAt, nowMs);
     const seen = Number.isInteger(state?.consecutive) && state.consecutive > 0 ? state.consecutive : 0;
-    const same = pendingHeld && pending === desired && since != null;
+    const tracked = pendingHeld && pending === desired && since != null && seen > 0;
+    const age = tracked ? nowMs - since : null;
+    const inWindow = tracked && age <= DOWNGRADE_WINDOW_MS;
+    const counted = inWindow && age >= DOWNGRADE_MIN_GAP_MS;
     downgrade = {
       priority: current,
       pending: desired,
       pendingHeld: true,
-      lastRecalcAt: same ? since : nowMs,
-      consecutive: same ? seen + 1 : 1,
+      lastRecalcAt: counted || !inWindow ? nowMs : since,
+      consecutive: counted ? seen + 1 : (inWindow ? seen : 1),
       changes,
     };
-    const gap = nowMs - downgrade.lastRecalcAt;
-    const confirmed = same && downgrade.consecutive >= 2 && gap >= DOWNGRADE_MIN_GAP_MS;
+    const confirmed = counted && downgrade.consecutive >= 2;
     if (!confirmed) {
       return { action: 'skip', priority: current, rule, alert: false, next: downgrade };
     }

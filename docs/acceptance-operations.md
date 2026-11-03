@@ -674,6 +674,8 @@ node watchers/acceptance/bin/prio-sync.mjs \
 
 `watchers/acceptance/bin/prio-run.mjs` 是一拍一次的入口。进程自己不循环，也不安装 cron、也不改 `/etc/cron.d`。节拍按 5 分钟一次来设计，由人在验收机上决定什么时候挂上定时任务。
 
+降档确认计数有有效期：只有彼此间隔不少于 15 分钟、且距最近一次被计入的观测不超过 60 分钟的多次观测才算确认，> 60 分钟才过期并从 1 重新数，间隔不到 15 分钟的观测不计入。
+
 ### 怎么开、怎么停
 
 先只跑 dry-run（默认就是 dry-run）：

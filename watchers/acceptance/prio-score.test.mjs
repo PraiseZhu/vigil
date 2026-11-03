@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { applyDebounce, RULES, scorePriority } from './bin/prio-score.mjs';
+import { applyDebounce, DOWNGRADE_MIN_GAP_MS, DOWNGRADE_WINDOW_MS, RULES, scorePriority } from './bin/prio-score.mjs';
 
 const T0 = Date.parse('2026-10-31T12:00:00Z');
 const MIN = 60 * 1000;
@@ -546,7 +546,7 @@ test('#153 SC2 降级要连续 2 次且间隔不少于 15 分钟', () => {
   const early = applyDebounce(first.next, scored('P2', 'situation'), T0 + 15 * MIN - 1);
   assert.equal(early.action, 'skip');
   assert.equal(early.priority, 'P0');
-  assert.equal(early.next.consecutive, 2);
+  assert.equal(early.next.consecutive, 1);
   assert.equal(early.next.lastRecalcAt, T0);
 
   const onTime = applyDebounce(early.next, scored('P2', 'situation'), T0 + 15 * MIN);
@@ -716,4 +716,141 @@ test('#153 打分不改传入的事实', () => {
   const snapshot = structuredClone(input);
   scorePriority(input, T0);
   assert.deepEqual(input, snapshot);
+});
+
+function downgradeFrom(priority, at) {
+  return applyDebounce(blankState({ priority }), scored('P2', 'situation'), at);
+}
+
+test('#239 SC1 窗口内确认仍然有效：间隔 15 分钟与 60 分钟减 1 毫秒都写', () => {
+  const atGap = applyDebounce(downgradeFrom('P1', T0).next, scored('P2', 'situation'), T0 + DOWNGRADE_MIN_GAP_MS);
+  assert.equal(atGap.action, 'write');
+  assert.equal(atGap.priority, 'P2');
+
+  const almostHour = applyDebounce(
+    downgradeFrom('P1', T0).next,
+    scored('P2', 'situation'),
+    T0 + DOWNGRADE_WINDOW_MS - 1,
+  );
+  assert.equal(almostHour.action, 'write');
+  assert.equal(almostHour.priority, 'P2');
+});
+
+test('#239 SC2 恰好 60 分钟仍在窗口内，判为 write', () => {
+  assert.equal(DOWNGRADE_WINDOW_MS, 60 * MIN);
+  assert.equal(DOWNGRADE_WINDOW_MS, 3_600_000);
+  const edge = applyDebounce(
+    downgradeFrom('P1', T0).next,
+    scored('P2', 'situation'),
+    T0 + 3_600_000,
+  );
+  assert.equal(edge.action, 'write');
+  assert.equal(edge.priority, 'P2');
+  const doc = readFileSync(fileURLToPath(new URL('../../docs/acceptance-operations.md', import.meta.url)), 'utf8');
+  assert.match(doc, /> 60 分钟才过期/);
+});
+
+test('#239 SC3 刚出窗口不确认，计数回到 1，lastRecalcAt 改为本次', () => {
+  const at = T0 + DOWNGRADE_WINDOW_MS + 1;
+  const expired = applyDebounce(downgradeFrom('P1', T0).next, scored('P2', 'situation'), at);
+  assert.equal(expired.action, 'skip');
+  assert.equal(expired.priority, 'P1');
+  assert.equal(expired.next.consecutive, 1);
+  assert.equal(expired.next.lastRecalcAt, at);
+  assert.equal(expired.next.pending, 'P2');
+  assert.equal(expired.next.pendingHeld, true);
+});
+
+test('#239 SC4 间隔不到 15 分钟的观测不计入，过期后的重算不确认', () => {
+  const tooClose = applyDebounce(
+    downgradeFrom('P1', T0).next,
+    scored('P2', 'situation'),
+    T0 + DOWNGRADE_MIN_GAP_MS - 1,
+  );
+  assert.equal(tooClose.action, 'skip');
+  assert.equal(tooClose.next.consecutive, 1);
+  assert.equal(tooClose.next.lastRecalcAt, T0);
+
+  const start = Date.parse('2026-11-03T04:30:00+08:00');
+  let clustered = blankState({ priority: 'P1' });
+  for (let i = 0; i < 5; i += 1) {
+    const decision = applyDebounce(clustered, scored('P2', 'situation'), start + i * 2 * MIN);
+    assert.equal(decision.action, 'skip');
+    assert.equal(decision.next.consecutive, 1);
+    clustered = decision.next;
+  }
+
+  const at0430 = Date.parse('2026-11-03T04:30:00+08:00');
+  const at0432 = Date.parse('2026-11-03T04:32:00+08:00');
+  const later = at0430 + 6.5 * HOUR;
+  const second = applyDebounce(downgradeFrom('P1', at0430).next, scored('P2', 'situation'), at0432);
+  assert.equal(second.action, 'skip');
+  assert.equal(second.next.consecutive, 1);
+  assert.equal(second.next.lastRecalcAt, at0430);
+  const recalc = applyDebounce(second.next, scored('P2', 'situation'), later);
+  assert.equal(recalc.action, 'skip');
+  assert.equal(recalc.priority, 'P1');
+  assert.equal(recalc.next.consecutive, 1);
+  assert.equal(recalc.next.lastRecalcAt, later);
+});
+
+test('#239 SC4 每 2 分钟观测一次，第 16 分钟前不计入，第 16 分钟确认', () => {
+  const start = T0;
+  let state = blankState({ priority: 'P1' });
+  for (let minute = 0; minute <= 14; minute += 2) {
+    const decision = applyDebounce(state, scored('P2', 'situation'), start + minute * MIN);
+    assert.equal(decision.action, 'skip', `第 ${minute} 分钟`);
+    assert.equal(decision.next.consecutive, 1, `第 ${minute} 分钟`);
+    assert.equal(decision.next.lastRecalcAt, start, `第 ${minute} 分钟`);
+    state = decision.next;
+  }
+  assert.equal(state.lastRecalcAt, start);
+  assert.equal(state.consecutive, 1);
+  const at16 = applyDebounce(state, scored('P2', 'situation'), start + 16 * MIN);
+  assert.equal(at16.action, 'write');
+  assert.equal(at16.priority, 'P2');
+  assert.equal(at16.next.pendingHeld, false);
+  assert.equal(at16.next.consecutive, 0);
+});
+
+test('#239 SC5 pending 档位变了就重置连续次数', () => {
+  const towardP3 = applyDebounce(downgradeFrom('P1', T0).next, scored('P3', 'situation'), T0 + 20 * MIN);
+  assert.equal(towardP3.action, 'skip');
+  assert.equal(towardP3.next.pending, 'P3');
+  assert.equal(towardP3.next.consecutive, 1);
+  assert.equal(towardP3.next.lastRecalcAt, T0 + 20 * MIN);
+
+  const backToP2 = applyDebounce(towardP3.next, scored('P2', 'situation'), T0 + 40 * MIN);
+  assert.equal(backToP2.action, 'skip');
+  assert.equal(backToP2.next.pending, 'P2');
+  assert.equal(backToP2.next.consecutive, 1);
+  assert.equal(backToP2.next.lastRecalcAt, T0 + 40 * MIN);
+});
+
+test('#239 SC6 异常 lastRecalcAt 从 1 开始，不抛异常，不确认', () => {
+  const cases = [
+    ['undefined', undefined],
+    ['null', null],
+    ['NaN', Number.NaN],
+    ['负数', -1],
+    ['晚于当前时间', T0 + 1],
+  ];
+  for (const [label, lastRecalcAt] of cases) {
+    const state = blankState({
+      priority: 'P1',
+      pending: 'P2',
+      pendingHeld: true,
+      lastRecalcAt,
+      consecutive: 4,
+    });
+    let decision;
+    assert.doesNotThrow(() => {
+      decision = applyDebounce(state, scored('P2', 'situation'), T0);
+    }, label);
+    assert.equal(decision.action, 'skip', label);
+    assert.equal(decision.priority, 'P1', label);
+    assert.equal(decision.next.consecutive, 1, label);
+    assert.equal(decision.next.lastRecalcAt, T0, label);
+    assert.equal(decision.next.pendingHeld, true, label);
+  }
 });
