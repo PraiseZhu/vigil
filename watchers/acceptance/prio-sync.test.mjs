@@ -26,6 +26,12 @@ import {
   restorePrio,
   runPrioSync,
   STALE_REMIND_MS,
+  ITEM_FIELD_QUERY,
+  PRIO_HOURLY_MAX,
+  PRIO_HOURLY_WINDOW_MS,
+  classifyPrioChange,
+  countRecentChanges,
+  readFieldValue,
 } from './bin/prio-sync.mjs';
 import { REPO, createFakeRun, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 
@@ -3875,4 +3881,148 @@ test('#222 SC15 改动文件不含令牌、本机绝对路径或外部仓库全�
 test('#222 SC16 本测试文件不依赖 origin 与 main 拼成的 ref', () => {
   const source = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8');
   assert.equal(source.includes(['origin', 'main'].join('/')), false);
+});
+
+test('#233 钩子 classifyPrioChange 标出降级、升级、改空、范围外', () => {
+  const table = {
+    mivo: [],
+    idle: [],
+    'daily-tool': [],
+    exclude: ['example-org/excluded-repo'],
+  };
+  assert.equal(classifyPrioChange({ field: '优先级', old: null, new: 'P2' }).kind, 'fill');
+  assert.equal(classifyPrioChange({ field: '优先级', old: '', new: 'P1' }).kind, 'fill');
+  assert.equal(classifyPrioChange({ field: '优先级', old: null, new: 'P0' }).kind, 'fill-other');
+  assert.equal(classifyPrioChange({ field: '优先级', old: 'P1', new: 'P2' }).kind, 'downgrade');
+  assert.equal(classifyPrioChange({ field: '优先级', old: 'P2', new: 'P1' }).kind, 'upgrade');
+  assert.equal(classifyPrioChange({ field: '优先级', old: 'P1', new: null }).kind, 'clear');
+  assert.equal(classifyPrioChange({ field: '优先级', old: 'P1', new: '' }).kind, 'clear');
+  assert.deepEqual(
+    classifyPrioChange({ field: '状态', old: null, new: 'Done' }),
+    { kind: 'out-of-scope', reason: 'field' },
+  );
+  assert.deepEqual(
+    classifyPrioChange(
+      { field: '优先级', repo: 'example-org/excluded-repo', old: null, new: 'P2' },
+      { table },
+    ),
+    { kind: 'out-of-scope', reason: 'exclude' },
+  );
+  assert.equal(classifyPrioChange({ field: '关联 PR', old: '', new: '#1' }).kind, 'link');
+});
+
+test('#233 钩子 onPlan 中止时 0 写入，外层能读到带 verdict 的计划', async () => {
+  const dir = tmpDir();
+  const gate = recorder();
+  const result = await runPrioSync({
+    dir,
+    items: [item(1), item(2)],
+    prs: [],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: capture().stdout,
+    onPlan(plan) {
+      assert.equal(plan.length, 2);
+      assert.ok(plan.every((row) => row.verdict === 'fill'));
+      return { abort: true, reason: 'downgrade' };
+    },
+  });
+  assert.equal(gate.writes.length, 0);
+  assert.equal(result.written, 0);
+  assert.equal(result.aborted, true);
+  assert.equal(result.plan.length, 2);
+  assert.equal(readJsonl(dir).length, 0);
+});
+
+test('#233 钩子 readBack 不一致时停止余下写入，一致时继续并留下回读结果', async () => {
+  const mismatchDir = tmpDir();
+  const mismatchGate = recorder();
+  const mismatch = await runPrioSync({
+    dir: mismatchDir,
+    items: [item(1), item(2)],
+    prs: [],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: mismatchGate.write,
+    stdout: capture().stdout,
+    readBack: async (change) => (change.issue === 1 ? 'P3' : change.new),
+  });
+  assert.equal(mismatchGate.writes.length, 1);
+  assert.equal(mismatch.written, 0);
+  assert.equal(mismatch.readbacks.length, 1);
+  assert.equal(mismatch.readbackMismatch.expected, 'P2');
+  assert.equal(mismatch.readbackMismatch.actual, 'P3');
+  assert.equal(readJsonl(mismatchDir).length, 0, '对不上就不记入变更日志，也不重试');
+
+  const okDir = tmpDir();
+  const okGate = recorder();
+  const ok = await runPrioSync({
+    dir: okDir,
+    items: [item(1), item(2)],
+    prs: [],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: okGate.write,
+    stdout: capture().stdout,
+    readBack: async (change) => change.new,
+  });
+  assert.equal(okGate.writes.length, 2);
+  assert.equal(ok.written, 2);
+  assert.equal(ok.readbackMismatch, null);
+  assert.equal(ok.readbacks.length, 2);
+  assert.equal(readJsonl(okDir).length, 2);
+});
+
+test('#233 钩子 写到一半出现 disabled，剩下的条目不写', async () => {
+  const dir = tmpDir();
+  const gate = recorder();
+  const result = await runPrioSync({
+    dir,
+    items: [item(1), item(2), item(3)],
+    prs: [],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: async (action) => {
+      gate.writes.push(action);
+      fs.writeFileSync(path.join(dir, 'disabled'), '');
+    },
+    stdout: capture().stdout,
+  });
+  assert.equal(gate.writes.length, 1);
+  assert.equal(result.stoppedByDisabled, true);
+  assert.equal(result.written, 1);
+});
+
+test('#233 钩子 countRecentChanges 以 changes.jsonl 时间戳做 1 小时窗口', () => {
+  const now = T0;
+  const row = (age) => ({ at: new Date(now - age).toISOString(), field: '优先级' });
+  assert.equal(PRIO_HOURLY_MAX, 50);
+  assert.equal(countRecentChanges([], now), 0);
+  assert.equal(countRecentChanges([row(PRIO_HOURLY_WINDOW_MS)], now), 0, '恰好满 1 小时的旧行滑出窗口');
+  assert.equal(countRecentChanges([row(PRIO_HOURLY_WINDOW_MS - 1)], now), 1);
+  assert.equal(countRecentChanges([row(1), row(PRIO_HOURLY_WINDOW_MS + 1)], now), 1);
+});
+
+test('#233 钩子 回读查询是只读的，并能从节点上取出优先级', () => {
+  assert.equal(isReadOnlyGraphql(ITEM_FIELD_QUERY), true);
+  const node = {
+    fieldValues: {
+      nodes: [
+        { name: 'P2', field: { name: '优先级' } },
+        { text: 'example#1', field: { name: '关联 PR' } },
+      ],
+    },
+  };
+  assert.equal(readFieldValue(node, '优先级'), 'P2');
+  assert.equal(readFieldValue(node, '关联 PR'), 'example#1');
+  assert.equal(readFieldValue(node, '状态'), null);
 });

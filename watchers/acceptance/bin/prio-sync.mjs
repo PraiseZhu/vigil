@@ -7,6 +7,8 @@
 // 检查还在跑（PENDING）时，关联 PR 文本沿用 debounce.json 的 prCi 里该 PR 上一拍的 ✓/✗，最多 CI_CARRY_TICKS 拍。
 // 这份标注只在 --write 且内容真变化时改；干跑整段原样保留，所以干跑日志里文本仍会在没有存档时跳。
 // 依据只写进 changes.jsonl，不新增看板字段。60 天没动静只提醒「还要不要」，不关 issue。
+// 持续运行（prio-run）可传 onPlan / readBack。计划上每条变更带 verdict（降级、改空、升级、范围外），
+// 写后回读放在返回值里。不传钩子时，输出和写入与以前一致。
 // --only-repo owner/repo 只处理这一个仓（大小写不敏感）。其它仓不打分、不写、不提醒，防抖原样保留。
 // --limit N 按仓名（小写）、issue 号、字段名只写前 N 条真会落闸的变更，N 最大 PRIO_LIMIT_MAX。
 // 超上限的行仍打印，末尾加「（本拍上限截掉）」，不写闸、不进 changes.jsonl，防抖按未写入退回。
@@ -41,12 +43,15 @@ export const STALE_REMIND_MS = 60 * 24 * 60 * 60 * 1000;
 const LINK_BASIS = 'link 关联 PR 文本与看板不一致';
 /** 检查连续 PENDING 时，关联 PR 文本最多沿用上一拍 ✓/✗ 的拍数。调用 runPrioSync 可改。 */
 export const CI_CARRY_TICKS = 6;
-/** `--limit` 的上限。看板大约百条，1000 留足余量，又挡住一次写太多。 */
+/** `--limit` 的上限。看板大约百条，1000 留足余量，又挡住一次写太多。持续运行的每拍上限也用这个数。 */
 export const PRIO_LIMIT_MAX = 1000;
+/** 持续运行：滚动 1 小时内最多写入这么多条，按 changes.jsonl 的时间戳计。 */
+export const PRIO_HOURLY_MAX = 50;
+export const PRIO_HOURLY_WINDOW_MS = 60 * 60 * 1000;
 const ONLY_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const LIMIT_RE = /^[1-9][0-9]*$/;
 const RESTORE_BASIS = 'restore 按变更日志改回';
-const LINK_HOLD = '不写关联 PR：没有 .prio/mac-mini-stopped，要等确认 Mac mini 已停写\n';
+const LINK_HOLD = '不写关联 PR：没有 .prio/mac-mini-stopped，扣住，要等确认 Mac mini 已停写\n';
 const RESTORE_SKIP = '跳过：当前值不是上次写入的值';
 
 /** 默认分类表是空的。真实仓名放在配置文件里，不写进源码。exclude 命中的仓整仓跳过。 */
@@ -455,6 +460,87 @@ function isExcludedRepo(repo, table) {
 function itemIsExcluded(item, table) {
   if (!item?.repo || !Number.isInteger(item.number) || item.number <= 0) return false;
   return item.repoClass === 'exclude' || isExcludedRepo(item.repo, table);
+}
+
+/**
+ * 一条计划变更的类别，给持续运行的外层读。不改打分。
+ * fill：空 → P1/P2，持续 --write 只自动写这种。
+ * downgrade / clear：已有优先级改低或改空。
+ * upgrade / fill-other：非空 → 别的值，或空 → P0/P3。
+ * out-of-scope：白名单以外的字段，或分类表 exclude 档的仓。
+ * link：关联 PR。没有 mac-mini-stopped 时由原逻辑扣住，不算这里的异常。
+ */
+export function classifyPrioChange(change, { table } = {}) {
+  const field = change?.field;
+  const repo = typeof change?.repo === 'string' && change.repo ? change.repo : repoOfRef(change?.item);
+  if (field !== '优先级' && field !== '关联 PR') {
+    return { kind: 'out-of-scope', reason: 'field' };
+  }
+  if (table && isExcludedRepo(repo, table)) {
+    return { kind: 'out-of-scope', reason: 'exclude' };
+  }
+  if (field === '关联 PR') return { kind: 'link', reason: '' };
+  const oldEmpty = change.old == null || change.old === '';
+  const newEmpty = change.new == null || change.new === '';
+  if (newEmpty) return { kind: 'clear', reason: '' };
+  if (oldEmpty && (change.new === 'P1' || change.new === 'P2')) return { kind: 'fill', reason: '' };
+  if (oldEmpty) return { kind: 'fill-other', reason: '' };
+  const oldRank = RANK.get(change.old);
+  const newRank = RANK.get(change.new);
+  if (oldRank == null || newRank == null) return { kind: 'other', reason: '' };
+  if (newRank > oldRank) return { kind: 'downgrade', reason: '' };
+  if (newRank < oldRank) return { kind: 'upgrade', reason: '' };
+  return { kind: 'same', reason: '' };
+}
+
+/** changes.jsonl 里落在 (now - window, now] 的行数。恰好等于窗口长度的旧行不再计入。缺文件当 0 条。 */
+export function countRecentChanges(rows, nowMs, windowMs = PRIO_HOURLY_WINDOW_MS) {
+  const now = Number(nowMs);
+  if (!Number.isFinite(now)) return 0;
+  const window = Number(windowMs);
+  let count = 0;
+  for (const row of rows || []) {
+    const at = Date.parse(row?.at);
+    if (!Number.isFinite(at) || at > now) continue;
+    if (now - at < window) count += 1;
+  }
+  return count;
+}
+
+export function readChangeLog(dir) {
+  const file = changesFile(dir);
+  if (!fs.existsSync(file)) return [];
+  return readJsonLines(file, '变更日志');
+}
+
+/** 写后回读一条看板字段。只读，给持续运行核对刚才写下的值。 */
+export const ITEM_FIELD_QUERY = `query ($id: ID!) {
+  node(id: $id) {
+    ... on ProjectV2Item {
+      id
+      fieldValues(first: 30) {
+        nodes {
+          __typename
+          ... on ProjectV2ItemFieldSingleSelectValue {
+            name
+            field { ... on ProjectV2FieldCommon { name } }
+          }
+          ... on ProjectV2ItemFieldTextValue {
+            text
+            field { ... on ProjectV2FieldCommon { name } }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+export function readFieldValue(node, field) {
+  const values = valuesOf(node);
+  if (!values.has(field)) return field === '关联 PR' ? '' : null;
+  const raw = values.get(field);
+  if (field === '优先级') return raw || null;
+  return raw ?? '';
 }
 
 function excludedSuffix(count) {
@@ -882,6 +968,8 @@ export async function runPrioSync({
   carryTicks = CI_CARRY_TICKS,
   onlyRepo = null,
   limit = null,
+  onPlan = null,
+  readBack = null,
 } = {}) {
   if (!dir) throw new Error('缺少状态目录');
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
@@ -1022,10 +1110,34 @@ export async function runPrioSync({
     });
   }
 
+  for (const change of changes) {
+    const found = classifyPrioChange(change, { table });
+    change.verdict = found.kind;
+    change.verdictReason = found.reason || '';
+  }
+  const plan = changes.map((change) => ({ ...change }));
+  let gate = { abort: false, allow: null };
+  if (typeof onPlan === 'function') {
+    const decided = await onPlan(plan);
+    if (decided?.abort) gate = { abort: true, reason: decided.reason || '' };
+    else if (typeof decided?.allow === 'function') gate = { abort: false, allow: decided.allow };
+  }
+
   let written = 0;
   let acceptedWrites = 0;
   const skippedRepos = new Map();
-  for (const change of changes) {
+  const readbacks = [];
+  const skippedAuto = [];
+  let readbackMismatch = null;
+  let stoppedByDisabled = false;
+  let outOfScopeHit = null;
+  const restoreFrom = (start) => {
+    for (let cursor = start; cursor < changes.length; cursor += 1) {
+      restoreUnwrittenDebounce(nextItems, saved, changes[cursor].item);
+    }
+  };
+  for (let index = 0; index < changes.length; index += 1) {
+    const change = changes[index];
     const basis = change.basis ? ` 依据：${change.basis}` : '';
     const line = `${change.item} ${change.field} ${show(change.old)} → ${show(change.new)}${basis}`;
     const held = change.field === '关联 PR' && !linkAllowed;
@@ -1044,6 +1156,33 @@ export async function runPrioSync({
     if (held) {
       outWrite(stdout, LINK_HOLD);
       continue;
+    }
+    if (fs.existsSync(disabledFile(dir))) {
+      stoppedByDisabled = true;
+      restoreFrom(index);
+      break;
+    }
+    if (gate.abort) {
+      restoreUnwrittenDebounce(nextItems, saved, change.item);
+      continue;
+    }
+    if (change.verdict === 'out-of-scope') {
+      outOfScopeHit = { item: change.item, field: change.field, verdictReason: change.verdictReason };
+      restoreFrom(index);
+      break;
+    }
+    if (gate.allow) {
+      const decision = gate.allow(change, { written });
+      if (decision !== 'write') {
+        skippedAuto.push({
+          item: change.item,
+          field: change.field,
+          verdict: change.verdict,
+          decision: decision || 'skip',
+        });
+        restoreUnwrittenDebounce(nextItems, saved, change.item);
+        continue;
+      }
     }
     const prior = skippedRepos.get(change.repo);
     if (prior) {
@@ -1073,6 +1212,33 @@ export async function runPrioSync({
       restoreUnwrittenDebounce(nextItems, saved, change.item);
       continue;
     }
+    if (typeof readBack === 'function') {
+      let actual;
+      try {
+        const raw = await readBack(change);
+        actual = raw && typeof raw === 'object' && !Array.isArray(raw) && Object.hasOwn(raw, 'value') ? raw.value : raw;
+      } catch (error) {
+        appendChange(dir, {
+          at: new Date(now).toISOString(),
+          item: change.item,
+          repo: change.repo,
+          issue: change.issue,
+          field: change.field,
+          old: change.old,
+          new: change.new,
+          basis: change.basis || '',
+        });
+        written += 1;
+        throw error;
+      }
+      const row = { item: change.item, field: change.field, expected: change.new, actual };
+      readbacks.push(row);
+      if (!sameValue(actual, change.new)) {
+        readbackMismatch = row;
+        restoreFrom(index);
+        break;
+      }
+    }
     appendChange(dir, {
       at: new Date(now).toISOString(),
       item: change.item,
@@ -1097,7 +1263,22 @@ export async function runPrioSync({
   const excludedTotal = (Number.isInteger(presetExcluded) && presetExcluded > 0 ? presetExcluded : 0) + skippedHere;
   const batch = `${onlyRepo ? `，按仓过滤掉 ${filteredByRepo} 条` : ''}${limit != null ? `，按上限截掉 ${truncatedByLimit} 条` : ''}`;
   outWrite(stdout, `${headOf(mode)}${items.length - skippedHere} 条，变更 ${changes.length}，写入 ${written}，钉住 ${pinned}${report.suffix}${excludedSuffix(excludedTotal)}${nullContentSuffix(nullContent)}${batch}\n`);
-  return { written, planned: changes.length, pinned, mode, excluded: excludedTotal, filteredByRepo, truncatedByLimit };
+  return {
+    written,
+    planned: changes.length,
+    pinned,
+    mode,
+    excluded: excludedTotal,
+    filteredByRepo,
+    truncatedByLimit,
+    plan,
+    readbacks,
+    readbackMismatch,
+    stoppedByDisabled,
+    aborted: gate.abort,
+    outOfScopeHit,
+    skippedAuto,
+  };
 }
 
 /** 把 since 这个时间点之后的变更改回当时的旧值。默认仍是 dry-run。 */

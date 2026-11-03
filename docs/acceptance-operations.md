@@ -669,3 +669,103 @@ node watchers/acceptance/bin/prio-sync.mjs \
 - 取值不合法就退出码非 0，一条都不写：不读写令牌，不读看板，不创建 `changes.jsonl`、`debounce.json` 和 `run-*.log`。`--limit` 的空值、`0`、负数、小数、夹着非数字、大于 1000，以及 `--only-repo` 的空值、只有一段、三段、首尾带 `/`、含空格，报错里都会写上期望格式和实际值。同一个参数出现两次，或者取值的位置是另一个以 `--` 开头的参数，同样退出码非 0。
 - `--only-repo` 或 `--limit` 不能和 `--restore` 一起用。一起出现时退出码非 0，报错是「--only-repo / --limit 不能和 --restore 同用」，还原不会执行。
 - 状态目录里已经有 `disabled` 时，带上这两个参数也还是已停用，写入数是 0。
+
+## 13. prio 持续运行
+
+`watchers/acceptance/bin/prio-run.mjs` 是一拍一次的入口。进程自己不循环，也不安装 cron、也不改 `/etc/cron.d`。节拍按 5 分钟一次来设计，由人在验收机上决定什么时候挂上定时任务。
+
+### 怎么开、怎么停
+
+先只跑 dry-run（默认就是 dry-run）：
+
+```sh
+node watchers/acceptance/bin/prio-run.mjs --state-dir <state-dir>
+```
+
+Inspector 看过至少 24 小时的 dry-run 之后，才在同一条命令上加 `--write`。`--write` 仍然只自动写「空优先级 → P1 或 P2」，并且只写授权清单里的仓。
+
+停写：
+
+```sh
+touch <state-dir>/disabled
+```
+
+文件在，这一拍就 0 次写入，dry-run 照跑，输出里有「已停写」，退出码 0。程序自己停写也是写这个文件。要恢复，人看完告警后删掉它。本程序不创建 `mac-mini-stopped`。
+
+下面两行只是示例，不要执行，本仓库不安装：
+
+```sh
+# */5 * * * * cd <repo> && node watchers/acceptance/bin/prio-run.mjs --state-dir <state-dir>
+# */5 * * * * cd <repo> && node watchers/acceptance/bin/prio-run.mjs --write --state-dir <state-dir>
+```
+
+### 配置项
+
+状态目录沿用 prio-sync，默认是当前用户主目录下的 `acceptance/tools/.prio`。测试和验收机都用 `--state-dir` 指到自己的目录。
+
+| 文件或参数 | 作用 |
+|---|---|
+| `--max-per-tick N` 或 `<state-dir>/run.json` 的 `maxPerTick` | 每拍最多写入几条。默认 10。0、负数、非整数、大于 1000 都在读令牌之前报错，信息里有期望和实际值 |
+| `<state-dir>/changes.jsonl` | 每小时上限的计数依据。滚动 1 小时内最多 50 条（`PRIO_HOURLY_MAX`）。第 51 条不写，并自动停写 |
+| `<state-dir>/authorized-repos.json` | `--write` 的授权清单。没有这个文件，或者仓名不在里面，该仓只做 dry-run |
+| `<state-dir>/disabled` | 停写开关 |
+| `<state-dir>/alerts.jsonl` | 告警。也可用 `--alerts-file` 换路径。不推到别处 |
+| `<state-dir>/fail-streak` | 连续多少拍遇到找不到或 5xx。满 3 拍自动停写 |
+| `<state-dir>/repo-class.json` | 仓分类，沿用 prio-sync。本入口不改这张表 |
+
+授权清单的格式（仓名用虚构例子；验收机上那 4 个已授权仓写在机器本地的这份文件里，不要写进 git）：
+
+```json
+{
+  "repos": ["example-org/sample-repo"]
+}
+```
+
+不在 `repos` 里的仓，即使能解析，持续 `--write` 也只打 dry-run，不调用写入。
+
+### 告警的含义
+
+每条告警是一行 JSON：`ts`、`kind`、`text`。`text` 用大白话，说清发生了什么、有没有影响、要不要人处理。不写令牌、主机名、公司名，也不写被验收仓的全名。
+
+| kind | 什么时候 | 人要做什么 |
+|---|---|---|
+| `prio-downgrade` | 计划里有把已有优先级改低或改空 | 已停写，看板没被改。看完这条，确认后删掉 `disabled` |
+| `prio-out-of-scope` | 计划里有白名单以外的字段，或排除档的仓 | 已停写，这一拍一条都没写。核对字段和分类后再删 `disabled` |
+| `prio-readback` | 写入后读回来的值对不上 | 已停写，剩下的没写，没有自动重试。核对看板后再删 `disabled` |
+| `prio-hourly` | 滚动 1 小时已经到 50 条，还有下一条要写 | 已停写。确认是不是写得太多，再删 `disabled` |
+| `prio-nonempty` | 有「非空 → 别的值」（含升级）或空 → P0/P3 | 没有停写。这些条没写。要改就手动跑 prio-sync |
+| `prio-github` | GitHub 返回找不到或 5xx | 这一拍没继续写。不满 3 拍先不用处理，下一拍再试。满 3 拍会停写 |
+
+相同的 `kind` 和 `text` 不重复追加。关联 PR 在没有 `mac-mini-stopped` 时只打印「扣住」，不算告警，也不写。持续 `--write` 即使已经有这个标记，也不自动写关联 PR。
+
+### 两段上线检查表
+
+都由 Inspector 逐步审批。本仓库只提供入口和这份检查表，不替人勾。
+
+**第一段：`--dry-run` 至少 24 小时**
+
+- 每条变化都能用日志里的依据解释。
+- 单条 24 小时内变化不超过 2 次。
+- 结果交给 Inspector 看过，再决定是否开 `--write`。
+
+**第二段：开 `--write` 后 1 小时内**
+
+- 除 Done 和已关闭的 issue 外，看板没有空优先级。已关闭的 issue 程序不打分，这是现行规则。
+- 「关联 PR」延迟 p95：Worker 路径不超过 10 秒，兜底路径不超过 90 秒。事件通道未接入前，这一项记为「未接入、不适用」。
+- 心跳和轮次正常，验收机 CPU、内存变化小于 5%。
+- 1 小时内改动不超过 50 条。
+
+**回滚条件**（满足任一就回滚）
+
+- 误写白名单以外的字段。
+- 1 小时内改动超过 50 条。
+- 心跳异常。
+- p95 超过 90 秒并持续 30 分钟。
+
+**回滚步骤**
+
+1. `touch <state-dir>/disabled`
+2. `node watchers/acceptance/bin/prio-sync.mjs --restore <开写时间> --state-dir <state-dir>`
+3. 确认 dry-run 的还原清单之后，再加 `--write` 把值改回去。
+
+github-live 的手测（真的看板上跑 24 小时、以及合并后确认没有新的 cron）由 Inspector 在验收机上做。本仓库的测试只覆盖入口、限额、停写和文档里的检查表。
