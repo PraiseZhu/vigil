@@ -4060,6 +4060,44 @@ async function drySync(dir, { nowMs = T0, items = [downgradeItem()], apply = fal
   return { gate, io };
 }
 
+test('#240 SC1 已停用时 dry-run 也不改 debounce.json：跑前跑后 sha256 相同，计数不变，看板外的键还在', async () => {
+  const dir = tmpDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'disabled'), '');
+  seedOwned(dir, 6, 'P0');
+  const file = path.join(dir, 'debounce.json');
+  const absentRef = 'example-owner/other-repo#99';
+  const absent = {
+    priority: 'P3',
+    pending: null,
+    pendingHeld: false,
+    lastRecalcAt: 42,
+    consecutive: 0,
+    changes: [7],
+  };
+  const raw = `${JSON.stringify({ items: { [`${REPO}#6`]: heldDowngrade(), [absentRef]: absent } })} \n`;
+  fs.writeFileSync(file, raw);
+  const before = fileSha256(file);
+  const { gate, io } = await drySync(dir);
+  assert.equal(gate.writes.length, 0);
+  assert.match(io.text(), /已停用：/);
+  assert.equal(fileSha256(file), before, '跑前跑后 sha256 相同');
+  const saved = readState(dir).items[`${REPO}#6`];
+  assert.equal(saved.consecutive, 1);
+  assert.equal(saved.pending, 'P2');
+  assert.equal(saved.pendingHeld, true);
+  assert.equal(saved.lastRecalcAt, T0);
+  assert.deepEqual(readState(dir).items[absentRef], absent);
+
+  const empty = tmpDir();
+  fs.mkdirSync(empty, { recursive: true });
+  fs.writeFileSync(path.join(empty, 'disabled'), '');
+  const missing = path.join(empty, 'debounce.json');
+  assert.equal(fs.existsSync(missing), false);
+  await drySync(empty, { items: [item(1, { labels: ['blocker'] })] });
+  assert.equal(fs.existsSync(missing), false);
+});
+
 test('#240 SC1 dry-run 不改 debounce.json：跑前跑后 sha256 相同，文件不存在时跑完仍然不存在', async () => {
   const dir = tmpDir();
   seedOwned(dir, 6, 'P0');
