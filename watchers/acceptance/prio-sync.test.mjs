@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { DOWNGRADE_MIN_GAP_MS } from './bin/prio-score.mjs';
+import { DOWNGRADE_MIN_GAP_MS, DOWNGRADE_WINDOW_MS } from './bin/prio-score.mjs';
 import { isReadOnlyGraphql } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import {
@@ -4206,16 +4206,40 @@ test('#240 SC5 --write 仍推进未确认降档、确认后写入，并删掉不
     changes: [],
   };
 
+  const freshDir = tmpDir();
+  seedOwned(freshDir, 6, 'P0');
+  writeDebounce(freshDir, { items: { [absentRef]: absent } });
+  const first = await drySync(freshDir, { apply: true, nowMs: T0 });
+  assert.equal(first.gate.writes.length, 0);
+  const firstSaved = readState(freshDir).items;
+  assert.equal(firstSaved[`${REPO}#6`].consecutive, 1);
+  assert.equal(firstSaved[`${REPO}#6`].pending, 'P2');
+  assert.equal(firstSaved[`${REPO}#6`].pendingHeld, true);
+  assert.equal(firstSaved[`${REPO}#6`].lastRecalcAt, T0);
+  assert.equal(Object.hasOwn(firstSaved, absentRef), false);
+
+  const early = await drySync(freshDir, { apply: true, nowMs: T0 + 2 * 60 * 1000 });
+  assert.equal(early.gate.writes.length, 0);
+  const earlySaved = readState(freshDir).items[`${REPO}#6`];
+  assert.equal(earlySaved.consecutive, 1);
+  assert.equal(earlySaved.lastRecalcAt, T0);
+
   const pendingDir = tmpDir();
   seedOwned(pendingDir, 6, 'P0');
   writeDebounce(pendingDir, { items: { [`${REPO}#6`]: heldDowngrade(), [absentRef]: absent } });
-  const pending = await drySync(pendingDir, { apply: true });
-  assert.equal(pending.gate.writes.length, 0);
+  // 第二次距第一次恰好 15 分钟，仍在 60 分钟窗口内。这一次被计入并达到确认，所以会写入。
+  const observedAt = T0 + DOWNGRADE_MIN_GAP_MS;
+  const pending = await drySync(pendingDir, { apply: true, nowMs: observedAt });
+  assert.equal(observedAt - T0 >= DOWNGRADE_MIN_GAP_MS, true);
+  assert.equal(observedAt - T0 <= DOWNGRADE_WINDOW_MS, true);
+  assert.equal(pending.gate.writes.length, 1);
+  assert.deepEqual(pending.gate.writes[0].fields, { 优先级: 'P2' });
   const pendingState = readState(pendingDir).items;
-  assert.equal(pendingState[`${REPO}#6`].consecutive, 2);
-  assert.equal(pendingState[`${REPO}#6`].pending, 'P2');
-  assert.equal(pendingState[`${REPO}#6`].pendingHeld, true);
-  assert.equal(pendingState[`${REPO}#6`].lastRecalcAt, T0);
+  assert.equal(pendingState[`${REPO}#6`].priority, 'P2');
+  assert.equal(pendingState[`${REPO}#6`].consecutive, 0);
+  assert.equal(pendingState[`${REPO}#6`].pending, null);
+  assert.equal(pendingState[`${REPO}#6`].pendingHeld, false);
+  assert.equal(pendingState[`${REPO}#6`].lastRecalcAt, null);
   assert.equal(Object.hasOwn(pendingState, absentRef), false);
 
   const confirmDir = tmpDir();
