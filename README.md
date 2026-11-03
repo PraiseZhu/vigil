@@ -94,6 +94,7 @@ README:[`watchers/mivo/README.md`](watchers/mivo/README.md)、
    | `workingDir` | `<watcher home>` 的绝对路径 | script 模式下作为命令的 cwd |
    | `useWorktree` | `false` | script 模式不支持 ephemeral worktree |
    | `notify` | 按需 | 必填对象 `{desktop, feishu}` |
+   | `agentKind` / `model` / `providerId` / `effort` / `fastMode` | 修复会话要用的模型配置 | 新建的修复会话沿用这几项(`agentKind` 填 `codex`);不填落到宿主默认模型;改了只影响之后新建的会话 |
 
    完整字段说明与排障见 [`docs/operations.md`](docs/operations.md#2-调度在-cindy-里创建发现器调度)。
 

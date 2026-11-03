@@ -50,6 +50,7 @@ Vigil 的两个 watcher **不是**可以配进任意 cron 的无状态脚本—�
 | `workingDir` | `<watcher home>` 的绝对路径 | script 模式下作为 `scriptConfig.command` 的 cwd |
 | `useWorktree` | `false` | script 模式不支持 ephemeral worktree |
 | `notify` | `{"desktop": false, "feishu": false}` | discover 建议静默;失败轮仍会记进调度日志 |
+| `agentKind` / `model` / `providerId` / `effort` / `fastMode` | 修复会话要用的 Agent、模型、模型来源、推理档和速度 | script 模式本身不调模型,但 discover 用 `sessions.dispatch` 新建的修复会话不带模型参数,直接沿用这几项;不填就落到宿主默认模型。派发消息按 `codex` 会话写,`agentKind` 填 `codex`。改这几项只影响之后新建的会话,已存在的修复会话要逐个改(Cindy 的 `set_session_runtime`) |
 
 discover 一次调用会扫描 `targetRepo` 下你自己的所有 open PR,不需要"每个 PR 一个调度项"。
 
