@@ -23,7 +23,7 @@ import { OWNER, REPO, HANDOFF_REPO, tmpDir, writeProfile, writeSecret } from './
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const NOW = Date.parse('2026-10-24T02:00:00.000Z');
 
-function makeFixture({ heartbeat, writeCommand = true } = {}) {
+function makeFixture({ heartbeat, writeCommand = true, apps, trustedBotLogins } = {}) {
   const slack = writeSecret(path.join(tmpDir(), 'secrets', 'slack.token'), 'fixture-slack-not-real');
   const exampleToken = writeSecret(path.join(tmpDir(), 'secrets', 'example.token'), 'fixture-token-not-real');
   const extraProfile = {
@@ -33,6 +33,8 @@ function makeFixture({ heartbeat, writeCommand = true } = {}) {
     exampleTokenFile: exampleToken,
   };
   if (writeCommand) extraProfile.writeCommand = ['node', 'example-write-command.mjs'];
+  if (apps) extraProfile.apps = apps;
+  if (trustedBotLogins) extraProfile.trustedBotLogins = trustedBotLogins;
   const base = writeProfile(tmpDir(), { profile: extraProfile });
   const paths = hostPaths(base.home);
   fs.mkdirSync(paths.hostDir, { recursive: true });
@@ -166,6 +168,95 @@ test('SC1 缺哪项报哪项：gh / 令牌账号 / 仓可读 / 看板 / fork 推
     assert.ok(failed.includes(name), `没报 ${name}：${failed.join(', ')}`);
   }
   assert.match(checkOf(result, '令牌账号').detail, /ExampleOther/);
+});
+
+test('令牌文件：apps.write 的私钥也在检查范围内（权限 644 点名叫出来，600 通过）', async () => {
+  const secretDir = path.join(tmpDir(), 'secrets');
+  fs.mkdirSync(secretDir, { recursive: true });
+  const keyFile = path.join(secretDir, 'write.key');
+  fs.writeFileSync(keyFile, 'placeholder', { mode: 0o600 });
+  fs.chmodSync(keyFile, 0o600);
+  const apps = { write: { appId: 5700001, privateKeyFile: keyFile, owners: [OWNER] } };
+  const fixture = makeFixture({ apps });
+  const okResult = await runDoctor({
+    profileEnv: fixture.profileEnv,
+    probes: makeProbes(),
+    github: makeGithub(),
+    now: () => NOW,
+  });
+  assert.equal(checkOf(okResult, '令牌文件').ok, true, checkOf(okResult, '令牌文件').detail);
+  assert.match(checkOf(okResult, '令牌文件').detail, /4 个密钥文件/, '顶层三个 + apps.write 的私钥都算进来');
+
+  fs.chmodSync(keyFile, 0o644);
+  const badResult = await runDoctor({
+    profileEnv: fixture.profileEnv,
+    probes: makeProbes(),
+    github: makeGithub(),
+    now: () => NOW,
+  });
+  const check = checkOf(badResult, '令牌文件');
+  assert.equal(check.ok, false, '权限放开必须报出来');
+  assert.match(check.detail, /apps\.write\.privateKeyFile/);
+});
+
+test('写 App 身份白名单：配了 apps.write 但 trustedBotLogins 里没它的 [bot] → 红灯说清后果；有它 → 绿；没配 apps.write → 不检查', async () => {
+  const secretDir = path.join(tmpDir(), 'secrets');
+  fs.mkdirSync(secretDir, { recursive: true });
+  const keyFile = path.join(secretDir, 'write.key');
+  fs.writeFileSync(keyFile, 'placeholder', { mode: 0o600 });
+  fs.chmodSync(keyFile, 0o600);
+  const BOT = 'example-automation[bot]';
+  const write = { write: { appId: 5700001, privateKeyFile: keyFile, owners: [OWNER] } };
+  const resolveAppBotLogin = async ({ app }) => {
+    assert.equal(app.appId, '5700001', '拿写 App 的 appId 去问 GET /app');
+    return BOT;
+  };
+  const doctor = (extra) => runDoctor({ probes: makeProbes(), github: makeGithub(), now: () => NOW, resolveAppBotLogin, ...extra });
+
+  const empty = await doctor({ profileEnv: makeFixture({ apps: write }).profileEnv });
+  const red = checkOf(empty, '写 App 身份白名单');
+  assert.equal(red.ok, false, '白名单空着必须报红');
+  assert.equal(empty.ok, false);
+  assert.ok(red.detail.includes(BOT), red.detail);
+  for (const phrase of [/trustedBotLogins/, /评论 .*作者会变成/, /轮次评论会被忽略/, /加进 trustedBotLogins 再开 apps\.write/]) {
+    assert.match(red.detail, phrase);
+  }
+
+  const trusted = await doctor({ profileEnv: makeFixture({ apps: write, trustedBotLogins: ['Example-Automation[bot]'] }).profileEnv });
+  const green = checkOf(trusted, '写 App 身份白名单');
+  assert.equal(green.ok, true, green.detail);
+  assert.match(green.detail, /example-automation\[bot\]/, '大小写不敏感也认（与 isTrustedAuthor 一致）');
+  assert.equal(trusted.ok, true);
+
+  let skippedCalls = 0;
+  const readOnly = await runDoctor({
+    profileEnv: makeFixture({ apps: { read: { appId: 5559539, privateKeyFile: keyFile, owners: [OWNER] } } }).profileEnv,
+    probes: makeProbes(),
+    github: makeGithub(),
+    now: () => NOW,
+    resolveAppBotLogin: async () => {
+      skippedCalls += 1;
+      return BOT;
+    },
+  });
+  const skipped = checkOf(readOnly, '写 App 身份白名单');
+  assert.equal(skipped.ok, true);
+  assert.match(skipped.detail, /没配 apps\.write/);
+  assert.match(skipped.detail, /跳过/);
+  assert.equal(skippedCalls, 0, '没配 apps.write 就不去问 GET /app');
+
+  const unknown = await runDoctor({
+    profileEnv: makeFixture({ apps: write }).profileEnv,
+    probes: makeProbes(),
+    github: makeGithub(),
+    now: () => NOW,
+    resolveAppBotLogin: async () => {
+      throw new Error('GET /app 返回 404');
+    },
+  });
+  const unresolved = checkOf(unknown, '写 App 身份白名单');
+  assert.equal(unresolved.ok, false, '查不到 bot 登录名就不能说白名单对得上');
+  assert.match(unresolved.detail, /404/);
 });
 
 test('SC1 仓读不到 → 「仓可读」报出来并点名', async () => {

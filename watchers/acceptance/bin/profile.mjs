@@ -272,7 +272,8 @@ function loadAppConfig(appConfigPath, file) {
 
 /**
  * 两级 App 配置：`apps: { read: {...}, write: {...} }`。
- * - read：①读 App（只做单仓读）；write：②写 App（推分支、PR、workflow；评论 / issue 等写先不开）。
+ * - read：①读 App（只做单仓读）；write：②写 App（评论 / issue / sub-issue / 推分支 / PR / workflow）。
+ *   评论与 issue 写出来作者是 `<app>[bot]`，要同时在 `trustedBotLogins` 里写上它，否则轮次认不出来。
  * - 每个 app：`appId`（正的安全整数或纯数字字符串，不收前导零）、`privateKeyFile`（绝对路径）、`owners`（默认 `[ownerLogin]`）。
  * - 安装号不在这里配：运行时用私钥 JWT 调 `GET /app/installations` 查。
  * - 只校格式，不在这里碰私钥文件：私钥缺失 / 不可读 / 权限不对时，用的时候回退账号令牌并记一行日志

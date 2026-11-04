@@ -163,27 +163,42 @@ App 装在多个 owner 上、读和写又是两个 App 时，用 `apps` 配。�
 - 令牌按 `(app, owner)` 各缓存 50 分钟，只放在进程内存里（本仓自己不落盘）；一个 `(app, owner)` 取不到不影响别的。
   取令牌整个过程（查安装 + 换令牌）上限 30 秒。owner 比较统一转小写，`ExampleUser` / `exampleuser` 命中同一份缓存。
 
-分流规则（**首批只读切 App，写待身份白名单**）：
+分流规则（**读与写都切 App；按 owner 逐个开**）：
 
 | 请求 | 走哪个令牌 |
 |---|---|
 | 落在 `apps.read.owners` 名下**单个仓**上的只读查询（议题正文、轮次评论、PR 检查等按 `owner/name` 定位的读） | ①读 App |
-| 评论 / issue / sub-issue 写：`comment.create/update`、`issue.create/edit/close/reopen`、`subissue.add` | 账号令牌（**首批不切 App**） |
+| 评论 / issue / sub-issue 写：`comment.create/update`、`issue.create/edit/close/reopen`、`subissue.add` | ②写 App |
 | 推分支 / PR / workflow：`branch.push`、`pr.create`、`pr.ready`、`pr.update-branch`、`ci.rerun` | ②写 App |
 | 跨仓盘点、搜索、`viewer`、看板读、别人组织的仓 | 账号令牌 |
 | 看板写（`project.field.set`） | 账号令牌（App 看不到个人账号下的 Projects v2） |
-| 其它没列出的写类型 | 账号令牌（不在表里就按账号令牌，不猜） |
+| 合并（`pr.merge`）与其它没列出的写类型 | 账号令牌（不在表里就按账号令牌，不猜） |
 
-评论 / issue / sub-issue 还没切：用 App 令牌写出来作者是 `<app>[bot]`，而 `bin/rounds.mjs`、`bin/collect.mjs`、
-`bin/tasks.mjs`、`host/prbot.mjs`、`host/prbot-gate-check.mjs` 都按 `author.login == ownerLogin` 认「自己发的」
-轮次评论、子 issue 和修正 issue。现在切会让轮次反复重开、`done/finish` 报 `NOT_CURRENT`、修正树消失。
-分流表里这几项先留成 `null`（占位），须等身份白名单（把 bot 登录名也算成自己）那个 PR 合并后再开。
-②的写（推分支 / PR / workflow）作者是 bot，不影响现有判定。
+开关粒度是 owner：某个 owner 要切写，只把它加进 `apps.write.owners`，别的 owner 继续账号令牌。
+**开之前必须先把 ②写 App 的 `<app>[bot]` 登录名写进 `profile.trustedBotLogins`**：用 App 令牌写出来作者是
+`<app>[bot]`，轮次评论 / 子 issue / 修正 issue 靠身份白名单（`bin/trusted-author.mjs`）认自己，白名单里没有
+这个 bot 就会让轮次反复重开、`done/finish` 报 `NOT_CURRENT`、修正树消失。①读 App 只做读，不要拿它的私钥配 `apps.write`：
+只读 App 通常没有 `issues: write` / `contents: write`，用它会一路 403 回退，白浪费一趟。
+
+**开关顺序（顺序反了，本轮及之后的轮次评论就会被当成别人的）**：
+
+1. 先拿到写 App 的 bot 登录名。profile 里不存这个名字，GitHub 给 App 的账号用户名是 `<slug>[bot]`，`slug` 只能用
+   写 App 的私钥签 JWT 问 `GET /app`（`appBotLogin()`，`bin/github.mjs`）。配了 `apps.write` 就跑一次 `doctor`：
+   「写 App 身份白名单」这一项会把查到的登录名写出来，不在白名单里直接报红。
+2. 把这个登录名（整串，带 `[bot]`）加进 `profile.trustedBotLogins`，重跑 `doctor` 等这一项变绿。
+3. 最后才把 owner 加进 `apps.write.owners`，重启写闸的 `serve`：`serve` 启动时只读一次 profile，
+   已经开着的轮次要等本轮 gate 结束才换成 bot 身份（不是「立即」生效）。
+
+回滚反过来：先从 `apps.write.owners` 删掉 owner（同样等本轮 gate 结束），再决定要不要把那个 bot 从
+`trustedBotLogins` 去掉——留着无害，只是多认一个身份。
 
 某个 `(app, owner)` 取不到令牌——没装、私钥缺失 / 不可读 / 权限不对、安装号查询失败、换令牌失败——或者
 App 读到 401 / 403 / 404（读是 gh 的 HTTP 状态与 GraphQL 错误；`branch.push` 是 git 的
 `Authentication failed` / `The requested URL returned error: 403` / `Permission to … denied` / `Repository not found`，
 这两套文案都认），就回退账号令牌重试一次，并在 `<home>/state/host/loop.log` 记一行：
+
+写路径只在 401 / 403 / 404 才回退重放：这三类是「请求被拒、没产生副作用」，重放安全。
+5xx / 超时**不回退也不重放**：服务端可能已经把评论 / issue 写进去了，重放会重复写。
 
 ```
 <UTC 时间> app-token-fallback kind=<token-failed|auth-401|auth-403|not-found> repo=<owner/name> app=<read|write> reason=<原因> <人话>，已改用原令牌重试一次
@@ -235,7 +250,8 @@ owner 只通过环境变量 `ACCEPTANCE_APP_OWNER` 告诉命令——认它的�
 `appConfigPath`、`appTokenCommand`、`appOwners`，还没有删 `apps`（它会把私钥路径字符串留在副本里；私钥内容仍被遮住）。
 改这一处要动 `host/sandbox.mjs`（遮罩规则），按约定本轮不动，列在 PR 的待批清单里。
 
-`doctor` 的「令牌文件」一项按原始 profile 的**顶层**键算，`apps.*.privateKeyFile` 目前不在这一项检查里，同样列在待补清单。
+`doctor` 的「令牌文件」一项除了原始 profile 的**顶层**键，也会检查 `apps.read.privateKeyFile` /
+`apps.write.privateKeyFile`（权限不是 600 时点名叫出来）。
 
 ## 3. 写闸
 
@@ -579,6 +595,10 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
   「拿不准」只记日志（明细里报出来），GitHub 只读核对没做成也照旧写进明细但不改变红绿。审计内部出错只报这一项失败。
   这一轮已经单独跑过审计时，加 `--skip-gate-audit`：这一项仍在，明细写「本次体检已单独跑过审计，这里跳过」，算通过，不再查 GitHub。不传则照旧跑一遍。
 - `令牌文件`：`…TokenFile` / App 私钥文件全部通过 600、属主当前用户、非空检查。
+- `写 App 身份白名单`：配了 `apps.write` 时，用写 App 的私钥签 JWT 调一次 `GET /app` 取 `slug`，
+  确认 `<slug>[bot]` 在 `profile.trustedBotLogins` 里（大小写不敏感）。不在就报红并说明后果（评论 / issue 作者会变成
+  那个 bot，白名单没它，轮次评论会被忽略），查不到 slug 也报红。没配 `apps.write` 就跳过（算通过，不查 GitHub）。
+  开关顺序见第 2 节「两级 App 配置」。
 - `Slack 频道`：只读——bot 令牌能过 `auth.test`，bot 在 `slackChannelId` 那个频道里（`conversations.info`
   的 `is_member`；令牌没有 `channels:read` / `groups:read` 就退到 `conversations.history limit=1`，bot 不在频道里
   会报 `not_in_channel`）。不发任何消息；没配 `slackChannelId` 就跳过（算通过）——当前部署就是这样：Slack 通报已关闭，告警只写 `alerts.jsonl`。

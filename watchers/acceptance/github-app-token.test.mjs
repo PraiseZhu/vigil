@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { createGithub, defaultRun, WRITE_APP_ROLE } from './bin/github.mjs';
+import { appBotLogin, createGithub, defaultRun, WRITE_APP_ROLE } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { prepareSandboxProfile } from './host/sandbox.mjs';
 import { OWNER, createFakeRun, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
@@ -630,28 +630,41 @@ for (const [status, kind] of [['401', 'auth-401'], ['403', 'auth-403'], ['404', 
   });
 }
 
-test('配了 apps.read：评论、开 issue、开 sub-issue 仍用账号令牌（作者不变，不铸 App 令牌）', async () => {
-  const { profile, loopLog } = appSetup({ read: {}, write: {} });
+test('②单 owner 开写：评论 / 建 issue / 子 issue / PR 写全走 ②的安装令牌；没开写权限的 owner 仍账号令牌', async () => {
+  // ②的 owners 只声明 OWNER：OWNER_B 没开写权限。
+  const { profile, loopLog } = appSetup({ read: {}, write: { owners: [OWNER] } });
   const fetchImpl = appFetch();
   const run = createFakeRun({ onApi: () => ({ id: 7, number: 9, html_url: 'https://example.test/x', state: 'closed' }) });
   const github = createGithub({ profile, run, fetchImpl });
   await github.write({ type: 'comment.create', repo: `${OWNER}/repo-a`, issue: 1, body: 'w' });
-  await github.write({ type: 'issue.create', repo: `${OWNER}/repo-a`, title: 't', body: 'b' });
+  await github.write({ type: 'comment.update', repo: `${OWNER}/repo-a`, commentId: 3, body: 'w' });
+  await github.write({ type: 'issue.create', repo: `${OWNER}/repo-a`, title: 't', body: 'b', labels: ['acceptance'] });
+  await github.write({ type: 'issue.edit', repo: `${OWNER}/repo-a`, issue: 1, body: 'b' });
+  await github.write({ type: 'issue.close', repo: `${OWNER}/repo-a`, issue: 1 });
+  await github.write({ type: 'issue.reopen', repo: `${OWNER}/repo-a`, issue: 1 });
+  // subissue.add 先 GET 子 issue 再 POST。
   await github.write({ type: 'subissue.add', repo: `${OWNER}/repo-a`, issue: 1, subRepo: `${OWNER}/repo-a`, subIssue: 2 });
-  // subissue.add 先 GET 子 issue 再 POST，所以三次写一共四次 gh 调用，全用账号令牌。
-  assert.deepEqual(appTokensUsed(run), Array(4).fill('owner-token'), '这些写的作者必须是 ownerLogin 自己');
-  assert.equal(fetchImpl.calls.list.length + fetchImpl.calls.token.length, 0, '不铸 ①/②令牌');
-  assert.equal(readLog(loopLog), '', '没试 App 就没有回退记录');
+  await github.write({ type: 'pr.create', repo: `${OWNER}/repo-a`, head: 'acceptance/1-x-sc1', title: 't', body: 'b' });
+  // 七次单调用 + subissue 两次 = 九次 gh 写调用，全用 ②的安装令牌。
+  assert.deepEqual(appTokensUsed(run), Array(9).fill(WRITE_TOKENS[OWNER]), '评论 / issue / 子 issue / PR 写用 ②写 App');
+  assert.ok(fetchImpl.calls.token.every((call) => call.iss === WRITE_ID), '只用 ②的私钥，从不动 ①读 App 的私钥');
+  assert.equal(readLog(loopLog), '', '没回退就不记日志');
+
+  // 没开写权限的 owner：账号令牌 + 一行回退记录（写不出去必须留痕）。
+  await github.write({ type: 'comment.create', repo: `${OWNER_B}/repo-b`, issue: 1, body: 'w' });
+  assert.equal(appTokensUsed(run).at(-1), 'owner-token', '名单外的 owner 写用账号令牌');
+  assert.match(readLog(loopLog), /app-token-fallback kind=token-failed repo=ExampleOwnerB\/repo-b app=write reason=owner-not-in-app-owners/);
 });
 
-test('分流表：评论 / issue / sub-issue 是 null（表项保留待身份白名单），只有推分支 / PR / workflow 指向 write', () => {
+test('分流表：评论 / issue / sub-issue / PR 写都指向 write；看板写与合并不在表里（账号令牌）', () => {
   for (const type of ['comment.create', 'comment.update', 'issue.create', 'issue.edit', 'issue.close', 'issue.reopen', 'subissue.add']) {
-    assert.equal(WRITE_APP_ROLE[type], null, `${type} 现在必须走账号令牌`);
+    assert.equal(WRITE_APP_ROLE[type], 'write', `${type} 走 ②写 App`);
   }
   for (const type of ['branch.push', 'pr.create', 'pr.ready', 'pr.update-branch', 'ci.rerun']) {
-    assert.equal(WRITE_APP_ROLE[type], 'write', `${type} 首批走 ②写 App`);
+    assert.equal(WRITE_APP_ROLE[type], 'write', `${type} 走 ②写 App`);
   }
   assert.equal(WRITE_APP_ROLE['project.field.set'], undefined, '看板写不在表里，继续账号令牌');
+  assert.equal(WRITE_APP_ROLE['pr.merge'], undefined, '合并这轮不接 App，继续账号令牌');
 });
 
 test('高风险写走 ②：推分支、开 PR、转 ready、workflow 用写 App 的安装令牌；看板写仍走账号令牌', async () => {
@@ -728,7 +741,7 @@ test('两级配置缺省：只有 read 时读走 ①、写全走账号令牌且�
   assert.equal(readLog(loopLog), '');
 });
 
-test('两级配置缺省：只有 write 时读与评论 / issue 写走账号令牌、高风险写走 ②，无回退日志', async () => {
+test('两级配置缺省：只有 write 时读走账号令牌、写（评论 / issue / PR）走 ②，无回退日志', async () => {
   const { profile, loopLog } = appSetup({ write: {} });
   const fetchImpl = appFetch();
   const run = createFakeRun({
@@ -739,7 +752,7 @@ test('两级配置缺省：只有 write 时读与评论 / issue 写走账号令�
   await github.graphql(Q, { owner: OWNER, name: 'repo-a', number: 1 });
   await github.write({ type: 'comment.create', repo: `${OWNER}/repo-a`, issue: 1, body: 'w' });
   await github.write({ type: 'pr.create', repo: `${OWNER}/repo-a`, head: 'acceptance/1-x-sc1', title: 't', body: 'b' });
-  assert.deepEqual(appTokensUsed(run), ['owner-token', 'owner-token', WRITE_TOKENS[OWNER]]);
+  assert.deepEqual(appTokensUsed(run), ['owner-token', WRITE_TOKENS[OWNER], WRITE_TOKENS[OWNER]]);
   assert.equal(readLog(loopLog), '');
 });
 
@@ -758,6 +771,31 @@ test('没配 apps：与现状完全一致——不碰 App 接口，读和写都�
   assert.deepEqual(appTokensUsed(run), ['owner-token', 'owner-token']);
   assert.equal(fetchImpl.calls.list.length + fetchImpl.calls.token.length, 0);
   assert.equal(readLog(loopLog), '');
+});
+
+test('没配 apps.write：7 类身份写（评论 / 标签 / issue 改关重开 / 子 issue）加 pr.create 共 9 次 gh 调用全走账号令牌，App 取令牌 0 次', async () => {
+  // 路由表里这 7 类的作者会变成 <app>[bot]（所以开写前要配 trustedBotLogins）；这里只配了 ①读 App，②写一个都没有。
+  const IDENTITY_WRITES = ['comment.create', 'comment.update', 'issue.create', 'issue.edit', 'issue.close', 'issue.reopen', 'subissue.add'];
+  assert.equal(IDENTITY_WRITES.length, 7, '身份敏感的写就是这 7 类');
+  for (const type of IDENTITY_WRITES) assert.equal(WRITE_APP_ROLE[type], 'write', `${type} 在表里指向 write`);
+  const { profile, loopLog } = appSetup({ read: {} });
+  assert.equal(profile.apps.write, undefined, '本来就没配 apps.write');
+  const fetchImpl = appFetch();
+  const run = createFakeRun({ onApi: () => ({ id: 7, number: 9, html_url: 'https://example.test/x' }) });
+  const github = createGithub({ profile, run, fetchImpl });
+  await github.write({ type: 'comment.create', repo: `${OWNER}/repo-a`, issue: 1, body: 'w' });
+  await github.write({ type: 'comment.update', repo: `${OWNER}/repo-a`, commentId: 3, body: 'w' });
+  await github.write({ type: 'issue.create', repo: `${OWNER}/repo-a`, title: 't', body: 'b', labels: ['acceptance'] });
+  await github.write({ type: 'issue.edit', repo: `${OWNER}/repo-a`, issue: 1, body: 'b' });
+  await github.write({ type: 'issue.close', repo: `${OWNER}/repo-a`, issue: 1 });
+  await github.write({ type: 'issue.reopen', repo: `${OWNER}/repo-a`, issue: 1 });
+  // subissue.add 先 GET 子 issue 再 POST。
+  await github.write({ type: 'subissue.add', repo: `${OWNER}/repo-a`, issue: 1, subRepo: `${OWNER}/repo-a`, subIssue: 2 });
+  await github.write({ type: 'pr.create', repo: `${OWNER}/repo-a`, head: 'acceptance/1-x-sc1', title: 't', body: 'b' });
+  // 七次单调用（7 类里 subissue 是两次，pr.create 一次）= 9 次 gh 调用。
+  assert.deepEqual(appTokensUsed(run), Array(9).fill('owner-token'), '一个 App 令牌都不用，与合入前一致');
+  assert.equal(fetchImpl.calls.list.length + fetchImpl.calls.token.length, 0, '没配 apps.write 就不查安装列表、不换令牌');
+  assert.equal(readLog(loopLog), '', '也不记 app-token-fallback');
 });
 
 test('两个 app 不串用：同一 owner 的 ①/② 令牌各存一份，读用 ①、推分支用 ②', async () => {
@@ -967,6 +1005,68 @@ test('pr.ready 被拒 403：回退账号令牌重试一次、只回退一次、�
   assert.match(readLog(loopLog), /kind=auth-403 repo=ExampleUser\/repo-a app=write reason=app-403/);
 });
 
+test('②写被拒 401/403/404：回退账号令牌重试一次、只重试一次、记一行 app=write（不带令牌）', async () => {
+  for (const [status, kind] of [['401', 'auth-401'], ['403', 'auth-403'], ['404', 'not-found']]) {
+    const { profile, loopLog } = appSetup({ write: {} });
+    const fetchImpl = appFetch();
+    const run = createFakeRun({
+      onApi: (_args, { env }) =>
+        env.GH_TOKEN === WRITE_TOKENS[OWNER]
+          ? { code: 1, stdout: '', stderr: `gh: HTTP ${status} (token ${WRITE_TOKENS[OWNER]})` }
+          : { code: 0, stdout: JSON.stringify({ id: 7, html_url: 'https://example.test/x' }) },
+    });
+    const github = createGithub({ profile, run, fetchImpl });
+    const result = await github.write({ type: 'comment.create', repo: `${OWNER}/repo-a`, issue: 1, body: 'w' });
+    assert.equal(result.commentId, 7, '回退后写成功');
+    assert.deepEqual(appTokensUsed(run), [WRITE_TOKENS[OWNER], 'owner-token'], '只回退一次，不重复写');
+    const log = readLog(loopLog);
+    assert.match(log, new RegExp(`kind=${kind} repo=ExampleUser/repo-a app=write reason=app-${status}`));
+    assert.doesNotMatch(log, new RegExp(`${WRITE_TOKENS[OWNER]}|owner-token`), 'Log 里不出现任何令牌');
+  }
+});
+
+test('②写 5xx / 超时不回退、不重放：非 401/403/404 可能是服务端已生效，重放会重复写', async () => {
+  const { profile, loopLog } = appSetup({ write: {} });
+  const fetchImpl = appFetch();
+  const run = createFakeRun({
+    onApi: () => ({ code: 1, stdout: '', stderr: 'gh: HTTP 502 Bad Gateway' }),
+  });
+  const github = createGithub({ profile, run, fetchImpl });
+  await assert.rejects(() => github.write({ type: 'comment.create', repo: `${OWNER}/repo-a`, issue: 1, body: 'w' }), /502/);
+  assert.deepEqual(appTokensUsed(run), [WRITE_TOKENS[OWNER]], '只试一次 ②令牌，不用账号令牌重放');
+  assert.equal(readLog(loopLog), '', '不回退就不记日志');
+});
+
+test('②取不到令牌：写回退账号令牌并记一行（reason=key-missing），不抛', async () => {
+  const home = tmpDir();
+  const secrets = path.join(home, 'secrets');
+  fs.mkdirSync(secrets, { recursive: true });
+  const { profile, loopLog } = appSetup({ write: { privateKeyFile: path.join(secrets, 'missing.key') } });
+  const fetchImpl = appFetch();
+  const run = createFakeRun({ onApi: () => ({ code: 0, stdout: JSON.stringify({ id: 7, html_url: 'x' }) }) });
+  const github = createGithub({ profile, run, fetchImpl });
+  await github.write({ type: 'comment.create', repo: `${OWNER}/repo-a`, issue: 1, body: 'w' });
+  assert.deepEqual(appTokensUsed(run), ['owner-token']);
+  assert.equal(fetchImpl.calls.list.length + fetchImpl.calls.token.length, 0, '私钥不可用时不去问 GitHub');
+  assert.match(readLog(loopLog), /app-token-fallback kind=token-failed repo=ExampleUser\/repo-a app=write reason=key-missing/);
+});
+
+test('写闸不自己取令牌：所有写都只经 github.write 转给 bin/github.mjs 那一套（App / 账号令牌同一处选）', () => {
+  // 写闸进程（host/write-gate.mjs）用整份 profile 建 createGithub（只去掉 writeCommand），所以它的写走的是同一套
+  // writeRoleFor → directWriteWithApp。这条护栏挡住有人在写闸里另起一套私钥 / 取令牌逻辑。
+  const source = fs.readFileSync(new URL('./host/write-gate.mjs', import.meta.url), 'utf8');
+  assert.match(source, /await github\.write\(toWrite\)/, '写闸的出口只有 github.write');
+  for (const forbidden of ['privateKeyFile', 'access_tokens', 'GH_TOKEN']) {
+    assert.ok(!source.includes(forbidden), `写闸里不该有 ${forbidden}（令牌只在 bin/github.mjs 取）`);
+  }
+  const cli = fs.readFileSync(new URL('./host/write-gate.mjs', import.meta.url), 'utf8');
+  assert.equal(
+    (cli.match(/createGithub\(\{ profile: \{ \.\.\.profile, writeCommand: undefined \}/g) || []).length,
+    2,
+    'serve / exec 两个入口都把完整 profile（含 apps）交给 createGithub',
+  );
+});
+
 test('apps 的 profile 校验：格式错的直接报错；私钥文件不在也不拦启动（用的时候回退）', () => {
   const bad = (apps, pattern) => {
     const home = tmpDir();
@@ -993,6 +1093,57 @@ test('apps 的 profile 校验：格式错的直接报错；私钥文件不在也
   const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
   assert.equal(profile.apps.read.appId, '123');
   assert.deepEqual([...profile.apps.read.owners], [OWNER], 'owners 缺省是 [ownerLogin]');
+});
+
+test('apps.write 的 profile 校验：缺 privateKeyFile / 相对路径 / owners 非数组 / 缺 appId 都明确报错', () => {
+  const bad = (write, pattern) => {
+    const home = tmpDir();
+    writeProfile(home, { profile: { apps: { write } } });
+    assert.throws(() => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }), pattern);
+  };
+  bad({ appId: '1' }, /apps\.write\.privateKeyFile/);
+  bad({ appId: '1', privateKeyFile: 'rel/write.key' }, /apps\.write\.privateKeyFile/);
+  bad({ privateKeyFile: '/k' }, /apps\.write\.appId/);
+  bad({ appId: '1', privateKeyFile: '/k', owners: 'ExampleUser' }, /apps\.write\.owners/);
+  bad({ appId: '1', privateKeyFile: '/k', owners: [] }, /apps\.write\.owners/);
+  bad({ appId: '1', privateKeyFile: '/k', owners: [1] }, /apps\.write\.owners/);
+  bad({ appId: '1', privateKeyFile: '/k', installationId: '2' }, /installationId/);
+  const home = tmpDir();
+  writeProfile(home, { profile: { apps: { write: { appId: 5700001, privateKeyFile: '/k', owners: ['ExampleUser'] } } } });
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  assert.equal(profile.apps.write.appId, '5700001');
+  assert.deepEqual([...profile.apps.write.owners], ['ExampleUser']);
+});
+
+test('apps.write 的 appId 非法值（0 / 负数 / 小数 / 布尔 / 前导零数字串）加载就报错并点名 apps.write.appId', () => {
+  for (const appId of [0, -1, 1.5, true, '00']) {
+    const home = tmpDir();
+    writeProfile(home, { profile: { apps: { write: { appId, privateKeyFile: '/k' } } } });
+    assert.throws(
+      () => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }),
+      /apps\.write\.appId/,
+      `appId ${JSON.stringify(appId)} 应在加载时报错（与 ①读 的规则一致）`,
+    );
+  }
+  const home = tmpDir();
+  writeProfile(home, { profile: { apps: { write: { appId: 5700001, privateKeyFile: '/k' } } } });
+  assert.equal(loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }).apps.write.appId, '5700001');
+});
+
+test('写 App 的 bot 登录名只能问 GET /app：得到 <slug>[bot]，JWT 的 iss 是写 App 的 appId；拿不到就抛错', async () => {
+  const { profile } = appSetup({ write: {} });
+  const calls = [];
+  const issOf = (opts) => JSON.parse(Buffer.from(String(opts.headers.Authorization).replace(/^Bearer /, '').split('.')[1], 'base64url').toString('utf8')).iss;
+  const okFetch = async (url, opts) => {
+    calls.push({ url, iss: issOf(opts) });
+    return { ok: true, status: 200, json: async () => ({ slug: 'example-automation', name: 'Example Automation' }) };
+  };
+  assert.equal(await appBotLogin({ app: profile.apps.write, fetchImpl: okFetch }), 'example-automation[bot]');
+  assert.deepEqual(calls, [{ url: 'https://api.github.com/app', iss: WRITE_ID }], '用写 App 的私钥签 JWT，不碰 ①的');
+  await assert.rejects(() => appBotLogin({ app: profile.apps.write, fetchImpl: async () => { throw new Error('offline'); } }), /连不上/);
+  await assert.rejects(() => appBotLogin({ app: profile.apps.write, fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({}) }) }), /404/);
+  await assert.rejects(() => appBotLogin({ app: profile.apps.write, fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({}) }) }), /slug/);
+  await assert.rejects(() => appBotLogin({ app: { ...profile.apps.write, privateKeyFile: '/nonexistent/write.key' }, fetchImpl: okFetch }), /私钥/);
 });
 
 test('沙箱遮罩覆盖 apps 里的私钥：嵌套的 privateKeyFile 也进遮罩名单', async () => {

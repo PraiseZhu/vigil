@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkSecretFile, forkTargetFor, loadAcceptanceProfile, tokenFiles, watcherHome } from './profile.mjs';
-import { createGithub } from './github.mjs';
+import { appBotLogin, createGithub } from './github.mjs';
 import { hostPaths, isAlive } from '../host/paths.mjs';
 import { createProbes } from '../host/probes.mjs';
 import { handoffFor, preflightCommands, repoConfig } from '../host/prbot-config.mjs';
@@ -157,6 +157,7 @@ export async function runDoctor({
   slackCheck = checkSlackAccess,
   gateAudit = (options) => runGateAudit(options),
   skipGateAudit = false,
+  resolveAppBotLogin = appBotLogin,
 } = {}) {
   const checks = [];
   const add = (name, ok, detail = '') => {
@@ -434,8 +435,13 @@ export async function runDoctor({
     rawProfile = {};
   }
   const keyFiles = tokenFiles(rawProfile);
-  if (profile.appPrivateKeyFile && !keyFiles.some((entry) => entry.file === profile.appPrivateKeyFile)) {
-    keyFiles.push({ key: 'appPrivateKeyFile', file: profile.appPrivateKeyFile });
+  const addKeyFile = (key, file) => {
+    if (file && !keyFiles.some((entry) => entry.file === file)) keyFiles.push({ key, file });
+  };
+  addKeyFile('appPrivateKeyFile', profile.appPrivateKeyFile);
+  // 两级配置的私钥在嵌套的 apps.<role>.privateKeyFile 里，按顶层键算的 tokenFiles() 看不到，单独补上。
+  for (const role of ['read', 'write']) {
+    addKeyFile(`apps.${role}.privateKeyFile`, profile.apps?.[role]?.privateKeyFile);
   }
   const badKeyFiles = [];
   for (const entry of keyFiles) {
@@ -452,6 +458,30 @@ export async function runDoctor({
       ? badKeyFiles.join('；')
       : `检查了 ${keyFiles.length} 个密钥文件（权限 600、属主当前用户）`,
   );
+
+  // 写 App 的自我身份：配了 apps.write 后评论 / issue 的作者变成 <app>[bot]，必须在 trustedBotLogins 里，
+  // 否则轮次评论 / 子 issue 认不出自己（轮次反复重开、done/finish 报 NOT_CURRENT）。登录名 profile 里不存，
+  // 只能用写 App 的私钥签 JWT 问一次 GET /app 拿 slug，再拼 <slug>[bot]。
+  if (!profile.apps?.write) {
+    add('写 App 身份白名单', true, '没配 apps.write，写走账号令牌，不检查 trustedBotLogins（跳过）');
+  } else {
+    let botLogin = null;
+    try {
+      botLogin = await resolveAppBotLogin({ app: profile.apps.write });
+    } catch (error) {
+      add('写 App 身份白名单', false, `配了 apps.write，但查不到它的 bot 登录名：${firstLine(error?.message)}`);
+    }
+    if (botLogin) {
+      const trusted = profile.trustedBotLogins.some((entry) => sameLogin(entry, botLogin));
+      add(
+        '写 App 身份白名单',
+        trusted,
+        trusted
+          ? `trustedBotLogins 里有 ${botLogin}（写出来作者是它，认得自己）`
+          : `配了 apps.write，但 profile 的 trustedBotLogins 里没有 ${botLogin}：开写后评论 / issue 作者会变成 ${botLogin}，白名单没它，轮次评论会被忽略（轮次反复重开、done/finish 报 NOT_CURRENT、修正树消失）。要先把 ${botLogin} 加进 trustedBotLogins 再开 apps.write`,
+      );
+    }
+  }
 
   // Slack（#61）：只读检查令牌能过 auth.test、bot 在目标频道里；没配 Slack 就跳过（算通过）。
   try {

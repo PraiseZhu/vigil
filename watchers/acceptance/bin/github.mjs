@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 // GitHub 读写的唯一出口：本文件才允许 spawn / 触网。
 // 读：配了 appConfigPath 走 App 安装令牌，否则走账号令牌。
-// 两级 App 配置 apps: { read, write }：read = ①读 App（只做单仓读），write = ②写 App（推分支 / PR / workflow）。
-// 写：首批只有 ②的 branch.push / pr.* / ci.rerun 走 App；评论、issue、sub-issue 仍走账号令牌——
-// 用 App 写出来作者会变成 app[bot]，而轮次/子 issue 的认领按 author.login == ownerLogin 判定，
-// 要等身份白名单落地（见 WRITE_APP_ROLE 的注释）。
+// 两级 App 配置 apps: { read, write }：read = ①读 App（只做单仓读），write = ②写 App。
+// 写：②的评论 / issue / sub-issue / 推分支 / PR / workflow 都走 App；看板写与合并不在表里，走账号令牌。
+// 评论 / issue 写出来作者是 app[bot]，靠 profile.trustedBotLogins（身份白名单，bin/trusted-author.mjs）认自己。
 // 安装号运行时用私钥 JWT 调 GET /app/installations 查；令牌按 (app, owner) 各缓存 50 分钟（只在内存里）。
 // 取不到令牌（没装 / 私钥缺失或不可读 / 查安装失败）或 App 读到 401/403/404（含 git 的同类文案）时，回退账号令牌一次，
 // 并在宿主 loop.log 记一行 app-token-fallback（kind、repo、app 名、原因，不含令牌）；一个 (app, owner) 失败不影响别的。
@@ -274,6 +273,43 @@ function withDedupeKey(action) {
   if (action.dedupeKey) return action;
   const { dedupeKey: _ignored, ...rest } = action;
   return { ...action, dedupeKey: sha256hex(stableStringify(rest)) };
+}
+
+/**
+ * 写 App 的 bot 登录名（`<slug>[bot]`）：profile 里没有这个名字，只能拿私钥签 App JWT 问 `GET /app` 的 `slug`。
+ * GitHub 给 App 的账号用户名就是 `<slug>[bot]`，身份白名单（`trustedBotLogins`）认的就是整串登录名。
+ * 拿不到（私钥不可读、连不上、返回不是 200、没有 slug）就抛错，怎么报由调用方决定（doctor 报红）。
+ */
+export async function appBotLogin({ app, fetchImpl = globalThis.fetch, now = () => Date.now() } = {}) {
+  if (!app?.appId || !app?.privateKeyFile) throw new Error('apps.write 的 appId / privateKeyFile 不全');
+  let pem;
+  try {
+    checkSecretFile(app.privateKeyFile, 'apps.write.privateKeyFile');
+    pem = fs.readFileSync(app.privateKeyFile, 'utf8');
+  } catch {
+    throw new Error('读不到 apps.write 的私钥文件（缺失 / 不可读 / 权限不是 600）');
+  }
+  const nowSec = Math.floor(now() / 1000);
+  const jwt = signJwt(pem, { iat: nowSec - 60, exp: nowSec + 540, iss: String(app.appId) });
+  let res;
+  try {
+    res = await fetchImpl('https://api.github.com/app', {
+      headers: { Authorization: `Bearer ${jwt}`, Accept: 'application/vnd.github+json' },
+      signal: AbortSignal.timeout(APP_MINT_TIMEOUT_MS),
+    });
+  } catch {
+    throw new Error('连不上 api.github.com/app');
+  }
+  let data = null;
+  try {
+    data = typeof res?.json === 'function' ? await res.json() : res;
+  } catch {
+    data = null;
+  }
+  if (res && res.ok === false) throw new Error(`GET /app 返回 ${res.status}`);
+  const slug = typeof data?.slug === 'string' ? data.slug.trim() : '';
+  if (!slug) throw new Error('GET /app 没给 slug');
+  return `${slug}[bot]`;
 }
 
 function signJwt(pem, payload) {
@@ -560,26 +596,26 @@ const APP_TOKEN_TTL_MS = 50 * 60 * 1000;
 const APP_INSTALL_CACHE_MS = 15 * 60 * 1000;
 
 /**
- * 写操作按风险分流到哪个 App：`read` = ①读 App，`write` = ②写 App（推分支、维护分支、开 PR、转 ready、workflow）；
- * 值为 `null` = 这一类**暂时不走 App**，落回账号令牌（表项留着当占位，开的时候改一处就行）。
+ * 写操作按风险分流到哪个 App：`read` = ①读 App，`write` = ②写 App。
+ * 值为 `null` = 这一类**不走 App**，落回账号令牌（表项留着当占位，开的时候改一处就行）。
  *
- * 评论 / issue / sub-issue 先不开：用 App 令牌写出来作者会变成 `<app>[bot]`，而 rounds / collect / tasks / prbot /
- * prbot-gate-check 全都按 `author.login == profile.ownerLogin` 认「自己发的」轮次评论、子 issue 和修正 issue。
- * 现在开会让轮次反复重开、`done/finish` 报 NOT_CURRENT、修正树消失，所以须等身份白名单（把 bot 登录名也算成自己）
- * 那个 PR 合并后再开。②的写（推分支 / PR / workflow）作者是 bot 不影响现有判定，首批先开。
- * 不在这张表里的写（如 project.field.set 看板写）继续走账号令牌：App 看不到个人账号下的 Projects v2。
+ * 评论 / issue / sub-issue 走的是 ②写 App：写出来作者是 `<app>[bot]`，身份白名单（#273 的 isTrustedAuthor，
+ * 把 `profile.trustedBotLogins` 里的 bot 登录名也算成自己）已合并且 rounds / collect / tasks / prbot /
+ * prbot-gate-check 都改了判定，所以这批写可以切。**开之前 profile 的 `trustedBotLogins` 必须写上
+ * ②写 App 的 `<app>[bot]`**，否则轮次评论会被当成别人的。
+ * 不在这张表里的写（如 project.field.set 看板写、pr.merge 合并）继续走账号令牌：
+ * App 看不到个人账号下的 Projects v2，合并这轮也没接。
  */
 export const WRITE_APP_ROLE = Object.freeze({
-  // 作者会变成 app[bot]，而 rounds/collect/tasks/prbot/prbot-gate-check 按 author.login==ownerLogin 认自己的评论和子 issue，
-  // 须等身份白名单 PR 合并后再开（现在保持账号令牌）。
-  'comment.create': null,
-  'comment.update': null,
-  'issue.create': null,
-  'issue.edit': null,
-  'issue.close': null,
-  'issue.reopen': null,
-  'subissue.add': null,
-  // 首批开：②写 App。profile 没配 apps.write 时本来就不进这条分支（账号令牌）。
+  // 评论 / issue / sub-issue：作者会变成 app[bot]，靠身份白名单（trustedBotLogins）认自己。
+  'comment.create': 'write',
+  'comment.update': 'write',
+  'issue.create': 'write',
+  'issue.edit': 'write',
+  'issue.close': 'write',
+  'issue.reopen': 'write',
+  'subissue.add': 'write',
+  // 推分支 / PR / workflow：作者是 bot 不影响现有判定。
   'branch.push': 'write',
   'pr.create': 'write',
   'pr.ready': 'write',
@@ -1530,8 +1566,8 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
   }
 
   /**
-   * 这次写该用哪个 App：②写 App。没配 apps、类型不在表里（如看板写）、表里值为 null（评论 / issue / sub-issue 等
-   * 等身份白名单的写）、或 repo 的 owner 不在该 app 的名单里都返回 null（账号令牌），与没有 apps 字段时完全一致。
+   * 这次写该不该走 ②写 App：没配 apps、没配 apps.write、类型不在表里（如看板写 / 合并）都返回 null（账号令牌）；
+   * repo 的 owner 不在该 app 的 owners 名单里也返回 null，不铸令牌、不打扰 GitHub。
    */
   function writeRoleFor(action) {
     if (!profile.apps) return null;
