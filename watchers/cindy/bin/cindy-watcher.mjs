@@ -2766,17 +2766,30 @@ function* discoverPass(prs, ctx, report, events) {
   if (failure) throw failure;
 }
 
-// One query for every open PR of the viewer: the fields a follow check compares, plus the latest commit's CI summary.
-// Only the summary state is asked for (no contexts), so the query stays cheap however many checks a PR has.
-const BATCH_QUERY = 'query($q:String!){search(query:$q,type:ISSUE,first:100){issueCount nodes{... on PullRequest{id isDraft headRefOid updatedAt labels(first:30){nodes{name}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}}';
-function parseBatch(raw) {
-  const search = JSON.parse(raw)?.data?.search;
-  if (!search || !Array.isArray(search.nodes) || !(Number(search.issueCount) <= search.nodes.length)) throw new Error('Batch PR query incomplete');
-  return new Map(search.nodes.filter((node) => node?.id).map((node) => [String(node.id), JSON.stringify([
-    node.isDraft === true, node.headRefOid, node.updatedAt,
-    (node.labels?.nodes ?? []).map((item) => item?.name).filter(Boolean).sort(),
-    node.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null,
-  ])]));
+// One read for the PRs this round lists: the fields a follow check compares, plus the latest commit's CI summary.
+// Only the summary state is asked for (no contexts), so the read stays cheap however many checks a PR has.
+// It reads those PRs by node id (`nodes(ids:[...])`), not with a `search`: the gh router answers a search root as the
+// personal account and serves `nodes` as the GitHub App, so the 15-second beat stops using the personal account's
+// rate limit (2026-11-04: the search read was most of that account's non-per-PR GraphQL traffic). A PR opened after the
+// round listed its PRs is seen from the next round on. No PRs, no read.
+const NODES_PER_READ = 100;
+const batchQueryFor = (ids) => `query{nodes(ids:[${ids.map((id) => JSON.stringify(id)).join(',')}]){... on PullRequest{id isDraft headRefOid updatedAt labels(first:30){nodes{name}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}`;
+export function* readBatch({ ghFn, ids }) {
+  const signatures = new Map();
+  for (let at = 0; at < ids.length; at += NODES_PER_READ) {
+    const wanted = ids.slice(at, at + NODES_PER_READ);
+    const payload = JSON.parse(yield () => ghFn(['api', 'graphql', '-f', `query=${batchQueryFor(wanted)}`]));
+    if (payload?.errors?.length || !Array.isArray(payload?.data?.nodes)) throw new Error('Batch PR query incomplete');
+    for (const node of payload.data.nodes) {
+      if (!node?.id) continue;
+      signatures.set(String(node.id), JSON.stringify([
+        node.isDraft === true, node.headRefOid, node.updatedAt,
+        (node.labels?.nodes ?? []).map((item) => item?.name).filter(Boolean).sort(),
+        node.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null,
+      ]));
+    }
+  }
+  return signatures;
 }
 
 // Tracks the PRs being handled so a follow beat never starts a second pass on the same PR.
@@ -2840,11 +2853,11 @@ export function* discoverWorkflow({
     paths, clock, deadline, perPrBudgetMs, gitFn, env, markCursor, dispatchReserveMs, fullCollectMs, inFlight: new Set(),
   };
   const hardDeadline = followUntilMs ? started + followUntilMs : deadline;
-  const batchArgs = ['api', 'graphql', '-f', `query=${BATCH_QUERY}`, '-f', `q=repo:${REPO} is:pr is:open author:${viewer}`];
+  const listedIds = listed.map((pr) => String(pr.id));
   let known = null;
   if (followMs > 0) {
     // The baseline is taken before the full pass so a change that lands while the pass runs is seen by the first beat.
-    try { known = parseBatch(yield () => ghFn(batchArgs)); } catch { known = null; }
+    try { known = yield* readBatch({ ghFn, ids: listedIds }); } catch { known = null; }
   }
   const baselineAt = clock();
   const lateNumbers = new Set();
@@ -2909,7 +2922,7 @@ export function* discoverWorkflow({
       const tickGh = memoRepoReads(baseGh, keptReads);
       lastAt = clock();
       let batch;
-      try { batch = parseBatch(yield () => tickGh(batchArgs)); } catch (error) { if (failed(error)) break; continue; }
+      try { batch = yield* readBatch({ ghFn: tickGh, ids: listedIds }); } catch (error) { if (failed(error)) break; continue; }
       failures = 0;
       waitMs = followMs;
       if (known === null) { known = batch; continue; }
