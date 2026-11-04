@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // 「仅基线失败」的机器判定：PR 的 validate 以 exit 1 失败时，在 merge-base 的干净 detached worktree 里
-// 用同 policy、同命令、同运行指纹再跑一次，只有 PR 失败集合 ⊆ 基线失败集合才可受控通过。
+// 同 policy、同运行指纹下只重跑 PR 失败的那几个单测文件，只有 PR 失败集合 ⊆ 基线失败集合才可受控通过。
+// 不再跑整个仓库 hook：hook 只跑与本分支改动相关的单测后，在 merge-base 上它一个测试都不会跑（2026-11-04）。
 // 与 cindy 侧无关（cindy 没有受控 pre-push，见其 README），不共享模块。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -58,6 +59,20 @@ export function readBaselineReceipt({ validations, receiptPath, receiptSha256, k
   } catch { return null; }
 }
 
+// The failed unit-test files to rerun on the merge-base, and the hook step name the PR failures carry. Only a
+// parsed, non-empty set from one step whose items all name a plain repo-relative test file can be rerun.
+const TEST_FILE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9_@./-]+$/;
+function baselineScope(prFailure) {
+  const items = prFailure?.state === 'parsed' && Array.isArray(prFailure.failureSet) ? prFailure.failureSet : [];
+  const steps = new Set(items.map((item) => item.step));
+  if (!items.length || steps.size !== 1 || !items.every((item) => typeof item.file === 'string' && TEST_FILE.test(item.file))) return null;
+  return { step: [...steps][0], files: [...new Set(items.map((item) => item.file))].sort() };
+}
+
+// A direct vitest run prints no hook failure marker; add the one the PR run carried so both parse the same way.
+const HOOK_MARKER = /^\[preflight\] ❌ .+ 失败\s*$/m;
+const withStepMarker = (output, step) => (HOOK_MARKER.test(output) ? output : `${output}\n[preflight] ❌ ${step} 失败\n`);
+
 function acceptable(pr, baseline, expected) {
   if (!baseline) return 'baseline-receipt-invalid';
   if (baseline.exitCode !== 1 || baseline.failureKind !== 'test-failure') return 'baseline-not-a-test-failure';
@@ -86,7 +101,10 @@ export async function compareBaseline({
   if (!basePolicy || sha(basePolicy) !== policySha256) return fail('baseline-policy-mismatch');
   const blob = (rev) => { try { return git(['-C', worktree, 'rev-parse', '--verify', '--quiet', `${rev}:package-lock.json`]).trim() || null; } catch { return null; } };
   if (blob(mergeBase) !== blob(validatedHead)) return fail('baseline-lockfile-mismatch');
-  const key = sha(JSON.stringify({ repo, mergeBase, policySha256, packageLockBlob: blob(mergeBase), runtimeSha256: wanted.runtimeSha256 }));
+  const scope = baselineScope(prFailure);
+  if (!scope) return fail('baseline-scope-unsupported');
+  const command = { binary: 'npm', args: ['run', 'test:unit', '--', '--maxWorkers=1', '--no-file-parallelism', ...scope.files] };
+  const key = sha(JSON.stringify({ repo, mergeBase, policySha256, packageLockBlob: blob(mergeBase), runtimeSha256: wanted.runtimeSha256, command }));
   const cacheDir = path.join(paths.validations, 'baseline-cache');
   const cacheFile = path.join(cacheDir, `${key}.json`);
 
@@ -118,18 +136,18 @@ export async function compareBaseline({
         const install = await runStep('npm', ['ci'], base, `${logBase}-npm-ci.log`);
         if (!install.ok) return null;
       }
-      const run = await runStep('/bin/bash', ['.githooks/pre-push'], base, `${logBase}-preflight.log`);
+      const run = await runStep(command.binary, command.args, base, `${logBase}-unit.log`);
       const baseRuntime = canonicalRuntime({ worktree: dir });
       const usable = fs.readFileSync(path.join(dir, '.githooks/pre-push'), 'utf8').trim() === basePolicy
         && runtimeSha256(baseRuntime) === wanted.runtimeSha256;
       if (!usable) return null;
       const failure = run.ok ? { state: 'parsed', failureSet: [], failureSetSha256: null }
-        : (run.failureKind ? { state: 'unparsed', failureSet: [], failureSetSha256: null } : parseFailureSet(run.output, { worktree: dir }));
+        : (run.failureKind ? { state: 'unparsed', failureSet: [], failureSetSha256: null } : parseFailureSet(withStepMarker(run.output, scope.step), { worktree: dir }));
       const receipt = {
         schemaVersion: 2, kind: 'mivo-baseline-validation', validationEvidenceVersion: 1, parserVersion: PARSER_VERSION,
         key, repo, mergeBase, policy: { file: '.githooks/pre-push', sha256: policySha256 },
         runtime: baseRuntime, runtimeSha256: wanted.runtimeSha256,
-        command: { binary: '/bin/bash', args: ['.githooks/pre-push'] },
+        command,
         exitCode: run.exitCode, failureKind: run.ok ? null : (run.failureKind ?? 'test-failure'),
         logPath: run.logPath, logSha256: run.logSha256,
         failureSetState: failure.state, failureSet: failure.failureSet, failureSetSha256: failure.failureSetSha256,
