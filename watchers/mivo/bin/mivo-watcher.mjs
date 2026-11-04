@@ -368,6 +368,8 @@ export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci
         nativeId: `${thread.id}:${comment.id ?? author ?? 'comment'}`,
         revision: `${thread.isResolved === true}:${thread.isOutdated === true}:${comment.updatedAt ?? comment.updated_at ?? comment.createdAt ?? ''}`,
         sha: pr.headRefOid ?? null,
+        // The commit the comment was written against; already-fixed proofs need it when no finding marker exists.
+        reviewHeadSha: comment.originalCommit?.oid ?? comment.original_commit_id ?? null,
         body: comment.body ?? '',
         contentHash: digest({ path: thread.path, resolved: thread.isResolved === true, id: comment.id, author, body: comment.body ?? '' }),
       }, comment), { headSha: pr.headRefOid ?? null }));
