@@ -3,6 +3,7 @@
 import { collectTree, parseMarker } from '../bin/collect.mjs';
 import { latestRound, parseRef, parseRounds } from '../bin/rounds.mjs';
 import { forkTargetFor } from '../bin/profile.mjs';
+import { isTrustedAuthor } from '../bin/trusted-author.mjs';
 
 export const CORRECTION_CLAIM_LINE = /^\[修正机\] 第 (\d+) 轮：修正中$/;
 export const CORRECTION_STATUS_LINE = /^\[修正机\] 第 (\d+) 轮：(修正中|Draft 已开|等 CI|再修 \d+\/2|已 Ready|需人工处理|中断)$/;
@@ -155,11 +156,10 @@ function refOf(repo, issue) {
  * 返回 checkCorrectionWrite(action)（null 放行，否则拒绝结果）和 correctionContext()（serve 启动时 fail-closed）。
  */
 export function createCorrectionCheck({ github, profile, binding, scopeOf, readIssueState, checkPrReady, gateActions, reject }) {
-  function parseCorrectionRounds(comments, ownerLogin) {
-    const owner = String(ownerLogin || '').toLowerCase();
+  function parseCorrectionRounds(comments, profile) {
     const rounds = [];
     for (const comment of comments || []) {
-      if (String(comment?.author?.login || '').toLowerCase() !== owner) continue;
+      if (!isTrustedAuthor(comment?.author, profile)) continue;
       const first = firstLine(comment.body);
       const match = CORRECTION_STATUS_LINE.exec(first);
       if (!match) continue;
@@ -216,9 +216,9 @@ export function createCorrectionCheck({ github, profile, binding, scopeOf, readI
       (correction) => String(correction.ref).toLowerCase() === String(binding.issue).toLowerCase(),
     );
     if (!entry || entry.state !== 'open') return null;
-    const rounds = parseCorrectionRounds(issueState.issue.comments?.nodes || [], profile.ownerLogin);
+    const rounds = parseCorrectionRounds(issueState.issue.comments?.nodes || [], profile);
     const latest = rounds.at(-1) || null;
-    const latestRoot = latestRound(parseRounds(rootState.issue.comments?.nodes || [], profile.ownerLogin));
+    const latestRoot = latestRound(parseRounds(rootState.issue.comments?.nodes || [], profile));
     return { issueState, marker, rootState, tree, entry, rounds, latest, latestRoot };
   }
 

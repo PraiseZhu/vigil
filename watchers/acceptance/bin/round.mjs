@@ -31,7 +31,7 @@ export const ISSUE_COMMENTS_QUERY = `query ($owner: String!, $name: String!, $nu
           createdAt
           updatedAt
           url
-          author { login }
+          author { login __typename }
         }
       }
     }
@@ -285,7 +285,7 @@ async function cmdStatus({ flags, github, profile, now, stdout }) {
   const { owner, name, number } = parseIssueRef(issue);
   const data = await github.graphql(ISSUE_COMMENTS_QUERY, { owner, name, number });
   const comments = data?.repository?.issue?.comments?.nodes || [];
-  const parsed = parseRounds(comments, profile.ownerLogin);
+  const parsed = parseRounds(comments, profile);
   const latest = latestRound(parsed);
   const stallMinutes = profile.stallMinutes;
   const rounds = createRounds({ github, profile, now });

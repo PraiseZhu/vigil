@@ -14,6 +14,7 @@ import { ISSUE_BODY_QUERY, collectTree, parseMarker } from '../bin/collect.mjs';
 import { beijingIso as roundsBeijingIso, bodyVersion, latestRound, parseRef, parseRounds, ISSUE_COMMENTS_QUERY as ROUND_COMMENTS_QUERY } from '../bin/rounds.mjs';
 import { collectTasks, repoTier } from '../bin/tasks.mjs';
 import { redact } from '../bin/redact.mjs';
+import { isTrustedAuthor } from '../bin/trusted-author.mjs';
 import { appendAlert, hostPaths, isAlive, readLockPayload, releaseLock, tryAcquireLock } from './paths.mjs';
 import { appendPrbotEvent } from './prbot-events.mjs';
 import { localEnv } from '../bin/localgit.mjs';
@@ -107,11 +108,10 @@ function loadState(paths, issue) {
   }
 }
 
-export function parseCorrectionRounds(comments, ownerLogin) {
-  const owner = String(ownerLogin || '').toLowerCase();
+export function parseCorrectionRounds(comments, profile) {
   const rounds = [];
   for (const comment of comments || []) {
-    if (String(comment?.author?.login || '').toLowerCase() !== owner) continue;
+    if (!isTrustedAuthor(comment?.author, profile)) continue;
     const first = String(comment.body || '').split('\n')[0] || '';
     const match = CORRECTION_STATUS_LINE.exec(first);
     if (!match) continue;
@@ -239,12 +239,12 @@ export async function correctionPrecheck({ github, profile, issue, hostConfig })
   if (!correction) return { action: 'idle', reason: 'missing' };
   const marker = parseMarker(correction.body);
   if (!marker || marker.root == null) return { action: 'idle', reason: 'no-marker' };
-  const correctionRounds = parseCorrectionRounds(correction.comments?.nodes || [], profile.ownerLogin);
+  const correctionRounds = parseCorrectionRounds(correction.comments?.nodes || [], profile);
   const latest = correctionRounds.at(-1) || null;
   let fresh = false;
   if (latest && CORRECTION_TERMINAL.has(latest.status)) {
     // 上一修正轮已收尾：只有总 issue 在它之后又出了一次「要修」裁决，才开下一修正轮。
-    const rootNow = await readIssueState(github, marker.root, profile.ownerLogin);
+    const rootNow = await readIssueState(github, marker.root, profile);
     const verdict = latestRound(rootNow?.rounds || []);
     const verdictAt = Date.parse(verdict?.createdAt || '') || 0;
     const roundAt = Date.parse(latest.createdAt || '') || 0;
@@ -477,14 +477,14 @@ export async function pollDraft({
   return { action: 'wait' };
 }
 
-async function readIssueState(github, ref, ownerLogin) {
+async function readIssueState(github, ref, profile) {
   const { owner, name, number } = parseRef(ref);
   const data = await github.graphql(ROUND_COMMENTS_QUERY, { owner, name, number });
   const issue = data?.repository?.issue;
   if (!issue) return null;
   // parseRounds 不带正文：评估要从最新裁决里取「要修」条目和原因，按评论 id 补回去。
   const bodies = new Map((issue.comments?.nodes || []).map((comment) => [comment.databaseId, comment.body]));
-  const rounds = parseRounds(issue.comments?.nodes || [], ownerLogin).map((round) => ({ ...round, body: bodies.get(round.commentId) ?? '' }));
+  const rounds = parseRounds(issue.comments?.nodes || [], profile).map((round) => ({ ...round, body: bodies.get(round.commentId) ?? '' }));
   return { issue, rounds };
 }
 
@@ -1630,7 +1630,7 @@ export async function runPrbotCorrection({
       }
 
       if (state.stage === 'assess') {
-        const root = await readIssueState(gateGithub, state.root, acceptanceProfile.ownerLogin);
+        const root = await readIssueState(gateGithub, state.root, acceptanceProfile);
         const latest = latestRound(root?.rounds || []);
         state.verdict = latest?.status || '没有裁决';
         if (!latest || latest.status !== '要修') {
@@ -2083,7 +2083,7 @@ export async function runPrbotCorrection({
           // 读不到就下一拍再试；不因此放行任何写。
         }
         try {
-          const rootState = await readIssueState(gateGithub, state.root, acceptanceProfile.ownerLogin);
+          const rootState = await readIssueState(gateGithub, state.root, acceptanceProfile);
           const latest = latestRound(rootState?.rounds || []);
           state.verdict = latest?.status || null;
         } catch {

@@ -3,6 +3,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { isTrustedAuthor } from './trusted-author.mjs';
 
 const FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(验收中|通过|要修|中断)/;
 const LOCK_STALE_MS = 10 * 60 * 1000;
@@ -18,7 +19,7 @@ export const ISSUE_COMMENTS_QUERY = `query ($owner: String!, $name: String!, $nu
           createdAt
           updatedAt
           url
-          author { login }
+          author { login __typename }
         }
       }
     }
@@ -87,17 +88,18 @@ function lineValue(body, label) {
 
 /**
  * 解析轮次评论，按轮次号升序。
- * 只认 ownerLogin 发的评论：公开仓上任何人都能发同样首行的评论，别人的一律当普通评论忽略。
- * 不传 ownerLogin 直接抛错（宁可停，不可误认）。
+ * 只认本人（ownerLogin）和配置的 App bot（trustedBotLogins）发的评论：公开仓上任何人都能发同样首行的评论，
+ * 别人的一律当普通评论忽略。第二个参数可以是 profile 对象，也可以只给 ownerLogin 字符串（老调用 / 测试）。
+ * 连 ownerLogin 都没有直接抛错（宁可停，不可误认）。
  */
-export function parseRounds(comments, ownerLogin) {
-  if (typeof ownerLogin !== 'string' || !ownerLogin) {
+export function parseRounds(comments, profile) {
+  const owner = typeof profile === 'string' ? profile : profile?.ownerLogin;
+  if (typeof owner !== 'string' || !owner) {
     throw new Error('parseRounds 需要 ownerLogin：只认我自己发的轮次评论');
   }
-  const owner = ownerLogin.toLowerCase();
   const rounds = [];
   for (const comment of comments || []) {
-    if (String(comment?.author?.login || '').toLowerCase() !== owner) continue;
+    if (!isTrustedAuthor(comment?.author, profile)) continue;
     const first = String(comment.body || '').split('\n')[0] || '';
     const match = FIRST_LINE.exec(first);
     if (!match) continue;
@@ -280,7 +282,7 @@ function maxRound(rounds) {
 export function createRounds({ github, profile, now = () => Date.now() }) {
   async function loadIssueState(ref, { write = true } = {}) {
     const issue = await readIssue(github, ref);
-    const rounds = parseRounds(commentsOf(issue), profile.ownerLogin);
+    const rounds = parseRounds(commentsOf(issue), profile);
     const latest = latestRound(rounds);
     const cache = readIssueCache(profile, ref);
     if (write && latest) {
@@ -299,7 +301,7 @@ export function createRounds({ github, profile, now = () => Date.now() }) {
     const ref = task.ref;
     const file = lockPath(profile, ref);
     const existing = await readIssue(github, ref);
-    const existingRounds = parseRounds(commentsOf(existing), profile.ownerLogin);
+    const existingRounds = parseRounds(commentsOf(existing), profile);
     if (fs.existsSync(file)) {
       if (!lockStale(readJson(file), existingRounds, now, file)) {
         throw new RoundError(`任务 ${ref} 已锁定`, 'LOCKED');
@@ -312,7 +314,7 @@ export function createRounds({ github, profile, now = () => Date.now() }) {
     }
     try {
       const fresh = await readIssue(github, ref);
-      const rounds = parseRounds(commentsOf(fresh), profile.ownerLogin);
+      const rounds = parseRounds(commentsOf(fresh), profile);
       const latest = latestRound(rounds);
       if (latest?.status === '验收中') {
         releaseLock(file);
