@@ -186,13 +186,32 @@ test('SC1 the poll gate takes the merge state from the batch, so a base move sti
   assert.equal(third.prs.some((item) => item.dispatch?.reason === 'fingerprint-unchanged'), false, 'BEHIND is a change, so every PR is looked at again');
 });
 
-test('SC1 a failed batch is not an error: each PR reads its own merge state, as before the batch existed', (t) => {
-  const f = roundFixture(t, { numbers: [951, 952, 953], bound: [951], mergeBatch: () => { throw new Error('gh: API rate limit already exceeded for user ID 1 (HTTP 403)'); } });
+test('SC1 a batch that failed for another reason is not an error: each PR reads its own merge state, as before the batch existed', (t) => {
+  const f = roundFixture(t, { numbers: [951, 952, 953], bound: [951], mergeBatch: () => { throw new Error('gh: HTTP 502 Bad Gateway'); } });
   const result = f.scan();
   assert.equal(result.prs.length, 3);
   assert.equal(f.queries.merge.length, 1);
   assert.equal(f.queries.tip.length, 3, 'one fallback read per PR');
-  assert.match(result.mergeStates.error, /rate limit/);
+  assert.match(result.mergeStates.error, /502/);
+});
+
+test('SC1 a rate-limited batch does not fan out into one read per PR: the PRs wait for the next round', (t) => {
+  let limited = true;
+  const f = roundFixture(t, { numbers: [951, 952, 953, 954], bound: [951, 952], mergeBatch: (listing) => {
+    if (limited) throw new Error('gh: API rate limit already exceeded for user ID 1 (HTTP 403)');
+    return mergeBatchBody(listing);
+  } });
+  const first = f.scan();
+  assert.equal(first.prs.length, 4, 'the round still ends normally and reports every PR');
+  assert.deepEqual([...new Set(first.prs.map((item) => item.dispatch.reason))], ['merge-state-unavailable']);
+  assert.equal(f.queries.merge.length, 1);
+  assert.equal(f.queries.tip.length, 0, 'no per-PR merge-state read');
+  assert.equal(f.queries.poll.length, 0, 'and no per-PR fingerprint query either');
+  assert.match(first.mergeStates.error, /rate limit/);
+  limited = false;
+  const second = f.scan('2026-10-15T00:02:00Z');
+  assert.equal(second.prs.some((item) => item.dispatch.reason === 'merge-state-unavailable'), false, 'the next round handles them');
+  assert.equal(f.queries.poll.length, 4);
 });
 
 test('SC5 PRs that change in a follow beat share one refreshed batch read', (t) => {

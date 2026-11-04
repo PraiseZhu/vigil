@@ -111,7 +111,7 @@ node watchers/<mivo|cindy>/bin/<mivo|cindy>-repair.mjs lock-doctor --home "$WATC
 
 `gh` 换了登录账号或想立即重读时,删掉这个文件即可,下一轮自动重建。
 
-mivo 的发现器每轮用一次 search 读全部在盯 PR 的 `mergeStateStatus` 与 base 提交（分流器会按个人账号回答这类读请求，逐 PR 读会把个人账号限流用光），`gh pr view --json` 也不再请求 `mergeStateStatus`。排障看 discover 返回里的 `mergeStates`：`batched` 是命中的 PR 数，`error` 非空表示这一轮批量读失败、各 PR 回退为自己读。
+mivo 的发现器每轮用一次 search 读全部在盯 PR 的 `mergeStateStatus` 与 base 提交（分流器会按个人账号回答这类读请求，逐 PR 读会把个人账号限流用光），`gh pr view --json` 也不再请求 `mergeStateStatus`。排障看 discover 返回里的 `mergeStates`：`batched` 是命中的 PR 数，`error` 非空表示这一轮批量读失败：限流类错误时需要合并状态的 PR 本轮不处理（`merge-state-unavailable`），其他错误时各 PR 回退为自己读。
 
 两个 watcher 读 PR 时都不请求 `headRepository` / `headRepositoryOwner`,这样经 GitHub App
 分流时整条读请求可以走 App。mivo 只用 `isCrossRepository` 区分同仓分支与 fork;cindy 要知道

@@ -207,6 +207,11 @@ export const FULL_COLLECT_MS = configMs('fullCollectMs', 'MIVO_WATCHER_FULL_COLL
 const FOLLOW_MAX_FAILURES = 3;
 const FOLLOW_BACKOFF_MAX_MS = 60000;
 const RATE_LIMITED = /rate limit|\b429\b|secondary|abuse|\b403\b/i;
+// A rate-limited batch read leaves no PR with a merge state, and reading each PR's own would only repeat the burst
+// that used the limit up (2026-11-04: 14 per-PR reads in one second after a failed batch). The index is marked
+// blocked instead: the PRs that need a merge state wait for the next round. Any other failure falls back to per-PR reads.
+const mergeIndexAfter = (error) => (RATE_LIMITED.test(String(error?.message ?? error))
+  ? Object.assign(new Map(), { blocked: String(error?.message ?? error).slice(0, 200) }) : null);
 
 function hasReviewIngress(view) {
   const reviews = view.latestReviews ?? view.reviews ?? [];
@@ -3283,6 +3288,10 @@ function* discoverOnePr(pr, ctx) {
     // full collection plus dispatch only when something changed. No per-PR
     // schedule exists, so the session never creates, binds or deletes one.
     if (deadline - clock() < 1000) return done();
+    if (mergeIndex?.blocked) {
+      report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'merge-state-unavailable', error: mergeIndex.blocked } });
+      return done();
+    }
     const polled = yield* pollWorkflow({
       now, enabled, allowDispatch, ghFn, collect, dispatchFn, paths, recheckFn, ownershipSnapshot,
       clock, budgetMs: Math.max(1, deadline - clock()), perPrBudgetMs, dispatchReserveMs, nodeId: key, prNumber: pr.number, gitFn, env, mergeIndex,
@@ -3464,6 +3473,10 @@ function* discoverOnePr(pr, ctx) {
   }
   // A Ready PR without a repair session gets the same fingerprint gate as a bound one: one lightweight query, and the
   // full collection (about 40 gh calls) only when the PR, its CI, reviews, comments or threads changed.
+  if (mergeIndex?.blocked) {
+    report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'merge-state-unavailable', error: mergeIndex.blocked } });
+    return done();
+  }
   let gateFingerprint = null;
   try {
     const snapshot = yield* fetchPollSnapshot({ nodeId: key, ghFn, mergeIndex });
@@ -3614,7 +3627,10 @@ export function* discoverWorkflow({
   try {
     ctx.mergeIndex = yield* collectMergeStates({ repo: REPO, viewer, ghFn });
     mergeStates = { batched: ctx.mergeIndex.size, error: null };
-  } catch (error) { mergeStates = { batched: 0, error: String(error?.message ?? error).slice(0, 200) }; }
+  } catch (error) {
+    ctx.mergeIndex = mergeIndexAfter(error);
+    mergeStates = { batched: 0, error: String(error?.message ?? error).slice(0, 200) };
+  }
   const baselineAt = clock();
   const lateNumbers = new Set();
   function* main() {
@@ -3723,7 +3739,7 @@ export function* discoverWorkflow({
       // The changed PRs share one fresh batch read instead of reading their merge state one by one; the round's first
       // batch is minutes old by now. A failed read leaves them to read their own state.
       let tickIndex = null;
-      try { tickIndex = yield* collectMergeStates({ repo: REPO, viewer, ghFn: tickGh }); } catch { tickIndex = null; }
+      try { tickIndex = yield* collectMergeStates({ repo: REPO, viewer, ghFn: tickGh }); } catch (error) { tickIndex = mergeIndexAfter(error); }
       yield spawn(discoverPass(changed, { ...ctx, ghFn: tickGh, mergeIndex: tickIndex, deadline: hardDeadline, now: passNow, nowMs: Date.parse(passNow) }, report, events));
     }
     const errors = yield drain();
