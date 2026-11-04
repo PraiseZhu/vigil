@@ -39,7 +39,10 @@ export function validationConfig({ env = process.env, fresh = false } = {}) {
   const timeoutMs = minutesToMs(optionalConfigStrict('preflightTimeoutMinutes', {
     env, envVar: 'MIVO_PREFLIGHT_TIMEOUT_MINUTES', fallback: 60,
   }), 'preflightTimeoutMinutes');
-  return { concurrency, stallMs, timeoutMs };
+  const lockWaitMs = minutesToMs(optionalConfigStrict('prePushLockWaitMinutes', {
+    env, envVar: 'MIVO_PREPUSH_LOCK_WAIT_MINUTES', fallback: 60,
+  }), 'prePushLockWaitMinutes');
+  return { concurrency, stallMs, timeoutMs, lockWaitMs };
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

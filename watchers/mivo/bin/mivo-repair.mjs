@@ -1071,7 +1071,35 @@ async function runLoggedStep(runFn, binary, args, base, logPath) {
   };
 }
 
-export async function validate({ home, taskPath, validatedHead, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, runFn = runLogged, env = process.env, originUrl = remoteUrl(REPO), slotPollMs = 250 } = {}) {
+// The repository pre-push holds one flock per clone and exits at once when another run holds it. That exit is a
+// queue, not a test result: recorded as a failure it made repair sessions write their own lock-grabbing scripts
+// (2026-11-04). The helper waits for the lock instead and reruns.
+const PRE_PUSH_LOCK_BUSY = /已有一份 pre-push 在跑|another pre-push is (?:already )?running/;
+export const PREFLIGHT_LOCK_BUSY = 'preflight-lock-busy';
+
+// Non-blocking probe: true when nobody holds <git common dir>/pre-push.flock right now. The probe lock is released
+// on exit, so it never holds the lock against the hook it is waiting for.
+export function probePrePushLock({ worktree, gitFn = command }) {
+  const common = path.resolve(worktree, gitOutput(['-C', worktree, 'rev-parse', '--git-common-dir'], gitFn).trim());
+  try {
+    execFileSync('perl', ['-MFcntl=:flock', '-e', 'open(my $f, ">>", $ARGV[0]) or exit 2; flock($f, LOCK_EX | LOCK_NB) or exit 1; exit 0',
+      path.join(common, 'pre-push.flock')], { stdio: 'ignore' });
+    return true;
+  } catch (error) {
+    if (error?.status === 1) return false;
+    throw error;
+  }
+}
+
+async function waitForPrePushLock({ probe, deadline, pollMs }) {
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    if (probe()) return true;
+  }
+  return false;
+}
+
+export async function validate({ home, taskPath, validatedHead, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command, runFn = runLogged, env = process.env, originUrl = remoteUrl(REPO), slotPollMs = 250, lockProbeFn = probePrePushLock, lockPollMs = 5_000 } = {}) {
   rejectSkip(env);
   const { paths, task } = taskFrom(home, taskPath);
   const stopHeartbeat = startActivityHeartbeat(paths, task, 'validate');
@@ -1148,12 +1176,25 @@ export async function validate({ home, taskPath, validatedHead, ghFn = command, 
         }
       }
       if (status !== 'fail') {
-        const step = await runLoggedStep(runFn, '/bin/bash', [policy.file], base, `${logBase}-preflight.log`);
+        let preflightCall = null;
+        const preflightRun = (binary, args, options) => { preflightCall = { binary, args }; return runFn(binary, args, options); };
+        let step = await runLoggedStep(preflightRun, '/bin/bash', [policy.file], base, `${logBase}-preflight.log`);
         ranPreflight = true;
+        const lockDeadline = Date.now() + config.lockWaitMs;
+        let lockBusy = false;
+        for (let retry = 1; !step.ok && !step.failureKind && PRE_PUSH_LOCK_BUSY.test(step.output); retry++) {
+          if (!await waitForPrePushLock({ probe: () => lockProbeFn({ worktree, gitFn }), deadline: lockDeadline, pollMs: lockPollMs })) { lockBusy = true; break; }
+          step = await runLoggedStep(runFn, preflightCall.binary, preflightCall.args, base, `${logBase}-preflight-${retry}.log`);
+        }
         exitCode = step.exitCode;
         outputHash = step.logSha256;
         log = { logPath: step.logPath, logSha256: step.logSha256 };
-        if (step.ok) {
+        if (lockBusy) {
+          status = 'fail';
+          failureKind = PREFLIGHT_LOCK_BUSY;
+          reason = `shared pre-push lock stayed busy for ${Math.round(config.lockWaitMs / 60_000)} minutes`;
+          failure = { state: 'unparsed', failureSet: [], failureSetSha256: null };
+        } else if (step.ok) {
           failure = emptyFailureSet();
           if (/^\[preflight\] skipped(?: |$)/m.test(step.output)) { status = 'fail'; failureKind = 'evidence-invalid'; failure = { state: 'unparsed', failureSet: [], failureSetSha256: null }; }
         } else {

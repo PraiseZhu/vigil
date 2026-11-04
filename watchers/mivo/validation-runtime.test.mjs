@@ -19,9 +19,13 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 test('validationConfig: 默认值、env 覆盖、非法值 fail-closed', (t) => {
   const home = tmp(t);
   const env = { MIVO_WATCHER_HOME: home };
-  assert.deepEqual(validationConfig({ env }), { concurrency: 2, stallMs: 600_000, timeoutMs: 3_600_000 });
+  assert.deepEqual(validationConfig({ env }), { concurrency: 2, stallMs: 600_000, timeoutMs: 3_600_000, lockWaitMs: 3_600_000 });
   assert.equal(validationConfig({ env: { ...env, MIVO_VALIDATE_CONCURRENCY: '3' } }).concurrency, 3);
   assert.equal(validationConfig({ env: { ...env, MIVO_VALIDATE_STALL_MINUTES: '0.5' } }).stallMs, 30_000);
+  assert.equal(validationConfig({ env: { ...env, MIVO_PREPUSH_LOCK_WAIT_MINUTES: '90' } }).lockWaitMs, 5_400_000);
+  for (const bad of ['0', '-2', 'x', '']) {
+    assert.throws(() => validationConfig({ env: { ...env, MIVO_PREPUSH_LOCK_WAIT_MINUTES: bad } }), /prePushLockWaitMinutes/, bad);
+  }
   for (const bad of ['0', '-1', '1.5', 'abc', '']) {
     assert.throws(() => validationConfig({ env: { ...env, MIVO_VALIDATE_CONCURRENCY: bad } }), /validateConcurrency/, bad);
   }

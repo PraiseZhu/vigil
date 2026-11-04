@@ -62,6 +62,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | `validateConcurrency` | `MIVO_VALIDATE_CONCURRENCY` | `2`。同一 watcher home 同时运行的 validate 上限，正整数；非法值（0、负数、小数、空串、非数字）直接报错，不静默回退。超限的 validate 排队等槽位，**排队不是失败**：不记失败、不消耗重试或 missing-result 计数。持有槽位的进程崩溃后，槽位按 pid 存活判定回收，并先终止它遗留的进程组：命令经 `sh` 启动，`sh` 先把进程组号落盘到槽位旁的 `.pgid` 文件、确认持有者仍存活才 `exec` 真正的命令，所以持有者在 spawn 之后任意时刻崩溃，要么组号已落盘可被回收，要么命令根本没有开始 |
 | `validateStallMinutes` | `MIVO_VALIDATE_STALL_MINUTES` | `10`。连续无新输出（stdout/stderr 都没有新字节）超过它就终止整个进程组，收据记 `failureKind: validate-stalled`，不当作测试失败；规则同 `preflightTimeoutMinutes`。心跳不算输出 |
 | `preflightTimeoutMinutes` | `MIVO_PREFLIGHT_TIMEOUT_MINUTES` | `60`。只接受大于 0 的有限数字或非空十进制字符串；换算毫秒后须为不超过 2147483647 的安全整数。非法值直接报错，不静默回退。env 优先于 profile。validate 的 `npm ci`（如需）与仓库预检、以及未复用收据时的 `git push` 都用此时限；两阶段各自独立计时，不共享一笔总预算。显式 `options.timeout` 仍然优先。 |
+| `prePushLockWaitMinutes` | `MIVO_PREPUSH_LOCK_WAIT_MINUTES` | `60`。仓库 pre-push 因「已有一份 pre-push 在跑」退出时，validate 不记失败，而是每 5 秒探一次共用锁（`<git 公共目录>/pre-push.flock`，非阻塞探测、探完即放），空出后重跑预检；累计等待超过此值才写 `failureKind: preflight-lock-busy` 的收据，watcher 把它当短暂阻塞，30 分钟后交回重试。规则同 `preflightTimeoutMinutes`。 |
 
 拷一份 [`config/examples/mivo.profile.example.json`](../../config/examples/mivo.profile.example.json)
 到你的 watcher home 下的 `config/profile.json`，把占位值换成真实路径即可。`config/profile.json`
