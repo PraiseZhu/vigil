@@ -5,6 +5,11 @@ import path from 'node:path';
 
 export const READONLY_SKIP = '代码目录只读（例如在验收轮沙箱里跑测试），真沙箱测试要在代码目录下建夹具，跳过';
 
+/** 把一段文本安全地放进 POSIX shell 命令（单引号；路径里有空格、$、反引号也原样传）。 */
+export function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`;
+}
+
 export function fixtureDirWritable(dir) {
   try {
     const probe = fs.mkdtempSync(path.join(dir, '.writable-probe-'));

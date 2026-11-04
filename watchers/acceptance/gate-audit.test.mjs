@@ -1074,9 +1074,9 @@ function cliHome(entries) {
   return { home, ledger: file };
 }
 
-function runGateAuditCli(home, args) {
+function runGateAuditCli(home, args, extraEnv = {}) {
   const result = spawnSync(process.execPath, [path.join(HERE, 'host', 'gate-audit.mjs'), ...args], {
-    env: { ...process.env, ACCEPTANCE_WATCHER_HOME: home },
+    env: { ...process.env, NODE_NO_WARNINGS: '1', ACCEPTANCE_WATCHER_HOME: home, ...extraEnv },
     encoding: 'utf8',
     timeout: 20000,
   });
@@ -1155,6 +1155,20 @@ test('CLI：--json 退出码 0/1/2，--summary 只读退出 0，崩溃退出 3',
 
   // 没有配置：崩溃退出码 3，stderr 一行，stdout 不输出。
   const broken = runGateAuditCli(tmpDir(), ['--json']);
+  assert.equal(broken.code, 3, broken.stderr);
+  assert.match(broken.stderr, /^写闸账本审计失败：/);
+  assert.equal(broken.stderr.trim().split('\n').length, 1);
+  assert.equal(broken.stdout, '');
+});
+
+// 复现：环境里带 NODE_USE_ENV_PROXY 时，Node 会先往 stderr 打实验性警告；错误行仍应单独一行，
+// 不能因为警告前缀把 CLI 的错误判定弄红。
+test('CLI：Node 运行时警告不混进错误行', () => {
+  const broken = runGateAuditCli(tmpDir(), ['--json'], {
+    NODE_USE_ENV_PROXY: '1',
+    HTTPS_PROXY: 'http://127.0.0.1:9',
+    HTTP_PROXY: 'http://127.0.0.1:9',
+  });
   assert.equal(broken.code, 3, broken.stderr);
   assert.match(broken.stderr, /^写闸账本审计失败：/);
   assert.equal(broken.stderr.trim().split('\n').length, 1);
