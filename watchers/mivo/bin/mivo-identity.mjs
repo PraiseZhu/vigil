@@ -3,6 +3,8 @@
 export const DEFAULT_LOGIN = 'PraiseZhu';
 export const DEFAULT_USER_ID = 290989140;
 export const BOT_LOGIN = 'praise-qa[bot]';
+// The GitHub App whose bot account may submit the review flow's reviews next to the configured reviewer login.
+export const REVIEWER_BOT_LOGIN = 'praisebuild[bot]';
 
 export function configuredLogin(env = process.env) {
   const value = String(env.VIGIL_GH_LOGIN ?? '').trim();

@@ -9,7 +9,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { planSessionTitle, repairSessionTitle } from './session-title.mjs';
-import { collectPublicReview, evaluatePublicReview, REVIEWER, reviewerFindingReviewIds, isReviewerCleanReport } from './public-review.mjs';
+import { collectPublicReview, evaluatePublicReview, isReviewerAuthor, reviewerFindingReviewIds, isReviewerCleanReport } from './public-review.mjs';
 import { collectPrSnapshot, collectPrOwnership, collectMergeStates, readMergeState, readMergeStatus, mergeStateIsBatched } from './mivo-pr-snapshot.mjs';
 import { selectHandoff, isCurrentHandoff, implicitHandoff } from './mivo-handoff.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './mivo-state.mjs';
@@ -368,7 +368,7 @@ export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci
     const external = threadComments.filter((comment) => !ownReceipt(comment, receiptActor));
     for (const comment of external) {
       const author = comment.author?.login ?? comment.user?.login;
-      const reviewerFinding = author === REVIEWER && findingReviews.has(comment.pullRequestReview?.id);
+      const reviewerFinding = isReviewerAuthor(comment.author ?? comment.user) && findingReviews.has(comment.pullRequestReview?.id);
       items.push(withCategory(withPublisher({
         source: isGreptileAuthor(author) ? 'greptile' : reviewerFinding ? 'mivo-review' : 'thread',
         actionable: thread.isResolved !== true,
