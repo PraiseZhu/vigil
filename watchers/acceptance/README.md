@@ -44,8 +44,8 @@
 | `stallMinutes` | 否 | 卡住判定阈值，默认 30 |
 | `writeCommand` | 否 | 写操作出口 argv；没配则直接用 `gh`/`git` |
 | `appConfigPath` | 否 | GitHub App 配置 JSON（单个安装、不分流）；配了读请求走 App 令牌，`apps` / `appTokenCommand` 都不生效 |
-| `apps` | 否 | 两级 App 配置 `{ read, write }`：每个 `{ appId, privateKeyFile, owners }`；按 (app, owner) 运行时查安装号、按 owner 各缓存令牌；读走 `read`，推分支/PR/workflow 走 `write`，看板写仍账号令牌 |
-| `appTokenCommand` | 否 | 旧形式：打印 App 安装令牌的外部命令（argv 数组），`owner` 作为最后一个参数追加；只在没配 `apps` / `appConfigPath` 时生效 |
+| `apps` | 否 | 两级 App 配置 `{ read, write }`：每个 `{ appId, privateKeyFile, owners }`（`appId` 只收正的安全整数，不收前导零）；按 (app, owner) 运行时查安装号、按 owner 各缓存令牌；首批只读切 App（读走 `read`），推分支/PR/workflow 走 `write`，评论 / issue / sub-issue 写与看板写暂仍账号令牌（等身份白名单） |
+| `appTokenCommand` | 否 | 旧形式：打印 App 安装令牌的外部命令（argv 数组）；argv 与上一版一致（不追加位置参数），owner 只通过环境变量 `ACCEPTANCE_APP_OWNER` 传入；只在没配 `apps` / `appConfigPath` 时生效 |
 | `appOwners` | 否 | 旧形式：`appTokenCommand` 对应的 owner 列表，默认 `[ownerLogin]` |
 | `slackBotTokenFile` | 否 | Slack bot 令牌文件（绝对路径）；配了就检查权限是 600，只有 `host/slack-notify.mjs` 读它 |
 | `slackChannelId` | 否 | Slack 频道 id（`C` / `G` 开头）；没配就不发通知（当前部署不配：通报已关闭，告警只写 `alerts.jsonl`，心跳 `slack.reason=not-configured` 属正常） |

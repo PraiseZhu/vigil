@@ -249,8 +249,8 @@ function loadAppConfig(appConfigPath, file) {
 
 /**
  * 两级 App 配置：`apps: { read: {...}, write: {...} }`。
- * - read：①读 App（读 + 低风险写）；write：②写 App（推分支、PR、workflow）。
- * - 每个 app：`appId`（正整数或纯数字字符串）、`privateKeyFile`（绝对路径）、`owners`（默认 `[ownerLogin]`）。
+ * - read：①读 App（只做单仓读）；write：②写 App（推分支、PR、workflow；评论 / issue 等写先不开）。
+ * - 每个 app：`appId`（正的安全整数或纯数字字符串，不收前导零）、`privateKeyFile`（绝对路径）、`owners`（默认 `[ownerLogin]`）。
  * - 安装号不在这里配：运行时用私钥 JWT 调 `GET /app/installations` 查。
  * - 只校格式，不在这里碰私钥文件：私钥缺失 / 不可读 / 权限不对时，用的时候回退账号令牌并记一行日志
  *   （整台验收机不能因为一枚没部署的私钥就停下）。
@@ -271,9 +271,15 @@ function parseApps(raw, file, ownerLogin) {
       }
     }
     const appId = candidate.appId;
+    // appId 会原样进 JWT 的 iss（`String(appId)`）：只认正的**安全整数**，且数字串不接受前导零。
+    // '00' / '007' 与 '0' / '7' 在 GitHub 侧是不同的字符串，String() 会原样签成 iss；1e21 这种更是
+    // String(1e21) === '1e+21'，签出来本身就是非法 iss。与其等第一次取令牌才 401，不如加载时就报错。
     const appIdOk =
-      (typeof appId === 'string' && /^\d+$/.test(appId) && appId !== '0') || (Number.isInteger(appId) && appId > 0);
-    if (!appIdOk) throw invalid(`${key}.appId`, file, '应为正整数或纯数字字符串');
+      (typeof appId === 'string' && /^[1-9]\d*$/.test(appId) && Number.isSafeInteger(Number(appId))) ||
+      (typeof appId === 'number' && Number.isSafeInteger(appId) && appId > 0);
+    if (!appIdOk) {
+      throw invalid(`${key}.appId`, file, '应为正的安全整数或纯数字字符串（不接受前导零、小数、布尔）');
+    }
     const privateKeyFile = candidate.privateKeyFile;
     if (typeof privateKeyFile !== 'string' || !privateKeyFile || !path.isAbsolute(privateKeyFile)) {
       throw invalid(`${key}.privateKeyFile`, file, '应为绝对路径');

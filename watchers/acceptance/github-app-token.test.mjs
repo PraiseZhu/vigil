@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { createGithub, defaultRun } from './bin/github.mjs';
+import { createGithub, defaultRun, WRITE_APP_ROLE } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { prepareSandboxProfile } from './host/sandbox.mjs';
 import { OWNER, createFakeRun, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
@@ -50,7 +50,7 @@ test('#163 SC1 取令牌命令超时整组杀掉：命令起的孙进程不能�
   assert.throws(() => process.kill(pid, 0), /ESRCH/, `孙进程 ${pid} 应已随进程组一起被杀`);
 });
 
-test('App 成功：App 覆盖的 owner 读走 App 令牌，取令牌命令带超时和进程组', async () => {
+test('App 成功：App 覆盖的 owner 读走 App 令牌，取令牌命令带超时、进程组和 owner 环境变量', async () => {
   const { profile, loopLog } = setup();
   const onOther = tokenCmd();
   const fake = createFakeRun({ onGraphql: () => ({ repository: { issue: { id: 'I1' } } }), onOther });
@@ -71,6 +71,7 @@ test('App 成功：App 覆盖的 owner 读走 App 令牌，取令牌命令带超
   assert.ok(mint.opts.timeoutMs > 0);
   assert.equal(mint.opts.killGroup, true);
   assert.equal(mint.opts.env.GH_TOKEN, undefined);
+  assert.equal(mint.opts.env.ACCEPTANCE_APP_OWNER, OWNER, 'owner 只走环境变量，不进 argv');
   assert.equal(readLog(loopLog), '');
 });
 
@@ -165,12 +166,12 @@ const TOKEN_C = 'app-token-owner-c';
 const fingerprint = (token) => crypto.createHash('sha256').update(token).digest('hex').slice(0, 12);
 const APP_OWNERS = [OWNER, OWNER_B, OWNER_C];
 
-/** 假取令牌命令：按最后一个参数（owner）返回各自的安装令牌，记录每次调用的参数。 */
+/** 假取令牌命令（旧形式）：argv 与上一版一致（不追加 owner），owner 从 ACCEPTANCE_APP_OWNER 环境变量读。 */
 function perOwnerTokenCmd(tokens, { fail = [] } = {}) {
   const calls = [];
-  const onOther = async (cmd, args) => {
+  const onOther = async (cmd, args, opts = {}) => {
     if (cmd !== 'fake-app-token') return { code: 1, stdout: '', stderr: 'unexpected' };
-    const owner = args[args.length - 1];
+    const owner = opts.env?.ACCEPTANCE_APP_OWNER;
     calls.push({ cmd, args, owner });
     if (fail.includes(owner)) return { code: 1, stdout: '', stderr: `Traceback: no install for ${owner}` };
     const token = tokens[owner];
@@ -180,7 +181,7 @@ function perOwnerTokenCmd(tokens, { fail = [] } = {}) {
   return onOther;
 }
 
-test('多 owner 各取各的令牌：命令带 owner 参数，读用该安装的令牌，同一 owner 只跑一次命令', async () => {
+test('多 owner 各取各的令牌：命令 argv 与上一版一致、owner 走环境变量，读用该安装的令牌，同一 owner 只跑一次命令', async () => {
   const { profile, loopLog } = setup({ appOwners: APP_OWNERS });
   const onOther = perOwnerTokenCmd({ [OWNER]: TOKEN_A, [OWNER_B]: TOKEN_B, [OWNER_C]: TOKEN_C });
   const run = createFakeRun({ onGraphql: () => ({ repository: { issue: { id: 'I1' } } }), onOther });
@@ -188,7 +189,12 @@ test('多 owner 各取各的令牌：命令带 owner 参数，读用该安装的
   for (const [owner, name] of [[OWNER, 'repo-a'], [OWNER_B, 'repo-b'], [OWNER_C, 'repo-c'], [OWNER, 'repo-a'], [OWNER_B, 'repo-b']]) {
     await github.graphql(Q, { owner, name, number: 1 });
   }
-  assert.deepEqual(onOther.calls.map((c) => c.owner), [OWNER, OWNER_B, OWNER_C], '同一个 owner 只跑一次取令牌命令，owner 是命令的最后一个参数');
+  assert.deepEqual(onOther.calls.map((c) => c.owner), [OWNER, OWNER_B, OWNER_C], '同一个 owner 只跑一次取令牌命令，owner 走环境变量');
+  assert.deepEqual(
+    [...new Set(onOther.calls.map((call) => JSON.stringify(call.args)))],
+    [JSON.stringify(['--print'])],
+    'argv 与上一版完全一致：不追加 owner（严格参数的旧脚本会直接非 0 退出）',
+  );
   const reads = run.calls.filter((c) => c.cmd === 'gh');
   assert.deepEqual(reads.map((c) => c.ghToken), [TOKEN_A, TOKEN_B, TOKEN_C, TOKEN_A, TOKEN_B], '每个 owner 的读用自己那次命令取到的令牌');
   const prints = reads.map((c) => fingerprint(c.ghToken));
@@ -274,12 +280,12 @@ test('令牌不进 loop.log、不进报错：多 owner 全失败时错误里只�
   assert.doesNotMatch(log, new RegExp(`${TOKEN_A}|${TOKEN_B}|${TOKEN_C}|owner-token`));
 });
 
-test('老形式的取令牌命令（不关心 owner 参数）照旧可用：多余参数不影响取到的令牌', async () => {
+test('老形式的取令牌命令（不关心 owner 参数）照旧可用：argv 与上一版完全一致', async () => {
   const { profile, loopLog } = setup({ appOwners: [OWNER, OWNER_B] });
   const calls = [];
-  const onOther = async (cmd, args) => {
+  const onOther = async (cmd, args, opts = {}) => {
     if (cmd !== 'fake-app-token') return { code: 1, stdout: '', stderr: 'unexpected' };
-    calls.push(args);
+    calls.push({ args, owner: opts.env?.ACCEPTANCE_APP_OWNER });
     return { code: 0, stdout: `${APP_TOKEN}\n`, stderr: '' };
   };
   const run = createFakeRun({ onGraphql: () => ({ repository: { issue: { id: 'I1' } } }), onOther });
@@ -287,10 +293,55 @@ test('老形式的取令牌命令（不关心 owner 参数）照旧可用：多�
   await github.graphql(Q, { owner: OWNER, name: 'repo-a', number: 1 });
   await github.graphql(Q, { owner: OWNER_B, name: 'repo-b', number: 1 });
   await github.graphql(Q, { owner: OWNER, name: 'repo-a', number: 2 });
-  assert.deepEqual(calls, [['--print', OWNER], ['--print', OWNER_B]], 'owner 追加在命令末尾；同一 owner 只跑一次');
+  assert.deepEqual(calls.map((call) => call.args), [['--print'], ['--print']], 'argv 与上一版一致（不追加 owner），同一 owner 只跑一次');
+  assert.deepEqual(calls.map((call) => call.owner), [OWNER, OWNER_B], 'owner 走 ACCEPTANCE_APP_OWNER；不认它的旧脚本不受影响');
   assert.deepEqual(run.calls.filter((c) => c.cmd === 'gh').map((c) => c.ghToken), [APP_TOKEN, APP_TOKEN, APP_TOKEN], '老脚本照旧给出同一枚令牌，读不换路');
   assert.equal(readLog(loopLog), '', '老脚本能取到令牌就没有回退');
 });
+
+test('旧路径严格参数的脚本（多一个位置参数就非 0）不再被多传 OWNER：读照旧走 App，不静默降级', async () => {
+  const { profile, loopLog } = setup({ appOwners: [OWNER, OWNER_B] });
+  const calls = [];
+  // 模拟 argparse 没定义位置参数的老脚本：参数个数不等于 2 就报错退出。
+  const onOther = async (cmd, args) => {
+    if (cmd !== 'fake-app-token') return { code: 1, stdout: '', stderr: 'unexpected' };
+    calls.push(args);
+    if (args.length !== 1) return { code: 2, stdout: '', stderr: 'fake-app-token: error: unrecognized arguments' };
+    return { code: 0, stdout: `${APP_TOKEN}\n`, stderr: '' };
+  };
+  const run = createFakeRun({ onGraphql: () => ({ repository: { issue: { id: 'I1' } } }), onOther });
+  const github = createGithub({ profile, run });
+  await github.graphql(Q, { owner: OWNER, name: 'repo-a', number: 1 });
+  await github.graphql(Q, { owner: OWNER_B, name: 'repo-b', number: 1 });
+  assert.deepEqual(calls, [['--print'], ['--print']]);
+  assert.deepEqual(run.calls.filter((c) => c.cmd === 'gh').map((c) => c.ghToken), [APP_TOKEN, APP_TOKEN], '两读都走 App 令牌');
+  assert.equal(readLog(loopLog), '', '严格参数的旧脚本不该被逼出回退日志');
+});
+
+for (const [label, stdout, code] of [
+  ['多行输出（stdout 不止令牌一行）', `${APP_TOKEN}\nsecond-line\n`, 0],
+  ['超时（run 按 124 收尾）', '', 124],
+  ['非 0 退出', '', 2],
+]) {
+  test(`旧路径取令牌命令${label}：回退账号令牌、记一行 reason=command-failed，不把输出当日志`, async () => {
+    const { profile, loopLog } = setup({ appOwners: [OWNER] });
+    const onOther = tokenCmd();
+    const run = createFakeRun({
+      onGraphql: () => ({ repository: { issue: { id: 'I1' } } }),
+      onOther: async (cmd, args, opts) => {
+        if (cmd !== 'fake-app-token') return { code: 1, stdout: '', stderr: 'unexpected' };
+        await onOther(cmd, args, opts);
+        return { code, stdout, stderr: '' };
+      },
+    });
+    const github = createGithub({ profile, run });
+    await github.graphql(Q, { owner: OWNER, name: 'repo-a', number: 1 });
+    assert.deepEqual(run.calls.filter((c) => c.cmd === 'gh').map((c) => c.ghToken), ['owner-token']);
+    const log = readLog(loopLog);
+    assert.match(log, /app-token-fallback kind=token-failed repo=ExampleUser\/repo-a app=legacy reason=command-failed/);
+    assert.doesNotMatch(log, new RegExp(`${APP_TOKEN}|second-line|owner-token`), '令牌和命令输出都不进日志');
+  });
+}
 
 // 两个字段互斥：配了 appConfigPath 就不做按仓分流（盘点、搜索、viewer 会一起换成安装令牌而漏单）。
 test('配了 appConfigPath 就不按仓分流：单仓读也走 App 配置铸造的令牌，不跑 appTokenCommand', async () => {
@@ -579,18 +630,28 @@ for (const [status, kind] of [['401', 'auth-401'], ['403', 'auth-403'], ['404', 
   });
 }
 
-test('低风险写走 ①：评论、关单、开 sub-issue 用读 App 的安装令牌', async () => {
+test('配了 apps.read：评论、开 issue、开 sub-issue 仍用账号令牌（作者不变，不铸 App 令牌）', async () => {
   const { profile, loopLog } = appSetup({ read: {}, write: {} });
   const fetchImpl = appFetch();
-  const run = createFakeRun({ onApi: (args) => ({ id: 7, number: 9, html_url: 'https://example.test/x', state: 'closed' }) });
+  const run = createFakeRun({ onApi: () => ({ id: 7, number: 9, html_url: 'https://example.test/x', state: 'closed' }) });
   const github = createGithub({ profile, run, fetchImpl });
   await github.write({ type: 'comment.create', repo: `${OWNER}/repo-a`, issue: 1, body: 'w' });
-  await github.write({ type: 'issue.close', repo: `${OWNER}/repo-a`, issue: 1 });
+  await github.write({ type: 'issue.create', repo: `${OWNER}/repo-a`, title: 't', body: 'b' });
   await github.write({ type: 'subissue.add', repo: `${OWNER}/repo-a`, issue: 1, subRepo: `${OWNER}/repo-a`, subIssue: 2 });
-  // subissue.add 先 GET 子 issue 再 POST，所以三次写一共四次 gh 调用。
-  assert.deepEqual(appTokensUsed(run), Array(4).fill(READ_TOKENS[OWNER]));
-  assert.ok(fetchImpl.calls.token.every((call) => call.iss === READ_ID), '低风险写不用 ②的私钥');
-  assert.equal(readLog(loopLog), '');
+  // subissue.add 先 GET 子 issue 再 POST，所以三次写一共四次 gh 调用，全用账号令牌。
+  assert.deepEqual(appTokensUsed(run), Array(4).fill('owner-token'), '这些写的作者必须是 ownerLogin 自己');
+  assert.equal(fetchImpl.calls.list.length + fetchImpl.calls.token.length, 0, '不铸 ①/②令牌');
+  assert.equal(readLog(loopLog), '', '没试 App 就没有回退记录');
+});
+
+test('分流表：评论 / issue / sub-issue 是 null（表项保留待身份白名单），只有推分支 / PR / workflow 指向 write', () => {
+  for (const type of ['comment.create', 'comment.update', 'issue.create', 'issue.edit', 'issue.close', 'issue.reopen', 'subissue.add']) {
+    assert.equal(WRITE_APP_ROLE[type], null, `${type} 现在必须走账号令牌`);
+  }
+  for (const type of ['branch.push', 'pr.create', 'pr.ready', 'pr.update-branch', 'ci.rerun']) {
+    assert.equal(WRITE_APP_ROLE[type], 'write', `${type} 首批走 ②写 App`);
+  }
+  assert.equal(WRITE_APP_ROLE['project.field.set'], undefined, '看板写不在表里，继续账号令牌');
 });
 
 test('高风险写走 ②：推分支、开 PR、转 ready、workflow 用写 App 的安装令牌；看板写仍走账号令牌', async () => {
@@ -667,7 +728,7 @@ test('两级配置缺省：只有 read 时读走 ①、写全走账号令牌且�
   assert.equal(readLog(loopLog), '');
 });
 
-test('两级配置缺省：只有 write 时读与低风险写走账号令牌、高风险写走 ②，无回退日志', async () => {
+test('两级配置缺省：只有 write 时读与评论 / issue 写走账号令牌、高风险写走 ②，无回退日志', async () => {
   const { profile, loopLog } = appSetup({ write: {} });
   const fetchImpl = appFetch();
   const run = createFakeRun({
@@ -770,6 +831,142 @@ test('配了 appConfigPath 就不按仓分流：apps 不生效、不查安装列
   assert.equal(readLog(loopLog), '');
 });
 
+// ── 边界：owner 大小写、名单外 owner、privateKeyFile 形态、写被 git 拒时的回退 ──
+test('owner 大小写不影响缓存：声明、变量、安装列表三种大小写命中同一枚令牌', async () => {
+  const { profile, loopLog } = appSetup({ read: { owners: ['ExampleUser'] } });
+  const fetchImpl = appFetch({
+    installs: { [READ_ID]: ['EXAMPLEUSER'] },
+    tokens: { [READ_ID]: { EXAMPLEUSER: READ_TOKENS[OWNER] } },
+  });
+  const run = createFakeRun({ onGraphql: () => ({ repository: { issue: { id: 'I1' } } }) });
+  const github = createGithub({ profile, run, fetchImpl });
+  await github.graphql(Q, { owner: 'exampleuser', name: 'repo-a', number: 1 });
+  await github.graphql(Q, { owner: 'ExampleUser', name: 'repo-a', number: 2 });
+  assert.deepEqual(appTokensUsed(run), [READ_TOKENS[OWNER], READ_TOKENS[OWNER]], '两次读都用同一枚 ①令牌');
+  assert.equal(fetchImpl.calls.list.length, 1, '安装列表只查一次');
+  assert.equal(fetchImpl.calls.token.length, 1, '同一 (app, owner) 只铸一次');
+  assert.equal(readLog(loopLog), '', '大小写不同不是回退');
+});
+
+test('apps.read.owners 名单外的 owner：直接用账号令牌，不打 App 接口、不记回退日志', async () => {
+  const { profile, loopLog } = appSetup({ read: { owners: [OWNER] } });
+  const fetchImpl = appFetch();
+  const run = createFakeRun({ onGraphql: () => ({ repository: { issue: { id: 'I1' } } }) });
+  const github = createGithub({ profile, run, fetchImpl });
+  await github.graphql(Q, { owner: OWNER_B, name: 'repo-b', number: 1 });
+  assert.deepEqual(appTokensUsed(run), ['owner-token']);
+  assert.equal(fetchImpl.calls.list.length + fetchImpl.calls.token.length, 0, '名单外不去试 App');
+  assert.equal(readLog(loopLog), '', '读路径名单外是预期行为，不记回退');
+});
+
+for (const [label, prepare, reason] of [
+  ['目录', (secrets) => {
+    const dir = path.join(secrets, 'keydir');
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }, 'key-unreadable'],
+  ['空文件', (secrets) => {
+    const file = path.join(secrets, 'empty.key');
+    fs.writeFileSync(file, '', { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
+    return file;
+  }, 'key-unreadable'],
+  ['权限 400', (secrets) => {
+    const file = path.join(secrets, 'mode400.key');
+    fs.writeFileSync(file, 'placeholder', { mode: 0o600 });
+    fs.chmodSync(file, 0o400);
+    return file;
+  }, 'key-unreadable'],
+  ['指向不存在目标的符号链接', (secrets) => {
+    const link = path.join(secrets, 'dangling.key');
+    fs.symlinkSync(path.join(secrets, 'not-there.key'), link);
+    return link;
+  }, 'key-missing'],
+]) {
+  test(`①读 App：privateKeyFile 是${label} → 回退账号令牌并记一行（reason=${reason}），不打 App 接口`, async () => {
+    const secrets = tmpDir();
+    const target = prepare(secrets);
+    const { profile, loopLog } = appSetup({ read: { privateKeyFile: target } });
+    const fetchImpl = appFetch();
+    const run = createFakeRun({ onGraphql: () => ({ repository: { issue: { id: 'I1' } } }) });
+    const github = createGithub({ profile, run, fetchImpl });
+    await github.graphql(Q, { owner: OWNER, name: 'repo-a', number: 1 });
+    assert.deepEqual(appTokensUsed(run), ['owner-token']);
+    const log = readLog(loopLog);
+    assert.match(log, new RegExp(`app-token-fallback kind=token-failed repo=ExampleUser/repo-a app=read reason=${reason}`));
+    assert.doesNotMatch(log, new RegExp(`${READ_TOKENS[OWNER]}|owner-token`), '回退日志里没有令牌');
+    assert.equal(fetchImpl.calls.list.length + fetchImpl.calls.token.length, 0, '私钥不可用时不去问 GitHub');
+  });
+}
+
+test('①读 App：privateKeyFile 是符号链接、目标合规时照常读（跟 githubTokenFile 一致，跟随链接）', async () => {
+  const secrets = tmpDir();
+  const real = makeKeyFile(secrets, 'real.key');
+  const link = path.join(secrets, 'link.key');
+  fs.symlinkSync(real, link);
+  const { profile, loopLog } = appSetup({ read: { privateKeyFile: link } });
+  const fetchImpl = appFetch();
+  const run = createFakeRun({ onGraphql: () => ({ repository: { issue: { id: 'I1' } } }) });
+  const github = createGithub({ profile, run, fetchImpl });
+  await github.graphql(Q, { owner: OWNER, name: 'repo-a', number: 1 });
+  assert.deepEqual(appTokensUsed(run), [READ_TOKENS[OWNER]]);
+  assert.equal(readLog(loopLog), '');
+});
+
+// P2-1：branch.push 走 git，报错是 git 自己的文案（不是 HTTP 状态那套），也要能回退账号令牌。
+for (const [stderr, kind, reason] of [
+  ['The requested URL returned error: 403', 'auth-403', 'app-403'],
+  ['remote: Permission to ExampleUser/repo-a.git denied to app[bot]', 'auth-403', 'app-403'],
+  ["fatal: Authentication failed for 'https://github.com/ExampleUser/repo-a.git/'", 'auth-401', 'app-401'],
+  ['remote: Repository not found.', 'not-found', 'app-404'],
+]) {
+  test(`branch.push 的 git 拒绝文案「${stderr}」→ 回退账号令牌并记一行（kind=${kind}）`, async () => {
+    const { profile, loopLog } = appSetup({ write: {} });
+    const fetchImpl = appFetch();
+    let rejected = false;
+    const run = createFakeRun({
+      onGit: (args, { rec }) => {
+        if (!args.includes('push')) return { code: 0, stdout: '' };
+        if (!rejected && tokenOf(rec) === WRITE_TOKENS[OWNER]) {
+          rejected = true;
+          return { code: 1, stdout: '', stderr };
+        }
+        return { code: 0, stdout: '' };
+      },
+    });
+    const github = createGithub({ profile, run, fetchImpl });
+    await github.write({ type: 'branch.push', repo: `${OWNER}/repo-a`, branch: 'acceptance/1-x-sc1', bundlePath: path.join(tmpDir(), 'b.bundle') });
+    assert.equal(rejected, true, '②令牌那次推送确实被拒了');
+    assert.deepEqual(
+      appTokensUsed(run),
+      [WRITE_TOKENS[OWNER], WRITE_TOKENS[OWNER], WRITE_TOKENS[OWNER], 'owner-token', 'owner-token', 'owner-token'],
+      '被拒后用账号令牌整段重放一次（3 条 git）',
+    );
+    const log = readLog(loopLog);
+    assert.match(log, new RegExp(`app-token-fallback kind=${kind} repo=ExampleUser/repo-a app=write reason=${reason}`));
+    assert.doesNotMatch(log, new RegExp(`${WRITE_TOKENS[OWNER]}|owner-token`));
+  });
+}
+
+test('pr.ready 被拒 403：回退账号令牌重试一次、只回退一次、记一行 app=write', async () => {
+  const { profile, loopLog } = appSetup({ write: {} });
+  const fetchImpl = appFetch();
+  let rejected = false;
+  const run = createFakeRun({
+    onApi: (args, { env }) => {
+      if (!rejected && env.GH_TOKEN === WRITE_TOKENS[OWNER]) {
+        rejected = true;
+        return { code: 1, stdout: '', stderr: 'HTTP 403: Resource not accessible by integration' };
+      }
+      return { code: 0, stdout: '{}' };
+    },
+  });
+  const github = createGithub({ profile, run, fetchImpl });
+  await github.write({ type: 'pr.ready', repo: `${OWNER}/repo-a`, pr: 5 });
+  assert.deepEqual(appTokensUsed(run), [WRITE_TOKENS[OWNER], 'owner-token']);
+  assert.match(readLog(loopLog), /kind=auth-403 repo=ExampleUser\/repo-a app=write reason=app-403/);
+});
+
 test('apps 的 profile 校验：格式错的直接报错；私钥文件不在也不拦启动（用的时候回退）', () => {
   const bad = (apps, pattern) => {
     const home = tmpDir();
@@ -782,6 +979,15 @@ test('apps 的 profile 校验：格式错的直接报错；私钥文件不在也
   bad({ read: { appId: '1', privateKeyFile: 'rel/key' } }, /privateKeyFile/);
   bad({ read: { appId: '1', privateKeyFile: '/k', owners: [] } }, /owners/);
   bad({ read: { appId: '1', privateKeyFile: '/k', install: '2' } }, /install/);
+  // appId 会原样进 JWT 的 iss：只认正的安全整数，数字串不收前导零。
+  for (const appId of [0, -1, 1.5, '', '00', '007', '1e21', ' 1', 1e21, Number.MAX_SAFE_INTEGER + 1, true, null]) {
+    bad({ read: { appId, privateKeyFile: '/k' } }, /appId/);
+  }
+  for (const appId of ['123', 123, Number.MAX_SAFE_INTEGER]) {
+    const home = tmpDir();
+    writeProfile(home, { profile: { apps: { read: { appId, privateKeyFile: '/k' } } } });
+    assert.equal(loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }).apps.read.appId, String(appId), `appId ${appId} 应被接受`);
+  }
   const home = tmpDir();
   writeProfile(home, { profile: { apps: { read: { appId: 123, privateKeyFile: '/nonexistent/app.key' } } } });
   const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });

@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 // GitHub 读写的唯一出口：本文件才允许 spawn / 触网。
 // 读：配了 appConfigPath 走 App 安装令牌，否则走账号令牌。
-// 两级 App 配置 apps: { read, write }：read = ①读 App（单仓读 + 低风险写），write = ②写 App（推分支 / PR / workflow）。
+// 两级 App 配置 apps: { read, write }：read = ①读 App（只做单仓读），write = ②写 App（推分支 / PR / workflow）。
+// 写：首批只有 ②的 branch.push / pr.* / ci.rerun 走 App；评论、issue、sub-issue 仍走账号令牌——
+// 用 App 写出来作者会变成 app[bot]，而轮次/子 issue 的认领按 author.login == ownerLogin 判定，
+// 要等身份白名单落地（见 WRITE_APP_ROLE 的注释）。
 // 安装号运行时用私钥 JWT 调 GET /app/installations 查；令牌按 (app, owner) 各缓存 50 分钟（只在内存里）。
-// 取不到令牌（没装 / 私钥缺失或不可读 / 查安装失败）或 App 读到 401/403/404 时，回退账号令牌一次，
+// 取不到令牌（没装 / 私钥缺失或不可读 / 查安装失败）或 App 读到 401/403/404（含 git 的同类文案）时，回退账号令牌一次，
 // 并在宿主 loop.log 记一行 app-token-fallback（kind、repo、app 名、原因，不含令牌）；一个 (app, owner) 失败不影响别的。
-// 没配 apps 时，回落旧的 appTokenCommand + appOwners（owner 作为命令最后一个参数，行为与上一版一致）。
+// 没配 apps 时，回落旧的 appTokenCommand + appOwners：命令的 argv 与上一版完全一致（不追加 owner），
+// owner 只放进环境变量 ACCEPTANCE_APP_OWNER——认它的脚本能按 owner 各给一枚令牌，不认的旧脚本照旧给默认安装的令牌。
 // 写：账号令牌或 App 令牌都要过 write() 的类型检查；配了 writeCommand 则整段交给写闸，绝不回落直接写。
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -556,18 +560,26 @@ const APP_TOKEN_TTL_MS = 50 * 60 * 1000;
 const APP_INSTALL_CACHE_MS = 15 * 60 * 1000;
 
 /**
- * 写操作按风险分流到哪个 App：`read` = ①读 App（评论、标签、开 sub-issue、关单等低风险写），
- * `write` = ②写 App（推分支、维护分支、开 PR、转 ready、workflow）。
+ * 写操作按风险分流到哪个 App：`read` = ①读 App，`write` = ②写 App（推分支、维护分支、开 PR、转 ready、workflow）；
+ * 值为 `null` = 这一类**暂时不走 App**，落回账号令牌（表项留着当占位，开的时候改一处就行）。
+ *
+ * 评论 / issue / sub-issue 先不开：用 App 令牌写出来作者会变成 `<app>[bot]`，而 rounds / collect / tasks / prbot /
+ * prbot-gate-check 全都按 `author.login == profile.ownerLogin` 认「自己发的」轮次评论、子 issue 和修正 issue。
+ * 现在开会让轮次反复重开、`done/finish` 报 NOT_CURRENT、修正树消失，所以须等身份白名单（把 bot 登录名也算成自己）
+ * 那个 PR 合并后再开。②的写（推分支 / PR / workflow）作者是 bot 不影响现有判定，首批先开。
  * 不在这张表里的写（如 project.field.set 看板写）继续走账号令牌：App 看不到个人账号下的 Projects v2。
  */
 export const WRITE_APP_ROLE = Object.freeze({
-  'comment.create': 'read',
-  'comment.update': 'read',
-  'issue.create': 'read',
-  'issue.edit': 'read',
-  'issue.close': 'read',
-  'issue.reopen': 'read',
-  'subissue.add': 'read',
+  // 作者会变成 app[bot]，而 rounds/collect/tasks/prbot/prbot-gate-check 按 author.login==ownerLogin 认自己的评论和子 issue，
+  // 须等身份白名单 PR 合并后再开（现在保持账号令牌）。
+  'comment.create': null,
+  'comment.update': null,
+  'issue.create': null,
+  'issue.edit': null,
+  'issue.close': null,
+  'issue.reopen': null,
+  'subissue.add': null,
+  // 首批开：②写 App。profile 没配 apps.write 时本来就不进这条分支（账号令牌）。
   'branch.push': 'write',
   'pr.create': 'write',
   'pr.ready': 'write',
@@ -578,6 +590,9 @@ export const WRITE_APP_ROLE = Object.freeze({
 /**
  * App 令牌读失败时，要不要回退账号令牌：401 / 凭证坏 → auth-401；403 / 无权限 → auth-403；
  * 404 / 找不到仓（App 没覆盖这个仓）→ not-found。超时、5xx 等不回退（照旧走只读重试规则）。
+ * `branch.push` / `pr.ready` 跑的是 git / gh 子命令，文案不是 HTTP 状态那一套：
+ * git 说的是 `fatal: Authentication failed`、`The requested URL returned error: 403`、
+ * `remote: Permission to <repo> denied`、`Repository not found`；这些也要认，否则写被拒时不会回退账号令牌。
  */
 export function appFallbackKind(result) {
   let text = `${result?.stderr || ''}\n`;
@@ -592,9 +607,9 @@ export function appFallbackKind(result) {
   } else {
     text += String(result?.stdout || '');
   }
-  if (/\bHTTP 401\b|Bad credentials/i.test(text)) return 'auth-401';
-  if (/\bHTTP 403\b|Resource not accessible by integration|\bFORBIDDEN\b/.test(text)) return 'auth-403';
-  if (/\bHTTP 404\b|Could not resolve to a (Repository|node)|\bNOT_FOUND\b/.test(text)) return 'not-found';
+  if (/\bHTTP 401\b|Bad credentials|Authentication failed|could not read Username|returned error: 401\b/i.test(text)) return 'auth-401';
+  if (/\bHTTP 403\b|Resource not accessible by integration|\bFORBIDDEN\b|returned error: 403\b|Permission to [^\n]* denied/i.test(text)) return 'auth-403';
+  if (/\bHTTP 404\b|Could not resolve to a (Repository|node)|\bNOT_FOUND\b|returned error: 404\b|Repository not found/i.test(text)) return 'not-found';
   return null;
 }
 
@@ -668,7 +683,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
    * 这条只读查询该不该走 App、走哪个：
    * - 配了 appConfigPath：不分流（旧模式，所有读都走那一枚安装令牌）；
    * - 配了 apps：只有 ①读 App 的 owner 名单里的单仓查询走 App，其它（盘点、搜索、viewer、别的 owner）账号令牌；
-   * - 都没有：回落旧形式 appTokenCommand + appOwners（与上一版行为一致）。
+   * - 都没有：回落旧形式 appTokenCommand + appOwners（命令 argv 与上一版一致，owner 只走环境变量）。
    */
   function readRouteFor(variables) {
     if (profile.appConfigPath) return null;
@@ -686,7 +701,12 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     return { mode: 'command', role: 'legacy', owner, repo };
   }
 
-  /** 跑外部命令取 App 令牌：owner 作为命令的最后一个参数传进去（老脚本忽略多余参数，行为不变）。 */
+  /**
+   * 跑外部命令取 App 令牌（旧形式）。argv 与上一版完全一致：**不追加 owner**——严格参数的旧脚本
+   * （argparse 没定义位置参数）会直接非 0 退出，读就静默降级成账号令牌，那是回归。
+   * owner 只放进环境变量 ACCEPTANCE_APP_OWNER：认它的脚本能按 owner 各给一枚令牌，不认的旧脚本照旧
+   * 返回默认安装的令牌（每个 owner 各跑一次，拿到的是同一枚，读照样走 App）。
+   */
   async function getCommandAppToken(owner) {
     const key = ownerKey(owner);
     if (cmdTokenCache.has(key)) return cmdTokenCache.get(key);
@@ -694,7 +714,11 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     const argv = profile.appTokenCommand;
     let result = null;
     try {
-      result = await runCmd(argv[0], [...argv.slice(1), owner], { env: baseEnv(), timeoutMs: APP_TOKEN_TIMEOUT_MS, killGroup: true });
+      result = await runCmd(argv[0], argv.slice(1), {
+        env: { ...baseEnv(), ACCEPTANCE_APP_OWNER: owner },
+        timeoutMs: APP_TOKEN_TIMEOUT_MS,
+        killGroup: true,
+      });
     } catch {
       result = null;
     }
@@ -1506,8 +1530,8 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
   }
 
   /**
-   * 这次写该用哪个 App：②写 App / ①读 App。没配 apps、类型不在表里（如看板写）、或 repo 的 owner
-   * 不在该 app 的名单里都返回 null（账号令牌），与没有 apps 字段时完全一致。
+   * 这次写该用哪个 App：②写 App。没配 apps、类型不在表里（如看板写）、表里值为 null（评论 / issue / sub-issue 等
+   * 等身份白名单的写）、或 repo 的 owner 不在该 app 的名单里都返回 null（账号令牌），与没有 apps 字段时完全一致。
    */
   function writeRoleFor(action) {
     if (!profile.apps) return null;
