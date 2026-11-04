@@ -43,9 +43,10 @@
 | `verdictOnlyIssues` | 否 | 只出裁决的 issue（显式名单，形如 `["owner/repo#43"]`，不收通配），默认 `[]`：照常验收、写看板和裁决，但不关、不勾、不开修正、不推送，由人复核后关（见 [`docs/acceptance-session.md`](../../docs/acceptance-session.md)） |
 | `stallMinutes` | 否 | 卡住判定阈值，默认 30 |
 | `writeCommand` | 否 | 写操作出口 argv；没配则直接用 `gh`/`git` |
-| `appConfigPath` | 否 | GitHub App 配置 JSON；配了读请求走 App 令牌 |
-| `appTokenCommand` | 否 | 打印 App 安装令牌的外部命令（argv 数组）；`appOwners` 名下单仓只读查询优先走它，失败或 401/403/404 回退账号令牌并记 loop.log |
-| `appOwners` | 否 | 装了该 App 的 owner 列表，默认 `[ownerLogin]` |
+| `appConfigPath` | 否 | GitHub App 配置 JSON（单个安装、不分流）；配了读请求走 App 令牌，`apps` / `appTokenCommand` 都不生效 |
+| `apps` | 否 | 两级 App 配置 `{ read, write }`：每个 `{ appId, privateKeyFile, owners }`（`appId` 只收正的安全整数，不收前导零）；按 (app, owner) 运行时查安装号、按 owner 各缓存令牌；首批只读切 App（读走 `read`），推分支/PR/workflow 走 `write`，评论 / issue / sub-issue 写与看板写暂仍账号令牌（等身份白名单） |
+| `appTokenCommand` | 否 | 旧形式：打印 App 安装令牌的外部命令（argv 数组）；argv 与上一版一致（不追加位置参数），owner 只通过环境变量 `ACCEPTANCE_APP_OWNER` 传入；只在没配 `apps` / `appConfigPath` 时生效 |
+| `appOwners` | 否 | 旧形式：`appTokenCommand` 对应的 owner 列表，默认 `[ownerLogin]` |
 | `slackBotTokenFile` | 否 | Slack bot 令牌文件（绝对路径）；配了就检查权限是 600，只有 `host/slack-notify.mjs` 读它 |
 | `slackChannelId` | 否 | Slack 频道 id（`C` / `G` 开头）；没配就不发通知（当前部署不配：通报已关闭，告警只写 `alerts.jsonl`，心跳 `slack.reason=not-configured` 属正常） |
 | `slackMentionUserId` | 否 | 立即发（ping）时 @ 的用户 id（`U` 开头）；摘要不 @ |
@@ -53,6 +54,11 @@
 Slack 通知怎么配、哪些事件立即发、哪些进摘要，见 [`docs/acceptance-slack.md`](../../docs/acceptance-slack.md)（#61）。
 
 令牌文件必须存在、是普通文件、属主是当前用户、权限不含组/他人位、去空白后非空。`appConfigPath` 指向 `{ "appId", "installationId", "privateKeyFile" }`，其中私钥文件同样过密钥校验。
+
+`appConfigPath` 和 `appTokenCommand` 互斥：两个都配时按 `appConfigPath` 走，不做按仓分流（盘点、搜索、`viewer` 会跟着换成安装令牌，导致漏单）。
+两级 App 配置 `apps` 与 `appTokenCommand` 也互斥（配了 `apps` 就不再跑外部命令）；`appConfigPath` 在场时 `apps` 也不生效。
+什么是 `apps`、读写怎么分流、回退日志长什么样、取令牌脚本的行为契约、以及 `apps` 在沙箱副本里的待补项，
+见 [`docs/acceptance-operations.md`](../../docs/acceptance-operations.md) 第 2 节「两级 App 配置：`apps`（app → owner）」。
 
 ## 盘点输出
 
