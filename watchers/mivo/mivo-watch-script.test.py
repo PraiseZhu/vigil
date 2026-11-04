@@ -88,6 +88,15 @@ class DispatchTests(unittest.TestCase):
         self.assertLess(elapsed, 1.1, "three 0.4 s dispatches ran one after another")
 
 
+class SummaryTests(unittest.TestCase):
+    def test_summary_keeps_the_merge_state_batch_result(self):
+        # The one batched merge-state read of a round reports its hit count and failure here; without it the
+        # completion evidence cannot tell a batched round from one that fell back to per-PR reads.
+        mod = load_watch()
+        summary = mod._summary({"mode": "discover", "prs": [], "mergeStates": {"batched": 6, "error": None}})
+        self.assertEqual(summary["mergeStates"], {"batched": 6, "error": None})
+
+
 class ConcurrentCallsTests(unittest.TestCase):
     def test_answers_are_routed_by_id_in_any_order(self):
         transport = FakeTransport()
