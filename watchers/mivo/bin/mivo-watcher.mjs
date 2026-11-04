@@ -1772,7 +1772,9 @@ export const INFRA_REOPEN_LIMIT = 3;
 // GitHub rate limits and gateway errors pass on their own; an external block for one of them used to wait for a
 // new head or a new watcher version (#1648/#1674 on 2026-11-03). It is handed back after a back-off, counted with
 // the infra reopens, so a GitHub that stays down is retried a few times per admission epoch and then left alone.
-export const TRANSIENT_BLOCK_REASON = /rate.?limit|速率限制|限流|abuse detection|HTTP 50[0234]|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|Gateway Time-?out|ETIMEDOUT|ECONNRESET|EAI_AGAIN|socket hang up|i\/o timeout/i;
+// Sessions also describe the same waits as an exhausted quota or a busy shared pre-push lock (#1621/#1741 on
+// 2026-11-04 sat blocked for hours with their fixes committed locally); those pass on their own as well.
+export const TRANSIENT_BLOCK_REASON = /rate.?limit|速率限制|限流|配额|quota|互斥锁|pre-push\.flock|pre-push (?:锁|lock)|abuse detection|HTTP 50[0234]|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|Gateway Time-?out|ETIMEDOUT|ECONNRESET|EAI_AGAIN|socket hang up|i\/o timeout/i;
 export const TRANSIENT_RETRY_BACKOFF_MS = 30 * 60 * 1000;
 export const KEEL_LEDGER_HELD = 'keel-ledger-unavailable';
 export function reopenExternalBlocked({ previous, paths, now, head }) {

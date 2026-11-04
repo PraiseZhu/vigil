@@ -65,6 +65,21 @@ test('gateway errors count as transient; other external blocks still wait for a 
   assert.equal(reopenInfraBlocked({ previous, paths, now: after(10 * TRANSIENT_RETRY_BACKOFF_MS) }), previous);
 });
 
+// 2026-11-04: #1621 and #1741 had their fixes committed locally but sat blocked for 8-20 hours, because the
+// sessions wrote "配额用尽" and "pre-push 互斥锁" instead of "rate limit" and the retry never matched.
+test('an exhausted GraphQL quota or a busy pre-push lock is transient too', (t) => {
+  for (const reason of [
+    'GitHub GraphQL API 配额用尽（预计 2026-11-03T19:45Z 重置），helper 的 gh pr view 调用失败，本轮无法完成收口。本地修复已提交，commit 尚未推送。',
+    'GitHub GraphQL 配额与仓库级 pre-push 互斥锁被并行修复会话长期占满：本轮 validate 需要的 assert-owner 与 .githooks/pre-push 连续 2 小时以上拿不到，无法完成受控推送。',
+    'pre-push.flock 一直被其他会话持有，受控推送排不上',
+  ]) {
+    const { paths, previous } = setup(t, { reason });
+    assert.equal(isValidateClassBlock(previous.activeTask), false, reason);
+    assert.equal(reopenInfraBlocked({ previous, paths, now: after(TRANSIENT_RETRY_BACKOFF_MS - 1) }), previous, reason);
+    assert.equal(reopenInfraBlocked({ previous, paths, now: after(TRANSIENT_RETRY_BACKOFF_MS) }).eligibility, 'active', reason);
+  }
+});
+
 test('only external blocks are retried as transient, and a failed validation receipt keeps its own rules', (t) => {
   const kinds = setup(t, { reason: RATE_LIMIT, blockedKind: 'required-ci' });
   assert.equal(reopenInfraBlocked({ previous: kinds.previous, paths: kinds.paths, now: after(TRANSIENT_RETRY_BACKOFF_MS) }), kinds.previous);
