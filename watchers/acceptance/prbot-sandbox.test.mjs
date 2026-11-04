@@ -45,7 +45,7 @@ function recordingRun({ bwrapCode = 0, bwrapThrows = false, stdout = '' } = {}) 
   return run;
 }
 
-test('SC3 pi 只在 bwrap 里跑；环境是白名单，PI_NO_SANDBOX 关不掉', async () => {
+test('SC3 pi 只在 bwrap 里跑；环境是白名单，PI_NO_SANDBOX 关不掉', { skip: bwrapAvailable ? false : 'bwrap 不可用（探针起不来），跳过真沙箱 contract' }, async () => {
   const { home, profile, worktree, hostConfig } = setup();
   const run = recordingRun();
   const result = await runPiInSandbox({
@@ -123,7 +123,7 @@ test('SC3 bwrap 起不来就不跑模型（返回 unavailable）', async () => {
   assert.equal(run.calls.some((call) => call.args.includes('--') && call.args.includes('pi')), false, '不跑模型');
 });
 
-test('SC4 预检：环境只有 8 个白名单变量（没有 LLM key / 令牌）；bwrap 不可用时一条都不跑', async () => {
+test('SC4 预检：环境只有 8 个白名单变量（没有 LLM key / 令牌）；bwrap 不可用时一条都不跑', { skip: bwrapAvailable ? false : 'bwrap 不可用（探针起不来），跳过真沙箱预检 contract' }, async () => {
   const { home, profile, worktree, hostConfig } = setup();
   const run = recordingRun();
   const result = await runPreflightInSandbox({

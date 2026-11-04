@@ -380,11 +380,12 @@ test('SC11 遮罩名单从 profile 算：新增 …TokenFile 键和 App 私钥�
     home,
   });
   for (const file of [tokenFile, newKeyFile, slackFile, privateKeyFile]) {
-    assert.ok(masks.files.includes(file), `遮罩名单少了 ${path.basename(file)}`);
+    // maskList returns real paths (bwrap binds real paths); on macOS /tmp is a symlink to /private/tmp.
+    assert.ok(masks.files.includes(fs.realpathSync(file)), `遮罩名单少了 ${path.basename(file)}`);
   }
-  assert.ok(masks.files.includes(path.join(fakeHome, '.git-credentials')));
-  assert.ok(masks.dirs.includes(path.join(fakeHome, '.ssh')));
-  assert.ok(masks.dirs.includes(path.join(home, 'state')), '宿主状态目录要遮');
+  assert.ok(masks.files.includes(fs.realpathSync(path.join(fakeHome, '.git-credentials'))));
+  assert.ok(masks.dirs.includes(fs.realpathSync(path.join(fakeHome, '.ssh'))));
+  assert.ok(masks.dirs.includes(fs.realpathSync(path.join(home, 'state'))), '宿主状态目录要遮');
 });
 
 test('SC11 maskList 两处来源各自生效：原始 profile 里新增的 …TokenFile 键；加载后 profile 的 App 私钥（appPrivateKeyFile）', () => {
@@ -394,11 +395,11 @@ test('SC11 maskList 两处来源各自生效：原始 profile 里新增的 …To
   const appConfigPath = writeSecret(path.join(base, 'secrets', 'app.json'), '{}');
   // 只在原始 JSON 里：加载后的 profile 不认识这个键。
   const fromRaw = maskList({ rawProfile: { nested: { customTokenFile: customToken } }, profile: {}, env: {} });
-  assert.ok(fromRaw.files.includes(customToken), '原始 profile 的新键要遮');
+  assert.ok(fromRaw.files.includes(fs.realpathSync(customToken)), '原始 profile 的新键要遮');
   // 只在加载后的 profile 里：App 私钥由 profile.mjs 从 App 配置读出，原始 JSON 里只有 appConfigPath。
   const fromLoaded = maskList({ rawProfile: { appConfigPath }, profile: { appConfigPath, appPrivateKeyFile: appKey }, env: {} });
-  assert.ok(fromLoaded.files.includes(appKey), 'App 私钥要遮');
-  assert.ok(fromLoaded.files.includes(appConfigPath), 'App 配置文件本身要遮');
+  assert.ok(fromLoaded.files.includes(fs.realpathSync(appKey)), 'App 私钥要遮');
+  assert.ok(fromLoaded.files.includes(fs.realpathSync(appConfigPath)), 'App 配置文件本身要遮');
 });
 
 test('SC11 buildBwrapArgs：可写绑定在只读根之后、遮罩在最后；状态目录重叠直接拒绝', () => {
