@@ -55,7 +55,18 @@ function boardAccess({ project = true, canUpdate = true, fields } = {}) {
   return { user: { projectV2: { id: 'PVT_1', viewerCanUpdate: canUpdate, fields: { nodes } } } };
 }
 
-function makeGithub({ viewer = OWNER, project = true, forkPermission = 'WRITE', canUpdate = true, fields, ownerGraphql = true } = {}) {
+function makeGithub({
+  viewer = OWNER,
+  project = true,
+  forkPermission = 'WRITE',
+  ownerForkPermission,
+  canUpdate = true,
+  fields,
+  ownerGraphql = true,
+} = {}) {
+  // forkPermission 是「读令牌（graphql）看这些仓的 viewerPermission」，ownerForkPermission 是「账号令牌（ownerGraphql）的」。
+  // 两者不同就是为了模拟 App 安装令牌：它对 viewerPermission 恒返回 null。
+  const ownerPermission = ownerForkPermission === undefined ? forkPermission : ownerForkPermission;
   const writes = [];
   const ownerQueries = [];
   const github = {
@@ -84,6 +95,10 @@ function makeGithub({ viewer = OWNER, project = true, forkPermission = 'WRITE', 
     github.ownerGraphql = async (query, variables = {}) => {
       ownerQueries.push({ query, variables });
       if (query === BOARD_ACCESS_QUERY) return boardAccess({ project, canUpdate, fields });
+      if (query === REPO_QUERY) {
+        const repo = `${variables.owner}/${variables.name}`;
+        return { repository: { nameWithOwner: repo, viewerPermission: ownerPermission } };
+      }
       throw new Error(`假 gh 不认识的账号令牌查询：${query.slice(0, 40)}`);
     };
   }
@@ -123,9 +138,12 @@ test('SC1/SC10 全部就绪：exit 0，逐项都标 ok', async () => {
   }
   // doctor 不对 GitHub 做任何真实写入：看板写回只读判断（账号令牌查 viewerCanUpdate 和字段）。
   assert.equal(github.writes.length, 0, 'doctor 不写 GitHub');
-  assert.equal(github.ownerQueries.length, 1);
+  // 两处只读判断走账号令牌：看板写回、fork 推送。
+  assert.equal(github.ownerQueries.length, 2);
   assert.equal(github.ownerQueries[0].query, BOARD_ACCESS_QUERY);
   assert.deepEqual(github.ownerQueries[0].variables, { login: OWNER, projectNumber: 7 });
+  assert.equal(github.ownerQueries[1].query, REPO_QUERY);
+  assert.deepEqual(github.ownerQueries[1].variables, { owner: OWNER, name: 'cindy' });
 });
 
 test('SC1 缺哪项报哪项：gh / 令牌账号 / 仓可读 / 看板 / fork 推送 / 常驻循环 / 令牌文件 / bwrap 遮罩', async () => {
@@ -327,7 +345,38 @@ test('SC1 CLI：配置缺失时打印一行 ✗ 并以 1 退出（假的 home，
   assert.match(lines[0], /^✗ 配置：/);
 });
 
-test('SC1 fork 推送按 forkTargets 查对照的 fork 仓（名字和上游不同）', async () => {
+test('SC1 fork 推送用账号令牌查（App 令牌 viewerPermission 恒 null 也照样通过）', async () => {
+  const fixture = makeFixture();
+  // 读令牌（模拟 App 安装令牌）没有 viewer 概念：对 fork 仓返回 viewerPermission=null；账号令牌是 ADMIN。
+  const github = makeGithub({ ownerForkPermission: 'ADMIN' });
+  const inner = github.graphql.bind(github);
+  github.graphql = async (query, variables = {}) => {
+    if (query === REPO_QUERY && variables.name === 'cindy') {
+      return { repository: { nameWithOwner: `${variables.owner}/cindy`, viewerPermission: null } };
+    }
+    return inner(query, variables);
+  };
+  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github, now: () => NOW });
+  const fork = checkOf(result, 'fork 推送');
+  assert.equal(fork.ok, true, fork.detail);
+  assert.equal(fork.detail, 'fork 有写权限');
+  const forkQueries = github.ownerQueries.filter((call) => call.query === REPO_QUERY);
+  assert.deepEqual(forkQueries.map((call) => call.variables), [{ owner: OWNER, name: 'cindy' }], 'fork 推送要走 ownerGraphql');
+  assert.equal(result.ok, true, JSON.stringify(result.checks.filter((check) => !check.ok)));
+});
+
+test('SC1 fork 推送：账号令牌只有 READ 时这项报红，并点名目标 fork', async () => {
+  const fixture = makeFixture();
+  const github = makeGithub({ ownerForkPermission: 'READ' });
+  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github, now: () => NOW });
+  const fork = checkOf(result, 'fork 推送');
+  assert.equal(fork.ok, false, 'READ 推不了');
+  assert.match(fork.detail, /推不了：/);
+  assert.match(fork.detail, new RegExp(`${OWNER}/cindy`));
+  assert.equal(result.ok, false);
+});
+
+test('SC2 fork 推送按 forkTargets 查对照的 fork 仓（名字和上游不同）', async () => {
   const fixture = makeFixture();
   const file = path.join(fixture.home, 'config', 'profile.json');
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -335,9 +384,9 @@ test('SC1 fork 推送按 forkTargets 查对照的 fork 仓（名字和上游不�
   raw.forkTargets = { 'makecindy/cindy': `${OWNER}/cindy-fork` };
   fs.writeFileSync(file, JSON.stringify(raw, null, 2));
   const asked = [];
-  const github = makeGithub({ forkPermission: 'READ' });
-  const inner = github.graphql.bind(github);
-  github.graphql = async (query, variables = {}) => {
+  const github = makeGithub({ ownerForkPermission: 'READ' });
+  const inner = github.ownerGraphql.bind(github);
+  github.ownerGraphql = async (query, variables = {}) => {
     if (query === REPO_QUERY && variables.owner === OWNER) {
       asked.push(`${variables.owner}/${variables.name}`);
       const writable = variables.name === 'cindy-fork';
@@ -350,6 +399,14 @@ test('SC1 fork 推送按 forkTargets 查对照的 fork 仓（名字和上游不�
   assert.equal(fork.ok, true, fork.detail);
   assert.ok(asked.includes(`${OWNER}/cindy-fork`), asked.join(','));
   assert.ok(!asked.includes(`${OWNER}/cindy`), '不该再查同名仓');
+});
+
+test('SC1 注入的 github 没有 ownerGraphql 时，fork 推送退回读令牌查（兼容）', async () => {
+  const fixture = makeFixture();
+  const github = makeGithub({ ownerGraphql: false, forkPermission: 'WRITE' });
+  const result = await runDoctor({ profileEnv: fixture.profileEnv, probes: makeProbes(), github, now: () => NOW });
+  const fork = checkOf(result, 'fork 推送');
+  assert.equal(fork.ok, true, fork.detail);
 });
 
 test('#60 修正轮交接配置：host.json 配了 prbot 就要求每个具体仓显式写 handoff（owner / watcher），预检格式也查', async () => {
