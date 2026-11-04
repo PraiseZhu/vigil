@@ -917,6 +917,51 @@ test('SC3 无输出看门狗：stalled 以独立原因记录，不当作测试�
   assert.equal(receipt.failureSetState, 'unparsed');
 });
 
+// 2026-11-04：仓库 pre-push 发现共用锁被占就直接失败退出，validate 把它记成测试失败，
+// 修复会话于是自写脚本抢锁、互相饿死。现在由 helper 排队等锁再重跑，等不到才记独立原因。
+const LOCK_BUSY_LOG = '[preflight] ❌ 已有一份 pre-push 在跑（pid 4242）,等它结束后再推送(锁:/work/.git/pre-push.flock)\n';
+
+test('pre-push 锁被占：helper 等锁空出后重跑预检，不记失败', async (t) => {
+  const f = fixture(t);
+  let runs = 0;
+  let probes = 0;
+  const result = await validate({
+    ...f.options, lockPollMs: 1,
+    lockProbeFn: () => { probes++; return probes >= 3; },
+    runFn: (...args) => { runs++; return runs === 1 ? failing(LOCK_BUSY_LOG)(...args) : 'fixture checks passed\n'; },
+  });
+  assert.equal(result.status, 'pass');
+  assert.equal(runs, 2, '锁空出后只重跑一次');
+  assert.equal(probes, 3, '锁仍被占时继续等');
+  const receipt = readReceipt(result);
+  assert.equal(receipt.failureKind, null);
+  assert.equal(fs.readFileSync(receipt.logPath, 'utf8'), 'fixture checks passed\n', '收据指向最后一次运行的日志');
+});
+
+test('pre-push 锁一直被占：超时后记 preflight-lock-busy，不当作测试失败', async (t) => {
+  const f = fixture(t);
+  let runs = 0;
+  const result = await validate({
+    ...f.options, env: { ...f.options.env, MIVO_PREPUSH_LOCK_WAIT_MINUTES: '0.0005' }, lockPollMs: 5,
+    lockProbeFn: () => false,
+    runFn: (...args) => { runs++; return failing(LOCK_BUSY_LOG)(...args); },
+  });
+  assert.equal(result.status, 'fail');
+  assert.equal(runs, 1, '锁一直没空出来就不再重跑');
+  const receipt = readReceipt(result);
+  assert.equal(receipt.failureKind, 'preflight-lock-busy');
+  assert.equal(receipt.failureSetState, 'unparsed');
+});
+
+test('真实测试失败不进入等锁重跑', async (t) => {
+  const f = fixture(t);
+  let probes = 0;
+  const result = await validate({ ...f.options, lockPollMs: 1, lockProbeFn: () => { probes++; return true; }, runFn: failing(HOOK_FAIL_LOG) });
+  assert.equal(result.status, 'fail');
+  assert.equal(probes, 0);
+  assert.equal(readReceipt(result).failureKind, 'test-failure');
+});
+
 test('SC1 并发上限：上限 1 时两个 validate 争用同一 home，runFn 峰值为 1，排队的不记为失败', async (t) => {
   const f = fixture(t);
   let running = 0;

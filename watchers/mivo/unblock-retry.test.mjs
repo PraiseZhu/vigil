@@ -87,6 +87,18 @@ test('only external blocks are retried as transient, and a failed validation rec
   assert.equal(isValidateClassBlock(receipt.previous.activeTask), true);
 });
 
+// #1741 on 2026-11-04: validate could not get the shared pre-push lock, the receipt said "failed", and the block
+// was held to the strict validate rules even though nothing had failed.
+test('a validation receipt that only timed out on the pre-push lock is retried as transient', (t) => {
+  const { paths, previous } = setup(t, {
+    reason: '本轮 validate 等不到共用的 pre-push 锁，修复已本地提交未推送。',
+    active: { validationBlock: { remoteHead: 'a'.repeat(40), failureKind: 'preflight-lock-busy' } },
+  });
+  assert.equal(isValidateClassBlock(previous.activeTask), false);
+  assert.equal(reopenInfraBlocked({ previous, paths, now: after(TRANSIENT_RETRY_BACKOFF_MS - 1) }), previous);
+  assert.equal(reopenInfraBlocked({ previous, paths, now: after(TRANSIENT_RETRY_BACKOFF_MS) }).eligibility, 'active');
+});
+
 // identity
 
 function git(cwd, ...args) {
