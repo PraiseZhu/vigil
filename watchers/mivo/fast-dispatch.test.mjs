@@ -9,7 +9,7 @@ import { readPr, statePaths } from './bin/mivo-state.mjs';
 import * as watcher from './bin/mivo-watcher.mjs';
 import { keptReadStore, memoRepoReads, scanOnce, watcherPaths, watchGuideMessage } from './bin/mivo-watcher.mjs';
 import { collectMivoCiSync, collectMivoCi } from './bin/mivo-ci.mjs';
-import { handoffPr, withAuthorHandoff, isMergeBatch, mergeBatchBody } from './handoff.fixture.mjs';
+import { handoffPr, withAuthorHandoff, isMergeBatch, mergeBatchBody, isFollowBatch, followBatchBody } from './handoff.fixture.mjs';
 
 // 反馈出现后尽快派发：整轮预算 / 派发预留 / 指纹闸 / 批量跟进 / CI 缓存（SC-1..SC-6）。
 const HEAD = 'a'.repeat(40);
@@ -63,13 +63,12 @@ const graphqlNode = (extra = {}) => ({
   reviewThreads: { nodes: [] }, commits: { nodes: [] }, ...extra,
 });
 
-// 一次批量查询（gh api graphql search）返回的每个 open PR 的轻量指纹字段，含最新提交的 CI 汇总 state。
+// 一次批量查询（gh api graphql 读仓库 open PR）返回的每个 open PR 的轻量指纹字段，含最新提交的 CI 汇总 state。
 const batchNode = (pr, rollup = 'SUCCESS') => ({ id: pr.id, number: pr.number, isDraft: pr.isDraft === true, headRefOid: pr.headRefOid,
   updatedAt: pr.updatedAt, labels: { nodes: (pr.labels ?? []).map((name) => ({ name })) },
   commits: { nodes: [{ commit: { statusCheckRollup: rollup ? { state: rollup } : null } }] } });
-const batchResponse = (prs, rollupFor = () => 'SUCCESS') => JSON.stringify({ data: { search: { issueCount: prs.length,
-  nodes: prs.map((pr) => batchNode(pr, rollupFor(pr))) } } });
-const isBatch = (args) => args[0] === 'api' && args[1] === 'graphql' && !isMergeBatch(args) && args.some((arg) => String(arg).includes('search('));
+const batchResponse = (prs, rollupFor = () => 'SUCCESS') => followBatchBody(prs.map((pr) => batchNode(pr, rollupFor(pr))));
+const isBatch = isFollowBatch;
 const isGate = (args) => args[0] === 'api' && args[1] === 'graphql' && !isBatch(args) && !isMergeBatch(args);
 
 function run(t, options) {

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { memoRepoReads, REPO, runGhAsync, scanOnce, scanOnceAsync, watcherPaths } from './bin/mivo-watcher.mjs';
 import { readPr, writePr } from './bin/mivo-state.mjs';
-import { handoffPr, withAuthorHandoff, isMergeBatch } from './handoff.fixture.mjs';
+import { handoffPr, withAuthorHandoff, isFollowBatch, followBatchBody } from './handoff.fixture.mjs';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -208,11 +208,11 @@ const graphqlNode = (extra = {}) => ({
   reviewThreads: { nodes: [] }, commits: { nodes: [] }, ...extra,
 });
 
-// One batched query (gh api graphql search) per follow beat: the light fingerprint fields of every open PR.
-const batchBody = (prs) => JSON.stringify({ data: { search: { issueCount: prs.length, nodes: prs.map((pr) => ({ id: pr.id, number: pr.number,
+// One batched read (gh api graphql, repository open PRs) per follow beat: the light fingerprint fields of every open PR.
+const batchBody = (prs) => followBatchBody(prs.map((pr) => ({ id: pr.id, number: pr.number,
   isDraft: pr.isDraft === true, headRefOid: pr.headRefOid, updatedAt: pr.updatedAt, labels: { nodes: [] },
-  commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] } })) } } });
-const isBatchQuery = (args) => args[0] === 'api' && args[1] === 'graphql' && !isMergeBatch(args) && args.some((arg) => String(arg).includes('search('));
+  commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] } })));
+const isBatchQuery = isFollowBatch;
 
 test('a PR dispatched again in the follow pass gets its own task, not the first task id', (t) => {
   const paths = homeOf(t);

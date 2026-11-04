@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { FOLLOW_INTERVAL_MS, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
-import { handoffPr, withAuthorHandoff, isMergeBatch, mergeBatchBody } from './handoff.fixture.mjs';
+import { handoffPr, withAuthorHandoff, isMergeBatch, mergeBatchBody, isFollowBatch, followBatchBody } from './handoff.fixture.mjs';
 
 // SC-6：同一夹具（5 个 open PR、其中 1 个有新反馈）下，一整轮 discover 的 gh 调用次数。
 // collect 桩按真实采集量（约 42 次 gh 调用：快照、CI、评论、线程、策略）通过传入的 ghFn 计数。
@@ -32,10 +32,10 @@ const node = (comments = 0, rollup = 'PENDING') => ({ state: 'OPEN', isDraft: fa
 
 const failingFor = (listed) => ({ ...quiet(listed), checks: [{ name: 'unit', state: 'FAILURE', bucket: 'fail' }],
   ci: { status: 'failed', required: [{ context: 'unit', status: 'failed', evidence: { id: 1, runId: 2, attempt: 1 } }] } });
-const isBatch = (args) => args[0] === 'api' && args[1] === 'graphql' && !isMergeBatch(args) && args.some((arg) => String(arg).includes('search('));
-const batchBody = (prs) => JSON.stringify({ data: { search: { issueCount: prs.length, nodes: prs.map((pr) => ({ id: pr.id, number: pr.number,
+const isBatch = isFollowBatch;
+const batchBody = (prs) => followBatchBody(prs.map((pr) => ({ id: pr.id, number: pr.number,
   isDraft: pr.isDraft === true, headRefOid: pr.headRefOid, updatedAt: pr.updatedAt, labels: { nodes: [] },
-  commits: { nodes: [{ commit: { statusCheckRollup: { state: pr.rollup ?? 'PENDING' } } }] } })) } } });
+  commits: { nodes: [{ commit: { statusCheckRollup: { state: pr.rollup ?? 'PENDING' } } }] } })));
 
 test('5 个 open PR 的一整轮：无变化与 1 个真实新反馈（CI 失败并派发）的 gh 调用次数', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-call-budget-'));

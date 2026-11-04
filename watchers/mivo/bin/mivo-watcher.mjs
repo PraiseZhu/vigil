@@ -3544,17 +3544,37 @@ function* discoverPass(prs, ctx, report, events) {
   if (failure) throw failure;
 }
 
-// One query for every open PR of the viewer: the fields a follow check compares, plus the latest commit's CI summary.
-// Only the summary state is asked for (no contexts), so the query stays cheap however many checks a PR has.
-const BATCH_QUERY = 'query($q:String!){search(query:$q,type:ISSUE,first:100){issueCount nodes{... on PullRequest{id isDraft headRefOid updatedAt labels(first:30){nodes{name}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}}';
-function parseBatch(raw) {
-  const search = JSON.parse(raw)?.data?.search;
-  if (!search || !Array.isArray(search.nodes) || !(Number(search.issueCount) <= search.nodes.length)) throw new Error('Batch PR query incomplete');
-  return new Map(search.nodes.filter((node) => node?.id).map((node) => [String(node.id), JSON.stringify([
-    node.isDraft === true, node.headRefOid, node.updatedAt,
-    (node.labels?.nodes ?? []).map((item) => item?.name).filter(Boolean).sort(),
-    node.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null,
-  ])]));
+// One read for every open PR of the viewer: the fields a follow check compares, plus the latest commit's CI summary.
+// Only the summary state is asked for (no contexts), so the read stays cheap however many checks a PR has.
+// It reads the repository's open PRs and keeps the viewer's own, not a `search`: the gh router answers a search root as
+// the personal account, whose rate limit ran out at about 4 reads a minute, while a repository read is served by the
+// GitHub App with its own limit (2026-11-04: this was most of the personal account's non-per-PR GraphQL traffic).
+const batchQueryFor = (repo, after) => {
+  const [owner, name] = repo.split('/');
+  return `query{repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){pullRequests(states:OPEN,first:100${after ? `,after:${JSON.stringify(after)}` : ''}){pageInfo{hasNextPage endCursor} nodes{id isDraft headRefOid updatedAt author{login} labels(first:30){nodes{name}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}}`;
+};
+const BATCH_MAX_PAGES = 10;
+export function* readBatch({ ghFn, viewer, repo = REPO }) {
+  const mine = String(viewer ?? '').toLowerCase();
+  const signatures = new Map();
+  let after = null;
+  for (let page = 0; page < BATCH_MAX_PAGES; page += 1) {
+    const payload = JSON.parse(yield () => ghFn(['api', 'graphql', '-f', `query=${batchQueryFor(repo, after)}`]));
+    const open = payload?.data?.repository?.pullRequests;
+    if (payload?.errors?.length || !open || !Array.isArray(open.nodes) || typeof open.pageInfo?.hasNextPage !== 'boolean') throw new Error('Batch PR query incomplete');
+    for (const node of open.nodes) {
+      if (!node?.id || !mine || String(node.author?.login ?? '').toLowerCase() !== mine) continue;
+      signatures.set(String(node.id), JSON.stringify([
+        node.isDraft === true, node.headRefOid, node.updatedAt,
+        (node.labels?.nodes ?? []).map((item) => item?.name).filter(Boolean).sort(),
+        node.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null,
+      ]));
+    }
+    if (!open.pageInfo.hasNextPage) return signatures;
+    after = open.pageInfo.endCursor;
+    if (typeof after !== 'string' || !after) throw new Error('Batch PR query cursor missing');
+  }
+  throw new Error('Batch PR query has too many pages');
 }
 
 // Tracks the PRs being handled so a follow beat never starts a second pass on the same PR.
@@ -3618,11 +3638,10 @@ export function* discoverWorkflow({
     paths, clock, deadline, perPrBudgetMs, gitFn, env, markCursor, dispatchReserveMs, fullCollectMs, inFlight: new Set(),
   };
   const hardDeadline = followUntilMs ? started + followUntilMs : deadline;
-  const batchArgs = ['api', 'graphql', '-f', `query=${BATCH_QUERY}`, '-f', `q=repo:${REPO} is:pr is:open author:${viewer}`];
   let known = null;
   if (followMs > 0) {
     // The baseline is taken before the full pass so a change that lands while the pass runs is seen by the first beat.
-    try { known = parseBatch(yield () => ghFn(batchArgs)); } catch { known = null; }
+    try { known = yield* readBatch({ ghFn, viewer }); } catch { known = null; }
   }
   // Every PR's merge state in one read, taken once the open PRs are listed and before any PR is handled. The router
   // answers merge state reads as the personal account, so one query per PR in one burst used up its rate limit
@@ -3698,7 +3717,7 @@ export function* discoverWorkflow({
       const tickGh = memoRepoReads(baseGh, keptReads);
       lastAt = clock();
       let batch;
-      try { batch = parseBatch(yield () => tickGh(batchArgs)); } catch (error) { if (failed(error)) break; continue; }
+      try { batch = yield* readBatch({ ghFn: tickGh, viewer }); } catch (error) { if (failed(error)) break; continue; }
       failures = 0;
       waitMs = followMs;
       if (known === null) { known = batch; continue; }
