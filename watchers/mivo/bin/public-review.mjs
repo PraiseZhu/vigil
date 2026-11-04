@@ -10,6 +10,7 @@
 import { collectPrSnapshot } from './mivo-pr-snapshot.mjs';
 import { collectMivoCiSteps, REVIEW_INFRA_CHECKS } from './mivo-ci.mjs';
 import { requireConfig } from './profile.mjs';
+import { REVIEWER_BOT_LOGIN } from './mivo-identity.mjs';
 
 // 目标仓库与审查账号在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
 const REPO = requireConfig('targetRepo', {
@@ -21,6 +22,22 @@ export const REVIEWER = requireConfig('reviewerLogin', {
   hint: '审查流程提交 review 的 GitHub 账号，示例："ExampleUser"。',
 });
 export const REVIEW_CHECK = 'review-pr';
+
+// The reviewer is the configured account or the review App's bot account. REST names a bot `<app>[bot]`; GraphQL's
+// Bot.login has no suffix and only __typename says it is a bot, so the suffix is added for a Bot and never for a User
+// (a person who happens to be called like the App must not pass).
+export function toAuthorLogin(author) {
+  if (!author) return '';
+  if (typeof author === 'string') return author;
+  const login = String(author.login ?? '');
+  const kind = author.__typename ?? author.type;
+  return kind === 'Bot' && login && !login.endsWith('[bot]') ? `${login}[bot]` : login;
+}
+const sameLogin = (a, b) => a.toLowerCase() === b.toLowerCase();
+export function isReviewerAuthor(author) {
+  const login = toAuthorLogin(author);
+  return login !== '' && (sameLogin(login, REVIEWER) || sameLogin(login, REVIEWER_BOT_LOGIN));
+}
 const REVIEW_WORKFLOW = '.github/workflows/review-pr.yml';
 const ACTIONS_APP_ID = 15368;
 // Review infrastructure checks belong to the review maintainer, never a business repair owner. The list lives in
@@ -31,7 +48,7 @@ const HEADER = /^> Mivo 自动审查 · .*?head `([a-f0-9]{12})` · base `([a-f0
 
 /** A review submitted by the reviewer account, parsed; null for anything else. */
 export function reviewerReport(review) {
-  if (review?.author?.login !== REVIEWER) return null;
+  if (!isReviewerAuthor(review?.author)) return null;
   const body = String(review.body ?? '');
   const header = HEADER.exec(body);
   const findings = /<!-- review-pr:findings head=([a-f0-9]{40})\b/.exec(body)?.[1] ?? null;

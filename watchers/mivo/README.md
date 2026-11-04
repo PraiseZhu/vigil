@@ -43,7 +43,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | profile 字段 | 环境变量 | 用途 |
 |---|---|---|
 | `targetRepo` | `MIVO_WATCHER_TARGET_REPO` | 要盯梢的 `owner/repo` |
-| `reviewerLogin` | `MIVO_WATCHER_REVIEWER_LOGIN` | 审查流程提交 review 的 GitHub 账号（它的报告、发现问题的 review 与行内线程才被当作审查信号） |
+| `reviewerLogin` | `MIVO_WATCHER_REVIEWER_LOGIN` | 审查流程提交 review 的 GitHub 账号（它的报告、发现问题的 review 与行内线程才被当作审查信号）。审查 App 的 bot 账号 `praisebuild[bot]`（`bin/mivo-identity.mjs` 的 `REVIEWER_BOT_LOGIN`）与它同等对待：REST 里 bot 登录名带 `[bot]`，GraphQL 的 `Bot.login` 不带，只在 `__typename` 为 `Bot` 时补后缀；名字相同的普通用户不算 |
 | `pluginRepoPath` | `MIVO_PLUGIN_REPO`（函数内手动预检，不经过 `profile.mjs` 的 fail-closed 报错路径） | 本地插件/项目工作仓的绝对路径，`mivo-repair.mjs` 建 worktree 要用 |
 
 ### 可选项（有安全默认值）
