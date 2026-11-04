@@ -814,9 +814,12 @@ export function assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview
   // Only the review account writes trusted finding markers; anyone else can type one into a comment.
   const markerTrusted = new Set((task?.feedback ?? []).filter((item) => item?.source === 'mivo-review').map((item) => item.key));
   const shas = new Map((task?.feedback ?? []).map((item) => [item?.key, item?.sha]));
-  // The reviewed version is the review account's finding marker head, or the feedback item's own commit (from the
-  // GitHub API) otherwise. Without either, already-fixed proves nothing and the arbiter rule stands.
-  const reviewedHeadFor = (key) => (markerTrusted.has(key) ? findingMarkerOf(bodies.get(key))?.head : null) ?? shas.get(key) ?? null;
+  const reviewHeads = new Map((task?.feedback ?? []).map((item) => [item?.key, item?.reviewHeadSha]));
+  // The reviewed version is the review account's finding marker head, else the commit the review or inline comment
+  // was written against (GitHub API), else the feedback item's sha (the PR head when collected). An inline Greptile
+  // comment has no marker, so without its own commit a fix landed after it could never be proven (#1599, 2026-11-04).
+  const reviewedHeadFor = (key) => (markerTrusted.has(key) ? findingMarkerOf(bodies.get(key))?.head : null)
+    ?? reviewHeads.get(key) ?? shas.get(key) ?? null;
   const proofFor = (sc) => {
     const fixedBy = sc.evidence.map((line) => line.trim()).find((line) => line.startsWith(ALREADY_FIXED))
       ?.slice(ALREADY_FIXED.length).trim().split(/\s+/)[0] ?? '';

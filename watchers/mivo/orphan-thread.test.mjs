@@ -135,3 +135,14 @@ test('a bot thread already queued for closing is not handed back', t => {
   assert.equal(sent.length, 0);
   assert.equal(outcome.prs[0].fresh, 0);
 });
+
+test('thread feedback records the commit each inline comment was written against', () => {
+  const written = 'e'.repeat(40);
+  const items = feedbackItems({ pr: { headRefOid: HEAD }, ci: { status: 'green', required: [] }, threads: [{
+    id: 'PRRT_written', isResolved: false, isOutdated: true, path: 'src/a.ts',
+    comments: [{ id: 'PRRC_written', body: 'P2 **x**', author: { login: 'greptile-apps' }, originalCommit: { oid: written } }],
+  }] }).filter((item) => item.threadId === 'PRRT_written');
+  assert.equal(items.length, 1);
+  assert.equal(items[0].sha, HEAD);
+  assert.equal(items[0].reviewHeadSha, written);
+});

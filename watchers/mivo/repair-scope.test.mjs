@@ -1159,3 +1159,24 @@ for (const protectedHead of [false, 'error']) test(`head branch rules ${protecte
   assert.equal(f.remoteHead(), f.head);
   assert.equal(f.childPrs.length, 0);
 });
+
+// #1599 2026-11-04: an inline Greptile comment has no finding marker and its sha is the PR head at collection, so
+// a fix that landed after the comment could never be proven. The comment's own commit is the reviewed version.
+test('A-6 an inline comment without a marker uses the commit it was written against as the reviewed version', () => {
+  const written = 'e'.repeat(40);
+  const item = codeFinding({ source: 'greptile', reviewHeadSha: written });
+  let seen = null;
+  assertDisputesAdjudicated({ scs: codeSc(['already-fixed: ' + 'f'.repeat(40)]), workers: [], task: codeTask(item),
+    fixedAfterReview: (sha, head) => { seen = head; return head === written; } });
+  assert.equal(seen, written);
+});
+
+test('A-6 the review account marker still wins over the comment commit', () => {
+  const reviewed = 'c'.repeat(12);
+  const item = codeFinding({ reviewHeadSha: 'e'.repeat(40),
+    body: '**P2**: concrete finding\n<!-- mivo-finding key=aaaaaaaaaaaa round=1 head=' + reviewed + ' -->' });
+  let seen = null;
+  assertDisputesAdjudicated({ scs: codeSc(['already-fixed: ' + 'f'.repeat(40)]), workers: [], task: codeTask(item),
+    fixedAfterReview: (sha, head) => { seen = head; return true; } });
+  assert.equal(seen, reviewed);
+});
