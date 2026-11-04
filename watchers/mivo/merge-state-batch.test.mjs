@@ -65,7 +65,7 @@ test('collectMergeStates reads every page of the viewer\'s open PRs with one que
 
 test('collectMergeStates fails on a GraphQL error or an incomplete page instead of returning a partial index', () => {
   const bad = (payload) => () => run(collectMergeStates({ repo: 'example-org/example-plugin', viewer: 'owner', ghFn: () => JSON.stringify(payload) }));
-  assert.throws(bad({ errors: [{ message: 'boom' }], data: null }), /GraphQL errors/);
+  assert.throws(bad({ errors: [{ message: 'boom' }], data: null }), /GraphQL errors: boom/);
   assert.throws(bad({ data: { search: { nodes: [] } } }), /incomplete/);
   assert.throws(bad({ data: { node: {} } }), /incomplete/);
 });
@@ -286,4 +286,18 @@ test('SC4 the merge-ready notice is sent only if a re-read still matches the sna
   assert.deepEqual(noticed(f.scan('2026-10-15T00:06:00Z')), [], 'and not again');
   const own = roundFixture(t, { numbers: [972], collect: ready('query'), live: { status: 'BEHIND', tip: MOVED } });
   assert.deepEqual(noticed(own.scan()), [972], 'a snapshot read with its own query is trusted as it is');
+});
+
+test('a bare 403 is not read as a rate limit: the PRs fall back to their own reads instead of waiting forever', (t) => {
+  const f = roundFixture(t, { numbers: [951, 952], mergeBatch: () => { throw new Error('gh: HTTP 403: Resource not accessible by integration'); } });
+  const result = f.scan();
+  assert.equal(result.prs.some((item) => item.dispatch?.reason === 'merge-state-unavailable'), false);
+  assert.equal(f.queries.tip.length, 2);
+});
+
+test('a blocked index stops every path that would read a PR\'s own merge state, not only the two skips', () => {
+  const blocked = Object.assign(new Map(), { blocked: 'rate limit' });
+  const calls = [];
+  assert.throws(() => collectPrSnapshotSync({ pr: { number: 1 }, ghFn: snapshotGh({ calls }), mergeIndex: blocked }), /merge-state-unavailable/);
+  assert.equal(calls.filter(mentionsMergeState).length, 0);
 });

@@ -210,7 +210,9 @@ const RATE_LIMITED = /rate limit|\b429\b|secondary|abuse|\b403\b/i;
 // A rate-limited batch read leaves no PR with a merge state, and reading each PR's own would only repeat the burst
 // that used the limit up (2026-11-04: 14 per-PR reads in one second after a failed batch). The index is marked
 // blocked instead: the PRs that need a merge state wait for the next round. Any other failure falls back to per-PR reads.
-const mergeIndexAfter = (error) => (RATE_LIMITED.test(String(error?.message ?? error))
+// Not RATE_LIMITED: a bare 403 can be a permission or SSO refusal, which waiting does not cure.
+const MERGE_STATE_LIMITED = /rate limit|\b429\b|secondary|abuse/i;
+const mergeIndexAfter = (error) => (MERGE_STATE_LIMITED.test(String(error?.message ?? error))
   ? Object.assign(new Map(), { blocked: String(error?.message ?? error).slice(0, 200) }) : null);
 
 function hasReviewIngress(view) {
@@ -1193,6 +1195,7 @@ function* fetchPollSnapshot({ nodeId, ghFn, mergeIndex = null }) {
   const query = 'query($id:ID!){node(id:$id){... on PullRequest{state isDraft updatedAt headRefOid baseRefOid mergeable baseRef{target{oid}} timelineItems(last:1,itemTypes:[READY_FOR_REVIEW_EVENT,CONVERT_TO_DRAFT_EVENT]){nodes{... on ReadyForReviewEvent{id} ... on ConvertToDraftEvent{id}}} labels(first:50){pageInfo{hasNextPage} nodes{name}} comments(last:20){totalCount nodes{id updatedAt}} reviews(last:10){totalCount nodes{id updatedAt}} reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved comments(last:5){nodes{id updatedAt}}}} commits(last:1){nodes{commit{statusCheckRollup{state} status{state contexts{context state}} checkSuites(first:30){pageInfo{hasNextPage} nodes{checkRuns(first:40){pageInfo{hasNextPage} nodes{name status conclusion databaseId detailsUrl}}}}}}}}}}';
   const raw = yield () => ghFn(['api', 'graphql', '-f', `query=${query}`, '-F', `id=${nodeId}`]);
   const snapshot = normalizePollSnapshot(JSON.parse(raw));
+  if (mergeIndex?.blocked) throw new Error(`merge-state-unavailable: ${mergeIndex.blocked}`);
   const known = mergeIndex?.get(String(nodeId));
   const live = known ?? (yield* readMergeStatus({ id: nodeId, ghFn }));
   return { ...snapshot, mergeStateStatus: live.mergeStateStatus ?? 'UNKNOWN' };
