@@ -275,6 +275,43 @@ function withDedupeKey(action) {
   return { ...action, dedupeKey: sha256hex(stableStringify(rest)) };
 }
 
+/**
+ * 写 App 的 bot 登录名（`<slug>[bot]`）：profile 里没有这个名字，只能拿私钥签 App JWT 问 `GET /app` 的 `slug`。
+ * GitHub 给 App 的账号用户名就是 `<slug>[bot]`，身份白名单（`trustedBotLogins`）认的就是整串登录名。
+ * 拿不到（私钥不可读、连不上、返回不是 200、没有 slug）就抛错，怎么报由调用方决定（doctor 报红）。
+ */
+export async function appBotLogin({ app, fetchImpl = globalThis.fetch, now = () => Date.now() } = {}) {
+  if (!app?.appId || !app?.privateKeyFile) throw new Error('apps.write 的 appId / privateKeyFile 不全');
+  let pem;
+  try {
+    checkSecretFile(app.privateKeyFile, 'apps.write.privateKeyFile');
+    pem = fs.readFileSync(app.privateKeyFile, 'utf8');
+  } catch {
+    throw new Error('读不到 apps.write 的私钥文件（缺失 / 不可读 / 权限不是 600）');
+  }
+  const nowSec = Math.floor(now() / 1000);
+  const jwt = signJwt(pem, { iat: nowSec - 60, exp: nowSec + 540, iss: String(app.appId) });
+  let res;
+  try {
+    res = await fetchImpl('https://api.github.com/app', {
+      headers: { Authorization: `Bearer ${jwt}`, Accept: 'application/vnd.github+json' },
+      signal: AbortSignal.timeout(APP_MINT_TIMEOUT_MS),
+    });
+  } catch {
+    throw new Error('连不上 api.github.com/app');
+  }
+  let data = null;
+  try {
+    data = typeof res?.json === 'function' ? await res.json() : res;
+  } catch {
+    data = null;
+  }
+  if (res && res.ok === false) throw new Error(`GET /app 返回 ${res.status}`);
+  const slug = typeof data?.slug === 'string' ? data.slug.trim() : '';
+  if (!slug) throw new Error('GET /app 没给 slug');
+  return `${slug}[bot]`;
+}
+
 function signJwt(pem, payload) {
   const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
   const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
@@ -1529,8 +1566,8 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
   }
 
   /**
-   * 这次写该用哪个 App：②写 App。没配 apps、类型不在表里（如看板写）、表里值为 null（评论 / issue / sub-issue 等
-   * 等身份白名单的写）、或 repo 的 owner 不在该 app 的名单里都返回 null（账号令牌），与没有 apps 字段时完全一致。
+   * 这次写该不该走 ②写 App：没配 apps、没配 apps.write、类型不在表里（如看板写 / 合并）都返回 null（账号令牌）；
+   * repo 的 owner 不在该 app 的 owners 名单里也返回 null，不铸令牌、不打扰 GitHub。
    */
   function writeRoleFor(action) {
     if (!profile.apps) return null;

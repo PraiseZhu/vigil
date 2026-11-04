@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { createGithub, defaultRun, WRITE_APP_ROLE } from './bin/github.mjs';
+import { appBotLogin, createGithub, defaultRun, WRITE_APP_ROLE } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { prepareSandboxProfile } from './host/sandbox.mjs';
 import { OWNER, createFakeRun, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
@@ -773,6 +773,31 @@ test('没配 apps：与现状完全一致——不碰 App 接口，读和写都�
   assert.equal(readLog(loopLog), '');
 });
 
+test('没配 apps.write：7 类身份写（评论 / 标签 / issue 改关重开 / 子 issue）加 pr.create 共 9 次 gh 调用全走账号令牌，App 取令牌 0 次', async () => {
+  // 路由表里这 7 类的作者会变成 <app>[bot]（所以开写前要配 trustedBotLogins）；这里只配了 ①读 App，②写一个都没有。
+  const IDENTITY_WRITES = ['comment.create', 'comment.update', 'issue.create', 'issue.edit', 'issue.close', 'issue.reopen', 'subissue.add'];
+  assert.equal(IDENTITY_WRITES.length, 7, '身份敏感的写就是这 7 类');
+  for (const type of IDENTITY_WRITES) assert.equal(WRITE_APP_ROLE[type], 'write', `${type} 在表里指向 write`);
+  const { profile, loopLog } = appSetup({ read: {} });
+  assert.equal(profile.apps.write, undefined, '本来就没配 apps.write');
+  const fetchImpl = appFetch();
+  const run = createFakeRun({ onApi: () => ({ id: 7, number: 9, html_url: 'https://example.test/x' }) });
+  const github = createGithub({ profile, run, fetchImpl });
+  await github.write({ type: 'comment.create', repo: `${OWNER}/repo-a`, issue: 1, body: 'w' });
+  await github.write({ type: 'comment.update', repo: `${OWNER}/repo-a`, commentId: 3, body: 'w' });
+  await github.write({ type: 'issue.create', repo: `${OWNER}/repo-a`, title: 't', body: 'b', labels: ['acceptance'] });
+  await github.write({ type: 'issue.edit', repo: `${OWNER}/repo-a`, issue: 1, body: 'b' });
+  await github.write({ type: 'issue.close', repo: `${OWNER}/repo-a`, issue: 1 });
+  await github.write({ type: 'issue.reopen', repo: `${OWNER}/repo-a`, issue: 1 });
+  // subissue.add 先 GET 子 issue 再 POST。
+  await github.write({ type: 'subissue.add', repo: `${OWNER}/repo-a`, issue: 1, subRepo: `${OWNER}/repo-a`, subIssue: 2 });
+  await github.write({ type: 'pr.create', repo: `${OWNER}/repo-a`, head: 'acceptance/1-x-sc1', title: 't', body: 'b' });
+  // 七次单调用（7 类里 subissue 是两次，pr.create 一次）= 9 次 gh 调用。
+  assert.deepEqual(appTokensUsed(run), Array(9).fill('owner-token'), '一个 App 令牌都不用，与合入前一致');
+  assert.equal(fetchImpl.calls.list.length + fetchImpl.calls.token.length, 0, '没配 apps.write 就不查安装列表、不换令牌');
+  assert.equal(readLog(loopLog), '', '也不记 app-token-fallback');
+});
+
 test('两个 app 不串用：同一 owner 的 ①/② 令牌各存一份，读用 ①、推分支用 ②', async () => {
   const { profile } = appSetup({ read: {}, write: {} });
   const fetchImpl = appFetch();
@@ -1070,7 +1095,7 @@ test('apps 的 profile 校验：格式错的直接报错；私钥文件不在也
   assert.deepEqual([...profile.apps.read.owners], [OWNER], 'owners 缺省是 [ownerLogin]');
 });
 
-test('apps.write 的 profile 校验：缺 privateKeyFile / 相对路径 / owners 非数组 / appId 不合法都明确报错', () => {
+test('apps.write 的 profile 校验：缺 privateKeyFile / 相对路径 / owners 非数组 / 缺 appId 都明确报错', () => {
   const bad = (write, pattern) => {
     const home = tmpDir();
     writeProfile(home, { profile: { apps: { write } } });
@@ -1088,6 +1113,37 @@ test('apps.write 的 profile 校验：缺 privateKeyFile / 相对路径 / owners
   const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
   assert.equal(profile.apps.write.appId, '5700001');
   assert.deepEqual([...profile.apps.write.owners], ['ExampleUser']);
+});
+
+test('apps.write 的 appId 非法值（0 / 负数 / 小数 / 布尔 / 前导零数字串）加载就报错并点名 apps.write.appId', () => {
+  for (const appId of [0, -1, 1.5, true, '00']) {
+    const home = tmpDir();
+    writeProfile(home, { profile: { apps: { write: { appId, privateKeyFile: '/k' } } } });
+    assert.throws(
+      () => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }),
+      /apps\.write\.appId/,
+      `appId ${JSON.stringify(appId)} 应在加载时报错（与 ①读 的规则一致）`,
+    );
+  }
+  const home = tmpDir();
+  writeProfile(home, { profile: { apps: { write: { appId: 5700001, privateKeyFile: '/k' } } } });
+  assert.equal(loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }).apps.write.appId, '5700001');
+});
+
+test('写 App 的 bot 登录名只能问 GET /app：得到 <slug>[bot]，JWT 的 iss 是写 App 的 appId；拿不到就抛错', async () => {
+  const { profile } = appSetup({ write: {} });
+  const calls = [];
+  const issOf = (opts) => JSON.parse(Buffer.from(String(opts.headers.Authorization).replace(/^Bearer /, '').split('.')[1], 'base64url').toString('utf8')).iss;
+  const okFetch = async (url, opts) => {
+    calls.push({ url, iss: issOf(opts) });
+    return { ok: true, status: 200, json: async () => ({ slug: 'example-automation', name: 'Example Automation' }) };
+  };
+  assert.equal(await appBotLogin({ app: profile.apps.write, fetchImpl: okFetch }), 'example-automation[bot]');
+  assert.deepEqual(calls, [{ url: 'https://api.github.com/app', iss: WRITE_ID }], '用写 App 的私钥签 JWT，不碰 ①的');
+  await assert.rejects(() => appBotLogin({ app: profile.apps.write, fetchImpl: async () => { throw new Error('offline'); } }), /连不上/);
+  await assert.rejects(() => appBotLogin({ app: profile.apps.write, fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({}) }) }), /404/);
+  await assert.rejects(() => appBotLogin({ app: profile.apps.write, fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({}) }) }), /slug/);
+  await assert.rejects(() => appBotLogin({ app: { ...profile.apps.write, privateKeyFile: '/nonexistent/write.key' }, fetchImpl: okFetch }), /私钥/);
 });
 
 test('沙箱遮罩覆盖 apps 里的私钥：嵌套的 privateKeyFile 也进遮罩名单', async () => {
