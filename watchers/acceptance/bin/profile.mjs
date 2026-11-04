@@ -247,6 +247,61 @@ function loadAppConfig(appConfigPath, file) {
   return parsed;
 }
 
+/**
+ * 两级 App 配置：`apps: { read: {...}, write: {...} }`。
+ * - read：①读 App（读 + 低风险写）；write：②写 App（推分支、PR、workflow）。
+ * - 每个 app：`appId`（正整数或纯数字字符串）、`privateKeyFile`（绝对路径）、`owners`（默认 `[ownerLogin]`）。
+ * - 安装号不在这里配：运行时用私钥 JWT 调 `GET /app/installations` 查。
+ * - 只校格式，不在这里碰私钥文件：私钥缺失 / 不可读 / 权限不对时，用的时候回退账号令牌并记一行日志
+ *   （整台验收机不能因为一枚没部署的私钥就停下）。
+ */
+function parseApps(raw, file, ownerLogin) {
+  if (!Object.hasOwn(raw, 'apps') || raw.apps === undefined || raw.apps === null) return undefined;
+  const value = raw.apps;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw invalid('apps', file, '应为对象，可只配 read / write 里的一个');
+  }
+  const parseApp = (candidate, key) => {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      throw invalid(key, file, '应为对象');
+    }
+    for (const field of Object.keys(candidate)) {
+      if (!['appId', 'privateKeyFile', 'owners'].includes(field)) {
+        throw invalid(key, file, `不认识的键「${field}」（只认 appId / privateKeyFile / owners）`);
+      }
+    }
+    const appId = candidate.appId;
+    const appIdOk =
+      (typeof appId === 'string' && /^\d+$/.test(appId) && appId !== '0') || (Number.isInteger(appId) && appId > 0);
+    if (!appIdOk) throw invalid(`${key}.appId`, file, '应为正整数或纯数字字符串');
+    const privateKeyFile = candidate.privateKeyFile;
+    if (typeof privateKeyFile !== 'string' || !privateKeyFile || !path.isAbsolute(privateKeyFile)) {
+      throw invalid(`${key}.privateKeyFile`, file, '应为绝对路径');
+    }
+    let owners = [ownerLogin];
+    if (candidate.owners !== undefined && candidate.owners !== null) {
+      if (
+        !Array.isArray(candidate.owners) ||
+        candidate.owners.length === 0 ||
+        candidate.owners.some((entry) => typeof entry !== 'string' || !/^[A-Za-z0-9-]+$/.test(entry))
+      ) {
+        throw invalid(`${key}.owners`, file, '应为非空 owner 登录名数组');
+      }
+      owners = [...candidate.owners];
+    }
+    return Object.freeze({ appId: String(appId), privateKeyFile, owners: Object.freeze(owners) });
+  };
+  const out = {};
+  for (const role of Object.keys(value)) {
+    if (role !== 'read' && role !== 'write') {
+      throw invalid('apps', file, `不认识的键「${role}」（只认 read / write）`);
+    }
+    out[role] = parseApp(value[role], `apps.${role}`);
+  }
+  if (Object.keys(out).length === 0) throw invalid('apps', file, '至少要配 read 或 write 里的一个');
+  return Object.freeze(out);
+}
+
 /** 读取并校验验收机 profile；失败抛 ProfileError（code=PROFILE_INVALID）。 */
 export function loadAcceptanceProfile(env = process.env) {
   const file = profilePath(env);
@@ -302,6 +357,8 @@ export function loadAcceptanceProfile(env = process.env) {
 
   const appConfigPath = optionalAbsolute(raw, 'appConfigPath', file);
   const appPrivateKeyFile = appConfigPath ? loadAppConfig(appConfigPath, file).privateKeyFile : undefined;
+  // 两级 App 配置（app → owner）：配了 apps 就不再走 appTokenCommand；appConfigPath 在场时也不做按仓分流。
+  const apps = parseApps(raw, file, ownerLogin);
 
   // App 安装令牌分流只读轮询：appTokenCommand 是一条外部命令（argv 数组），标准输出打印安装令牌；
   // 只在宿主上、只给读 GitHub 的那一个 gh 子进程用。appOwners：装了这个 App 的 owner（默认只有 ownerLogin）。
@@ -345,6 +402,7 @@ export function loadAcceptanceProfile(env = process.env) {
     writeCommand: writeCommand ? Object.freeze(writeCommand) : undefined,
     appConfigPath,
     appPrivateKeyFile,
+    apps,
     appTokenCommand: appTokenCommand ? Object.freeze(appTokenCommand) : undefined,
     appOwners: Object.freeze(appOwners),
     slackBotTokenFile,

@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 // GitHub 读写的唯一出口：本文件才允许 spawn / 触网。
 // 读：配了 appConfigPath 走 App 安装令牌，否则走账号令牌。
-// 配了 appTokenCommand（外部命令打印 App 安装令牌）：落在 appOwners 名下单个仓上的只读查询优先走 App 令牌，
-// 取不到令牌、或 App 读到 401/403/404 时回退账号令牌重试一次，并在宿主 loop.log 记一行（不含令牌）。
-// 写：一律走账号令牌；配了 writeCommand 则整段交给写闸，绝不回落直接写。
+// 两级 App 配置 apps: { read, write }：read = ①读 App（单仓读 + 低风险写），write = ②写 App（推分支 / PR / workflow）。
+// 安装号运行时用私钥 JWT 调 GET /app/installations 查；令牌按 (app, owner) 各缓存 50 分钟（只在内存里）。
+// 取不到令牌（没装 / 私钥缺失或不可读 / 查安装失败）或 App 读到 401/403/404 时，回退账号令牌一次，
+// 并在宿主 loop.log 记一行 app-token-fallback（kind、repo、app 名、原因，不含令牌）；一个 (app, owner) 失败不影响别的。
+// 没配 apps 时，回落旧的 appTokenCommand + appOwners（owner 作为命令最后一个参数，行为与上一版一致）。
+// 写：账号令牌或 App 令牌都要过 write() 的类型检查；配了 writeCommand 则整段交给写闸，绝不回落直接写。
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -545,6 +548,33 @@ function parseJson(stdout, label) {
 /** 取 App 令牌的外部命令最多等多久（超时整组杀掉，按取不到处理、回退账号令牌）。 */
 export const APP_TOKEN_TIMEOUT_MS = 30000;
 
+/** 用私钥铸造 App 令牌（查安装 + 换令牌）整个过程最多等多久，和外部命令同一个上限。 */
+export const APP_MINT_TIMEOUT_MS = 30000;
+
+/** 安装令牌 1 小时有效，缓存 50 分钟；安装列表缓存 15 分钟（两者都只在内存里）。 */
+const APP_TOKEN_TTL_MS = 50 * 60 * 1000;
+const APP_INSTALL_CACHE_MS = 15 * 60 * 1000;
+
+/**
+ * 写操作按风险分流到哪个 App：`read` = ①读 App（评论、标签、开 sub-issue、关单等低风险写），
+ * `write` = ②写 App（推分支、维护分支、开 PR、转 ready、workflow）。
+ * 不在这张表里的写（如 project.field.set 看板写）继续走账号令牌：App 看不到个人账号下的 Projects v2。
+ */
+export const WRITE_APP_ROLE = Object.freeze({
+  'comment.create': 'read',
+  'comment.update': 'read',
+  'issue.create': 'read',
+  'issue.edit': 'read',
+  'issue.close': 'read',
+  'issue.reopen': 'read',
+  'subissue.add': 'read',
+  'branch.push': 'write',
+  'pr.create': 'write',
+  'pr.ready': 'write',
+  'pr.update-branch': 'write',
+  'ci.rerun': 'write',
+});
+
 /**
  * App 令牌读失败时，要不要回退账号令牌：401 / 凭证坏 → auth-401；403 / 无权限 → auth-403；
  * 404 / 找不到仓（App 没覆盖这个仓）→ not-found。超时、5xx 等不回退（照旧走只读重试规则）。
@@ -610,44 +640,223 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
   }
 
   let ownerTokenCache;
-  let appTokenCache;
-  let cmdTokenCache;
-  let cmdTokenFailed = false;
+  let configAppToken;
+  // 两级 App 配置的令牌：按 `${role}:${owner}` 各存一份，两个 app 不串用；失败也按 key 记，不再反复试。
+  const appTokenCache = new Map();
+  const appTokenFailure = new Map();
+  const appInstallCache = new Map();
+  // 旧形式 appTokenCommand（外部命令）的缓存，仍按 owner 分开。
+  const cmdTokenCache = new Map();
+  const cmdTokenFailed = new Set();
+  const ownerKey = (owner) => String(owner).toLowerCase();
+  const allAppTokens = () =>
+    [configAppToken, ...[...appTokenCache.values()].map((entry) => entry.token), ...cmdTokenCache.values()].filter(Boolean);
   const writeFallback = fallbackLog || defaultFallbackLog(profile);
 
-  /** 这条查询落在 App 覆盖的单个仓上吗：是就返回 owner/name，不是（跨仓清单、搜索、viewer、别的组织）返回 null。 */
-  function appRepoFor(variables) {
-    if (!profile.appTokenCommand || profile.appConfigPath) return null;
+  function appConfigFor(role) {
+    return profile?.apps?.[role] || null;
+  }
+
+  /** 这个 owner 是否在该 app 的安装名单里（role = read | write）。 */
+  function appCovers(role, owner) {
+    const app = appConfigFor(role);
+    if (!app) return false;
+    return app.owners.some((entry) => ownerKey(entry) === ownerKey(owner));
+  }
+
+  /**
+   * 这条只读查询该不该走 App、走哪个：
+   * - 配了 appConfigPath：不分流（旧模式，所有读都走那一枚安装令牌）；
+   * - 配了 apps：只有 ①读 App 的 owner 名单里的单仓查询走 App，其它（盘点、搜索、viewer、别的 owner）账号令牌；
+   * - 都没有：回落旧形式 appTokenCommand + appOwners（与上一版行为一致）。
+   */
+  function readRouteFor(variables) {
+    if (profile.appConfigPath) return null;
     const owner = variables?.owner;
     const name = variables?.name;
     if (typeof owner !== 'string' || typeof name !== 'string' || !owner || !name) return null;
+    const repo = `${owner}/${name}`;
+    if (profile.apps) {
+      if (!appCovers('read', owner)) return null;
+      return { mode: 'mint', role: 'read', owner, repo };
+    }
+    if (!profile.appTokenCommand) return null;
     const owners = profile.appOwners || [profile.ownerLogin];
-    if (!owners.some((entry) => String(entry).toLowerCase() === owner.toLowerCase())) return null;
-    return `${owner}/${name}`;
+    if (!owners.some((entry) => ownerKey(entry) === ownerKey(owner))) return null;
+    return { mode: 'command', role: 'legacy', owner, repo };
   }
 
-  /** 跑外部命令取 App 令牌：只放进这次读的那个 gh 子进程；取不到就记住，这个实例里不再反复试。 */
-  async function getCommandAppToken() {
-    if (cmdTokenCache) return cmdTokenCache;
-    if (cmdTokenFailed) return null;
+  /** 跑外部命令取 App 令牌：owner 作为命令的最后一个参数传进去（老脚本忽略多余参数，行为不变）。 */
+  async function getCommandAppToken(owner) {
+    const key = ownerKey(owner);
+    if (cmdTokenCache.has(key)) return cmdTokenCache.get(key);
+    if (cmdTokenFailed.has(key)) return null;
     const argv = profile.appTokenCommand;
     let result = null;
     try {
-      result = await runCmd(argv[0], argv.slice(1), { env: baseEnv(), timeoutMs: APP_TOKEN_TIMEOUT_MS, killGroup: true });
+      result = await runCmd(argv[0], [...argv.slice(1), owner], { env: baseEnv(), timeoutMs: APP_TOKEN_TIMEOUT_MS, killGroup: true });
     } catch {
       result = null;
     }
     const token = result?.code === 0 ? String(result.stdout || '').trim() : '';
     if (!token || /\s/.test(token)) {
-      cmdTokenFailed = true;
+      cmdTokenFailed.add(key);
       return null;
     }
-    cmdTokenCache = token;
+    cmdTokenCache.set(key, token);
     return token;
   }
 
-  function logFallback(kind, repo) {
-    writeFallback(`${new Date(nowFn()).toISOString()} app-token-fallback kind=${kind} repo=${repo} ${FALLBACK_TEXT[kind] || 'App 令牌读失败'}，已改用原令牌重试一次`);
+  function mintError(reason) {
+    const error = new Error(`App 令牌取不到：${reason}`);
+    error.reason = reason;
+    return error;
+  }
+
+  /** 调 App 的 REST 接口：从 deadline 算剩余时间，超时 / 网络错都转成带 reason 的错（消息里没有令牌）。 */
+  async function appFetch(apiPath, { method = 'GET', auth, deadline } = {}) {
+    const remaining = deadline - nowFn();
+    if (!(remaining > 0)) throw mintError('timeout');
+    let res;
+    try {
+      res = await fetchFn(`https://api.github.com${apiPath}`, {
+        method,
+        headers: { Authorization: `Bearer ${auth}`, Accept: 'application/vnd.github+json' },
+        signal: AbortSignal.timeout(Math.max(1, Math.min(remaining, APP_MINT_TIMEOUT_MS))),
+      });
+    } catch {
+      throw mintError('network');
+    }
+    let data = null;
+    try {
+      data = typeof res?.json === 'function' ? await res.json() : res;
+    } catch {
+      data = null;
+    }
+    if (res && res.ok === false) throw mintError(`http-${res.status}`);
+    return data;
+  }
+
+  /**
+   * 安装号运行时查：用私钥签 JWT 调 GET /app/installations，按 account.login 匹配 owner。
+   * 安装号不写死、不落盘；安装列表只在内存里按 app 缓存 15 分钟。
+   */
+  async function installationFor(role, app, owner, pem, deadline) {
+    const cached = appInstallCache.get(role);
+    let byOwner;
+    if (cached && nowFn() - cached.at < APP_INSTALL_CACHE_MS) {
+      byOwner = cached.byOwner;
+    } else {
+      const nowSec = Math.floor(nowFn() / 1000);
+      const jwt = signJwt(pem, { iat: nowSec - 60, exp: nowSec + 540, iss: String(app.appId) });
+      byOwner = new Map();
+      let page = 1;
+      while (page <= 20) {
+        let data;
+        try {
+          data = await appFetch(`/app/installations?per_page=100&page=${page}`, { auth: jwt, deadline });
+        } catch (error) {
+          throw mintError(error?.reason === 'timeout' ? 'install-lookup-timeout' : `install-lookup-${error?.reason || 'failed'}`);
+        }
+        if (!Array.isArray(data)) throw mintError('install-lookup-bad-response');
+        for (const item of data) {
+          const login = item?.account?.login;
+          const id = item?.id;
+          if (typeof login === 'string' && login && id) byOwner.set(ownerKey(login), id);
+        }
+        if (data.length < 100) break;
+        page += 1;
+      }
+      appInstallCache.set(role, { at: nowFn(), byOwner });
+    }
+    const found = byOwner.get(ownerKey(owner));
+    if (!found) throw mintError('not-installed');
+    return found;
+  }
+
+  /**
+   * 取某个 (app, owner) 的安装令牌。失败不抛，返回 { error: { kind, reason } }，由调用方记一行日志后回退账号令牌。
+   * 私钥缺失 / 不可读 / 没装 / 安装号查不到 / 换令牌失败都落成 reason，不会让进程停下。
+   */
+  async function mintRoleToken(role, owner) {
+    const key = `${role}:${ownerKey(owner)}`;
+    const cached = appTokenCache.get(key);
+    if (cached && cached.exp > nowFn() + 60000) return { token: cached.token };
+    const remembered = appTokenFailure.get(key);
+    if (remembered) return { error: remembered };
+    const fail = (reason, kind = 'token-failed') => {
+      const error = { kind, reason };
+      appTokenFailure.set(key, error);
+      return { error };
+    };
+    const app = appConfigFor(role);
+    if (!app) return fail('app-not-configured');
+    // 名单就是「这个 (app, owner) 装了没装」的声明：没列进来就当没装，回退但要留一行日志（写路径尤其要可见）。
+    if (!app.owners.some((entry) => ownerKey(entry) === ownerKey(owner))) return fail('owner-not-in-app-owners');
+    if (!fs.existsSync(app.privateKeyFile)) return fail('key-missing');
+    let pem;
+    try {
+      checkSecretFile(app.privateKeyFile, `apps.${role}.privateKeyFile`);
+      pem = fs.readFileSync(app.privateKeyFile, 'utf8');
+    } catch {
+      return fail('key-unreadable');
+    }
+    const deadline = nowFn() + APP_MINT_TIMEOUT_MS;
+    let installId;
+    try {
+      installId = await installationFor(role, app, owner, pem, deadline);
+    } catch (error) {
+      return fail(error?.reason || 'install-lookup-failed');
+    }
+    let token = '';
+    try {
+      const nowSec = Math.floor(nowFn() / 1000);
+      const jwt = signJwt(pem, { iat: nowSec - 60, exp: nowSec + 540, iss: String(app.appId) });
+      const data = await appFetch(`/app/installations/${installId}/access_tokens`, { method: 'POST', auth: jwt, deadline });
+      token = typeof data?.token === 'string' ? data.token : '';
+    } catch (error) {
+      return fail(error?.reason ? `token-request-${error.reason}` : 'token-request-failed');
+    }
+    if (!token || /\s/.test(token)) return fail('empty-token');
+    appTokenCache.set(key, { token, exp: nowFn() + APP_TOKEN_TTL_MS });
+    return { token };
+  }
+
+  /** 取这次读该用的 App 令牌：新配置用私钥铸造，旧形式跑外部命令。 */
+  async function appReadToken(route) {
+    if (route.mode === 'command') {
+      const token = await getCommandAppToken(route.owner);
+      return token ? { token } : { error: { kind: 'token-failed', reason: 'command-failed' } };
+    }
+    return mintRoleToken(route.role, route.owner);
+  }
+
+  /** 401 说明这枚安装令牌坏了：只在这个实例的这个 (app, owner) 上不再用它。 */
+  function forgetAppToken(route) {
+    const key = `${route.role}:${ownerKey(route.owner)}`;
+    if (route.mode === 'command') {
+      cmdTokenFailed.add(ownerKey(route.owner));
+      cmdTokenCache.delete(ownerKey(route.owner));
+      return;
+    }
+    appTokenCache.delete(key);
+    appTokenFailure.set(key, { kind: 'auth-401', reason: 'app-401' });
+  }
+
+  /** App 读/写被拒时记的 reason：和 kind 一一对应，方便 grep 出是哪一类。 */
+  function appRejectReason(kind) {
+    if (kind === 'not-found') return 'app-404';
+    if (kind === 'auth-403') return 'app-403';
+    return 'app-401';
+  }
+
+  /** 一行显式回退记录：kind、repo、app 名、原因；不含令牌。 */
+  function logFallback(kind, repo, info = {}) {
+    const appField = info.role ? ` app=${info.role}` : '';
+    const reasonField = info.reason ? ` reason=${info.reason}` : '';
+    writeFallback(
+      `${new Date(nowFn()).toISOString()} app-token-fallback kind=${kind} repo=${repo}${appField}${reasonField} ${FALLBACK_TEXT[kind] || 'App 令牌读失败'}，已改用原令牌重试一次`,
+    );
   }
 
   function getOwnerToken() {
@@ -657,8 +866,9 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     return ownerTokenCache;
   }
 
-  async function mintAppToken() {
-    if (appTokenCache) return appTokenCache;
+  /** 旧的一把梭模式（appConfigPath）：装的安装号写在配置文件里，换一枚令牌所有读都用它。 */
+  async function mintConfigAppToken() {
+    if (configAppToken) return configAppToken;
     const raw = fs.readFileSync(profile.appConfigPath, 'utf8');
     const appConfig = JSON.parse(raw);
     const pem = fs.readFileSync(appConfig.privateKeyFile, 'utf8');
@@ -681,17 +891,17 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
       throw new Error(`铸造 App 令牌失败：${res.status}`);
     }
     if (!data?.token) throw new Error('铸造 App 令牌失败：响应没有 token');
-    appTokenCache = data.token;
-    return appTokenCache;
+    configAppToken = data.token;
+    return configAppToken;
   }
 
   async function getReadToken() {
-    if (profile.appConfigPath) return mintAppToken();
+    if (profile.appConfigPath) return mintConfigAppToken();
     return getOwnerToken();
   }
 
   function failFrom(result, token) {
-    const detail = redact(result.stderr || result.stdout || `exit ${result.code}`, [token, ownerTokenCache, appTokenCache, cmdTokenCache]);
+    const detail = redact(result.stderr || result.stdout || `exit ${result.code}`, [token, ownerTokenCache, ...allAppTokens()]);
     throw new Error(detail);
   }
 
@@ -740,27 +950,23 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
           identity,
         });
       }
-      throw new Error(redact(messages.join('; '), [token, ownerTokenCache, appTokenCache, cmdTokenCache]));
+      throw new Error(redact(messages.join('; '), [token, ownerTokenCache, ...allAppTokens()]));
     }
     return parsed.data ?? parsed;
   }
 
   async function graphql(query, variables) {
-    const appRepo = isReadOnlyGraphql(query) ? appRepoFor(variables) : null;
-    if (appRepo) {
-      const appToken = await getCommandAppToken();
-      if (appToken) {
-        const first = await sendGraphql(appToken, query, variables);
+    const route = isReadOnlyGraphql(query) ? readRouteFor(variables) : null;
+    if (route) {
+      const minted = await appReadToken(route);
+      if (minted.token) {
+        const first = await sendGraphql(minted.token, query, variables);
         const kind = appFallbackKind(first);
-        if (!kind) return finishGraphql(first, appToken, 'app');
-        // 401：令牌本身坏了，这个实例里不再用它。
-        if (kind === 'auth-401') {
-          cmdTokenFailed = true;
-          cmdTokenCache = undefined;
-        }
-        logFallback(kind, appRepo);
+        if (!kind) return finishGraphql(first, minted.token, 'app');
+        if (kind === 'auth-401') forgetAppToken(route);
+        logFallback(kind, route.repo, { role: route.role, reason: appRejectReason(kind) });
       } else {
-        logFallback('token-failed', appRepo);
+        logFallback(minted.error.kind, route.repo, { role: route.role, reason: minted.error.reason });
       }
       const ownerToken = getOwnerToken();
       return finishGraphql(await sendGraphql(ownerToken, query, variables), ownerToken, 'user');
@@ -845,8 +1051,8 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     return parsed.data ?? parsed;
   }
 
-  async function ghApi(method, apiPath, body) {
-    const token = getOwnerToken();
+  async function ghApi(method, apiPath, body, tokenOverride) {
+    const token = tokenOverride || getOwnerToken();
     const args = ['api', '-X', method, apiPath];
     if (body !== undefined) args.push('--input', '-');
     const result = await runCmd('gh', args, {
@@ -1085,8 +1291,8 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     return { itemId: item.id, projectId: project.id };
   }
 
-  async function pushBranch(action) {
-    const token = getOwnerToken();
+  async function pushBranch(action, tokenOverride) {
+    const token = tokenOverride || getOwnerToken();
     const { repo, branch, bundlePath, forceWithLease } = action;
     // 参数会进 git 命令行：bundle 必须是绝对路径（不可能以 - 开头被当成选项），分支和仓名只收安全字符。
     if (typeof bundlePath !== 'string' || !path.isAbsolute(bundlePath)) {
@@ -1179,14 +1385,16 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     return { dir, repo, branch };
   }
 
-  async function directWrite(action) {
+  /** 真正发写请求：token 不给就用账号令牌；给了就是这次写专用（①/② App 安装令牌）。 */
+  async function directWrite(action, tokenOverride) {
+    const writerToken = tokenOverride || getOwnerToken();
     switch (action.type) {
       case 'comment.create': {
-        const data = await ghApi('POST', `repos/${action.repo}/issues/${action.issue}/comments`, { body: action.body });
+        const data = await ghApi('POST', `repos/${action.repo}/issues/${action.issue}/comments`, { body: action.body }, writerToken);
         return { commentId: data.id, url: data.html_url };
       }
       case 'comment.update': {
-        const data = await ghApi('PATCH', `repos/${action.repo}/issues/comments/${action.commentId}`, { body: action.body });
+        const data = await ghApi('PATCH', `repos/${action.repo}/issues/comments/${action.commentId}`, { body: action.body }, writerToken);
         return { commentId: data.id ?? action.commentId, url: data.html_url };
       }
       case 'issue.create': {
@@ -1194,35 +1402,35 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
           title: action.title,
           body: action.body,
           labels: action.labels,
-        });
+        }, writerToken);
         return { issue: data.number, url: data.html_url, nodeId: data.node_id, id: data.id };
       }
       case 'issue.close': {
         const data = await ghApi('PATCH', `repos/${action.repo}/issues/${action.issue}`, {
           state: 'closed',
           state_reason: action.reason || 'completed',
-        });
+        }, writerToken);
         return { issue: data.number ?? action.issue, url: data.html_url };
       }
       case 'issue.reopen': {
-        const data = await ghApi('PATCH', `repos/${action.repo}/issues/${action.issue}`, { state: 'open' });
+        const data = await ghApi('PATCH', `repos/${action.repo}/issues/${action.issue}`, { state: 'open' }, writerToken);
         return { issue: data.number ?? action.issue, url: data.html_url };
       }
       case 'issue.edit': {
-        const data = await ghApi('PATCH', `repos/${action.repo}/issues/${action.issue}`, { body: action.body });
+        const data = await ghApi('PATCH', `repos/${action.repo}/issues/${action.issue}`, { body: action.body }, writerToken);
         return { issue: data.number ?? action.issue, url: data.html_url };
       }
       case 'subissue.add': {
-        const sub = await ghApi('GET', `repos/${action.subRepo}/issues/${action.subIssue}`);
+        const sub = await ghApi('GET', `repos/${action.subRepo}/issues/${action.subIssue}`, undefined, writerToken);
         const data = await ghApi('POST', `repos/${action.repo}/issues/${action.issue}/sub_issues`, {
           sub_issue_id: sub.id,
-        });
+        }, writerToken);
         return { issue: action.issue, subIssue: action.subIssue, id: data.id };
       }
       case 'project.field.set':
         return setProjectFields(action);
       case 'branch.push':
-        return pushBranch(action);
+        return pushBranch(action, writerToken);
       case 'pr.create': {
         const data = await ghApi('POST', `repos/${action.repo}/pulls`, {
           head: action.head,
@@ -1230,25 +1438,24 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
           title: action.title,
           body: action.body,
           draft: action.draft !== undefined ? action.draft : true,
-        });
+        }, writerToken);
         return { pr: data.number, url: data.html_url };
       }
       case 'pr.ready': {
-        const token = getOwnerToken();
         const result = await runCmd('gh', ['pr', 'ready', String(action.pr), '-R', action.repo], {
-          env: ghEnv(token),
+          env: ghEnv(writerToken),
         });
-        if (result.code !== 0) failFrom(result, token);
+        if (result.code !== 0) failFrom(result, writerToken);
         return { pr: action.pr, repo: action.repo };
       }
       case 'pr.update-branch': {
         const data = await ghApi('PUT', `repos/${action.repo}/pulls/${action.pr}/update-branch`, {
           expected_head_sha: action.expectedHeadSha,
-        });
+        }, writerToken);
         return { pr: action.pr, repo: action.repo, message: data.message, url: data.html_url };
       }
       case 'ci.rerun': {
-        await ghApi('POST', `repos/${action.repo}/actions/runs/${action.runId}/rerun-failed-jobs`);
+        await ghApi('POST', `repos/${action.repo}/actions/runs/${action.runId}/rerun-failed-jobs`, undefined, writerToken);
         return { pr: action.pr, repo: action.repo, runId: action.runId };
       }
       default:
@@ -1298,13 +1505,50 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     throw new WriteBusyError('外发忙');
   }
 
+  /**
+   * 这次写该用哪个 App：②写 App / ①读 App。没配 apps、类型不在表里（如看板写）、或 repo 的 owner
+   * 不在该 app 的名单里都返回 null（账号令牌），与没有 apps 字段时完全一致。
+   */
+  function writeRoleFor(action) {
+    if (!profile.apps) return null;
+    const role = WRITE_APP_ROLE[action.type];
+    if (!role || !appConfigFor(role)) return null;
+    return String(action.repo || '').split('/')[0] ? role : null;
+  }
+
+  /**
+   * 拿 App 令牌发这次写；取不到、或 App 被拒（401/403/404）就回退账号令牌重试一次，并记一行
+   * app-token-fallback（带 app 名和原因）。写闸白名单、动作内容都不变，只换发请求的身份。
+   */
+  async function directWriteWithApp(action, role) {
+    const repo = String(action.repo || '');
+    const owner = repo.split('/')[0];
+    const minted = await mintRoleToken(role, owner);
+    if (!minted.token) {
+      logFallback(minted.error.kind, repo, { role, reason: minted.error.reason });
+      return directWrite(action);
+    }
+    try {
+      return await directWrite(action, minted.token);
+    } catch (error) {
+      const kind = appFallbackKind({ code: 1, stderr: String(error?.message || '') });
+      if (!kind) throw error;
+      if (kind === 'auth-401') forgetAppToken({ mode: 'mint', role, owner });
+      logFallback(kind, repo, { role, reason: appRejectReason(kind) });
+      return directWrite(action);
+    }
+  }
+
   async function write(action) {
     if (!action || !WRITE_TYPE_SET.has(action.type)) {
       throw new Error(`未知写操作类型：${action?.type}`);
     }
     const prepared = withDedupeKey(action);
+    // 写闸（writeCommand）那条路上，发请求的身份由写闸那边决定；本 PR 不在那边换令牌。
     if (profile.writeCommand) return writeViaCommand(prepared);
-    return directWrite(prepared);
+    const role = writeRoleFor(prepared);
+    if (!role) return directWrite(prepared);
+    return directWriteWithApp(prepared, role);
   }
 
   return { graphql, ownerGraphql, write, fetchBranch, profile };

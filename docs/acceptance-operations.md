@@ -139,12 +139,87 @@ CI 结论由宿主在代码预取、依赖预装之后、起 pi 之前只读查�
 再跑一次 `doctor`（第 6 节）确认「令牌账号」「仓可读」「看板」「看板写回」都过。
 `appConfigPath` 配了的话读请求走 GitHub App 令牌，写仍然走账号令牌。
 
-`appTokenCommand`（argv 数组，例如 `["python3", "/path/to/print-app-token.py"]`）是另一种分流只读轮询的办法：
-外部命令把 App 安装令牌打印到标准输出，验收机只把它放进那一次读 GitHub 的 gh 子进程的 `GH_TOKEN`，不进常驻进程环境、不落盘、不进日志。
-只有落在 `appOwners`（默认只有 `ownerLogin`）名下**单个仓**上的只读查询走 App；跨仓清单、搜索、viewer 和别的组织的仓照旧走账号令牌（App 看不到没装它的组织，换了会漏单）。
-取令牌失败（非 0 退出、超时 30 秒、输出为空），或 App 读到 401 / 403 / 404，就改用账号令牌重试一次，并在 `<home>/state/host/loop.log` 记一行：
-`<UTC 时间> app-token-fallback kind=<token-failed|auth-401|auth-403|not-found> repo=<owner/name> <人话>，已改用原令牌重试一次`。
-超时、5xx 不回退，照旧按只读超时 / 重试规则处理；写操作和 mutation 一律账号令牌，不回退、不重试。沙箱里的 profile 副本删掉 `appTokenCommand` 和 `appOwners`。
+### 两级 App 配置：`apps`（app → owner）
+
+App 装在多个 owner 上、读和写又是两个 App 时，用 `apps` 配。这是现在推荐的方式，其余字段不用动：
+
+```json
+"apps": {
+  "read":  { "appId": "<①读 App 编号>",  "privateKeyFile": "/path/to/<①读 App 的私钥文件>",
+             "owners": ["<owner A>", "<owner B>", "<owner C>", "<owner D>"] },
+  "write": { "appId": "<②写 App 编号>", "privateKeyFile": "/path/to/<②写 App 的私钥文件>",
+             "owners": ["<owner A>", "<owner B>"] }
+}
+```
+
+- `read` 是 ①读 App，`write` 是 ②写 App；两个都可只配一个，`owners` 缺省是 `[ownerLogin]`。
+- **安装号不在配置里**：运行时用私钥签 JWT 调 `GET /app/installations`，按 `account.login` 找这个 owner 的安装号。
+- 私钥路径写在 profile 里（绝对路径、600），私钥内容不进仓库；找不到 / 不可读 / 权限不对时**不拦启动**：
+  用的时候回退账号令牌并记一行（见下），整台验收机不会因为一枚没部署的私钥停摆。
+- 令牌按 `(app, owner)` 各缓存 50 分钟，只放在进程内存里（本仓自己不落盘）；一个 `(app, owner)` 取不到不影响别的。
+  取令牌整个过程（查安装 + 换令牌）上限 30 秒。
+
+分流规则：
+
+| 请求 | 走哪个令牌 |
+|---|---|
+| 落在 `apps.read.owners` 名下**单个仓**上的只读查询（议题正文、轮次评论、PR 检查等按 `owner/name` 定位的读） | ①读 App |
+| 低风险写：`comment.create/update`、`issue.create/edit/close/reopen`、`subissue.add` | ①读 App |
+| 高风险写：`branch.push`、`pr.create`、`pr.ready`、`pr.update-branch`、`ci.rerun` | ②写 App |
+| 跨仓盘点、搜索、`viewer`、看板读、别人组织的仓 | 账号令牌 |
+| 看板写（`project.field.set`） | 账号令牌（App 看不到个人账号下的 Projects v2） |
+| 其它没列出的写类型 | 账号令牌（不在表里就按账号令牌，不猜） |
+
+某个 `(app, owner)` 取不到令牌——没装、私钥缺失 / 不可读 / 权限不对、安装号查询失败、换令牌失败——或者
+App 读到 401 / 403 / 404，就回退账号令牌重试一次，并在 `<home>/state/host/loop.log` 记一行：
+
+```
+<UTC 时间> app-token-fallback kind=<token-failed|auth-401|auth-403|not-found> repo=<owner/name> app=<read|write> reason=<原因> <人话>，已改用原令牌重试一次
+```
+
+`reason` 是一个短码，方便 grep：`not-installed`、`owner-not-in-app-owners`、`key-missing`、`key-unreadable`、
+`install-lookup-http-<状态>`、`install-lookup-network`、`install-lookup-timeout`、`install-lookup-bad-response`、
+`token-request-http-<状态>`、`token-request-network`、`token-request-timeout`、`empty-token`、`app-401`/`app-403`/`app-404`。
+日志和报错里都不出现令牌。目标是 0 次回退；回退必须看得见。
+
+**没装 App 的 owner 不要写进 `owners`**。读路径上名单外的 owner 直接用账号令牌（不浪费一趟）；写路径上如果该 App 配了
+但 owner 不在名单里，会记一行 `reason=owner-not-in-app-owners` 再回退——这是有意的，写不出去必须留痕。
+
+优先级（三处都配时按这个顺序，别混着配）：
+
+1. `appConfigPath`：配了就**不做按仓分流**，所有读都换成那一枚安装令牌（旧模式；盘点、搜索、`viewer` 会跟着换，
+   容易静默漏单、`doctor` 的「令牌账号」变成 `…[bot]`）。`apps`、`appTokenCommand` 都不生效。
+2. `apps`：按上表分流。配了 `apps` 就不再走 `appTokenCommand`。
+3. `appTokenCommand` + `appOwners`（旧形式，见下）：没有 `apps` 也没有 `appConfigPath` 时才生效。
+
+### 取令牌脚本（运维侧，旧形式 / 外部调用）
+
+`appTokenCommand`（argv 数组，例如 `["python3", "/path/to/print-app-token.py"]`）是让外部命令取令牌的旧办法：
+命令把安装令牌打印到标准输出，验收机只把它放进那一次读 GitHub 的 gh 子进程的 `GH_TOKEN`，不进常驻进程环境、不进日志。
+验收机把落在这个仓上的 `owner` 作为命令的**最后一个参数**追加；令牌按 owner 在内存里各缓存一份。
+`appOwners`（默认 `[ownerLogin]`）列这个 App 装在哪几个 owner 上；名单外的 owner 直接账号令牌。
+
+脚本不在本仓里（属于运维侧）。它要满足的行为契约：
+
+- 接受 `--app read|write`（默认 `read`）和一个可选的位置参数 `OWNER`；
+- **安装号在运行时查**：用 JWT 调 `GET /app/installations`，按 `account.login` 找参数里那个 owner 的安装号；
+- 令牌按 `(app, owner)` 各缓存 50 分钟，缓存文件按 `(app, owner)` 分开、权限 600，放在私有目录（目录 700）；
+  安装列表也按 app 分开缓存；两个 App 的缓存互不串用；
+- 参数里的 owner 没装这个 App：非零退出 + stderr 一句人话错误，stdout 不输出任何东西；
+- 令牌只打印到 stdout（stdout 只有令牌一行）；过程信息和错误走 stderr，错误信息里不带令牌；
+- 不带 owner 参数调用时按配置里的默认 owner 取（只有一个安装时用那个安装）；老的调用方（不带参数的脚本调用）不用改。
+
+脚本写出来的安装列表缓存和令牌缓存也算凭证：它们得落在 `host.json` 的 `credentialDirs` 列出的目录里（整个目录遮住），
+或者放在 `$HOME` 下本来就遮住的位置；两者都不满足时 bwrap 遮罩覆盖不到它。脚本和私钥本身也别放进 `homeAllowDirs` 这类白名单目录。
+
+### 遮罩与 `apps` 的已知缺口（待补）
+
+私钥文件本身由键名规则遮住：`maskList()` 递归收集 profile 里所有 `…PrivateKeyFile` / 正好叫 `privateKeyFile` 的键，
+所以 `apps.read.privateKeyFile` / `apps.write.privateKeyFile` 都会进遮罩名单。但沙箱 profile 副本目前只删
+`appConfigPath`、`appTokenCommand`、`appOwners`，还没有删 `apps`（它会把私钥路径字符串留在副本里；私钥内容仍被遮住）。
+改这一处要动 `host/sandbox.mjs`（遮罩规则），按约定本轮不动，列在 PR 的待批清单里。
+
+`doctor` 的「令牌文件」一项按原始 profile 的**顶层**键算，`apps.*.privateKeyFile` 目前不在这一项检查里，同样列在待补清单。
 
 ## 3. 写闸
 
