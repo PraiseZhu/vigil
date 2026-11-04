@@ -429,8 +429,13 @@ export async function runDoctor({
     rawProfile = {};
   }
   const keyFiles = tokenFiles(rawProfile);
-  if (profile.appPrivateKeyFile && !keyFiles.some((entry) => entry.file === profile.appPrivateKeyFile)) {
-    keyFiles.push({ key: 'appPrivateKeyFile', file: profile.appPrivateKeyFile });
+  const addKeyFile = (key, file) => {
+    if (file && !keyFiles.some((entry) => entry.file === file)) keyFiles.push({ key, file });
+  };
+  addKeyFile('appPrivateKeyFile', profile.appPrivateKeyFile);
+  // 两级配置的私钥在嵌套的 apps.<role>.privateKeyFile 里，按顶层键算的 tokenFiles() 看不到，单独补上。
+  for (const role of ['read', 'write']) {
+    addKeyFile(`apps.${role}.privateKeyFile`, profile.apps?.[role]?.privateKeyFile);
   }
   const badKeyFiles = [];
   for (const entry of keyFiles) {

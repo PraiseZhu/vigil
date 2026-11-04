@@ -23,7 +23,7 @@ import { OWNER, REPO, HANDOFF_REPO, tmpDir, writeProfile, writeSecret } from './
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const NOW = Date.parse('2026-10-24T02:00:00.000Z');
 
-function makeFixture({ heartbeat, writeCommand = true } = {}) {
+function makeFixture({ heartbeat, writeCommand = true, apps } = {}) {
   const slack = writeSecret(path.join(tmpDir(), 'secrets', 'slack.token'), 'fixture-slack-not-real');
   const exampleToken = writeSecret(path.join(tmpDir(), 'secrets', 'example.token'), 'fixture-token-not-real');
   const extraProfile = {
@@ -33,6 +33,7 @@ function makeFixture({ heartbeat, writeCommand = true } = {}) {
     exampleTokenFile: exampleToken,
   };
   if (writeCommand) extraProfile.writeCommand = ['node', 'example-write-command.mjs'];
+  if (apps) extraProfile.apps = apps;
   const base = writeProfile(tmpDir(), { profile: extraProfile });
   const paths = hostPaths(base.home);
   fs.mkdirSync(paths.hostDir, { recursive: true });
@@ -148,6 +149,35 @@ test('SC1 缺哪项报哪项：gh / 令牌账号 / 仓可读 / 看板 / fork 推
     assert.ok(failed.includes(name), `没报 ${name}：${failed.join(', ')}`);
   }
   assert.match(checkOf(result, '令牌账号').detail, /ExampleOther/);
+});
+
+test('令牌文件：apps.write 的私钥也在检查范围内（权限 644 点名叫出来，600 通过）', async () => {
+  const secretDir = path.join(tmpDir(), 'secrets');
+  fs.mkdirSync(secretDir, { recursive: true });
+  const keyFile = path.join(secretDir, 'write.key');
+  fs.writeFileSync(keyFile, 'placeholder', { mode: 0o600 });
+  fs.chmodSync(keyFile, 0o600);
+  const apps = { write: { appId: 5700001, privateKeyFile: keyFile, owners: [OWNER] } };
+  const fixture = makeFixture({ apps });
+  const okResult = await runDoctor({
+    profileEnv: fixture.profileEnv,
+    probes: makeProbes(),
+    github: makeGithub(),
+    now: () => NOW,
+  });
+  assert.equal(checkOf(okResult, '令牌文件').ok, true, checkOf(okResult, '令牌文件').detail);
+  assert.match(checkOf(okResult, '令牌文件').detail, /4 个密钥文件/, '顶层三个 + apps.write 的私钥都算进来');
+
+  fs.chmodSync(keyFile, 0o644);
+  const badResult = await runDoctor({
+    profileEnv: fixture.profileEnv,
+    probes: makeProbes(),
+    github: makeGithub(),
+    now: () => NOW,
+  });
+  const check = checkOf(badResult, '令牌文件');
+  assert.equal(check.ok, false, '权限放开必须报出来');
+  assert.match(check.detail, /apps\.write\.privateKeyFile/);
 });
 
 test('SC1 仓读不到 → 「仓可读」报出来并点名', async () => {
