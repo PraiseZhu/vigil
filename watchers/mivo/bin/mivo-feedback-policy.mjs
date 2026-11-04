@@ -117,12 +117,21 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
       }
       return result('required-ci-fix', [], 'verified-code-scanning-failure');
     }
+    // A failed optional Actions check blocks Mivo pre-review (every check must be green); its proof comes only
+    // from failedOptionalCiItems, never from a comment or the gh pr checks list.
+    const optional = item.optionalFailure;
+    if (optional) {
+      if (optional.verified !== true || optional.status !== 'failed' || optional.headSha !== headSha) {
+        return result('needs-triage', [], 'invalid-optional-ci-evidence');
+      }
+      return result('required-ci-fix', [], 'verified-optional-ci-failure');
+    }
     const proof = item.requiredFailure;
     if (proof && (proof.verified !== true || proof.status !== 'failed' || proof.headSha !== headSha)) {
       return result('needs-triage', [], 'invalid-required-ci-evidence');
     }
     // Legacy task CI items were emitted only by failedRequiredCiItems. Do not
-    // infer CI authority from a comment mentioning checks or from optional checks.
+    // infer CI authority from a comment mentioning checks or from unverified optional checks.
     return result('required-ci-fix', [], proof ? 'verified-required-ci-failure' : 'legacy-required-ci-failure');
   }
   // pr-hygiene workflow 的机器人通知（如「冲突已解决」）：冲突本身由 conflict 来源处理，通知被编辑一次就派一轮只会空转。

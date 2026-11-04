@@ -8,6 +8,7 @@ import {
   classifyReviewFeedback, feedbackItems, newFeedback, dispatchParams, constrainRetryDispatch, scanOnce, watcherPaths, REPO,
 } from './bin/mivo-watcher.mjs';
 import { writePr } from './bin/mivo-state.mjs';
+import { feedbackRepairPolicy } from './bin/mivo-feedback-policy.mjs';
 import { command, ciResult, preflightTimeoutMs } from './bin/mivo-repair.mjs';
 import { _resetProfileCacheForTests } from './bin/profile.mjs';
 
@@ -232,6 +233,59 @@ test('required app failure dispatches', (t) => {
   const result = runScan(paths, listed, () => ({
     ci: { status: 'failed', required: [{ context: 'verify', appId: 7, status: 'failed', evidence: { id: 7, runId: 8, attempt: 1, url: 'https://github.com/x/y' } }] },
     policy: { status: 'verified', required: [{ context: 'verify', appId: 7 }] },
+    mergeReady: false,
+  }), () => { sent += 1; return { target_session_id: 's1' }; });
+  assert.equal(sent, 1);
+  assert.equal(result.prs[0].dispatch.attempted, true);
+});
+
+// 2026-11-03 #1641: an optional check (pr-handoff-gate) was red, pre-review would not send the PR to review,
+// and the watcher repaired only required checks, so nobody fixed it.
+const optionalRed = { context: 'pr-handoff-gate', status: 'failed', reason: 'failure', evidence: { id: 21, sha: HEAD, runId: 22, url: 'https://github.com/x/y/actions/runs/22/job/23' } };
+test('a verified optional Actions failure is repair feedback with its own proof', () => {
+  const items = feedbackItems({ pr, ci: { status: 'green', required: [{ context: 'unit', status: 'green' }], optional: [optionalRed] } });
+  const ci = items.filter((item) => item.source === 'ci');
+  assert.equal(ci.length, 1);
+  assert.equal(ci[0].nativeId, 'optional:pr-handoff-gate');
+  assert.deepEqual(ci[0].optionalFailure, { verified: true, status: 'failed', headSha: HEAD, context: 'pr-handoff-gate', checkId: 21, runId: 22 });
+  assert.equal(ci[0].requiredFailure, undefined);
+  assert.equal(ci[0].repairPolicy.action, 'required-ci-fix');
+  assert.equal(ci[0].repairPolicy.reason, 'verified-optional-ci-failure');
+});
+test('optional CI evidence for another head is not repair authority', () => {
+  const items = feedbackItems({ pr, ci: { status: 'green', required: [], optional: [{ ...optionalRed, evidence: { ...optionalRed.evidence, sha: 'b'.repeat(40) } }] } });
+  const ci = items.find((item) => item.source === 'ci');
+  assert.notEqual(ci.repairPolicy.action, 'required-ci-fix');
+});
+// The policy only trusts the watcher's own optional-CI proof: `verified` must be the literal true and the proof
+// must be bound to the same head. Both guards have bite because item.sha already matches HEAD here, so the
+// upstream `stale-head` early return cannot stand in for them.
+test('optional CI proof that is not verified is not repair authority', () => {
+  const policy = feedbackRepairPolicy({
+    source: 'ci', sha: HEAD,
+    optionalFailure: { verified: false, status: 'failed', headSha: HEAD, context: 'pr-handoff-gate', checkId: 21, runId: 22 },
+  }, { headSha: HEAD });
+  assert.equal(policy.action, 'needs-triage');
+  assert.equal(policy.reason, 'invalid-optional-ci-evidence');
+  assert.equal(policy.canChangeCode, false);
+});
+test('optional CI proof bound to another head is not repair authority', () => {
+  const policy = feedbackRepairPolicy({
+    source: 'ci', sha: HEAD,
+    optionalFailure: { verified: true, status: 'failed', headSha: BASE, context: 'pr-handoff-gate', checkId: 21, runId: 22 },
+  }, { headSha: HEAD });
+  assert.equal(policy.action, 'needs-triage');
+  assert.equal(policy.reason, 'invalid-optional-ci-evidence');
+});
+test('unknown CI emits no optional items either', () => {
+  assert.equal(feedbackItems({ pr, ci: { status: 'unknown', required: [], optional: [optionalRed] } }).filter((item) => item.source === 'ci').length, 0);
+});
+test('optional Actions failure dispatches a repair round', (t) => {
+  const { paths, listed } = scanHome(t);
+  let sent = 0;
+  const result = runScan(paths, listed, () => ({
+    ci: { status: 'green', required: [{ context: 'verify', status: 'green' }], optional: [optionalRed] },
+    policy: { status: 'verified', required: [{ context: 'verify' }] },
     mergeReady: false,
   }), () => { sent += 1; return { target_session_id: 's1' }; });
   assert.equal(sent, 1);
