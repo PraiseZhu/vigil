@@ -17,6 +17,7 @@ import { acquireLock, AUTHOR_RECLAIMED, readPr, writePr } from './mivo-state.mjs
 import { optionalConfig, requireConfig } from './profile.mjs';
 import { acquireValidationSlot, runStreaming, validationConfig } from './mivo-validation-runtime.mjs';
 import { compareBaseline, verifyBaselineBinding } from './mivo-validation-baseline.mjs';
+import { configuredLogin, configuredUserId } from './mivo-identity.mjs';
 import {
   PARSER_VERSION, canonicalRuntime, emptyFailureSet, lookupPass, parseFailureSet, publishPass, runtimeSha256,
 } from './mivo-validation-evidence.mjs';
@@ -635,9 +636,10 @@ function configValue(args, gitFn) {
   try { return gitOutput(args, gitFn).trim(); }
   catch (error) { if (error?.status === 1) return ''; throw error; }
 }
-export function ensureCommitIdentity({ worktree, gitFn = command, ghFn = command }) {
-  let user;
-  try { user = ghJson(['api', 'user'], ghFn); } catch { return { configured: false, reason: 'gh-user-unavailable' }; }
+// The commit identity is the configured account (VIGIL_GH_LOGIN / VIGIL_GH_USER_ID), not whoever `gh api user` says.
+export function ensureCommitIdentity({ worktree, gitFn = command, identity = { login: configuredLogin(), id: configuredUserId() } }) {
+  const user = identity;
+  if (user?.id == null) return { configured: false, reason: 'gh-user-unavailable' };
   const login = user?.login;
   const id = user?.id;
   if (typeof login !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/.test(login) || !Number.isSafeInteger(id) || id <= 0) {
@@ -691,7 +693,7 @@ export function prepare({ home, taskPath, ghFn = command, ownershipFn = collectP
   if (!strict || strict.head !== pr.headRefOid) fail('watch worktree was not aligned to the PR head');
   const repairPolicy = assertTaskRepairScope(task, pr.headRefOid);
   const needsSync = task.headRefOid !== pr.headRefOid;
-  const commitIdentity = ensureCommitIdentity({ worktree: aligned.worktree, gitFn, ghFn });
+  const commitIdentity = ensureCommitIdentity({ worktree: aligned.worktree, gitFn });
   return { ...identity(task, sessionId), repairPolicy, status: needsSync ? 'needs-sync' : 'prepared', needsSync, commitIdentity,
     worktree: aligned.worktree, head: pr.headRefOid, remoteHead: pr.headRefOid, sourceHead: task.headRefOid, created: checkout.created,
     preservation: aligned.preservation ?? null, realigned: aligned.realigned ?? null, ciErrors: ciErrorExcerpts(task, ghFn) };

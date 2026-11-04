@@ -7,6 +7,8 @@ import { ciErrorExcerpts, verifyKeelRun } from './bin/cindy-repair.mjs';
 import * as repair from './bin/cindy-repair.mjs';
 import { constrainRetryDispatch, dispatchParams, scanOnce, watcherPaths } from './bin/cindy-watcher.mjs';
 import { writePr } from './bin/cindy-state.mjs';
+// 这些夹具里 PR 作者是 ExampleUser：watcher 以 VIGIL_GH_LOGIN 指定的账号运行，不再问 gh api user。
+process.env.VIGIL_GH_LOGIN = 'ExampleUser';
 
 const HEAD = 'a'.repeat(40);
 const REPO = 'makecindy/cindy';

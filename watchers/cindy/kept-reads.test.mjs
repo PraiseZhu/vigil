@@ -97,7 +97,10 @@ test('a corrupt or future-dated store is ignored', (t) => {
   assert.equal(gh.count(VIEWER), 2);
 });
 
-test('two discover rounds in the same home ask GitHub for the login once', (t) => {
+test('two discover rounds in the same home use the configured login and never ask GitHub for it', (t) => {
+  const original = process.env.VIGIL_GH_LOGIN;
+  process.env.VIGIL_GH_LOGIN = 'ExampleUser';
+  t.after(() => { if (original === undefined) delete process.env.VIGIL_GH_LOGIN; else process.env.VIGIL_GH_LOGIN = original; });
   const paths = stateDirOf(t);
   fs.mkdirSync(paths.stateDir, { recursive: true });
   const gh = counting((args) => (args[0] === 'api' && args[1] === 'user' ? 'ExampleUser\n' : '[]'));
@@ -110,7 +113,7 @@ test('two discover rounds in the same home ask GitHub for the login once', (t) =
     const result = scanOnce({ mode: 'discover', enabled: false, paths, now, ghFn });
     assert.equal(result.viewer, 'ExampleUser');
   }
-  assert.equal(gh.count(VIEWER), 1);
+  assert.equal(gh.count(VIEWER), 0);
   assert.equal(listArgs.length, 2);
   for (const args of listArgs) {
     assert.equal(args[args.indexOf('--author') + 1], 'ExampleUser');

@@ -97,7 +97,7 @@ function identityRepo(t) {
   return { plugin, worktree };
 }
 const gitFn = (_bin, args) => execFileSync('git', args, { encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull } }).trim();
-const ghUser = () => JSON.stringify({ login: 'ExampleUser', id: 42 });
+const ghUser = { login: 'ExampleUser', id: 42 };
 const commit = (worktree, file, extraEnv = {}) => {
   fs.writeFileSync(path.join(worktree, file), `${file}\n`);
   git(worktree, 'add', file);
@@ -107,7 +107,7 @@ const commit = (worktree, file, extraEnv = {}) => {
 
 test('prepare identity: the watch worktree commits with the noreply identity, the main checkout keeps its own', (t) => {
   const { plugin, worktree } = identityRepo(t);
-  assert.deepEqual(ensureCommitIdentity({ worktree, gitFn, ghFn: ghUser }), { configured: true });
+  assert.deepEqual(ensureCommitIdentity({ worktree, gitFn, identity: ghUser }), { configured: true });
   assert.equal(git(worktree, 'config', 'user.email'), '42+ExampleUser@users.noreply.github.com');
   assert.equal(git(plugin, 'config', 'user.email'), 'person@example.invalid');
   const head = commit(worktree, 'b.txt');
@@ -117,7 +117,7 @@ test('prepare identity: the watch worktree commits with the noreply identity, th
 
 test('validate guard: an unpushed commit carrying the inherited email is reported, pushed history is not', (t) => {
   const { worktree } = identityRepo(t);
-  ensureCommitIdentity({ worktree, gitFn, ghFn: ghUser });
+  ensureCommitIdentity({ worktree, gitFn, identity: ghUser });
   const leaked = commit(worktree, 'c.txt', { GIT_AUTHOR_EMAIL: 'person@example.invalid' });
   const clean = commit(worktree, 'd.txt');
   assert.deepEqual(privateIdentityCommits({ worktree, head: clean, gitFn }), [leaked]);
@@ -125,10 +125,10 @@ test('validate guard: an unpushed commit carrying the inherited email is reporte
   assert.deepEqual(privateIdentityCommits({ worktree, head: git(worktree, 'rev-parse', 'HEAD'), gitFn }), [], 'the suggested rebase fixes it');
 });
 
-test('prepare identity is skipped, not guessed, when the GitHub user cannot be read', (t) => {
+test('prepare identity is skipped, not guessed, when the configured account has no user id', (t) => {
   const { worktree } = identityRepo(t);
-  assert.deepEqual(ensureCommitIdentity({ worktree, gitFn, ghFn: () => { throw new Error('HTTP 502'); } }), { configured: false, reason: 'gh-user-unavailable' });
-  assert.deepEqual(ensureCommitIdentity({ worktree, gitFn, ghFn: () => JSON.stringify({ login: 'bad name', id: 1 }) }), { configured: false, reason: 'gh-user-invalid' });
+  assert.deepEqual(ensureCommitIdentity({ worktree, gitFn, identity: { login: 'ExampleUser', id: null } }), { configured: false, reason: 'gh-user-unavailable' });
+  assert.deepEqual(ensureCommitIdentity({ worktree, gitFn, identity: { login: 'bad name', id: 1 } }), { configured: false, reason: 'gh-user-invalid' });
   assert.equal(git(worktree, 'config', 'user.email'), 'person@example.invalid');
   const head = commit(worktree, 'e.txt');
   assert.deepEqual(privateIdentityCommits({ worktree, head, gitFn }), [], 'an unconfigured checkout is not checked');

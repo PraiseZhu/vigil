@@ -103,13 +103,13 @@ node watchers/<mivo|cindy>/bin/<mivo|cindy>-repair.mjs lock-doctor --home "$WATC
 
 ### GitHub 读请求与缓存
 
-发现器每轮最多 165 秒,每分钟排一次触发(上一轮结束后才排下一次)。采集有硬上限:每次 gh 调用前检查「整轮截止 − 派发预留」,到了就中止该 PR 的采集(标 `collectRetry`,下一轮最先处理),所以一轮不会跑过约 165 秒;整轮最后约 40 秒(派发预留 25 秒 + 最小采集 15 秒)内才出现的变化不再启动采集,同样留到下一轮开头——「新反馈通常 30 秒内派发」只在其余时段成立,最坏情况下一轮开头才处理。下面两类读请求只能用 `gh` 登录的个人账号发(GitHub App 令牌调不了
-`/user`,读分支保护要管理权限),所以跨轮缓存在 `state/kept-reads.json`:
+发现器每轮最多 165 秒,每分钟排一次触发(上一轮结束后才排下一次)。采集有硬上限:每次 gh 调用前检查「整轮截止 − 派发预留」,到了就中止该 PR 的采集(标 `collectRetry`,下一轮最先处理),所以一轮不会跑过约 165 秒;整轮最后约 40 秒(派发预留 25 秒 + 最小采集 15 秒)内才出现的变化不再启动采集,同样留到下一轮开头——「新反馈通常 30 秒内派发」只在其余时段成立,最坏情况下一轮开头才处理。下面这类读请求只能用 `gh` 登录的个人账号发(读分支保护要管理权限),所以跨轮缓存在 `state/kept-reads.json`:
 
-- 登录名(`gh api user`):6 小时。
 - 分支规则、分支对象、分支保护:10 分钟。改了必需检查,watcher 最多晚 10 分钟看到。
 
-`gh` 换了登录账号或想立即重读时,删掉这个文件即可,下一轮自动重建。
+watcher 以哪个 GitHub 账号运行不再问 `gh api user`,而是显式配置:`VIGIL_GH_LOGIN`(默认 `PraiseZhu`)、提交邮箱用的 `VIGIL_GH_USER_ID`(默认账号自带 id);判断「自己的」PR head 时同时认 `praise-qa[bot]`。
+
+想立即重读分支规则时,删掉这个文件即可,下一轮自动重建。
 
 mivo 的发现器每轮用一次 search 读全部在盯 PR 的 `mergeStateStatus` 与 base 提交（分流器会按个人账号回答这类读请求，逐 PR 读会把个人账号限流用光），`gh pr view --json` 也不再请求 `mergeStateStatus`。排障看 discover 返回里的 `mergeStates`：`batched` 是命中的 PR 数，`error` 非空表示这一轮批量读失败：限流类错误时需要合并状态的 PR 本轮不处理（`merge-state-unavailable`），其他错误时各 PR 回退为自己读。
 

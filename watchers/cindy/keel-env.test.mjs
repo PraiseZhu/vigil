@@ -7,6 +7,12 @@ import * as repair from './bin/cindy-repair.mjs';
 import * as watcher from './bin/cindy-watcher.mjs';
 import { pendingEvents } from './bin/notify.mjs';
 import { readPr, writePr } from './bin/cindy-state.mjs';
+// prepare 夹具的 PR 作者是 ExampleUser；watcher 以 VIGIL_GH_LOGIN 指定的账号运行，不再问 gh api user。
+function asLogin(t, login) {
+  const original = process.env.VIGIL_GH_LOGIN;
+  process.env.VIGIL_GH_LOGIN = login;
+  t.after(() => { if (original === undefined) delete process.env.VIGIL_GH_LOGIN; else process.env.VIGIL_GH_LOGIN = original; });
+}
 
 // KEEL reinstalled into a namespace (xd) moved the ledger and made `namespace:null` calls fail with
 // GHOST_NOT_FOUND. Fixtures use placeholder ids only. New symbols are read off the module namespaces
@@ -406,6 +412,7 @@ test('F2: prepare blocks a Keel task when keelLedgerRoot is not configured, befo
 });
 
 test('F2: a task from before the Keel flow (v1, or no keelFlow) is still prepared without a ledger root', t => {
+  asLogin(t, 'ExampleUser');
   for (const extra of [{ keelFlow: true, keelFlowVersion: undefined }, { keelFlow: undefined, keelFlowVersion: undefined }]) {
     const home = tmp(t, 'keel-env-home-');
     const { taskPath } = writeTask(home, extra);

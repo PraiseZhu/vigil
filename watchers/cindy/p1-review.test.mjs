@@ -17,6 +17,8 @@ import { acquireDeployExclusive, acquireLock, DEPLOY_LOCK_NAME, lockStatus, read
 import {
   DISPATCH_PARAM_KEYS, dispatchParams, feedbackItems, scanOnce, watchGuideMessage, watcherPaths,
 } from './bin/cindy-watcher.mjs';
+// 这些夹具里 PR 作者是 ExampleUser：watcher 以 VIGIL_GH_LOGIN 指定的账号运行，不再问 gh api user。
+process.env.VIGIL_GH_LOGIN = 'ExampleUser';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);

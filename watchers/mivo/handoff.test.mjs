@@ -68,7 +68,7 @@ function fixture({ existing = [], login = 'ExampleUser', head = basic.headRefOid
     if (args[1].startsWith('repos/')) return JSON.stringify([existing]);
     throw new Error(`unexpected gh args: ${JSON.stringify(args)}`);
   };
-  return { ghFn, calls, options: { command: 'handoff', repo, number: 1, ghFn } };
+  return { ghFn, calls, options: { command: 'handoff', repo, number: 1, ghFn, login } };
 }
 
 test('handoff posts once, verifies current ownership and returns receipt; repeats are idempotent', () => {
