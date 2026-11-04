@@ -114,6 +114,7 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
       contexts: ['verify'], checks: [{ context: 'verify', app_id: 123 }],
     } });
     if (endpoint === `repos/${REPO}/rules/branches/main?per_page=100`) return JSON.stringify([[]]);
+    if (endpoint === `repos/${REPO}/rules/branches/fix%2Fscope?per_page=100` && protectedHead === 'error') throw new Error('HTTP 502');
     if (endpoint === `repos/${REPO}/rules/branches/fix%2Fscope?per_page=100`) return JSON.stringify([protectedHead
       ? [{ type: 'non_fast_forward' }, { type: 'pull_request', parameters: {} }] : []]);
     if (String(endpoint).startsWith(`repos/${REPO}/pulls?state=open&head=`)) return JSON.stringify([childPrs]);
@@ -1149,8 +1150,8 @@ test('protected head branch: finalize retry reuses the pushed child branch and t
   assert.deepEqual(second.childPr, first.childPr);
 });
 
-test('unprotected head branch keeps the direct push', async (t) => {
-  const f = fixture(t);
+for (const protectedHead of [false, 'error']) test(`head branch rules ${protectedHead ? 'unreadable' : 'without pull_request'}: keeps the direct push`, async (t) => {
+  const f = fixture(t, { protectedHead });
   assert.equal((await f.validate()).status, 'pass');
   f.report([f.sc('pass', ['thread:P1'])]);
   const result = f.finalize();
