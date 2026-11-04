@@ -8,6 +8,7 @@ import {
   classifyReviewFeedback, feedbackItems, newFeedback, dispatchParams, constrainRetryDispatch, scanOnce, watcherPaths, REPO,
 } from './bin/mivo-watcher.mjs';
 import { writePr } from './bin/mivo-state.mjs';
+import { feedbackRepairPolicy } from './bin/mivo-feedback-policy.mjs';
 import { command, ciResult, preflightTimeoutMs } from './bin/mivo-repair.mjs';
 import { _resetProfileCacheForTests } from './bin/profile.mjs';
 
@@ -255,6 +256,26 @@ test('optional CI evidence for another head is not repair authority', () => {
   const items = feedbackItems({ pr, ci: { status: 'green', required: [], optional: [{ ...optionalRed, evidence: { ...optionalRed.evidence, sha: 'b'.repeat(40) } }] } });
   const ci = items.find((item) => item.source === 'ci');
   assert.notEqual(ci.repairPolicy.action, 'required-ci-fix');
+});
+// The policy only trusts the watcher's own optional-CI proof: `verified` must be the literal true and the proof
+// must be bound to the same head. Both guards have bite because item.sha already matches HEAD here, so the
+// upstream `stale-head` early return cannot stand in for them.
+test('optional CI proof that is not verified is not repair authority', () => {
+  const policy = feedbackRepairPolicy({
+    source: 'ci', sha: HEAD,
+    optionalFailure: { verified: false, status: 'failed', headSha: HEAD, context: 'pr-handoff-gate', checkId: 21, runId: 22 },
+  }, { headSha: HEAD });
+  assert.equal(policy.action, 'needs-triage');
+  assert.equal(policy.reason, 'invalid-optional-ci-evidence');
+  assert.equal(policy.canChangeCode, false);
+});
+test('optional CI proof bound to another head is not repair authority', () => {
+  const policy = feedbackRepairPolicy({
+    source: 'ci', sha: HEAD,
+    optionalFailure: { verified: true, status: 'failed', headSha: BASE, context: 'pr-handoff-gate', checkId: 21, runId: 22 },
+  }, { headSha: HEAD });
+  assert.equal(policy.action, 'needs-triage');
+  assert.equal(policy.reason, 'invalid-optional-ci-evidence');
 });
 test('unknown CI emits no optional items either', () => {
   assert.equal(feedbackItems({ pr, ci: { status: 'unknown', required: [], optional: [optionalRed] } }).filter((item) => item.source === 'ci').length, 0);

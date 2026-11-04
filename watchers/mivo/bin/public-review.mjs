@@ -8,7 +8,7 @@
 // - every round writes a `review-pr` check run (GitHub Actions) on the PR head; the latest one is the
 //   current verdict for that head.
 import { collectPrSnapshot } from './mivo-pr-snapshot.mjs';
-import { collectMivoCiSteps } from './mivo-ci.mjs';
+import { collectMivoCiSteps, REVIEW_INFRA_CHECKS } from './mivo-ci.mjs';
 import { requireConfig } from './profile.mjs';
 
 // 目标仓库与审查账号在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
@@ -23,8 +23,8 @@ export const REVIEWER = requireConfig('reviewerLogin', {
 export const REVIEW_CHECK = 'review-pr';
 const REVIEW_WORKFLOW = '.github/workflows/review-pr.yml';
 const ACTIONS_APP_ID = 15368;
-// Review infrastructure checks belong to the review maintainer, never a business repair owner.
-const REVIEW_INFRA_CHECKS = [REVIEW_CHECK, 'gate', 'seat1', 'seat2', 'seat3', 'publish', 'native_attestation', 'control_attestation'];
+// Review infrastructure checks belong to the review maintainer, never a business repair owner. The list lives in
+// mivo-ci.mjs so the optional-check exclusions cannot drift from the snapshot filter.
 const parse = v => typeof v === 'string' ? JSON.parse(v) : v;
 const at = c => Date.parse(c.created_at ?? c.createdAt);
 const HEADER = /^> Mivo 自动审查 · .*?head `([a-f0-9]{12})` · base `([a-f0-9]{12})`/m;

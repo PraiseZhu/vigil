@@ -24,7 +24,8 @@ const digest = value => createHash('sha256').update(JSON.stringify(value)).diges
 // 2026-08-04), so a failed optional Actions check blocks review like a required one: #1641 sat on pr-handoff-gate
 // on 2026-11-03 while nothing repaired it. Only the latest Actions run of each name on this head counts; review
 // infrastructure and CodeQL (its alerts come through code scanning) are not the author's to fix.
-const OPTIONAL_EXCLUDED = new Set(['review-pr', 'gate', 'seat1', 'seat2', 'seat3', 'publish', 'native_attestation', 'control_attestation', 'CodeQL']);
+export const REVIEW_INFRA_CHECKS = ['review-pr', 'gate', 'seat1', 'seat2', 'seat3', 'publish', 'native_attestation', 'control_attestation'];
+const OPTIONAL_EXCLUDED = new Set([...REVIEW_INFRA_CHECKS, 'CodeQL']);
 const OPTIONAL_FAILED = new Set(['failure', 'timed_out', 'startup_failure']);
 export function failedOptionalActions({ checks = [], policy, repo, headSha }) {
   const jobUrl = new RegExp(`^https://github\\.com/${repo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/actions/runs/(\\d+)/job/(\\d+)/?$`);
