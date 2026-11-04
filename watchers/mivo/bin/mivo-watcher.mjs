@@ -2138,6 +2138,7 @@ const BLOCKED_KIND_TEXT = {
   'invalid-result': '修复会话交回的结果对不上本 PR 或缺少验证证据',
   'dispatch-retry-limit': '宿主多次拒绝创建修复会话',
   'unknown-dispatch-receipt': '派发修复会话后没拿到确认回执',
+  'child-pr': '修复已开成子 PR 送进受保护的 head 分支，等子 PR 合入后在新 HEAD 上复核',
 };
 function noticeReason(reason) {
   return String(reason ?? '').replace(/\/(?:Users|home|private|tmp|var)\/[^\s'"`]+/g, '<本机路径>')
