@@ -24,6 +24,7 @@ import { enqueueNotice } from './notify.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
 import { triageText } from './mivo-ci-triage.mjs';
 import { collectMivoCiSteps } from './mivo-ci.mjs';
+import { configuredLogin } from './mivo-identity.mjs';
 
 // 目标仓库在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
 export const REPO = requireConfig('targetRepo', {
@@ -170,7 +171,7 @@ export function memoRepoReads(ghFn, store = null) {
 }
 
 function readViewer(ghFn, paths, clock) {
-  return memoRepoReads(ghFn, keptReadStore(paths.stateDir, clock))(['api', 'user', '-q', '.login']);
+  return configuredLogin();
 }
 
 // A generator yields parallel(workflows) to run several sub-workflows at once; it gets back one
@@ -3587,7 +3588,7 @@ export function* discoverWorkflow({
   // Repository-wide reads (branch rules, variables, workflow, required-checks file) are the same for every PR.
   const keptReads = keptReadStore(paths.stateDir, clock);
   let ghFn = memoRepoReads(baseGh, keptReads);
-  const viewer = String(yield () => ghFn(['api', 'user', '-q', '.login'])).trim();
+  const viewer = String(yield () => configuredLogin()).trim();
   const listArgs = [
     'pr', 'list', '--repo', REPO, '--author', viewer, '--state', 'open', '--limit', '1000',
     '--json', 'number,id,headRefOid,headRefName,isDraft,labels,url,updatedAt,title',

@@ -58,7 +58,9 @@ process.stdout.write(JSON.stringify(result));
   const env = { ...process.env, MIVO_WATCHER_TARGET_REPO: repo, MIVO_WATCHER_HOME: home,
     MIVO_PLUGIN_REPO: plugin, GH_BIN: fakeGh, E2E_GITHUB: serviceFile,
     E2E_CALLS: callsFile, E2E_DELIVERIES: deliveriesFile,
-    MIVO_WATCHER_WATCH_HOMES: '[]' };
+    MIVO_WATCHER_WATCH_HOMES: '[]',
+    // The fixture PR author; the watcher runs as VIGIL_GH_LOGIN instead of asking `gh api user`.
+    VIGIL_GH_LOGIN: 'ExampleUser' };
   delete env.MIVO_PR_LOCK_TOKEN;
   delete env.MIVO_WATCHER_PROFILE;
   delete env.MIVO_WATCHER_LIFELINE_CONFIG;

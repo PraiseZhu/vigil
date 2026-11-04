@@ -63,7 +63,7 @@ test('upgrade retries legacy last PR proven cut short by global budget',t=>{
 test('transport stops subsequent calls once PR budget exhausted',t=>{
  const f=fixture(t);let clock=0,calls=0;
  scanOnce({paths:f.paths,now,clock:()=>clock,perPrBudgetMs:1000,ghFn:a=>{calls++;return a[0]==='api'?'owner':JSON.stringify([makePr(1)]);},collect:(_,{ghFn})=>{clock=1100;ghFn(['api','should-not-run']);}});
- assert.equal(calls,2);
+ assert.equal(calls,1); // pr list only: the login is configured, not read from gh
 });
 for(const wake of ['created','resumed','already-active','queued'])test(`${wake} receipt does not claim active Host turn`,t=>{
  const f=fixture(t);const state=f.read();

@@ -22,6 +22,7 @@ import { canonicalRuntime, runtimeSha256 } from './cindy-validation-evidence.mjs
 import { enqueueNotice } from './notify.mjs';
 import { optionalConfig } from './profile.mjs';
 import { triageText } from './cindy-ci-triage.mjs';
+import { configuredLogin } from './cindy-identity.mjs';
 export const DISPATCH_PARAM_KEYS = Object.freeze(['title', 'message', 'target_session_id']);
 export const REPO = 'makecindy/cindy';
 const GH = process.env.GH_BIN ?? 'gh';
@@ -164,7 +165,7 @@ export function memoRepoReads(ghFn, store = null) {
 }
 
 function readViewer(ghFn, paths, clock) {
-  return memoRepoReads(ghFn, keptReadStore(paths.stateDir, clock))(['api', 'user', '-q', '.login']);
+  return configuredLogin();
 }
 
 // A generator yields parallel(workflows) to run several sub-workflows at once; it gets back one
@@ -2809,7 +2810,7 @@ export function* discoverWorkflow({
   // Repository-wide reads (branch rules, variables, workflows) are the same for every PR of a pass.
   const keptReads = keptReadStore(paths.stateDir, clock);
   let ghFn = memoRepoReads(baseGh, keptReads);
-  const viewer = String(yield () => ghFn(['api', 'user', '-q', '.login'])).trim();
+  const viewer = String(yield () => configuredLogin()).trim();
   const listArgs = [
     'pr', 'list', '--repo', REPO, '--author', viewer, '--state', 'open', '--limit', '1000',
     '--json', 'number,id,headRefOid,headRefName,isDraft,labels,url,updatedAt,title,isCrossRepository',

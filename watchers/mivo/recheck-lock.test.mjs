@@ -31,6 +31,8 @@ test('discover passes its actual PR lock into the recheck child', t => {
 
 import { acquireLock, PR_LOCK_TOKEN_ENV, readPr, writePr } from './bin/mivo-state.mjs';
 import { repairPaths, watchWorktreePath } from './bin/mivo-repair.mjs';
+// 这些夹具里 PR 作者是 ExampleUser：watcher 以 VIGIL_GH_LOGIN 指定的账号运行，不再问 gh api user。
+process.env.VIGIL_GH_LOGIN = 'ExampleUser';
 test('real recheck child writes under the PR lock without releasing parent ownership', t => {
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'mivo-recheck-lock-'));
  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));

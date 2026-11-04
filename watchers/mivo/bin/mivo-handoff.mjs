@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { collectPrOwnershipSync } from './mivo-pr-snapshot.mjs';
+import { configuredLogin } from './mivo-identity.mjs';
 
 const same = (a, b) => typeof a === 'string' && a.length > 0 && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
@@ -81,11 +82,11 @@ function sameOwnership(before, after) {
     && before.headRefOid === after.headRefOid && before.releaseEpoch === after.releaseEpoch;
 }
 
-export function runHandoff({ command, repo, number, expectedHead, ghFn = gh }) {
+export function runHandoff({ command, repo, number, expectedHead, ghFn = gh, login = configuredLogin() }) {
   requireValue(['inspect', 'handoff', 'reclaim'].includes(command), 'command must be inspect, handoff or reclaim');
   requireValue(typeof repo === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)
     && Number.isSafeInteger(number) && number > 0, 'valid --repo and --pr are required');
-  const account = parse(ghFn(['api', 'user']));
+  const account = { login, type: 'User' };
   const read = () => collectPrOwnershipSync({ pr: { repo, number }, ghFn });
   const before = read();
   const authorAuthorized = human(account) && same(account.login, before.author.login);
