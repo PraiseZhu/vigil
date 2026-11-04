@@ -1,10 +1,28 @@
 #!/bin/sh
 # 常驻调度循环（#47 SC12）：单实例，每拍跑一次 tick.mjs。
 # 第二个实例拿不到 flock 就退出 0，不跑 tick。拿不到锁那一行不留痕（本来就没跑起来）。
-# ACCEPTANCE_TICK_SECONDS 只给测试用（正式部署用默认 60）。
+# 拍间隔默认 180 秒（#247 SC3：60 → 180，请求量与额度消耗降到约 1/3）。
+# ACCEPTANCE_TICK_SECONDS 只给测试用（正式部署用默认 180）；生效值也交给 tick，写进心跳的 tickIntervalS。
+# 注入值不是 1..3600 的整数（非数字、0、负数、误填的毫秒数）就按默认 180 秒睡（#247 P2-B）：
+# 不然 sleep 拿非法值会当场报错、循环变成空转。上界与心跳年龄上限同源。
 # SIGKILL 杀不了 trap，那种退出留不了痕迹。
 set -u
 HOME_DIR="${ACCEPTANCE_WATCHER_HOME:?需要 ACCEPTANCE_WATCHER_HOME}"
+TICK_SECONDS="${ACCEPTANCE_TICK_SECONDS:-180}"
+case "$TICK_SECONDS" in
+  '' | *[!0-9]*) TICK_SECONDS=180 ;;
+esac
+# 超过 4 位一律回落到 180（含 19 位以上）：shell 的 [ -gt ] 遇到超出整数范围的值会报错并非零退出，
+# if 判为假，原值就被原样留下来，`sleep` 又真的接受它（实测循环停摆、心跳过期但 pid 还在）。
+# 4 位以内（含 3600）才用整数比较。
+if [ "${#TICK_SECONDS}" -gt 4 ]; then
+  TICK_SECONDS=180
+fi
+# 上面已保证全是数字，这里可以放心用整数比较（前导 0 不影响）。
+if [ "$TICK_SECONDS" -lt 1 ] || [ "$TICK_SECONDS" -gt 3600 ]; then
+  TICK_SECONDS=180
+fi
+export ACCEPTANCE_TICK_SECONDS="$TICK_SECONDS"
 mkdir -p "$HOME_DIR/state/host"
 exec 9>"$HOME_DIR/state/host/loop.lock"
 flock -n 9 || { echo "loop 已在跑" >&2; exit 0; }
@@ -31,6 +49,6 @@ trap '
 while :; do
   node "$(dirname "$0")/tick.mjs" 9>&- &
   wait $!
-  sleep "${ACCEPTANCE_TICK_SECONDS:-60}" 9>&- &
+  sleep "$TICK_SECONDS" 9>&- &
   wait $!
 done

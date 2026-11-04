@@ -13,6 +13,7 @@ import {
   createFakeRun,
   inventoryData,
   issueNode,
+  pageInfo,
   roundComment,
   sha256Body,
   tmpDir,
@@ -435,4 +436,52 @@ test('#224 SC15 带修正标记的已关闭且 PR 已合并子 issue 不产出�
   assert.equal(tasks.some((task) => task.ref === `${REPO}#2`), false);
   const found = tasks.find((task) => task.ref === `${REPO}#3`);
   assert.equal(found.kind, 'child');
+});
+
+// ── #247 SC1：一拍只发一遍盘点（请求数只随页数增长），且回归项不变 ──
+
+test('#247 SC1 盘点请求数只随页数增长；已关单有变化仍被拉到', async () => {
+  const profile = profileWith();
+  const open1 = issueNode({ repo: REPO, number: 20, author: OWNER });
+  const closedChanged = issueNode({
+    repo: REPO,
+    number: 21,
+    author: OWNER,
+    state: 'CLOSED',
+    closedAt: '2026-10-25T00:00:00.000Z',
+    updatedAt: '2026-10-25T00:00:00.000Z',
+    prs: [{ number: 5, url: `https://github.com/${REPO}/pull/5`, mergedAt: '2026-10-25T01:00:00.000Z', repository: { nameWithOwner: REPO } }],
+  });
+  const seenOpenCursors = [];
+  const calls = [];
+  const run = createFakeRun({
+    onGraphql: (payload) => {
+      calls.push(payload.variables);
+      seenOpenCursors.push(payload.variables.openAfter);
+      if (!payload.variables.openAfter) {
+        return inventoryData({
+          open: [open1],
+          closed: [closedChanged],
+          openPage: pageInfo(true, 'open-cursor-1'),
+          closedPage: pageInfo(false, null),
+        });
+      }
+      return inventoryData({ open: [], closed: [], openPage: pageInfo(false, null), closedPage: pageInfo(false, null) });
+    },
+  });
+  const github = createGithub({ profile, run, fetchImpl: async () => ({ token: 'nope' }) });
+  const tasks = await collectTasks(github, profile);
+  assert.equal(calls.length, 2, `两页就该只发两次请求，实际 ${calls.length}`);
+  assert.deepEqual(seenOpenCursors, [null, 'open-cursor-1']);
+  // closed 那一遍翻完了就不再翻（同一页里两次查询合成一次请求，不重复拉）。
+  assert.equal(calls.every((variables) => variables.since === profile.startAt), true, '已关单按 startAt 之后的变化拉');
+  const closed = tasks.find((task) => task.ref === `${REPO}#21`);
+  assert.ok(closed, '已关单有变化（更新过）仍要进盘点');
+  assert.equal(closed.state, 'closed');
+  assert.equal(closed.linkedPrs.length, 1);
+});
+
+test('#247 SC1 回归：评论窗口仍是 50 条（不改小），评论多的任务照样能进盘点', () => {
+  assert.match(INVENTORY_QUERY, /comments\(last: 50\)/);
+  assert.equal(LEAD_HANDOFF_COMMENT_WINDOW, 50);
 });

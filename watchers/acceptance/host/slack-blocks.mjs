@@ -427,8 +427,8 @@ export const NOTICE_COPY = Object.freeze({
   },
   'tick-failed': {
     title: '验收机有一拍调度出错',
-    what: '一次调度（每分钟一次）中途出错，常见是网络瞬断。',
-    impact: '只影响这一分钟，下一拍会自动再来。',
+    what: '一次调度（每 180 秒一次）中途出错，常见是网络瞬断。',
+    impact: '只影响这一拍，下一拍会自动再来。',
     auto: '已记日志，下一拍自动重试。',
     action: '不用。',
     needsHuman: false,

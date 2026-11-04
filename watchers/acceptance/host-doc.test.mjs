@@ -28,8 +28,9 @@ function listHostFiles(dir = HOST) {
   return out;
 }
 
-test('SC2 文档写清调度：loop 每分钟按调度文档的顺序、认领前过内存门和测试锁、ensure.sh 每小时巡检', () => {
-  assert.match(doc, /每分钟/);
+test('SC2 文档写清调度：loop 每 180 秒按调度文档的顺序、认领前过内存门和测试锁、ensure.sh 每小时巡检', () => {
+  assert.match(doc, /每 180 秒/);
+  assert.doesNotMatch(doc, /常驻循环每分钟/, '60 → 180 秒（#247 SC3/P3-4）后文档不许再写「常驻循环每分钟」');
   assert.match(doc, /host\/loop/);
   assert.match(doc, /acceptance-scheduler\.md/);
   assert.match(doc, /认领\*\*之前\*\*过内存门/);
@@ -116,7 +117,7 @@ test('SC4 文档写清上线顺序、停用和回滚', () => {
   assert.match(doc, /poll\.mjs --json/);
   assert.match(doc, /手动跑一轮/);
   assert.match(doc, /host\/round\.mjs --issue/);
-  assert.match(doc, /常驻循环每分钟/);
+  assert.match(doc, /常驻循环每 180 秒/);
   assert.match(doc, /stop\.sh/);
   assert.match(doc, /rollback\.mjs/);
   assert.match(doc, /回滚：手动停用/);

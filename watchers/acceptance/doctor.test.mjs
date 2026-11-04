@@ -17,6 +17,7 @@ import {
   skipGateAuditFromArgv,
 } from './bin/doctor.mjs';
 import { hostPaths } from './host/paths.mjs';
+import { HEARTBEAT_MAX_AGE_MS, heartbeatMaxAgeMs } from './host/poll-beat.mjs';
 import { OWNER, REPO, HANDOFF_REPO, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -513,4 +514,64 @@ test('写闸账本审计：默认调用一次，输出和现在一样；--skip-g
   assert.equal(skipGateAuditFromArgv(['node', 'doctor.mjs']), false);
   assert.equal(skipGateAuditFromArgv(['node', 'doctor.mjs', '--skip-gate-audit']), true);
   assert.equal(skipGateAuditFromArgv(['node', 'doctor.mjs', '--board-item', 'example-owner/example-repo#1']), false);
+});
+
+// #247 P2-6：心跳年龄上限按拍间隔算（拍间隔 + 余量），不再硬贴 180000 ms。
+// 一拍的心跳时刻是「拍尾写 → sleep(拍间隔) → 下一拍启动才写」，所以「一个拍间隔」正好在边界上。
+test('#247 P2-6 常驻循环：180 秒拍、心跳 200 秒前 → 绿（上限 = 拍间隔 + 余量）；300 秒才红', async () => {
+  const within = makeFixture({ heartbeat: { at: new Date(NOW - 200000).toISOString(), pid: process.pid, tickIntervalS: 180 } });
+  const ok = await runDoctor({ profileEnv: within.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, uptime: () => 1000 });
+  const okCheck = checkOf(ok, '常驻循环');
+  assert.equal(okCheck.ok, true, okCheck.detail);
+  assert.match(okCheck.detail, /上限 240 秒/, '上限按心跳里的 tickIntervalS 折算并留 60 秒余量');
+
+  const beyond = makeFixture({ heartbeat: { at: new Date(NOW - 300000).toISOString(), pid: process.pid, tickIntervalS: 180 } });
+  const red = await runDoctor({ profileEnv: beyond.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, uptime: () => 1000 });
+  assert.equal(checkOf(red, '常驻循环').ok, false, '超出拍间隔 + 余量照样报红');
+});
+
+// #247 P2-B：心跳里的 tickIntervalS 只认 1..3600 的整数。离谱值（超大 / 0 / 负数 / 非数字 / 字符串）
+// 一律回落默认 180 秒 → 上限 240 秒，不许把一个写歪的值放大成「几小时不重启也绿」。
+test('#247 P2-B 心跳年龄上限有上界：tickIntervalS 只认 1..3600 的整数，其余回落默认 180 秒', () => {
+  const cases = [
+    ['缺失', undefined, 240000],
+    ['null', null, 240000],
+    ['0', 0, 240000],
+    ['负数', -60, 240000],
+    ['NaN', Number.NaN, 240000],
+    ['Infinity', Number.POSITIVE_INFINITY, 240000],
+    ['非整数', 1.5, 240000],
+    ['字符串', '600', 240000],
+    ['布尔', true, 240000],
+    ['对象', { seconds: 600 }, 240000],
+    ['下限内', 60, 120000],
+    ['默认', 180, 240000],
+    ['上限边界', 3600, 3660000],
+    ['上限 + 1', 3601, 240000],
+    ['一天', 86400, 240000],
+    ['十亿', 1e9, 240000],
+  ];
+  for (const [label, value, expected] of cases) {
+    assert.equal(
+      heartbeatMaxAgeMs({ tickIntervalS: value }),
+      expected,
+      `${label}：tickIntervalS=${String(value)} 的年龄上限`,
+    );
+  }
+  assert.equal(HEARTBEAT_MAX_AGE_MS, 240000, '默认上限不变');
+});
+
+test('#247 P2-B 心跳写歪的那个值不让看门狗失效：tickIntervalS=86400 时 300 秒前的心跳照样报红', async () => {
+  const lying = makeFixture({ heartbeat: { at: new Date(NOW - 300000).toISOString(), pid: process.pid, tickIntervalS: 86400 } });
+  const red = await runDoctor({ profileEnv: lying.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, uptime: () => 1000 });
+  const check = checkOf(red, '常驻循环');
+  assert.equal(check.ok, false, `上限要回落到 240 秒，不能按 86400 秒算：${check.detail}`);
+  assert.match(check.detail, /上限 240 秒/);
+
+  // 上界本身是允许的：3600 秒拍 → 3660 秒上限，300 秒前的心跳是健康的。
+  const edge = makeFixture({ heartbeat: { at: new Date(NOW - 300000).toISOString(), pid: process.pid, tickIntervalS: 3600 } });
+  const green = await runDoctor({ profileEnv: edge.profileEnv, probes: makeProbes(), github: makeGithub(), now: () => NOW, uptime: () => 1000 });
+  const edgeCheck = checkOf(green, '常驻循环');
+  assert.equal(edgeCheck.ok, true, edgeCheck.detail);
+  assert.match(edgeCheck.detail, /上限 3660 秒/);
 });

@@ -41,6 +41,12 @@ export function hostPaths(home) {
     prbotRoundsDir: path.join(prbotDir, 'rounds'),
     prbotReadyDir: path.join(prbotDir, 'ready'),
     hostConfig: path.join(home, 'config', 'host.json'),
+    // 额度预算配置（#247 SC5）：三个消费方各一条，缺项就报错，不猜默认值。
+    rateBudgetConfig: path.join(home, 'config', 'rate-budget.json'),
+    // 最近一次响应头的剩余与 reset（按令牌身份分开记）、组件用量（#247 SC9）。
+    rateState: path.join(hostDir, 'rate-budget.json'),
+    // 每拍一份看板快照（#247 SC2）：dry-run、写入、仓外读者共用这一份。
+    boardSnapshot: path.join(hostDir, 'board-snapshot.json'),
     loopLog: path.join(hostDir, 'loop.log'),
     roundRunDir: path.join(home, 'run'),
   };

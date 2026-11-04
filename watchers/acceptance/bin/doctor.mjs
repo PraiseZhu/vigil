@@ -13,7 +13,7 @@ import { createProbes } from '../host/probes.mjs';
 import { handoffFor, preflightCommands, repoConfig } from '../host/prbot-config.mjs';
 import { checkSlackAccess } from '../host/slack-notify.mjs';
 import { describeViolation, runGateAudit } from '../host/gate-audit.mjs';
-import { POLL_STALL_S, heartbeatPhase, phaseLabel, pollingElapsedS } from '../host/poll-beat.mjs';
+import { POLL_STALL_S, heartbeatMaxAgeMs, heartbeatPhase, heartbeatTickSeconds, phaseLabel, pollingElapsedS } from '../host/poll-beat.mjs';
 
 /** 令牌账号 == ownerLogin 用这条。 */
 export const VIEWER_QUERY = `query {
@@ -63,7 +63,6 @@ export const BOARD_ACCESS_QUERY = `query ($login: String!, $projectNumber: Int!)
 export const ACCEPTANCE_OPTIONS = Object.freeze(['验收中', '要修', '修正中', '通过']);
 
 export const MIN_NODE_MAJOR = 22;
-export const HEARTBEAT_MAX_AGE_MS = 180000;
 const FORK_PERMISSIONS = new Set(['ADMIN', 'MAINTAIN', 'WRITE']);
 
 function firstLine(text) {
@@ -371,14 +370,21 @@ export async function runDoctor({
     const label = phase ? phaseLabel(phase.name) : '';
     const pollS = phase ? pollingElapsedS(phase, { now, uptime }) : null;
     const pollStuck = pollS !== null && pollS > POLL_STALL_S;
-    const heartbeatDetail = `心跳 ${ageS} 秒前（上限 ${HEARTBEAT_MAX_AGE_MS / 1000} 秒）`;
+    // 上限按心跳里的拍间隔算（#247 P2-6），但拍间隔有上界（#247 P2-B）：写歪的值回落默认 180 秒 → 240 秒上限。
+    const tickS = heartbeatTickSeconds(heartbeat);
+    const heartbeatDetail = `心跳 ${ageS} 秒前（上限 ${heartbeatMaxAgeMs(heartbeat) / 1000} 秒）`;
+    // 心跳里的拍间隔用不了（写歪 / 手改 / 别的写入方）：把原因写进 detail，别让 240 秒看起来像是配置的意图。
+    const tickNote =
+      tickS === heartbeat?.tickIntervalS
+        ? ''
+        : `；心跳里的 tickIntervalS=${String(heartbeat?.tickIntervalS).slice(0, 20)} 不可用，按默认拍间隔 ${tickS} 秒算`;
     const killHint = phase?.name === 'poll' ? '拉取 120 秒就该被掐掉' : phase?.name === 'prbot' ? '每次读取 120 秒就该被掐掉' : '这一段不该这么久';
     let detail;
     if (!alive) detail = '心跳里的 pid 已经不在（循环没跑）';
     else if (pollStuck) detail = `${label}已 ${pollS} 秒没结束，超过上限 ${POLL_STALL_S} 秒（${killHint}，可能卡死）；${heartbeatDetail}`;
     else if (pollS !== null) detail = `${heartbeatDetail}，正在${label}（已 ${pollS} 秒，上限 ${POLL_STALL_S} 秒）`;
     else detail = heartbeatDetail;
-    add('常驻循环', alive && age <= HEARTBEAT_MAX_AGE_MS && !pollStuck, detail);
+    add('常驻循环', alive && age <= heartbeatMaxAgeMs(heartbeat) && !pollStuck, `${detail}${tickNote}`);
   } catch {
     add('常驻循环', false, '没有心跳文件（循环没跑）');
   }

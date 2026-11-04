@@ -25,6 +25,15 @@ export function watcherHome(env = process.env) {
   return path.resolve(HERE, '..');
 }
 
+/**
+ * 显式设了的 home（`ACCEPTANCE_WATCHER_HOME`），没设或不是绝对路径就返回 null。
+ * 需要 fail-closed 的调用方用它：不回落默认目录，也不按别的参数猜路径（#247 P1-1）。
+ */
+export function explicitWatcherHome(env = process.env) {
+  const explicit = env?.[HOME_ENV];
+  return typeof explicit === 'string' && path.isAbsolute(explicit) ? explicit : null;
+}
+
 export function profilePath(env = process.env) {
   return path.join(watcherHome(env), 'config', 'profile.json');
 }

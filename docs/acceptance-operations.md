@@ -15,8 +15,8 @@
 
 | 部分 | 落在哪 | 规则 |
 |---|---|---|
-| 常驻调度 | `watchers/acceptance/host/loop` | 单实例（flock），**每分钟**跑一拍 `host/tick.mjs`，顺序照 `docs/acceptance-scheduler.md` |
-| 每小时巡检 | `watchers/acceptance/host/ensure.sh` | 给每小时一次的 routine 调用：心跳不超过 180 秒就不做事；心跳过期但原循环进程还在、单实例锁还占着，只记一条「心跳延迟」（`heartbeat-delayed`，进摘要），不补起；其中墙钟跳了很久、按机器实际运行时间心跳还在 180 秒内的，记 `host-frozen`（整机冻结），也不补起；其余情况把 `loop` 拉起来并写一条提醒（`stop.sh` 主动停过的记成部署重启 `loop-deploy-restarted`，进摘要；整机冻结后原循环已经不在的记 `heartbeat-stale-after-freeze`） |
+| 常驻调度 | `watchers/acceptance/host/loop` | 单实例（flock），**每 180 秒**跑一拍 `host/tick.mjs`（#247 从 60 秒改成 180 秒，生效值写进心跳的 `tickIntervalS`），顺序照 `docs/acceptance-scheduler.md` |
+| 每小时巡检 | `watchers/acceptance/host/ensure.sh` | 给每小时一次的 routine 调用：心跳不超过「拍间隔 + 60 秒余量」（默认 240 秒）就不做事；心跳过期但原循环进程还在、单实例锁还占着，只记一条「心跳延迟」（`heartbeat-delayed`，进摘要），不补起；其中墙钟跳了很久、按机器实际运行时间心跳还在同一上限内的，记 `host-frozen`（整机冻结），也不补起；其余情况把 `loop` 拉起来并写一条提醒（`stop.sh` 主动停过的记成部署重启 `loop-deploy-restarted`，进摘要；整机冻结后原循环已经不在的记 `heartbeat-stale-after-freeze`） |
 | 资源门 | `host/round.mjs` | 认领**之前**过内存门（MemAvailable ≥ 3 GiB），不够时在 `state/host/rounds.log` 留一行 `<UTC 时间> mem-gate-defer issue=<owner/repo#号> availKiB=<KiB 或 unknown> thresholdMiB=3072 内存门：…，这一拍不认领`（阈值 3072 MiB = 3221225472 字节；issue 是这一拍被挡的待开轮）（统计用 `grep mem-gate-defer`，按行首时间筛近 24 小时；#147 之前的老行没有时间，不回填）和测试锁（mivo 同时只跑一轮；`host.json` 的 `serialRepos` 名单里的仓同样各自同时只跑一轮）；最多 2 轮同时跑 |
 | 写闸 | `host/write-gate.mjs` | 所有写动作在沙箱外再查一遍，以它为准（见第 3 节） |
 | 模型 | `host/round.mjs` + `<home>/config/host.json` | pi 用 **DeepSeek V4.1 Flash**，推理 **max**；有争议条目的裁决运行（`host/adjudicate.mjs`）用 `anthropic/claude-opus-5-5`，推理 **medium**（`adjudicateCommand`） |
@@ -414,7 +414,7 @@ Slack 自己的 `slack-failed`（重试用完）、`slack-history-failed`（读�
    ```
 
    写闸总开关关着时这一轮不认领、直接退出 3（不写提醒）；心跳里是 `gate: disabled`。
-6. **打开总开关，让常驻循环每分钟调度**：
+6. **打开总开关，让常驻循环每 180 秒调度**：
 
    ```sh
    : > <home>/state/write-gate/enabled      # 建这个文件就是打开
@@ -482,7 +482,7 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
   `ADMIN`/`MAINTAIN`/`WRITE`。fork 默认是 `ownerLogin` 名下同名的仓；名字不同就在 profile 里写
   `"forkTargets": {"<上游 owner/repo>": "<ownerLogin>/<fork 名>"}`（键必须在 `forkRepos` 里，fork 必须在
   `ownerLogin` 名下）。修正轮推分支、写闸核对 PR head 用的都是同一个对照。
-- `常驻循环`：心跳里的 pid 活着且心跳不超过 3 分钟。心跳只表示循环活着：一拍内每 30 秒刷新一次，并带 `phase`（`name`、`startedAt`、`startedUptimeS`、`elapsedS`，当前阶段、已多久；阶段有 `poll` 拉取、`abort` 清理卡住的轮次、`prbot` 修正轮读取、`dispatch` 派发、`audit` 写闸审计、`notify` 发通知），拉取阶段另带旧字段 `polling`（兼容），拍尾的心跳两者都不带。修正轮里每发起一次 GitHub 读取都重新计时，每次读取 45 秒没返回就连同它起的子进程整组掐掉，用新进程重试一次，重试也没返回才按读失败收尾、提醒里注明「已重试一次」；拉取（poll）同理，单次 60 秒、超时整组掐掉重试一次（写不加超时、不重试）。重试成功不写提醒，只在 `state/host/loop.log` 留一行 `<UTC 时间> read-retry-ok kind=<poll|prbot-read> totalMs=<毫秒> 读取超时已重试成功`，统计超时次数用 `grep -c read-retry-ok`。任何阶段按机器实际运行时间算超过 180 秒就不再刷新心跳，这一项也单独报红并写明阶段（例如「修正轮读取已 N 秒没结束，超过上限 180 秒」）。
+- `常驻循环`：心跳里的 pid 活着且心跳不超过「拍间隔 + 60 秒余量」（默认 180 秒拍 → 240 秒；`tickIntervalS` 只认 1..3600，见第 14 节「心跳年龄阈值」）。心跳只表示循环活着：一拍内每 30 秒刷新一次，并带 `phase`（`name`、`startedAt`、`startedUptimeS`、`elapsedS`，当前阶段、已多久；阶段有 `poll` 拉取、`abort` 清理卡住的轮次、`prbot` 修正轮读取、`dispatch` 派发、`audit` 写闸审计、`notify` 发通知），拉取阶段另带旧字段 `polling`（兼容），拍尾的心跳两者都不带。修正轮里每发起一次 GitHub 读取都重新计时，每次读取 45 秒没返回就连同它起的子进程整组掐掉，用新进程重试一次，重试也没返回才按读失败收尾、提醒里注明「已重试一次」；拉取（poll）同理，单次 60 秒、超时整组掐掉重试一次（写不加超时、不重试）。重试成功不写提醒，只在 `state/host/loop.log` 留一行 `<UTC 时间> read-retry-ok kind=<poll|prbot-read> totalMs=<毫秒> 读取超时已重试成功`，统计超时次数用 `grep -c read-retry-ok`。任何阶段按机器实际运行时间算超过 180 秒就不再刷新心跳，这一项也单独报红并写明阶段（例如「修正轮读取已 N 秒没结束，超过上限 180 秒」）。
 - `写闸账本审计`：只读跑一次写闸账本审计（第 3 节的 `state/write-gate/ledger.jsonl`），看有没有越规写入；
   明细报「核对了多少行、基线是什么、基线后违规几条、拿不准几条、这次新发现哪几条」。只有**明确违规**让这一项变红；
   「拿不准」只记日志（明细里报出来），GitHub 只读核对没做成也照旧写进明细但不改变红绿。审计内部出错只报这一项失败。
@@ -528,6 +528,10 @@ ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/host/rollback.mjs
 
 - 常驻循环每拍跑一次（只读本地账本，**不查 GitHub**），结果写进 `heartbeat.lastTick.gateAudit`
   （`checked` / `found` / `sinceBaseline` / `uncertain`）；出错只写 `heartbeat.lastTick.gateAuditError`，不影响这一拍。
+- 带 `--github` 时只审上次游标之后新增的轮次；某次查询失败（5xx / 限流 / 读不到评论）的轮次记进
+  `state/host/gate-audit.json` 的 `pendingGithubRounds`，下一轮一定重查，不因游标推进而永久退出审计。
+  待审集合上限 `AUDIT_PENDING_LIMIT = 500` 条；**超上限不静默丢**：审计游标退回到被丢掉的最早一轮之前
+  （下一轮把它们当新增轮次重查），并在审计日志留一行 `level: info`、`rule: pending-overflow`（写明丢掉几条、退到第几行）。
 - `doctor` 的「写闸账本审计」和手动运行会带上 `--github` 的只读评论核对。
   已经单独跑过时：`node watchers/acceptance/bin/doctor.mjs --skip-gate-audit`（项名不变，算通过，不再查一遍）。默认不跳过。
   评论按 issue 根有限并发读取（同时最多 4 个请求），只取 `databaseId` 和 `createdAt`，窗口仍是最后 100 条。
@@ -781,3 +785,76 @@ touch <state-dir>/disabled
 3. 确认 dry-run 的还原清单之后，再加 `--write` 把值改回去。
 
 github-live 的手测（真的看板上跑 24 小时、以及合并后确认没有新的 cron）由 Inspector 在验收机上做。本仓库的测试只覆盖入口、限额、停写和文档里的检查表。
+
+## 14. 额度预算与按真实剩余退避
+
+对应本仓 issue #247。额度是账号级的，本机所有读 GitHub 的组件共用同一枚用户令牌，所以这里只管本机一侧：每个组件一份预算、看板每拍只读一次、剩余额度只看响应头。
+
+### 判定依据
+
+只看最近一次只读 GraphQL 响应头 `x-ratelimit-remaining` 与 `x-ratelimit-reset`，**不看** `rate_limit` 表（实测表里能多报几千分）。响应头由 `bin/github.mjs` 的只读通道带回（`gh api graphql --include` 或 `fetch` 响应对象），组件身份标记一起记。
+
+阈值常量集中写在 `watchers/acceptance/bin/rate-budget.mjs`，数值只有两档，严格小于才生效：
+
+| 剩余额度 | 动作 |
+|---|---|
+| `remaining < 1500` | 这一拍跳过看板读（整板查询一次都不发），其余非必要读照跑 |
+| `remaining < 800` | 这一拍全面暂停非必要读，只保留主循环 poll |
+| 恰好 1500 / 800 | 不触发该档（严格小于） |
+| 响应头缺失或不是数字 | 写一行 `rate-unknown`，不跳过、不暂停，不拿另一枚令牌的数顶替 |
+| 响应头缺字段（读失败没有头块、502 页面、App 令牌回落） | 一条都不记：不拿空值覆盖上一次的有效剩余 |
+
+过了 `x-ratelimit-reset` 之后进入限速恢复期：默认「重置后前 5 分钟」，恢复期内每拍最多 1 次非必要读，多个消费方按 `loop` → `prio-run` → `board-live` 的顺序轮转，不在重置瞬间集中补扫。恢复期结束后，本轮剩余以新窗口的实际响应头为准；新窗口还没拿到响应头时写 `rate-unknown`，不沿用旧窗口的暂停状态。
+
+### 预算配置
+
+必填文件 `<home>/config/rate-budget.json`（`rate-budget.mjs` 的 `readBudgetFile`），缺项、非整数、非正数都报可诊断错误，不按默认值猜：
+
+```json
+{
+  "rateBudget": {
+    "loop": 500,
+    "prio-run": 300,
+    "board-live": 140
+  }
+}
+```
+
+单位是这一小时的额度点数。`loop` 按「poll 的响应头个数 × 6 点」记，`prio-run` 一次整板读按 8 点记，`board-live` 按 REST 请求数记（它主要走 App 安装令牌的独立额度）。三个值都是保守值，按 #247「待定」项取：主循环改后实测约 500 点/小时、prio-run 沿用 300、仓外看板组件落在用户令牌上约 140 请求/小时。超预算只有该组件自己跳过，同一小时里别的组件照常跑。注意「跳过」的粒度不是一拍：`used` 只增不减、UTC 整点才切窗，所以某个组件一旦在这一小时里超了预算，这一小时**剩余所有拍**它都不再做那一读（不是只丢刚才那一拍）；跨过 5 拍时写一条 `rate-skip-escalate` 提醒（同一段连跳只写一条：越过阈值后继续跳过不再重复提醒，恢复放行或切窗清零后重新计），见本节末尾。
+
+**预算闸只约束非必要读**：`purpose: 'essential'`（只有主循环 poll）直接放行，越预算照跑——拦它会把这一小时剩下的 poll 连同心跳之外的 abort / 派发一起停掉，而心跳仍是 `ok: true`（复审报的 P1）。用量照记，所以 `components.<组件>.used` 超过预算值是正常现象，超预算的后果只落在该组件的非必要读上（修正轮发现、卡住检查、看板整板读等）。响应头闸的 `< 800` 一档同样只暂停非必要读，`essential` 不拦，两处口径一致。
+
+配置缺了或值不对时：`prio-run` 打一行「额度预算配置无法使用：…」并只走响应头闸；主循环把原因写进心跳的 `lastTick.rateBudgetError`，同样不猜默认值。
+
+### 状态文件（按令牌分开）
+
+`<home>/state/host/rate-budget.json`。`identities` 下每个令牌一格（`user` 账号令牌、`app` App 安装令牌），各记 `remaining` / `remainingRaw` / `reset` / `at` / `source`，互相不覆盖；某一枚没有记录时按缺头处理（`rate-unknown`）。`components` 下是各组件本小时（UTC 整点切窗）的 `used`，`recovery` 是当前恢复期的轮转位置，`skips` 是连续「因额度跳过」的拍数：`skips.byKey` 按「组件:用途」分开数（判定连跳用这个），每一项记 `count`（连跳的**拍**数）、`lastAt`、`lastTick`（这一拍已经计过数，同一拍再判只算一拍）、`escalated`（这一段连跳已经提醒过，不再重复）、`reason`；`skips.count` 是**最近一次判定那个 key** 的连跳数，随判定顺序变化，外部要读连跳请看 `byKey`。
+
+### 看板快照（每拍只整板读一次）
+
+`<home>/state/host/board-snapshot.json`，由 `prio-run` 每拍开头写一次，字段固定为 `version`（状态格式版本，当前是 1）、`at`（抓取时间，ISO）、`items`、`excludedCount`、`nullContent`。同一拍里 dry-run、`--write` 和仓外看板读者共用这一份，不再各自发整板查询；PR 搜索不属于快照，照旧每次都拉。
+
+读者只有两条路：`at` 距今不超过一个拍间隔（默认 180 秒）就直接用；过了就**重拉一次并覆盖**（`prio-run` 走这条），或者报「快照过期」不用（仓外读者走这条）。读接口是 `rate-budget.mjs` 的 `readBoardSnapshot`，返回 `{ok, reason, at, ageMs, items, excludedCount, nullContent}`，`reason` 是 `missing` / `stale` / `corrupt` / `clock-skew`。不许静默用旧数据。`ageMs` 为负（墙钟往回跳）按 `clock-skew` 处理：旧快照不能用，等下一拍重拉。快照里的 `items` 是抓取那一刻按 `repo-class.json` 分档过滤后的结果；拍内改分类表不影响这一份快照（下一拍重拉时生效）。用到快照的那一拍不按整板读记点数（真发请求时才记 8 点）。
+
+### 日志行
+
+跳过、缺头、重置恢复都写一行到 `state/host/loop.log`（`prio-run` 写自己的 `run-YYYY-MM-DD.log`），键值格式与「资源门」一致，统计用 `grep`：
+
+```
+<UTC 时间> rate-skip component=prio-run identity=user remaining=1400 action=remaining-below-1500 因额度跳过
+<UTC 时间> rate-skip component=loop identity=user remaining=unknown action=over-budget budget=500 used=498 cost=6 因额度跳过
+<UTC 时间> rate-unknown component=loop identity=app remaining=unknown raw=（缺失） reason=no-record 响应头缺失或不合法，本拍不跳过
+<UTC 时间> rate-recovery component=loop identity=user remaining=438 resetAt=2026-11-03T19:07:00.000Z 重置后限速恢复：每拍最多 1 次非必要读
+```
+
+连续「因额度跳过」超过 5 拍（N=5）时行尾再带 `streak=<拍数>`，仍然只跳过、不抛错；连跳节数按「组件 + 用途」分开数（`skips.byKey`），同一拍里 `essential` 放行不会把非必要读的连跳清零，同一拍里同一个 key 判两次（`loop` 的修正轮发现 + 卡住检查）也只算一拍。跨过 5 拍时写一条 `rate-skip-escalate` 提醒（带 `count`、`component`），只写这一条：越过阈值后继续跳过不再重复写，恢复放行或切窗清零后重新计；心跳 `ok` 一直是 true，光看心跳发现不了「整小时没在推进」。
+
+限流被识别出来（403 带 rate limit 文案、429、GraphQL 的 `RATE_LIMITED` 错误码）时：`poll.mjs` 以退出码 75 收尾；修正轮发现和卡住检查遇限流时那一段直接跳过。两种情况都记 `lastTick.rateSkipped = github-rate-limited`（具体哪一段看同一条心跳里的 `rateSkippedStage`），不写 `tick-failed` / `prbot-tick-failed`、不触发看门狗停循环。跳过的原因只有一个字段名 `rateSkipped`（不再另写 `skipped`），取值是 `over-budget` / `remaining-below-800` / `remaining-below-1500` / `recovery-turn` / `github-rate-limited` 之一。
+
+额度判定自己出错（状态文件读不出、写不下去）时：这一拍照常跑（放行），原因写进心跳的 `lastTick.rateGateError`，并在 `loop.log` 写一行 `rate-unknown … reason=rate-gate-error`——不静默 fail-open。`prio-run` 同一口径：判定或写状态出错就放行，写一行 `rate-unknown component=prio-run … reason=rate-gate-error` 到它自己的 `run-YYYY-MM-DD.log`，返回值里带 `gateError`；看板快照写不下去（位置被目录占着、磁盘满、权限不对）也不挡这一拍，写一行 `board-snapshot-error component=prio-run reason=write-failed` 并带 `snapshotError`，这一拍用的是刚拉到的数据。
+
+### 心跳年龄阈值
+
+一拍的心跳时刻是「拍尾写 → sleep(拍间隔) → 下一拍 node 启动后才写」，所以「一个拍间隔」正好压在边界上。`bin/doctor.mjs` 的「常驻循环」和 `host/ensure.sh` 都按**心跳里的 `tickIntervalS` + 60 秒余量**判（默认 180 秒拍 → 240 秒上限），不写死 180000 ms；`tickIntervalS` 缺失时按默认 180 秒算。
+
+上限不能由心跳内容无限放大：`tickIntervalS` 只认 **1..3600 的整数**（JSON 数字，字符串不算）。缺失、`null`、0、负数、非整数、非数字、字符串、超过 3600 一律回落默认 180 秒（上限 240 秒），doctor 的明细会写明「心跳里的 tickIntervalS=… 不可用，按默认拍间隔 180 秒算」。写入侧 `host/loop` / `host/tick.mjs` 先用同一档上界夹一次（`ACCEPTANCE_TICK_SECONDS` 是 `abc` / `0` / `180000` 都按 180 秒睡、按 180 秒写），读取侧 `bin/doctor.mjs` 与 `host/ensure.sh` 再用同一把尺判。不这样夹的话，一个误填的毫秒数（`180000`）会让心跳上限变成 50 小时、`86400` 会变成一天，看门狗在 pid 还活着这条分支上完全不判，而且没有任何告警。

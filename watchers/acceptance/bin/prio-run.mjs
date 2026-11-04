@@ -8,7 +8,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { redact } from './redact.mjs';
-import { loadAcceptanceProfile } from './profile.mjs';
+import { explicitWatcherHome, loadAcceptanceProfile } from './profile.mjs';
+import { hostPaths } from '../host/paths.mjs';
+import {
+  TICK_SECONDS,
+  appendRateLog,
+  decideTick,
+  readBoardSnapshot,
+  readBudgetFile,
+  readRateState,
+  writeBoardSnapshot,
+  writeRateState,
+} from './rate-budget.mjs';
 import {
   ITEM_FIELD_QUERY,
   PRIO_HOURLY_MAX,
@@ -30,6 +41,8 @@ import {
 } from './prio-sync.mjs';
 
 export const PRIO_TICK_DEFAULT = 10;
+/** 一次整板读的估计点数（实测单页 2 点、一次约 8 点）：只用来记 prio-run 的小时用量。 */
+export const BOARD_READ_COST = 8;
 const PRIORITIES = new Set(['P0', 'P1', 'P2', 'P3']);
 const FAIL_STREAK_LIMIT = 3;
 
@@ -325,7 +338,7 @@ async function loadBoard(deps, profile, table) {
   if (deps.loadItems) {
     const items = await deps.loadItems();
     const prs = deps.loadPrs ? await deps.loadPrs() : [];
-    return { items: items || [], prs: prs || [], excludedCount: 0, nullContent: 0, reader: null };
+    return { items: items || [], prs: prs || [], excludedCount: 0, nullContent: 0, reader: null, source: 'injected' };
   }
   const reader = createReadGithub({ profile, run: deps.run, fetchImpl: deps.fetchImpl });
   const board = await loadBoardItems(reader, profile, table);
@@ -337,7 +350,59 @@ async function loadBoard(deps, profile, table) {
     excludedCount: board.excludedCount,
     nullContent: board.skipped?.nullContent || 0,
     reader,
+    source: 'fetched',
   };
+}
+
+/**
+ * 这一拍的宿主状态文件（看板快照、额度状态、预算配置）：直接问 host/paths.mjs，不按 `--state-dir` 的布局猜（#247 P1-1）。
+ * 部署里 `--state-dir` 是 `<home>/tools/.prio`，宿主状态在 `$ACCEPTANCE_WATCHER_HOME/state/host`，两者不同级；
+ * 早先「上两级 + state/host」的推导会写到 <home>/state/host（没人读的目录），看板快照与分令牌账都落到错的地方。
+ * 没设 `ACCEPTANCE_WATCHER_HOME` 时返回 null：不猜路径，调用方按「额度闸未启用」处理。
+ */
+export function hostFilesFromEnv(env) {
+  const home = explicitWatcherHome(env);
+  return home ? hostPaths(home) : null;
+}
+
+/**
+ * 这一拍的看板数据（#247 SC2）：整板只读一次。
+ * - 本地快照还新（at 距今不超过一个拍间隔）：直接用，不再发整板 GraphQL；dry-run、写入、仓外读者共用这一份；
+ * - 快照过期或缺失：重拉一次并覆盖，不静默用旧数据。
+ * 重拉只覆盖整板读，PR 搜索不属于快照，照旧每次都拉。
+ */
+async function resolveBoard(deps, profile, table, { snapshot, snapshotFile, now, tickSeconds, onSnapshotError }) {
+  if (deps.loadItems) return loadBoard(deps, profile, table);
+  const reader = createReadGithub({ profile, run: deps.run, fetchImpl: deps.fetchImpl });
+  if (snapshot && snapshot.ok) {
+    const repos = [...new Set((snapshot.items || []).map((entry) => entry.repo))];
+    const prs = deps.loadPrs ? await deps.loadPrs() : await loadPullRequests(reader, repos, table);
+    return {
+      items: snapshot.items,
+      prs: prs || [],
+      excludedCount: snapshot.excludedCount || 0,
+      nullContent: snapshot.nullContent || 0,
+      reader,
+      source: 'snapshot',
+      snapshotAt: snapshot.at,
+    };
+  }
+  const board = await loadBoard(deps, profile, table);
+  if (snapshotFile) {
+    try {
+      writeBoardSnapshot(snapshotFile, {
+        at: now,
+        items: board.items,
+        excludedCount: board.excludedCount,
+        nullContent: board.nullContent,
+      });
+    } catch (error) {
+      // 快照写不下去（位置被目录占着、磁盘满、权限不对）不挡这一拍：这一拍照常用刚拉到的数据，
+      // 只留痕（#247 复审 P2-a，与 host/tick.mjs 的 rateGate 同一口径：判定/写盘自己出错就放行）。
+      if (typeof onSnapshotError === 'function') onSnapshotError(error);
+    }
+  }
+  return { ...board, snapshotReason: snapshot?.reason || 'missing' };
 }
 
 export async function runContinuous(argv = [], deps = {}) {
@@ -364,7 +429,85 @@ export async function runContinuous(argv = [], deps = {}) {
     const table = deps.table || readRepoClassTable(path.join(dir, 'repo-class.json'));
     const allowRepos = wantWrite ? readAuthorizedRepos(path.join(dir, 'authorized-repos.json')) : [];
     const hourlyUsed = countRecentChanges(readChangeLog(dir), now, PRIO_HOURLY_WINDOW_MS);
-    const board = await loadBoard(deps, profile, table);
+    // 额度两道闸（#247 SC5 / SC6）：先看预算与响应头剩余，不够就这一拍不读看板、不写，也不报错。
+    // 状态文件用 host/paths.mjs 的那一组（P1-1）；没给 home 又没显式给文件时不做额度闸（不猜路径）。
+    const hostFiles = deps.hostFiles || hostFilesFromEnv(deps.env);
+    const snapshotFile = deps.snapshotFile || hostFiles?.boardSnapshot || null;
+    const rateFile = deps.rateFile || hostFiles?.rateState || null;
+    const budgetFile = deps.budgetFile || hostFiles?.rateBudgetConfig || null;
+    let budgets = deps.budgets || null;
+    let budgetError = null;
+    if (!budgets && budgetFile) {
+      try {
+        budgets = readBudgetFile(budgetFile);
+      } catch (error) {
+        // 配置缺了或值不对：报出来、不猜默认值，只走响应头闸。
+        budgetError = String(error?.message || error);
+        stdout.write(`额度预算配置无法使用：${budgetError}\n`);
+      }
+    }
+    if (!rateFile) {
+      stdout.write('额度闸未启用：没设 ACCEPTANCE_WATCHER_HOME，也没有显式给出额度状态文件\n');
+    }
+    const tickSeconds = deps.tickSeconds || TICK_SECONDS;
+    // 快照先读：已经能用的快照不发整板读，这一拍就不该按整板读记点数（#247 P3-6）。
+    const snapshot = snapshotFile ? readBoardSnapshot(snapshotFile, { now, tickSeconds }) : null;
+    const willFetchBoard = !deps.loadItems && !snapshot?.ok;
+    let gate = { allowed: true, state: null, log: null, remaining: null, skipStreak: 0, reason: '' };
+    let gateError = null;
+    let snapshotError = null;
+    if (rateFile) {
+      try {
+        gate = decideTick({
+          component: 'prio-run',
+          purpose: 'board',
+          state: readRateState(rateFile),
+          now,
+          budgets,
+          cost: willFetchBoard ? BOARD_READ_COST : 0,
+        });
+        writeRateState(rateFile, gate.state);
+      } catch (error) {
+        // 额度判定或写状态自己出错（状态文件位置被目录占着、读不出来、写不下去）：这一拍照常跑（放行）并留痕。
+        // 与 host/tick.mjs 的 rateGate 同一口径（#247 复审 P2-a）：要么放行 + 留痕，要么就不算 fail-open。
+        gateError = String(error?.message || error);
+        gate = { allowed: true, state: null, log: null, remaining: null, skipStreak: 0, reason: 'rate-gate-error' };
+        stdout.write(
+          `${new Date(now).toISOString()} rate-unknown component=prio-run identity=user remaining=unknown reason=rate-gate-error ${gateError} 判定或写状态出错，这一拍照常跑\n`,
+        );
+      }
+      if (gate.log) {
+        appendRateLog(path.join(dir, `run-${new Date(now).toISOString().slice(0, 10)}.log`), gate.log);
+        stdout.write(`${gate.log}\n`);
+      }
+      if (!gate.allowed) {
+        // 因额度跳过（SC6）：不抛错、不发起整板读，这一拍什么也不写。
+        return {
+          written: 0,
+          exitCode: 0,
+          disabled: disabledAtStart,
+          alertsFile,
+          skipped: gate.reason,
+          stop: 'rate-budget',
+          remaining: gate.remaining,
+          skipStreak: gate.skipStreak,
+          budgetError,
+          gateError,
+        };
+      }
+    }
+    const board = await resolveBoard(deps, profile, table, {
+      snapshot,
+      snapshotFile,
+      now,
+      tickSeconds,
+      onSnapshotError: (error) => {
+        snapshotError = String(error?.message || error);
+        stdout.write(
+          `${new Date(now).toISOString()} board-snapshot-error component=prio-run reason=write-failed ${snapshotError} 快照写不下去，这一拍照常跑\n`,
+        );
+      },
+    });
     let writeFn = deps.write || null;
     if (wantWrite && !writeFn) {
       const writer = createPriorityGithub({ profile, token, run: deps.run, fetchImpl: deps.fetchImpl });
@@ -417,6 +560,11 @@ export async function runContinuous(argv = [], deps = {}) {
       alertsFile,
       assessment,
       result,
+      boardSource: board.source,
+      boardSnapshotReason: board.snapshotReason || '',
+      budgetError,
+      gateError,
+      snapshotError,
     };
     if (result.readbackMismatch) {
       writeDisabled(dir, '回读不一致，持续写入已暂停');

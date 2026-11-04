@@ -35,6 +35,8 @@ export const AUDIT_STATE_VERSION = 1;
 export const AUDIT_RULES_VERSION = 2;
 /** 去重指纹最多留这么多条（账本一天一两百条，够用很久）。 */
 export const AUDIT_SEEN_LIMIT = 5000;
+/** 待审（上几轮没查成的根上的轮次）最多记这么多条，防止坏网络下状态文件无限长大。 */
+export const AUDIT_PENDING_LIMIT = 500;
 /** 一条提醒里最多带几条明细（其余在审计日志里）。 */
 export const AUDIT_DETAIL_LIMIT = 5;
 /** 汇总里每类最多列几条（其余只报总数）。 */
@@ -447,13 +449,24 @@ async function mapLimited(items, limit, worker) {
  * 只读查 GitHub：账本里开过的轮次评论还在不在（固定的只读评论查询，绝不写）。
  * 某个 issue 的评论超过查询窗口（100 条）且窗口没覆盖到那一轮的时间，就不下结论。
  * 各根同时最多 AUDIT_COMMENT_CONCURRENCY 个请求；违规和错误仍按根的出现顺序排列。
+ * `from` 是上次审到的账本行号（#247 SC4）：只审这行之后新增的轮次所在根，不再每轮扫全部根。
+ * `pending` 是上几轮没查成的根上待审的轮次（评论 id）：即使行号 ≤ from 也要重查——
+ * 一次 5xx / 限流不该让某个根永久退出审计（P1-2）。
+ * 返回的 `pending` 是这一轮仍没查成的轮次（含上次遗留），由调用方写回状态；超过 AUDIT_PENDING_LIMIT 时
+ * 只留前 AUDIT_PENDING_LIMIT 条，并把被丢掉的条数与最早行号一起交出去（`pendingDropped*`）——
+ * 调用方据此把游标退回去重查，不许静默丢（P3-2：丢掉的轮次行号 ≤ from、又不在 pending 里，就永久不再被审）。
  */
-export async function checkRoundComments({ rounds, entries, github }) {
+export async function checkRoundComments({ rounds, entries, github, from = 0, pending = [] }) {
   const out = [];
   const errors = [];
-  if (!github || typeof github.graphql !== 'function') return { violations: out, errors, checked: 0 };
+  if (!github || typeof github.graphql !== 'function') {
+    return { violations: out, errors, checked: 0, pending: [], pendingDropped: 0, pendingDroppedFromLine: null };
+  }
+  const pendingSet = new Set((Array.isArray(pending) ? pending : []).map((id) => String(id)));
   const byRoot = new Map();
   for (const value of rounds.values()) {
+    const id = String(value.commentId);
+    if (Number(value.line) <= Number(from) && !pendingSet.has(id)) continue;
     const list = byRoot.get(value.root) || [];
     list.push(value);
     byRoot.set(value.root, list);
@@ -478,21 +491,33 @@ export async function checkRoundComments({ rounds, entries, github }) {
     }
   });
   let checked = 0;
+  const stillPending = new Map();
   for (let index = 0; index < jobs.length; index += 1) {
     const job = jobs[index];
     const result = fetched[index];
     if (result?.error) {
       errors.push(`${job.root}：${str(result.error?.message || result.error).split('\n')[0].slice(0, 120)}`);
+      for (const value of job.list) stillPending.set(String(value.commentId), value);
       continue;
     }
     if (!Array.isArray(result?.nodes)) {
       errors.push(`${job.root}：读不到评论`);
+      for (const value of job.list) stillPending.set(String(value.commentId), value);
       continue;
     }
     checked += 1;
     out.push(...judgeRoundRoot(job.root, job.list, result.nodes, entries));
   }
-  return { violations: out, errors, checked };
+  const all = [...stillPending.values()];
+  const dropped = all.slice(AUDIT_PENDING_LIMIT);
+  return {
+    violations: out,
+    errors,
+    checked,
+    pending: all.slice(0, AUDIT_PENDING_LIMIT).map((value) => String(value.commentId)),
+    pendingDropped: dropped.length,
+    pendingDroppedFromLine: dropped.length ? Math.min(...dropped.map((value) => Number(value.line))) : null,
+  };
 }
 
 export function fingerprint(item, rawLine = '') {
@@ -732,7 +757,17 @@ export async function runGateAudit({ home, profile, github = null, now = () => D
       const { violations, rounds } = auditEntries(entries, { profile, scopes });
       let githubFound = [];
       let githubErrors = [];
-      if (github) ({ violations: githubFound, errors: githubErrors } = await checkRoundComments({ rounds, entries, github }));
+      let githubPending = [];
+      let baselineCursor = lines.length;
+      if (github) {
+        const checkedComments = await checkRoundComments({ rounds, entries, github });
+        githubFound = checkedComments.violations;
+        githubErrors = checkedComments.errors;
+        githubPending = checkedComments.pending;
+        // 基线这一轮就把待审集合装满了：游标退回去重查，不静默丢（#247 P3-2）。
+        const floor = pendingOverflowCursor(checkedComments, { paths, stamp });
+        if (floor !== null) baselineCursor = Math.min(floor, lines.length);
+      }
       const all = [...violations, ...githubFound];
       const definite = all.filter((item) => item.level === 'violation');
       const uncertain = all.filter((item) => item.level === 'uncertain');
@@ -749,8 +784,10 @@ export async function runGateAudit({ home, profile, github = null, now = () => D
           uncertainRules: countRules(uncertain),
           sample: [...definite, ...uncertain].slice(0, AUDIT_DETAIL_LIMIT).map(describeViolation),
         },
-        cursor: lines.length,
-        prefixHash: prefixHash(lines, lines.length),
+        cursor: baselineCursor,
+        prefixHash: prefixHash(lines, baselineCursor),
+        // 基线这一轮没查成的根：下一轮并进待审集合重查，不把缺口固化成「查过了」。
+        pendingGithubRounds: githubPending,
         rulesVersion: AUDIT_RULES_VERSION,
         sinceBaseline: 0,
         uncertainSinceBaseline: 0,
@@ -776,6 +813,7 @@ export async function runGateAudit({ home, profile, github = null, now = () => D
 
     const found = [];
     let recheck = null;
+    let cursorFloor = null;
     if (Number(state.rulesVersion || 1) < AUDIT_RULES_VERSION && prefixHash(lines, Number(state.cursor) || 0) === state.prefixHash) {
       // 规则升级：按新规则重算基线后的旧账（见 AUDIT_RULES_VERSION），记一条 info 日志，不发提醒。
       recheck = recheckSinceBaseline({ state, entries, lines, profile, scopes, seen, auditLogFile: paths.auditLogFile });
@@ -809,9 +847,14 @@ export async function runGateAudit({ home, profile, github = null, now = () => D
     found.push(...violations);
     let githubErrors = [];
     if (github) {
-      const checkedComments = await checkRoundComments({ rounds, entries, github });
+      // 上几轮没查成的轮次这一轮一定要重查（#247 P1-2）：光靠 `from` 会让失败的根永久退出审计。
+      const pending = Array.isArray(state.pendingGithubRounds) ? state.pendingGithubRounds : [];
+      const checkedComments = await checkRoundComments({ rounds, entries, github, from, pending });
       const githubFound = checkedComments.violations;
       githubErrors = checkedComments.errors;
+      state.pendingGithubRounds = checkedComments.pending;
+      // 待审集合装不下：把游标退回去重查，不静默丢（#247 P3-2）。
+      cursorFloor = pendingOverflowCursor(checkedComments, { paths, stamp });
       if (!state.baseline?.githubChecked && githubErrors.length > 0) {
         // 基线还没查过 GitHub、这次又没查全：先不下结论，下次再查。
       } else if (!state.baseline?.githubChecked) {
@@ -876,8 +919,8 @@ export async function runGateAudit({ home, profile, github = null, now = () => D
       }
     }
 
-    state.cursor = lines.length;
-    state.prefixHash = prefixHash(lines, lines.length);
+    state.cursor = cursorFloor === null ? lines.length : Math.min(cursorFloor, lines.length);
+    state.prefixHash = prefixHash(lines, state.cursor);
     state.sinceBaseline = Number(state.sinceBaseline || 0) + freshViolations.length;
     state.uncertainSinceBaseline = Number(state.uncertainSinceBaseline || 0) + freshUncertain.length;
     state.lastRunAt = stamp;
@@ -901,6 +944,32 @@ export async function runGateAudit({ home, profile, github = null, now = () => D
   } finally {
     releaseLock(paths.auditLock);
   }
+}
+
+/** 待审集合装不下时（#247 P3-2）：被截掉的轮次行号 ≤ from、又不在 pending 里，就永久不再被审。
+ * 不静默丢：把审计游标退回到被丢掉的最早一轮之前，下一轮把它们当「新增轮次」重查，同时在审计日志留一行。
+ * 返回下一轮该用的 from（null = 不用退）。
+ */
+function pendingOverflowCursor(checked, { paths, stamp }) {
+  if (!(checked?.pendingDropped > 0)) return null;
+  const from = Math.max(0, Number(checked.pendingDroppedFromLine) - 1);
+  try {
+    fs.mkdirSync(path.dirname(paths.auditLogFile), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(
+      paths.auditLogFile,
+      `${JSON.stringify({
+        ts: stamp,
+        level: 'info',
+        rule: 'pending-overflow',
+        detail: `待审轮次超出上限 ${AUDIT_PENDING_LIMIT}，丢掉 ${checked.pendingDropped} 条；审计游标退回到第 ${from} 行，下一轮重查`,
+        text: '待审集合超上限，下一轮重查',
+      })}\n`,
+      { mode: 0o600 },
+    );
+  } catch {
+    // 日志写不了不影响审计本身：游标照样退回去，覆盖不缩水。
+  }
+  return from;
 }
 
 function countRules(list) {
