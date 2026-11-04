@@ -1379,6 +1379,100 @@ function retriggerRequiredCi({ paths, task, ci, ghFn, previous, sourceHead }) {
   return { retried: true, ciRetrigger };
 }
 
+// A head branch whose effective rules include `pull_request` (e.g. an `integration/*` stage branch whose
+// stage PR targets main) rejects every direct push with GH013, so a direct push can never land (2026-11-04:
+// stage PR #1599 blocked five rounds in a row). A failed probe keeps the direct push: the push stays the gate.
+export function headRequiresPullRequest(task, ghFn = command) {
+  let pages;
+  try {
+    pages = ghJson(['api', `repos/${task.repo}/rules/branches/${encodeURIComponent(task.headRefName)}?per_page=100`, '--paginate', '--slurp'], ghFn);
+  } catch { return false; }
+  if (!Array.isArray(pages) || !pages.every(Array.isArray)) return false;
+  return pages.flat().some((rule) => rule?.type === 'pull_request');
+}
+
+export function childPrBranch(task, validatedHead) {
+  return `vigil/pr-${task.number}-fix-${validatedHead.slice(0, 12)}`;
+}
+
+// Title follows the fix commit's own conventional subject so the target repo's title gate sees a real type.
+export function childPrTitle(task, subject) {
+  const line = String(subject ?? '').split('\n')[0].trim();
+  const typed = /^[a-z]+(\([^)]+\))?!?: .+/.test(line) ? line : `fix: #${task.number} 审查反馈修复`;
+  return `${typed}（#${task.number} 盯梢子 PR）`.slice(0, 250);
+}
+
+export function childPrBody(task, parentBody, validatedHead, scs) {
+  const issueLine = String(parentBody ?? '').split('\n').find((line) => /^任务 issue：/.test(line.trim()));
+  const fixed = scs.filter((sc) => sc.status !== 'no-change')
+    .map((sc) => `- ${sc.id}：${(sc.evidence ?? [])[0] ?? '见提交说明'}`);
+  return [
+    ...(issueLine ? [issueLine.trim(), ''] : []),
+    '## 这次改了什么',
+    '',
+    `把 #${task.number} 审查反馈的修复送进 \`${task.headRefName}\`。#${task.number} 的分支受规则集保护，只能经 PR 合入，盯梢不能直接推送，所以修复改走本子 PR。`,
+    '',
+    ...(fixed.length ? fixed : ['- 见提交说明']),
+    '',
+    '## 怎么验证的',
+    '',
+    `修复提交 \`${validatedHead}\` 已过盯梢本地验证与目标仓 pre-push 全量预检。`,
+    '',
+    '## 风险',
+    '',
+    `只含上面的修复。本 PR 合入后 #${task.number} 的分支前进，盯梢在新 HEAD 上复核原反馈并回复讨论；合并由有合并权限的账号按集成分支规则执行。`,
+    '',
+  ].join('\n');
+}
+
+function findOpenChildPr(task, branch, ghFn) {
+  const owner = task.repo.split('/')[0];
+  const pages = ghJson(['api', `repos/${task.repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}&per_page=100`, '--paginate', '--slurp'], ghFn);
+  if (!Array.isArray(pages) || !pages.every(Array.isArray)) fail('child PR lookup returned an unexpected shape');
+  return pages.flat().find((pr) => pr?.head?.ref === branch && pr?.base?.ref === task.headRefName) ?? null;
+}
+
+// Push the validated fix to its own branch and open (or reuse) a PR into the protected head branch.
+// Idempotent on retry: the child branch may already hold validatedHead and the PR may already exist.
+export function deliverViaChildPr({ worktree, task, validatedHead, remoteHead, scs, gitFn, ghFn, originUrl = remoteUrl(task.repo), guard }) {
+  if (!guard?.home || !guard.taskPath) fail('push ownership guard required');
+  const checkout = assertWorktree(worktree, task, gitFn, originUrl);
+  if (!checkout || checkout.head !== validatedHead) fail('local HEAD changed before push');
+  const latest = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
+  if (latest !== remoteHead) fail('remote branch changed before push');
+  try { gitOutput(['-C', worktree, 'merge-base', '--is-ancestor', remoteHead, validatedHead], gitFn); }
+  catch { fail('remote branch advanced independently; refusing to open a child PR on a stale base'); }
+  const branch = childPrBranch(task, validatedHead);
+  const ref = `refs/heads/${branch}`;
+  const existing = gitOutput(['ls-remote', originUrl, ref], gitFn).split(/\s+/)[0];
+  if (existing && existing !== validatedHead) fail(`child branch ${branch} already holds another commit`);
+  let pushed = false;
+  if (!existing) {
+    const hookPath = gitOutput(['-C', worktree, 'rev-parse', '--git-path', 'hooks'], gitFn).trim();
+    if (!hookPath) fail('effective Git hook directory unavailable');
+    const verified = guard.verification;
+    const validatedPolicy = ['pass', 'baseline-only-failure'].includes(verified?.status) && verified.head === validatedHead && verified.policy?.file && verified.policy?.sha256
+      ? { policyFile: verified.policy.file, policySha256: verified.policy.sha256 } : null;
+    const hooks = createPushHooks({ worktree, originalHooks: path.resolve(worktree, hookPath),
+      home: guard.home, taskPath: guard.taskPath, head: validatedHead, ref, gitBinary: GIT, validatedPolicy });
+    try {
+      gitOutput(['-C', worktree, '-c', `core.hooksPath=${hooks.dir}`, 'push', 'origin', `HEAD:${ref}`], gitFn, { env: guard.env ?? process.env });
+    } finally { hooks.cleanup(); }
+    const after = gitOutput(['ls-remote', originUrl, ref], gitFn).split(/\s+/)[0];
+    if (after !== validatedHead) fail('child branch changed after push; pushed commit requires reconciliation');
+    pushed = true;
+  }
+  let pr = findOpenChildPr(task, branch, ghFn);
+  if (!pr) {
+    const parent = ghJson(['api', `repos/${task.repo}/pulls/${task.number}`], ghFn);
+    pr = ghJson(['api', '--method', 'POST', `repos/${task.repo}/pulls`,
+      '-f', `title=${childPrTitle(task, gitOutput(['-C', worktree, 'log', '-1', '--format=%s', validatedHead], gitFn))}`, '-f', `head=${branch}`, '-f', `base=${task.headRefName}`,
+      '-f', `body=${childPrBody(task, parent?.body, validatedHead, scs)}`, '-F', 'draft=false'], ghFn);
+  }
+  if (!Number.isInteger(pr?.number) || typeof pr.html_url !== 'string') fail('child PR creation returned an unexpected shape');
+  return { pushed, childPr: { number: pr.number, url: pr.html_url, branch, base: task.headRefName, head: validatedHead } };
+}
+
 export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, originUrl = remoteUrl(task.repo), guard) {
   if (remoteHead === validatedHead) return { pushed: false };
   if (!guard?.home || !guard.taskPath) fail('push ownership guard required');
@@ -1486,6 +1580,18 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   const keel = verifyKeelRun({ task, runId: keelRun, root: keelRoot, validatedHead, verification });
   const beforePush = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
   if (beforePush.pr.headRefOid !== branchHead) fail('remote branch changed before push');
+  if (validatedHead !== branchHead && headRequiresPullRequest(task, ghFn)) {
+    const delivered = deliverViaChildPr({ worktree, task, validatedHead, remoteHead: branchHead, scs, gitFn, ghFn, originUrl,
+      guard: { home, taskPath, env, verification } });
+    // Blocked on the PR's current head: once the child PR merges, the head moves on its own and the watcher
+    // treats that like an author push, delivering the feedback again so it is checked on the merged code.
+    return saveResult(paths, task, sessionId, {
+      status: 'blocked', blockedKind: 'child-pr',
+      reason: `修复已送子 PR #${delivered.childPr.number}（${delivered.childPr.url}）；${task.headRefName} 只能经 PR 合入，等子 PR 合入后在新 HEAD 上复核`,
+      head: branchHead, scs, feedbackCoverage, ...workersField, keel, verification, checks: [], pushed: false,
+      childPr: delivered.childPr,
+    });
+  }
   const push = pushIfNeeded(worktree, task, validatedHead, branchHead, gitFn, originUrl, { home, taskPath, env, verification });
   // Retrying finalize after a recorded push must preserve its ownership proof.
   const pushed = push.pushed || (branchHead === validatedHead && validatedHead !== task.headRefOid);

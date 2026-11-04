@@ -18,7 +18,7 @@ const finding = (priority, key = `thread:${priority}`) => ({
 
 // Every Git mutation is confined to this test's disposable repositories. gh is
 // entirely simulated; unexpected API calls fail instead of reaching the network.
-function fixture(t, { changed = true, lockfile = false, nodeModules = false } = {}) {
+function fixture(t, { changed = true, lockfile = false, nodeModules = false, protectedHead = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-repair-scope-'));
   const home = path.join(root, 'watcher');
   const plugin = path.join(root, 'plugin');
@@ -89,6 +89,7 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false } = 
   const ciConclusion = () => ciConclusionValue;
   const pushCalls = [];
   const ghCalls = [];
+  const childPrs = [];
   const gitFn = (_binary, args) => {
     if (args.includes('push')) {
       pushCalls.push(args);
@@ -113,6 +114,18 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false } = 
       contexts: ['verify'], checks: [{ context: 'verify', app_id: 123 }],
     } });
     if (endpoint === `repos/${REPO}/rules/branches/main?per_page=100`) return JSON.stringify([[]]);
+    if (endpoint === `repos/${REPO}/rules/branches/fix%2Fscope?per_page=100` && protectedHead === 'error') throw new Error('HTTP 502');
+    if (endpoint === `repos/${REPO}/rules/branches/fix%2Fscope?per_page=100`) return JSON.stringify([protectedHead
+      ? [{ type: 'non_fast_forward' }, { type: 'pull_request', parameters: {} }] : []]);
+    if (String(endpoint).startsWith(`repos/${REPO}/pulls?state=open&head=`)) return JSON.stringify([childPrs]);
+    if (endpoint === `repos/${REPO}/pulls/790`) return JSON.stringify({ number: 790, body: '任务 issue：example-org/example-plugin#12\n\nparent' });
+    if (args[1] === '--method' && args[2] === 'POST' && args[3] === `repos/${REPO}/pulls`) {
+      const field = (name) => args.find((a) => a.startsWith(`${name}=`)).slice(name.length + 1);
+      const created = { number: 800 + childPrs.length, html_url: `https://github.com/${REPO}/pull/${800 + childPrs.length}`,
+        title: field('title'), body: field('body'), head: { ref: field('head') }, base: { ref: field('base') } };
+      childPrs.push(created);
+      return JSON.stringify(created);
+    }
     if (endpoint === `repos/${REPO}/contents/docs/sync/required-checks.json?ref=${sourceHead}`) return JSON.stringify({
       type: 'file', encoding: 'base64', content: Buffer.from(JSON.stringify({ on_main: ['verify'], pr_only: [] })).toString('base64'),
     });
@@ -143,7 +156,8 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false } = 
     feedbackKeys, evidence: ['synthetic fixture checked locally'] });
   const options = { home, taskPath, scReport, validatedHead: head, originUrl, gitFn, ghFn,
     env: { ...process.env, PREFLIGHT_SKIP: '0' } };
-  return { task, paths, worktree, sourceHead, head, options, saveTask, report, sc, pushCalls, ghCalls,
+  return { task, paths, worktree, sourceHead, head, options, saveTask, report, sc, pushCalls, ghCalls, childPrs,
+    remoteRef: (ref) => { try { return git('--git-dir', originUrl, 'rev-parse', '--verify', '--quiet', ref); } catch { return null; } },
     setCiConclusion: (value) => { ciConclusionValue = value; },
     remoteHead: () => git('--git-dir', originUrl, 'rev-parse', 'refs/heads/fix/scope'),
     validate: () => validate(options), finalize: () => finalize(options) };
@@ -1101,4 +1115,47 @@ test('T-8 a finding marker typed into a non-review comment is not trusted as the
   const fixedAfterReview = (_sha, reviewedHead) => reviewedHead === forgedHead;
   const task = { headRefOid: 'a'.repeat(40), feedback: [{ ...finding('P2', 'thread:forged'), body }] };
   assert.throws(() => assertDisputesAdjudicated({ scs, workers: [], task, fixedAfterReview }), /ADJUDICATE_REQUIRED/);
+});
+
+test('protected head branch: validated fix goes to a child PR, the head branch is never pushed', async (t) => {
+  const f = fixture(t, { protectedHead: true });
+  assert.equal((await f.validate()).status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  const result = f.finalize();
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.blockedKind, 'child-pr');
+  assert.equal(result.pushed, false);
+  assert.equal(result.head, f.sourceHead);
+  assert.equal(f.remoteHead(), f.sourceHead);
+  const branch = `vigil/pr-790-fix-${f.head.slice(0, 12)}`;
+  assert.equal(f.remoteRef(`refs/heads/${branch}`), f.head);
+  assert.equal(f.childPrs.length, 1);
+  assert.deepEqual({ head: f.childPrs[0].head.ref, base: f.childPrs[0].base.ref }, { head: branch, base: 'fix/scope' });
+  assert.match(f.childPrs[0].title, /^fix: #790 审查反馈修复（#790 盯梢子 PR）$/);
+  assert.match(f.childPrs[0].body, /^任务 issue：example-org\/example-plugin#12\n/);
+  for (const heading of ['## 这次改了什么', '## 怎么验证的', '## 风险']) assert.ok(f.childPrs[0].body.includes(heading));
+  assert.deepEqual(result.childPr, { number: 800, url: `https://github.com/${REPO}/pull/800`, branch, base: 'fix/scope', head: f.head });
+  assert.ok(f.pushCalls.every((args) => !args.includes('HEAD:refs/heads/fix/scope')));
+});
+
+test('protected head branch: finalize retry reuses the pushed child branch and the open child PR', async (t) => {
+  const f = fixture(t, { protectedHead: true });
+  assert.equal((await f.validate()).status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  const first = f.finalize();
+  const pushes = f.pushCalls.length;
+  const second = f.finalize();
+  assert.equal(f.pushCalls.length, pushes);
+  assert.equal(f.childPrs.length, 1);
+  assert.deepEqual(second.childPr, first.childPr);
+});
+
+for (const protectedHead of [false, 'error']) test(`head branch rules ${protectedHead ? 'unreadable' : 'without pull_request'}: keeps the direct push`, async (t) => {
+  const f = fixture(t, { protectedHead });
+  assert.equal((await f.validate()).status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  const result = f.finalize();
+  assert.notEqual(result.blockedKind, 'child-pr');
+  assert.equal(f.remoteHead(), f.head);
+  assert.equal(f.childPrs.length, 0);
 });
