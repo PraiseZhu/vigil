@@ -57,13 +57,12 @@ const graphqlNode = (extra = {}) => ({
   reviewThreads: { nodes: [] }, commits: { nodes: [] }, ...extra,
 });
 
-// 一次批量查询（gh api graphql search）返回的每个 open PR 的轻量指纹字段，含最新提交的 CI 汇总 state。
+// 一次批量查询（gh api graphql nodes(ids:[…])，按本轮列出的 PR id 读）返回的每个 open PR 的轻量指纹字段，含最新提交的 CI 汇总 state。
 const batchNode = (pr, rollup = 'SUCCESS') => ({ id: pr.id, number: pr.number, isDraft: pr.isDraft === true, headRefOid: pr.headRefOid,
   updatedAt: pr.updatedAt, labels: { nodes: (pr.labels ?? []).map((name) => ({ name })) },
   commits: { nodes: [{ commit: { statusCheckRollup: rollup ? { state: rollup } : null } }] } });
-const batchResponse = (prs, rollupFor = () => 'SUCCESS') => JSON.stringify({ data: { search: { issueCount: prs.length,
-  nodes: prs.map((pr) => batchNode(pr, rollupFor(pr))) } } });
-const isBatch = (args) => args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('search('));
+const batchResponse = (prs, rollupFor = () => 'SUCCESS') => JSON.stringify({ data: { nodes: prs.map((pr) => batchNode(pr, rollupFor(pr))) } });
+const isBatch = (args) => args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('nodes(ids:'));
 const isGate = (args) => args[0] === 'api' && args[1] === 'graphql' && !isBatch(args);
 
 function run(t, options) {

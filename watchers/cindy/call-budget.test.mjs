@@ -31,10 +31,10 @@ const node = (comments = 0, rollup = 'PENDING') => ({ state: 'OPEN', isDraft: fa
 
 const failingFor = (listed) => ({ ...quiet(listed), checks: [{ name: 'unit', state: 'FAILURE', bucket: 'fail' }],
   ci: { status: 'failed', required: [{ context: 'unit', status: 'failed', evidence: { id: 1, runId: 2, attempt: 1 } }] } });
-const isBatch = (args) => args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('search('));
-const batchBody = (prs) => JSON.stringify({ data: { search: { issueCount: prs.length, nodes: prs.map((pr) => ({ id: pr.id, number: pr.number,
+const isBatch = (args) => args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('nodes(ids:'));
+const batchBody = (prs) => JSON.stringify({ data: { nodes: prs.map((pr) => ({ id: pr.id, number: pr.number,
   isDraft: pr.isDraft === true, headRefOid: pr.headRefOid, updatedAt: pr.updatedAt, labels: { nodes: [] },
-  commits: { nodes: [{ commit: { statusCheckRollup: { state: pr.rollup ?? 'PENDING' } } }] } })) } } });
+  commits: { nodes: [{ commit: { statusCheckRollup: { state: pr.rollup ?? 'PENDING' } } }] } })) } });
 
 test('5 个 open PR 的一整轮：无变化与 1 个真实新反馈（CI 失败并派发）的 gh 调用次数', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-call-budget-'));

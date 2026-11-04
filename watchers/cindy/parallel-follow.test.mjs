@@ -156,11 +156,11 @@ const graphqlNode = (extra = {}) => ({
   reviewThreads: { nodes: [] }, commits: { nodes: [] }, ...extra,
 });
 
-// One batched query (gh api graphql search) per follow beat: the light fingerprint fields of every open PR.
-const batchBody = (prs) => JSON.stringify({ data: { search: { issueCount: prs.length, nodes: prs.map((pr) => ({ id: pr.id, number: pr.number,
+// One batched read (gh api graphql nodes(ids:[...])) per follow beat: the light fingerprint fields of every open PR.
+const batchBody = (prs) => JSON.stringify({ data: { nodes: prs.map((pr) => ({ id: pr.id, number: pr.number,
   isDraft: pr.isDraft === true, headRefOid: pr.headRefOid, updatedAt: pr.updatedAt, labels: { nodes: [] },
-  commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] } })) } } });
-const isBatchQuery = (args) => args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('search('));
+  commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] } })) } });
+const isBatchQuery = (args) => args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('nodes(ids:'));
 
 test('a PR dispatched again in the follow pass gets its own task, not the first task id', (t) => {
   const paths = homeOf(t);
