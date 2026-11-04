@@ -82,6 +82,7 @@ def _summary(scan: dict) -> dict:
         "repo": scan.get("repo"),
         "prs": scan.get("prs", []),
         "events": scan.get("events", []),
+        "mergeStates": scan.get("mergeStates"),
         "statePath": scan.get("statePath"),
     })
     encoded = json.dumps(complete, ensure_ascii=False, separators=(",", ":"))

@@ -9,7 +9,7 @@ import { readPr, statePaths } from './bin/mivo-state.mjs';
 import * as watcher from './bin/mivo-watcher.mjs';
 import { keptReadStore, memoRepoReads, scanOnce, watcherPaths, watchGuideMessage } from './bin/mivo-watcher.mjs';
 import { collectMivoCiSync, collectMivoCi } from './bin/mivo-ci.mjs';
-import { handoffPr, withAuthorHandoff } from './handoff.fixture.mjs';
+import { handoffPr, withAuthorHandoff, isMergeBatch, mergeBatchBody } from './handoff.fixture.mjs';
 
 // 反馈出现后尽快派发：整轮预算 / 派发预留 / 指纹闸 / 批量跟进 / CI 缓存（SC-1..SC-6）。
 const HEAD = 'a'.repeat(40);
@@ -69,8 +69,8 @@ const batchNode = (pr, rollup = 'SUCCESS') => ({ id: pr.id, number: pr.number, i
   commits: { nodes: [{ commit: { statusCheckRollup: rollup ? { state: rollup } : null } }] } });
 const batchResponse = (prs, rollupFor = () => 'SUCCESS') => JSON.stringify({ data: { search: { issueCount: prs.length,
   nodes: prs.map((pr) => batchNode(pr, rollupFor(pr))) } } });
-const isBatch = (args) => args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('search('));
-const isGate = (args) => args[0] === 'api' && args[1] === 'graphql' && !isBatch(args);
+const isBatch = (args) => args[0] === 'api' && args[1] === 'graphql' && !isMergeBatch(args) && args.some((arg) => String(arg).includes('search('));
+const isGate = (args) => args[0] === 'api' && args[1] === 'graphql' && !isBatch(args) && !isMergeBatch(args);
 
 function run(t, options) {
   const { paths, plugin } = setup(t);
@@ -197,6 +197,7 @@ function tickFixture(t, { listFor, rollupFor = () => 'SUCCESS', followMs = 15000
     ghFn: (args) => {
       if (args[0] === 'api' && args[1] === 'user') return 'owner';
       if (args[0] === 'pr' && args[1] === 'list') { lists.push(now); return listFor(now); }
+      if (isMergeBatch(args)) return mergeBatchBody(JSON.parse(listFor(now)));
       if (isBatch(args)) { batches.push(now); return batchResponse(JSON.parse(listFor(now)), (pr) => rollupFor(pr, now)); }
       if (isGate(args)) { gates.push(now); return JSON.stringify({ data: { node: gate(now) } }); }
       return '[]';

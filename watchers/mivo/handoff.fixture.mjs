@@ -23,3 +23,11 @@ export function withAuthorHandoff(collected, listed) {
     body: `<!-- vigil-handoff ${JSON.stringify(receipt)} -->` };
   return { ...collected, pr, comments: [...(collected.comments ?? []), comment] };
 }
+
+// The round's one batched merge-state read (a GraphQL search that selects mergeStateStatus). Test doubles that detect
+// the follow-beat batch by `search(` must leave this one out, and can answer it with mergeBatchBody.
+export const isMergeBatch = (args) => args[0] === 'api' && args[1] === 'graphql'
+  && args.some((arg) => String(arg).includes('search(') && String(arg).includes('mergeStateStatus'));
+export const mergeBatchBody = (prs, { status = 'CLEAN', tip = 'c'.repeat(40) } = {}) => JSON.stringify({ data: { search: {
+  pageInfo: { hasNextPage: false, endCursor: null },
+  nodes: prs.map((pr) => ({ id: pr.id, mergeStateStatus: typeof status === 'function' ? status(pr) : status, baseRef: { name: 'main', target: { oid: tip } } })) } } });

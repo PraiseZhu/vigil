@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { collectPrOwnership } from './mivo-pr-snapshot.mjs';
+import { collectPrOwnership, readMergeState, mergeStateIsBatched } from './mivo-pr-snapshot.mjs';
 
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const UNCONFIRMED_MS = 5 * 60 * 1000;
@@ -98,6 +98,14 @@ export function* updateBaseBranch({
   const live = yield* (ownershipSnapshot ?? readOwnership)({ pr: { number: pr.number, repo }, ghFn });
   assertActionOwner({ live, snapshot, entry, viewer, expected });
   if (dryRun) return { entry, action: { attempted: false, reason: 'dry-run', key: plan.key } };
+  // A snapshot taken from the round's batch read can be minutes old; update-branch writes to the PR, so its merge
+  // state and base tip are read again for this one PR first.
+  if (mergeStateIsBatched(snapshot)) {
+    const live = yield* readMergeState({ id: pr.id, ghFn });
+    if (String(live.mergeStateStatus ?? 'UNKNOWN').toUpperCase() !== 'BEHIND' || live.baseTipOid !== snapshot.baseTipOid) {
+      return { entry, action: { attempted: false, reason: 'merge-state-changed', key: plan.key } };
+    }
+  }
   const reserved = {
     ...entry,
     baseUpdate: {
