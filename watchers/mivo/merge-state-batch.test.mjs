@@ -7,7 +7,7 @@ import { FOLLOW_INTERVAL_MS, scanOnce, watcherPaths } from './bin/mivo-watcher.m
 import { writePr } from './bin/mivo-state.mjs';
 import { collectMergeStates, collectPrOwnership, collectPrSnapshotSync, readMergeState } from './bin/mivo-pr-snapshot.mjs';
 import { updateBaseBranch } from './bin/mivo-pr-actions.mjs';
-import { handoffPr, handoffReceipt, isMergeBatch, mergeBatchBody, withAuthorHandoff } from './handoff.fixture.mjs';
+import { handoffPr, handoffReceipt, isFollowBatch, followBatchBody, isMergeBatch, mergeBatchBody, withAuthorHandoff } from './handoff.fixture.mjs';
 
 // 2026-11-04: the gh router answers any read that selects mergeStateStatus as the personal account, and one query per
 // PR in one burst (16-19 in a second) used up that account's rate limit. A round now reads merge state once.
@@ -147,9 +147,9 @@ function roundFixture(t, { numbers, bound = [], mergeBatch = (listing) => mergeB
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(listing());
     if (args[0] === 'pr' && args[1] === 'view') { queries.views.push(args); return JSON.stringify({}); }
     if (isMergeBatch(args)) { queries.merge.push(now); return mergeBatch(listing(), now); }
-    if (args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('search('))) {
-      return JSON.stringify({ data: { search: { issueCount: numbers.length, nodes: listing().map((pr) => ({ id: pr.id, isDraft: false, headRefOid: HEAD,
-        updatedAt: pr.updatedAt, labels: { nodes: [] }, commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] } })) } } });
+    if (isFollowBatch(args)) {
+      return followBatchBody(listing().map((pr) => ({ id: pr.id, isDraft: false, headRefOid: HEAD,
+        updatedAt: pr.updatedAt, labels: { nodes: [] }, commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] } })));
     }
     if (isPollQuery(args)) { queries.poll.push(args); return JSON.stringify({ data: { node: pollNode() } }); }
     if (isTipQuery(args)) { queries.tip.push(args); return tipAnswer(live); }

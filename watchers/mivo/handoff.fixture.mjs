@@ -24,6 +24,13 @@ export function withAuthorHandoff(collected, listed) {
   return { ...collected, pr, comments: [...(collected.comments ?? []), comment] };
 }
 
+// The follow beat's read of the repository's open PRs (a `repository{pullRequests}` read, served by the GitHub App).
+// Nodes without an author get the test viewer 'owner'; a node of someone else is passed through with its own author.
+export const isFollowBatch = (args) => args[0] === 'api' && args[1] === 'graphql'
+  && args.some((arg) => String(arg).includes('pullRequests(states:OPEN') && !String(arg).includes('mergeStateStatus'));
+export const followBatchBody = (nodes, { hasNextPage = false, endCursor = null } = {}) => JSON.stringify({ data: { repository: { pullRequests: {
+  pageInfo: { hasNextPage, endCursor }, nodes: nodes.map((node) => ({ author: { login: 'owner' }, ...node })) } } } });
+
 // The round's one batched merge-state read (a GraphQL search that selects mergeStateStatus). Test doubles that detect
 // the follow-beat batch by `search(` must leave this one out, and can answer it with mergeBatchBody.
 export const isMergeBatch = (args) => args[0] === 'api' && args[1] === 'graphql'
