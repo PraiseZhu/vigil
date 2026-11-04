@@ -4,6 +4,8 @@
 // 每拍先看停写开关，再看每拍 / 每小时上限，然后调 prio-sync，写完一条就回读。
 // 降级、改空、白名单外、排除档、回读不一致、小时上限，都是写 .prio/disabled 并记一条告警。
 // 告警只追加 alerts.jsonl，不推到别处。文案不带令牌、主机名、仓的全名。
+// `--only-empty-to-p2`：只写「空 → P2」这一子集，计划里的降级、改空、升级、空 → P1、关联 PR 静默排除，
+// 不 abort、不建停写开关、不发告警，只在 run 日志里记一行排除计数（分四类）。不带这个开关时行为不变。
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -72,7 +74,7 @@ export function parseMaxPerTick(raw) {
 }
 
 export function parsePrioRunArgs(argv) {
-  const out = { write: false, dryRun: false, stateDir: null, maxPerTick: null, alertsFile: null };
+  const out = { write: false, dryRun: false, onlyEmptyToP2: false, stateDir: null, maxPerTick: null, alertsFile: null };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--write') {
@@ -81,6 +83,11 @@ export function parsePrioRunArgs(argv) {
     }
     if (arg === '--dry-run') {
       out.dryRun = true;
+      continue;
+    }
+    if (arg === '--only-empty-to-p2') {
+      // 重复传是幂等的（还是「开」），不做布尔翻转。
+      out.onlyEmptyToP2 = true;
       continue;
     }
     if (arg === '--state-dir' || arg === '--max-per-tick' || arg === '--alerts-file') {
@@ -162,6 +169,11 @@ function priorityWord(value) {
 /**
  * 看整份计划，决定这一拍是整拍停写，还是只自动写授权仓里的空 → P1/P2。
  * 每拍名额和小时名额都按仓名、issue 号、字段名排好再取前面的，和 --limit 同一顺序。
+ *
+ * `onlyEmptyToP2`：只留「空 → P2」这一子集。其它行（降级/改空、升级到任何值、空 → P1、关联 PR）
+ * 静默排除，不 abort、不建停写开关、不进 nonAuto（因此不会发 prio-downgrade / prio-nonempty 告警）；
+ * 排除条数按四类累计，由调用方写进 run 日志。范围外（白名单字段、排除档仓）不在这个开关的授权里，
+ * 仍旧整拍停写——那是配置或字段错了，需要人看，不属于「授权只放宽到空 → P2」的范围。
  */
 export function assessContinuousPlan(plan, {
   maxPerTick,
@@ -169,6 +181,7 @@ export function assessContinuousPlan(plan, {
   hourlyMax = PRIO_HOURLY_MAX,
   allowRepos = [],
   table = null,
+  onlyEmptyToP2 = false,
 } = {}) {
   const rows = (Array.isArray(plan) ? plan : []).map((change) => ({
     change,
@@ -177,6 +190,67 @@ export function assessContinuousPlan(plan, {
   const outOfScope = rows.filter((row) => row.kind === 'out-of-scope');
   const downgrades = rows.filter((row) => row.kind === 'downgrade' || row.kind === 'clear');
   const nonAuto = [];
+  if (onlyEmptyToP2) {
+    if (outOfScope.length > 0) {
+      return {
+        abort: true,
+        reason: 'out-of-scope',
+        outOfScope,
+        downgrades: [],
+        nonAuto,
+        hourlyStop: false,
+        onlyEmptyToP2: true,
+        excludedTotal: 0,
+        exclusions: { downgradeClear: 0, upgradeToP1: 0, emptyToP1: 0, link: 0 },
+        wouldWrite: [],
+        allow() { return 'skip'; },
+      };
+    }
+    const allowSet = new Set((allowRepos || []).map((repo) => String(repo).toLowerCase()));
+    // 四类只为了日志可读：降级/清空、升 P1（含同值、未知值）、空 → P1（含空 → P3）、关联 PR。
+    // 授权清单以外的空 → P2 不写，但它不是被开关排除的，不进这四类，也不进 excludedTotal。
+    const exclusions = { downgradeClear: 0, upgradeToP1: 0, emptyToP1: 0, link: 0 };
+    let excludedTotal = 0;
+    const eligible = [];
+    for (const row of rows) {
+      const change = row.change;
+      if (row.kind === 'fill' && change?.new === 'P2') {
+        if (allowSet.has(String(change?.repo || '').toLowerCase())) eligible.push(change);
+        continue;
+      }
+      excludedTotal += 1;
+      if (row.kind === 'link') exclusions.link += 1;
+      else if (row.kind === 'clear' || row.kind === 'downgrade') exclusions.downgradeClear += 1;
+      else if (row.kind === 'fill' || row.kind === 'fill-other') exclusions.emptyToP1 += 1;
+      else exclusions.upgradeToP1 += 1;
+    }
+    const sorted = eligible.sort(compareChange);
+    const room = Math.max(0, Number(hourlyMax) - Number(hourlyUsed));
+    const quota = Math.min(Number(maxPerTick) || 0, room);
+    const picked = sorted.slice(0, quota);
+    const chosen = new Set(picked.map(changeKey));
+    const hourlyStop = sorted.length > room;
+    return {
+      abort: false,
+      reason: '',
+      outOfScope,
+      downgrades: [],
+      nonAuto,
+      hourlyStop,
+      onlyEmptyToP2: true,
+      excludedTotal,
+      exclusions,
+      wouldWrite: picked,
+      chosen,
+      allow(change) {
+        const found = classifyPrioChange(change, { table });
+        if (found.kind !== 'fill' || change?.new !== 'P2') return 'skip';
+        if (!allowSet.has(String(change?.repo || '').toLowerCase())) return 'skip';
+        if (chosen.has(changeKey(change))) return 'write';
+        return 'defer';
+      },
+    };
+  }
   if (outOfScope.length > 0 || downgrades.length > 0) {
     return {
       abort: true,
@@ -427,7 +501,9 @@ export async function runContinuous(argv = [], deps = {}) {
   try {
     const profile = deps.loadProfile ? deps.loadProfile() : loadAcceptanceProfile();
     const table = deps.table || readRepoClassTable(path.join(dir, 'repo-class.json'));
-    const allowRepos = wantWrite ? readAuthorizedRepos(path.join(dir, 'authorized-repos.json')) : [];
+    const allowRepos = wantWrite || args.onlyEmptyToP2
+      ? readAuthorizedRepos(path.join(dir, 'authorized-repos.json'))
+      : [];
     const hourlyUsed = countRecentChanges(readChangeLog(dir), now, PRIO_HOURLY_WINDOW_MS);
     // 额度两道闸（#247 SC5 / SC6）：先看预算与响应头剩余，不够就这一拍不读看板、不写，也不报错。
     // 状态文件用 host/paths.mjs 的那一组（P1-1）；没给 home 又没显式给文件时不做额度闸（不猜路径）。
@@ -537,7 +613,8 @@ export async function runContinuous(argv = [], deps = {}) {
       table,
       excludedCount: board.excludedCount,
       nullContent: board.nullContent,
-      onPlan: wantWrite
+      // 写入时按闸放行；只带 --only-empty-to-p2 的 dry-run 也算一遍（只数不写，不动停写开关）。
+      onPlan: wantWrite || args.onlyEmptyToP2
         ? (plan) => {
           assessment = assessContinuousPlan(plan, {
             maxPerTick,
@@ -545,7 +622,21 @@ export async function runContinuous(argv = [], deps = {}) {
             hourlyMax: PRIO_HOURLY_MAX,
             allowRepos,
             table,
+            onlyEmptyToP2: args.onlyEmptyToP2,
           });
+          if (assessment.onlyEmptyToP2) {
+            const x = assessment.exclusions;
+            stdout.write(
+              `按 --only-empty-to-p2 排除 ${assessment.excludedTotal} 条（降级/清空 ${x.downgradeClear}、升 P1 ${x.upgradeToP1}、空→P1 ${x.emptyToP1}、关联 PR ${x.link}）\n`,
+            );
+            if (!wantWrite) {
+              const list = assessment.wouldWrite.map((change) => `${change.item} ${change.field} ${priorityWord(change.old)} → ${priorityWord(change.new)}`);
+              stdout.write(
+                `按 --only-empty-to-p2 会写 ${list.length} 条：${list.length ? list.join('、') : '无'}\n`,
+              );
+            }
+          }
+          if (!wantWrite) return null;
           if (assessment.abort) return { abort: true, reason: assessment.reason };
           return { allow: assessment.allow };
         }
@@ -572,6 +663,8 @@ export async function runContinuous(argv = [], deps = {}) {
       return { ...base, disabled: true, stop: 'readback' };
     }
     if (result.stoppedByDisabled) return { ...base, stop: 'disabled' };
+    // 下面这些停写/告警只属于真写：dry-run（哪怕带了 --only-empty-to-p2）绝不建停写开关、不发告警。
+    if (!wantWrite) return { ...base, stop: disabledAtStart ? 'disabled' : '' };
     if (result.outOfScopeHit || assessment?.reason === 'out-of-scope') {
       writeDisabled(dir, '范围外变更，持续写入已暂停');
       emitAlert(stdout, alertsFile, now, 'out-of-scope', {});

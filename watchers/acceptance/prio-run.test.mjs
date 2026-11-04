@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { REPO, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 import { DOWNGRADE_MIN_GAP_MS } from './bin/prio-score.mjs';
 import { PRIO_HOURLY_MAX, PRIO_HOURLY_WINDOW_MS } from './bin/prio-sync.mjs';
-import { alertTextFor, hostFilesFromEnv, main, parseMaxPerTick } from './bin/prio-run.mjs';
+import { alertTextFor, hostFilesFromEnv, main, parseMaxPerTick, parsePrioRunArgs } from './bin/prio-run.mjs';
 import { hostPaths } from './host/paths.mjs';
 
 const T0 = Date.parse('2026-10-31T12:00:00.000Z');
@@ -1004,4 +1004,330 @@ test('#247 P2-a 看板快照写不下去：这一拍照常用刚拉到的数据�
   assert.equal(gh.boardCalls(), 1, '快照坏了就重拉一次');
   assert.equal(result.boardSource, 'fetched', '这一拍用的是刚拉到的数据');
   assert.match(io.text(), /board-snapshot-error component=prio-run reason=write-failed/, '写失败要留痕');
+});
+
+// ── --only-empty-to-p2：只写「空 → P2」这一子集，其它行静默排除、不 abort、不建开关、不告警 ──
+
+/** 按给定计划走一遍 onPlan 闸：只有 gate 说 write 的才调 opts.write。真 prio-sync 的闸语义一致。 */
+function planSync(plan) {
+  return async (syncOpts) => {
+    const gate = await syncOpts.onPlan(plan);
+    const done = [];
+    if (gate && !gate.abort && typeof gate.allow === 'function') {
+      for (const change of plan) {
+        if (gate.allow(change) !== 'write') continue;
+        await syncOpts.write({
+          type: 'project.field.set',
+          repo: change.repo,
+          issue: change.issue,
+          fields: { [change.field]: change.new },
+          ref: change.item,
+        });
+        done.push(change);
+      }
+    }
+    return {
+      written: done.length,
+      aborted: Boolean(gate?.abort),
+      readbacks: [],
+      readbackMismatch: null,
+      stoppedByDisabled: false,
+      outOfScopeHit: null,
+      skippedAuto: [],
+      plan,
+    };
+  };
+}
+
+/** 混合计划：7 条降级/清空、2 条空 → P1、2 条升级、1 条关联 PR、4 条空 → P2。 */
+function mixedPlan(extra = {}) {
+  const at = (number, field, oldValue, newValue, repo = REPO) => ({
+    item: `${repo}#${number}`,
+    repo,
+    issue: number,
+    field,
+    old: oldValue,
+    new: newValue,
+  });
+  return [
+    at(1, '优先级', 'P1', 'P2'),
+    at(2, '优先级', 'P0', 'P1'),
+    at(3, '优先级', 'P2', 'P3'),
+    at(4, '优先级', 'P1', 'P3'),
+    at(5, '优先级', 'P1', null),
+    at(6, '优先级', 'P2', null),
+    at(7, '优先级', 'P0', null),
+    at(8, '优先级', null, 'P1'),
+    at(9, '优先级', null, 'P1'),
+    at(10, '优先级', 'P2', 'P1'),
+    at(11, '优先级', 'P3', 'P2'),
+    at(12, '关联 PR', '', 'PR #9 ✓'),
+    ...extra.emptyToP2 ?? [at(13, '优先级', null, 'P2'), at(14, '优先级', null, 'P2'), at(15, '优先级', null, 'P2'), at(16, '优先级', null, 'P2')],
+  ];
+}
+
+const EXCLUDE_LINE = /按 --only-empty-to-p2 排除 12 条（降级\/清空 7、升 P1 2、空→P1 2、关联 PR 1）/;
+
+test('#285 开关关 + 计划有降级：仍整拍停写并建开关（回归）', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const { writes, result, io } = await run(dir, ['--write'], { sync: planSync(mixedPlan()) });
+  assert.equal(writes.length, 0);
+  assert.equal(result.stop, 'downgrade');
+  assert.equal(disabled(dir), true);
+  assert.equal(readAlerts(dir).length, 1);
+  assert.equal(readAlerts(dir)[0].kind, 'prio-downgrade');
+  assert.equal(EXCLUDE_LINE.test(io.text()), false, '没带开关就不打排除计数');
+});
+
+test('#285 开关开 + 混合计划：只写空 → P2，不 abort、不建开关、无告警，日志有排除计数', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const plan = mixedPlan();
+  const { writes, result, io } = await run(dir, ['--write', '--only-empty-to-p2', '--max-per-tick', '2'], {
+    sync: planSync(plan),
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(writes.map((action) => action.issue), [13, 14], '每拍上限 2 条，按仓名/issue 号取前面的');
+  for (const action of writes) {
+    assert.deepEqual(action.fields, { 优先级: 'P2' });
+  }
+  assert.equal(result.stop, '');
+  assert.equal(disabled(dir), false, '不建停写开关');
+  assert.equal(readAlerts(dir).length, 0, '不发 prio-downgrade / prio-nonempty');
+  assert.match(io.text(), EXCLUDE_LINE);
+  assert.equal(/prio-downgrade|prio-nonempty/.test(io.text()), false);
+
+  // 同一份计划把每拍上限放到 10：4 条空 → P2 全写，其它行一条也不写。
+  const wide = tmpDir();
+  allow(wide, [REPO]);
+  const all = await run(wide, ['--write', '--only-empty-to-p2', '--max-per-tick', '10'], {
+    sync: planSync(mixedPlan()),
+  });
+  assert.deepEqual(all.writes.map((action) => action.issue), [13, 14, 15, 16]);
+  assert.equal(disabled(wide), false);
+  assert.equal(readAlerts(wide).length, 0);
+  assert.match(all.io.text(), EXCLUDE_LINE);
+});
+
+test('#285 开关开 + 计划里一条空 → P2 都没有：写 0 条且正常退出', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const plan = mixedPlan({ emptyToP2: [] });
+  const { writes, result, io } = await run(dir, ['--write', '--only-empty-to-p2'], { sync: planSync(plan) });
+  assert.equal(writes.length, 0);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stop, '');
+  assert.equal(disabled(dir), false);
+  assert.equal(readAlerts(dir).length, 0);
+  assert.match(io.text(), /按 --only-empty-to-p2 排除 12 条/);
+  assert.match(io.text(), /关联 PR 1/);
+});
+
+test('#285 disabled 存在时即使带开关也不写', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  fs.writeFileSync(path.join(dir, 'disabled'), '');
+  const { writes, result, io } = await run(dir, ['--write', '--only-empty-to-p2'], {
+    sync: planSync(mixedPlan()),
+  });
+  assert.equal(writes.length, 0);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stop, 'disabled');
+  assert.match(io.text(), /已停写/);
+  assert.equal(readAlerts(dir).length, 0);
+});
+
+test('#285 不在 authorized-repos 的空 → P2 不写，也不算被开关排除', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const plan = [
+    { item: `${REPO}#1`, repo: REPO, issue: 1, field: '优先级', old: null, new: 'P2' },
+    { item: `${OTHER}#2`, repo: OTHER, issue: 2, field: '优先级', old: null, new: 'P2' },
+    { item: `${OTHER}#3`, repo: OTHER, issue: 3, field: '优先级', old: null, new: 'P1' },
+  ];
+  const { writes, result, io } = await run(dir, ['--write', '--only-empty-to-p2'], { sync: planSync(plan) });
+  assert.deepEqual(writes.map((action) => action.repo), [REPO]);
+  assert.equal(disabled(dir), false);
+  assert.equal(result.stop, '');
+  assert.match(io.text(), /按 --only-empty-to-p2 排除 1 条（降级\/清空 0、升 P1 0、空→P1 1、关联 PR 0）/);
+});
+
+test('#285 dry-run + 开关：一条都不写、不建开关、不告警，日志写明会写哪几条和排除分类', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const { writes, result, io } = await run(dir, ['--dry-run', '--only-empty-to-p2', '--max-per-tick', '10'], {
+    sync: planSync(mixedPlan()),
+  });
+  assert.equal(writes.length, 0);
+  assert.equal(result.exitCode, 0);
+  assert.equal(disabled(dir), false, 'dry-run 遇降级也不建停写开关');
+  assert.equal(readAlerts(dir).length, 0);
+  assert.match(io.text(), EXCLUDE_LINE);
+  assert.match(io.text(), /按 --only-empty-to-p2 会写 4 条：/);
+  assert.match(io.text(), /#13 优先级 空 → P2/);
+});
+
+test('#285 开关开 + 最近 1 小时已满：仍按每小时上限停写', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  for (let i = 0; i < PRIO_HOURLY_MAX; i += 1) {
+    seedChange(dir, 1000 + i, 'P2', { at: T0 - 60 * 1000 });
+  }
+  const { writes, result } = await run(dir, ['--write', '--only-empty-to-p2'], { sync: planSync(mixedPlan()) });
+  assert.equal(writes.length, 0);
+  assert.equal(result.stop, 'hourly');
+  assert.equal(disabled(dir), true);
+  assert.equal(readAlerts(dir)[0].kind, 'prio-hourly');
+});
+
+test('#285 参数解析：--only-empty-to-p2 缺省关、重复传仍是开、可与既有参数同用', () => {
+  const base = parsePrioRunArgs([]);
+  assert.equal(base.onlyEmptyToP2, false, '缺省关');
+  assert.deepEqual(base, { write: false, dryRun: false, onlyEmptyToP2: false, stateDir: null, maxPerTick: null, alertsFile: null });
+
+  const once = parsePrioRunArgs([
+    '--dry-run', '--only-empty-to-p2', '--max-per-tick', '10', '--state-dir', '/tmp/example-state',
+  ]);
+  assert.equal(once.onlyEmptyToP2, true);
+  assert.equal(once.dryRun, true);
+  assert.equal(once.maxPerTick, '10');
+  assert.equal(once.stateDir, '/tmp/example-state');
+
+  const twice = parsePrioRunArgs(['--write', '--only-empty-to-p2', '--only-empty-to-p2']);
+  assert.equal(twice.onlyEmptyToP2, true, '重复传是幂等的');
+  assert.equal(twice.write, true);
+  assert.throws(() => parsePrioRunArgs(['--only-empty-to-p2=x']), /无法识别的参数/);
+});
+
+test('#285 授权仓 16 条空 → P2：每拍只写 10 条，且是排序后的前 10 条', async () => {
+  const dir = tmpDir();
+  const second = 'example-org/accepted-two';
+  allow(dir, [REPO, second]);
+  // 输入顺序故意打乱（先大号、两仓交替），证明写的是按仓名/issue 号排完序的前 10 条，不是计划里的前 10 条。
+  const inputOrder = [9, 2, 12, 5, 1, 11, 7, 3, 15, 4, 10, 16, 6, 13, 8, 14];
+  const plan = inputOrder.map((number) => {
+    const repo = number % 2 === 0 ? second : REPO;
+    return { item: `${repo}#${number}`, repo, issue: number, field: '优先级', old: null, new: 'P2' };
+  });
+  const { writes, result, io } = await run(dir, ['--write', '--only-empty-to-p2', '--max-per-tick', '10'], {
+    sync: planSync(plan),
+  });
+  assert.equal(writes.length, 10, '每拍上限 10 条，计划里 16 条也只写 10 条');
+  // 名额按仓名（小写）、issue 号排完再取前 10 条：example-org/accepted-two 的 8 条偶数号在前，
+  // 再是 example-owner/example-repo 的 #1、#3。写调用本身的顺序跟计划顺序（prio-sync 按计划遍历），
+  // 所以这里比集合，不比调用先后。
+  assert.deepEqual(writes.map((action) => `${action.repo}#${action.issue}`).sort(), [
+    `${second}#2`, `${second}#4`, `${second}#6`, `${second}#8`, `${second}#10`,
+    `${second}#12`, `${second}#14`, `${second}#16`, `${REPO}#1`, `${REPO}#3`,
+  ].sort());
+  const written = new Set(writes.map((action) => `${action.repo}#${action.issue}`));
+  assert.deepEqual(
+    plan.map((change) => change.item).filter((item) => !written.has(item)).sort(),
+    [`${REPO}#5`, `${REPO}#7`, `${REPO}#9`, `${REPO}#11`, `${REPO}#13`, `${REPO}#15`].sort(),
+    '剩下的 6 条留给下一拍',
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stop, '');
+  assert.equal(disabled(dir), false);
+  assert.equal(readAlerts(dir).length, 0);
+  assert.match(io.text(), /按 --only-empty-to-p2 排除 0 条（降级\/清空 0、升 P1 0、空→P1 0、关联 PR 0）/);
+});
+
+/** 假看板：优先级、关联 PR 都是可变值。写调用会真的改这份数据，好查「被排除的条目一条都没动」。 */
+function boardSync(plan, board) {
+  const rowOf = (item) => board.find((entry) => `${entry.repo}#${entry.number}` === item);
+  return async (syncOpts) => {
+    const gate = await syncOpts.onPlan(plan);
+    const done = [];
+    if (gate && !gate.abort && typeof gate.allow === 'function') {
+      for (const change of plan) {
+        if (gate.allow(change) !== 'write') continue;
+        await syncOpts.write({
+          type: 'project.field.set',
+          dedupeKey: `prio:${change.item}:${change.field}:${change.old}:${change.new}`,
+          itemId: change.itemId,
+          repo: change.repo,
+          issue: change.issue,
+          fields: { [change.field]: change.new },
+          ref: change.item,
+        });
+        const row = rowOf(change.item);
+        if (!row) throw new Error(`假看板里没有 ${change.item}`);
+        if (change.field === '优先级') row.priority = change.new;
+        else row.linkedPr = change.new;
+        done.push(change.item);
+      }
+    }
+    return {
+      written: done.length,
+      aborted: Boolean(gate?.abort),
+      readbacks: [],
+      readbackMismatch: null,
+      stoppedByDisabled: false,
+      outOfScopeHit: null,
+      skippedAuto: [],
+      plan,
+    };
+  };
+}
+
+test('#285 被排除的条目一条都不动：看板上的优先级/关联 PR 写前写后完全相同', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const at = (number, field, oldValue, newValue, { repo = REPO, itemId = `PVTI_${number}`, boardValue = oldValue } = {}) => ({
+    change: { item: `${repo}#${number}`, repo, issue: number, field, old: oldValue, new: newValue, itemId },
+    board: {
+      repo,
+      number,
+      priority: field === '优先级' ? boardValue : 'P2',
+      linkedPr: field === '关联 PR' ? boardValue : '',
+    },
+  });
+  const rows = [
+    at(1, '优先级', 'P1', 'P2', { itemId: 'PVTI_1' }), // 降级
+    at(2, '优先级', 'P2', null, { itemId: 'PVTI_2' }), // 改空
+    at(3, '优先级', 'P2', 'P1', { itemId: 'PVTI_3' }), // 升级
+    at(4, '优先级', null, 'P1', { itemId: 'PVTI_4' }), // 空 → P1
+    at(5, '关联 PR', '', 'PR #9 ✓', { itemId: 'PVTI_5' }), // 关联 PR
+    at(6, '优先级', null, 'P2', { repo: OTHER, itemId: 'PVTI_6' }), // 非授权仓的空 → P2
+    at(7, '优先级', null, 'P2', { itemId: 'PVTI_7' }), // 授权仓空 → P2：这一条要真写
+  ];
+  const plan = rows.map((row) => row.change);
+  const board = rows.map((row) => row.board);
+  const excluded = plan.slice(0, 6);
+  const before = structuredClone(board);
+
+  const { writes, result } = await run(dir, ['--write', '--only-empty-to-p2'], {
+    sync: boardSync(plan, board),
+  });
+  assert.deepEqual(writes.map((action) => action.itemId).sort(), ['PVTI_7'], '只写授权仓的那条空 → P2');
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stop, '');
+  assert.equal(disabled(dir), false);
+  assert.equal(readAlerts(dir).length, 0);
+
+  const touched = new Set(writes.flatMap((action) => [action.itemId, action.ref, action.repo && `${action.repo}#${action.issue}`]));
+  for (const change of excluded) {
+    assert.equal(touched.has(change.itemId), false, `${change.item} 不该出现在写调用里`);
+    assert.equal(touched.has(change.item), false, `${change.item} 不该出现在写调用里`);
+    assert.equal(
+      writes.some((action) => action.repo === change.repo && action.issue === change.issue),
+      false,
+      `${change.item} 不该出现在写调用里`,
+    );
+  }
+  // 假看板上真写了的那条变了，被排除的 6 条按字段逐条对比：写前写后完全一样。
+  assert.equal(board[6].priority, 'P2', '授权仓的空 → P2 真写了（证明这份假看板会跟着写调用变）');
+  for (const [index, entry] of board.entries()) {
+    const label = `${entry.repo}#${entry.number}`;
+    if (index === 6) continue;
+    assert.equal(entry.priority, before[index].priority, `${label} 的优先级不该变`);
+    assert.equal(entry.linkedPr, before[index].linkedPr, `${label} 的关联 PR 不该变`);
+  }
+  assert.deepEqual(
+    board.filter((_entry, index) => index !== 6),
+    before.filter((_entry, index) => index !== 6),
+    '被排除的 6 条整条记录写前写后完全相同',
+  );
 });

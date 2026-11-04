@@ -791,6 +791,14 @@ dry-run 不改 `<state-dir>/debounce.json`。文件本来没有，跑完仍然�
 
 Inspector 看过至少 24 小时的 dry-run 之后，才在同一条命令上加 `--write`。`--write` 仍然只自动写「空优先级 → P1 或 P2」，并且只写授权清单里的仓。
 
+授权只放宽到「空 → P2」时，再加 `--only-empty-to-p2`（默认关，不带时行为与上面一致）：
+
+```sh
+node watchers/acceptance/bin/prio-run.mjs --write --only-empty-to-p2 --state-dir <state-dir>
+```
+
+带上它，计划里只留「`kind=fill`、`new=P2`、`old` 为空」的行；降级、改空、升级到任何值、空 → P1、关联 PR 一律静默排除：不 abort、不建 `<state-dir>/disabled`、不发 `prio-downgrade` / `prio-nonempty` 告警，只在 run 日志里记一行 `按 --only-empty-to-p2 排除 N 条（降级/清空 a、升 P1 b、空→P1 c、关联 PR d）`。授权清单、`--max-per-tick`、每小时 50 条上限、回读校验、备份流程都不变；已有 `<state-dir>/disabled` 仍然拦住写入。计划里有白名单字段或排除档仓这种范围外变更时，仍然整拍停写（那不是授权范围问题，是配置或字段错了）。配 `--dry-run` 时只把「会写哪几条」和排除分类打进入 run 日志，一条都不写，也不建开关。
+
 停写：
 
 ```sh
