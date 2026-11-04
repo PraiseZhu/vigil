@@ -100,6 +100,8 @@ export function* readMergeStatus({ id, ghFn }) {
 // mergeIndex: Map of PR node id -> { mergeStateStatus, baseTipOid } from collectMergeStates; a PR it does not
 // know (or no index at all) is read with its own query, exactly as before the batch existed.
 export function* resolveMergeState({ id, ghFn, mergeIndex = null }) {
+  // A rate-limited batch read marks the index blocked: no PR reads its own state then, whichever path asks.
+  if (mergeIndex?.blocked) throw new Error(`merge-state-unavailable: ${mergeIndex.blocked}`);
   const known = mergeIndex?.get?.(String(id));
   if (known) return { ...known, source: 'batch' };
   return yield* readMergeState({ id, ghFn });
@@ -122,7 +124,7 @@ export function* collectMergeStates({ repo, viewer, ghFn }) {
     const args = ['api', 'graphql', '-f', `query=${MERGE_STATE_QUERY}`, '-f', `q=repo:${repo} is:pr is:open author:${viewer}`];
     if (after) args.push('-f', `after=${after}`);
     const payload = parse(yield () => ghFn(args));
-    requireValue(payload && !payload.errors?.length, 'merge state GraphQL errors');
+    requireValue(payload && !payload.errors?.length, `merge state GraphQL errors: ${String(payload?.errors?.[0]?.message ?? '').slice(0, 120)}`);
     const result = payload.data?.search;
     requireValue(result && Array.isArray(result.nodes) && typeof result.pageInfo?.hasNextPage === 'boolean', 'incomplete merge state page');
     for (const node of result.nodes) {
