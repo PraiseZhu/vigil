@@ -93,7 +93,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 
 ### 仅基线失败的受控通过（`baseline-only-failure`）
 
-仅当 PR 的 validate 以 exit 1 失败、失败集合解析完整且非空时才会跑基线（通过的运行零额外开销）。基线在干净的 detached worktree 里检出 `git merge-base(validatedHead, origin/<base>)`，同宿主、同命令（`bash .githooks/pre-push`）、同 policy、同运行指纹各跑一次；基线日志与收据不可变，基线结果按 `sha256(repo, mergeBase, policy, package-lock blob, 运行指纹)` 缓存，同键并发加锁只跑一次，用完的 worktree 定点清理（清理失败则不受控通过）。
+仅当 PR 的 validate 以 exit 1 失败、失败集合解析完整且非空时才会跑基线（通过的运行零额外开销）。基线在干净的 detached worktree 里检出 `git merge-base(validatedHead, origin/<base>)`，同宿主、同 policy、同运行指纹下只重跑 PR 失败的那几个单测文件（`npm run test:unit -- --maxWorkers=1 --no-file-parallelism <文件…>`，不跑整个 hook：hook 只跑与本分支改动相关的单测后，在 merge-base 上它一个测试都不会跑）；PR 失败集合必须来自同一步骤、每项都是仓内相对路径的测试文件，否则不跑基线。基线日志与收据不可变，基线结果按 `sha256(repo, mergeBase, policy, package-lock blob, 运行指纹, 命令)` 缓存，同键并发加锁只跑一次，用完的 worktree 定点清理（清理失败则不受控通过）。
 
 接受条件缺一不可：PR 失败集合非空且每个元素（含 `errorSha`）都在基线失败集合里；基线本身 exit 1；两次 policy 哈希与运行指纹相同（含 `package-lock.json` 一致）；收据 head = validatedHead 且 owner 复核通过。基线通过、PR 多一个失败、`errorSha` 不同、任一方 `unparsed`/stalled/超时都判 fail。
 

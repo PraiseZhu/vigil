@@ -1061,6 +1061,24 @@ test('SC6 并发的两个 validate 对同一基线键只跑一次基线', async 
   assert.equal(baselineRuns.length, 1);
 });
 
+// 2026-11-04：仓库 pre-push 改成只跑与本分支改动相关的单测后，在 merge-base 上跑 hook 一个测试都不会跑，
+// 「基线本来就挂」永远判不成立。基线改为在 merge-base 上只重跑 PR 失败的那几个测试文件。
+test('SC6 基线只重跑 PR 失败的测试文件，不跑仓库 hook；原始 vitest 输出（没有 hook 标记）也能比对', async (t) => {
+  const { f } = baselineFixture(t);
+  const baseCalls = [];
+  const rawVitest = failLog(A, B).split('\n').filter((line) => !line.startsWith('[preflight]')).join('\n');
+  const runFn = (binary, args, opts) => {
+    if (opts.cwd === f.worktree) throw Object.assign(new Error('Command failed'), { status: 1, stdout: failLog(A), stderr: '' });
+    baseCalls.push([binary, ...args]);
+    throw Object.assign(new Error('Command failed'), { status: 1, stdout: rawVitest, stderr: '' });
+  };
+  const verification = await validate({ ...f.options, runFn });
+  assert.equal(verification.status, 'baseline-only-failure');
+  assert.deepEqual(baseCalls, [['npm', 'run', 'test:unit', '--', '--maxWorkers=1', '--no-file-parallelism', 'scripts/ops/example.test.mjs']]);
+  const receipt = readReceipt(verification);
+  assert.equal(receipt.baseline.mergeBase, f.sourceHead);
+});
+
 // Findings about tests, docs, the PR body or handoff files are fixed, not disputed or adjudicated; the only
 // no-change is a commit after the reviewed head that already fixed it.
 // The review account's own finding: only its markers are trusted as the reviewed head (T-8).
