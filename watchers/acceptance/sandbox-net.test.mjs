@@ -307,12 +307,13 @@ test('CI 上 bwrap 必须可用（真沙箱网络 contract 不许被跳过）', 
   assert.equal(bwrapAvailable, true);
 });
 
-/** 真沙箱夹具：放在 /tmp 之外（沙箱自带 --tmpfs /tmp）。 */
+/** 真沙箱夹具：HOME 放在 /tmp 之外（沙箱自带 --tmpfs /tmp）；roundDir 用短临时目录并被显式绑定进沙箱，
+ *  免得仓库路径很长时出网 socket 超过 unix socket 的 107 字节上限。 */
 function realFixture() {
   const outside = fs.mkdtempSync(path.join(HERE, '.sandbox-net-test-'));
   after(() => fs.rmSync(outside, { recursive: true, force: true }));
   const hostHome = path.join(outside, 'host-home');
-  const roundDir = path.join(outside, 'round');
+  const roundDir = tmpDir('sandbox-net-round-');
   for (const dir of [hostHome, path.join(roundDir, 'home'), path.join(roundDir, 'tmp')]) fs.mkdirSync(dir, { recursive: true });
   const env = sandboxEnv({
     base: { ...process.env, ...REAL_SENTINELS, HOME: hostHome, PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin` },
@@ -329,6 +330,14 @@ function realFixture() {
   });
   return { outside, hostHome, roundDir, env, args };
 }
+
+// 复现：仓库路径很长时，夹具如果也建在仓库里，roundDir/egress/egress.sock 会超过 107 字节，
+// startEgressProxy 直接拒绝，真沙箱网络用例就红了。roundDir 用短临时目录（仍显式绑定进沙箱）。
+test('真沙箱夹具的出网 socket 路径不超过 107 字节', () => {
+  const { roundDir } = realFixture();
+  const socketPath = path.join(roundDir, 'egress', 'egress.sock');
+  assert.ok(Buffer.byteLength(socketPath) <= MAX_SOCKET_PATH_BYTES, socketPath);
+});
 
 test('真 bwrap：宿主 127.0.0.1 上的端口、抽象 unix socket 都连不到；/run 是空 tmpfs', { skip: SKIP }, async () => {
   const { roundDir, env, args } = realFixture();

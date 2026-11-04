@@ -10,7 +10,7 @@ import { buildBwrapArgs, defaultHomeAllow, probeBwrap } from './host/sandbox.mjs
 import { run as procRun } from './host/proc.mjs';
 import { tmpDir } from './fake-gh.fixture.mjs';
 
-import { READONLY_SKIP, fixtureDirWritable } from './real-sandbox.fixture.mjs';
+import { READONLY_SKIP, fixtureDirWritable, shellQuote } from './real-sandbox.fixture.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
 
@@ -190,7 +190,7 @@ test(
     const piCommand = [
       'sh',
       '-c',
-      `mkdir -p "$HOME/.pi/agent" && cp ${path.join(piAgent, 'models.json')} ${path.join(piAgent, 'settings.json')} "$HOME/.pi/agent/" && exec pi "$@"`,
+      `mkdir -p "$HOME/.pi/agent" && cp ${shellQuote(path.join(piAgent, 'models.json'))} ${shellQuote(path.join(piAgent, 'settings.json'))} "$HOME/.pi/agent/" && exec pi "$@"`,
       'pi',
       '--model',
       'example/model',

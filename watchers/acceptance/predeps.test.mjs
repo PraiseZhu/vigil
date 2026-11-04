@@ -1,6 +1,7 @@
 // 方案 B：宿主在模型沙箱之外按 lockfile 预装 npm 依赖（host/predeps.mjs），只读挂进沙箱；
 // 沙箱的出网名单（host.json 的 egressAllow）不变，沙箱里的 npm 一律离线。
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -27,7 +28,7 @@ import { runHostRound } from './host/round.mjs';
 import { QUIET_ENV, buildBwrapArgs, probeBwrap, sandboxEnv } from './host/sandbox.mjs';
 import { run as procRun } from './host/proc.mjs';
 import { REPO, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
-import { READONLY_SKIP, fixtureDirWritable } from './real-sandbox.fixture.mjs';
+import { READONLY_SKIP, fixtureDirWritable, shellQuote } from './real-sandbox.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
@@ -375,6 +376,16 @@ test('环境问题中断的退避更长（30 分钟 → 2 小时 → 6 小时封
 
 const bwrapAvailable = await probeBwrap(procRun);
 
+// 复现：真沙箱夹具会把路径拼进 /bin/sh -c。路径带空格时，未加引号就会被 shell 拆成多个参数。
+test('真沙箱脚本里的路径带空格时仍按一个参数传（shellQuote）', () => {
+  const dir = fs.mkdtempSync(path.join(tmpDir(), 'space path-'));
+  const file = path.join(dir, 'left pad.txt');
+  fs.writeFileSync(file, 'ok');
+  const result = spawnSync('/bin/sh', ['-c', `cat ${shellQuote(file)}`], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, 'ok');
+});
+
 test(
   '真 bwrap：预装的 node_modules 在检出目录里读得到、写不进；tmpfs 缓存目录可写',
   { skip: !bwrapAvailable ? 'bwrap 不可用（探针起不来），跳过真沙箱测试' : fixtureDirWritable(HERE) ? false : READONLY_SKIP },
@@ -401,7 +412,7 @@ test(
         readOnlyMounts: [{ src: nmSrc, dest: nmDest }],
         tmpfsDirs: [path.join(nmDest, '.cache')],
       });
-      const script = `cat ${nmDest}/left-pad/index.js; touch ${nmDest}/x 2>/dev/null && echo WROTE || echo RO; touch ${nmDest}/.cache/y && echo CACHE`;
+      const script = `cat ${shellQuote(path.join(nmDest, 'left-pad', 'index.js'))}; touch ${shellQuote(path.join(nmDest, 'x'))} 2>/dev/null && echo WROTE || echo RO; touch ${shellQuote(path.join(nmDest, '.cache', 'y'))} && echo CACHE`;
       const result = await procRun('bwrap', [...args, '/bin/sh', '-c', script], { timeoutMs: 20000 });
       assert.equal(result.code, 0, result.stderr);
       assert.match(result.stdout, /^ok/);
