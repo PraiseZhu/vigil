@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { FOLLOW_INTERVAL_MS, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
-import { handoffPr, withAuthorHandoff } from './handoff.fixture.mjs';
+import { handoffPr, withAuthorHandoff, isMergeBatch, mergeBatchBody } from './handoff.fixture.mjs';
 
 // SC-6：同一夹具（5 个 open PR、其中 1 个有新反馈）下，一整轮 discover 的 gh 调用次数。
 // collect 桩按真实采集量（约 42 次 gh 调用：快照、CI、评论、线程、策略）通过传入的 ghFn 计数。
@@ -32,7 +32,7 @@ const node = (comments = 0, rollup = 'PENDING') => ({ state: 'OPEN', isDraft: fa
 
 const failingFor = (listed) => ({ ...quiet(listed), checks: [{ name: 'unit', state: 'FAILURE', bucket: 'fail' }],
   ci: { status: 'failed', required: [{ context: 'unit', status: 'failed', evidence: { id: 1, runId: 2, attempt: 1 } }] } });
-const isBatch = (args) => args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('search('));
+const isBatch = (args) => args[0] === 'api' && args[1] === 'graphql' && !isMergeBatch(args) && args.some((arg) => String(arg).includes('search('));
 const batchBody = (prs) => JSON.stringify({ data: { search: { issueCount: prs.length, nodes: prs.map((pr) => ({ id: pr.id, number: pr.number,
   isDraft: pr.isDraft === true, headRefOid: pr.headRefOid, updatedAt: pr.updatedAt, labels: { nodes: [] },
   commits: { nodes: [{ commit: { statusCheckRollup: { state: pr.rollup ?? 'PENDING' } } }] } })) } } });
@@ -44,12 +44,14 @@ test('5 个 open PR 的一整轮：无变化与 1 个真实新反馈（CI 失败
   const paths = watcherPaths(home);
   fs.mkdirSync(paths.stateDir, { recursive: true });
   let stamps = [];
+  let mergeReads = 0;
   let now = 0;
   let broken = null;
   let sent = 0;
   const listing = () => [951, 952, 953, 954, 955].map((n) => listedPr(n, broken === n ? { updatedAt: '2026-10-15T00:05:00Z', rollup: 'FAILURE' } : {}));
   const round = (stamp) => {
     stamps = [];
+    mergeReads = 0;
     now = 0;
     sent = 0;
     const result = scanOnce({
@@ -60,6 +62,7 @@ test('5 个 open PR 的一整轮：无变化与 1 个真实新反馈（CI 失败
         stamps.push(now);
         if (args[0] === 'api' && args[1] === 'user') return 'owner';
         if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(listing());
+        if (isMergeBatch(args)) { mergeReads += 1; return mergeBatchBody(listing()); }
         if (isBatch(args)) return batchBody(listing());
         if (args[0] === 'api' && args[1] === 'graphql') {
           const id = Number(String(args.at(-1)).replace(/\D/g, ''));
@@ -73,7 +76,7 @@ test('5 个 open PR 的一整轮：无变化与 1 个真实新反馈（CI 失败
       },
       dispatchFn: (params) => { sent += 1; return { target_session_id: `sess-${params.title.match(/#(\d+)/)[1]}` }; },
     });
-    return { calls: stamps.length, first60: stamps.filter((at) => at < 60000).length, sent, result };
+    return { calls: stamps.length, first60: stamps.filter((at) => at < 60000).length, sent, result, mergeReads };
   };
   round('2026-10-15T00:00:00Z');
   const none = round('2026-10-15T00:02:00Z');
@@ -81,7 +84,10 @@ test('5 个 open PR 的一整轮：无变化与 1 个真实新反馈（CI 失败
   const one = round('2026-10-15T00:04:00Z');
   console.log(`CALL_BUDGET none-changed=${none.calls} first60s=${none.first60} one-feedback=${one.calls} first60s=${one.first60} sent=${one.sent}`);
   assert.equal(one.sent, 1, 'the one new feedback is really delivered');
-  // 无变化：登录 1 + 列表 1 + 基线批量 1 + 5 次指纹 + 每 15 秒一次批量查询，不再全量采集。
+  // 5 个 PR 的 mergeStateStatus 一轮只读 1 次（批量），不再每个 PR 各读一次；无变化的一轮里没有 PR 单独读它。
+  assert.equal(none.mergeReads, 1, 'merge state is read once for the whole round');
+  assert.equal(one.mergeReads, 1, 'and the full collection of the changed PR does not read it again');
+  // 无变化：登录 1 + 列表 1 + 基线批量 1 + 合并状态批量 1 + 5 次指纹 + 每 15 秒一次批量查询，不再全量采集。
   assert.ok(none.calls <= 20, `no-change round used ${none.calls} gh calls`);
   assert.ok(none.first60 <= 12, `first 60 s of a no-change round used ${none.first60} gh calls`);
   assert.ok(one.calls <= none.calls + COLLECT_CALLS + 4, `one-feedback round used ${one.calls} gh calls`);

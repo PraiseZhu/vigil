@@ -8,7 +8,9 @@ const DEFAULT_REPO = requireConfig('targetRepo', {
 // No headRepository / headRepositoryOwner: the gh router sends any read asking for them to the personal account
 // (a GitHub App cannot see a private fork, and GitHub then returns the field empty without an error).
 // isCrossRepository alone tells a same-repository branch from a fork, which is all this watcher needs.
-const FIELDS = 'id,number,title,body,url,state,isDraft,headRefOid,headRefName,baseRefOid,baseRefName,createdAt,author,isCrossRepository,mergeable,mergeStateStatus,reviewDecision';
+// No mergeStateStatus either: the gh router answers any read that asks for it as the personal account, whose rate
+// limit one burst per PR used up (2026-11-04). It comes from the one batched query per round (collectMergeStates).
+const FIELDS = 'id,number,title,body,url,state,isDraft,headRefOid,headRefName,baseRefOid,baseRefName,createdAt,author,isCrossRepository,mergeable,reviewDecision';
 const parse = (raw) => typeof raw === 'string' ? JSON.parse(raw) : raw;
 const requireValue = (ok, reason) => { if (!ok) throw new Error(`PR snapshot: ${reason}`); };
 const quote = (value) => JSON.stringify(value);
@@ -67,7 +69,74 @@ function list(raw, label) {
   return value;
 }
 
-export function* collectPrSnapshot({ pr, ghFn }) {
+// mergeStateStatus is computed for the caller: a read-only GitHub App token always gets BLOCKED, so no PR
+// read through the gh App router was ever merge-ready or BEHIND (last merge-ready notice #1170, 2026-10-20).
+// Selecting viewer keeps the query on the user identity (the router sends viewer queries there). One PR's query is
+// the fallback; a round reads every PR's merge state with one search (collectMergeStates).
+const tipQueryFor = (id) => `query{viewer{login} node(id:${quote(id)}){... on PullRequest{mergeStateStatus baseRef{name target{oid}}}}}`;
+function mergeStateOf(node) {
+  requireValue(node && typeof node === 'object', 'missing base tip');
+  const baseTipOid = node.baseRef?.target?.oid;
+  requireValue(typeof baseTipOid === 'string' && /^[a-f0-9]{40}$/i.test(baseTipOid), 'invalid base tip');
+  return { mergeStateStatus: typeof node.mergeStateStatus === 'string' && node.mergeStateStatus ? node.mergeStateStatus : null, baseTipOid };
+}
+
+// Reads one PR's merge state and live base tip with its own query (the pre-batch behaviour). Used as the fallback
+// and as the last-moment re-read before an action that writes to GitHub.
+export function* readMergeState({ id, ghFn }) {
+  const payload = parse(yield () => ghFn(['api', 'graphql', '-f', `query=${tipQueryFor(id)}`]));
+  requireValue(payload && !payload.errors?.length && payload.data?.node, 'missing base tip');
+  return { ...mergeStateOf(payload.data.node), source: 'query' };
+}
+
+// The poll gate only needs the merge state (its own query already carries the base tip), so a missing field stays
+// UNKNOWN there instead of failing the gate the way a missing base tip fails a full collection.
+export function* readMergeStatus({ id, ghFn }) {
+  const query = `query{viewer{login} node(id:${quote(id)}){... on PullRequest{mergeStateStatus}}}`;
+  const status = parse(yield () => ghFn(['api', 'graphql', '-f', `query=${query}`]))?.data?.node?.mergeStateStatus;
+  return { mergeStateStatus: typeof status === 'string' && status ? status : null, source: 'query' };
+}
+
+// mergeIndex: Map of PR node id -> { mergeStateStatus, baseTipOid } from collectMergeStates; a PR it does not
+// know (or no index at all) is read with its own query, exactly as before the batch existed.
+export function* resolveMergeState({ id, ghFn, mergeIndex = null }) {
+  const known = mergeIndex?.get?.(String(id));
+  if (known) return { ...known, source: 'batch' };
+  return yield* readMergeState({ id, ghFn });
+}
+
+// True when the merge state in a snapshot came from the round's batch, so it may be seconds to minutes old and
+// must be read again right before an action that writes to GitHub.
+export const mergeStateIsBatched = (snapshot) => snapshot?.mergeStateSource === 'batch';
+
+// One search for every open PR of the viewer replaces one query per PR (2026-11-04: 16-19 per-PR queries in one
+// second used up the personal account's rate limit). A PR missing from the result keeps working through
+// readMergeState, so the batch only ever removes queries, it never decides a PR's state by omission.
+const MERGE_STATE_QUERY = 'query($q:String!,$after:String){viewer{login} search(query:$q,type:ISSUE,first:100,after:$after){pageInfo{hasNextPage endCursor} nodes{... on PullRequest{id mergeStateStatus baseRef{name target{oid}}}}}}';
+const MERGE_STATE_MAX_PAGES = 20;
+export function* collectMergeStates({ repo, viewer, ghFn }) {
+  requireValue(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) && typeof viewer === 'string' && viewer.length > 0 && typeof ghFn === 'function', 'invalid input');
+  const index = new Map();
+  let after = null;
+  for (let page = 0; page < MERGE_STATE_MAX_PAGES; page += 1) {
+    const args = ['api', 'graphql', '-f', `query=${MERGE_STATE_QUERY}`, '-f', `q=repo:${repo} is:pr is:open author:${viewer}`];
+    if (after) args.push('-f', `after=${after}`);
+    const payload = parse(yield () => ghFn(args));
+    requireValue(payload && !payload.errors?.length, 'merge state GraphQL errors');
+    const result = payload.data?.search;
+    requireValue(result && Array.isArray(result.nodes) && typeof result.pageInfo?.hasNextPage === 'boolean', 'incomplete merge state page');
+    for (const node of result.nodes) {
+      if (!node?.id) continue;
+      try { index.set(String(node.id), mergeStateOf(node)); } catch { /* left out: that PR reads its own state */ }
+    }
+    if (!result.pageInfo.hasNextPage) return index;
+    after = result.pageInfo.endCursor;
+    requireValue(typeof after === 'string' && after.length > 0, 'merge state cursor missing');
+  }
+  return index;
+}
+
+export function* collectPrSnapshot({ pr, ghFn, mergeIndex = null }) {
   const repo = pr.repo ?? DEFAULT_REPO;
   const number = Number(pr.number);
   requireValue(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) && Number.isSafeInteger(number) && number > 0 && typeof ghFn === 'function', 'invalid input');
@@ -76,16 +145,9 @@ export function* collectPrSnapshot({ pr, ghFn }) {
   for (const key of ['id', 'headRefOid', 'headRefName', 'baseRefOid', 'baseRefName']) {
     if (pr[key] !== undefined) requireValue(pr[key] === before[key], `listed ${key} drift`);
   }
-  // mergeStateStatus is computed for the caller: a read-only GitHub App token always gets BLOCKED, so no PR
-  // read through the gh App router was ever merge-ready or BEHIND (last merge-ready notice #1170, 2026-10-20).
-  // Selecting viewer keeps this one small query on the user identity (the router sends viewer queries there).
-  const tipQuery = `query{viewer{login} node(id:${quote(before.id)}){... on PullRequest{mergeStateStatus baseRef{name target{oid}}}}}`;
-  const tipPayload = parse(yield () => ghFn(['api', 'graphql', '-f', `query=${tipQuery}`]));
-  requireValue(tipPayload && !tipPayload.errors?.length && tipPayload.data?.node, 'missing base tip');
-  const liveMergeState = typeof tipPayload.data.node.mergeStateStatus === 'string' && tipPayload.data.node.mergeStateStatus
-    ? tipPayload.data.node.mergeStateStatus : (before.mergeStateStatus || 'UNKNOWN');
-  const baseTipOid = tipPayload.data.node.baseRef?.target?.oid;
-  requireValue(typeof baseTipOid === 'string' && /^[a-f0-9]{40}$/i.test(baseTipOid), 'invalid base tip');
+  const live = yield* resolveMergeState({ id: before.id, ghFn, mergeIndex });
+  const liveMergeState = live.mergeStateStatus || before.mergeStateStatus || 'UNKNOWN';
+  const baseTipOid = live.baseTipOid;
   const releaseEpoch = yield* epoch({ pr: before, ghFn });
   const checks = list(yield () => ghFn(['pr', 'checks', String(number), '--repo', repo, '--json', 'name,state,bucket,link']), 'checks');
   const requiredChecks = list(yield () => ghFn(['pr', 'checks', String(number), '--repo', repo, '--required', '--json', 'name,state,bucket,link']), 'required checks');
@@ -122,7 +184,7 @@ export function* collectPrSnapshot({ pr, ghFn }) {
   const ciStatus = requiredChecksGreen ? 'green' : requiredChecks.some((check) => ['FAILURE', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'ERROR'].includes(check.state)) ? 'failed'
     : requiredChecks.length && requiredChecks.every((check) => ['SUCCESS', 'PENDING', 'QUEUED', 'IN_PROGRESS', 'WAITING', 'EXPECTED'].includes(check.state)) ? 'pending' : 'unknown';
   return { pr: { ...after, releaseEpoch, mergeStateStatus: liveMergeState }, checks, requiredChecks, reviews, comments, threads, labels: labelNodes.map((label) => label.name),
-    mergeable: after.mergeable ?? 'UNKNOWN', mergeStateStatus: liveMergeState, baseTipOid,
+    mergeable: after.mergeable ?? 'UNKNOWN', mergeStateStatus: liveMergeState, baseTipOid, mergeStateSource: live.source,
     reviewDecision: after.reviewDecision, requiredChecksGreen, ciStatus,
     ciPolicySource: 'gh-required-checks-only', unifiedPolicyVerified: false, identityVerified: true };
 }

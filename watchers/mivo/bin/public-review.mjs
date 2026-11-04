@@ -193,8 +193,8 @@ function* reviewSystemLive(ghFn) {
   } catch { return false; }
 }
 
-export function* collectPublicReview(pr, ghFn, { handledFeedback = [] } = {}) {
-  const snapshot = yield* collectPrSnapshot({pr: {...pr, repo: REPO}, ghFn});
+export function* collectPublicReview(pr, ghFn, { handledFeedback = [], mergeIndex = null } = {}) {
+  const snapshot = yield* collectPrSnapshot({pr: {...pr, repo: REPO}, ghFn, mergeIndex});
   const ci = yield* collectMivoCiSteps({pr:snapshot.pr, ghFn});
   snapshot.requiredChecksGreen = ci.status === 'green';
   snapshot.optionalCi = Array.isArray(ci.optional) ? ci.optional : [];
@@ -220,6 +220,7 @@ export function* collectPublicReview(pr, ghFn, { handledFeedback = [] } = {}) {
     admissionReason: reviewIngress ? ciReason : 'review-ingress-missing',
     mergeReady: verdict.ready, reviewReason: verdict.reason, reviewEvidence: verdict,
     mergeStateStatus: snapshot.mergeStateStatus ?? snapshot.pr.mergeStateStatus ?? 'UNKNOWN',
+    mergeStateSource: snapshot.mergeStateSource ?? null,
     baseTipOid: snapshot.baseTipOid ?? null,
     baseUpdateEligible: verdict.baseUpdateEligible === true,
     reviewRuns: runs};
