@@ -124,7 +124,7 @@ test('startAt 之前已关闭的根 issue 不收', async () => {
 });
 
 test('SC1 我建的总 issue 下我建的子 issue 不单独成任务（查询带父 issue 作者）', async () => {
-  assert.match(INVENTORY_QUERY, /parent \{ number repository \{ nameWithOwner \} author \{ login \} \}/);
+  assert.match(INVENTORY_QUERY, /parent \{ number repository \{ nameWithOwner \} author \{ login __typename \} \}/);
   const profile = profileWith();
   const parent = issueNode({
     repo: REPO,

@@ -296,13 +296,14 @@ export function createGate({
     }
   }
 
-  /** 读一轮 issue 的正文和轮次评论（固定查询，不经调用方）。 */
+  /** 读一轮 issue 的正文和轮次评论（固定查询，不经调用方）。
+   * 轮次评论绑定只认本人（ownerLogin）和配置的 App bot（trustedBotLogins）发的评论，所以整份 profile 传进去。 */
   async function readIssueState(ref) {
     const { owner, name, number } = parseRef(ref);
     const data = await github.graphql(ROUNDS_COMMENTS_QUERY, { owner, name, number });
     const issue = data?.repository?.issue;
     if (!issue) return null;
-    const rounds = parseRounds(issue.comments?.nodes || [], profile.ownerLogin);
+    const rounds = parseRounds(issue.comments?.nodes || [], profile);
     return { issue, rounds, latest: latestRound(rounds) };
   }
 

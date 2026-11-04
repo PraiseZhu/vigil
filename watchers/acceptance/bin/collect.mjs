@@ -3,14 +3,15 @@
 // 只读：本文件不发任何写请求。
 import { bodyVersion, parseRef } from './rounds.mjs';
 import { leadHandoffOf, repoTier } from './tasks.mjs';
+import { isTrustedAuthor } from './trusted-author.mjs';
 import { isVerdictOnly } from './profile.mjs';
 
 export const MANUAL_LAYERS = Object.freeze(['cindy-mac', 'cindy-windows', 'paid', 'github-live']);
 
-const COMMENT_FIELDS = 'id databaseId body url createdAt updatedAt author { login }';
+const COMMENT_FIELDS = 'id databaseId body url createdAt updatedAt author { login __typename }';
 const PR_FIELDS = 'number url mergedAt repository { nameWithOwner }';
 const SUB_ISSUE_FIELDS = `number title body state url
-        author { login }
+        author { login __typename }
         repository { nameWithOwner }
         comments(last: 50) { nodes { ${COMMENT_FIELDS} } }
         closedByPullRequestsReferences(first: 20, includeClosedPrs: true) { nodes { ${PR_FIELDS} } }`;
@@ -41,7 +42,7 @@ export const SEARCH_QUERY = `query ($q: String!) {
         body
         state
         url
-        author { login }
+        author { login __typename }
         repository { nameWithOwner }
         comments(last: 50) { nodes { ${COMMENT_FIELDS} } }
         closedByPullRequestsReferences(first: 20, includeClosedPrs: true) { nodes { ${PR_FIELDS} } }
@@ -65,10 +66,6 @@ const DISPUTE_ITEM = /([\w.-]+\/[\w.-]+#\d+)\s*SC(\d+)/;
 const ACCEPTANCE_FIRST_LINE = /^\[验收机\] 第 \d+ 轮：(通过|要修)/;
 const CORRECTION_FIRST_LINE = /^\[修正机\] 第/;
 const DISPUTE_MARK = '有争议';
-
-function sameLogin(a, b) {
-  return String(a || '').toLowerCase() === String(b || '').toLowerCase();
-}
 
 function openState(state) {
   return String(state || '').toUpperCase() === 'CLOSED' ? 'closed' : 'open';
@@ -126,10 +123,10 @@ export function parseMarker(text) {
   return { root: match[1], item: match[2], sc: Number(match[3]), round: Number(match[4]) };
 }
 
-/** 只认我自己发的最新一条轮次评论。 */
-function latestOwnRoundComment(comments, ownerLogin, firstLineRe) {
+/** 只认本人（ownerLogin）和配置的 App bot 发的最新一条轮次评论。 */
+function latestOwnRoundComment(comments, profile, firstLineRe) {
   const own = (comments || []).filter((comment) => {
-    if (!sameLogin(comment?.author?.login, ownerLogin)) return false;
+    if (!isTrustedAuthor(comment?.author, profile)) return false;
     const first = String(comment.body || '').split('\n')[0] || '';
     return firstLineRe.test(first);
   });
@@ -192,10 +189,9 @@ export async function collectTree({ github, profile, ref }) {
 
   const rootRepo = issue.repository?.nameWithOwner || `${owner}/${name}`;
   const rootRef = `${rootRepo}#${issue.number}`;
-  const ownerLogin = profile.ownerLogin;
   const ranked = repoTier(rootRepo, profile) || { tier: null, fork: false };
 
-  const subNodes = (issue.subIssues?.nodes || []).filter((node) => sameLogin(node?.author?.login, ownerLogin));
+  const subNodes = (issue.subIssues?.nodes || []).filter((node) => isTrustedAuthor(node?.author, profile));
   const kind = subNodes.length >= 1 ? 'parent' : 'standalone';
 
   // 修正子 issue：挂着的子 issue + 没挂上但正文带标记的（跨仓、watch 档交接仓都靠搜索找）。
@@ -209,7 +205,7 @@ export async function collectTree({ github, profile, ref }) {
     const found = await github.graphql(SEARCH_QUERY, { q: query });
     for (const node of found?.search?.nodes || []) {
       if (node?.__typename && node.__typename !== 'Issue') continue;
-      if (!sameLogin(node?.author?.login, ownerLogin)) continue;
+      if (!isTrustedAuthor(node?.author, profile)) continue;
       const marker = parseMarker(node.body);
       if (!marker || marker.root !== rootRef) continue;
       const nodeRef = `${node.repository?.nameWithOwner || rootRepo}#${node.number}`;
@@ -255,16 +251,16 @@ export async function collectTree({ github, profile, ref }) {
   }
 
   const disputed = [];
-  const rootRound = latestOwnRoundComment(issue.comments?.nodes, ownerLogin, ACCEPTANCE_FIRST_LINE);
+  const rootRound = latestOwnRoundComment(issue.comments?.nodes, profile, ACCEPTANCE_FIRST_LINE);
   if (rootRound) disputed.push(...disputedLines(rootRound, 'acceptance'));
   for (const [, entry] of correctionsByRef) {
-    const round = latestOwnRoundComment(entry.node.comments?.nodes, ownerLogin, CORRECTION_FIRST_LINE);
+    const round = latestOwnRoundComment(entry.node.comments?.nodes, profile, CORRECTION_FIRST_LINE);
     if (round) disputed.push(...disputedLines(round, 'correction'));
   }
 
   const manual = issues.flatMap((entry) => entry.items.filter((item) => item.manual));
   // 批准执行的交接只是线索：验收会话按它多查几处，每条 SC 照样自己验（SESSION.md「批准执行的交接」）。
-  const lead = leadHandoffOf(issue.comments?.nodes, ownerLogin);
+  const lead = leadHandoffOf(issue.comments?.nodes, profile);
 
   return {
     root: {
@@ -278,7 +274,7 @@ export async function collectTree({ github, profile, ref }) {
       fork: Boolean(ranked.fork),
       // 只出裁决（profile 的 verdictOnlyIssues）：不关、不勾、不开修正、不推送，最后一步只写裁决。
       verdictOnly: isVerdictOnly(profile, rootRef),
-      // 有 ownerLogin 发的「批准执行登记」评论：这棵树由批准执行推进（#140）。
+      // 有本人 / 配置的 App bot 发的「批准执行登记」评论：这棵树由批准执行推进（#140）。
       approveExec: Boolean(lead.registeredAt),
     },
     handoff: lead.handoff,

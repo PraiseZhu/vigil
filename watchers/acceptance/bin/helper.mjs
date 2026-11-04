@@ -33,7 +33,7 @@ export const COMMENTS_QUERY = `query ($owner: String!, $name: String!, $number: 
           createdAt
           updatedAt
           url
-          author { login }
+          author { login __typename }
         }
       }
     }
@@ -188,7 +188,7 @@ async function cmdDone({ github, profile, ref, n, now, stdout, stderr }) {
   const { owner, name, number } = parseRef(ref);
   const data = await github.graphql(COMMENTS_QUERY, { owner, name, number });
   const comments = data?.repository?.issue?.comments?.nodes || [];
-  const rounds = parseRounds(comments, profile.ownerLogin);
+  const rounds = parseRounds(comments, profile);
   const latest = latestRound(rounds);
   if (!latest || latest.round !== n || !['通过', '要修'].includes(latest.status)) {
     const actual = latest ? `第 ${latest.round} 轮（${latest.status}）` : '还没有轮次';

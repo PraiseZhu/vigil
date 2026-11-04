@@ -3,6 +3,7 @@
 import { parseMarker } from './collect.mjs';
 import { bodyVersion, latestRound, parseRounds } from './rounds.mjs';
 import { lastFinal } from './trigger.mjs';
+import { isTrustedAuthor } from './trusted-author.mjs';
 import { taskDispute } from '../host/adjudication-store.mjs';
 
 const ISSUE_FIELDS = `id
@@ -14,9 +15,9 @@ const ISSUE_FIELDS = `id
         createdAt
         closedAt
         updatedAt
-        author { login }
+        author { login __typename }
         repository { nameWithOwner }
-        parent { number repository { nameWithOwner } author { login } }
+        parent { number repository { nameWithOwner } author { login __typename } }
         subIssues(first: 50) {
           nodes {
             number
@@ -24,7 +25,7 @@ const ISSUE_FIELDS = `id
             state
             url
             closedAt
-            author { login }
+            author { login __typename }
             repository { nameWithOwner }
           }
         }
@@ -44,7 +45,7 @@ const ISSUE_FIELDS = `id
             createdAt
             updatedAt
             url
-            author { login }
+            author { login __typename }
           }
         }`;
 
@@ -88,21 +89,12 @@ export function repoTier(repo, profile) {
 
 export { bodyVersion };
 
-
-function loginOf(author) {
-  return String(author?.login || '');
-}
-
-function sameLogin(a, b) {
-  return String(a || '').toLowerCase() === String(b || '').toLowerCase();
-}
-
 function issueRef(repo, number) {
   return `${repo}#${number}`;
 }
 
 // 批准执行（approve-exec）的交接（#140）：lead 派出 owner 会话时在总 issue 上发「批准执行登记：…」，
-// 验收总 issue 通过后发「[批准执行] 交接验收 · 第 n 次」。只认 ownerLogin 发的，别人发同样首行的评论不算。
+// 验收总 issue 通过后发「[批准执行] 交接验收 · 第 n 次」。只认本人（ownerLogin）和配置的 App bot 发的，别人发同样首行的评论不算。
 export const APPROVE_EXEC_REGISTRATION = '批准执行登记：';
 /** 只看总 issue 最近这么多条评论：和盘点查询的 `comments(last: 50)` 一致，collect 拉了 100 条也只按这 50 条判断（#140「不做」）。 */
 export const LEAD_HANDOFF_COMMENT_WINDOW = 50;
@@ -135,9 +127,9 @@ export function handoffFocus(body) {
  * 总 issue 的评论 → 最近一条登记的时间、最新一条交接（{url, createdAt, n, focus}）；没有就是 null。
  * 早于最后一条登记的交接不算（之后又派了会话，旧交接已过期）：trigger、collect、verdict 都按「没有交接」处理。
  */
-export function leadHandoffOf(comments, ownerLogin) {
+export function leadHandoffOf(comments, profile) {
   const recent = [...(comments || [])].sort(byTime).slice(-LEAD_HANDOFF_COMMENT_WINDOW);
-  const own = recent.filter((comment) => sameLogin(comment?.author?.login, ownerLogin));
+  const own = recent.filter((comment) => isTrustedAuthor(comment?.author, profile));
   const registration = own.filter((comment) => String(comment.body || '').startsWith(APPROVE_EXEC_REGISTRATION)).at(-1);
   const handoffs = own.filter((comment) => LEAD_HANDOFF_FIRST_LINE.test(String(comment.body || '').split('\n')[0]));
   const latest = handoffs.filter((comment) => !registration || byTime(comment, registration) > 0).at(-1);
@@ -158,12 +150,12 @@ function asIssueList(connection) {
   return connection?.nodes || [];
 }
 
-function isRoot(issue, ownerLogin) {
+function isRoot(issue, profile) {
   const parent = issue.parent;
   if (!parent) return true;
-  // 父作者不是我 → 当根；本查询拿不到父作者时按「父缺失」处理。
+  // 父作者不是本人 / 配置的 App bot → 当根；本查询拿不到父作者时按「父缺失」处理。
   if (!parent.author) return true;
-  return !sameLogin(loginOf(parent.author), ownerLogin);
+  return !isTrustedAuthor(parent.author, profile);
 }
 
 /**
@@ -183,7 +175,7 @@ function toChildTask(issue, profile, ranked, repo, byKey) {
   if (parseMarker(issue.body) != null) return null;
 
   const ownerChildren = (issue.subIssues?.nodes || []).filter((child) =>
-    sameLogin(loginOf(child.author), profile.ownerLogin),
+    isTrustedAuthor(child.author, profile),
   );
   const outOfScope = [
     ...new Set(
@@ -193,13 +185,13 @@ function toChildTask(issue, profile, ranked, repo, byKey) {
     ),
   ];
   const ref = issueRef(repo, issue.number);
-  const rounds = parseRounds(issue.comments?.nodes || [], profile.ownerLogin);
-  const lead = leadHandoffOf(issue.comments?.nodes, profile.ownerLogin);
+  const rounds = parseRounds(issue.comments?.nodes || [], profile);
+  const lead = leadHandoffOf(issue.comments?.nodes, profile);
   const parent = issue.parent || {};
   const parentRepo = parent.repository?.nameWithOwner || repo;
   const parentRef = parent.number ? issueRef(parentRepo, parent.number) : null;
   const parentIssue = parentRef && byKey ? byKey.get(parentRef) : null;
-  const parentRounds = parentIssue ? parseRounds(parentIssue.comments?.nodes || [], profile.ownerLogin) : [];
+  const parentRounds = parentIssue ? parseRounds(parentIssue.comments?.nodes || [], profile) : [];
   const parentLatest = latestRound(parentRounds);
   const parentFinal = lastFinal(parentRounds);
   return {
@@ -236,13 +228,13 @@ function toTask(issue, profile, byKey) {
   const repo = issue.repository?.nameWithOwner;
   const ranked = repoTier(repo, profile);
   if (!ranked) return null;
-  if (!sameLogin(loginOf(issue.author), profile.ownerLogin)) return null;
-  if (!isRoot(issue, profile.ownerLogin)) return toChildTask(issue, profile, ranked, repo, byKey);
+  if (!isTrustedAuthor(issue.author, profile)) return null;
+  if (!isRoot(issue, profile)) return toChildTask(issue, profile, ranked, repo, byKey);
   if (issue.state === 'CLOSED' && issue.closedAt && Date.parse(issue.closedAt) < Date.parse(profile.startAt)) {
     return null;
   }
   const ownerChildren = (issue.subIssues?.nodes || []).filter((child) =>
-    sameLogin(loginOf(child.author), profile.ownerLogin),
+    isTrustedAuthor(child.author, profile),
   );
   const kind = ownerChildren.length >= 1 ? 'parent' : 'standalone';
   // 任务树里有不在任何名单里的仓：写闸按仓拒绝读写它，验收走不完（裁决出了、issue 却关不上），所以不派发、只提醒。
@@ -254,8 +246,8 @@ function toTask(issue, profile, byKey) {
     ),
   ];
   const ref = issueRef(repo, issue.number);
-  const rounds = parseRounds(issue.comments?.nodes || [], profile.ownerLogin);
-  const lead = leadHandoffOf(issue.comments?.nodes, profile.ownerLogin);
+  const rounds = parseRounds(issue.comments?.nodes || [], profile);
+  const lead = leadHandoffOf(issue.comments?.nodes, profile);
   return {
     ref,
     repo,

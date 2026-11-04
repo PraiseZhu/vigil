@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { BOT_LOGIN_PATTERN } from './trusted-author.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HOME_ENV = 'ACCEPTANCE_WATCHER_HOME';
@@ -127,6 +128,28 @@ function optionalIssueList(raw, key, file) {
     }
   }
   return [...raw[key]];
+}
+
+/**
+ * trustedBotLogins（可选）：可以代表本人发言的 App bot 登录名，默认 []（行为与只有 ownerLogin 时完全一致）。
+ * 每项必须带 [bot] 后缀：普通用户名配进来等于把别人发的评论当本人，直接报错；重复项（不分大小写）也报错。
+ */
+function optionalBotLogins(raw, file) {
+  if (!Object.hasOwn(raw, 'trustedBotLogins') || raw.trustedBotLogins === undefined || raw.trustedBotLogins === null) return [];
+  if (!Array.isArray(raw.trustedBotLogins)) throw invalid('trustedBotLogins', file, '应为字符串数组');
+  const seen = new Set();
+  const logins = [];
+  for (const item of raw.trustedBotLogins) {
+    if (typeof item !== 'string' || !item) throw invalid('trustedBotLogins', file, '每项应为非空字符串');
+    if (!BOT_LOGIN_PATTERN.test(item)) {
+      throw invalid('trustedBotLogins', file, `每项应为带 [bot] 后缀的 App bot 登录名（普通用户名不能当 bot）：${item}`);
+    }
+    const key = item.toLowerCase();
+    if (seen.has(key)) throw invalid('trustedBotLogins', file, `重复条目：${item}`);
+    seen.add(key);
+    logins.push(item);
+  }
+  return logins;
 }
 
 /**
@@ -320,6 +343,9 @@ export function loadAcceptanceProfile(env = process.env) {
     appOwners = [...raw.appOwners];
   }
 
+  // 身份白名单只多认配置里的 App bot：没配时是 []，判断逻辑和「只认 ownerLogin」完全一致。
+  const trustedBotLogins = optionalBotLogins(raw, file);
+
   // #61 复审决定：Slack 令牌文件权限不对 / 读不到不能让整台验收机停下，所以这里只校验路径是绝对路径，
   // 不做 checkSecretFile（那会抛错，loadAcceptanceProfile 失败整拍就停）。权限 / 属主 / 符号链接 / 空文件
   // 由 host/slack-notify.mjs 在读之前检查：不满足就不读令牌、跳过通知、原因写进心跳；doctor 照样报出来。
@@ -347,6 +373,7 @@ export function loadAcceptanceProfile(env = process.env) {
     appPrivateKeyFile,
     appTokenCommand: appTokenCommand ? Object.freeze(appTokenCommand) : undefined,
     appOwners: Object.freeze(appOwners),
+    trustedBotLogins: Object.freeze(trustedBotLogins),
     slackBotTokenFile,
     slackChannelId,
     slackMentionUserId,
