@@ -304,6 +304,11 @@ export async function runDoctor({
     add('看板写回', false, firstLine(error?.message));
   }
 
+  // 这是 doctor 单项的有意例外：其它只读查询仍按 apps.read 走 App 令牌，只有「fork 推送」这一项固定用账号令牌。
+  // fork 推送：真实推送用的是账号令牌（github.mjs 的 pushBranch / directWrite），所以查写权限也得用账号令牌。
+  // App 安装令牌没有「viewer」这个概念，GitHub 对它返回的 repository.viewerPermission 恒为 null（既不是 READ，
+  // 也不会报 403），拿 App 令牌查这一项只会在配了 apps.read 的 profile 上一直报红，而实际推送是通的。
+  const forkQuery = typeof api.ownerGraphql === 'function' ? api.ownerGraphql.bind(api) : api.graphql.bind(api);
   const forkProblems = [];
   for (const pattern of profile.forkRepos || []) {
     const name = String(pattern).split('/')[1];
@@ -311,7 +316,7 @@ export async function runDoctor({
     const target = forkTargetFor(profile, pattern);
     const [owner, targetName] = target.split('/');
     try {
-      const data = await api.graphql(REPO_QUERY, { owner, name: targetName });
+      const data = await forkQuery(REPO_QUERY, { owner, name: targetName });
       const permission = data?.repository?.viewerPermission;
       if (!FORK_PERMISSIONS.has(String(permission))) forkProblems.push(target);
     } catch {
