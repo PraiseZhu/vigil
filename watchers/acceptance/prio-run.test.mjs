@@ -971,3 +971,37 @@ test('#247 P3-6 用同一拍快照的那一次不按整板读记点数（否则�
   const afterSnapshot = JSON.parse(fs.readFileSync(world.rateFile, 'utf8'));
   assert.equal(afterSnapshot.components['prio-run'].used, 8, '没发整板读就不该再记 8 点');
 });
+
+// ── 复审 rev-258 P2-a：额度闸与快照写自己出错时 fail-open（与 loop.test.mjs 的「额度闸自己出错」对称） ──
+
+test('#247 P2-a 额度闸自己出错（状态文件位置被目录占着）：这一拍照常跑、放行并留痕', async () => {
+  const world = boardSetup();
+  const io = capture();
+  const gh = boardRun();
+  // 状态文件位置被一个目录占着：写不进去（rename 到目录上报 EISDIR）→ 判定内部抛错。
+  fs.mkdirSync(world.rateFile, { recursive: true });
+  const result = await main(['--state-dir', world.dir, '--dry-run'], { ...boardDeps(world, gh), stdout: io.stdout });
+  assert.equal(result.exitCode, 0, '额度闸自己出错不把这一拍弄挂');
+  assert.match(String(result.gateError || ''), /EISDIR|directory|illegal/i, '返回值要能看见闸自己出错');
+  assert.equal(result.stop, '', '不因为闸出错就当成「因额度跳过」');
+  assert.equal(gh.boardCalls(), 1, '放行：看板照读');
+  assert.match(io.text(), /rate-unknown component=prio-run identity=user remaining=unknown reason=rate-gate-error/, '要留一行可查的痕迹');
+  // 痕迹也要落进这一拍的 run 日志（stdout 被 tee 进去），不然只留在终端里。
+  const runLog = fs.readdirSync(world.dir).find((name) => /^run-\d{4}-\d{2}-\d{2}\.log$/.test(name));
+  assert.ok(runLog, '这一拍的 run 日志要写出来');
+  assert.match(fs.readFileSync(path.join(world.dir, runLog), 'utf8'), /reason=rate-gate-error/);
+});
+
+test('#247 P2-a 看板快照写不下去：这一拍照常用刚拉到的数据，只留痕', async () => {
+  const world = boardSetup();
+  const io = capture();
+  const gh = boardRun();
+  // 快照位置被一个目录占着：读到的是「坏快照」（corrupt），重拉之后写盘失败。
+  fs.mkdirSync(world.snapshotFile, { recursive: true });
+  const result = await main(['--state-dir', world.dir, '--dry-run'], { ...boardDeps(world, gh), stdout: io.stdout });
+  assert.equal(result.exitCode, 0, '快照写不下去不把这一拍弄挂');
+  assert.match(String(result.snapshotError || ''), /EISDIR|directory|illegal/i, '返回值要能看见快照写失败');
+  assert.equal(gh.boardCalls(), 1, '快照坏了就重拉一次');
+  assert.equal(result.boardSource, 'fetched', '这一拍用的是刚拉到的数据');
+  assert.match(io.text(), /board-snapshot-error component=prio-run reason=write-failed/, '写失败要留痕');
+});

@@ -483,6 +483,8 @@ export async function runTick({
     }
 
     /** 判定一次读能不能发；日志行（因额度跳过 / rate-unknown / 重置后限速）写 loop.log。 */
+    // 同一拍里的多次判定共用一个拍标识：连跳按「拍」数，越过阈值那一次只写一条提醒（#247 P2-b）。
+    const tickGateId = String(now());
     const rateGate = ({ component, purpose = 'non-essential', cost = 0, reserve = 0, tickId } = {}) => {
       try {
         const decided = decideTick({
@@ -490,7 +492,7 @@ export async function runTick({
           purpose,
           state: readRateState(paths.rateState),
           now: now(),
-          tickId,
+          tickId: tickId ?? tickGateId,
           budgets: rateBudgets,
           cost,
           reserve,
@@ -539,7 +541,9 @@ export async function runTick({
     const noteRateLimited = (stage, error) => {
       const identity = error?.identity === 'app' ? 'app' : defaultIdentity('loop');
       try {
-        if (error?.remaining != null || error?.reset != null) {
+        // 只有真的拿到了剩余才记（#247 复审 P3）：`remaining` 缺失时照记会把已知剩余抹成 unknown，
+        // 恰好是最需要退避的时刻。github 侧同一类守卫也是「没有剩余就不记」。
+        if (error?.remaining != null) {
           writeRateState(
             paths.rateState,
             recordHeader(readRateState(paths.rateState), {
@@ -571,8 +575,8 @@ export async function runTick({
       heartbeat.lastTick.rateSkippedStage = stage;
     };
 
-    // 主循环 poll 是必要读（低额度时优先），但预算超了也要跳过这一拍（#247 SC5）。
-    // `reserve` 只在预算比较时算上这一次读的估计点数：预算刚好剩一点时提前止步（P3-2 的 cost 也不再恒为 0）。
+    // 主循环 poll 是必要读（低额度 / 超预算时都照跑，#247 SC5 / 复审 P1）：预算闸对 essential 直接放行，
+    // 剩余低于 800 也只暂停非必要读。`reserve` 只在预算比较时算上这一次读的估计点数（对 essential 不生效）。
     const pollGate = rateGate({ component: 'loop', purpose: 'essential', reserve: GRAPHQL_COST_PER_REQUEST });
     noteRateSkip(pollGate, { component: 'loop', purpose: 'essential' });
     if (!pollGate.allowed) {

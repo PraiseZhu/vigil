@@ -1503,44 +1503,127 @@ test('#247 P2-2 poll 没给 reads 时按 1 记；给了 0（这一拍没发请�
   assert.equal(state.components.loop, undefined, 'reads=0 表示这一拍没发请求，不记用量');
 });
 
-test('#247 P2-3 预算超了：心跳写 rateSkipped（和限流同一个字段）、日志带真实 cost，连续跳过超过 N 拍写一条提醒', async () => {
+test('#247 P1 预算越线时 essential 照跑（poll/abort/派发），只有非必要读被跳过', async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  hostWithPrbot(home);
+  enableGate(home);
   const paths = hostPaths(home);
   const nowMs = Date.parse('2026-10-24T02:00:00.000Z');
   writeBudgetConfig(home, { loop: 500, 'prio-run': 300, 'board-live': 140 });
-  // 本小时已经用满（used 500）：之后每一拍都判 over-budget（整点才切窗）。
-  writeRateStateFile(paths, { remaining: 4000, used: 500, nowMs });
+  // 本小时已经用满（used 500）：非必要读全部跳过，但 essential 不受预算闸约束（复审 rev-258 的 P1）。
+  writeRateStateFile(paths, { remaining: 4000, resetInMs: 3000 * 1000, used: 500, nowMs });
   const polled = [];
+  const aborted = [];
+  const started = [];
+  const discovered = [];
+  const stalled = [];
+  const heartbeat = await runTick({
+    home,
+    env: { ...process.env },
+    now: () => nowMs,
+    run: async (cmd, args) => {
+      polled.push(args);
+      // 一条卡住的轮次（要 abort）+ 一条该派发的条目（要起轮）。
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          entries: [
+            { issue: `${REPO}#9`, round: 1, stale: true, lastProgressAt: '2026-10-24T01:00:00.000Z' },
+            { issue: `${REPO}#10`, kind: 'standalone', tier: 'auto', fork: false, nextRound: 1, bodyVersion: 'sha256:abc' },
+          ],
+          tasks: [],
+          reads: 1,
+        }),
+        stderr: '',
+      };
+    },
+    spawnRound: (issue) => {
+      started.push(issue);
+      return 1;
+    },
+    spawnPrbot: () => 1,
+    runRound: async (argv) => {
+      aborted.push(argv);
+      return { code: 0, stdout: '', stderr: '' };
+    },
+    discoverPrbot: async () => {
+      discovered.push('discover');
+      return [];
+    },
+    checkPrbotStalled: async () => {
+      stalled.push('stalled');
+      return [];
+    },
+    cleanupPrbot: () => [],
+    gateAudit: async () => ({ checkedLines: 0, newViolations: [], sinceBaseline: null, newUncertain: [] }),
+    notify: async () => ({ ok: false, reason: 'not-configured' }),
+  });
+  assert.equal(heartbeat.lastTick.ok, true, '心跳照旧 ok');
+  assert.equal(polled.length, 1, 'essential（主循环 poll）越预算也照跑，不然这一小时剩下的 poll 全停');
+  assert.deepEqual(aborted.map((argv) => argv[0]), ['abort'], '卡住的轮次照样 abort（心跳 ok 之外的唯一推进动作）');
+  assert.ok(aborted[0].includes(`${REPO}#9`), `abort 带上卡住的 issue：${aborted[0]}`);
+  assert.deepEqual(started, [`${REPO}#10`], '该派发的条目照样派发');
+  assert.deepEqual(discovered, [], '非必要读（修正轮发现）被预算闸跳过');
+  assert.deepEqual(stalled, [], '非必要读（卡住检查）被预算闸跳过');
+  assert.equal(heartbeat.lastTick.rateSkipped, 'over-budget', '跳过原因写进心跳（外部只认这一个字段）');
+  const log = fs.readFileSync(paths.loopLog, 'utf8');
+  assert.match(log, /rate-skip component=loop identity=user remaining=4000 action=over-budget budget=500 used=506 cost=6 因额度跳过/);
+  const alerts = readAlerts(paths).filter((entry) => entry.kind === 'rate-skip-escalate');
+  assert.equal(alerts.length, 0, '只跳过 1 拍（两个非必要闸算一拍）不该提醒');
+});
+
+test('#247 P2-b 预算越线连跑 2N+3 拍：提醒恰好 1 条，连跳按「拍」数', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  hostWithPrbot(home);
+  const paths = hostPaths(home);
+  const nowMs = Date.parse('2026-10-24T02:00:00.000Z');
+  writeBudgetConfig(home, { loop: 500, 'prio-run': 300, 'board-live': 140 });
+  // 窗口重置在 55 分钟后：这一段都算同一个窗口，不会切进恢复期（那样连跳会被清零）。
+  writeRateStateFile(paths, { remaining: 4000, resetInMs: 55 * 60 * 1000, used: 500, nowMs });
+  const ticks = 2 * MAX_CONSECUTIVE_SKIPS + 3;
+  const polled = [];
+  const discovered = [];
+  const stalled = [];
   let heartbeat = null;
-  // 连跑 N+1 拍：整小时都不 poll，但每拍心跳都正常 —— 光看心跳发现不了「没在推进」。
-  for (let i = 0; i <= MAX_CONSECUTIVE_SKIPS; i += 1) {
+  for (let i = 0; i < ticks; i += 1) {
     heartbeat = await runTick({
       home,
       env: { ...process.env },
-      now: () => nowMs + i * 180000,
-      run: async (cmd, args) => {
-        polled.push(args);
-        return { code: 0, stdout: '[]', stderr: '' };
+      now: () => nowMs + i * TICK_INTERVAL_SECONDS * 1000,
+      run: async () => {
+        polled.push(i);
+        return { code: 0, stdout: JSON.stringify({ entries: [], tasks: [], reads: 1 }), stderr: '' };
       },
       spawnRound: () => 1,
       spawnPrbot: () => 1,
       runRound: async () => ({ code: 0, stdout: '', stderr: '' }),
-      checkPrbotStalled: async () => [],
+      discoverPrbot: async () => {
+        discovered.push(i);
+        return [];
+      },
+      checkPrbotStalled: async () => {
+        stalled.push(i);
+        return [];
+      },
       cleanupPrbot: () => [],
       gateAudit: async () => ({ checkedLines: 0, newViolations: [], sinceBaseline: null, newUncertain: [] }),
       notify: async () => ({ ok: false, reason: 'not-configured' }),
     });
     assert.equal(heartbeat.lastTick.ok, true, `第 ${i + 1} 拍心跳仍是 ok`);
   }
-  assert.equal(polled.length, 0, '超预算这一拍不 poll');
-  assert.equal(heartbeat.lastTick.rateSkipped, 'over-budget', '跳过原因写进心跳（外部只认这一个字段）');
-  const log = fs.readFileSync(paths.loopLog, 'utf8');
-  assert.match(log, /rate-skip component=loop identity=user remaining=4000 action=over-budget budget=500 used=500 cost=6 因额度跳过/);
+  assert.equal(polled.length, ticks, '每一拍都 poll（essential 不受预算闸约束）');
+  assert.deepEqual(discovered, [], '每一拍的非必要读都被跳过');
+  assert.deepEqual(stalled, [], '每一拍的非必要读都被跳过');
   const alerts = readAlerts(paths).filter((entry) => entry.kind === 'rate-skip-escalate');
-  assert.equal(alerts.length, 1, '连续跳过超过 N 拍要有一条提醒，不能只有日志');
-  assert.equal(alerts[0].count, MAX_CONSECUTIVE_SKIPS + 1);
+  assert.equal(alerts.length, 1, `连跳 ${ticks} 拍只该有 1 条提醒（原先每拍 2 条）`);
+  assert.equal(alerts[0].count, MAX_CONSECUTIVE_SKIPS + 1, '提醒写的是刚跨过阈值时的拍数');
   assert.equal(alerts[0].component, 'loop');
+  const state = JSON.parse(fs.readFileSync(paths.rateState, 'utf8'));
+  assert.equal(state.skips.byKey['loop:non-essential'].count, ticks, '连跳按拍数（同一拍两个非必要闸只算一拍）');
+  const log = fs.readFileSync(paths.loopLog, 'utf8');
+  assert.match(log, /rate-skip component=loop identity=user remaining=4000 action=over-budget budget=500 used=506 cost=6 因额度跳过/);
 });
+
 
 test('#247 P3-1 额度闸自己出错（状态文件写不下去）：仍然放行，但心跳和日志都留痕', async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
@@ -1705,6 +1788,9 @@ test('#247 P2-B host/loop 不拿离谱的注入值去 sleep：非法值按默认
     for (const [injected, expected] of [
       ['abc', '180'],
       ['180000', '180'],
+      // 超过 4 位（超出 shell 整数比较范围，[ -gt ] 会报错并非零退出、原值被留下来）：按长度直接回落。
+      ['99999999999999999999', '180'],
+      ['000180', '180'],
       ['0', '180'],
       ['7', '7'],
     ]) {
@@ -1760,4 +1846,37 @@ test('#247 P3-3 卡住检查遇限流：这一拍跳过不写 prbot-tick-failed�
   assert.match(fs.readFileSync(paths.loopLog, 'utf8'), /rate-skip component=loop identity=user remaining=0 action=github-rate-limited 因额度跳过/);
   const state = JSON.parse(fs.readFileSync(paths.rateState, 'utf8'));
   assert.equal(state.identities.user.remaining, 0, '限流带的响应头也要记下来');
+});
+
+// 复审 rev-258 顺手项：tick 侧记限流响应头时只看 `remaining`。只有 reset、没有 remaining 的头块
+// （中间代理改写、老版本 gh）不能把已知剩余记成 unknown——那恰好是最需要退避的时刻。
+test('#247 限流响应头只有 reset 没有 remaining：不把已知剩余抹成 unknown', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  hostWithPrbot(home);
+  const paths = hostPaths(home);
+  const nowMs = Date.parse('2026-10-24T02:00:00.000Z');
+  // 1200：高于 800，非必要读（修正轮发现）不被响应头闸跳过，才会走到「限流上报的头块只有 reset」这一支。
+  writeRateStateFile(paths, { remaining: 1200, nowMs });
+  const heartbeat = await runTick({
+    home,
+    env: { ...process.env },
+    now: () => nowMs,
+    run: async () => ({ code: 0, stdout: JSON.stringify({ entries: [], tasks: [], reads: 1 }), stderr: '' }),
+    spawnRound: () => 1,
+    spawnPrbot: () => 1,
+    runRound: async () => ({ code: 0, stdout: '', stderr: '' }),
+    discoverPrbot: async () => {
+      throw new RateLimitError('触发 GitHub 限流', { remaining: null, reset: '1762299600', identity: 'user' });
+    },
+    checkPrbotStalled: async () => [],
+    cleanupPrbot: () => [],
+    gateAudit: async () => ({ checkedLines: 0, newViolations: [], sinceBaseline: null, newUncertain: [] }),
+    notify: async () => ({ ok: false, reason: 'not-configured' }),
+  });
+  assert.equal(heartbeat.lastTick.ok, true);
+  assert.equal(heartbeat.lastTick.rateSkipped, 'github-rate-limited');
+  const state = JSON.parse(fs.readFileSync(paths.rateState, 'utf8'));
+  assert.equal(state.identities.user.remaining, 1200, '只有 reset 的头块不许把已知剩余覆盖成 unknown');
+  assert.equal(state.identities.user.known, true);
+  assert.match(fs.readFileSync(paths.loopLog, 'utf8'), /rate-skip component=loop identity=user remaining=1200 action=github-rate-limited 因额度跳过/);
 });

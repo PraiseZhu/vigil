@@ -323,15 +323,29 @@ export function decideTick({
   // 连跳节数按「组件 + 用途」分开数（#247 P2-3）：同一拍里 essential 放行会把全局计数清零，
   // 那样非必要读的连续跳过永远数不到 1 以上，SC10 也就观察不到。
   const skipKey = `${component}:${purpose}`;
-  const previousSkip = Number(next.skips.byKey?.[skipKey]?.count) > 0 ? Number(next.skips.byKey[skipKey].count) : 0;
+  const previousEntry = next.skips.byKey?.[skipKey];
+  const previousSkip = Number(previousEntry?.count) > 0 ? Number(previousEntry.count) : 0;
+  // 连跳数按「拍」数，不按「判定次数」数（#247 P2-b）：同一拍里同一个 key 可能判两次（loop 的修正轮发现
+  // 与卡住检查共用 `loop:non-essential`），这一拍已经记过一次就不再累加，提醒也不会在同一拍写两条。
+  const sameTick = previousEntry?.lastTick != null && String(previousEntry.lastTick) === tickKey;
+  // 只有「刚跨过阈值」那一次提醒（#247 P2-b）：越过之后每一拍都还跳过，但提醒不重复写，
+  // 恢复（allowed）或切窗后被清零才重新计。
+  const alreadyEscalated = Boolean(previousEntry?.escalated);
   const result = (patch) => {
-    const skipStreak = patch.allowed ? 0 : previousSkip + 1;
+    const skipStreak = patch.allowed ? 0 : sameTick ? previousSkip : previousSkip + 1;
+    const escalate = !patch.allowed && skipStreak > MAX_CONSECUTIVE_SKIPS && !alreadyEscalated;
     next.skips = {
       count: skipStreak,
       lastAt: isoAt(at),
       byKey: {
         ...next.skips.byKey,
-        [skipKey]: { count: skipStreak, lastAt: isoAt(at), reason: patch.allowed ? '' : patch.reason || '' },
+        [skipKey]: {
+          count: skipStreak,
+          lastAt: isoAt(at),
+          lastTick: patch.allowed ? null : tickKey,
+          escalated: !patch.allowed && (alreadyEscalated || skipStreak > MAX_CONSECUTIVE_SKIPS),
+          reason: patch.allowed ? '' : patch.reason || '',
+        },
       },
     };
     if (patch.allowed && amount > 0) {
@@ -344,15 +358,17 @@ export function decideTick({
       raw: record?.remainingRaw ?? '',
       resetAt: record?.reset ?? null,
       skipStreak,
-      escalate: !patch.allowed && skipStreak > MAX_CONSECUTIVE_SKIPS,
+      escalate,
       state: next,
       scope: patch.scope || 'this-tick',
       ...patch,
     };
   };
 
-  // 1. 预算闸：只影响这个组件自己。
-  if (budgets) {
+  // 1. 预算闸：只影响这个组件自己，而且只约束非必要读（#247 P1 / 复审 rev-258）。
+  //    essential（主循环 poll）直接放行：`used` 只增不减、UTC 整点才切窗，一旦越过预算，拦它就会把这一小时
+  //    剩余的 poll 连同心跳之外的 abort / 派发一起停掉，而心跳仍是 ok:true。用量照记，超预算只影响非必要读。
+  if (budgets && purpose !== 'essential') {
     const budget = budgets[component];
     if (!Number.isInteger(budget) || budget <= 0) {
       throw new Error(`额度预算「${component}」期望正整数，实际：${showActual(budget)}`);
@@ -456,7 +472,7 @@ export function decideTick({
       action: reason,
     });
   }
-  const streakAfter = previousSkip + 1;
+  const streakAfter = sameTick ? previousSkip : previousSkip + 1;
   if (!allowed && streakAfter > MAX_CONSECUTIVE_SKIPS) {
     log = `${log ?? ''} streak=${streakAfter}`;
   }

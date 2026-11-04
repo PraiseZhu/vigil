@@ -118,6 +118,15 @@ const CASES = [
     expectLogKind: 'rate-skip',
   },
   {
+    // 复审 rev-258 补的那一格：严格小于才算暂停，恰好 800 的非必要读要放行（原先只钉了看板读那一档）。
+    name: '剩余恰好 = 800 且这一读是非必要（非看板）：放行（严格小于才暂停）',
+    remaining: 800,
+    purpose: 'non-essential',
+    expectAllowed: true,
+    expectMode: 'normal',
+    expectLogKind: null,
+  },
+  {
     name: '剩余 799：全面暂停非必要读；主循环 poll（essential）照跑',
     remaining: 799,
     purpose: 'non-essential',
@@ -239,13 +248,48 @@ test('#247 SC5 预算配置：缺项、非正整数都报可诊断错误，不�
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify({ rateBudget: { loop: 500, 'prio-run': 300, 'board-live': 140 } }));
   assert.equal(readBudgetFile(file).loop, 500);
+  // 文件在、但 JSON 非法（复审 rev-258 的测试缺口）：照旧报可诊断错误，不静默当成「没配预算」。
+  fs.writeFileSync(file, '{ "rateBudget": { "loop": 500, ');
+  assert.throws(() => readBudgetFile(file), /额度预算配置不是合法 JSON/);
+});
+
+test('#247 SC5 预算闸只约束非必要读：essential（主循环 poll）越预算也放行', () => {
+  const budgets = { loop: 500, 'prio-run': 300, 'board-live': 140 };
+  let state = stateWith(4000);
+  state = chargeBudget(state, { component: 'loop', cost: 498, now: NOW });
+  // 复审 rev-258 的 P1：`used` 只增不减、整点才切窗，拦 essential 会把这小时剩下的 poll/abort/派发一起停掉。
+  const essential = decideTick({
+    component: 'loop',
+    purpose: 'essential',
+    state,
+    now: NOW,
+    budgets,
+    tickId: 't1',
+    reserve: 6,
+  });
+  assert.equal(essential.allowed, true, 'essential 越预算也照跑');
+  assert.equal(essential.mode, 'normal');
+  assert.equal(essential.log, null, '放行就不写 rate-skip 日志');
+  // 同一份状态、同一拍：非必要读照旧被预算闸拦住。
+  const optional = decideTick({
+    component: 'loop',
+    purpose: 'non-essential',
+    state,
+    now: NOW,
+    budgets,
+    tickId: 't1',
+    reserve: 6,
+  });
+  assert.equal(optional.allowed, false, '非必要读照样受预算闸约束');
+  assert.equal(optional.mode, 'over-budget');
+  assert.match(optional.log, /action=over-budget budget=500 used=498 cost=6/);
 });
 
 test('#247 SC5 某组件超预算只让它自己跳过这一拍，别的组件照常跑', () => {
   const budgets = { loop: 500, 'prio-run': 300, 'board-live': 140 };
   let state = stateWith(4000);
   state = chargeBudget(state, { component: 'loop', cost: 498, now: NOW });
-  const loop = decideTick({ component: 'loop', purpose: 'essential', state, now: NOW, budgets, cost: 6 });
+  const loop = decideTick({ component: 'loop', purpose: 'non-essential', state, now: NOW, budgets, cost: 6 });
   assert.equal(loop.allowed, false);
   assert.equal(loop.mode, 'over-budget');
   assert.match(loop.log, /action=over-budget/);
@@ -315,18 +359,42 @@ test('#247 SC9 两枚令牌分开记账、互不覆盖；只有一枚有记录�
   assert.deepEqual(readRateState(path.join(path.dirname(file), 'nope.json')), emptyRateState());
 });
 
-test('#247 SC6 连续跳过记 streak：超过 N=5 时日志带上拍数，仍然只是跳过', () => {
+test('#247 SC6 连续跳过记 streak：超过 N=5 时日志带上拍数，仍然只是跳过，且只在跨过阈值那一次提醒', () => {
   const state = stateWith(0);
   let current = state;
   let last = null;
-  for (let i = 0; i < MAX_CONSECUTIVE_SKIPS + 1; i += 1) {
+  const escalations = [];
+  for (let i = 0; i < MAX_CONSECUTIVE_SKIPS + 3; i += 1) {
     last = decideTick({ component: 'prio-run', purpose: 'board', state: current, now: NOW + i * 1000, tickId: `t${i}` });
     current = last.state;
+    if (last.escalate) escalations.push(i);
   }
   assert.equal(last.allowed, false);
-  assert.equal(last.skipStreak, MAX_CONSECUTIVE_SKIPS + 1);
-  assert.equal(last.escalate, true);
-  assert.match(last.log, /streak=6/);
+  assert.equal(last.skipStreak, MAX_CONSECUTIVE_SKIPS + 3, '连跳按拍数一直累加');
+  assert.deepEqual(escalations, [MAX_CONSECUTIVE_SKIPS], '只有刚跨过阈值那一拍 escalate（#247 复审 P2-b）');
+  assert.match(last.log, /streak=8/);
+});
+
+// 复审 rev-258 P2-b：同一拍里同一个 key 判两次（loop 的发现 + 卡住检查）只算一拍，提醒也只写一条。
+test('#247 P2-b 连跳按拍去重：同一拍两个非必要闸只算一拍，提醒恰好一条', () => {
+  const ticks = 2 * MAX_CONSECUTIVE_SKIPS + 3;
+  let current = stateWith(4000, { reset: String(Math.floor(NOW / 1000) + 3300) }); // 剩余充足、窗口不重置：只让预算闸拦
+  const budgets = { loop: 500, 'prio-run': 300, 'board-live': 140 };
+  current = chargeBudget(current, { component: 'loop', cost: 500, now: NOW });
+  const perTick = [];
+  for (let i = 0; i < ticks; i += 1) {
+    const tickId = `t${i}`;
+    const at = NOW + i * TICK_SECONDS * 1000;
+    const first = decideTick({ component: 'loop', purpose: 'non-essential', state: current, now: at, tickId, budgets, reserve: 6 });
+    const second = decideTick({ component: 'loop', purpose: 'non-essential', state: first.state, now: at, tickId, budgets, reserve: 6 });
+    current = second.state;
+    perTick.push({ skipStreak: second.skipStreak, escalate: [first.escalate, second.escalate] });
+  }
+  const escalated = perTick.flatMap((entry, index) => entry.escalate.map((value, slot) => (value ? `${index}:${slot}` : null)).filter(Boolean));
+  assert.deepEqual(escalated, [`${MAX_CONSECUTIVE_SKIPS}:0`], `跑 ${ticks} 拍（每拍两次判定）只该有 1 次提醒`);
+  assert.equal(perTick.at(-1).skipStreak, ticks, '连跳数是拍数，不是判定次数');
+  assert.equal(current.skips.byKey['loop:non-essential'].count, ticks, 'byKey 也按拍数记');
+  assert.equal(current.skips.byKey['loop:non-essential'].escalated, true, '跨过阈值后记着已提醒过，不再重复');
 });
 
 test('#247 窗口相位：reset 还在前面是 normal，过了就是 recovery', () => {
@@ -415,8 +483,11 @@ test('#247 P2-5 窗口相位：reset 比现在还晚一个窗口以上（时钟�
 test('#247 P3-1 同一拍里 essential 放行不清非必要读的连跳（skips.byKey 分开数）', () => {
   let current = stateWith(700); // 低于 800：essential 放行、非必要读暂停
   const steps = [];
+  // 每步用一个新拍标识：连跳按「拍」数，同一拍重复判定不再累加（复审 rev-258 P2-b）。
+  let tick = 0;
   for (const purpose of ['non-essential', 'essential', 'non-essential', 'non-essential']) {
-    const decision = decideTick({ component: 'loop', purpose, state: current, now: NOW, tickId: 't1' });
+    tick += 1;
+    const decision = decideTick({ component: 'loop', purpose, state: current, now: NOW, tickId: `t${tick}` });
     current = decision.state;
     steps.push({ purpose, allowed: decision.allowed, skipStreak: decision.skipStreak });
   }
@@ -434,7 +505,7 @@ test('#247 P3-1 同一拍里 essential 放行不清非必要读的连跳（skips
   assert.equal(current.skips.byKey['loop:essential'].count, 0, 'essential 自己那一档是 0');
 
   // 另一个组件、同一拍：各算各的。
-  const other = decideTick({ component: 'prio-run', purpose: 'non-essential', state: current, now: NOW, tickId: 't1' });
+  const other = decideTick({ component: 'prio-run', purpose: 'non-essential', state: current, now: NOW, tickId: 't4' });
   assert.equal(other.skipStreak, 1, '别的组件第一次跳过是 1，不接着 loop 的连跳');
   assert.equal(other.state.skips.byKey['loop:non-essential'].count, 3, '动别人不清 loop 的连跳');
 });

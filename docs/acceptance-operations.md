@@ -820,17 +820,19 @@ github-live 的手测（真的看板上跑 24 小时、以及合并后确认没�
 }
 ```
 
-单位是这一小时的额度点数。`loop` 按「poll 的响应头个数 × 6 点」记，`prio-run` 一次整板读按 8 点记，`board-live` 按 REST 请求数记（它主要走 App 安装令牌的独立额度）。三个值都是保守值，按 #247「待定」项取：主循环改后实测约 500 点/小时、prio-run 沿用 300、仓外看板组件落在用户令牌上约 140 请求/小时。超预算只有该组件自己跳过，同一小时里别的组件照常跑。注意「跳过」的粒度不是一拍：`used` 只增不减、UTC 整点才切窗，所以某个组件一旦在这一小时里超了预算，这一小时**剩余所有拍**它都不再做那一读（不是只丢刚才那一拍）；跨过 5 拍会写一条 `rate-skip-escalate` 提醒，见本节末尾。
+单位是这一小时的额度点数。`loop` 按「poll 的响应头个数 × 6 点」记，`prio-run` 一次整板读按 8 点记，`board-live` 按 REST 请求数记（它主要走 App 安装令牌的独立额度）。三个值都是保守值，按 #247「待定」项取：主循环改后实测约 500 点/小时、prio-run 沿用 300、仓外看板组件落在用户令牌上约 140 请求/小时。超预算只有该组件自己跳过，同一小时里别的组件照常跑。注意「跳过」的粒度不是一拍：`used` 只增不减、UTC 整点才切窗，所以某个组件一旦在这一小时里超了预算，这一小时**剩余所有拍**它都不再做那一读（不是只丢刚才那一拍）；跨过 5 拍时写一条 `rate-skip-escalate` 提醒（同一段连跳只写一条：越过阈值后继续跳过不再重复提醒，恢复放行或切窗清零后重新计），见本节末尾。
+
+**预算闸只约束非必要读**：`purpose: 'essential'`（只有主循环 poll）直接放行，越预算照跑——拦它会把这一小时剩下的 poll 连同心跳之外的 abort / 派发一起停掉，而心跳仍是 `ok: true`（复审报的 P1）。用量照记，所以 `components.<组件>.used` 超过预算值是正常现象，超预算的后果只落在该组件的非必要读上（修正轮发现、卡住检查、看板整板读等）。响应头闸的 `< 800` 一档同样只暂停非必要读，`essential` 不拦，两处口径一致。
 
 配置缺了或值不对时：`prio-run` 打一行「额度预算配置无法使用：…」并只走响应头闸；主循环把原因写进心跳的 `lastTick.rateBudgetError`，同样不猜默认值。
 
 ### 状态文件（按令牌分开）
 
-`<home>/state/host/rate-budget.json`。`identities` 下每个令牌一格（`user` 账号令牌、`app` App 安装令牌），各记 `remaining` / `remainingRaw` / `reset` / `at` / `source`，互相不覆盖；某一枚没有记录时按缺头处理（`rate-unknown`）。`components` 下是各组件本小时（UTC 整点切窗）的 `used`，`recovery` 是当前恢复期的轮转位置，`skips` 是连续「因额度跳过」的拍数：`skips.byKey` 按「组件:用途」分开数（判定连跳用这个）；`skips.count` 是**最近一次判定那个 key** 的连跳数，随判定顺序变化，外部要读连跳请看 `byKey`。
+`<home>/state/host/rate-budget.json`。`identities` 下每个令牌一格（`user` 账号令牌、`app` App 安装令牌），各记 `remaining` / `remainingRaw` / `reset` / `at` / `source`，互相不覆盖；某一枚没有记录时按缺头处理（`rate-unknown`）。`components` 下是各组件本小时（UTC 整点切窗）的 `used`，`recovery` 是当前恢复期的轮转位置，`skips` 是连续「因额度跳过」的拍数：`skips.byKey` 按「组件:用途」分开数（判定连跳用这个），每一项记 `count`（连跳的**拍**数）、`lastAt`、`lastTick`（这一拍已经计过数，同一拍再判只算一拍）、`escalated`（这一段连跳已经提醒过，不再重复）、`reason`；`skips.count` 是**最近一次判定那个 key** 的连跳数，随判定顺序变化，外部要读连跳请看 `byKey`。
 
 ### 看板快照（每拍只整板读一次）
 
-`<home>/state/host/board-snapshot.json`，由 `prio-run` 每拍开头写一次，字段固定为 `at`（抓取时间，ISO）、`items`、`excludedCount`、`nullContent`。同一拍里 dry-run、`--write` 和仓外看板读者共用这一份，不再各自发整板查询；PR 搜索不属于快照，照旧每次都拉。
+`<home>/state/host/board-snapshot.json`，由 `prio-run` 每拍开头写一次，字段固定为 `version`（状态格式版本，当前是 1）、`at`（抓取时间，ISO）、`items`、`excludedCount`、`nullContent`。同一拍里 dry-run、`--write` 和仓外看板读者共用这一份，不再各自发整板查询；PR 搜索不属于快照，照旧每次都拉。
 
 读者只有两条路：`at` 距今不超过一个拍间隔（默认 180 秒）就直接用；过了就**重拉一次并覆盖**（`prio-run` 走这条），或者报「快照过期」不用（仓外读者走这条）。读接口是 `rate-budget.mjs` 的 `readBoardSnapshot`，返回 `{ok, reason, at, ageMs, items, excludedCount, nullContent}`，`reason` 是 `missing` / `stale` / `corrupt` / `clock-skew`。不许静默用旧数据。`ageMs` 为负（墙钟往回跳）按 `clock-skew` 处理：旧快照不能用，等下一拍重拉。快照里的 `items` 是抓取那一刻按 `repo-class.json` 分档过滤后的结果；拍内改分类表不影响这一份快照（下一拍重拉时生效）。用到快照的那一拍不按整板读记点数（真发请求时才记 8 点）。
 
@@ -845,11 +847,11 @@ github-live 的手测（真的看板上跑 24 小时、以及合并后确认没�
 <UTC 时间> rate-recovery component=loop identity=user remaining=438 resetAt=2026-11-03T19:07:00.000Z 重置后限速恢复：每拍最多 1 次非必要读
 ```
 
-连续「因额度跳过」超过 5 拍（N=5）时行尾再带 `streak=<拍数>`，仍然只跳过、不抛错；连跳节数按「组件 + 用途」分开数（`skips.byKey`），同一拍里 `essential` 放行不会把非必要读的连跳清零。跨过 5 拍时再写一条 `rate-skip-escalate` 提醒（带 `count`、`component`）：心跳 `ok` 一直是 true，光看心跳发现不了「整小时没在推进」。
+连续「因额度跳过」超过 5 拍（N=5）时行尾再带 `streak=<拍数>`，仍然只跳过、不抛错；连跳节数按「组件 + 用途」分开数（`skips.byKey`），同一拍里 `essential` 放行不会把非必要读的连跳清零，同一拍里同一个 key 判两次（`loop` 的修正轮发现 + 卡住检查）也只算一拍。跨过 5 拍时写一条 `rate-skip-escalate` 提醒（带 `count`、`component`），只写这一条：越过阈值后继续跳过不再重复写，恢复放行或切窗清零后重新计；心跳 `ok` 一直是 true，光看心跳发现不了「整小时没在推进」。
 
 限流被识别出来（403 带 rate limit 文案、429、GraphQL 的 `RATE_LIMITED` 错误码）时：`poll.mjs` 以退出码 75 收尾；修正轮发现和卡住检查遇限流时那一段直接跳过。两种情况都记 `lastTick.rateSkipped = github-rate-limited`（具体哪一段看同一条心跳里的 `rateSkippedStage`），不写 `tick-failed` / `prbot-tick-failed`、不触发看门狗停循环。跳过的原因只有一个字段名 `rateSkipped`（不再另写 `skipped`），取值是 `over-budget` / `remaining-below-800` / `remaining-below-1500` / `recovery-turn` / `github-rate-limited` 之一。
 
-额度判定自己出错（状态文件读不出、写不下去）时：这一拍照常跑（放行），原因写进心跳的 `lastTick.rateGateError`，并在 `loop.log` 写一行 `rate-unknown … reason=rate-gate-error`——不静默 fail-open。
+额度判定自己出错（状态文件读不出、写不下去）时：这一拍照常跑（放行），原因写进心跳的 `lastTick.rateGateError`，并在 `loop.log` 写一行 `rate-unknown … reason=rate-gate-error`——不静默 fail-open。`prio-run` 同一口径：判定或写状态出错就放行，写一行 `rate-unknown component=prio-run … reason=rate-gate-error` 到它自己的 `run-YYYY-MM-DD.log`，返回值里带 `gateError`；看板快照写不下去（位置被目录占着、磁盘满、权限不对）也不挡这一拍，写一行 `board-snapshot-error component=prio-run reason=write-failed` 并带 `snapshotError`，这一拍用的是刚拉到的数据。
 
 ### 心跳年龄阈值
 

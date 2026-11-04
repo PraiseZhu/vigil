@@ -12,6 +12,12 @@ TICK_SECONDS="${ACCEPTANCE_TICK_SECONDS:-180}"
 case "$TICK_SECONDS" in
   '' | *[!0-9]*) TICK_SECONDS=180 ;;
 esac
+# 超过 4 位一律回落到 180（含 19 位以上）：shell 的 [ -gt ] 遇到超出整数范围的值会报错并非零退出，
+# if 判为假，原值就被原样留下来，`sleep` 又真的接受它（实测循环停摆、心跳过期但 pid 还在）。
+# 4 位以内（含 3600）才用整数比较。
+if [ "${#TICK_SECONDS}" -gt 4 ]; then
+  TICK_SECONDS=180
+fi
 # 上面已保证全是数字，这里可以放心用整数比较（前导 0 不影响）。
 if [ "$TICK_SECONDS" -lt 1 ] || [ "$TICK_SECONDS" -gt 3600 ]; then
   TICK_SECONDS=180

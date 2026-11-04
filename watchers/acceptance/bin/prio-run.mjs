@@ -371,7 +371,7 @@ export function hostFilesFromEnv(env) {
  * - 快照过期或缺失：重拉一次并覆盖，不静默用旧数据。
  * 重拉只覆盖整板读，PR 搜索不属于快照，照旧每次都拉。
  */
-async function resolveBoard(deps, profile, table, { snapshot, snapshotFile, now, tickSeconds }) {
+async function resolveBoard(deps, profile, table, { snapshot, snapshotFile, now, tickSeconds, onSnapshotError }) {
   if (deps.loadItems) return loadBoard(deps, profile, table);
   const reader = createReadGithub({ profile, run: deps.run, fetchImpl: deps.fetchImpl });
   if (snapshot && snapshot.ok) {
@@ -389,12 +389,18 @@ async function resolveBoard(deps, profile, table, { snapshot, snapshotFile, now,
   }
   const board = await loadBoard(deps, profile, table);
   if (snapshotFile) {
-    writeBoardSnapshot(snapshotFile, {
-      at: now,
-      items: board.items,
-      excludedCount: board.excludedCount,
-      nullContent: board.nullContent,
-    });
+    try {
+      writeBoardSnapshot(snapshotFile, {
+        at: now,
+        items: board.items,
+        excludedCount: board.excludedCount,
+        nullContent: board.nullContent,
+      });
+    } catch (error) {
+      // 快照写不下去（位置被目录占着、磁盘满、权限不对）不挡这一拍：这一拍照常用刚拉到的数据，
+      // 只留痕（#247 复审 P2-a，与 host/tick.mjs 的 rateGate 同一口径：判定/写盘自己出错就放行）。
+      if (typeof onSnapshotError === 'function') onSnapshotError(error);
+    }
   }
   return { ...board, snapshotReason: snapshot?.reason || 'missing' };
 }
@@ -448,16 +454,28 @@ export async function runContinuous(argv = [], deps = {}) {
     const snapshot = snapshotFile ? readBoardSnapshot(snapshotFile, { now, tickSeconds }) : null;
     const willFetchBoard = !deps.loadItems && !snapshot?.ok;
     let gate = { allowed: true, state: null, log: null, remaining: null, skipStreak: 0, reason: '' };
+    let gateError = null;
+    let snapshotError = null;
     if (rateFile) {
-      gate = decideTick({
-        component: 'prio-run',
-        purpose: 'board',
-        state: readRateState(rateFile),
-        now,
-        budgets,
-        cost: willFetchBoard ? BOARD_READ_COST : 0,
-      });
-      writeRateState(rateFile, gate.state);
+      try {
+        gate = decideTick({
+          component: 'prio-run',
+          purpose: 'board',
+          state: readRateState(rateFile),
+          now,
+          budgets,
+          cost: willFetchBoard ? BOARD_READ_COST : 0,
+        });
+        writeRateState(rateFile, gate.state);
+      } catch (error) {
+        // 额度判定或写状态自己出错（状态文件位置被目录占着、读不出来、写不下去）：这一拍照常跑（放行）并留痕。
+        // 与 host/tick.mjs 的 rateGate 同一口径（#247 复审 P2-a）：要么放行 + 留痕，要么就不算 fail-open。
+        gateError = String(error?.message || error);
+        gate = { allowed: true, state: null, log: null, remaining: null, skipStreak: 0, reason: 'rate-gate-error' };
+        stdout.write(
+          `${new Date(now).toISOString()} rate-unknown component=prio-run identity=user remaining=unknown reason=rate-gate-error ${gateError} 判定或写状态出错，这一拍照常跑\n`,
+        );
+      }
       if (gate.log) {
         appendRateLog(path.join(dir, `run-${new Date(now).toISOString().slice(0, 10)}.log`), gate.log);
         stdout.write(`${gate.log}\n`);
@@ -474,6 +492,7 @@ export async function runContinuous(argv = [], deps = {}) {
           remaining: gate.remaining,
           skipStreak: gate.skipStreak,
           budgetError,
+          gateError,
         };
       }
     }
@@ -482,6 +501,12 @@ export async function runContinuous(argv = [], deps = {}) {
       snapshotFile,
       now,
       tickSeconds,
+      onSnapshotError: (error) => {
+        snapshotError = String(error?.message || error);
+        stdout.write(
+          `${new Date(now).toISOString()} board-snapshot-error component=prio-run reason=write-failed ${snapshotError} 快照写不下去，这一拍照常跑\n`,
+        );
+      },
     });
     let writeFn = deps.write || null;
     if (wantWrite && !writeFn) {
@@ -538,6 +563,8 @@ export async function runContinuous(argv = [], deps = {}) {
       boardSource: board.source,
       boardSnapshotReason: board.snapshotReason || '',
       budgetError,
+      gateError,
+      snapshotError,
     };
     if (result.readbackMismatch) {
       writeDisabled(dir, '回读不一致，持续写入已暂停');
