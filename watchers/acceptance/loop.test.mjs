@@ -1242,7 +1242,7 @@ test('#247 SC1 poll 还是老形状（数组）时，修正轮仍自己拉，不
   assert.equal(discovered[0].tasks, null, '老形状没有清单：留给 discoverCorrections 自己拉');
 });
 
-test('#247 SC3 默认拍间隔 180 秒；注入小间隔后 sleep 序列跟着变', async () => {
+test('#247 SC3 默认拍间隔 180 秒；注入小间隔后 sleep 序列跟着变', { skip: FLOCK_SKIP }, async () => {
   // 静态：脚本默认值就是 180，不再是 60。
   const script = fs.readFileSync(path.join(HOST_DIR, 'loop'), 'utf8');
   assert.match(script, /ACCEPTANCE_TICK_SECONDS:-180/);
@@ -1717,7 +1717,7 @@ test('#247 P2-B 拍间隔写进心跳前也有上界：ACCEPTANCE_TICK_SECONDS �
   }
 });
 
-test('#247 P2-B ensure.sh 与 doctor 用同一把尺：tickIntervalS 只认 1..3600，超出回落 240 秒', async () => {
+test('#247 P2-B ensure.sh 与 doctor 用同一把尺：tickIntervalS 只认 1..3600，超出回落 240 秒', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
@@ -1768,7 +1768,7 @@ test('#247 P2-B ensure.sh 与 doctor 用同一把尺：tickIntervalS 只认 1..3
   }
 });
 
-test('#247 P2-B host/loop 不拿离谱的注入值去 sleep：非法值按默认 180 秒睡', async () => {
+test('#247 P2-B host/loop 不拿离谱的注入值去 sleep：非法值按默认 180 秒睡', { skip: FLOCK_SKIP }, async () => {
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
   const tickLog = path.join(home, 'tick.log');
   knownTickLogs.add(tickLog);
