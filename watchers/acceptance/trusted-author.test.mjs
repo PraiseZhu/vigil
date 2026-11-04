@@ -16,6 +16,7 @@ import { OWNER, REPO, roundComment, tmpDir, writeProfile } from './fake-gh.fixtu
 // 夹具里的 App bot 登录名用占位符：公开仓不写真实 App 名之外的任何编号。
 const BOT = 'example-automation[bot]';
 const OTHER_BOT = 'dependabot[bot]';
+const STRANGER = 'StrangerUser';
 const ROOT_REF = `${REPO}#1`;
 const BOT_PROFILE = { ownerLogin: OWNER, trustedBotLogins: [BOT] };
 
@@ -84,9 +85,9 @@ test('SC4 类型可得时 bot 项必须是 Bot；类型拿不到的老数据只�
   // 本人是账号（User），带 Bot 类型反而不放行
   assert.equal(isTrustedAuthor(authorOf(OWNER, 'User'), BOT_PROFILE), true);
   assert.equal(isTrustedAuthor(authorOf(OWNER, 'Bot'), BOT_PROFILE), false);
-  // 显式传类型
-  assert.equal(isTrustedAuthor(BOT, BOT_PROFILE, { type: 'Bot' }), true);
-  assert.equal(isTrustedAuthor(BOT, BOT_PROFILE, { type: 'User' }), false);
+  // 显式多传一个第三参数：已被忽略，类型只认作者自带的 __typename（见 SC9）
+  assert.equal(isTrustedAuthor(authorOf(BOT, 'Bot'), BOT_PROFILE, { type: 'User' }), true);
+  assert.equal(isTrustedAuthor(authorOf(BOT, 'User'), BOT_PROFILE, { type: 'Bot' }), false);
   // 冒充者带 Bot 类型也不放行
   assert.equal(isTrustedAuthor(authorOf(`${BOT}x`, 'Bot'), BOT_PROFILE), false);
 });
@@ -101,6 +102,17 @@ test('SC5 手工拼的名单：不带 [bot] 的条目不生效，isBotLogin 只�
   for (const bad of ['StrangerUser', 'Stranger[bot]x', '[bot]', '', null, 42]) {
     assert.equal(isBotLogin(bad), false, JSON.stringify(bad));
   }
+});
+
+test('SC9 第三参数不再能覆盖作者自带的类型：传 {type} 洗不白 User，也贬不了真 bot', () => {
+  // 生产代码全是两参调用；这里故意多传第三参数，证明它被忽略。
+  // 作者自带 User（登录名撞上名单项），第三参数传 Bot 也不能变成可信。
+  assert.equal(isTrustedAuthor(authorOf(BOT, 'User'), BOT_PROFILE, { type: 'Bot' }), false);
+  assert.equal(isTrustedAuthor(authorOf(STRANGER, 'User'), BOT_PROFILE, { type: 'Bot' }), false);
+  // 反过来，第三参数传 User 也不影响作者自带 Bot 的判定。
+  assert.equal(isTrustedAuthor(authorOf(BOT, 'Bot'), BOT_PROFILE, { type: 'User' }), true);
+  // 作者对象没有类型时，第三参数同样不会被当成类型来源：只按 login 命中。
+  assert.equal(isTrustedAuthor(authorOf(BOT), BOT_PROFILE, { type: 'User' }), true);
 });
 
 test('SC6 profile 校验：非数组 / 不带 [bot] / 空串 / 重复 / 非字符串都报错并点名键', () => {
