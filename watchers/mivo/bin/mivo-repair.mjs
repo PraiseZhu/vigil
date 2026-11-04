@@ -1077,13 +1077,26 @@ async function runLoggedStep(runFn, binary, args, base, logPath) {
 const PRE_PUSH_LOCK_BUSY = /已有一份 pre-push 在跑|another pre-push is (?:already )?running/;
 export const PREFLIGHT_LOCK_BUSY = 'preflight-lock-busy';
 
-// Non-blocking probe: true when nobody holds <git common dir>/pre-push.flock right now. The probe lock is released
-// on exit, so it never holds the lock against the hook it is waiting for.
-export function probePrePushLock({ worktree, gitFn = command }) {
+// How many slots the worktree's own hook takes. Since 2026-11-04 the hook holds one of up to
+// PREFLIGHT_MAX_CONCURRENCY flocks (pre-push.flock, pre-push.flock.1 …); it falls back to 5 unless the value is a
+// 1-4 digit integer in 1-64, and so does this. A branch that has not synced main still carries the single-lock hook.
+function prePushSlots(worktree, env) {
+  if (!fs.readFileSync(path.join(worktree, '.githooks', 'pre-push'), 'utf8').includes('PREFLIGHT_MAX_CONCURRENCY')) return 1;
+  const raw = env.PREFLIGHT_MAX_CONCURRENCY ?? '5';
+  const value = /^\d{1,4}$/.test(raw) ? Number(raw) : 0;
+  return value >= 1 && value <= 64 ? value : 5;
+}
+
+// Non-blocking probe: true when one of the slots the worktree's hook would take is free right now. The probe locks
+// are released on exit, so it never holds a slot against the hook it is waiting for.
+export function probePrePushLock({ worktree, gitFn = command, env = process.env }) {
   const common = path.resolve(worktree, gitOutput(['-C', worktree, 'rev-parse', '--git-common-dir'], gitFn).trim());
+  const lock = path.join(common, 'pre-push.flock');
+  const slots = Array.from({ length: prePushSlots(worktree, env) }, (_, slot) => (slot ? `${lock}.${slot}` : lock));
   try {
-    execFileSync('perl', ['-MFcntl=:flock', '-e', 'open(my $f, ">>", $ARGV[0]) or exit 2; flock($f, LOCK_EX | LOCK_NB) or exit 1; exit 0',
-      path.join(common, 'pre-push.flock')], { stdio: 'ignore' });
+    execFileSync('perl', ['-MFcntl=:flock', '-e',
+      'for my $p (@ARGV) { open(my $f, ">>", $p) or exit 2; exit 0 if flock($f, LOCK_EX | LOCK_NB); } exit 1', ...slots],
+    { stdio: 'ignore' });
     return true;
   } catch (error) {
     if (error?.status === 1) return false;
@@ -1183,7 +1196,7 @@ export async function validate({ home, taskPath, validatedHead, ghFn = command, 
         const lockDeadline = Date.now() + config.lockWaitMs;
         let lockBusy = false;
         for (let retry = 1; !step.ok && !step.failureKind && PRE_PUSH_LOCK_BUSY.test(step.output); retry++) {
-          if (!await waitForPrePushLock({ probe: () => lockProbeFn({ worktree, gitFn }), deadline: lockDeadline, pollMs: lockPollMs })) { lockBusy = true; break; }
+          if (!await waitForPrePushLock({ probe: () => lockProbeFn({ worktree, gitFn, env }), deadline: lockDeadline, pollMs: lockPollMs })) { lockBusy = true; break; }
           step = await runLoggedStep(runFn, preflightCall.binary, preflightCall.args, base, `${logBase}-preflight-${retry}.log`);
         }
         exitCode = step.exitCode;
