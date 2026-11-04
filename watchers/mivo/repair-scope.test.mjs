@@ -1052,6 +1052,47 @@ test('SC6 stalled / timeout 不跑基线；同键基线只跑一次（缓存命�
   assert.deepEqual(worktreesLeft(), []);
 });
 
+// 2026-11-04：main 上的 .githooks/pre-push 一天改了两次。修复会话把 main 合进分支后，分支带的是 main 的新 hook，
+// 不再等于派单时的那份；这不是 PR 自己改 hook，按「和合入的 main 那一侧一致」放行，PR 自己改 hook 仍要批准。
+function mergeMainWithNewHook(f, { prEditsHookAfter = false } = {}) {
+  const git = (...args) => execFileSync('git', ['-C', f.worktree, ...args], { encoding: 'utf8',
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull } }).trim();
+  const hook = path.join(f.worktree, '.githooks/pre-push');
+  const commit = (message) => git('-c', 'commit.gpgsign=false', 'commit', '-q', '-am', message);
+  git('checkout', '-q', '-b', 'fixture-main', f.sourceHead);
+  fs.appendFileSync(hook, '# main: up to 5 at a time\n');
+  commit('main changes the hook');
+  git('push', '-q', 'origin', 'HEAD:refs/heads/main');
+  git('checkout', '-q', 'watch/pr-790');
+  git('branch', '-q', '-D', 'fixture-main');
+  git('fetch', '-q', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+  git('-c', 'commit.gpgsign=false', 'merge', '-q', '--no-edit', 'origin/main');
+  if (prEditsHookAfter) {
+    fs.appendFileSync(hook, '# pr: skip the unit step\n');
+    commit('pr edits the hook');
+  }
+  return git('rev-parse', 'HEAD');
+}
+
+test('合入 main 带来的新 hook 放行：validate 通过并记下来源，finalize 复核通过', async (t) => {
+  const f = fixture(t);
+  const head = mergeMainWithNewHook(f);
+  const options = { ...f.options, validatedHead: head, runFn: () => 'fixture checks passed\n' };
+  const verification = await validate(options);
+  assert.equal(verification.status, 'pass');
+  assert.equal(readReceipt(verification).policy.fromBase.baseRefName, 'main');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  assert.equal(finalize(options).status, 'complete');
+  assert.equal(f.remoteHead(), head);
+});
+
+test('合入 main 之后 PR 自己又改了 hook：仍按策略变更拦下', async (t) => {
+  const f = fixture(t);
+  const head = mergeMainWithNewHook(f, { prEditsHookAfter: true });
+  await assert.rejects(validate({ ...f.options, validatedHead: head, runFn: () => 'fixture checks passed\n' }),
+    /local preflight policy changed from the dispatched baseline/);
+});
+
 test('SC6 并发的两个 validate 对同一基线键只跑一次基线', async (t) => {
   const { f, route, outcome, baselineRuns } = baselineFixture(t);
   const slowBase = async () => { await new Promise((resolve) => setTimeout(resolve, 200)); return outcome(failLog(A))(); };

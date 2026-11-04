@@ -1004,12 +1004,26 @@ function rejectSkip(env = process.env) {
   if (env.PREFLIGHT_SKIP === '1') fail('PREFLIGHT_SKIP=1 cannot authorize repair validation or push; a bound approval receipt is required for an exception');
 }
 
-function validationPolicy(worktree, task, gitFn) {
+// The hook the branch carries must be the one it was dispatched with, or the base branch's own hook at the point the
+// branch last merged it (merge-base with origin/<base>): a session that merges main picks up main's reviewed hook,
+// which is not the PR changing its own checks. Any other hook change still needs a user-approved exception.
+function validationPolicy(worktree, task, gitFn, baseRefName = null) {
   const file = '.githooks/pre-push';
   const expected = gitOutput(['-C', worktree, 'show', `${task.headRefOid}:${file}`], gitFn).trim();
   const actual = fs.readFileSync(path.join(worktree, file), 'utf8').trim();
-  if (!expected || expected !== actual) fail('local preflight policy changed from the dispatched baseline');
-  return { file, sourceHead: task.headRefOid, sha256: hash(actual) };
+  if (expected && expected === actual) return { file, sourceHead: task.headRefOid, sha256: hash(actual) };
+  const fromBase = baseHook(worktree, file, baseRefName, gitFn);
+  if (!actual || fromBase?.hook !== actual) fail('local preflight policy changed from the dispatched baseline');
+  return { file, sourceHead: task.headRefOid, sha256: hash(actual), fromBase: { baseRefName, mergeBase: fromBase.mergeBase } };
+}
+
+function baseHook(worktree, file, baseRefName, gitFn) {
+  if (typeof baseRefName !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(baseRefName) || baseRefName.includes('..')) return null;
+  try {
+    const mergeBase = gitOutput(['-C', worktree, 'merge-base', 'HEAD', `refs/remotes/origin/${baseRefName}`], gitFn).trim();
+    if (!isSha(mergeBase)) return null;
+    return { mergeBase, hook: gitOutput(['-C', worktree, 'show', `${mergeBase}:${file}`], gitFn).trim() };
+  } catch { return null; }
 }
 
 function validationPointer(paths, task, head) {
@@ -1126,7 +1140,7 @@ export async function validate({ home, taskPath, validatedHead, ghFn = command, 
   if (!checkout || checkout.head !== validatedHead) fail('worktree HEAD does not match validated-head');
   assertPushableIdentity({ worktree, head: validatedHead, gitFn });
   const exception = validationException(paths, task, sessionId, validatedHead, worktree, gitFn);
-  const policy = exception ? null : validationPolicy(worktree, task, gitFn);
+  const policy = exception ? null : validationPolicy(worktree, task, gitFn, ownedPr?.baseRefName);
   const startedAt = new Date().toISOString();
   let exitCode = null;
   let outputHash = null;
@@ -1237,7 +1251,7 @@ export async function validate({ home, taskPath, validatedHead, ghFn = command, 
     assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead, allowValidatedHead: true });
     const after = assertWorktree(worktree, task, gitFn, originUrl);
     if (!after || after.head !== validatedHead) fail('HEAD changed during local validation');
-    if (policy && validationPolicy(worktree, task, gitFn).sha256 !== policy.sha256) fail('preflight policy changed during validation');
+    if (policy && validationPolicy(worktree, task, gitFn, ownedPr?.baseRefName).sha256 !== policy.sha256) fail('preflight policy changed during validation');
     if (runtime && runtimeSha256(canonicalRuntime({ worktree })) !== runtimeSha256(runtime)) fail('validation runtime fingerprint changed during validation');
   } catch (error) { status = 'fail'; reason = error.message; failureKind ??= 'evidence-invalid'; }
   const receipt = {
@@ -1279,7 +1293,7 @@ function verifiedLocal(paths, task, sessionId, head, worktree, gitFn, receiptPat
     return { status: receipt.status, head, receiptPath: file, receiptSha256: pointer.receiptSha256 };
   }
   if (receipt.status === 'baseline-only-failure') {
-    const policy = validationPolicy(worktree, task, gitFn);
+    const policy = validationPolicy(worktree, task, gitFn, receipt.policy?.fromBase?.baseRefName);
     if (receipt.policy?.sha256 !== policy.sha256) fail('local validation did not pass for this HEAD');
     if (receipt.runtimeSha256 !== runtimeSha256(canonicalRuntime({ worktree }))) fail('baseline-only validation runtime fingerprint changed');
     const problem = verifyBaselineBinding({ validations: paths.validations, receipt });
@@ -1290,7 +1304,7 @@ function verifiedLocal(paths, task, sessionId, head, worktree, gitFn, receiptPat
     };
   }
   if (receipt.status !== 'pass' || receipt.exitCode !== 0) fail('local validation did not pass for this HEAD');
-  const policy = validationPolicy(worktree, task, gitFn);
+  const policy = validationPolicy(worktree, task, gitFn, receipt.policy?.fromBase?.baseRefName);
   if (receipt.policy?.sha256 !== policy.sha256) fail('local validation did not pass for this HEAD');
   return {
     status: receipt.status, head, receiptPath: file, receiptSha256: pointer.receiptSha256,
