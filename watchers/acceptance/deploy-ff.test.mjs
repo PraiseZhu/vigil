@@ -977,7 +977,7 @@ test('#215 SC9 命令行入口标准输出恰好两行', { skip: FLOCK_SKIP }, a
   assert.equal(parts[2], '');
 });
 
-test('#215 SC10 SC14 SC17 源码静态约束', { skip: FLOCK_SKIP }, () => {
+test('#215 SC10 SC14 SC17 源码静态约束', () => {
   const hostImport = spawnSync('grep', ['-nE', String.raw`from '\./host/|from '\.\./host/|host/[a-z-]+\.mjs`, SCRIPT], { encoding: 'utf8' });
   assert.equal(hostImport.status, 1, hostImport.stdout);
   const banned = spawnSync('grep', ['-niE', 'crontab|systemctl|--write|authorization|slack', SCRIPT], { encoding: 'utf8' });
@@ -986,13 +986,20 @@ test('#215 SC10 SC14 SC17 源码静态约束', { skip: FLOCK_SKIP }, () => {
   assert.equal(renames.status, 0, renames.stderr);
   assert.match(renames.stdout, /--no-renames/);
   assert.match(fs.readFileSync(SCRIPT, 'utf8'), /renameSync/);
-  const expected = [
-    'docs/acceptance-operations.md',
-    'watchers/acceptance/deploy-ff.mjs',
-    'watchers/acceptance/deploy-ff.test.mjs',
-  ];
+  // 改了判定实现就必须同一个提交带上文档和测试。只比这条规则，不比整份提交列表：
+  // 一次提交里可以同时改别的文件（比如随同的测试夹具），那不是这次要比的东西。
+  const COMPANIONS = ['docs/acceptance-operations.md', 'watchers/acceptance/deploy-ff.test.mjs'];
+  const missingCompanions = (files) => (files.includes('watchers/acceptance/deploy-ff.mjs')
+    ? COMPANIONS.filter((file) => !files.includes(file)) : []);
+  // 规则本身先自检：浅克隆下拿不到父提交、走不到下面的真实比对，这里保证规则没被改松。
+  assert.deepEqual(missingCompanions(['watchers/acceptance/deploy-ff.mjs']), COMPANIONS);
+  assert.deepEqual(missingCompanions(['watchers/acceptance/deploy-ff.mjs', 'docs/acceptance-operations.md']),
+    ['watchers/acceptance/deploy-ff.test.mjs']);
+  assert.deepEqual(missingCompanions(['watchers/acceptance/deploy-ff.mjs', ...COMPANIONS,
+    'watchers/acceptance/host/sandbox.mjs']), []);
+  assert.deepEqual(missingCompanions(['watchers/acceptance/loop.test.mjs']), []);
   // 不读 origin/main：CI 的 checkout 往往只有一个提交，没有远端引用。
-  // 父提交在本地时，用 HEAD 和它的父提交比；浅克隆没有父提交时，改查工作区里这三份文件。
+  // 父提交在本地时，用 HEAD 和它的父提交比；浅克隆没有父提交时，只能查这三份文件都在这次提交里。
   const parent = spawnSync('git', ['rev-parse', '--verify', '--quiet', 'HEAD^'], { cwd: ROOT, encoding: 'utf8' });
   const untracked = spawnSync('git', ['ls-files', '--others', '--exclude-standard'], { cwd: ROOT, encoding: 'utf8' });
   assert.equal(untracked.status, 0);
@@ -1000,10 +1007,10 @@ test('#215 SC10 SC14 SC17 源码静态约束', { skip: FLOCK_SKIP }, () => {
   if (parent.status === 0) {
     const diff = spawnSync('git', ['diff', '--name-only', 'HEAD^', 'HEAD'], { cwd: ROOT, encoding: 'utf8' });
     assert.equal(diff.status, 0, diff.stderr);
-    const files = diff.stdout.split('\n').map((line) => line.trim()).filter(Boolean).sort();
-    assert.deepEqual(files, expected);
+    const files = diff.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+    assert.deepEqual(missingCompanions(files), [], `这次提交只动了 ${files.join(', ')}`);
   } else {
-    for (const file of expected) {
+    for (const file of ['watchers/acceptance/deploy-ff.mjs', ...COMPANIONS]) {
       assert.equal(fs.existsSync(path.join(ROOT, file)), true, file);
       const tracked = spawnSync('git', ['cat-file', '-e', `HEAD:${file}`], { cwd: ROOT, encoding: 'utf8' });
       assert.equal(tracked.status, 0, `${file} 不在这次提交里`);
