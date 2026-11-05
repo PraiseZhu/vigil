@@ -1,5 +1,6 @@
 {
   "targetRepo": "your-org/your-plugin-repo",
+  "reviewerLogin": "ExampleUser",
   "pluginRepoPath": "/path/to/your-plugin-checkout",
   "severityStandardPath": "/path/to/review-skill-checkout/mivo/config/severity.md",
   "keelLedgerRoot": "/path/to/keel-data-dir",

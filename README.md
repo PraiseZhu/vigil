@@ -62,41 +62,100 @@ README:[`watchers/mivo/README.md`](watchers/mivo/README.md)、
 
 ## 安装与部署
 
-1. **准备 watcher home**:一个不随代码仓库发布的运行目录,存放 `state/`、`deployments/`、
-   `config/profile.json`。
+下面以 mivo watcher 为例，写的是线上实际在用的做法。cindy watcher 步骤相同，命令和环境变量把 `mivo` 换成 `cindy`；它的 `deploy.mjs` 多一个 `bootstrap` 子命令，见 [`watchers/cindy/README.md`](watchers/cindy/README.md)。
 
-   ```sh
-   mkdir -p /path/to/your/mivo-watcher-home/config
-   cp config/examples/mivo.profile.example.json /path/to/your/mivo-watcher-home/config/profile.json
-   # 编辑 profile.json,把占位值换成真实的仓库名、本地仓路径
-   ```
+### 1. 准备 watcher home
 
-2. **部署代码**:`deploy.mjs` 是无数据库依赖的"校验 + 原子安装"脚本。
+watcher home 是一个不随代码仓库发布的运行目录：`bin/` 放部署进来的代码，`config/profile.json` 放配置，`state/` 放运行状态，`deployments/` 放每次部署的记录和备份。第一次安装要先建好 `bin/` 和 `state/prs/`：缺 `state/prs/` 时部署预检读不到状态直接失败，缺 `bin/` 时安装写不进文件、整次回滚。
 
-   ```sh
-   node watchers/mivo/deploy.mjs verify                 # 校验 import 闭包
-   node watchers/mivo/deploy.mjs bootstrap --home <dir>
-   node watchers/mivo/deploy.mjs preview --home <dir> --database <sqlite file> --id <id> --plan <file>
-   node watchers/mivo/deploy.mjs apply --plan <file>
-   ```
+```sh
+HOME_DIR=/path/to/your/mivo-watcher-home
+mkdir -p "$HOME_DIR/bin" "$HOME_DIR/config" "$HOME_DIR/state/prs" "$HOME_DIR/deployments"
+cp config/examples/mivo.profile.example.json "$HOME_DIR/config/profile.json"
+# 编辑 profile.json，把占位值换成真实值
+```
 
-3. **在 Cindy 里创建发现器调度**:新建一条 schedule,字段取值如下(字段名取自 Cindy 调度器
-   自身的 `schedule_create` 参数 schema):
+`profile.json` 的字段（每项都可以用右列的环境变量覆盖，环境变量优先）：
 
-   | 字段 | 取值 | 说明 |
-   |---|---|---|
-   | `executionMode` | `"script"` | 零 token 模式:宿主不起 agent,直接执行 `scriptConfig.command` |
-   | `cronExpr` | `"* * * * *"` | 每分钟触发;一轮最多跑 165 秒,轮内与全量处理并行、每 15 秒批量复查一次全部 open PR 的变化(转 Ready / 新推送 / 新反馈 / CI 汇总),新反馈通常 30 秒内派发(整轮最后约 40 秒内才出现的变化留到下一轮开头;每次采集到「整轮截止 − 派发预留」就中止并标 collectRetry,下一轮最先处理)。调度器在本轮结束后才排下一次触发(同一 schedule 不重叠、不积压),一轮实际约 150–160 秒结束(165 秒是上限),选每分钟时两轮之间约 20–30 秒空档;`*/2` 会留出最长约 80 秒的空档。整轮预算须小于调度 `timeoutMs`(180 秒) |
-   | `timezone` | 如 `"Asia/Shanghai"` | 必填,IANA 时区 id |
-   | `recurring` | `true` | discover 是常驻轮询 |
-   | `scriptConfig.command` | `python3 <watcher home>/bin/mivo-watch-script.py --mode discover` | cwd 为 `workingDir`;必须实现 `cindy-script/1` 协议(stdout 只能是协议帧,调试输出走 stderr) |
-   | `scriptConfig.capabilities` | `["sessions.dispatch"]` | 能力白名单,默认全拒,discover 只需要这一项 |
-   | `workingDir` | `<watcher home>` 的绝对路径 | script 模式下作为命令的 cwd |
-   | `useWorktree` | `false` | script 模式不支持 ephemeral worktree |
-   | `notify` | 按需 | 必填对象 `{desktop, feishu}` |
-   | `agentKind` / `model` / `providerId` / `effort` / `fastMode` | 修复会话要用的模型配置 | 新建的修复会话沿用这几项(`agentKind` 填 `codex` 或 `pi`);不填落到宿主默认模型;改了只影响之后新建的会话 |
+| 字段 | 必填 | 环境变量 | 作用 |
+|---|---|---|---|
+| `targetRepo` | 是 | `MIVO_WATCHER_TARGET_REPO` | 要盯的仓库，`owner/repo` |
+| `pluginRepoPath` | 是 | `MIVO_PLUGIN_REPO` | 目标仓在本机的检出目录（绝对路径），修复会话的 worktree 从这里开 |
+| `reviewerLogin` | 是 | `MIVO_WATCHER_REVIEWER_LOGIN` | 审查流程提交 review 的 GitHub 账号，用来判断「审查通过」和识别审查意见 |
+| `severityStandardPath` | 建议 | `MIVO_SEVERITY_STANDARD_PATH` | 分级标准（severity.md）的本机路径，派给修复会话的规则里带上它的全文；不配就不带 |
+| `keelLedgerRoot` / `keelNamespace` | 用 KEEL 时 | `MIVO_KEEL_LEDGER_ROOT` / `MIVO_KEEL_NAMESPACE` | KEEL 台账目录和命名空间，修复会话按它们找 KEEL run |
+| `watchHomes` | 否 | `MIVO_WATCHER_WATCH_HOMES` | 本机所有 watcher home 列表，默认 `[]` |
+| `validateConcurrency` / `validateStallMinutes` / `preflightTimeoutMinutes` / `prePushLockWaitMinutes` | 否 | `MIVO_VALIDATE_CONCURRENCY` 等 | 本地验证的并发数和各类超时，默认值与含义见 [`docs/operations.md`](docs/operations.md#7-本地-validate-的并发日志与收据) |
+| `resolveFixedThreadsWithApp` | 否 | `MIVO_WATCHER_RESOLVE_FIXED_THREADS_WITH_APP` | 用 GitHub App 关闭「审查机已复核修好」的讨论串，默认关；打开时还要配 `praisebuildAppId`、`praisebuildInstallationId`、`praisebuildPrivateKeyPath`（App ID、安装 ID、私钥文件路径），读取逻辑在 [`watchers/mivo/bin/mivo-app-token.mjs`](watchers/mivo/bin/mivo-app-token.mjs) |
 
-   完整字段说明与排障见 [`docs/operations.md`](docs/operations.md#2-调度在-cindy-里创建发现器调度)。
+缺了必填项不会落到默认值：用到它的地方直接报错，并在错误里写明字段名。
+
+### 2. 部署代码
+
+`deploy.mjs` 把源码 `watchers/mivo/bin/` 下清单里的文件装进 `<watcher home>/bin/`，安装前后都按哈希核对，中途失败自动回滚。它从**脚本自己所在的检出**取文件，所以先检出要部署的那个提交，再在里面跑：
+
+```sh
+git worktree add --detach .worktrees/deploy-<sha7> <commit>   # 干净检出，不要用有改动的工作树
+cd .worktrees/deploy-<sha7>
+
+HOME_DIR=/path/to/your/mivo-watcher-home
+DB="$HOME/Library/Application Support/Cindy/cindy-<账号>.db"   # Cindy 的本地数据库（macOS 位置）
+ID=vigil-<sha7>-<YYYYMMDD>-r1                                  # 每次部署一个新 id，不能重复
+
+node watchers/mivo/deploy.mjs verify --home "$HOME_DIR"        # 看哪些文件会变（match:false 表示有更新）
+node watchers/mivo/deploy.mjs preview --home "$HOME_DIR" --database "$DB" --id "$ID" \
+  --plan "$HOME_DIR/deployments/$ID.plan.json"                 # 生成部署计划
+node watchers/mivo/deploy.mjs apply --plan "$HOME_DIR/deployments/$ID.plan.json"
+node watchers/mivo/deploy.mjs verify --home "$HOME_DIR"        # 部署后应为 match:true
+```
+
+- `--database` 只用来确认修复会话都空闲（需要 `sqlite3` 命令）。有会话正在跑时 `preview` / `apply` 报 `Host session active or missing`，等它跑完再试即可；`apply` 期间状态或文件被改动也会拒绝并回滚。
+- `--plan` 必须是绝对路径，文件不能已存在；`--id` 只能用小写字母、数字和 `-`。
+- `apply` 成功后在 `<watcher home>/deployments/<id>/` 留下 `before/`（被替换的旧文件）、`manifest.json` 和 `receipt.json`（`status: installed`）。要退回上一版，把 `before/` 里的文件拷回 `bin/`，或者检出旧提交用新的 id 再部署一次。
+- 部署只换代码，不碰 `state/`、`config/` 和调度；正在跑的一轮不受影响，下一轮起用新代码。部署完删掉临时检出即可。
+
+### 3. 在 Cindy 里创建调度
+
+需要两条 script 模式的调度：**发现器**（每轮扫一遍 open PR，有新反馈就派修复会话）和**通知**（把盯梢事件发给你）。通知调度的参数见 [`docs/operations.md`](docs/operations.md#通知调度)。发现器的字段取值如下（字段名取自 Cindy 调度器自身的 `schedule_create` 参数 schema）：
+
+| 字段 | 取值 | 说明 |
+|---|---|---|
+| `executionMode` | `"script"` | 零 token 模式：宿主不起 agent，直接执行 `scriptConfig.command` |
+| `cronExpr` | `"* * * * *"` | 每分钟触发；一轮最多跑 165 秒，同一条调度不重叠、不积压。改成 `*/2`、`*/4` 也能跑，代价是两轮之间无人检测的空档变长。节拍细节见 [`docs/operations.md`](docs/operations.md#2-调度在-cindy-里创建发现器调度) |
+| `timezone` | 如 `"Asia/Shanghai"` | 必填，IANA 时区 id |
+| `recurring` | `true` | discover 是常驻轮询 |
+| `scriptConfig.command` | 见下 | cwd 为 `workingDir`；stdout 只能是 `cindy-script/1` 协议帧，调试输出走 stderr |
+| `scriptConfig.capabilities` | `["sessions.dispatch"]` | 能力白名单，默认全拒，discover 只需要这一项 |
+| `scriptConfig.timeoutMs` | `180000` | 整轮预算 165 秒，须小于它 |
+| `workingDir` | `<watcher home>` 的绝对路径 | script 模式下作为命令的 cwd |
+| `useWorktree` | `false` | script 模式不支持 ephemeral worktree |
+| `notify` | `{"desktop": false, "feishu": false}` | discover 建议静默，失败轮仍会记进调度日志 |
+| `agentKind` / `model` / `providerId` / `effort` / `fastMode` | 修复会话要用的模型配置 | 新建的修复会话沿用这几项（`agentKind` 填 `codex` 或 `pi`）；不填落到宿主默认模型；改了只影响之后新建的会话 |
+
+`scriptConfig.command` 要带环境变量，调度器不会替你设：
+
+```sh
+env MIVO_WATCHER_LIVE=1 \
+  MIVO_WATCHER_HOME=<watcher home> \
+  MIVO_NODE_BIN=<node 的绝对路径> \
+  GH_BIN=<gh 的绝对路径> \
+  PATH=<node、gh、git、python3 所在目录> \
+  python3 <watcher home>/bin/mivo-watch-script.py --mode discover
+```
+
+| 变量 | 必需 | 作用 |
+|---|---|---|
+| `MIVO_WATCHER_LIVE=1` | 是 | 真正派发修复会话的开关。不设时 discover 照常扫描，但**一个修复会话都不派**，界面上看不出异常 |
+| `MIVO_WATCHER_HOME` | 建议 | watcher home 路径；不设时按脚本所在位置推断 |
+| `MIVO_NODE_BIN` | 建议 | Node 可执行文件；不设时在 `PATH` 里找 `node` |
+| `GH_BIN` | 否 | 要用的 `gh`（例如一个按账号分流的包装脚本）；不设时用 `PATH` 里的 `gh` |
+| `PATH` | 是 | 调度器的进程环境很干净，`node`、`gh`、`git`、`python3` 要能找到 |
+
+### 4. 上线后确认
+
+- `node watchers/mivo/deploy.mjs verify --home <watcher home>` 输出 `match: true`。
+- 在 Cindy 的调度运行记录里，部署之后第一轮状态是成功，结果是一行以 `{"mode":"discover"` 开头的 JSON，`prs` 里列出了目标仓你名下的 open PR。
+- 有新审查意见的 PR，对应条目的 `dispatch.attempted` 为 `true`，Cindy 里出现标题以 `#<PR号>-` 开头的修复会话。如果一直是 `false`，先查调度命令里有没有 `MIVO_WATCHER_LIVE=1`。
 
 ## 修复 session 如何工作
 

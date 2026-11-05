@@ -261,22 +261,17 @@ node bin/notify.mjs emit --home "$MIVO_WATCHER_HOME"
 
 如果你的团队用不同的分级或标签名,直接改这几个文件里的常量即可,不影响其余逻辑。
 
-## 部署脚本（可选）
+## 部署脚本
 
-`deploy.mjs` 是一个无数据库依赖的「校验 + 原子安装」脚本,用于把 `bin/` 下的文件同步到某个
-运行目录,并在安装前后做哈希校验、回滚。它不绑定任何具体调度器或数据库,`verify`/`bootstrap`/
-`preview`/`apply` 四个子命令都是纯文件系统操作:
+`deploy.mjs` 把 `bin/` 下清单里的文件装进运行目录，安装前后都按哈希核对、失败回滚，不改 `state/`、配置和调度。它只有三个子命令（没有 `bootstrap`，那是 cindy 版才有的）：
 
 ```sh
-node deploy.mjs verify                                  # 只校验源码 manifest 闭包
-node deploy.mjs bootstrap --home /path/to/runtime
-node deploy.mjs preview  --home /path/to/runtime --database /path/to/some.db --id <release-id> --plan /tmp/plan.json
-node deploy.mjs apply    --plan /tmp/plan.json
+node deploy.mjs verify  --home <watcher home>                    # 比对源码与运行目录，match:true 表示一致
+node deploy.mjs preview --home <watcher home> --database <Cindy 的 .db 文件> --id <新 id> --plan <绝对路径>
+node deploy.mjs apply   --plan <同一个 plan 文件>
 ```
 
-`--database` 参数指向一个 sqlite3 文件,`preview`/`apply` 会用它检查"目标 session 当前是否
-空闲",这是可选的额外安全检查;如果你的场景不需要,可以直接改 `deploy.mjs` 里的 `idle()`
-函数跳过这一步。
+`--database` 用来确认修复会话都空闲（需要 `sqlite3`），不是可选项。完整步骤（从哪份检出部署、第一次安装要先建 `bin/` 和 `state/prs/`、部署记录与回退、调度命令必须带 `MIVO_WATCHER_LIVE=1`）见根目录 [`README.md`](../../README.md#安装与部署)。
 
 ## 测试
 
