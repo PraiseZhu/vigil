@@ -1538,12 +1538,13 @@ test('W4-b SC3 receivedAt 缺失、非法或不是字符串时 gatewayMs 记 nul
       { deliveryId: 'no-received', created_at: '2026-10-31T00:00:00.000Z' },
       { deliveryId: 'bad-received', created_at: '2026-10-31T00:00:02.000Z', receivedAt: 'not-a-date' },
       { deliveryId: 'not-string', created_at: '2026-10-31T00:00:05.000Z', receivedAt: 1761955200000 },
+      { deliveryId: 'object-received', created_at: '2026-10-31T00:00:06.000Z', receivedAt: { at: '2026-10-31T00:00:04.000Z' } },
     ],
     poll: async () => [],
     latencyFile,
   });
   const rows = readLatencyLog(latencyFile);
-  assert.equal(rows.length, 3);
+  assert.equal(rows.length, 4);
   for (const row of rows) {
     assert.equal(row.gatewayMs, null);
     assert.equal(row.receivedAt, null);
@@ -1554,7 +1555,8 @@ test('W4-b SC3 receivedAt 缺失、非法或不是字符串时 gatewayMs 记 nul
     [
       ['no-received', 'received-at-missing'],
       ['bad-received', 'received-at-invalid'],
-      ['not-string', 'received-at-missing'],
+      ['not-string', 'received-at-not-string'],
+      ['object-received', 'received-at-not-string'],
     ],
   );
   assert.deepEqual(
@@ -1563,6 +1565,7 @@ test('W4-b SC3 receivedAt 缺失、非法或不是字符串时 gatewayMs 记 nul
       ['no-received', 10000],
       ['bad-received', 8000],
       ['not-string', 5000],
+      ['object-received', 4000],
     ],
   );
 });
@@ -1671,6 +1674,46 @@ test('W4-b SC4 pulledAtMs 不是有限数时 pulledAt 记 null，事件不算失
   assert.equal(rows[0].latencyMs, 10000);
   assert.equal(rows[0].gatewayMs, 1000);
   assert.deepEqual(reports, []);
+});
+
+test('W4-b #317 now() 整段不是有限数时 processedAt 记 null，不抛 RangeError，主流程仍确认', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const at = Date.parse('2026-10-31T00:00:10.000Z');
+  const controller = new AbortController();
+  const confirmed = [];
+  let nan = false;
+  await runEventChannel({
+    // 拉到这一批之后整段 now() 都是 NaN：pulledAt 和 processedAt 都算不出来。
+    now: () => (nan ? Number.NaN : at),
+    sleep: async () => {},
+    signal: controller.signal,
+    pull: async () => {
+      nan = true;
+      return [
+        {
+          deliveryId: 'nan-all',
+          created_at: '2026-10-31T00:00:00.000Z',
+          receivedAt: '2026-10-31T00:00:04.000Z',
+        },
+      ];
+    },
+    poll: async () => [],
+    confirm: async (ids) => {
+      confirmed.push(...ids);
+      controller.abort();
+    },
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].deliveryId, 'nan-all');
+  assert.equal(rows[0].pulledAt, null);
+  assert.equal(rows[0].processedAt, null);
+  assert.equal(rows[0].latencyMs, null);
+  assert.equal(rows[0].gatewayMs, null);
+  assert.equal(rows[0].gatewayMsReject, 'processed-at-invalid');
+  // 写日志失败不变事件失败：这条照常确认，Worker 才清掉。
+  assert.deepEqual(confirmed, ['nan-all']);
 });
 
 test('W4-b SC4 首次追加时自动建目录，新文件权限 0600', async () => {

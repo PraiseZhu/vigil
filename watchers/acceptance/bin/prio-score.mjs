@@ -28,6 +28,8 @@ export const DOWNGRADE_MIN_GAP_MS = 15 * MINUTE_MS;
 export const DOWNGRADE_WINDOW_MS = 60 * MINUTE_MS;
 export const CHANGE_WINDOW_MS = 60 * MINUTE_MS;
 export const MAX_CHANGES_PER_HOUR = 4;
+/** gatewayMs 的上限：Worker 收到到写完超过 10 分钟就不是这一段的本机耗时，按坏数据记 null。 */
+export const GATEWAY_MAX_MS = 10 * MINUTE_MS;
 
 export const PIN_LABEL = 'prio:pin';
 export const BLOCKER_LABEL = 'blocker';

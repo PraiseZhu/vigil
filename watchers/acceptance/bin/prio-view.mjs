@@ -7,6 +7,8 @@
 // 延迟按指标分两组各算，不混在一起：
 //   事件→写完 用 latencyMs（事件发生到写完，老行也有）；gateway 用 gatewayMs（Worker 收到到写完）。
 // 没有 gatewayMs 的行只进第一组，不会把 GitHub 那段算进本机延迟。两组的样本数各自记 n。
+// gatewayMs 只收 0 ≤ 值 ≤ GATEWAY_MAX_MS 的样本：负值和超过 10 分钟的值不进 gateway 组；
+// latencyMs 那列不看这个范围，行为不变。
 // 已关闭、已排除的 item 本函数不判断，由调用方过滤。
 // 运行日志跨 UTC 日时，调用方要把前一天的日志拼在前面。
 //
@@ -19,7 +21,7 @@
 // 冻结只数 CHANGE_WINDOW_MS（1 小时）内、且不晚于 nowMs 的 changes。
 // prio-sync 有几处会把没过滤的旧数组原样存回去，所以这里不能直接看数组长度。
 
-import { CHANGE_WINDOW_MS, MAX_CHANGES_PER_HOUR } from './prio-score.mjs';
+import { CHANGE_WINDOW_MS, GATEWAY_MAX_MS, MAX_CHANGES_PER_HOUR } from './prio-score.mjs';
 
 /** 停更阈值默认值：10 分钟。调用方可传 staleAfterMs 覆盖。 */
 export const DEFAULT_STALE_MS = 10 * 60 * 1000;
@@ -157,12 +159,14 @@ function freezeText(changes, nowMs, timeZone) {
   return `冻结（1 小时内 ${recent.length} 次，约 ${formatPrioClock(oldestStillNeeded + CHANGE_WINDOW_MS, timeZone)} 解冻）`;
 }
 
-/** 只取这一行的这个指标。缺失、不是数字、NaN / Infinity 都不进样本。 */
-function percentiles(rows, key) {
+/** 只取这一行的这个指标。缺失、不是数字、NaN / Infinity 都不进样本。传 maxValue 时只收 0 ≤ 值 ≤ maxValue。 */
+function percentiles(rows, key, maxValue = null) {
   const values = [];
   for (const row of rows) {
     const value = row?.[key];
-    if (typeof value === 'number' && Number.isFinite(value)) values.push(value);
+    if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+    if (maxValue != null && (value < 0 || value > maxValue)) continue;
+    values.push(value);
   }
   values.sort((left, right) => left - right);
   if (!values.length) return { p50: null, p95: null, n: 0 };
@@ -305,7 +309,7 @@ export function viewPrio({
   const latencyLog = parseJsonl(latency);
   if (latencyLog.bad) notices.push(`延迟日志有 ${latencyLog.bad} 行坏数据`);
   const latencyStats = percentiles(latencyLog.rows, 'latencyMs');
-  const gatewayStats = percentiles(latencyLog.rows, 'gatewayMs');
+  const gatewayStats = percentiles(latencyLog.rows, 'gatewayMs', GATEWAY_MAX_MS);
 
   const run = lastRunOf(runLog);
   const lastRunAt = run ? run.at : null;

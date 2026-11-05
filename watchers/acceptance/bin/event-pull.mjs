@@ -8,8 +8,9 @@
 // 每处理完一个事件，往状态目录的 latency.jsonl 追加一行，记三段：Worker 收到（receivedAt，
 // 由 Worker 写进队列记录）、本机拉到（pulledAt）、本机写完（processedAt，也就是 writtenAt）。
 // latencyMs 仍是「事件发生 → 写完」；另记 gatewayMs = 写完 − Worker 收到，这才是 Worker 之后的本机耗时。
-// gatewayMs 只收 0 ≤ 值 ≤ GATEWAY_MAX_MS（10 分钟）的样本。receivedAt 缺失、解析不出、在将来（差值小于 0）
-// 或差得超过 10 分钟时，gatewayMs 记 null，并在同一行留 gatewayMsReject 说明原因；不抛错，也不影响 latencyMs。
+// gatewayMs 只收 0 ≤ 值 ≤ GATEWAY_MAX_MS（10 分钟）的样本。receivedAt 缺失、不是字符串、解析不出、
+// 在将来（差值小于 0）或差得超过 10 分钟时，gatewayMs 记 null，并在同一行留 gatewayMsReject 说明原因；
+// 写完时刻不是有限数时同样记 null（processed-at-invalid）。这些情况都不抛错，也不影响 latencyMs。
 // pulledAt 取这一批拉到的时间；调用方给的时间不是有限数时记 null，不让写日志失败变成事件失败。
 // 目标：Worker 路径 p95 ≤ 10 秒，兜底轮询 ≤ 90 秒（60 秒一轮，留处理余量）。
 // 轮询函数由调用方注入（现有 60 秒轮询留在外面，这里不替换它）。不读令牌。
@@ -19,12 +20,13 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { GATEWAY_MAX_MS } from './prio-score.mjs';
 
 export const PULL_INTERVAL_MS = 2000;
 export const POLL_INTERVAL_MS = 60 * 1000;
 
-/** gatewayMs 的上限：Worker 收到到写完超过 10 分钟就不是这一段的本机耗时，按坏数据记 null。 */
-export const GATEWAY_MAX_MS = 10 * 60 * 1000;
+/** 常量定义在 prio-score.mjs（看板视图也算同一段延迟），这里继续按原名导出。 */
+export { GATEWAY_MAX_MS };
 
 /** 延迟文件默认位置。和 prio-sync.mjs 的 stateFiles().latency 是同一个路径，绝对路径，不随 cwd 变。 */
 export function defaultLatencyFile(homeDir = os.homedir()) {
@@ -150,17 +152,21 @@ function appendLatency(file, event, { processedAtMs, pulledAtMs, source }) {
   const createdAt = event.created_at || event.createdAt || null;
   const delta = typeof createdAt === 'string' ? processedAtMs - Date.parse(createdAt) : null;
   // receivedAt 由 Worker 写。缺失、不是字符串、或解析不出时间时，gatewayMs 记 null，不抛错。
-  const receivedAt = typeof event.receivedAt === 'string' ? event.receivedAt : null;
+  const hasReceivedAt = event?.receivedAt != null;
+  const receivedAt = typeof event?.receivedAt === 'string' ? event.receivedAt : null;
   const receivedMs = receivedAt == null ? Number.NaN : Date.parse(receivedAt);
   const receivedOk = Number.isFinite(receivedMs);
   // 范围校验：负数说明 receivedAt 在将来（或时钟被拨过），超过 10 分钟不是这一段的本机耗时。
   let gatewayMs = null;
   let gatewayMsReject = null;
-  if (receivedAt == null) gatewayMsReject = 'received-at-missing';
+  if (!hasReceivedAt) gatewayMsReject = 'received-at-missing';
+  else if (receivedAt == null) gatewayMsReject = 'received-at-not-string';
   else if (!receivedOk) gatewayMsReject = 'received-at-invalid';
   else {
     const candidate = processedAtMs - receivedMs;
-    if (candidate < 0) gatewayMsReject = 'negative';
+    // 写完时刻不是有限数时这一段算不出，不把 NaN 写进 gatewayMs。
+    if (!Number.isFinite(candidate)) gatewayMsReject = 'processed-at-invalid';
+    else if (candidate < 0) gatewayMsReject = 'negative';
     else if (candidate > GATEWAY_MAX_MS) gatewayMsReject = 'too-large';
     else gatewayMs = candidate;
   }
@@ -169,7 +175,7 @@ function appendLatency(file, event, { processedAtMs, pulledAtMs, source }) {
     createdAt,
     receivedAt: receivedOk ? receivedAt : null,
     pulledAt: toIsoOrNull(pulledAtMs),
-    processedAt: new Date(processedAtMs).toISOString(),
+    processedAt: toIsoOrNull(processedAtMs),
     latencyMs: Number.isFinite(delta) ? delta : null,
     gatewayMs,
     source,
