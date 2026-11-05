@@ -10,7 +10,10 @@
 // 队列最多 1000 条。超过就拒绝新事件并记一条告警，不丢掉最旧的。告警键 a:<deliveryId>，只留最近 50 条。
 // 失败次数记在事件上。同一条失败 5 次后，拉取端确认（POST /ack）才移出队列。
 // EventChannelDurableObject 用一份持久存储；两个 Worker 实例共用它时，webhook 和 /pull 才不会各看各的内存。
-// /pull 只读队列。本文件不部署；默认导出的 fetch 就是以后挂到 Worker 上的处理函数。不要在这里加部署配置。
+// /pull 只读队列。本文件不直接部署：部署入口和 wrangler 配置在 worker/，那边把请求转给唯一一个 DO 实例。
+// 默认导出的 fetch 是内存版，只给测试和本地用，别当成线上入口。部署配置也放 worker/，不要加在这里。
+// SQLite 版 DO 的 transaction 回调已不给 txn（官方文档说该对象废弃），所以四处事务都走 runInTransaction：
+// 回调拿不到 txn 就用 storage 本身，与旧 txn 的语义一样。
 
 export const SEEN_LIMIT = 4096;
 export const SEEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -195,6 +198,14 @@ function toPublicEvent(stored) {
   return event;
 }
 
+/**
+ * 事务。SQLite 版 Durable Object 的 storage.transaction 回调不再给 txn 参数（该对象废弃），
+ * 拿不到 txn 时直接用 storage —— 在 SQLite 后端，事务里的 ctx.storage 就是那个入口。
+ */
+export async function runInTransaction(storage, fn) {
+  return storage.transaction(async (txn) => fn(txn ?? storage));
+}
+
 async function listMap(txn, prefix) {
   const listed = await txn.list({ prefix });
   if (listed instanceof Map) return listed;
@@ -287,7 +298,7 @@ async function handleRequest(request, env, durable) {
     if (!(await pullAuthorized(request, env.PULL_TOKEN))) return unauthorized();
     let events = [];
     let alerts = [];
-    await storage.transaction(async (txn) => {
+    await runInTransaction(storage, async (txn) => {
       events = (await readQueue(txn)).map(toPublicEvent);
       alerts = await readAlerts(txn);
     });
@@ -303,7 +314,7 @@ async function handleRequest(request, env, durable) {
     }
     if (!body || !Array.isArray(body.ids)) return new Response('bad ack', { status: 400 });
     const drop = new Set(body.ids.filter((id) => typeof id === 'string'));
-    await storage.transaction(async (txn) => {
+    await runInTransaction(storage, async (txn) => {
       let removed = 0;
       for (const event of await readQueue(txn)) {
         if (!drop.has(event.deliveryId)) continue;
@@ -329,7 +340,7 @@ async function handleRequest(request, env, durable) {
     const error = String(body.error ?? '').slice(0, ERROR_SUMMARY_LIMIT);
     const failureLimit = durable.failureLimit;
     let result = null;
-    await storage.transaction(async (txn) => {
+    await runInTransaction(storage, async (txn) => {
       const event = (await readQueue(txn)).find((item) => item.deliveryId === body.id);
       if (!event) return;
       const next = { ...event, failures: (event.failures || 0) + 1, lastError: error };
@@ -354,7 +365,7 @@ async function handleRequest(request, env, durable) {
   const maxValueBytes = durable.maxValueBytes;
   const queueLimit = durable.queueLimit;
   let badJson = false;
-  await storage.transaction(async (txn) => {
+  await runInTransaction(storage, async (txn) => {
     const prior = await txn.get(seenKey(deliveryId));
     if (seenFresh(prior, nowMs, ttlMs)) return;
     let payload;

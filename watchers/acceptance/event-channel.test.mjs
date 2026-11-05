@@ -60,6 +60,17 @@ function ackRequest(ids, token = TOKEN) {
   });
 }
 
+function failRequest(id, { token = TOKEN, error = 'boom-w4a' } = {}) {
+  return new Request('https://example.invalid/fail', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ id, error }),
+  });
+}
+
 async function enqueueDelivery(worker, env, delivery) {
   const body = JSON.stringify({ created_at: '2026-10-31T00:00:00.000Z', action: 'opened' });
   const response = await worker.fetch(webhookRequest(body, { delivery }), env);
@@ -1234,4 +1245,201 @@ test('#189 SC4 同一份存储重建 Worker 后失败次数接着数，第 5 次
   assert.equal(abandoned[0].deliveryId, 'retry-189');
   assert.equal(abandoned[0].failures, 5);
   assert.match(abandoned[0].error, /boom-189/);
+});
+
+// W4-a：部署入口（worker/index.mjs）、SQLite 版 DO 不给 txn 的适配、事件乱序到达。
+// 只模拟 Durable Object 的接口，没有连真实 Cloudflare 账号；真实 DO 上的冒烟未做（见 worker/README.md）。
+
+// SQLite 版 DO 的 transaction 回调按文档已不给 txn（该对象废弃），这里模拟只调一次、不传参数。
+function noTxnStorage() {
+  const map = new Map();
+  const stats = { transactions: 0 };
+  const storage = {
+    async get(key) {
+      if (!map.has(key)) return undefined;
+      return structuredClone(map.get(key));
+    },
+    async put(key, value) {
+      map.set(key, structuredClone(value));
+    },
+    async delete(key) {
+      map.delete(key);
+    },
+    async list({ prefix = '' } = {}) {
+      const out = new Map();
+      for (const [key, value] of map) {
+        if (String(key).startsWith(prefix)) out.set(key, structuredClone(value));
+      }
+      return out;
+    },
+    async transaction(fn) {
+      stats.transactions += 1;
+      return fn();
+    },
+  };
+  return { storage, stats };
+}
+
+// Durable Object 命名空间的最小替身：记下 idFromName / get 的入参，返回给定的实例。
+function fakeChannelBinding(durable) {
+  const calls = [];
+  const namespace = {
+    calls,
+    idFromName(name) {
+      calls.push(`id:${name}`);
+      return { name };
+    },
+    get(id) {
+      calls.push(`get:${id.name}`);
+      return durable;
+    },
+  };
+  return namespace;
+}
+
+test('W4-a SC2 事务适配：回调不给 txn 时用 storage 本身，给了 txn 就用 txn', async () => {
+  const { runInTransaction } = await import('./bin/event-worker.mjs');
+  const { storage, stats } = noTxnStorage();
+  let seen = null;
+  await runInTransaction(storage, async (db) => {
+    seen = db;
+  });
+  assert.equal(stats.transactions, 1);
+  assert.equal(seen, storage);
+
+  const txn = { marker: 'txn' };
+  const withTxn = {
+    ...storage,
+    async transaction(fn) {
+      return fn(txn);
+    },
+  };
+  let used = null;
+  await runInTransaction(withTxn, async (db) => {
+    used = db;
+  });
+  assert.equal(used, txn);
+});
+
+test('W4-a SC2 不传 txn 的存储上 /webhook 入队、重复 delivery 只入队一次、/fail 记失败、/ack 清队列', async () => {
+  const { storage, stats } = noTxnStorage();
+  const worker = createEventWorker({ storage, now: () => 1_700_000_000_000 });
+  const env = workerEnv();
+
+  await enqueueDelivery(worker, env, 'solo-txn');
+  await enqueueDelivery(worker, env, 'solo-txn');
+  assert.deepEqual(await pullIds(worker, env), ['solo-txn']);
+
+  const failed = await worker.fetch(failRequest('solo-txn'), env);
+  assert.equal(failed.status, 200);
+  const failBody = await failed.json();
+  assert.equal(failBody.failures, 1);
+  assert.equal(failBody.abandoned, false);
+
+  const acked = await worker.fetch(ackRequest(['solo-txn']), env);
+  assert.equal(acked.status, 204);
+  assert.deepEqual(await pullIds(worker, env), []);
+
+  assert.ok(stats.transactions >= 4, `四条路由都要走事务，实际 ${stats.transactions}`);
+});
+
+test('W4-a SC1 Worker 入口把四条路由都转发到 idFromName(main) 的同一个 DO 实例', async () => {
+  const entry = (await import('./worker/index.mjs')).default;
+  const { EventChannelDurableObject } = await import('./bin/event-worker.mjs');
+  const env = workerEnv();
+  const durable = new EventChannelDurableObject(
+    { storage: sharedStorage(), now: () => 1_700_000_000_000 },
+    env,
+  );
+  const namespace = fakeChannelBinding(durable);
+  const bound = { ...env, EVENT_CHANNEL: namespace };
+
+  const posted = await entry.fetch(webhookRequest(smallPayload(), { delivery: 'entry-1' }), bound);
+  assert.equal(posted.status, 204);
+
+  const pulled = await entry.fetch(pullRequest(TOKEN), bound);
+  const queued = await pulled.json();
+  assert.deepEqual(queued.events.map((event) => event.deliveryId), ['entry-1']);
+
+  const failed = await entry.fetch(failRequest('entry-1'), bound);
+  assert.equal(failed.status, 200);
+  assert.equal((await failed.json()).failures, 1);
+
+  const acked = await entry.fetch(ackRequest(['entry-1']), bound);
+  assert.equal(acked.status, 204);
+  assert.deepEqual((await (await entry.fetch(pullRequest(TOKEN), bound)).json()).events, []);
+
+  // 路由不在 Worker 层拦，未知路径也照转，由 DO 回 404。
+  const unknown = await entry.fetch(new Request('https://example.invalid/nope', { method: 'GET' }), bound);
+  assert.equal(unknown.status, 404);
+
+  const ids = namespace.calls.filter((call) => call.startsWith('id:'));
+  assert.deepEqual(ids, ['id:main', 'id:main', 'id:main', 'id:main', 'id:main', 'id:main']);
+  assert.deepEqual(
+    namespace.calls.filter((call) => call.startsWith('get:')),
+    ['get:main', 'get:main', 'get:main', 'get:main', 'get:main', 'get:main'],
+  );
+});
+
+test('W4-a SC1 入口没拿到 EVENT_CHANNEL 绑定时返回 500，不装作成功', async () => {
+  const entry = (await import('./worker/index.mjs')).default;
+  const response = await entry.fetch(webhookRequest(smallPayload(), { delivery: 'no-binding' }), workerEnv());
+  assert.equal(response.status, 500);
+  const half = await entry.fetch(
+    webhookRequest(smallPayload(), { delivery: 'half-binding' }),
+    { ...workerEnv(), EVENT_CHANNEL: {} },
+  );
+  assert.equal(half.status, 500);
+});
+
+test('W4-a SC4 旧事件晚到时不被丢弃、不顶掉已入队的新事件，/pull 按到达顺序交付', async () => {
+  const worker = createEventWorker({ now: () => 1_700_000_000_000 });
+  const env = workerEnv();
+  const newer = JSON.stringify({
+    created_at: '2026-10-31T00:00:30.000Z',
+    action: 'synchronize',
+    pull_request: { number: 12 },
+  });
+  const older = JSON.stringify({
+    created_at: '2026-10-31T00:00:00.000Z',
+    action: 'opened',
+    pull_request: { number: 12 },
+  });
+  await postWebhook(worker, env, newer, 'late-new', 'pull_request');
+  await postWebhook(worker, env, older, 'late-old', 'pull_request');
+
+  const response = await worker.fetch(pullRequest(TOKEN), env);
+  const events = (await response.json()).events;
+  assert.deepEqual(events.map((event) => event.deliveryId), ['late-new', 'late-old']);
+  assert.deepEqual(events.map((event) => event.created_at), [
+    '2026-10-31T00:00:30.000Z',
+    '2026-10-31T00:00:00.000Z',
+  ]);
+});
+
+test('W4-a SC3 部署文件只有 SQLite 版 DO 绑定，没有密钥、令牌、本机路径', () => {
+  const dir = path.join(HERE, 'worker');
+  const toml = fs.readFileSync(path.join(dir, 'wrangler.toml'), 'utf8');
+  const entry = fs.readFileSync(path.join(dir, 'index.mjs'), 'utf8');
+  const readme = fs.readFileSync(path.join(dir, 'README.md'), 'utf8');
+
+  assert.match(toml, /^name = "acceptance-event-channel"$/m);
+  assert.match(toml, /^main = "index\.mjs"$/m);
+  assert.match(toml, /^name = "EVENT_CHANNEL"$/m);
+  assert.match(toml, /^class_name = "EventChannelDurableObject"$/m);
+  assert.match(toml, /^new_sqlite_classes = \["EventChannelDurableObject"\]$/m);
+  assert.doesNotMatch(toml, /^new_classes\s*=/m, '免费档只能用 SQLite 后端，迁移必须是 new_sqlite_classes');
+
+  for (const source of [toml, entry, readme]) {
+    assert.doesNotMatch(source, /gh[pousr]_[A-Za-z0-9]{20,}/);
+    assert.doesNotMatch(source, /github_pat_/);
+    assert.doesNotMatch(source, /\/Users\/[A-Za-z0-9._-]+/);
+    assert.doesNotMatch(source, /WEBHOOK_SECRET\s*=/);
+    assert.doesNotMatch(source, /PULL_TOKEN\s*=/);
+    assert.doesNotMatch(source, /PraiseZhu/);
+  }
+  // 入口只转发，不自己读写存储，也不读 GitHub 令牌。
+  assert.match(entry, /idFromName\('main'\)/);
+  assert.doesNotMatch(entry, /node:fs/);
+  assert.doesNotMatch(entry, /node:child_process/);
 });
