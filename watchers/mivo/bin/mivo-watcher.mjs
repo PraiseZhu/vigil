@@ -18,7 +18,7 @@ import {lifelineFeedback} from './mivo-lifeline-source.mjs';
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent, completedMemberFeedback, coveredFeedbackItems, replyToMemberFeedback, requestMemberReviewers } from './mivo-review-resolve.mjs';
 import { codeScanningFeedbackItems } from './mivo-code-scanning.mjs';
 import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck, readBaseDrift, isSyncableBase } from './mivo-pr-actions.mjs';
-import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath, findingMarkerOf } from './mivo-repair.mjs';
+import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath, findingMarkerOf, childPrListArgs, parseOpenChildPrs } from './mivo-repair.mjs';
 import { PARSER_VERSION, canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
@@ -1060,6 +1060,18 @@ export function* readDispatchGate({ pr, ghFn }) {
   if (view.state === 'OPEN') return { ok: true, state: 'OPEN' };
   if (view.state === 'MERGED' || view.state === 'CLOSED') return { ok: false, reason: 'pr-not-open-before-dispatch', state: view.state };
   return { ok: false, reason: 'pr-state-unavailable-before-dispatch', error: 'unknown PR state: ' + String(view.state) };
+}
+
+// A head branch that only takes PRs gets its fixes as child PRs (vigil/pr-<N>-fix-*). While one is still open, a
+// new delivery would only make another PR for the same findings, so the scan waits for it (2026-11-05: a stage PR
+// collected a child PR on every round). A list that cannot be read counts as "unknown", never as "none".
+export function* readOpenChildPrs({ pr, ghFn }) {
+  try {
+    const raw = yield () => ghFn(childPrListArgs(REPO, pr.headRefName));
+    return { ok: true, childPrs: parseOpenChildPrs(JSON.parse(String(raw)), { repo: REPO, number: pr.number, headRefName: pr.headRefName }) };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error).slice(0, 400) };
+  }
 }
 
 function* notifyDispatchConflictOnce({ previous, key, paths, now, dryRun, dispatchFn, remaining, pr, ghFn }) {
@@ -2711,6 +2723,18 @@ export function* processPr({
       persistState(state, paths);
       report.push({ number: pr.number, dispatch: { attempted: false, bound: false, reason: gate.reason, state: gate.state ?? null } });
       return;
+    }
+    // Held before the cursor moves: the feedback is still fresh on the next scan, once the child PR is gone.
+    if (shouldDispatch && !forceCreate) {
+      const open = yield* readOpenChildPrs({ pr: { number: pr.number, headRefName: pr.headRefName ?? previous.headRefName }, ghFn });
+      const held = !open.ok ? { reason: 'child-pr-check-unavailable', error: open.error }
+        : open.childPrs.length ? { reason: 'child-pr-open', childPrs: open.childPrs.map((child) => child.number) } : null;
+      if (held) {
+        state.prs[key] = { ...previous, lastDispatchGuard: { at: now, ...held } };
+        persistState(state, paths);
+        report.push({ number: pr.number, dispatch: { attempted: false, bound: false, ...held } });
+        return;
+      }
     }
   }
   previous = {

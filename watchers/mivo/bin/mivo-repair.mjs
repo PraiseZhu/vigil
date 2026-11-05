@@ -1464,8 +1464,38 @@ export function headRequiresPullRequest(task, ghFn = command) {
   return pages.flat().some((rule) => rule?.type === 'pull_request');
 }
 
+export function childPrPrefix(number) {
+  return `vigil/pr-${number}-fix-`;
+}
+
 export function childPrBranch(task, validatedHead) {
-  return `vigil/pr-${task.number}-fix-${validatedHead.slice(0, 12)}`;
+  return `${childPrPrefix(task.number)}${validatedHead.slice(0, 12)}`;
+}
+
+// The child branch is named after the fix commit, so every fix round gets a new branch: "is this branch's PR open"
+// cannot tell that an earlier round's child PR is still waiting. Open PRs into the head branch can
+// (2026-11-05: a stage PR collected a new child PR on every round while the first was unmerged).
+export function childPrListArgs(repo, headRefName) {
+  if (typeof headRefName !== 'string' || !headRefName) fail('child PR lookup needs the head branch name');
+  return ['api', `repos/${repo}/pulls?state=open&base=${encodeURIComponent(headRefName)}&per_page=100`, '--paginate', '--slurp'];
+}
+
+// Keeps only this PR's own child PRs: same repo, head branch under this PR's prefix, base is this PR's head branch.
+export function parseOpenChildPrs(pages, { repo, number, headRefName }) {
+  if (!Array.isArray(pages) || !pages.every(Array.isArray)) fail('child PR lookup returned an unexpected shape');
+  const prefix = childPrPrefix(number);
+  return pages.flat()
+    .filter((pr) => typeof pr?.head?.ref === 'string' && pr.head.ref.startsWith(prefix) && pr.base?.ref === headRefName
+      && String(pr.head.repo?.full_name ?? '').toLowerCase() === repo.toLowerCase())
+    .map((pr) => {
+      if (!Number.isInteger(pr.number) || typeof pr.html_url !== 'string') fail('child PR lookup returned an unexpected shape');
+      return { number: pr.number, url: pr.html_url, branch: pr.head.ref, base: pr.base.ref, head: pr.head.sha };
+    })
+    .sort((a, b) => a.number - b.number);
+}
+
+export function listOpenChildPrs({ repo, number, headRefName }, ghFn = command) {
+  return parseOpenChildPrs(ghJson(childPrListArgs(repo, headRefName), ghFn), { repo, number, headRefName });
 }
 
 // Title follows the fix commit's own conventional subject so the target repo's title gate sees a real type.
@@ -1521,6 +1551,11 @@ export function deliverViaChildPr({ worktree, task, validatedHead, remoteHead, s
   if (existing && existing !== validatedHead) fail(`child branch ${branch} already holds another commit`);
   let pushed = false;
   if (!existing) {
+    // An earlier round's child PR still open: the fix waits for it instead of opening another one. Only a branch
+    // that is not on the remote yet reaches here, so a retry of the same commit keeps its own branch and PR.
+    const earlier = listOpenChildPrs({ repo: task.repo, number: task.number, headRefName: task.headRefName }, ghFn)
+      .find((open) => open.branch !== branch);
+    if (earlier) return { pushed: false, reused: true, childPr: earlier };
     const hookPath = gitOutput(['-C', worktree, 'rev-parse', '--git-path', 'hooks'], gitFn).trim();
     if (!hookPath) fail('effective Git hook directory unavailable');
     const verified = guard.verification;
@@ -1658,9 +1693,11 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
       guard: { home, taskPath, env, verification } });
     // Blocked on the PR's current head: once the child PR merges, the head moves on its own and the watcher
     // treats that like an author push, delivering the feedback again so it is checked on the merged code.
+    const { number: childNumber, url: childUrl } = delivered.childPr;
+    const delivery = delivered.reused ? `已有子 PR #${childNumber} 仍开着，本轮修复没有另开（${childUrl}）` : `修复已送子 PR #${childNumber}（${childUrl}）`;
     return saveResult(paths, task, sessionId, {
       status: 'blocked', blockedKind: 'child-pr',
-      reason: `修复已送子 PR #${delivered.childPr.number}（${delivered.childPr.url}）；${task.headRefName} 只能经 PR 合入，等子 PR 合入后在新 HEAD 上复核`,
+      reason: `${delivery}；${task.headRefName} 只能经 PR 合入，等子 PR 合入后在新 HEAD 上复核`,
       head: branchHead, scs, feedbackCoverage, ...workersField, keel, verification, checks: [], pushed: false,
       childPr: delivered.childPr,
     });
