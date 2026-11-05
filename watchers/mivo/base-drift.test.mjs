@@ -7,7 +7,7 @@ import { scanOnceAsync, watcherPaths, lastBaseSyncAt, baseSyncRetryDue } from '.
 import { readPr, writePr } from './bin/mivo-state.mjs';
 import {
   planBaseUpdate, readBaseDrift, updateBaseBranch, baseDriftDue,
-  BASE_SYNC_MIN_BEHIND, BASE_SYNC_SPACING_MS,
+  BASE_SYNC_MIN_BEHIND, BASE_SYNC_SPACING_MS, headRulesRequirePr, readHeadSyncHold,
 } from './bin/mivo-pr-actions.mjs';
 import { handoffPr, handoffReceipt, isFollowBatch, followBatchBody, isMergeBatch, mergeBatchBody, withAuthorHandoff } from './handoff.fixture.mjs';
 
@@ -327,4 +327,28 @@ test('a PR held back by its head branch rules does not hold the sync window from
   assert.deepEqual(f.synced(), [982], 'the unprotected PR is synced in the same round');
   await f.scan(new Date(Date.parse(first) + BASE_SYNC_SPACING_MS + 60_000).toISOString());
   assert.deepEqual(f.synced(), [982], 'and the held one still is not, later');
+});
+
+test('headRulesRequirePr finds a pull_request rule on any page and rejects an answer that is not pages of rules', () => {
+  assert.equal(headRulesRequirePr([[{ type: 'deletion' }], [{ type: 'pull_request' }]]), true);
+  assert.equal(headRulesRequirePr(requiresPr), true);
+  assert.equal(headRulesRequirePr([[{ type: 'deletion' }, { type: 'non_fast_forward' }], []]), false);
+  assert.equal(headRulesRequirePr([[]]), false);
+  assert.equal(headRulesRequirePr([]), false);
+  for (const bad of [null, {}, 'x', [{ type: 'pull_request' }]]) assert.throws(() => headRulesRequirePr(bad), /expected pages of rules/);
+});
+
+test('readHeadSyncHold reads the head branch\'s effective rules and holds on a pull_request rule or an unreadable answer', () => {
+  const calls = [];
+  const hold = (answer, headRefName = 'integration/canvas s2') => run(readHeadSyncHold({ repo: 'example-org/example-plugin', headRefName,
+    ghFn: (args) => { calls.push(args); if (answer instanceof Error) throw answer; return typeof answer === 'string' ? answer : JSON.stringify(answer); } }));
+  assert.equal(hold(requiresPr), 'head-requires-pr');
+  assert.deepEqual(calls[0], ['api', 'repos/example-org/example-plugin/rules/branches/integration%2Fcanvas%20s2?per_page=100', '--paginate', '--slurp']);
+  assert.equal(hold([[]]), null);
+  assert.equal(hold(new Error('HTTP 502')), 'head-rules-unavailable');
+  assert.equal(hold('not json'), 'head-rules-unavailable');
+  assert.equal(hold({ message: 'Not Found' }), 'head-rules-unavailable');
+  const before = calls.length;
+  assert.equal(hold([[]], ''), 'head-rules-unavailable', 'no head branch name, no guess');
+  assert.equal(calls.length, before);
 });
