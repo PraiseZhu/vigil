@@ -145,6 +145,10 @@ export function* updateBaseBranch({
 }) {
   const plan = planBaseUpdate({ snapshot, entry, fresh: [], now, behindThreshold });
   const threshold = Number.isSafeInteger(behindThreshold) && behindThreshold > 0 ? behindThreshold : 0;
+  const behind = Number(snapshot?.behindBy);
+  // The widened path is only the one planBaseUpdate took when the count is known and at least the threshold; below
+  // it (or without a count) the plan fell back to the old BEHIND + review-gates path and must re-read like before.
+  const widened = threshold > 0 && Number.isSafeInteger(behind) && behind >= threshold;
   if (!plan.eligible) return { entry, action: { attempted: false, reason: plan.reason } };
   const expected = {
     nodeId: pr.id,
@@ -161,9 +165,9 @@ export function* updateBaseBranch({
   assertActionOwner({ live, snapshot, entry, viewer, expected });
   if (dryRun) return { entry, action: { attempted: false, reason: 'dry-run', key: plan.key } };
   // A snapshot taken from the round's batch read can be minutes old; update-branch writes to the PR, so its merge
-  // state and base tip are read again for this one PR first. In behind-threshold mode the count is re-read too:
-  // the threshold is about the current base, not the one the round started with.
-  if (threshold > 0) {
+  // state and base tip are read again for this one PR first. On the widened path the count is re-read too: the
+  // threshold is about the current base, not the one the round started with.
+  if (widened) {
     const live = yield* readMergeState({ id: pr.id, ghFn, headRefName: pr.headRefName });
     const liveBehind = Number(live.behindBy);
     if (String(live.mergeable ?? 'UNKNOWN').toUpperCase() !== 'MERGEABLE'

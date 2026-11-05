@@ -248,3 +248,35 @@ test('threshold mode updates the base when the re-read still qualifies behind', 
   assert.equal(calls.some((args) => args.join(' ').includes('update-branch') && args.join(' ').includes(`expected_head_sha=${HEAD}`)), true);
   assert.equal(calls.some((args) => args.includes('rebase')), false);
 });
+
+test('threshold mode below the count still updates a BEHIND PR through the old re-read', () => {
+  // The widened path did not apply (3 < 10): planBaseUpdate fell back to BEHIND + clean review, so updateBaseBranch
+  // must not demand behindBy >= 10 again — it re-reads the merge state exactly like the old path and writes.
+  const calls = [];
+  const ghFn = (args) => {
+    calls.push(args);
+    if (args.some((arg) => String(arg).includes('compare(headRef:'))) {
+      throw new Error('the widened re-read must not run for a below-threshold PR');
+    }
+    if (String(args.at(-1)).includes('viewer{login} node(id:')) {
+      return JSON.stringify({ data: { node: { mergeStateStatus: 'BEHIND', baseRef: { name: 'main', target: { oid: TIP } } } } });
+    }
+    return '{}';
+  };
+  const ownershipSnapshot = function* () { return { pr: snapshot().pr }; };
+  const saves = [];
+  const result = run(updateBaseBranch({
+    pr: snapshot().pr,
+    entry: {},
+    snapshot: behindSnapshot({
+      behindBy: 3, mergeStateStatus: 'BEHIND', mergeStateSource: 'batch',
+      reviewEvidence: { ready: false, reason: 'behind', blockers: ['behind'], baseUpdateEligible: true },
+    }),
+    ghFn, ownershipSnapshot, save: (entry) => saves.push(entry), now,
+    viewer: 'owner', repo: 'example-org/example-plugin', behindThreshold: 10,
+  }), ghFn);
+  assert.equal(result.action.reason, 'accepted');
+  assert.equal(saves[0].baseUpdate.status, 'reserved');
+  assert.equal(calls.some((args) => args.join(' ').includes('update-branch')
+    && args.join(' ').includes(`expected_head_sha=${HEAD}`)), true);
+});
