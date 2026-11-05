@@ -2358,7 +2358,9 @@ export function* processPr({
   // before trustedHead existed).
   const dispatchedHead = ['accepted', 'queued'].includes(previous.activeTask?.status) && previous.activeTask.head === ownerPr.headRefOid;
   // The watcher's own base sync moved the head off the trusted one; that is not the author taking the PR back.
-  const syncedHead = ['reserved', 'accepted', 'uncertain'].includes(previous.baseUpdate?.status)
+  // Only a sync GitHub accepted: an uncertain one (a 422 conflict, a timeout) may not have happened, and the head
+  // that follows can be the author's own fix.
+  const syncedHead = ['reserved', 'accepted'].includes(previous.baseUpdate?.status)
     && previous.baseUpdate.head === trusted;
   const headChanged = sameHandoffEpoch && trusted !== ownerPr.headRefOid && !controlledHead && !dispatchedHead && !syncedHead;
   const taskInFlight = Boolean(previous.pendingDispatch?.dispatchId) || (Boolean(previous.activeTask?.dispatchId)
@@ -2661,10 +2663,17 @@ export function* processPr({
     }
     previous = { ...previous, baseSyncRetryAt: plan.retryAt };
     if (plan.eligible) {
-      const outcome = yield* updateBaseBranch({
-        pr: ownerPr, entry: previous, snapshot: collected, ghFn,
-        ownershipSnapshot, save: saveEntry, now, dryRun, viewer, repo: REPO, drift, lastSyncAt,
-      });
+      // The claim stands only for a request that was sent; an ownership mismatch or a moved merge state gives the
+      // window back, or a PR that keeps failing that check would hold every other PR off.
+      let outcome = null;
+      try {
+        outcome = yield* updateBaseBranch({
+          pr: ownerPr, entry: previous, snapshot: collected, ghFn,
+          ownershipSnapshot, save: saveEntry, now, dryRun, viewer, repo: REPO, drift, lastSyncAt,
+        });
+      } finally {
+        if (!outcome?.action.attempted && baseSyncClaim.at === now) baseSyncClaim.at = null;
+      }
       previous = outcome.entry;
       if (outcome.action.attempted) {
         state.prs[key] = previous;
@@ -3031,18 +3040,22 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
     && !pendingActionDue(previous) && !scanRecheckDue(previous, now) && !baseSyncRetryDue(previous, now);
 }
 
-function baseSyncRetryDue(previous, now) {
+// Only near the retry time: a PR that left the sync path before it (back to Draft, opted out) keeps the old value,
+// and an always-due retry would collect it fully on every scan. The periodic full collection covers it after that.
+export const BASE_SYNC_RETRY_WINDOW_MS = 15 * 60 * 1000;
+export function baseSyncRetryDue(previous, now) {
   const at = Date.parse(previous.baseSyncRetryAt ?? '');
-  return Number.isFinite(at) && Date.parse(now) >= at;
+  const elapsed = Date.parse(now) - at;
+  return Number.isFinite(at) && elapsed >= 0 && elapsed < BASE_SYNC_RETRY_WINDOW_MS;
 }
 
-// The newest sync any of this watcher's PRs started, for the spacing between syncs. Read from the PR entries, which
-// are the only state the watcher persists.
+// The newest sync any of this watcher's PRs sent, for the spacing between syncs; a refused one counts too, so a
+// refusal that repeats takes no more than its share. Read from the PR entries, the only state the watcher persists.
 export function lastBaseSyncAt(state) {
   let latest = null;
   for (const entry of Object.values(state?.prs ?? {})) {
     const update = entry?.baseUpdate;
-    if (!update || !['reserved', 'accepted', 'uncertain', 'updated'].includes(update.status)) continue;
+    if (!update || !['reserved', 'accepted', 'uncertain', 'updated', 'failed', 'superseded'].includes(update.status)) continue;
     const at = Date.parse(update.requestedAt ?? '');
     if (Number.isFinite(at) && (latest == null || at > latest)) latest = at;
   }

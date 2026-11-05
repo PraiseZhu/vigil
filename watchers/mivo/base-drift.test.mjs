@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { scanOnceAsync, watcherPaths, lastBaseSyncAt } from './bin/mivo-watcher.mjs';
-import { writePr } from './bin/mivo-state.mjs';
+import { scanOnceAsync, watcherPaths, lastBaseSyncAt, baseSyncRetryDue } from './bin/mivo-watcher.mjs';
+import { readPr, writePr } from './bin/mivo-state.mjs';
 import {
   planBaseUpdate, readBaseDrift, updateBaseBranch, baseDriftDue,
   BASE_SYNC_MIN_BEHIND, BASE_SYNC_SPACING_MS,
@@ -82,19 +82,37 @@ test('one sync per spacing window across the watcher, and a refused sync waits a
   assert.equal(spaced.reason, 'spacing');
   assert.equal(spaced.retryAt, new Date(Date.parse(NOW) - 60_000 + BASE_SYNC_SPACING_MS).toISOString());
   assert.equal(plan({ drift: drift(20), lastSyncAt: new Date(Date.parse(NOW) - BASE_SYNC_SPACING_MS).toISOString() }).eligible, true);
+  assert.equal(plan({ drift: drift(20), lastSyncAt: new Date(Date.parse(NOW) + 3_600_000).toISOString() }).eligible, true, 'a last sync in the future does not hold it off');
   const key = plan({ drift: drift(20) }).key;
-  const refused = { baseUpdate: { key, status: 'failed', requestedAt: hoursAgo(0.5), checkedAt: hoursAgo(0.5) } };
+  const refused = { baseUpdate: { key, head: HEAD, status: 'failed', requestedAt: hoursAgo(0.5), checkedAt: hoursAgo(0.5) } };
   assert.equal(plan({ drift: drift(20), entry: refused }).reason, 'failed-cooldown');
   assert.equal(plan({ drift: drift(20), entry: { baseUpdate: { ...refused.baseUpdate, checkedAt: hoursAgo(2) } } }).eligible, true);
+  // main moved on since the refusal: a new base tip, the same head. A token without the workflow scope is refused again.
+  const movedTip = 'd'.repeat(40);
+  const onNewTip = planBaseUpdate({ snapshot: snapshot({ baseTipOid: movedTip }), entry: { baseUpdate: { ...refused.baseUpdate, head: HEAD } },
+    fresh: [], now: NOW, drift: drift(25, hoursAgo(1), { baseTip: movedTip }) });
+  assert.equal(onNewTip.reason, 'failed-cooldown', 'the cooldown is per head, not per base tip');
 });
 
-test('lastBaseSyncAt takes the newest sync any PR started, ignoring failed ones', () => {
+test('a postponed sync forces a collection only near its retry time, not forever', () => {
+  const entry = { baseSyncRetryAt: NOW };
+  const at = (minutes) => new Date(Date.parse(NOW) + minutes * 60_000).toISOString();
+  assert.equal(baseSyncRetryDue(entry, at(-1)), false, 'not before it');
+  assert.equal(baseSyncRetryDue(entry, at(0)), true);
+  assert.equal(baseSyncRetryDue(entry, at(14)), true);
+  assert.equal(baseSyncRetryDue(entry, at(16)), false, 'a stale value left by a PR that went back to Draft');
+  assert.equal(baseSyncRetryDue({}, NOW), false);
+});
+
+test('lastBaseSyncAt takes the newest sync any PR sent, a refused one included', () => {
   const state = { prs: {
     a: { baseUpdate: { status: 'updated', requestedAt: hoursAgo(3) } },
     b: { baseUpdate: { status: 'accepted', requestedAt: hoursAgo(1) } },
     c: { baseUpdate: { status: 'failed', requestedAt: hoursAgo(0) } },
     d: {},
   } };
+  assert.equal(lastBaseSyncAt(state), hoursAgo(0), 'a refusal that repeats takes its share of the spacing too');
+  delete state.prs.c;
   assert.equal(lastBaseSyncAt(state), hoursAgo(1));
   assert.equal(lastBaseSyncAt({ prs: {} }), null);
 });
@@ -133,16 +151,25 @@ test('a drift sync goes ahead when the live re-read says BLOCKED, and stops only
 });
 
 // ---- a whole discover round ----
-const listedPr = (number) => ({ number, id: `PR_${number}`, headRefOid: HEAD, headRefName: `fix/${number}`,
+// Each PR's current head; an accepted update-branch moves it to SYNCED, as GitHub's merge commit would.
+const SYNCED = 'e'.repeat(40);
+let heads = {};
+const headOf = (number) => heads[number] ?? HEAD;
+const listedPr = (number) => ({ number, id: `PR_${number}`, headRefOid: headOf(number), headRefName: `fix/${number}`,
   title: 'fix', isDraft: false, labels: [], updatedAt: '2026-11-04T00:00:00Z' });
 const isPollQuery = (args) => args[0] === 'api' && args[1] === 'graphql' && args.some((arg) => String(arg).includes('timelineItems'));
-const pollNode = () => ({ state: 'OPEN', isDraft: false, headRefOid: HEAD, baseRefOid: BASE, mergeable: 'MERGEABLE',
+const pollNode = (number) => ({ state: 'OPEN', isDraft: false, headRefOid: headOf(number), baseRefOid: BASE, mergeable: 'MERGEABLE',
   labels: { nodes: [] }, comments: { totalCount: 0, nodes: [] }, reviews: { totalCount: 0, nodes: [] },
   reviewThreads: { nodes: [] }, commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] } });
 const ownerFields = (number) => ({ id: `PR_${number}`, number, state: 'OPEN', isDraft: false, sameRepository: true,
-  author: { login: 'owner' }, headRefOid: HEAD, headRefName: `fix/${number}`, baseRefOid: BASE, baseRefName: 'main', releaseEpoch: 'e' });
-const waitingReview = (listed) => withAuthorHandoff({
-  pr: ownerFields(listed.number),
+  author: { login: 'owner' }, headRefOid: headOf(number), headRefName: `fix/${number}`, baseRefOid: BASE, baseRefName: 'main', releaseEpoch: 'e' });
+// The author handed off once, at HEAD; the receipt stays bound to that head when the head moves later.
+const waitingReview = (listed) => {
+  const collected = withAuthorHandoff(waitingReviewBody(listed.number), { ...listed, headRefOid: HEAD });
+  return { ...collected, pr: { ...collected.pr, headRefOid: headOf(listed.number) } };
+};
+const waitingReviewBody = (number) => ({
+  pr: { ...ownerFields(number), headRefOid: HEAD },
   admissionVerified: true,
   checks: [{ name: 'unit', state: 'PENDING', bucket: 'pending' }],
   ci: { status: 'pending', required: [{ context: 'unit', status: 'pending', evidence: { id: 1, runId: 2, attempt: 1 } }] },
@@ -150,7 +177,7 @@ const waitingReview = (listed) => withAuthorHandoff({
   comments: [], reviews: [], threads: [], labels: [], mergeReady: false,
   mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', mergeStateSource: 'query', baseTipOid: TIP,
   reviewReason: 'waiting-review', reviewEvidence: { ready: false, reason: 'waiting-review', blockers: ['waiting-review', 'waiting-ci', 'blocked'], baseUpdateEligible: false },
-}, listed);
+});
 
 function roundFixture(t, { numbers, behindBy }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-base-drift-'));
@@ -158,6 +185,7 @@ function roundFixture(t, { numbers, behindBy }) {
   t.after(() => { fs.rmSync(home, { recursive: true, force: true }); fs.rmSync(plugin, { recursive: true, force: true }); });
   const paths = watcherPaths(home);
   fs.mkdirSync(paths.stateDir, { recursive: true });
+  heads = {};
   for (const number of numbers) {
     const listed = listedPr(number);
     const handoff = handoffReceipt({ ...listed, releaseEpoch: 'e' });
@@ -173,12 +201,22 @@ function roundFixture(t, { numbers, behindBy }) {
     if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({});
     if (isMergeBatch(args)) return mergeBatchBody(numbers.map(listedPr), { status: () => 'BLOCKED' });
     if (isFollowBatch(args)) {
-      return followBatchBody(numbers.map(listedPr).map((pr) => ({ id: pr.id, isDraft: false, headRefOid: HEAD,
+      return followBatchBody(numbers.map(listedPr).map((pr) => ({ id: pr.id, isDraft: false, headRefOid: pr.headRefOid,
         updatedAt: pr.updatedAt, labels: { nodes: [] }, commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] } })));
     }
-    if (isPollQuery(args)) return JSON.stringify({ data: { node: pollNode() } });
-    if (String(args[1] ?? '').includes('/compare/')) { compares.push(args); return JSON.stringify({ behind_by: behindBy, merge_base_date: hoursAgo(5) }); }
-    if (args.join(' ').includes('update-branch')) { writes.push(args); return '{}'; }
+    if (isPollQuery(args)) {
+      const number = Number(/id=PR_(\d+)/.exec(args.join(' '))?.[1]);
+      return JSON.stringify({ data: { node: pollNode(number) } });
+    }
+    if (String(args[1] ?? '').includes('/compare/')) {
+      compares.push(args);
+      return JSON.stringify({ behind_by: String(args[1]).includes(`...${SYNCED}`) ? 0 : behindBy, merge_base_date: hoursAgo(5) });
+    }
+    if (args.join(' ').includes('update-branch')) {
+      writes.push(args);
+      heads[Number(/pulls\/(\d+)\/update-branch/.exec(args.join(' '))[1])] = SYNCED;
+      return '{}';
+    }
     return '[]';
   };
   let clock = 0;
@@ -191,7 +229,7 @@ function roundFixture(t, { numbers, behindBy }) {
     collect: (pr) => waitingReview(listedPr(pr.number)), dispatchFn: () => { throw new Error('nothing to dispatch'); },
   });
   const synced = () => writes.map((args) => Number(/pulls\/(\d+)\/update-branch/.exec(args.join(' '))?.[1]));
-  return { scan, synced, compares };
+  return { scan, synced, compares, entry: (number) => readPr(home, `PR_${number}`), push: (number, head) => { heads[number] = head; } };
 }
 
 test('a round brings a main PR that is 12 behind up to date, one PR per spacing window', async (t) => {
@@ -214,4 +252,19 @@ test('a round leaves a PR that is only a few commits behind alone', async (t) =>
   assert.deepEqual(f.synced(), []);
   await f.scan(new Date(Date.parse(NOW) + 60_000).toISOString());
   assert.equal(f.compares.length, 1, 'and not read again while the head and base tip stay the same');
+});
+
+test('the head a sync produced is not taken for the author pushing; an author push afterwards still is', async (t) => {
+  const f = roundFixture(t, { numbers: [984], behindBy: 12 });
+  const at = (minutes) => new Date(Date.parse(NOW) + minutes * 60_000).toISOString();
+  await f.scan(NOW);
+  assert.deepEqual(f.synced(), [984]);
+  await f.scan(at(1));
+  const synced = f.entry(984);
+  assert.equal(synced.baseUpdate.status, 'updated');
+  assert.equal(synced.trustedHead.head, SYNCED, 'the merge commit becomes the trusted head');
+  assert.equal(synced.handoff.head, HEAD, 'the author\'s handoff stays: the watcher\'s own merge commit is not an author push');
+  f.push(984, 'f'.repeat(40));
+  await f.scan(at(2));
+  assert.equal(f.entry(984).handoff.head, 'f'.repeat(40), 'the author\'s own push afterwards is still handled as one (new handoff)');
 });

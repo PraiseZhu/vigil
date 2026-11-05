@@ -91,11 +91,15 @@ export function planBaseUpdate({ snapshot, entry, fresh = [], now, drift = null,
     if (current && current.key === key && ['reserved', 'accepted', 'uncertain', 'updated'].includes(current.status)) {
       return `already-${current.status}`;
     }
-    if (current && current.key === key && current.status === 'failed'
+    // Held per head, not per base tip: a refusal that repeats (a token without the workflow scope while main changes
+    // workflow files) would otherwise be retried on every merge into main.
+    if (current && current.head === pr.headRefOid && current.status === 'failed'
       && Date.parse(now) - Date.parse(current.checkedAt ?? current.requestedAt) < BASE_SYNC_FAILED_COOLDOWN_MS) {
       return 'failed-cooldown';
     }
-    if (lastSyncAt && Date.parse(now) - Date.parse(lastSyncAt) < BASE_SYNC_SPACING_MS) return 'spacing';
+    // A last sync later than now (a clock set back) does not hold syncs off until the clock catches up.
+    const sinceLastSync = Date.parse(now) - Date.parse(lastSyncAt ?? '');
+    if (sinceLastSync >= 0 && sinceLastSync < BASE_SYNC_SPACING_MS) return 'spacing';
     return 'eligible';
   })();
   // Due but held back only by the spacing or a recent refusal: the PR has to be collected again at this time even
