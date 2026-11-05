@@ -119,18 +119,16 @@ fork 的归属,头仓改从 REST `repos/<repo>/pulls/<n>` 读,读不到(fork 已
 
 ## 4. 部署脚本
 
-`deploy.mjs` 的四个子命令是纯文件系统操作(校验哈希、原子安装、失败回滚),不依赖任何
-外部数据库或调度器:
+`deploy.mjs` 校验哈希、原子安装、失败回滚，不改 `state/`、配置和调度。两个 watcher 的子命令不完全相同：
 
 ```sh
-node watchers/<mivo|cindy>/deploy.mjs verify                 # 只校验源码内部的 import 闭包
-node watchers/<mivo|cindy>/deploy.mjs bootstrap --home <dir>
-node watchers/<mivo|cindy>/deploy.mjs preview --home <dir> --database <sqlite file> --id <id> --plan <file>
+node watchers/<mivo|cindy>/deploy.mjs verify --home <dir>      # mivo 必须带 --home
+node watchers/cindy/deploy.mjs bootstrap --home <dir>          # 只有 cindy 有；mivo 第一次安装先手动建 <dir>/bin/ 和 <dir>/state/prs/
+node watchers/<mivo|cindy>/deploy.mjs preview --home <dir> --database <Cindy 的 .db 文件> --id <id> --plan <绝对路径>
 node watchers/<mivo|cindy>/deploy.mjs apply --plan <file>
 ```
 
-`--database` 指向的 sqlite3 文件只用于一个可选的"目标会话是否空闲"安全检查(`idle()` 函数),
-如果你的部署场景不需要这层检查,可以直接改这个函数或传一个空库。
+`--database` 指向 Cindy 的本地数据库，用来确认修复会话都空闲（`idle()`，需要 `sqlite3`）；有会话在跑时 `preview` / `apply` 会拒绝，等它跑完再试。完整步骤见根目录 [`README.md`](../README.md#安装与部署)。
 
 ## 5. 停止盯梢某个 PR
 
