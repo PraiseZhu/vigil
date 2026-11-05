@@ -809,7 +809,7 @@ node watchers/acceptance/bin/prio-run.mjs --state-dir <state-dir>
 
 dry-run 不改 `<state-dir>/debounce.json`。文件本来没有，跑完仍然没有。已经记下的降档确认计数（`consecutive`、`pending`、`pendingHeld`、`lastRecalcAt`）不会往前推，看板上没有的条目也不会从状态文件里删掉。`--write` 仍按原来的规则更新这份文件。
 
-Inspector 看过至少 24 小时的 dry-run 之后，才在同一条命令上加 `--write`。`--write` 仍然只自动写「空优先级 → P1 或 P2」，并且只写授权清单里的仓。
+Inspector 看过至少 24 小时的 dry-run 之后，才在同一条命令上加 `--write`。`--write` 仍然只自动写「空优先级 → P1 或 P2」，并且只写授权清单里的仓。要写关联 PR 时单独挂 `--only-field "关联 PR"`（见下面的参数表）。
 
 授权只放宽到「空 → P2」时，再加 `--only-empty-to-p2`（默认关，不带时行为与上面一致）：
 
@@ -841,6 +841,7 @@ touch <state-dir>/disabled
 | 文件或参数 | 作用 |
 |---|---|
 | `--max-per-tick N` 或 `<state-dir>/run.json` 的 `maxPerTick` | 每拍最多写入几条。默认 10。0、负数、非整数、大于 1000 都在读令牌之前报错，信息里有期望和实际值 |
+| `--only-field 优先级` 或 `--only-field "关联 PR"` | 只让这一个字段进写闸。取值只认这两个（源码里的 `ONLY_FIELD_NAMES`），精确相等：不 trim、不折大小写，也不接受多值；未知值、空值、重复出现、取值位置是另一个 `--` 参数，都在读令牌和联网之前报错，信息里有允许取值和实际值。不带时行为不变（关联 PR 仍不写）。带「关联 PR」时 link 才走写闸，仍受逐条回读、停写开关、每小时 50 条约束；此时优先级侧的降级/改空本拍不写、不触发停写（降级告警由不带该参数的那一段 cron 负责，run 日志记一行排除计数）。和 `--only-empty-to-p2` 同时给会报错（「--only-empty-to-p2 不能和 --only-field 同用」，读令牌前退出） |
 | `<state-dir>/changes.jsonl` | 每小时上限的计数依据。滚动 1 小时内最多 50 条（`PRIO_HOURLY_MAX`）。第 51 条不写，并自动停写 |
 | `<state-dir>/authorized-repos.json` | `--write` 的授权清单。没有这个文件，或者仓名不在里面，该仓只做 dry-run |
 | `<state-dir>/disabled` | 停写开关 |
@@ -871,7 +872,7 @@ touch <state-dir>/disabled
 | `prio-nonempty` | 有「非空 → 别的值」（含升级）或空 → P0/P3 | 没有停写。这些条没写。要改就手动跑 prio-sync |
 | `prio-github` | GitHub 返回找不到或 5xx | 这一拍没继续写。不满 3 拍先不用处理，下一拍再试。满 3 拍会停写 |
 
-相同的 `kind` 和 `text` 不重复追加。关联 PR 在没有 `mac-mini-stopped` 时只打印「扣住」，不算告警，也不写。持续 `--write` 即使已经有这个标记，也不自动写关联 PR。
+相同的 `kind` 和 `text` 不重复追加。关联 PR 在没有 `mac-mini-stopped` 时只打印「扣住」，不算告警，也不写。持续 `--write` 不带 `--only-field "关联 PR"` 时不写关联 PR；带上才写，且仍受逐条回读、停写开关和每小时 50 条约束。
 
 ### 两段上线检查表
 
