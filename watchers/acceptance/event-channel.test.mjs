@@ -2482,6 +2482,56 @@ test('W4g SC4 补写退避 60 秒 → 5 分钟 → 15 分钟：未到期不调 s
   assert.equal(calls.at(-1).at, due3);
 });
 
+test('W4g 补充 发现来源也受退避约束：退避没到期的目标，发现到了也不重写', async () => {
+  const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  let nowMs = t0;
+  const calls = [];
+  const state = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  const pipeline = createEventPipeline({
+    state,
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async (target) => {
+      calls.push({ at: nowMs, ref: target.ref });
+      throw new Error('看板写不进去');
+    },
+    logger: () => {},
+    // 发现通道每拍都返回同一个目标；updatedAt 跟时钟走，保证它每一拍都落在发现窗口里
+    // （窗口是「上次成功发现 - 2 分钟」，写死 t0 的话后面几拍会自然发现不到，验不出退避这道闸）。
+    listRecent: async ({ repo }) => [{ repo, number: 7, kind: 'issue', updatedAt: new Date(nowMs).toISOString() }],
+  });
+  // 事件路径先写失败一次：pending 里留下这条，第 1 次补写排在「失败时刻 + 60 秒」。
+  await assert.rejects(() => pipeline.onEvent(issueEvent('discovery-backoff-1', { issue: 7 })), /看板写不进去/);
+  const key = 'example/owner-a#7';
+  assert.equal(calls.length, 1, '事件路径写一次就失败');
+  assert.equal(state.pending.has(key), true, '失败先留在 pending');
+  const due1 = t0 + 60000;
+  const due2 = due1 + 5 * 60000;
+  const pollAt = async (at) => {
+    nowMs = at;
+    assert.deepEqual(await pipeline.poll({ workerFailing: true }), []);
+  };
+
+  // +30 秒与差 1 秒到期（+59 秒）：发现通道每拍都看到这个目标，但退避没到期，一个都不写。
+  await pollAt(t0 + 30000);
+  assert.equal(calls.length, 1, '失败后 30 秒：发现了也不重写');
+  await pollAt(due1 - 1000);
+  assert.equal(calls.length, 1, '失败后 59 秒：还差 1 秒，发现了也不重写');
+
+  await pollAt(due1);
+  assert.equal(calls.length, 2, '失败后 60 秒：到期，补写一次（这一拍又失败，下一档排到 5 分钟）');
+  assert.equal(calls.at(-1).at, due1, '补写就发生在这一拍');
+
+  // 第 2 次失败后排到 +5 分钟：差 1 秒（+4 分 59 秒）不写，到期写一次。
+  await pollAt(due2 - 1000);
+  assert.equal(calls.length, 2, '第 2 档差 1 秒：发现了也不重写');
+  await pollAt(due2);
+  assert.equal(calls.length, 3, '第 2 档到期：补写一次');
+  assert.equal(calls.at(-1).at, due2, '第 2 档补写就发生在这一拍');
+});
+
 test('W4g SC5 上限放弃：第 4 次失败后移出 pending、只写一行放弃日志、之后不再重试；ok:false 仍不 ack', async () => {
   const fixture = eventRunFixture();
   const t0 = Date.parse('2026-11-01T12:00:00.000Z');
