@@ -317,11 +317,31 @@ function loadDebounceState(dir) {
   return { items: items ?? {}, prCiPresent, prCi: prCiPresent ? parsed.prCi : undefined };
 }
 
-function saveDebounce(dir, items, prCi) {
+export function saveDebounce(dir, items, prCi, fsImpl = fs) {
   const body = { items };
   if (prCi !== undefined) body.prCi = prCi;
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(stateFile(dir), `${JSON.stringify(body)}\n`);
+  fsImpl.mkdirSync(dir, { recursive: true });
+  writeFileAtomic(stateFile(dir), `${JSON.stringify(body)}\n`, fsImpl);
+}
+
+/**
+ * 原子写：同目录临时文件写完再 rename 到目标路径（#324 SC2）。读的一方要么看到完整的旧内容，
+ * 要么看到完整的新内容，不会读到写了一半的 JSON。内容格式不变（调用方传什么就写什么）。
+ * fsImpl 只给测试注入：替换 renameSync 等方法，挡住「写完临时文件、改名之前」这一步。
+ */
+function writeFileAtomic(file, text, fsImpl = fs) {
+  const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+  try {
+    fsImpl.writeFileSync(tmp, text);
+    fsImpl.renameSync(tmp, file);
+  } catch (error) {
+    try {
+      fsImpl.unlinkSync(tmp);
+    } catch {
+      // 删不掉临时文件不是失败原因：把上面那条原始错误抛出去，调用方才知道为什么没写成。
+    }
+    throw error;
+  }
 }
 
 function appendChange(dir, row) {

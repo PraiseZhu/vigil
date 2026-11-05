@@ -26,6 +26,7 @@ import {
   readRepoClassTable,
   restorePrio,
   runPrioSync,
+  saveDebounce,
   STALE_REMIND_MS,
   ITEM_FIELD_QUERY,
   ONLY_FIELD_NAMES,
@@ -34,6 +35,7 @@ import {
   classifyPrioChange,
   countRecentChanges,
   readFieldValue,
+  stateFiles,
 } from './bin/prio-sync.mjs';
 import { REPO, createFakeRun, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 
@@ -4623,6 +4625,38 @@ test('#255 SC7 不带 --only-field 时输出不变；计划只含放行字段时
   assert.match(plain.io.text(), /变更 1，写入 0/);
   assert.equal(plain.io.text().includes('按字段过滤掉'), false);
   assert.equal(filtered.io.text(), plain.io.text());
+});
+
+test('#324 SC2 防抖文件先写临时文件再改名：改名失败时旧文件仍是完整可解析的旧内容，也不留临时文件', () => {
+  const dir = tmpDir();
+  const file = stateFiles(dir).debounce;
+  const items = { [`${REPO}#1`]: { priority: 'P0' } };
+  const prCi = { [`${REPO}#9`]: { mark: 'fail', pending: 0 } };
+  const before = `${JSON.stringify({
+    items: { [`${REPO}#1`]: { priority: 'P2' } },
+    prCi: { [`${REPO}#9`]: { mark: 'pass', pending: 1 } },
+  })}\n`;
+  fs.writeFileSync(file, before);
+  // 只挡「改名」这一步：临时文件已经写完，模拟两个写者交错 / 进程在改名之前被杀。
+  const failing = { ...fs, renameSync() { throw new Error('改名失败（模拟）；'); } };
+  assert.throws(() => saveDebounce(dir, items, prCi, failing), /改名失败/);
+  assert.equal(fs.readFileSync(file, 'utf8'), before, '读的一方还能拿到完整的旧内容');
+  const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(parsed.items[`${REPO}#1`].priority, 'P2');
+  assert.deepEqual(fs.readdirSync(dir), ['debounce.json'], '临时文件不能留在读路径上');
+});
+
+test('#324 SC2/SC3 防抖文件内容格式不变，写完只有一份 debounce.json', () => {
+  const dir = tmpDir();
+  saveDebounce(dir, { [`${REPO}#1`]: { priority: 'P2' } }, { [`${REPO}#9`]: { mark: 'pass', pending: 0 } });
+  assert.equal(
+    fs.readFileSync(path.join(dir, 'debounce.json'), 'utf8'),
+    `${JSON.stringify({ items: { [`${REPO}#1`]: { priority: 'P2' } }, prCi: { [`${REPO}#9`]: { mark: 'pass', pending: 0 } } })}\n`,
+  );
+  assert.deepEqual(fs.readdirSync(dir), ['debounce.json']);
+  // prCi 不传就不该多出这个键（与改前一致）。
+  saveDebounce(dir, {});
+  assert.equal(fs.readFileSync(path.join(dir, 'debounce.json'), 'utf8'), `${JSON.stringify({ items: {} })}\n`);
 });
 
 test('#255 SC8 第 12 节写明 --only-field 的取值、过滤位置、计数关系、--restore 冲突与防抖退回', () => {
