@@ -7,7 +7,7 @@ import { scanOnceAsync, watcherPaths, lastBaseSyncAt, baseSyncRetryDue } from '.
 import { readPr, writePr } from './bin/mivo-state.mjs';
 import {
   planBaseUpdate, readBaseDrift, updateBaseBranch, baseDriftDue,
-  BASE_SYNC_MIN_BEHIND, BASE_SYNC_SPACING_MS,
+  BASE_SYNC_MIN_BEHIND, BASE_SYNC_SPACING_MS, headRulesRequirePr, readHeadSyncHold,
 } from './bin/mivo-pr-actions.mjs';
 import { handoffPr, handoffReceipt, isFollowBatch, followBatchBody, isMergeBatch, mergeBatchBody, withAuthorHandoff } from './handoff.fixture.mjs';
 
@@ -179,7 +179,8 @@ const waitingReviewBody = (number) => ({
   reviewReason: 'waiting-review', reviewEvidence: { ready: false, reason: 'waiting-review', blockers: ['waiting-review', 'waiting-ci', 'blocked'], baseUpdateEligible: false },
 });
 
-function roundFixture(t, { numbers, behindBy }) {
+// headRules answers the effective-rules read of a PR's head branch with the pages gh --slurp returns, or throws.
+function roundFixture(t, { numbers, behindBy, mergeBaseHours = 5, headRules = () => [[]] }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-base-drift-'));
   const plugin = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-base-drift-plugin-'));
   t.after(() => { fs.rmSync(home, { recursive: true, force: true }); fs.rmSync(plugin, { recursive: true, force: true }); });
@@ -195,6 +196,7 @@ function roundFixture(t, { numbers, behindBy }) {
   }
   const writes = [];
   const compares = [];
+  const ruleReads = [];
   const ghFn = (args) => {
     if (args[0] === 'api' && args[1] === 'user') return 'owner';
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(numbers.map(listedPr));
@@ -210,7 +212,12 @@ function roundFixture(t, { numbers, behindBy }) {
     }
     if (String(args[1] ?? '').includes('/compare/')) {
       compares.push(args);
-      return JSON.stringify({ behind_by: String(args[1]).includes(`...${SYNCED}`) ? 0 : behindBy, merge_base_date: hoursAgo(5) });
+      return JSON.stringify({ behind_by: String(args[1]).includes(`...${SYNCED}`) ? 0 : behindBy, merge_base_date: hoursAgo(mergeBaseHours) });
+    }
+    if (String(args[1] ?? '').includes('/rules/branches/')) {
+      const number = Number(/rules\/branches\/fix%2F(\d+)/.exec(args[1])?.[1]);
+      ruleReads.push(number);
+      return JSON.stringify(headRules(number));
     }
     if (args.join(' ').includes('update-branch')) {
       writes.push(args);
@@ -229,7 +236,7 @@ function roundFixture(t, { numbers, behindBy }) {
     collect: (pr) => waitingReview(listedPr(pr.number)), dispatchFn: () => { throw new Error('nothing to dispatch'); },
   });
   const synced = () => writes.map((args) => Number(/pulls\/(\d+)\/update-branch/.exec(args.join(' '))?.[1]));
-  return { scan, synced, compares, entry: (number) => readPr(home, `PR_${number}`), push: (number, head) => { heads[number] = head; } };
+  return { scan, synced, compares, ruleReads, entry: (number) => readPr(home, `PR_${number}`), push: (number, head) => { heads[number] = head; } };
 }
 
 test('a round brings a main PR that is 12 behind up to date, one PR per spacing window', async (t) => {
@@ -267,4 +274,81 @@ test('the head a sync produced is not taken for the author pushing; an author pu
   f.push(984, 'f'.repeat(40));
   await f.scan(at(2));
   assert.equal(f.entry(984).handoff.head, 'f'.repeat(40), 'the author\'s own push afterwards is still handled as one (new handoff)');
+});
+
+// 2026-11-05: a stage PR's head branch (integration/*) only takes changes through a PR, so update-branch is refused
+// there however far behind it is. The watcher kept trying (and holding the 5-minute window while it did).
+// The sync claim is kept per process, so each case below scans in a window of its own, apart from the cases before it.
+let windows = 0;
+const nextWindow = () => new Date(Date.parse(NOW) + 3_600_000 + (++windows) * 30 * 60_000).toISOString();
+const requiresPr = [[{ type: 'deletion' }, { type: 'pull_request', ruleset_id: 1, parameters: { required_approving_review_count: 0 } }]];
+
+test('a PR whose head branch only takes changes through a PR is not synced, however far behind or old', async (t) => {
+  for (const [numbers, behindBy, mergeBaseHours] of [[[985], 12, 5], [[986], 2, 49]]) {
+    const f = roundFixture(t, { numbers, behindBy, mergeBaseHours, headRules: () => requiresPr });
+    await f.scan(nextWindow());
+    assert.deepEqual(f.synced(), [], `behind ${behindBy}, merge base ${mergeBaseHours}h old: no update-branch`);
+    assert.deepEqual(f.ruleReads, numbers, 'the head branch\'s rules are read once the PR is due');
+    assert.equal(f.entry(numbers[0]).baseUpdate, undefined, 'and nothing is recorded as a sync');
+    assert.equal(f.entry(numbers[0]).baseSyncRetryAt ?? null, null, 'no forced collection for a sync that cannot happen');
+  }
+});
+
+test('a PR whose head branch rules cannot be read is not synced either', async (t) => {
+  const f = roundFixture(t, { numbers: [987], behindBy: 12, headRules: () => { throw new Error('HTTP 502'); } });
+  await f.scan(nextWindow());
+  assert.deepEqual(f.synced(), []);
+  assert.deepEqual(f.ruleReads, [987]);
+  assert.equal(f.entry(987).baseUpdate, undefined);
+  assert.equal(f.entry(987).baseSyncRetryAt ?? null, null);
+  const malformed = roundFixture(t, { numbers: [988], behindBy: 12, headRules: () => ({ message: 'Not Found' }) });
+  await malformed.scan(nextWindow());
+  assert.deepEqual(malformed.synced(), [], 'an answer that is not pages of rules counts as unreadable');
+});
+
+test('a head branch with no pull_request rule is synced as before, after one read of its rules', async (t) => {
+  const f = roundFixture(t, { numbers: [989], behindBy: 12, headRules: () => [[{ type: 'deletion' }], []] });
+  await f.scan(nextWindow());
+  assert.deepEqual(f.ruleReads, [989]);
+  assert.deepEqual(f.synced(), [989]);
+});
+
+test('the rules are read only for a PR that is due: a PR a few commits behind costs no extra request', async (t) => {
+  const f = roundFixture(t, { numbers: [990], behindBy: 3, headRules: () => requiresPr });
+  await f.scan(nextWindow());
+  assert.deepEqual(f.ruleReads, []);
+  assert.deepEqual(f.synced(), []);
+});
+
+test('a PR held back by its head branch rules does not hold the sync window from the others', async (t) => {
+  const f = roundFixture(t, { numbers: [981, 982], behindBy: 12, headRules: (number) => (number === 981 ? requiresPr : [[]]) });
+  const first = nextWindow();
+  await f.scan(first);
+  assert.deepEqual(f.synced(), [982], 'the unprotected PR is synced in the same round');
+  await f.scan(new Date(Date.parse(first) + BASE_SYNC_SPACING_MS + 60_000).toISOString());
+  assert.deepEqual(f.synced(), [982], 'and the held one still is not, later');
+});
+
+test('headRulesRequirePr finds a pull_request rule on any page and rejects an answer that is not pages of rules', () => {
+  assert.equal(headRulesRequirePr([[{ type: 'deletion' }], [{ type: 'pull_request' }]]), true);
+  assert.equal(headRulesRequirePr(requiresPr), true);
+  assert.equal(headRulesRequirePr([[{ type: 'deletion' }, { type: 'non_fast_forward' }], []]), false);
+  assert.equal(headRulesRequirePr([[]]), false);
+  assert.equal(headRulesRequirePr([]), false);
+  for (const bad of [null, {}, 'x', [{ type: 'pull_request' }]]) assert.throws(() => headRulesRequirePr(bad), /expected pages of rules/);
+});
+
+test('readHeadSyncHold reads the head branch\'s effective rules and holds on a pull_request rule or an unreadable answer', () => {
+  const calls = [];
+  const hold = (answer, headRefName = 'integration/canvas s2') => run(readHeadSyncHold({ repo: 'example-org/example-plugin', headRefName,
+    ghFn: (args) => { calls.push(args); if (answer instanceof Error) throw answer; return typeof answer === 'string' ? answer : JSON.stringify(answer); } }));
+  assert.equal(hold(requiresPr), 'head-requires-pr');
+  assert.deepEqual(calls[0], ['api', 'repos/example-org/example-plugin/rules/branches/integration%2Fcanvas%20s2?per_page=100', '--paginate', '--slurp']);
+  assert.equal(hold([[]]), null);
+  assert.equal(hold(new Error('HTTP 502')), 'head-rules-unavailable');
+  assert.equal(hold('not json'), 'head-rules-unavailable');
+  assert.equal(hold({ message: 'Not Found' }), 'head-rules-unavailable');
+  const before = calls.length;
+  assert.equal(hold([[]], ''), 'head-rules-unavailable', 'no head branch name, no guess');
+  assert.equal(calls.length, before);
 });

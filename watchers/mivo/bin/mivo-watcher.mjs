@@ -18,7 +18,7 @@ import {lifelineFeedback} from './mivo-lifeline-source.mjs';
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent, completedMemberFeedback, coveredFeedbackItems, replyToMemberFeedback, requestMemberReviewers, partitionServerFixedThreads, resolveServerFixedThreads, SERVER_FIXED_REASON } from './mivo-review-resolve.mjs';
 import { resolveWithAppEnabled, resolveThreadsWithApp } from './mivo-app-token.mjs';
 import { codeScanningFeedbackItems } from './mivo-code-scanning.mjs';
-import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck, readBaseDrift, isSyncableBase } from './mivo-pr-actions.mjs';
+import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck, readBaseDrift, isSyncableBase, readHeadSyncHold } from './mivo-pr-actions.mjs';
 import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath, findingMarkerOf, childPrListArgs, parseOpenChildPrs } from './mivo-repair.mjs';
 import { PARSER_VERSION, canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
@@ -2704,9 +2704,22 @@ export function* processPr({
     if (plan.eligible) {
       lastSyncAt = newestIso(lastBaseSyncAtAcross(state, paths), baseSyncClaim.at);
       plan = planBaseUpdate({ snapshot: collected, entry: previous, fresh, now, drift, lastSyncAt });
-      // A round runs its PRs in parallel: claim the window before the first yield, or every PR reads "no sync yet"
-      // from disk and all of them sync at once (2026-11-05: #1807 and #1727 in the same second).
-      if (plan.eligible) baseSyncClaim.at = now;
+      // A head branch that takes changes only through a PR refuses update-branch. Its rules are read once the sync
+      // is due and the window is free, and before the claim: a claim held across the read would keep every other PR
+      // out of the window on each scan, for a sync that never goes out.
+      if (plan.eligible) {
+        const held = yield* readHeadSyncHold({ repo: REPO, headRefName: ownerPr.headRefName ?? previous.headRefName, ghFn });
+        if (held) {
+          plan = { ...plan, eligible: false, reason: held, retryAt: null };
+        } else {
+          // The read took a step: another PR may have claimed the window in the meantime.
+          lastSyncAt = newestIso(lastBaseSyncAtAcross(state, paths), baseSyncClaim.at);
+          plan = planBaseUpdate({ snapshot: collected, entry: previous, fresh, now, drift, lastSyncAt });
+          // A round runs its PRs in parallel: claim the window before the next yield, or every PR reads "no sync yet"
+          // from disk and all of them sync at once (2026-11-05: #1807 and #1727 in the same second).
+          if (plan.eligible) baseSyncClaim.at = now;
+        }
+      }
     }
     previous = { ...previous, baseSyncRetryAt: plan.retryAt };
     if (plan.eligible) {
