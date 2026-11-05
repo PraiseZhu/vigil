@@ -48,6 +48,19 @@ function addScanning(scanning, rule) {
   }
 }
 
+// A branch guarded only by rulesets reports protected:true, but its classic /protection answers 404 "Branch not
+// protected". gh exits 1 for every HTTP error, so the 404 and GitHub's message are only in its output; matching
+// error.status === 404 never held, and every integration/* PR stayed at required-policy-unknown (2026-11-05).
+export function isBranchNotProtected(error) {
+  if (error?.status === 404 && error.apiMessage === 'Branch not protected') return true;
+  let body = null;
+  try { body = JSON.parse(String(error?.stdout ?? '')); } catch { body = null; }
+  const stderr = String(error?.stderr ?? '');
+  const notFound = String(body?.status ?? '') === '404' || /\(HTTP 404\)/.test(stderr);
+  const message = body?.message === 'Branch not protected' || /Branch not protected/.test(stderr);
+  return notFound && message;
+}
+
 function* loadBranchRequired({ gh, repo, baseRefName, branchPath, isProtected, into, scanning = [], strict = { value: null } }) {
   const rulesPages = parse(yield () => gh(['api', `repos/${repo}/rules/branches/${encodeURIComponent(baseRefName)}?per_page=100`, '--paginate', '--slurp']));
   assert(Array.isArray(rulesPages) && rulesPages.every(Array.isArray), 'incomplete effective rules');
@@ -65,7 +78,7 @@ function* loadBranchRequired({ gh, repo, baseRefName, branchPath, isProtected, i
   let protection;
   try { protection = parse(yield () => gh(['api', `${branchPath}/protection`])); }
   catch (error) {
-    if (error.status === 404 && error.apiMessage === 'Branch not protected') protection = { required_status_checks: null };
+    if (isBranchNotProtected(error)) protection = { required_status_checks: null };
     else throw error;
   }
   assert(protection && typeof protection === 'object', 'unknown classic protection');
