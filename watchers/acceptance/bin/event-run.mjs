@@ -9,9 +9,10 @@
 // 默认 dry-run（只算不写），--write 才真写。真写之前探测 /tmp/prio-write.lock：
 // 抢不到每 2 秒重试、最多 10 秒，仍抢不到就抛错，本次事件不确认，留在 Worker 里下次再拉。
 //
-// 三层回退：Worker 正常 → 每 2 秒拉事件；Worker 连续失败 pollAfterFailures 次（缺省 3）→ 才跑 60 秒兜底轮询；
-// 本进程整个挂掉 → 现有 30 分钟定时任务照旧收敛看板。兜底轮询只补写「事件写过但没写成功」的单条目标，
-// 不整盘读，也不替现有定时任务做对账。
+// 三层回退：Worker 正常 → 每 2 秒拉事件；Worker 连续失败 pollAfterFailures 次（缺省 1 次：一次失败就兜底）→ 才跑 60 秒兜底轮询；
+// 本进程整个挂掉 → 现有 30 分钟定时任务照旧收敛看板。兜底轮询补写「事件写过但没写成功」的单条目标，
+// 并（Worker 失败期间）每 60 秒对授权仓做一次发现：用只读 REST 列最近更新的 PR/issue，把目标交给同一条单条写入路径。
+// 发现和事件补写合并去重，同一目标一拍只写一次；不整盘读，也不替现有定时任务做对账。
 //
 // 两个停写开关都遵守：<stateDir>/disabled（自动写入已暂停）→ 事件只确认不写；
 // <stateDir>/event-run.disabled（本拉取器停用）→ 连拉都不拉，空转并写日志说明。
@@ -21,7 +22,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { checkSecretFile, explicitWatcherHome, ProfileError } from './profile.mjs';
+import { checkSecretFile, explicitWatcherHome, loadAcceptanceProfile, ProfileError } from './profile.mjs';
 import {
   DEFAULT_POLL_AFTER_FAILURES,
   POLL_INTERVAL_MS,
@@ -32,10 +33,11 @@ import {
   runEventChannel,
 } from './event-pull.mjs';
 import { prIssueRefs } from './pr-link.mjs';
+import { createReadGithub } from './prio-sync.mjs';
 import { readAuthorizedRepos } from './prio-run.mjs';
 import { SINGLE_ITEM_MODULE, loadSingleItemModule } from '../prio-item-loader.mjs';
 
-/** 兜底轮询的门槛（缺省 3 次）由 event-pull.mjs 定义，这里只是转发，免得两边各写一份。 */
+/** 兜底轮询的门槛（缺省 1 次：一次失败就兜底）由 event-pull.mjs 定义，这里只是转发，免得两边各写一份。 */
 export { DEFAULT_POLL_AFTER_FAILURES };
 
 /** 只处理这四类事件（Worker 侧也只订阅这四类）。其它类型到了也只确认不写。 */
@@ -49,6 +51,9 @@ export { SINGLE_ITEM_MODULE, loadSingleItemModule };
 export const EVENT_RUN_LOG_MAX_BYTES = 5 * 1024 * 1024;
 /** 停用 / 空转这类重复日志最多每 60 秒一条。 */
 const QUIET_LOG_MS = 60 * 1000;
+/** 兜底发现的时间水位：还没成功发现过（刚启动）回看 10 分钟；之后按上次成功发现减 2 分钟。 */
+export const DISCOVERY_LOOKBACK_MS = 10 * 60 * 1000;
+export const DISCOVERY_OVERLAP_MS = 2 * 60 * 1000;
 
 export class EventRunConfigError extends Error {
   constructor(message, code = 'EVENT_RUN_CONFIG') {
@@ -384,9 +389,142 @@ export function createEventRunState({ allowedRepos = [] } = {}) {
 }
 
 /**
+ * 发现用的 GitHub 读取依赖，形状：
+ *   listRecent({ repo, sinceMs }) => [{ repo, number, kind: 'pull'|'issue', updatedAt, body?, headRef? }]
+ * 缺省实现走现有只读 GraphQL 通道（见下面的 createGraphqlListRecent）：每仓每分钟 1 次调用，
+ * 低于「授权仓数 × 2」的上限（Worker 失败期间每 60 秒才一拍）。
+ * updatedAt 早于 sinceMs 的行丢弃（与 REST 版一样按客户端过滤）。
+ */
+
+/**
+ * 发现用的具名只读 query：一次拿一仓最近更新的 PR 与 issue。
+ * `issues` 连接按 GraphQL 语义同时返回 PR，所以节点带 __typename，建行时跳过 PullRequest，
+ * 否则同一个 PR 会被当成「issue 号」写一遍。
+ */
+export const DISCOVERY_QUERY = `query DiscoveryRecent($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(first: 50, orderBy: {field: UPDATED_AT, direction: DESC}, states: [OPEN, MERGED, CLOSED]) {
+      nodes { __typename number updatedAt headRefName body }
+    }
+    issues(first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes { __typename number updatedAt }
+    }
+  }
+}`;
+
+/** 把 DISCOVERY_QUERY 的返回变成 listRecent 约定的行（还没按 sinceMs 过滤）。 */
+export function graphqlRecentRows({ repo, data, sinceMs = null } = {}) {
+  const repository = data?.repository;
+  if (!repository) return [];
+  const rows = [];
+  for (const node of repository.pullRequests?.nodes || []) {
+    rows.push({
+      repo,
+      number: node?.number,
+      kind: 'pull',
+      updatedAt: node?.updatedAt,
+      body: node?.body,
+      headRef: node?.headRefName,
+    });
+  }
+  for (const node of repository.issues?.nodes || []) {
+    // issues 连接同时返回 PR：PR 已经在上面按 pr-link 反查过，这里跳过，免得往 PR 号上写。
+    if (node?.__typename === 'PullRequest') continue;
+    rows.push({ repo, number: node?.number, kind: 'issue', updatedAt: node?.updatedAt });
+  }
+  return rows.filter((row) => {
+    const updatedMs = Date.parse(String(row.updatedAt ?? ''));
+    return !Number.isFinite(sinceMs) || !Number.isFinite(updatedMs) || updatedMs >= sinceMs;
+  });
+}
+
+/**
+ * 缺省的发现通道：用现有只读通道（prio-sync.mjs 的 createReadGithub().ownerGraphql）。
+ * 只发只读 query，不新建令牌、不读环境变量里的令牌、不起子进程、不加动态 import。
+ * reader 懒创建：第一次 poll 才 loadAcceptanceProfile 并建通道；profile / reader / 构造器都可注入，测试里不碰真网络。
+ */
+export function createGraphqlListRecent({
+  reader = null,
+  profile = null,
+  loadProfile = loadAcceptanceProfile,
+  createReader = createReadGithub,
+} = {}) {
+  let cached = reader;
+  return async function listRecent({ repo, sinceMs }) {
+    if (!cached) {
+      const loaded = profile || loadProfile();
+      cached = createReader({ profile: loaded });
+    }
+    const [owner, name] = String(repo || '').split('/');
+    if (!owner || !name) return [];
+    const data = await cached.ownerGraphql(DISCOVERY_QUERY, { owner, name });
+    return graphqlRecentRows({ repo, data, sinceMs });
+  };
+}
+
+/**
+ * 把发现通道返回的一页目标变回 owner/repo#number。
+ * PR 跟事件路径一样走 pr-link 反查任务 issue（正文「任务 issue：」行、Closes 行、acceptance/<号> 分支等），
+ * 反查不到就跳过：宁可不写，也不往 PR 号上写认领字段。
+ * updatedAt 早于 sinceMs 的一律丢掉（pulls 接口没有 since，只能客户端过滤）。
+ */
+export function discoveryTargets({ repo, rows = [], sinceMs = null } = {}) {
+  const found = new Map();
+  const add = (rawRepo, rawNumber, via) => {
+    const name = String(rawRepo || '').trim();
+    const number = numberOrNull(rawNumber);
+    if (!name.includes('/') || !number) return;
+    const ref = `${name}#${number}`;
+    if (found.has(ref.toLowerCase())) return;
+    found.set(ref.toLowerCase(), { repo: name, issue: number, ref, via });
+  };
+  for (const row of rows || []) {
+    const name = String(row?.repo || repo || '').trim();
+    const number = numberOrNull(row?.number);
+    if (!name.includes('/') || !number) continue;
+    const updatedMs = Date.parse(String(row?.updatedAt ?? ''));
+    if (Number.isFinite(sinceMs) && Number.isFinite(updatedMs) && updatedMs < sinceMs) continue;
+    if (String(row?.kind) === 'pull') {
+      for (const ref of prIssueRefs({
+        repo: name,
+        number,
+        body: row.body,
+        title: row.title,
+        headRefName: row.headRef,
+      })) {
+        const at = ref.lastIndexOf('#');
+        if (at > 0) add(ref.slice(0, at), ref.slice(at + 1), 'discover-pr');
+      }
+    } else if (String(row?.kind) === 'issue') {
+      add(name, number, 'discover-issue');
+    }
+  }
+  return [...found.values()];
+}
+
+/**
+ * 窄写入函数：事件路径与发现路径都只从这里写。payload 形状固定为
+ * { repo, issue, ref, event, source, linkAllowed, now }，交给 syncOne 的 ctx 只有状态目录 { dir: stateDir }。
+ * syncOne 返回 result 时：ok === false 表示没写成功——抛错（reason 进错误信息），调用方因此不 ack、不推进水位；
+ * mode === 'disabled' 且 ok 为 true 表示停写开关生效、这一条没写：不抛，由调用方决定可以 ack。
+ */
+export function createWriteTarget({ syncOne, stateDir }) {
+  const ctx = { dir: stateDir };
+  return async function writeTarget(payload) {
+    const result = await syncOne(payload, ctx);
+    if (result && result.ok === false) {
+      const reason = summarize(result.reason || '没写成功，调用方没给原因');
+      throw new Error(`单条读写失败：${payload?.ref || '目标未知'}（${reason}）`);
+    }
+    return result || {};
+  };
+}
+
+/**
  * 事件处理与兜底轮询共用的一段逻辑：定位目标 → 过白名单与开关 → 抢锁 → 交给 syncOne 单条读写。
  * syncOne 是注入的依赖（缺省由 runEventRun 经 ../prio-item-loader.mjs 加载 bin/prio-item.mjs）。
  * 没有它就不写、也不假装写过。
+ * listRecent 是发现通道的读取依赖（形状见上方 DISCOVERY_QUERY 前面的注释）；不传就只补写 pending。
  * 抛错的三种情况都会让这条事件不确认：抢不到写锁、单条读写模块没部署、syncOne 自己报错。
  */
 export function createEventPipeline({
@@ -398,8 +536,19 @@ export function createEventPipeline({
   logger = () => {},
   now = () => Date.now(),
   exists = (file) => fs.existsSync(file),
+  listRecent = null,
+  discoveryLookbackMs = DISCOVERY_LOOKBACK_MS,
+  discoveryOverlapMs = DISCOVERY_OVERLAP_MS,
 } = {}) {
   if (!state || !paths) throw new EventRunConfigError('事件处理需要 state 和 paths');
+
+  // 事件路径和发现路径共用的窄写入函数；模块未部署时为空，调用方先判过再进来。
+  const writeTarget = typeof syncOne === 'function'
+    ? createWriteTarget({ syncOne, stateDir: paths.stateDir })
+    : null;
+
+  // 上次成功发现的时间：只存内存，进程重启后回到「回看 10 分钟」。
+  let lastDiscoveryMs = null;
 
   let lastQuietAt = -Infinity;
   function logQuiet(text) {
@@ -418,11 +567,13 @@ export function createEventPipeline({
     return state.watermarks.get(String(ref).toLowerCase()) ?? null;
   }
 
-  async function writeTarget(target, { event = null, createdMs = null, source = 'event' } = {}) {
+  /** 单条写入：抢锁 → 拼 payload → 走窄写入函数。返回 { written, mode }；written > 0 才算真写进看板。 */
+  async function writeOne(target, { event = null, createdMs = null, source = 'event' } = {}) {
+    if (!writeTarget) throw new Error('单条读写模块未部署');
     await lock();
     const linkAllowed = exists(paths.markerFile);
     if (!linkAllowed) logQuiet('没有 mac-mini-stopped 标记：「关联 PR」这类 link 字段交给 syncOne 扣住，这里不绕过');
-    await syncOne({
+    const result = await writeTarget({
       repo: target.repo,
       issue: target.issue,
       ref: target.ref,
@@ -431,34 +582,39 @@ export function createEventPipeline({
       linkAllowed,
       now: now(),
     });
+    // 停写开关在 syncOne 里生效（mode: 'disabled'）：没有写，也不推进事件水位，但这一条可以 ack。
+    if (result.mode === 'disabled') return { written: 0, mode: 'disabled' };
     if (Number.isFinite(createdMs)) state.watermarks.set(String(target.ref).toLowerCase(), createdMs);
+    const written = Number(result?.written);
+    return { written: Number.isFinite(written) && written > 0 ? written : 0, mode: result.mode };
   }
 
+  /** 处理一条事件。返回值 { written } 给延迟行用：只有真写进看板且回读成功才是 true。 */
   async function onEvent(event) {
     const type = String(event?.event || '');
     if (!EVENT_TYPES.includes(type)) {
       logOnce(`type:${type}`, `不处理「${type}」这类事件（只订阅 issues、issue_comment、pull_request、pull_request_review），这条只确认不写`);
-      return;
+      return { written: false };
     }
     const targets = eventTargets(event);
     if (!targets.length) {
       logOnce(`nowhere:${type}`, `有一条 ${type} 事件定位不到 owner/repo#number（正文可能被 Worker 省略），这条只确认不写`);
-      return;
+      return { written: false };
     }
     const allowed = targets.filter((target) => state.allowedRepos.has(String(target.repo).toLowerCase()));
     if (!allowed.length) {
       logOnce(`repo:${targets[0].repo.toLowerCase()}`, `事件所属的仓（${targets[0].repo}）不在授权清单里，这条只确认不写`);
-      return;
+      return { written: false };
     }
     if (exists(paths.prioDisabledFile)) {
       logQuiet('.prio/disabled 存在，自动写入已暂停：这条事件只确认不写');
-      return;
+      return { written: false };
     }
     if (!write) {
       for (const target of allowed) {
         logger(`dry-run：本应单条读写 ${target.ref}（${target.via}），没有写；要真写请加 --write`);
       }
-      return;
+      return { written: false };
     }
     if (typeof syncOne !== 'function') {
       // 不确认：留在 Worker 里，模块部署后自动接着处理。连续失败到上限后由 Worker 放弃并留痕。
@@ -466,6 +622,7 @@ export function createEventPipeline({
       throw new Error('单条读写模块未部署');
     }
     const createdMs = Date.parse(String(event?.created_at || ''));
+    let written = 0;
     for (const target of allowed) {
       const key = String(target.ref).toLowerCase();
       const mark = watermarkOf(target.ref);
@@ -477,38 +634,84 @@ export function createEventPipeline({
       }
       state.pending.set(key, target);
       try {
-        await writeTarget(target, { event, createdMs, source: 'event' });
+        written += (await writeOne(target, { event, createdMs, source: 'event' })).written;
         state.pending.delete(key);
       } catch (error) {
         // 留在 pending 里，等兜底轮询再补一次；同时把错误抛出去，让这条事件保持不确认。
         throw error;
       }
     }
+    return { written: written > 0 };
+  }
+
+  /** 上一次成功发现的时间 → 这一拍要回看的起点。没成功过就回看 10 分钟。 */
+  function discoverySinceMs() {
+    return lastDiscoveryMs == null ? now() - discoveryLookbackMs : lastDiscoveryMs - discoveryOverlapMs;
+  }
+
+  /** 对每个授权仓列一次最近更新的 PR/issue，变回待写目标。读取抛错就交给 poll 记日志。 */
+  async function discover() {
+    const repos = [...state.allowedRepos];
+    if (!repos.length) {
+      logQuiet('Worker 连续失败，兜底发现这一拍没有授权仓，跳过');
+      return [];
+    }
+    const sinceMs = discoverySinceMs();
+    const targets = [];
+    for (const repo of repos) {
+      const rows = await listRecent({ repo, sinceMs });
+      targets.push(...discoveryTargets({ repo, rows, sinceMs }));
+    }
+    lastDiscoveryMs = now();
+    return targets;
   }
 
   /**
-   * 兜底轮询：Worker 连续失败时才被调用。只补写事件路径没写成功的目标（每条一次单条读写），
-   * 不整盘读看板，也不返回事件（返回空数组）。
+   * 兜底轮询：Worker 连续失败时才被调用。两路来源合并去重：事件路径没写成功的目标 + 这一拍发现到的目标，
+   * 同一目标一拍只写一次，都走 writeTarget。不整盘读看板，也不返回事件（返回空数组）。
+   * 停写开关（.prio/disabled）存在时发现照跑、一个都不写，日志写明；dry-run 同样不写。
+   * 发现通道报错（包括缺省「未配置」）先把待补目标写掉，再把错误抛出去：错误由调用方记日志，循环不退出。
    */
   async function poll() {
-    const pending = [...state.pending.values()];
-    if (!pending.length) {
-      logQuiet('Worker 连续失败，兜底轮询这一拍没有待补的单条目标（看板收敛交给现有的定时任务）');
-      return [];
+    const queue = new Map();
+    for (const target of state.pending.values()) {
+      queue.set(String(target.ref).toLowerCase(), target);
     }
-    if (typeof syncOne !== 'function') {
-      logQuiet('单条读写模块未部署，兜底轮询这一拍补不了：等模块部署后再说');
-      return [];
-    }
-    for (const target of pending) {
+    let discoveryError = null;
+    if (typeof listRecent === 'function') {
       try {
-        await writeTarget(target, { source: 'poll' });
-        state.pending.delete(String(target.ref).toLowerCase());
-        logger(`兜底轮询补写 ${target.ref} 完成`);
+        const found = await discover();
+        for (const target of found) {
+          const key = String(target.ref).toLowerCase();
+          if (!queue.has(key)) queue.set(key, target);
+        }
+        if (found.length) logger(`兜底发现到 ${found.length} 个目标：${found.map((target) => target.ref).join('、')}`);
       } catch (error) {
-        logger(`兜底轮询补写 ${target.ref} 失败：${summarize(error)}`);
+        discoveryError = error;
+        logQuiet(`兜底发现这一拍失败：${summarize(error)}`);
       }
     }
+    const targets = [...queue.values()];
+    if (!targets.length) {
+      if (!discoveryError) logQuiet('Worker 连续失败，兜底轮询这一拍没有待补的单条目标（看板收敛交给现有的定时任务）');
+    } else if (exists(paths.prioDisabledFile)) {
+      logQuiet(`.prio/disabled 存在，自动写入已暂停：兜底这一拍发现到 ${targets.length} 个目标，只发现不写`);
+    } else if (!write) {
+      logQuiet(`dry-run：兜底这一拍发现到 ${targets.length} 个目标，没有写；要真写请加 --write`);
+    } else if (typeof syncOne !== 'function') {
+      logQuiet('单条读写模块未部署，兜底轮询这一拍补不了：等模块部署后再说');
+    } else {
+      for (const target of targets) {
+        try {
+          await writeOne(target, { source: 'poll' });
+          state.pending.delete(String(target.ref).toLowerCase());
+          logger(`兜底轮询补写 ${target.ref} 完成`);
+        } catch (error) {
+          logger(`兜底轮询补写 ${target.ref} 失败：${summarize(error)}`);
+        }
+      }
+    }
+    if (discoveryError) throw discoveryError;
     return [];
   }
 
@@ -545,12 +748,18 @@ export async function runEventRun({
   lock = acquireWriteLock,
   exists = (file) => fs.existsSync(file),
   state = null,
+  // 发现通道：缺省用只读 GraphQL（每仓 1 次调用）；profile / reader 可注入，测试里不碰真网络。
+  listRecent = null,
+  profile = null,
+  reader = null,
 } = {}) {
   if (!config?.paths) throw new EventRunConfigError('事件拉取器缺少路径配置');
   const paths = config.paths;
   const log = logger || makeEventRunLogger(paths.logFile, { now });
   const shared = state || createEventRunState({ allowedRepos: readAllowedRepos(paths.authorizedReposFile, log) });
   const syncOneImpl = syncOne !== undefined ? syncOne : await loadModule();
+  // 懒创建在 createGraphqlListRecent 里：这里只把构造参数传进去，不读 profile、不建通道。
+  const discoverRecent = listRecent || createGraphqlListRecent({ reader, profile });
   if (write && typeof syncOneImpl !== 'function') {
     log('单条读写模块未部署：事件只会被确认前先失败，不会写任何东西；等模块部署后再开 --write');
   }
@@ -578,6 +787,7 @@ export async function runEventRun({
     logger: log,
     now,
     exists,
+    listRecent: discoverRecent,
   });
 
   const poll = async () => {
@@ -689,6 +899,9 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       lock: deps.lock || acquireWriteLock,
       syncOne: deps.syncOne,
       loadModule: deps.loadModule || loadSingleItemModule,
+      listRecent: deps.listRecent || null,
+      profile: deps.profile || null,
+      reader: deps.reader || null,
       channel: deps.channel || runEventChannel,
       fetchImpl: deps.fetchImpl || fetch,
       sleep: deps.sleep,

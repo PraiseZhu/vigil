@@ -4,6 +4,12 @@
 // changes.jsonl / debounce.json / reminded.jsonl / run-YYYY-MM-DD.log 的形状
 // 与 prio-sync.mjs 的 appendChange、saveDebounce、remindOnce、main 运行头一致。
 // latency.jsonl 的形状与 event-pull.mjs 追加的行一致；没有样本时 p50/p95 显示「无数据」。
+// 行上有 written 字段时只收 written === true 的（真写入并回读成功）；老行没有这个字段，仍按原口径收。
+// 延迟按指标分两组各算，不混在一起：
+//   事件→写完 用 latencyMs（事件发生到写完，老行也有）；gateway 用 gatewayMs（Worker 收到到写完）。
+// 没有 gatewayMs 的行只进第一组，不会把 GitHub 那段算进本机延迟。两组的样本数各自记 n。
+// gatewayMs 只收 0 ≤ 值 ≤ GATEWAY_MAX_MS 的样本：负值和超过 10 分钟的值不进 gateway 组；
+// latencyMs 那列不看这个范围，行为不变。
 // 已关闭、已排除的 item 本函数不判断，由调用方过滤。
 // 运行日志跨 UTC 日时，调用方要把前一天的日志拼在前面。
 //
@@ -16,7 +22,7 @@
 // 冻结只数 CHANGE_WINDOW_MS（1 小时）内、且不晚于 nowMs 的 changes。
 // prio-sync 有几处会把没过滤的旧数组原样存回去，所以这里不能直接看数组长度。
 
-import { CHANGE_WINDOW_MS, MAX_CHANGES_PER_HOUR } from './prio-score.mjs';
+import { CHANGE_WINDOW_MS, GATEWAY_MAX_MS, MAX_CHANGES_PER_HOUR } from './prio-score.mjs';
 
 /** 停更阈值默认值：10 分钟。调用方可传 staleAfterMs 覆盖。 */
 export const DEFAULT_STALE_MS = 10 * 60 * 1000;
@@ -154,11 +160,16 @@ function freezeText(changes, nowMs, timeZone) {
   return `冻结（1 小时内 ${recent.length} 次，约 ${formatPrioClock(oldestStillNeeded + CHANGE_WINDOW_MS, timeZone)} 解冻）`;
 }
 
-function percentiles(rows) {
+/** 只取这一行的这个指标。缺失、不是数字、NaN / Infinity 都不进样本。传 maxValue 时只收 0 ≤ 值 ≤ maxValue。 */
+function percentiles(rows, key, maxValue = null) {
   const values = [];
   for (const row of rows) {
-    const value = row?.latencyMs;
-    if (typeof value === 'number' && Number.isFinite(value)) values.push(value);
+    // written 只在真写入并回读成功时为 true；dry-run、无变化、写锁忙的是 false，不进样本。
+    if ('written' in (row || {}) && row.written !== true) continue;
+    const value = row?.[key];
+    if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+    if (maxValue != null && (value < 0 || value > maxValue)) continue;
+    values.push(value);
   }
   values.sort((left, right) => left - right);
   if (!values.length) return { p50: null, p95: null, n: 0 };
@@ -166,10 +177,15 @@ function percentiles(rows) {
   return { p50: at(0.5), p95: at(0.95), n: values.length };
 }
 
-function latencyLine(stats) {
+function groupText(stats) {
   const p50 = stats.p50 == null ? '无数据' : String(stats.p50);
   const p95 = stats.p95 == null ? '无数据' : String(stats.p95);
-  return `关联 PR 延迟 p50 ${p50} p95 ${p95}`;
+  return `p50 ${p50} p95 ${p95} (n=${stats.n})`;
+}
+
+/** 两组各写各的：事件→写完（latencyMs）在前，gateway（gatewayMs）在后。 */
+function latencyLine(latencyStats, gatewayStats) {
+  return `关联 PR 延迟 事件→写完 ${groupText(latencyStats)}｜gateway ${groupText(gatewayStats)}`;
 }
 
 function basisText(basis) {
@@ -221,6 +237,7 @@ function compareItems(left, right) {
  * @param {string} [input.reminded] reminded.jsonl 全文
  * @param {string} [input.runLog] 运行日志全文。跨 UTC 日时把前一天拼在前面，取最后一个运行头。
  * @param {string} [input.latency] latency.jsonl 全文。缺省或没有样本时 p50/p95 为「无数据」。
+ *   返回的 `latency` 是 latencyMs（事件→写完）那一组，`gatewayLatency` 是 gatewayMs 那一组，各自带 n。
  * @param {number} input.nowMs 当前时间（毫秒）。调用方传入，本函数不调用 Date.now。
  * @param {number} [input.staleAfterMs] 停更阈值。默认 10 分钟。距离恰好等于阈值不算停更。
  * @param {string} [input.timeZone] IANA 时区。传入后解冻时刻和停更行里的运行头按该时区显示。
@@ -294,7 +311,8 @@ export function viewPrio({
 
   const latencyLog = parseJsonl(latency);
   if (latencyLog.bad) notices.push(`延迟日志有 ${latencyLog.bad} 行坏数据`);
-  const latencyStats = percentiles(latencyLog.rows);
+  const latencyStats = percentiles(latencyLog.rows, 'latencyMs');
+  const gatewayStats = percentiles(latencyLog.rows, 'gatewayMs', GATEWAY_MAX_MS);
 
   const run = lastRunOf(runLog);
   const lastRunAt = run ? run.at : null;
@@ -329,7 +347,7 @@ export function viewPrio({
     else lines.push(`停更红条：最近运行头 ${lastRunAt}`);
   }
   for (const row of rows) lines.push(rowLine(row, lastRunMode));
-  lines.push(latencyLine(latencyStats));
+  lines.push(latencyLine(latencyStats, gatewayStats));
   for (const notice of notices) lines.push(notice);
 
   return {
@@ -340,6 +358,7 @@ export function viewPrio({
     stale,
     staleAfterMs: limit,
     latency: latencyStats,
+    gatewayLatency: gatewayStats,
     notices: notices.map((notice) => redact(notice)),
   };
 }

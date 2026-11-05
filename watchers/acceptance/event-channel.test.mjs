@@ -1,5 +1,5 @@
 // W4 事件通道：Worker 校验 webhook 签名并入队，本机拉取循环每 2 秒拉一次；
-// 60 秒轮询只在 Worker 连续失败到门槛（缺省 3 次）之后才兜底。
+// 60 秒轮询只在 Worker 连续失败到门槛（缺省 1 次：一次失败就兜底）之后才跑。
 // 延迟写到 .prio/latency.jsonl。W4-c 的常驻拉取器（bin/event-run.mjs）也在这份测试里。
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -7,10 +7,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { createEventWorker } from './bin/event-worker.mjs';
+import {
+  ACK_BODY_LIMIT,
+  FAIL_BODY_LIMIT,
+  WEBHOOK_BODY_LIMIT,
+  createEventWorker,
+} from './bin/event-worker.mjs';
 import {
   PULL_INTERVAL_MS,
   POLL_INTERVAL_MS,
+  appendLatencyRow,
+  defaultLatencyFile,
   latencyPercentiles,
   pullFromWorker,
   readLatencyLog,
@@ -18,6 +25,7 @@ import {
 } from './bin/event-pull.mjs';
 import {
   DEFAULT_POLL_AFTER_FAILURES,
+  DISCOVERY_QUERY,
   LOCK_RETRY_MS,
   LOCK_WAIT_MAX_MS,
   SINGLE_ITEM_MODULE,
@@ -26,6 +34,7 @@ import {
   appendEventRunLog,
   createEventPipeline,
   createEventRunState,
+  createGraphqlListRecent,
   eventRunPaths,
   eventTargets,
   loadSingleItemModule,
@@ -35,6 +44,10 @@ import {
   runEventRun,
   writeLockHeld,
 } from './bin/event-run.mjs';
+import { isReadOnlyGraphql } from './bin/github.mjs';
+import { renderPrioBoardSection } from './bin/prio-board-section.mjs';
+import { viewPrio } from './bin/prio-view.mjs';
+import { defaultStateDir, stateFiles } from './bin/prio-sync.mjs';
 import { tmpDir } from './fake-gh.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -77,6 +90,17 @@ function ackRequest(ids, token = TOKEN) {
       'content-type': 'application/json',
     },
     body: JSON.stringify({ ids }),
+  });
+}
+
+function failRequest(id, { token = TOKEN, error = 'boom-w4a' } = {}) {
+  return new Request('https://example.invalid/fail', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ id, error }),
   });
 }
 
@@ -1658,8 +1682,8 @@ test('W4c SC5 .prio/disabled 存在时只确认不写', async () => {
   assert.ok(logs.some((line) => /disabled/.test(line)));
 });
 
-test('W4c SC6 兜底轮询只在 Worker 连续失败到门槛后才跑（缺省 3 次），正常时一次都不跑', async () => {
-  assert.equal(DEFAULT_POLL_AFTER_FAILURES, 3);
+test('W4c SC6 兜底轮询只在 Worker 连续失败到门槛后才跑（缺省 1 次：一次失败就兜底），正常时一次都不跑', async () => {
+  assert.equal(DEFAULT_POLL_AFTER_FAILURES, 1);
   const runFake = async ({ fail = false, pollAfterFailures = undefined, until }) => {
     let t = 0;
     const pollCalls = [];
@@ -1683,8 +1707,9 @@ test('W4c SC6 兜底轮询只在 Worker 连续失败到门槛后才跑（缺省 
     return pollCalls;
   };
   assert.deepEqual(await runFake({ until: 200000 }), [], 'Worker 正常：兜底轮询一次都不跑');
-  // 失败只发生在 60 秒节点上：t=4000 第 1 次、t=60000 第 2 次、t=120000 第 3 次，t=180000 那一拍才允许轮询。
-  assert.deepEqual(await runFake({ fail: true, until: 190000 }), [180000]);
+  // 缺省门槛 1 次：t=0 第一次失败，t=60000 那一拍就允许轮询（之后每 60 秒一次）。
+  assert.deepEqual(await runFake({ fail: true, until: 190000 }), [60000, 120000, 180000]);
+  assert.deepEqual(await runFake({ fail: true, until: 70000 }), [60000], '一次失败就够，不用攒到第 3 次');
   assert.deepEqual(await runFake({ fail: true, until: 70000, pollAfterFailures: 1 }), [60000]);
   assert.deepEqual(await runFake({ until: 130000, pollAfterFailures: 0 }), [0, 60000, 120000], '0 = 退回每拍都跑的旧行为');
 });
@@ -1715,6 +1740,289 @@ test('W4c SC6 兜底轮询只补写事件路径没写成功的那一条，不整
   assert.deepEqual(written, ['example/owner-a#7'], '补完之后没有待补目标');
 });
 
+test('W4c SC6 兜底发现：Worker 失败期间发现授权仓最近更新的 PR/issue，PR 反查任务 issue、反查不到跳过，同一目标一拍只写一次', async () => {
+  const fixture = eventRunFixture();
+  const nowMs = Date.parse('2026-11-01T12:00:00.000Z');
+  const calls = [];
+  const written = [];
+  const state = createEventRunState({ allowedRepos: ['example/owner-a', 'example/owner-b'] });
+  // 事件路径已经留下一半：#7 也在发现结果里，这一拍只能写一次。
+  state.pending.set('example/owner-a#7', { repo: 'example/owner-a', issue: 7, ref: 'example/owner-a#7', via: 'event' });
+  const pipeline = createEventPipeline({
+    state,
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async (target) => {
+      written.push(target.ref);
+      return { written: 1 };
+    },
+    lock: async () => {},
+    logger: () => {},
+    listRecent: async ({ repo, sinceMs }) => {
+      calls.push({ repo, sinceMs });
+      if (repo === 'example/owner-a') {
+        return [
+          { repo, number: 7, kind: 'issue', updatedAt: '2026-11-01T11:59:30.000Z' },
+          { repo, number: 9, kind: 'pull', updatedAt: '2026-11-01T11:59:40.000Z', body: '任务 issue：example/owner-a#11' },
+          { repo, number: 12, kind: 'pull', updatedAt: '2026-11-01T11:59:50.000Z', body: '没有任务 issue 行', headRef: 'feature/y' },
+          { repo, number: 13, kind: 'issue', updatedAt: '2026-11-01T10:00:00.000Z' },
+        ];
+      }
+      return [{ repo, number: 5, kind: 'issue', updatedAt: '2026-11-01T11:59:59.000Z' }];
+    },
+  });
+  assert.deepEqual(await pipeline.poll(), []);
+  assert.deepEqual(
+    calls.map((call) => call.repo),
+    ['example/owner-a', 'example/owner-b'],
+    '每个授权仓每拍发现一次（每仓两种列表 → 每分钟 ≤ 授权仓数 × 2 次 REST）',
+  );
+  assert.ok(calls.every((call) => call.sinceMs === nowMs - 10 * 60 * 1000), '进程刚起来：回看 10 分钟');
+  assert.deepEqual(
+    written,
+    ['example/owner-a#7', 'example/owner-a#11', 'example/owner-b#5'],
+    '#7 只写一次；PR#9 反查到任务 issue#11；反查不到的 PR#12 与早于 since 的 #13 跳过',
+  );
+});
+
+test('W4c SC6 兜底发现的时间水位：首次回看 10 分钟，之后按上次成功发现减 2 分钟', async () => {
+  const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  let nowMs = t0;
+  const calls = [];
+  const pipeline = createEventPipeline({
+    state: createEventRunState({ allowedRepos: ['example/owner-a'] }),
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async () => ({ written: 0 }),
+    lock: async () => {},
+    logger: () => {},
+    listRecent: async ({ repo, sinceMs }) => {
+      calls.push([repo, sinceMs]);
+      return [];
+    },
+  });
+  await pipeline.poll();
+  nowMs = t0 + 60000;
+  await pipeline.poll();
+  assert.deepEqual(calls, [
+    ['example/owner-a', t0 - 600000],
+    ['example/owner-a', t0 - 120000],
+  ]);
+});
+
+test('W4c SC6 .prio/disabled 存在时发现路径只发现不写，日志写明', async () => {
+  const fixture = eventRunFixture();
+  fs.writeFileSync(fixture.paths.prioDisabledFile, '');
+  const logs = [];
+  let writes = 0;
+  let discovered = 0;
+  const pipeline = createEventPipeline({
+    state: createEventRunState({ allowedRepos: ['example/owner-a'] }),
+    paths: fixture.paths,
+    write: true,
+    now: () => Date.parse('2026-11-01T12:00:00.000Z'),
+    syncOne: async () => {
+      writes += 1;
+      return { written: 1 };
+    },
+    lock: async () => {},
+    logger: (line) => logs.push(line),
+    listRecent: async ({ repo }) => {
+      discovered += 1;
+      return [{ repo, number: 7, kind: 'issue', updatedAt: '2026-11-01T11:59:30.000Z' }];
+    },
+  });
+  assert.deepEqual(await pipeline.poll(), []);
+  assert.equal(discovered, 1, '停写开关只管写，发现照跑');
+  assert.equal(writes, 0, '停写开关存在时发现路径一个都不写');
+  assert.ok(logs.some((line) => /disabled/.test(line) && /不写/.test(line)));
+});
+
+test('W4c SC6 缺省发现通道用只读 GraphQL：每仓 1 次调用、PR 带出 body/headRefName、只回 updatedAt ≥ since 的行', async () => {
+  assert.equal(isReadOnlyGraphql(DISCOVERY_QUERY), true, 'query 必须被只读通道认成单个只读 query');
+  const calls = [];
+  // 假 reader：按仓名返回两个仓的结果，记下每次调用的 query 与变量。
+  const reader = {
+    async ownerGraphql(query, variables) {
+      calls.push({ query, variables });
+      const recent = variables.name === 'owner-a';
+      return {
+        repository: {
+          pullRequests: { nodes: [
+            {
+              __typename: 'PullRequest',
+              number: 9,
+              updatedAt: recent ? '2026-11-01T11:59:40Z' : '2026-11-01T11:30:00Z',
+              headRefName: 'acceptance/7-9-sc1',
+              body: '任务 issue：example/owner-a#11',
+            },
+          ] },
+          issues: { nodes: [
+            { __typename: 'Issue', number: 7, updatedAt: recent ? '2026-11-01T11:30:00Z' : '2026-11-01T09:00:00Z' },
+            // issues 连接会同时返回 PR：不能当成 issue 号再写一遍。
+            { __typename: 'PullRequest', number: 9, updatedAt: '2026-11-01T11:59:40Z' },
+          ] },
+        },
+      };
+    },
+  };
+  const listRecent = createGraphqlListRecent({ reader });
+  const sinceMs = Date.parse('2026-11-01T11:00:00Z');
+  const a = await listRecent({ repo: 'example/owner-a', sinceMs });
+  const b = await listRecent({ repo: 'example/owner-b', sinceMs });
+
+  assert.equal(calls.length, 2, '每仓只调 1 次');
+  assert.deepEqual(calls.map((call) => call.variables), [
+    { owner: 'example', name: 'owner-a' },
+    { owner: 'example', name: 'owner-b' },
+  ]);
+  assert.ok(calls.every((call) => call.query === DISCOVERY_QUERY));
+  assert.ok(calls.every((call) => isReadOnlyGraphql(call.query) === true));
+
+  assert.deepEqual(a.map((row) => `${row.kind}:${row.number}`), ['pull:9', 'issue:7'], 'PR 不会从 issues 再写一遍');
+  assert.deepEqual(b.map((row) => `${row.kind}:${row.number}`), ['pull:9'], 'updatedAt 早于 since 的整行丢掉');
+  assert.equal(a[0].body, '任务 issue：example/owner-a#11');
+  assert.equal(a[0].headRef, 'acceptance/7-9-sc1');
+});
+
+test('W4c SC6 缺省发现通道懒创建：第一次 poll 才读 profile 并建 reader，之后复用', async () => {
+  let loaded = 0;
+  let built = 0;
+  const listRecent = createGraphqlListRecent({
+    loadProfile: () => {
+      loaded += 1;
+      return { marker: '占位 profile' };
+    },
+    createReader: ({ profile }) => {
+      built += 1;
+      assert.equal(profile.marker, '占位 profile');
+      return { ownerGraphql: async () => ({ repository: { pullRequests: { nodes: [] }, issues: { nodes: [] } } }) };
+    },
+  });
+  assert.equal(loaded, 0, '创建时不读 profile');
+  assert.equal(built, 0, '创建时不建 reader');
+  await listRecent({ repo: 'example/owner-a', sinceMs: 0 });
+  await listRecent({ repo: 'example/owner-a', sinceMs: 0 });
+  assert.equal(loaded, 1);
+  assert.equal(built, 1, 'reader 只建一次');
+});
+
+test('W4c SC6 runEventRun 把发现的 reader 接进 poll：授权仓每仓一次读取，目标走同一条写入', async () => {
+  const fixture = eventRunFixture();
+  const calls = [];
+  const written = [];
+  await runEventRun({
+    config: { ...configOf(fixture), write: true },
+    write: true,
+    syncOne: async (payload) => {
+      written.push(payload.ref);
+      return { ok: true, written: 1 };
+    },
+    lock: async () => {},
+    logger: () => {},
+    reader: {
+      async ownerGraphql(query, variables) {
+        calls.push(variables.name);
+        return {
+          repository: {
+            pullRequests: { nodes: [] },
+            issues: { nodes: [
+              { __typename: 'Issue', number: variables.name === 'owner-a' ? 7 : 8, updatedAt: new Date().toISOString() },
+            ] },
+          },
+        };
+      },
+    },
+    channel: async (deps) => {
+      await deps.poll();
+    },
+  });
+  assert.deepEqual(calls, ['owner-a', 'owner-b'], '每个授权仓读一次');
+  assert.deepEqual(written.sort(), ['example/owner-a#7', 'example/owner-b#8']);
+});
+
+test('W4c SC6 延迟行带 written 标记：真写入为 true，无变化/dry-run/非授权仓为 false，老行不写这个键', async () => {
+  // 真写入与无变化：syncOne 自己报 written。
+  const writtenFixture = eventRunFixture();
+  const worker = fakePullWorker({ batches: [[issueEvent('w1', { issue: 7 }), issueEvent('w2', { issue: 8 })]] });
+  await runOneTick({
+    config: { ...configOf(writtenFixture), write: true },
+    fetchImpl: worker.fetchImpl,
+    syncOne: async (target) => ({ written: target.issue === 7 ? 1 : 0 }),
+    lock: async () => {},
+  });
+  const rows = readLatencyLog(writtenFixture.paths.latencyFile);
+  assert.equal(rows.find((row) => row.deliveryId === 'w1')?.written, true, '写到看板并读回成功 = true');
+  assert.equal(rows.find((row) => row.deliveryId === 'w2')?.written, false, '无变化（written 0）= false');
+
+  // dry-run 与非授权仓：都不写，标记为 false。
+  const dryFixture = eventRunFixture();
+  const dryWorker = fakePullWorker({
+    batches: [[issueEvent('d1', { issue: 7 }), issueEvent('x1', { repo: 'example/owner-z', issue: 9 })]],
+  });
+  await runOneTick({
+    config: configOf(dryFixture),
+    fetchImpl: dryWorker.fetchImpl,
+    syncOne: async () => ({ written: 1 }),
+    lock: async () => {},
+  });
+  const dryRows = readLatencyLog(dryFixture.paths.latencyFile);
+  assert.equal(dryRows.find((row) => row.deliveryId === 'd1')?.written, false, 'dry-run = false');
+  assert.equal(dryRows.find((row) => row.deliveryId === 'x1')?.written, false, '非授权仓 = false');
+
+  // onEvent 不返回结果（老调用方）：行里不写 written 键，看板按原口径收。
+  const bareFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  let t = 0;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 1,
+    pull: async () => [{ deliveryId: 'legacy', created_at: '2026-10-31T00:00:00.000Z' }],
+    poll: async () => [],
+    onEvent: async () => {},
+    latencyFile: bareFile,
+  });
+  assert.equal('written' in readLatencyLog(bareFile)[0], false);
+});
+
+test('W4c SC6 窄写入函数：payload 形状固定、ctx 只有状态目录；ok:false 抛错带 reason 且不设水位，mode=disabled 不设水位但可 ack', async () => {
+  const fixture = eventRunFixture();
+  const state = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  const calls = [];
+  const pipeline = createEventPipeline({
+    state,
+    paths: fixture.paths,
+    write: true,
+    syncOne: async (payload, ctx) => {
+      calls.push({ payload, ctx });
+      if (payload.issue === 7) return { ok: false, reason: '看板字段不接受这个值' };
+      if (payload.issue === 8) return { ok: true, mode: 'disabled', written: 0 };
+      return { ok: true, written: 1 };
+    },
+    lock: async () => {},
+    logger: () => {},
+  });
+  await assert.rejects(() => pipeline.onEvent(issueEvent('f1', { issue: 7 })), /看板字段不接受这个值/);
+  assert.equal(state.watermarks.has('example/owner-a#7'), false, 'ok:false 不推进水位');
+  assert.deepEqual(
+    Object.keys(calls[0].payload).sort(),
+    ['event', 'issue', 'linkAllowed', 'now', 'ref', 'repo', 'source'],
+    'payload 形状固定',
+  );
+  assert.deepEqual(calls[0].ctx, { dir: fixture.paths.stateDir }, 'ctx 只带状态目录');
+
+  // mode=disabled 且 ok：停写开关生效，这条不写、不设水位，但不抛错，所以可以 ack。
+  assert.deepEqual(await pipeline.onEvent(issueEvent('d1', { issue: 8 })), { written: false });
+  assert.equal(state.watermarks.has('example/owner-a#8'), false);
+  assert.deepEqual(await pipeline.onEvent(issueEvent('w1', { issue: 9 })), { written: true });
+  assert.equal(state.watermarks.has('example/owner-a#9'), true);
+});
+
 test('W4c SC7 日志超过上限截断保留尾部，权限仍是 600', () => {
   const fixture = eventRunFixture();
   const file = path.join(fixture.home, 'state', 'host', 'event-run.log');
@@ -1730,9 +2038,25 @@ test('W4c SC7 日志超过上限截断保留尾部，权限仍是 600', () => {
   assert.doesNotMatch(text, /第 0 行/);
 });
 
-test('W4c SC7 单条读写模块未部署：不确认事件、日志写人话', async () => {
+test('W4c SC7 单条读写模块未部署：不确认事件、日志写人话（注入「未部署」，不看真实文件在不在）', async () => {
   assert.equal(SINGLE_ITEM_MODULE, './bin/prio-item.mjs');
-  assert.equal(await loadSingleItemModule(), null, '本仓还没有单条读写模块，缺省加载应返回 null 而不是抛错');
+  // 模块在不在由注入的 importer 决定，测试不依赖 bin/prio-item.mjs 是否已经部署（#319 合并后也不会变红）。
+  const missing = Object.assign(new Error('Cannot find module'), { code: 'ERR_MODULE_NOT_FOUND' });
+  assert.equal(
+    await loadSingleItemModule({ importer: async () => { throw missing; } }),
+    null,
+    '模块不在：加载器返回 null，不抛错',
+  );
+  assert.equal(
+    await loadSingleItemModule({ importer: async () => ({}) }),
+    null,
+    '模块在但没导出 syncOneItem：同样算未部署',
+  );
+  await assert.rejects(
+    () => loadSingleItemModule({ importer: async () => { throw new Error('读模块时磁盘出错'); } }),
+    /磁盘出错/,
+    '其它加载错误照原样抛出去',
+  );
   const fixture = eventRunFixture();
   const worker = fakePullWorker({ batches: [[issueEvent('m1', { issue: 7 })]] });
   const logs = await runOneTick({
@@ -1745,6 +2069,10 @@ test('W4c SC7 单条读写模块未部署：不确认事件、日志写人话', 
   assert.equal(worker.calls.fail.length, 1);
   assert.ok(logs.some((line) => /单条读写模块未部署/.test(line)));
 });
+
+// 预留：等 #319 合入真 syncEventItem 之后，在这里加一条「真 syncEventItem + 假 GitHub」的端到端实例：
+// 一条 issue 事件 → syncEventItem 单条读写 → 假 GitHub 只回该条 → 断言写入字段与读回结果。
+// 现在不写：仓库里还没有 syncEventItem，写了只能假设实现形状。
 
 test('W4c SC8 默认 dry-run 不写；--write 与 --dry-run 不能同时给', async () => {
   assert.equal(parseEventRunArgs([]).write, false);
@@ -1776,6 +2104,11 @@ test('W4c SC9 拉起脚本草稿：flock -n + pgrep -fx + setsid nohup，不装 
   assert.doesNotMatch(src, /\/home\/[A-Za-z0-9._-]+/, '不写死本机绝对路径');
   assert.doesNotMatch(src, /\/Users\/[A-Za-z0-9._-]+/);
   assert.match(src, /\$\{HOME/);
+  // 状态目录显式传给拉取器；pgrep -fx 的精确匹配必须跟着包含这个参数，RUN_ARGS 为空时也一样稳。
+  assert.match(src, /--state-dir "\$STATE_DIR"/);
+  assert.match(src, /CMD_ARGS="\$STATE_ARGS\$\{RUN_ARGS:\+ \$RUN_ARGS\}"/);
+  assert.match(src, /pgrep -fx "\$NODE_BIN \$SCRIPT \$CMD_ARGS"/);
+  assert.match(src, /"\$NODE_BIN" "\$SCRIPT" \$CMD_ARGS/);
 });
 
 test('W4c SC8 --once 走 CLI 入口跑一拍：读 600 配置、处理一条事件、写完日志退出', async () => {
@@ -1805,4 +2138,894 @@ test('W4c SC8 事件路径不整盘读看板：event-run 只借用授权清单�
   const src = fs.readFileSync(path.join(HERE, 'bin', 'event-run.mjs'), 'utf8');
   assert.match(src, /readAuthorizedRepos/);
   assert.doesNotMatch(src, /loadBoardItems|loadPullRequests|runPrioSync|BOARD_ITEMS_QUERY|PR_SEARCH_QUERY/);
+});
+
+// W4-a：部署入口（worker/index.mjs）、SQLite 版 DO 不给 txn 的适配、事件乱序到达。
+// 只模拟 Durable Object 的接口，没有连真实 Cloudflare 账号；真实 DO 上的冒烟未做（见 worker/README.md）。
+
+// SQLite 版 DO 的 transaction 回调按文档已不给 txn（该对象废弃），这里模拟只调一次、不传参数。
+function noTxnStorage() {
+  const map = new Map();
+  const stats = { transactions: 0 };
+  const storage = {
+    async get(key) {
+      if (!map.has(key)) return undefined;
+      return structuredClone(map.get(key));
+    },
+    async put(key, value) {
+      map.set(key, structuredClone(value));
+    },
+    async delete(key) {
+      map.delete(key);
+    },
+    async list({ prefix = '' } = {}) {
+      const out = new Map();
+      for (const [key, value] of map) {
+        if (String(key).startsWith(prefix)) out.set(key, structuredClone(value));
+      }
+      return out;
+    },
+    async transaction(fn) {
+      stats.transactions += 1;
+      return fn();
+    },
+  };
+  return { storage, stats };
+}
+
+// Durable Object 命名空间的最小替身：记下 idFromName / get 的入参，返回给定的实例。
+function fakeChannelBinding(durable) {
+  const calls = [];
+  const namespace = {
+    calls,
+    idFromName(name) {
+      calls.push(`id:${name}`);
+      return { name };
+    },
+    get(id) {
+      calls.push(`get:${id.name}`);
+      return durable;
+    },
+  };
+  return namespace;
+}
+
+test('W4-a SC2 事务适配：回调不给 txn 时用 storage 本身，给了 txn 就用 txn', async () => {
+  const { runInTransaction } = await import('./bin/event-worker.mjs');
+  const { storage, stats } = noTxnStorage();
+  let seen = null;
+  await runInTransaction(storage, async (db) => {
+    seen = db;
+  });
+  assert.equal(stats.transactions, 1);
+  assert.equal(seen, storage);
+
+  const txn = { marker: 'txn' };
+  const withTxn = {
+    ...storage,
+    async transaction(fn) {
+      return fn(txn);
+    },
+  };
+  let used = null;
+  await runInTransaction(withTxn, async (db) => {
+    used = db;
+  });
+  assert.equal(used, txn);
+});
+
+test('W4-a SC2 不传 txn 的存储上 /webhook 入队、重复 delivery 只入队一次、/fail 记失败、/ack 清队列', async () => {
+  const { storage, stats } = noTxnStorage();
+  const worker = createEventWorker({ storage, now: () => 1_700_000_000_000 });
+  const env = workerEnv();
+
+  await enqueueDelivery(worker, env, 'solo-txn');
+  await enqueueDelivery(worker, env, 'solo-txn');
+  assert.deepEqual(await pullIds(worker, env), ['solo-txn']);
+
+  const failed = await worker.fetch(failRequest('solo-txn'), env);
+  assert.equal(failed.status, 200);
+  const failBody = await failed.json();
+  assert.equal(failBody.failures, 1);
+  assert.equal(failBody.abandoned, false);
+
+  const acked = await worker.fetch(ackRequest(['solo-txn']), env);
+  assert.equal(acked.status, 204);
+  assert.deepEqual(await pullIds(worker, env), []);
+
+  assert.ok(stats.transactions >= 4, `四条路由都要走事务，实际 ${stats.transactions}`);
+});
+
+test('W4-a SC1 Worker 入口把四条路由都转发到 idFromName(main) 的同一个 DO 实例', async () => {
+  const entry = (await import('./worker/index.mjs')).default;
+  const { EventChannelDurableObject } = await import('./bin/event-worker.mjs');
+  const env = workerEnv();
+  const durable = new EventChannelDurableObject(
+    { storage: sharedStorage(), now: () => 1_700_000_000_000 },
+    env,
+  );
+  const namespace = fakeChannelBinding(durable);
+  const bound = { ...env, EVENT_CHANNEL: namespace };
+
+  const posted = await entry.fetch(webhookRequest(smallPayload(), { delivery: 'entry-1' }), bound);
+  assert.equal(posted.status, 204);
+
+  const pulled = await entry.fetch(pullRequest(TOKEN), bound);
+  const queued = await pulled.json();
+  assert.deepEqual(queued.events.map((event) => event.deliveryId), ['entry-1']);
+
+  const failed = await entry.fetch(failRequest('entry-1'), bound);
+  assert.equal(failed.status, 200);
+  assert.equal((await failed.json()).failures, 1);
+
+  const acked = await entry.fetch(ackRequest(['entry-1']), bound);
+  assert.equal(acked.status, 204);
+  assert.deepEqual((await (await entry.fetch(pullRequest(TOKEN), bound)).json()).events, []);
+
+  // 路由不在 Worker 层拦，未知路径也照转，由 DO 回 404。
+  const unknown = await entry.fetch(new Request('https://example.invalid/nope', { method: 'GET' }), bound);
+  assert.equal(unknown.status, 404);
+
+  const ids = namespace.calls.filter((call) => call.startsWith('id:'));
+  assert.deepEqual(ids, ['id:main', 'id:main', 'id:main', 'id:main', 'id:main', 'id:main']);
+  assert.deepEqual(
+    namespace.calls.filter((call) => call.startsWith('get:')),
+    ['get:main', 'get:main', 'get:main', 'get:main', 'get:main', 'get:main'],
+  );
+});
+
+test('W4-a SC1 入口没拿到 EVENT_CHANNEL 绑定时返回 500，不装作成功', async () => {
+  const entry = (await import('./worker/index.mjs')).default;
+  const response = await entry.fetch(webhookRequest(smallPayload(), { delivery: 'no-binding' }), workerEnv());
+  assert.equal(response.status, 500);
+  const half = await entry.fetch(
+    webhookRequest(smallPayload(), { delivery: 'half-binding' }),
+    { ...workerEnv(), EVENT_CHANNEL: {} },
+  );
+  assert.equal(half.status, 500);
+});
+
+test('W4-a SC4 旧事件晚到时不被丢弃、不顶掉已入队的新事件，/pull 按到达顺序交付', async () => {
+  const worker = createEventWorker({ now: () => 1_700_000_000_000 });
+  const env = workerEnv();
+  const newer = JSON.stringify({
+    created_at: '2026-10-31T00:00:30.000Z',
+    action: 'synchronize',
+    pull_request: { number: 12 },
+  });
+  const older = JSON.stringify({
+    created_at: '2026-10-31T00:00:00.000Z',
+    action: 'opened',
+    pull_request: { number: 12 },
+  });
+  await postWebhook(worker, env, newer, 'late-new', 'pull_request');
+  await postWebhook(worker, env, older, 'late-old', 'pull_request');
+
+  const response = await worker.fetch(pullRequest(TOKEN), env);
+  const events = (await response.json()).events;
+  assert.deepEqual(events.map((event) => event.deliveryId), ['late-new', 'late-old']);
+  assert.deepEqual(events.map((event) => event.created_at), [
+    '2026-10-31T00:00:30.000Z',
+    '2026-10-31T00:00:00.000Z',
+  ]);
+});
+
+test('W4-a SC3 部署文件只有 SQLite 版 DO 绑定，没有密钥、令牌、本机路径', () => {
+  const dir = path.join(HERE, 'worker');
+  const toml = fs.readFileSync(path.join(dir, 'wrangler.toml'), 'utf8');
+  const entry = fs.readFileSync(path.join(dir, 'index.mjs'), 'utf8');
+  const readme = fs.readFileSync(path.join(dir, 'README.md'), 'utf8');
+
+  assert.match(toml, /^name = "acceptance-event-channel"$/m);
+  assert.match(toml, /^main = "index\.mjs"$/m);
+  assert.match(toml, /^name = "EVENT_CHANNEL"$/m);
+  assert.match(toml, /^class_name = "EventChannelDurableObject"$/m);
+  assert.match(toml, /^new_sqlite_classes = \["EventChannelDurableObject"\]$/m);
+  assert.doesNotMatch(toml, /^new_classes\s*=/m, '免费档只能用 SQLite 后端，迁移必须是 new_sqlite_classes');
+
+  for (const source of [toml, entry, readme]) {
+    assert.doesNotMatch(source, /gh[pousr]_[A-Za-z0-9]{20,}/);
+    assert.doesNotMatch(source, /github_pat_/);
+    assert.doesNotMatch(source, /\/Users\/[A-Za-z0-9._-]+/);
+    assert.doesNotMatch(source, /WEBHOOK_SECRET\s*=/);
+    assert.doesNotMatch(source, /PULL_TOKEN\s*=/);
+    assert.doesNotMatch(source, /PraiseZhu/);
+  }
+  // 入口只转发，不自己读写存储，也不读 GitHub 令牌。
+  assert.match(entry, /idFromName\('main'\)/);
+  assert.doesNotMatch(entry, /node:fs/);
+  assert.doesNotMatch(entry, /node:child_process/);
+});
+
+// W4-b：一条延迟行拆成三段（Worker 收到 / 本机拉到 / 写完）。
+// receivedAt 由 Worker 写进队列记录，pulledAt 由拉取端在 acceptBatch 里记，gatewayMs = 写完 − Worker 收到。
+// latencyMs 语义不变（事件发生 → 写完），现有断言照旧。
+
+test('W4-b SC1 Worker 存 receivedAt：/pull 带出 Worker 收到时间，正文被省略时也带', async () => {
+  const received = Date.parse('2026-10-31T00:00:05.000Z');
+  const worker = createEventWorker({ now: () => received });
+  const env = workerEnv();
+  await enqueueDelivery(worker, env, 'stamped');
+  const events = (await (await worker.fetch(pullRequest(TOKEN), env)).json()).events;
+  assert.equal(events.length, 1);
+  assert.equal(events[0].receivedAt, '2026-10-31T00:00:05.000Z');
+  assert.equal(events[0].created_at, '2026-10-31T00:00:00.000Z');
+
+  // 正文超上限、只留元数据时，receivedAt 不能跟着 payload 一起丢。
+  const tiny = createEventWorker({ now: () => received, maxValueBytes: 64 });
+  const tinyEnv = workerEnv();
+  const big = JSON.stringify({
+    created_at: '2026-10-31T00:00:00.000Z',
+    action: 'opened',
+    body: 'x'.repeat(4000),
+  });
+  const response = await tiny.fetch(webhookRequest(big, { delivery: 'stamped-omitted' }), tinyEnv);
+  assert.equal(response.status, 204);
+  const omitted = (await (await tiny.fetch(pullRequest(TOKEN), tinyEnv)).json()).events[0];
+  assert.equal(omitted.payloadOmitted, true);
+  assert.equal(omitted.receivedAt, '2026-10-31T00:00:05.000Z');
+});
+
+test('W4-b SC2 延迟行同时记 receivedAt / pulledAt / gatewayMs，latencyMs 仍按事件发生时间算', async () => {
+  const dir = tmpDir();
+  const latencyFile = path.join(dir, '.prio', 'latency.jsonl');
+  let t = Date.parse('2026-10-31T00:00:10.000Z');
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: Date.parse('2026-10-31T00:00:10.000Z') + 1,
+    pull: async () => [
+      {
+        deliveryId: 'three-segments',
+        event: 'pull_request',
+        created_at: '2026-10-31T00:00:00.000Z',
+        receivedAt: '2026-10-31T00:00:04.000Z',
+        payload: {
+          action: 'opened',
+          repository: { full_name: 'example-org/owner-a' },
+          pull_request: { number: 42 },
+        },
+      },
+    ],
+    poll: async () => [],
+    onEvent: async () => {
+      // 处理本身耗 1 秒：pulledAt 与 processedAt 就不会撞在同一毫秒上。
+      t += 1000;
+    },
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 1);
+  const [row] = rows;
+  assert.equal(row.deliveryId, 'three-segments');
+  assert.equal(row.createdAt, '2026-10-31T00:00:00.000Z');
+  assert.equal(row.receivedAt, '2026-10-31T00:00:04.000Z');
+  assert.equal(row.pulledAt, '2026-10-31T00:00:10.000Z');
+  assert.equal(row.processedAt, '2026-10-31T00:00:11.000Z');
+  assert.equal(row.latencyMs, 11000);
+  assert.equal(row.gatewayMs, 7000);
+  assert.equal(row.source, 'worker');
+  assert.equal(row.repo, 'example-org/owner-a');
+  assert.equal(row.number, 42);
+  assert.equal(row.action, 'opened');
+  assert.equal(fs.statSync(latencyFile).mode & 0o777, 0o600);
+});
+
+test('W4-b SC3 receivedAt 缺失、非法或不是字符串时 gatewayMs 记 null，latencyMs 照旧且不抛错', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  let t = Date.parse('2026-10-31T00:00:10.000Z');
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: Date.parse('2026-10-31T00:00:10.000Z') + 1,
+    pull: async () => [
+      { deliveryId: 'no-received', created_at: '2026-10-31T00:00:00.000Z' },
+      { deliveryId: 'bad-received', created_at: '2026-10-31T00:00:02.000Z', receivedAt: 'not-a-date' },
+      { deliveryId: 'not-string', created_at: '2026-10-31T00:00:05.000Z', receivedAt: 1761955200000 },
+      { deliveryId: 'object-received', created_at: '2026-10-31T00:00:06.000Z', receivedAt: { at: '2026-10-31T00:00:04.000Z' } },
+    ],
+    poll: async () => [],
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 4);
+  for (const row of rows) {
+    assert.equal(row.gatewayMs, null);
+    assert.equal(row.receivedAt, null);
+    assert.equal(typeof row.pulledAt, 'string');
+  }
+  assert.deepEqual(
+    rows.map((row) => [row.deliveryId, row.gatewayMsReject]),
+    [
+      ['no-received', 'received-at-missing'],
+      ['bad-received', 'received-at-invalid'],
+      ['not-string', 'received-at-not-string'],
+      ['object-received', 'received-at-not-string'],
+    ],
+  );
+  assert.deepEqual(
+    rows.map((row) => [row.deliveryId, row.latencyMs]),
+    [
+      ['no-received', 10000],
+      ['bad-received', 8000],
+      ['not-string', 5000],
+      ['object-received', 4000],
+    ],
+  );
+});
+
+test('W4-b SC3 gatewayMs 只收 0—600000ms：receivedAt 在将来或差超过 10 分钟时记 null 并留 gatewayMsReject', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const at = Date.parse('2026-10-31T00:00:10.000Z');
+  const created = '2026-10-31T00:00:00.000Z';
+  let t = at;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: at + 1,
+    pull: async () => [
+      // receivedAt 比写完还晚：差值为负，不当成样本。
+      { deliveryId: 'future-received', created_at: created, receivedAt: '2026-10-31T00:00:30.000Z' },
+      // 差 10 分钟 11 秒，超过上限。
+      { deliveryId: 'too-old', created_at: created, receivedAt: '2026-10-30T23:49:59.000Z' },
+      // 正好 600000ms：收。
+      { deliveryId: 'exactly-max', created_at: created, receivedAt: '2026-10-30T23:50:10.000Z' },
+      // 正好 0：收。
+      { deliveryId: 'zero', created_at: created, receivedAt: '2026-10-31T00:00:10.000Z' },
+    ],
+    poll: async () => [],
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 4);
+  assert.deepEqual(
+    rows.map((row) => [row.deliveryId, row.gatewayMs, row.gatewayMsReject ?? null]),
+    [
+      ['future-received', null, 'negative'],
+      ['too-old', null, 'too-large'],
+      ['exactly-max', 600000, null],
+      ['zero', 0, null],
+    ],
+  );
+  // 范围校验不影响 latencyMs（事件发生 → 写完）。
+  assert.deepEqual(
+    rows.map((row) => row.latencyMs),
+    [10000, 10000, 10000, 10000],
+  );
+});
+
+test('W4-b SC4 短写时按 offset 继续写完剩下的字节，不留下半行', () => {
+  const file = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const realWriteSync = fs.writeSync;
+  let calls = 0;
+  // 每次只写 7 个字节，强制走短写分支。fs 是单例，event-pull.mjs 用的是同一个对象。
+  fs.writeSync = (fd, buffer, offset, length) => {
+    calls += 1;
+    return realWriteSync(fd, buffer, offset, Math.min(7, length));
+  };
+  try {
+    appendLatencyRow(file, { deliveryId: 'short-write', padding: 'x'.repeat(100) });
+  } finally {
+    fs.writeSync = realWriteSync;
+  }
+  assert.ok(calls > 1, `应该发生多次写：${calls}`);
+  const lines = fs.readFileSync(file, 'utf8').split('\n').filter((line) => line.trim());
+  assert.equal(lines.length, 1);
+  const row = JSON.parse(lines[0]);
+  assert.equal(row.deliveryId, 'short-write');
+  assert.equal(row.padding.length, 100);
+});
+
+test('W4-b SC4 pulledAtMs 不是有限数时 pulledAt 记 null，事件不算失败', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const at = Date.parse('2026-10-31T00:00:10.000Z');
+  const controller = new AbortController();
+  const reports = [];
+  let nan = false;
+  await runEventChannel({
+    // 只在取这一批的 pulledAtMs 时给 NaN，写完的时刻恢复正常。
+    now: () => (nan ? Number.NaN : at),
+    sleep: async () => {},
+    signal: controller.signal,
+    pull: async () => {
+      nan = true;
+      return [
+        {
+          deliveryId: 'nan-pulled',
+          created_at: '2026-10-31T00:00:00.000Z',
+          receivedAt: '2026-10-31T00:00:09.000Z',
+        },
+      ];
+    },
+    poll: async () => [],
+    reportFailure: async (event) => {
+      reports.push(event.deliveryId);
+      return { failures: 1 };
+    },
+    onEvent: async () => {
+      nan = false;
+      controller.abort();
+    },
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].deliveryId, 'nan-pulled');
+  assert.equal(rows[0].pulledAt, null);
+  assert.equal(rows[0].processedAt, '2026-10-31T00:00:10.000Z');
+  assert.equal(rows[0].latencyMs, 10000);
+  assert.equal(rows[0].gatewayMs, 1000);
+  assert.deepEqual(reports, []);
+});
+
+test('W4-b #317 now() 整段不是有限数时 processedAt 记 null，不抛 RangeError，主流程仍确认', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const at = Date.parse('2026-10-31T00:00:10.000Z');
+  const controller = new AbortController();
+  const confirmed = [];
+  let nan = false;
+  await runEventChannel({
+    // 拉到这一批之后整段 now() 都是 NaN：pulledAt 和 processedAt 都算不出来。
+    now: () => (nan ? Number.NaN : at),
+    sleep: async () => {},
+    signal: controller.signal,
+    pull: async () => {
+      nan = true;
+      return [
+        {
+          deliveryId: 'nan-all',
+          created_at: '2026-10-31T00:00:00.000Z',
+          receivedAt: '2026-10-31T00:00:04.000Z',
+        },
+      ];
+    },
+    poll: async () => [],
+    confirm: async (ids) => {
+      confirmed.push(...ids);
+      controller.abort();
+    },
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].deliveryId, 'nan-all');
+  assert.equal(rows[0].pulledAt, null);
+  assert.equal(rows[0].processedAt, null);
+  assert.equal(rows[0].latencyMs, null);
+  assert.equal(rows[0].gatewayMs, null);
+  assert.equal(rows[0].gatewayMsReject, 'processed-at-invalid');
+  // 写日志失败不变事件失败：这条照常确认，Worker 才清掉。
+  assert.deepEqual(confirmed, ['nan-all']);
+});
+
+test('W4-b SC4 首次追加时自动建目录，新文件权限 0600', async () => {
+  const dir = tmpDir();
+  const latencyFile = path.join(dir, 'deep', 'nested', '.prio', 'latency.jsonl');
+  assert.equal(fs.existsSync(path.dirname(latencyFile)), false);
+  let t = 0;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 1,
+    pull: async () => [{ deliveryId: 'first-row', created_at: '2026-10-31T00:00:00.000Z' }],
+    poll: async () => [],
+    latencyFile,
+  });
+  assert.equal(readLatencyLog(latencyFile).length, 1);
+  assert.equal(fs.statSync(latencyFile).mode & 0o777, 0o600);
+});
+
+test('W4-b SC4 两个进程同时往同一个 latency.jsonl 追加：行数对得上，没有半行', async () => {
+  const { spawn } = await import('node:child_process');
+  const { pathToFileURL } = await import('node:url');
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const moduleUrl = pathToFileURL(path.join(HERE, 'bin', 'event-pull.mjs')).href;
+  const script = path.join(tmpDir(), 'append-rows.mjs');
+  fs.writeFileSync(
+    script,
+    [
+      `import { appendLatencyRow } from ${JSON.stringify(moduleUrl)};`,
+      'const [file, tag, count] = process.argv.slice(2);',
+      'for (let i = 0; i < Number(count); i += 1) {',
+      "  appendLatencyRow(file, { deliveryId: `${tag}-${i}`, padding: 'x'.repeat(200) });",
+      '}',
+    ].join('\n'),
+  );
+  const write = (tag) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [script, latencyFile, tag, '100'], { stdio: 'ignore' });
+      child.on('error', reject);
+      child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`${tag} 退出码 ${code}`))));
+    });
+  await Promise.all([write('a'), write('b')]);
+  const lines = fs
+    .readFileSync(latencyFile, 'utf8')
+    .split('\n')
+    .filter((line) => line.trim());
+  assert.equal(lines.length, 200);
+  for (const line of lines) {
+    assert.doesNotThrow(() => JSON.parse(line), `出现半行：${line.slice(0, 80)}`);
+  }
+  assert.equal(new Set(lines.map((line) => JSON.parse(line).deliveryId)).size, 200);
+  assert.equal(fs.statSync(latencyFile).mode & 0o777, 0o600);
+});
+
+test('W4-b SC5 延迟文件默认位置由 prio-sync 的状态目录拼出：event-pull 写的和看板读的是同一个文件', async () => {
+  const fakeHome = path.join(tmpDir(), 'home-example');
+  const stateDir = defaultStateDir(fakeHome);
+  const latencyFile = stateFiles(stateDir).latency;
+  // 期望路径从 prio-sync 的状态目录定义拼出来，不把 event-pull 里的实现表达式抄一遍。
+  assert.equal(defaultLatencyFile(fakeHome), latencyFile);
+  assert.equal(path.isAbsolute(defaultLatencyFile()), true);
+  assert.equal(defaultLatencyFile().endsWith(path.join('acceptance', 'tools', '.prio', 'latency.jsonl')), true);
+
+  // 写：event-pull 按默认位置追加一行。
+  const at = Date.parse('2026-10-31T00:00:10.000Z');
+  let t = at;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: at + 1,
+    pull: async () => [
+      {
+        deliveryId: 'same-file',
+        created_at: '2026-10-31T00:00:00.000Z',
+        receivedAt: '2026-10-31T00:00:09.000Z',
+      },
+    ],
+    poll: async () => [],
+    latencyFile: defaultLatencyFile(fakeHome),
+  });
+  assert.equal(readLatencyLog(latencyFile).length, 1);
+
+  // 读：看板那一节按同一个状态目录读 latency.jsonl，能看到刚写的样本。
+  const section = renderPrioBoardSection({ stateDir, nowMs: at + 1000 });
+  assert.match(
+    section,
+    /关联 PR 延迟 事件→写完 p50 10000 p95 10000 \(n=1\)｜gateway p50 1000 p95 1000 \(n=1\)/,
+  );
+
+  await assert.rejects(
+    runEventChannel({
+      now: () => 0,
+      sleep: async () => {},
+      until: 1,
+      pull: async () => [],
+      poll: async () => [],
+      latencyFile: path.join('.prio', 'latency.jsonl'),
+    }),
+    /latencyFile 必须是绝对路径/,
+  );
+});
+
+test('W4-b SC1 同一拍的 worker 行和 poll 行各进各的组：事件→写完两条，gateway 只数带 receivedAt 的', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const at = Date.parse('2026-10-31T00:00:10.000Z');
+  let t = at;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: at + 1,
+    pull: async () => [
+      {
+        deliveryId: 'from-worker',
+        created_at: '2026-10-31T00:00:00.000Z',
+        receivedAt: '2026-10-31T00:00:09.000Z',
+      },
+    ],
+    poll: async () => [{ deliveryId: 'from-poll', created_at: '2026-10-31T00:00:02.000Z' }],
+    // 这条测的是两种来源的统计分组，不测兜底门槛：门槛设 0 让 poll 每拍都跑。
+    pollAfterFailures: 0,
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.deepEqual(
+    rows.map((row) => [row.deliveryId, row.source, row.latencyMs, row.gatewayMs]),
+    [
+      ['from-worker', 'worker', 10000, 1000],
+      ['from-poll', 'poll', 8000, null],
+    ],
+  );
+  const view = viewPrio({ latency: fs.readFileSync(latencyFile, 'utf8'), nowMs: at + 1000 });
+  // 事件→写完两条都在；gateway 只有 worker 那一条。
+  assert.equal(view.latency.n, 2);
+  assert.equal(view.latency.p50, 8000);
+  assert.equal(view.latency.p95, 10000);
+  assert.equal(view.gatewayLatency.n, 1);
+  assert.equal(view.gatewayLatency.p50, 1000);
+  assert.match(
+    view.lines.find((entry) => entry.startsWith('关联 PR 延迟')),
+    /^关联 PR 延迟 事件→写完 p50 8000 p95 10000 \(n=2\)｜gateway p50 1000 p95 1000 \(n=1\)$/,
+  );
+});
+
+// W4-e：请求体大小上限。三条读 body 的路由（/webhook、/ack、/fail）都先看 content-length 快速拒绝，
+// 没有该头或声明偏小时按读到的累计字节数兜底，超限一律 413；/webhook 的 413 在验签之前返回。
+// 413 只回上限数字，不回显 body、不提 secret。
+
+// 可数读取次数的流：用来证明「超限就不再读」而不是「读完再判」。
+function countingStream(chunks, counter) {
+  let index = 0;
+  return new ReadableStream({
+    pull(controller) {
+      counter.reads += 1;
+      if (index >= chunks.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunks[index]);
+      index += 1;
+    },
+  });
+}
+
+function streamRequest(pathname, chunks, { headers = {}, counter = { reads: 0 } } = {}) {
+  const request = new Request(`https://example.invalid${pathname}`, {
+    method: 'POST',
+    headers,
+    body: countingStream(chunks, counter),
+    duplex: 'half',
+  });
+  return { request, counter };
+}
+
+function repeatChunk(byte, size) {
+  return new Uint8Array(size).fill(byte);
+}
+
+// 构造字节数正好为 size 的合法 webhook JSON：padding 全是 ASCII，字符数等于字节数。
+function exactSizeWebhookBody(size) {
+  const skeleton = {
+    created_at: '2026-10-31T00:00:00.000Z',
+    action: 'opened',
+    repository: { full_name: 'example-org/example-repo' },
+    issue: { number: 7 },
+    padding: '',
+  };
+  const base = JSON.stringify(skeleton).length;
+  return JSON.stringify({ ...skeleton, padding: 'x'.repeat(size - base) });
+}
+
+test('W4-e SC1 /webhook content-length 超限时直接 413：不打开 body 流、不入队', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  // 「一读就报错」的流：只要代码去读 body，worker.fetch 就会抛，不可能回 413。
+  const unreadable = new Request('https://example.invalid/webhook', {
+    method: 'POST',
+    headers: {
+      'content-length': String(WEBHOOK_BODY_LIMIT + 1),
+      'x-github-delivery': 'too-large-cl',
+      'x-github-event': 'issues',
+    },
+    body: new ReadableStream({
+      pull(controller) {
+        controller.error(new Error('body must not be read'));
+      },
+    }),
+    duplex: 'half',
+  });
+  const response = await worker.fetch(unreadable, env);
+  assert.equal(response.status, 413);
+  assert.deepEqual(await pullIds(worker, env), []);
+  // 413 只给上限，不回显 body 内容。
+  const text = await response.text();
+  assert.match(text, new RegExp(String(WEBHOOK_BODY_LIMIT)));
+  assert.doesNotMatch(text, /action|opened/);
+});
+
+test('W4-e SC1 没有 content-length（chunked）时累计超限即 413，不把整段读完', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  const chunks = Array.from({ length: 8 }, () => repeatChunk(0x78, 256 * 1024));
+  const { request, counter } = streamRequest('/webhook', chunks, {
+    headers: { 'x-github-delivery': 'too-large-stream', 'x-github-event': 'issues' },
+  });
+  assert.equal(request.headers.get('content-length'), null);
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 413);
+  assert.ok(counter.reads < chunks.length, `超限后应停止读取，实际读了 ${counter.reads}/${chunks.length} 块`);
+  assert.deepEqual(await pullIds(worker, env), []);
+});
+
+test('W4-e SC1 恶意 content-length 小于实际 body 时，按实际累计字节判 413', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  const chunks = Array.from({ length: 4 }, () => repeatChunk(0x78, 256 * 1024));
+  const { request } = streamRequest('/webhook', chunks, {
+    headers: {
+      'content-length': '16',
+      'x-github-delivery': 'lying-content-length',
+      'x-github-event': 'issues',
+    },
+  });
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 413);
+  assert.deepEqual(await pullIds(worker, env), []);
+});
+
+test('W4-e SC1 body 字节数正好等于上限时通过：/webhook 204、/ack 204', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+
+  const body = exactSizeWebhookBody(WEBHOOK_BODY_LIMIT);
+  assert.equal(Buffer.byteLength(body), WEBHOOK_BODY_LIMIT);
+  const accepted = await worker.fetch(
+    new Request('https://example.invalid/webhook', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': String(WEBHOOK_BODY_LIMIT),
+        'x-hub-signature-256': sign(body, SECRET),
+        'x-github-delivery': 'at-limit',
+        'x-github-event': 'issues',
+      },
+      body,
+    }),
+    env,
+  );
+  assert.equal(accepted.status, 204);
+  const pulled = await worker.fetch(pullRequest(TOKEN), env);
+  const events = (await pulled.json()).events;
+  assert.deepEqual(events.map((event) => event.deliveryId), ['at-limit']);
+  // 整条事件超过单值上限（128 KiB），存成元数据但事件本身不丢。
+  assert.equal(events[0].payloadOmitted, true);
+  assert.equal(events[0].number, 7);
+
+  // 刚好等于 /ack 上限的合法确认体：JSON 骨架 12 字节，其余用 id 补满。
+  const ackBody = `{"ids":["${'a'.repeat(ACK_BODY_LIMIT - 12)}"]}`;
+  assert.equal(Buffer.byteLength(ackBody), ACK_BODY_LIMIT);
+  const acked = await worker.fetch(
+    new Request('https://example.invalid/ack', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        'content-type': 'application/json',
+        'content-length': String(ACK_BODY_LIMIT),
+      },
+      body: ackBody,
+    }),
+    env,
+  );
+  assert.equal(acked.status, 204);
+
+  // /fail 同一条边界：正好等于上限的合法失败体照常记一次失败。
+  const failSkeleton = JSON.stringify({ id: 'at-limit', error: '' }).length;
+  const failBody = JSON.stringify({ id: 'at-limit', error: 'x'.repeat(FAIL_BODY_LIMIT - failSkeleton) });
+  assert.equal(Buffer.byteLength(failBody), FAIL_BODY_LIMIT);
+  const failed = await worker.fetch(
+    new Request('https://example.invalid/fail', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        'content-type': 'application/json',
+        'content-length': String(FAIL_BODY_LIMIT),
+      },
+      body: failBody,
+    }),
+    env,
+  );
+  assert.equal(failed.status, 200);
+  assert.equal((await failed.json()).failures, 1);
+
+  // 只多一个字节就走 413：边界是「不超过上限」，不是「小于上限再加余量」。
+  const overBody = exactSizeWebhookBody(WEBHOOK_BODY_LIMIT + 1);
+  assert.equal(Buffer.byteLength(overBody), WEBHOOK_BODY_LIMIT + 1);
+  const rejected = await worker.fetch(webhookRequest(overBody, { delivery: 'over-limit' }), env);
+  assert.equal(rejected.status, 413);
+});
+
+test('W4-e SC1 限内的错签名 / 缺签名头 / 缺 secret 仍是 401，不受 413 逻辑影响', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  const body = JSON.stringify({ created_at: '2026-10-31T00:00:00.000Z', action: 'opened' });
+
+  const wrong = await worker.fetch(
+    webhookRequest(body, { delivery: 'wrong-sig', signature: sign(body, 'not-the-secret') }),
+    env,
+  );
+  assert.equal(wrong.status, 401);
+
+  const missing = await worker.fetch(
+    new Request('https://example.invalid/webhook', {
+      method: 'POST',
+      headers: { 'content-length': String(body.length), 'x-github-delivery': 'missing-sig' },
+      body,
+    }),
+    env,
+  );
+  assert.equal(missing.status, 401);
+
+  const noSecret = await worker.fetch(webhookRequest(body, { delivery: 'no-secret' }), { PULL_TOKEN: TOKEN });
+  assert.equal(noSecret.status, 401);
+
+  // 超限时 413 先于验签：签名是错的也回 413，且响应里没有请求内容和 secret。
+  const big = `${body}${'x'.repeat(WEBHOOK_BODY_LIMIT)}`;
+  const oversized = await worker.fetch(
+    webhookRequest(big, { delivery: 'too-large-bad-sig', signature: 'sha256=deadbeef' }),
+    env,
+  );
+  assert.equal(oversized.status, 413);
+  const text = await oversized.text();
+  assert.doesNotMatch(text, new RegExp(SECRET));
+  assert.doesNotMatch(text, /sha256=deadbeef/);
+
+  assert.deepEqual(await pullIds(worker, env), []);
+});
+
+test('W4-e SC1 /ack、/fail 超限 413 且不动队列；令牌不对时仍是 401', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  await postWebhook(worker, env, smallPayload(), 'keep-me');
+
+  const bigJson = JSON.stringify({ ids: ['a'.repeat(ACK_BODY_LIMIT)] });
+  const ackTooLarge = await worker.fetch(
+    new Request('https://example.invalid/ack', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(bigJson)),
+      },
+      body: bigJson,
+    }),
+    env,
+  );
+  assert.equal(ackTooLarge.status, 413);
+
+  // 没有 content-length 的 chunked 超限体同样 413。
+  const { request: chunkedAck } = streamRequest('/ack', [repeatChunk(0x7b, ACK_BODY_LIMIT + 1024)], {
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+  });
+  const chunked = await worker.fetch(chunkedAck, env);
+  assert.equal(chunked.status, 413);
+
+  const failTooLarge = await worker.fetch(
+    new Request('https://example.invalid/fail', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        'content-type': 'application/json',
+        'content-length': String(FAIL_BODY_LIMIT + 1),
+      },
+      body: JSON.stringify({ id: 'keep-me', error: 'x'.repeat(FAIL_BODY_LIMIT) }),
+    }),
+    env,
+  );
+  assert.equal(failTooLarge.status, 413);
+
+  // 413 没把队列清掉，也没记失败。
+  assert.deepEqual(await pullIds(worker, env), ['keep-me']);
+
+  // 授权在读 body 之前：令牌不对时即便 body 巨大也还是 401。
+  const badToken = await worker.fetch(
+    new Request('https://example.invalid/ack', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer wrong-pull-token',
+        'content-type': 'application/json',
+        'content-length': String(ACK_BODY_LIMIT + 1),
+      },
+      body: '{"ids":[]}',
+    }),
+    env,
+  );
+  assert.equal(badToken.status, 401);
+
+  const noToken = await worker.fetch(
+    new Request('https://example.invalid/fail', { method: 'POST', body: '{"id":"keep-me"}' }),
+    env,
+  );
+  assert.equal(noToken.status, 401);
 });

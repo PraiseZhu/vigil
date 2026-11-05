@@ -1,0 +1,17 @@
+# 事件通道 Worker 的部署配置。只放入口和绑定，不放任何密钥、环境变量或自定义域。
+# 两个 secret 用命令写进 Worker，值不进仓库、不进命令历史（见 README.md）：
+#   npx wrangler secret put WEBHOOK_SECRET
+#   npx wrangler secret put PULL_TOKEN
+# 免费档只能用 SQLite 后端的 Durable Object，所以迁移写 new_sqlite_classes，不要改成 new_classes。
+name = "acceptance-event-channel"
+main = "index.mjs"
+compatibility_date = "2026-10-01"
+
+# 队列、去重表、告警都在这一个实例里（index.mjs 固定 idFromName('main')）。
+[[durable_objects.bindings]]
+name = "EVENT_CHANNEL"
+class_name = "EventChannelDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["EventChannelDurableObject"]
