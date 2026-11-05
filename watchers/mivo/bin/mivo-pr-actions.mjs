@@ -52,10 +52,11 @@ export function planBaseUpdate({ snapshot, entry, fresh = [], now, behindThresho
   const eligibleFromReview = evidence.baseUpdateEligible === true || snapshot?.baseUpdateEligible === true;
   const inFlight = Boolean(entry?.activeTask) && !['complete', 'legacy-complete'].includes(entry.activeTask.status)
     && entry.activeTask.blockedKind !== 'author-reclaimed';
-  // Behind-threshold mode only waits for a repair that is actually working. A blocked or waiting-ci task is not
-  // running, and updating the base is exactly how a stale PR gets moving again.
+  // Behind-threshold mode only waits for a repair that is actually working. A blocked task is not running, and
+  // updating the base is exactly how a stale PR gets moving again; a waiting-ci task still is running, because
+  // moving the head would pull the CI it is waiting on out from under it.
   const repairRunning = Boolean(entry?.activeTask)
-    && !['complete', 'legacy-complete', 'blocked', 'waiting-ci'].includes(entry.activeTask.status)
+    && !['complete', 'legacy-complete', 'blocked'].includes(entry.activeTask.status)
     && entry.activeTask.blockedKind !== 'author-reclaimed';
   const pendingDispatch = Boolean(entry?.pendingDispatch);
   const threshold = Number.isSafeInteger(behindThreshold) && behindThreshold > 0 ? behindThreshold : 0;
@@ -66,11 +67,13 @@ export function planBaseUpdate({ snapshot, entry, fresh = [], now, behindThresho
   const reason = (() => {
     if (pr.state !== 'OPEN' || pr.isDraft) return 'inactive';
     if (pr.baseRefName !== 'main') return 'base-not-main';
-    if (threshold > 0) {
+    // A merge-ready PR is waiting for a person to merge it; moving the head would void its review verdict.
+    if (snapshot?.mergeReady === true) return 'merge-ready';
+    // The threshold only widens the gate for PRs that are at least N commits behind. Below the threshold, or
+    // without a count, the original BEHIND + review-gates path still decides.
+    if (threshold > 0 && behindKnown && behind >= threshold) {
       if (String(snapshot?.mergeable ?? 'UNKNOWN').toUpperCase() !== 'MERGEABLE') return 'not-mergeable';
       if (!/^[a-f0-9]{40}$/i.test(String(snapshot?.baseTipOid ?? ''))) return 'base-tip-unknown';
-      if (!behindKnown) return 'behind-unknown';
-      if (behind < threshold) return 'behind-below-threshold';
       if (reviewInProgress(evidence)) return 'review-in-progress';
       if ((fresh ?? []).length) return 'fresh-feedback';
       if (repairRunning) return 'repair-in-flight';

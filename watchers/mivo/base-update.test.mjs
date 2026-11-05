@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { planBaseUpdate, assertActionOwner, updateBaseBranch, reconcileBaseUpdate, parseBehindThreshold } from './bin/mivo-pr-actions.mjs';
+import { evaluatePublicReview } from './bin/public-review.mjs';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -113,7 +114,7 @@ test('reconcileBaseUpdate marks updated when head advances and unconfirmed after
 // Default is off: the old path (BEHIND + review gates) must not change.
 function behindSnapshot(extra = {}) {
   return snapshot({
-    mergeStateStatus: 'UNSTABLE', behindBy: 12,
+    mergeStateStatus: 'UNSTABLE', behindBy: 12, baseUpdateEligible: false,
     reviewEvidence: { ready: false, reason: 'review-veto', blockers: ['review-veto'], baseUpdateEligible: false },
     ...extra,
   });
@@ -130,14 +131,46 @@ test('threshold mode accepts a stale PR even when its CI or review verdict is no
   assert.equal(planBaseUpdate({ snapshot: behindSnapshot(), entry: {}, fresh: [], now }).eligible, false);
 });
 
-test('threshold mode honours the count, the base tip and the review-in-progress gate', () => {
-  assert.equal(behindPlan({ behindBy: 9 }).reason, 'behind-below-threshold');
-  assert.equal(behindPlan({ behindBy: undefined }).reason, 'behind-unknown');
+test('threshold mode honours the count, the base tip and mergeability', () => {
   assert.equal(behindPlan({ baseTipOid: null }).reason, 'base-tip-unknown');
   assert.equal(behindPlan({ mergeable: 'CONFLICTING' }).reason, 'not-mergeable');
-  assert.equal(behindPlan({
-    reviewEvidence: { ready: false, reason: 'review-in-progress', blockers: ['review-in-progress'] },
-  }).reason, 'review-in-progress');
+});
+
+test('threshold mode falls back to the old BEHIND + review-gates path below the threshold or without a count', () => {
+  const clear = { ready: false, reason: 'behind', blockers: ['behind'], baseUpdateEligible: true };
+  assert.equal(behindPlan({ behindBy: 5, mergeStateStatus: 'BEHIND', reviewEvidence: clear }).eligible, true,
+    'a less-behind PR with a clean review is still updated the old way');
+  assert.equal(behindPlan({ behindBy: undefined, mergeStateStatus: 'BEHIND', reviewEvidence: clear }).eligible, true,
+    'an unknown count falls back instead of blocking');
+  assert.equal(behindPlan({ behindBy: 5, mergeStateStatus: 'CLEAN', reviewEvidence: clear }).reason, 'merge-state-clean',
+    'the fallback keeps the old merge-state gate');
+});
+
+test('threshold mode never updates a merge-ready PR', () => {
+  assert.equal(behindPlan({ mergeReady: true }).reason, 'merge-ready');
+  assert.equal(planBaseUpdate({ snapshot: snapshot({ mergeReady: true }), entry: {}, fresh: [], now }).reason, 'merge-ready',
+    'the old path does not update a PR that is only waiting for a person to merge it');
+});
+
+test('threshold mode takes review-in-progress from the real review evidence', () => {
+  // The gate must read what evaluatePublicReview writes, not a hand-shaped evidence object: the latest review-pr
+  // check on the head is still running.
+  const checkedAt = '2026-11-05T00:00:00Z';
+  const reviewSnapshot = {
+    pr: {
+      id: 'PR_1', number: 7, state: 'OPEN', isDraft: false, sameRepository: true,
+      author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, baseRefName: 'main', releaseEpoch: 'ready:e',
+    },
+    comments: [], reviews: [], threads: [], labels: [], mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE',
+    requiredChecksGreen: true, ci: { status: 'green' }, optionalCi: [], codeScanning: { status: 'clean' },
+  };
+  const checks = [{
+    name: 'review-pr', app: { id: 15368 }, head_sha: HEAD, status: 'in_progress', conclusion: null, started_at: checkedAt, id: 1,
+  }];
+  const evidence = evaluatePublicReview({ snapshot: reviewSnapshot, checks, runs: {} });
+  assert.equal(evidence.reason, 'review-in-progress');
+  assert.ok(evidence.blockers.includes('review-in-progress'));
+  assert.equal(behindPlan({ reviewEvidence: evidence }).reason, 'review-in-progress');
 });
 
 test('threshold mode still waits for fresh feedback, running work and a human', () => {
@@ -146,9 +179,10 @@ test('threshold mode still waits for fresh feedback, running work and a human', 
   assert.equal(behindPlan({}, { pendingDispatch: { dispatchId: 'x' } }).reason, 'pending-dispatch');
   assert.equal(behindPlan({}, { needsHuman: { reason: 'x' } }).reason, 'needs-human');
   assert.equal(behindPlan({}, { dispatchConflict: { at: now } }).reason, 'dispatch-conflict');
-  // A blocked or waiting-ci task is not running: updating the base is what moves such a stale PR again.
+  // A blocked task is not running: updating the base is what moves such a stale PR again. waiting-ci is running:
+  // moving the head would pull the CI it is waiting on out from under it.
   assert.equal(behindPlan({}, { activeTask: { status: 'blocked', blockedKind: 'external' } }).eligible, true);
-  assert.equal(behindPlan({}, { activeTask: { status: 'waiting-ci' } }).eligible, true);
+  assert.equal(behindPlan({}, { activeTask: { status: 'waiting-ci' } }).reason, 'repair-in-flight');
   // The legacy path keeps its old, stricter reading of an active task.
   assert.equal(planBaseUpdate({
     snapshot: snapshot(), entry: { activeTask: { status: 'blocked', blockedKind: 'external' } }, fresh: [], now,

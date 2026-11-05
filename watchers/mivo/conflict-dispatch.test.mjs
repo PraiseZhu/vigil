@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { conflictDispatchDue, pollFingerprint, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
+import { CONFLICT_FEEDBACK_KEY, conflictDispatchDue, pollFingerprint, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
 import { readPr, writePr as writePrState } from './bin/mivo-state.mjs';
 import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
 
@@ -96,19 +96,37 @@ function poll(paths, { snapshot, collect, dispatchFn }) {
   return { result, collected, entry: readPr(paths.home, nodeId) };
 }
 
-test('conflictDispatchDue tracks the head/base-tip pair', () => {
-  assert.equal(conflictDispatchDue({ previous: {}, snapshot: snap() }), true);
+test('conflictDispatchDue tracks the head/base-tip pair and the 60-minute head cooldown', () => {
+  const at = (value) => ({ head: HEAD, baseTip: TIP, at: value });
+  assert.equal(conflictDispatchDue({ previous: {}, snapshot: snap(), now }), true, 'a new conflict is due at once');
+  assert.equal(conflictDispatchDue({ previous: { conflictDispatch: at('2026-11-04T23:00:00Z') }, snapshot: snap(), now }), false,
+    'the same head and base tip is sent once');
   assert.equal(conflictDispatchDue({
-    previous: { conflictDispatch: { head: HEAD, baseTip: TIP } }, snapshot: snap(),
-  }), false, 'the same head and base tip is sent once');
+    previous: { conflictDispatch: at('2026-11-04T23:30:00Z') }, snapshot: snap({ baseTipOid: MOVED }), now,
+  }), false, 'a moved base inside the cooldown waits');
   assert.equal(conflictDispatchDue({
-    previous: { conflictDispatch: { head: HEAD, baseTip: TIP } }, snapshot: snap({ baseTipOid: MOVED }),
-  }), true, 'a moved base is a new conflict');
+    previous: { conflictDispatch: at('2026-11-04T22:00:00Z') }, snapshot: snap({ baseTipOid: MOVED }), now,
+  }), true, 'a moved base after the cooldown is due again');
   assert.equal(conflictDispatchDue({
-    previous: { conflictDispatch: { head: MOVED, baseTip: TIP } }, snapshot: snap(),
-  }), true, 'a new head is a new conflict');
-  assert.equal(conflictDispatchDue({ previous: {}, snapshot: snap({ mergeable: 'MERGEABLE' }) }), false);
-  assert.equal(conflictDispatchDue({ previous: {}, snapshot: snap({ baseTipOid: null }) }), false);
+    previous: { conflictDispatch: at('2026-11-04T23:59:00Z') }, snapshot: snap({ headRefOid: MOVED }), now,
+  }), true, 'a new head is due at once');
+  assert.equal(conflictDispatchDue({ previous: {}, snapshot: snap({ mergeable: 'MERGEABLE' }), now }), false);
+  assert.equal(conflictDispatchDue({ previous: {}, snapshot: snap({ baseTipOid: null }), now }), false);
+});
+
+test('a repair that is running, a pending delivery or a dispatch conflict closes the conflict gate', () => {
+  assert.equal(conflictDispatchDue({
+    previous: { activeTask: { status: 'accepted' } }, snapshot: snap(), now,
+  }), false, 'a running repair must not have its head moved under it');
+  assert.equal(conflictDispatchDue({
+    previous: { activeTask: { status: 'waiting-ci' } }, snapshot: snap(), now,
+  }), true, 'a repair waiting for CI can take a conflict task');
+  assert.equal(conflictDispatchDue({
+    previous: { pendingDispatch: { dispatchId: 'x' } }, snapshot: snap(), now,
+  }), false);
+  assert.equal(conflictDispatchDue({
+    previous: { dispatchConflict: { at: now } }, snapshot: snap(), now,
+  }), false);
 });
 
 test('a conflict already in the cursor is still collected and dispatched', (t) => {
@@ -160,4 +178,74 @@ test('a moved base tip dispatches the conflict again even with an unchanged head
   assert.equal(collected, 1);
   assert.match(params.message, /"key":"conflict:merge-conflict"/);
   assert.equal(entry.conflictDispatch.baseTip, MOVED);
+});
+
+test('a due conflict reaches a blocked external session even with the same feedback text', (t) => {
+  const { paths } = homeOf(t);
+  // The blocked task already carries this exact conflict (same content hash), so the "same blocked cause" guard
+  // would swallow it. A due conflict is new information and must be delivered anyway (#1746).
+  seed(paths);
+  const hash = createHash('sha256').update(JSON.stringify({ mergeable: 'CONFLICTING', baseTip: TIP })).digest('hex');
+  fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });
+  fs.writeFileSync(path.join(paths.stateDir, 'tasks', 'live-1746-old.json'), JSON.stringify({
+    dispatchId: 'live-1746-old', nodeId, number: 1746,
+    feedback: [{
+      key: 'conflict:merge-conflict', source: 'conflict', nativeId: 'merge-conflict',
+      revision: HEAD, sha: HEAD, body: 'PR has merge conflicts with its base branch.', contentHash: hash,
+    }],
+  }));
+  let params;
+  const { result, entry } = poll(paths, {
+    snapshot: snap(),
+    collect: collectedConflict,
+    dispatchFn: (value) => { params = value; return { target_session_id: 'sess-1746' }; },
+  });
+  assert.equal(result.prs[0].dispatch.bound, true);
+  assert.match(params.message, /"key":"conflict:merge-conflict"/);
+  assert.deepEqual({ head: entry.conflictDispatch.head, baseTip: entry.conflictDispatch.baseTip }, { head: HEAD, baseTip: TIP });
+});
+
+test('a moved base inside the cooldown is collected once, held back, then skipped', (t) => {
+  const { paths } = homeOf(t);
+  seed(paths, {
+    eligibility: 'active',
+    activeTask: { dispatchId: 'live-1746-old', sessionId: 'sess-1746', head: HEAD, status: 'complete' },
+    conflictDispatch: { head: HEAD, baseTip: TIP, at: '2026-11-04T23:30:00Z', dispatchId: 'live-1746-old' },
+    pollFingerprint: pollFingerprint(snap()),
+  });
+  let dispatches = 0;
+  const dispatchFn = () => { dispatches += 1; return { target_session_id: 'sess-1746' }; };
+  const first = poll(paths, {
+    snapshot: snap({ baseTipOid: MOVED }),
+    collect: () => collectedConflict({ baseTipOid: MOVED }),
+    dispatchFn,
+  });
+  assert.equal(first.collected, 1);
+  assert.equal(dispatches, 0, 'the cooldown holds the conflict back');
+  assert.equal(first.result.prs[0].dispatch.reason, 'no-new-feedback');
+  assert.equal(first.entry.feedbackCursor[CONFLICT_FEEDBACK_KEY], conflictStamp(), 'the conflict stays pending');
+  const second = poll(paths, {
+    snapshot: snap({ baseTipOid: MOVED }),
+    collect: () => { throw new Error('must not collect while the gate is closed'); },
+    dispatchFn,
+  });
+  assert.equal(second.collected, 0, 'a held-back conflict does not force a full collection every round');
+  assert.equal(second.result.prs[0].dispatch.reason, 'fingerprint-unchanged');
+  assert.equal(dispatches, 0);
+});
+
+test('a running repair closes the gate instead of forcing a collection every round', (t) => {
+  const { paths } = homeOf(t);
+  seed(paths, {
+    activeTask: { dispatchId: 'live-1746-run', sessionId: 'sess-1746', head: HEAD, status: 'accepted' },
+    lastDispatch: { dispatchId: 'live-1746-run', at: '2026-11-05T00:00:00Z', recoveryCount: 0 },
+    pollFingerprint: pollFingerprint(snap()),
+  });
+  const { result, collected } = poll(paths, {
+    snapshot: snap(),
+    collect: () => { throw new Error('must not collect while a repair is running'); },
+    dispatchFn: () => { throw new Error('must not dispatch while a repair is running'); },
+  });
+  assert.equal(collected, 0);
+  assert.equal(result.prs[0].dispatch.reason, 'fingerprint-unchanged');
 });
