@@ -2653,8 +2653,11 @@ export function* processPr({
     // The spacing is across all PRs, and a round hands processPr only this PR's entry: read the others from disk,
     // and only when a sync would otherwise go ahead.
     if (plan.eligible) {
-      lastSyncAt = lastBaseSyncAtAcross(state, paths);
+      lastSyncAt = newestIso(lastBaseSyncAtAcross(state, paths), baseSyncClaim.at);
       plan = planBaseUpdate({ snapshot: collected, entry: previous, fresh, now, drift, lastSyncAt });
+      // A round runs its PRs in parallel: claim the window before the first yield, or every PR reads "no sync yet"
+      // from disk and all of them sync at once (2026-11-05: #1807 and #1727 in the same second).
+      if (plan.eligible) baseSyncClaim.at = now;
     }
     previous = { ...previous, baseSyncRetryAt: plan.retryAt };
     if (plan.eligible) {
@@ -3044,6 +3047,14 @@ export function lastBaseSyncAt(state) {
     if (Number.isFinite(at) && (latest == null || at > latest)) latest = at;
   }
   return latest == null ? null : new Date(latest).toISOString();
+}
+
+// The sync this process claimed last; shared by the PRs of a round, which run in parallel within one process.
+const baseSyncClaim = { at: null };
+
+function newestIso(a, b) {
+  if (!a || !b) return a ?? b ?? null;
+  return Date.parse(a) >= Date.parse(b) ? a : b;
 }
 
 function lastBaseSyncAtAcross(state, paths) {

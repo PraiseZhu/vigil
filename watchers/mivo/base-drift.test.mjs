@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { scanOnce, watcherPaths, lastBaseSyncAt } from './bin/mivo-watcher.mjs';
+import { scanOnceAsync, watcherPaths, lastBaseSyncAt } from './bin/mivo-watcher.mjs';
 import { writePr } from './bin/mivo-state.mjs';
 import {
   planBaseUpdate, readBaseDrift, updateBaseBranch, baseDriftDue,
@@ -182,34 +182,36 @@ function roundFixture(t, { numbers, behindBy }) {
     return '[]';
   };
   let clock = 0;
-  const scan = (stamp) => scanOnce({
+  // The async driver, as discover runs in production: the round's PRs really interleave at each gh call.
+  const scan = (stamp) => scanOnceAsync({
     mode: 'discover', enabled: true, allowDispatch: true, paths, now: stamp, clock: () => clock, followMs: 0, sleepFn: (ms) => { clock += ms; },
     fullCollectMs: 1e12, gitFn: () => '', env: { MIVO_PLUGIN_REPO: plugin }, ghFn,
-    ownershipSnapshot: function* ({ pr }) { return { pr: handoffPr(ownerFields(pr.number)) }; },
+    // One extra step before the answer, as a real gh call would take: the round's PRs interleave here.
+    ownershipSnapshot: function* ({ pr }) { yield () => new Promise((resolve) => setTimeout(resolve, 5)); return { pr: handoffPr(ownerFields(pr.number)) }; },
     collect: (pr) => waitingReview(listedPr(pr.number)), dispatchFn: () => { throw new Error('nothing to dispatch'); },
   });
   const synced = () => writes.map((args) => Number(/pulls\/(\d+)\/update-branch/.exec(args.join(' '))?.[1]));
   return { scan, synced, compares };
 }
 
-test('a round brings a main PR that is 12 behind up to date, one PR per spacing window', (t) => {
+test('a round brings a main PR that is 12 behind up to date, one PR per spacing window', async (t) => {
   const f = roundFixture(t, { numbers: [981, 982], behindBy: 12 });
-  const first = f.scan(NOW);
-  assert.equal(f.synced().length, 1, 'the BLOCKED main PR is synced, and only one of the two this round');
+  const first = await f.scan(NOW);
+  assert.equal(f.synced().length, 1, 'the BLOCKED main PR is synced, and only one of the two PRs running in parallel this round');
   const reasons = first.prs.map((item) => item.dispatch?.reason);
   assert.ok(reasons.includes('base-update-accepted'), `reasons: ${reasons}`);
   // Nothing on GitHub changes in the fixture; the waiting PR is still collected again once the window has passed.
-  f.scan(new Date(Date.parse(NOW) + 60_000).toISOString());
+  await f.scan(new Date(Date.parse(NOW) + 60_000).toISOString());
   assert.equal(f.synced().length, 1, 'not inside the spacing window');
-  f.scan(new Date(Date.parse(NOW) + BASE_SYNC_SPACING_MS + 60_000).toISOString());
+  await f.scan(new Date(Date.parse(NOW) + BASE_SYNC_SPACING_MS + 60_000).toISOString());
   assert.deepEqual(f.synced().sort(), [981, 982]);
 });
 
-test('a round leaves a PR that is only a few commits behind alone', (t) => {
+test('a round leaves a PR that is only a few commits behind alone', async (t) => {
   const f = roundFixture(t, { numbers: [983], behindBy: 3 });
-  f.scan(NOW);
+  await f.scan(NOW);
   assert.equal(f.compares.length, 1, 'the drift is read');
   assert.deepEqual(f.synced(), []);
-  f.scan(new Date(Date.parse(NOW) + 60_000).toISOString());
+  await f.scan(new Date(Date.parse(NOW) + 60_000).toISOString());
   assert.equal(f.compares.length, 1, 'and not read again while the head and base tip stay the same');
 });
