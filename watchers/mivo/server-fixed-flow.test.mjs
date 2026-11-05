@@ -332,3 +332,26 @@ test('a thread the App path took is not brought back by a missing-result recover
   const on = await again.poll({ threads, switchValue: '1', appResolveFn: spy({ resolved: ['PRRT_1'], failures: [] }) });
   assert.deepEqual(sentKeys(on.sent).sort(), ['thread:PRRT_2:PRRC_2a']);
 });
+
+test('a failed resolve stays undelivered even when another thread is dispatched in the same round', async (t) => {
+  const w = world(t);
+  const net = github({ mint: () => ({ status: 422, json: async () => ({}) }) });
+  const failed = await w.poll({ threads: [fixedThread(1), openThread(2)], switchValue: '1', appResolveFn: net.appResolveFn });
+  assert.deepEqual(sentKeys(failed.sent), ['thread:PRRT_2:PRRC_2a']);
+  assert.ok(!Object.keys(failed.entry.feedbackCursor ?? {}).some((key) => key.includes('PRRT_1')), 'the bound dispatch does not mark the held thread as delivered');
+  const later = await w.poll({ threads: [fixedThread(1), openThread(2)] });
+  assert.equal(later.report.dispatch.reason, 'task-in-flight', 'the session working on the other thread holds the round');
+  assert.equal(later.report.fresh, 2, 'with the switch off the held thread comes back as fresh feedback, not as delivered');
+});
+
+test('a thread the App resolved earlier and a person reopened is closed again by the existing path once a task covers it', async (t) => {
+  const reopened = threadOf('PRRT_1', [finding('PRRC_1a'), fixedReply('PRRC_1b'), { id: 'PRRC_1c', author: person, body: '还是有问题', createdAt: '2026-11-05T00:50:00Z' }]);
+  for (const switchValue of [undefined, '1']) {
+    const w = taskCovering(t, [reopened]);
+    writePr(w.paths.home, NODE, { ...w.state(), autoClosedThreads: { PRRT_1: { at: NOW, key: KEY, reason: 'server-review-fixed', head: HEAD, commentId: 'PRRC_1b' } } });
+    const asked = spy({ resolved: [], failures: [] });
+    const run = await w.poll({ threads: [reopened], switchValue, appResolveFn: asked });
+    assert.equal(asked.log.length, 0, 'a person spoke last: not a server-fixed thread');
+    assert.equal(resolvesThrough(run.calls).length, 2, `switch ${JSON.stringify(switchValue)}: the covered thread is answered and resolved as before`);
+  }
+});

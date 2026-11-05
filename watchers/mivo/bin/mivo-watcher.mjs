@@ -2464,7 +2464,7 @@ export function* processPr({
   // found fixed are resolved as the review App's bot, not dispatched. A failed resolve leaves the thread open,
   // only logs, and never falls back to this watcher's own account (the cursor stays as it was, so a build with
   // the switch off still delivers it).
-  const serverFixed = { ids: new Set(), held: [] };
+  const serverFixed = { ids: new Set() };
   if (!dryRun && resolveWithAppEnabled()) {
     const { eligible } = partitionServerFixedThreads(collected.threads ?? [], ownerPr.headRefOid, previous);
     if (eligible.length > 0) {
@@ -2473,7 +2473,12 @@ export function* processPr({
       autoClosedThisRound = outcome.closed;
       const failedIds = new Set(outcome.failed.map((failure) => failure.threadId));
       serverFixed.ids = new Set(eligible.map((hit) => hit.threadId));
-      serverFixed.held = rawFresh.filter((item) => failedIds.has(item.threadId));
+      // Held out of `cursor` itself: a delivery bound later in this round for other feedback saves `cursor` whole.
+      for (const item of rawFresh) {
+        if (!failedIds.has(item.threadId)) continue;
+        if (Object.hasOwn(cursorBase, item.key)) cursor[item.key] = cursorBase[item.key];
+        else delete cursor[item.key];
+      }
       for (const { threadId, phase, expected, actual } of outcome.failed) {
         events.push({ kind: 'server-fixed-thread-resolve-failed', number: pr.number, threadId, phase, expected, actual });
       }
@@ -2555,8 +2560,11 @@ export function* processPr({
       }
     } catch { /* keep pending items */ }
     const seen = new Set();
-    // A thread the App path resolved (or tried to) is not answered again with this account's token.
-    const appHandled = (threadId) => serverFixed.ids.has(threadId) || previous.autoClosedThreads?.[threadId]?.reason === SERVER_FIXED_REASON;
+    // A thread the App path took this round, or resolved earlier and still resolved, is not answered again with this
+    // account. Once a person reopens it, the existing path closes it as before.
+    const threadById = new Map((collected.threads ?? []).map((thread) => [thread?.id, thread]));
+    const appHandled = (threadId) => serverFixed.ids.has(threadId)
+      || (previous.autoClosedThreads?.[threadId]?.reason === SERVER_FIXED_REASON && threadById.get(threadId)?.isResolved === true);
     closable = closable.filter((item) => item?.threadId && !appHandled(item.threadId) && !seen.has(item.threadId) && seen.add(item.threadId));
     if (closable.length > 0) {
       const outcome = yield* closeRefutedThreads({
@@ -2733,7 +2741,7 @@ export function* processPr({
   let dispatch = { attempted: false, bound: false, reason: 'no-new-feedback' };
   // Advance only non-actionable observations until a delivery is acknowledged.
   const retainedCursor = { ...cursor };
-  for (const item of [...fresh, ...serverFixed.held]) {
+  for (const item of fresh) {
     if (Object.hasOwn(cursorBase, item.key)) retainedCursor[item.key] = cursorBase[item.key];
     else delete retainedCursor[item.key];
   }
