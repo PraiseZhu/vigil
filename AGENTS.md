@@ -55,6 +55,16 @@ python3 -B watchers/cindy/cindy-watch-script.test.py
 新增测试时,夹具数据(仓库名、用户名、路径)一律用占位符,不要引用真实数据,即便只是本机
 开发时顺手写的"我自己的仓库名"。
 
+Cloud Agent 的用户级 git 配置会用 `url.*.insteadOf` 把 `https://github.com/` 重写成带访问令牌的地址。
+`git remote get-url` 因此会带回凭证,mivo 的 worktree origin 校验会失败。跑测试时不要读这份用户级配置:
+
+```sh
+GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null npm test
+```
+
+acceptance 的真沙箱测试依赖系统包 `bubblewrap`(装好后 `bwrap --ro-bind / / true` 应能退出 0)。
+本仓库没有第三方 npm 依赖,也不提交 lockfile,依赖安装用 `npm install --no-package-lock`。
+
 ## 两个 watcher 的源码不要互相耦合
 
 `watchers/mivo` 和 `watchers/cindy` 是两套独立的实现(cindy 是 mivo 的 cross-repo fork 变体,
