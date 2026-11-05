@@ -34,12 +34,14 @@ import {
   eventRunPaths,
   eventTargets,
   loadSingleItemModule,
+  makeEventRunLogger,
   main as eventRunMain,
   parseEventRunArgs,
   readEventRunConfig,
   runEventRun,
 } from './bin/event-run.mjs';
 import { isReadOnlyGraphql } from './bin/github.mjs';
+import { GRAPHQL_COST_PER_REQUEST } from './bin/rate-budget.mjs';
 import { writeLockHeld } from './bin/prio-lock.mjs';
 import { renderPrioBoardSection } from './bin/prio-board-section.mjs';
 import { viewPrio } from './bin/prio-view.mjs';
@@ -1703,12 +1705,15 @@ test('W4c SC6 兜底轮询只在 Worker 连续失败到门槛后才跑（缺省 
 
 test('W4c SC6 兜底轮询只补写事件路径没写成功的那一条，不整盘读', async () => {
   const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  let nowMs = t0;
   const written = [];
   let failOnce = true;
   const pipeline = createEventPipeline({
     state: createEventRunState({ allowedRepos: ['example/owner-a'] }),
     paths: fixture.paths,
     write: true,
+    now: () => nowMs,
     syncOne: async (target) => {
       if (failOnce) {
         failOnce = false;
@@ -1720,8 +1725,13 @@ test('W4c SC6 兜底轮询只补写事件路径没写成功的那一条，不整
   });
   await assert.rejects(() => pipeline.onEvent(issueEvent('p1', { issue: 7 })), /连不上看板/);
   assert.deepEqual(written, []);
+  // 补写通道有退避：失败后第一拍（同一时刻）还没到期，不重试。
   assert.deepEqual(await pipeline.poll(), []);
-  assert.deepEqual(written, ['example/owner-a#7'], '兜底轮询把没写成功的那条补上');
+  assert.deepEqual(written, [], '退避没到期：这一拍不补');
+  nowMs = t0 + 60000;
+  assert.deepEqual(await pipeline.poll(), []);
+  assert.deepEqual(written, ['example/owner-a#7'], '60 秒后兜底轮询把没写成功的那条补上');
+  nowMs = t0 + 120000;
   assert.deepEqual(await pipeline.poll(), []);
   assert.deepEqual(written, ['example/owner-a#7'], '补完之后没有待补目标');
 });
@@ -2288,6 +2298,449 @@ test('W4f SC9 授权清单里含 * 的条目在发现时跳过并记一行，其
   );
 });
 
+// ── W4-g：发现闸不重复记账、written:0 不算完成、补写退避与放弃、日志与预算重读（issue #327）────
+
+test('W4g SC1 发现闸只判定不记账：used 增量 = 实际请求数 × 6，不多出闸那 6 点', async () => {
+  const fixture = eventRunFixture();
+  const nowMs = Date.parse('2026-11-01T12:00:00.000Z');
+  writeRateStateFile(fixture.paths.rateStateFile, { used: 10, nowMs });
+  const calls = [];
+  // 真的记账通道：每发一次发现请求就 chargeOnce 记一笔（与生产同一条路径）。
+  const listRecent = createGraphqlListRecent({
+    reader: {
+      async ownerGraphql(_query, { owner, name }) {
+        calls.push(`${owner}/${name}`);
+        return { repository: { pullRequests: { nodes: [] }, issues: { nodes: [] } } };
+      },
+    },
+    rateStateFile: fixture.paths.rateStateFile,
+    now: () => nowMs,
+  });
+  const pipeline = createEventPipeline({
+    state: createEventRunState({ allowedRepos: ['example/owner-a', 'example/owner-b'] }),
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async () => ({ written: 1 }),
+    logger: () => {},
+    listRecent,
+  });
+  await pipeline.poll();
+  assert.equal(calls.length, 2, '两个授权仓各发一次发现请求');
+  const after = JSON.parse(fs.readFileSync(fixture.paths.rateStateFile, 'utf8'));
+  const used = after.components['prio-run'].used;
+  assert.equal(used, 10 + GRAPHQL_COST_PER_REQUEST * calls.length, 'used 只按实际发出的请求记账');
+  assert.notEqual(
+    used,
+    10 + GRAPHQL_COST_PER_REQUEST + GRAPHQL_COST_PER_REQUEST * calls.length,
+    '闸自己不再多记那 6 点（判定用 cost:0 + reserve）',
+  );
+});
+
+test('W4g SC2 reserve 在预算边界上生效：仓数 × 6 预留不够就一次请求都不发，used 不变', async () => {
+  const nowMs = Date.parse('2026-11-01T12:00:00.000Z');
+  const runOnce = async ({ repos, budget, used }) => {
+    const fixture = eventRunFixture();
+    fs.mkdirSync(path.dirname(fixture.paths.rateBudgetConfigFile), { recursive: true });
+    fs.writeFileSync(
+      fixture.paths.rateBudgetConfigFile,
+      JSON.stringify({ rateBudget: { loop: 500, 'prio-run': budget, 'board-live': 140 } }),
+    );
+    writeRateStateFile(fixture.paths.rateStateFile, { used, nowMs });
+    const calls = [];
+    const logs = [];
+    const pipeline = createEventPipeline({
+      state: createEventRunState({ allowedRepos: repos }),
+      paths: fixture.paths,
+      write: true,
+      now: () => nowMs,
+      syncOne: async () => ({ written: 1 }),
+      logger: (line) => logs.push(line),
+      listRecent: async ({ repo }) => {
+        calls.push(repo);
+        return [];
+      },
+    });
+    await pipeline.poll();
+    const state = JSON.parse(fs.readFileSync(fixture.paths.rateStateFile, 'utf8'));
+    return { calls, logs, used: state.components['prio-run']?.used ?? 0 };
+  };
+
+  // 两仓：used 6 + cost 0 + reserve 12 > 预算 13 → 拒绝，且 used 不变（拒绝不是靠记账堆出来的）。
+  const two = await runOnce({ repos: ['example/owner-a', 'example/owner-b'], budget: 13, used: 6 });
+  assert.deepEqual(two.calls, [], 'reserve 不够：这一拍一次发现请求都不发');
+  assert.equal(two.used, 6, '被拒那一拍不记任何点，used 仍是 6');
+  assert.ok(two.logs.some((line) => /额度不够/.test(line) && /over-budget/.test(line)), '日志写明原因');
+
+  // 同一份预算只留一个授权仓：used 6 + 0 + reserve 6 ≤ 13 → 放行，证明 reserve 随仓数变。
+  const one = await runOnce({ repos: ['example/owner-a'], budget: 13, used: 6 });
+  assert.deepEqual(one.calls, ['example/owner-a'], 'reserve 随仓数降到 6：这一拍放行并发一次请求');
+  assert.equal(one.used, 6, '闸不记点：放行不再给 used 加 6');
+});
+
+test('W4g SC3 written:0 的静默跳过不算完成：不进 handled、日志写跳过、重叠窗口内下一拍重写', async () => {
+  const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  let nowMs = t0;
+  const writes = [];
+  const logs = [];
+  const state = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  const pipeline = createEventPipeline({
+    state,
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async (target) => {
+      writes.push(target.ref);
+      return { ok: true, written: 0, mode: 'write', reason: 'rate-budget' };
+    },
+    logger: (line) => logs.push(line),
+    listRecent: async ({ repo }) => [{ repo, number: 7, kind: 'issue', updatedAt: new Date(t0).toISOString() }],
+  });
+  await pipeline.poll();
+  nowMs = t0 + 60000;
+  await pipeline.poll();
+  assert.equal(state.handled.size, 0, 'written:0 不进「本次故障期已处理」集合');
+  assert.equal(writes.length, 2, '同一目标下一拍（2 分钟重叠窗口内）会再写一次');
+  const skipLines = logs.filter((line) => /跳过/.test(line));
+  assert.ok(skipLines.length >= 1, '日志里写「跳过」');
+  assert.ok(skipLines.some((line) => /rate-budget/.test(line)), '跳过行带原因');
+  assert.equal(logs.some((line) => /完成/.test(line)), false, '一条都没写就不许出现「完成」');
+
+  // mode === 'disabled' 仍然算完成：这一条可以 ack。
+  const disabledFixture = eventRunFixture();
+  const disabledState = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  const disabledLogs = [];
+  const disabledPipeline = createEventPipeline({
+    state: disabledState,
+    paths: disabledFixture.paths,
+    write: true,
+    now: () => t0,
+    syncOne: async () => ({ ok: true, written: 0, mode: 'disabled', reason: 'stop-switch' }),
+    logger: (line) => disabledLogs.push(line),
+    listRecent: async ({ repo }) => [{ repo, number: 7, kind: 'issue', updatedAt: new Date(t0).toISOString() }],
+  });
+  await disabledPipeline.poll();
+  assert.equal(disabledState.handled.size, 1, 'mode=disabled 仍进 handled，事件可以 ack');
+  assert.ok(disabledLogs.some((line) => /完成/.test(line)), '停写开关生效这一条仍写「完成」');
+});
+
+test('W4g SC4 补写退避 60 秒 → 5 分钟 → 15 分钟：未到期不调 syncOne、也不说已经补完', async () => {
+  const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  let nowMs = t0;
+  const calls = [];
+  const logs = [];
+  const state = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  const pipeline = createEventPipeline({
+    state,
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async (target) => {
+      calls.push({ at: nowMs, ref: target.ref });
+      throw new Error('看板写不进去');
+    },
+    logger: (line) => logs.push(line),
+  });
+  // 事件路径先失败一次：pending 里留下这条，第一次补写排在「失败时刻 + 60 秒」。
+  await assert.rejects(() => pipeline.onEvent(issueEvent('retry-backoff-1', { issue: 7 })), /看板写不进去/);
+  assert.equal(calls.length, 1, '事件路径写一次就失败');
+  const due1 = t0 + 60000;
+  const due2 = due1 + 5 * 60000;
+  const due3 = due2 + 15 * 60000;
+  const pollAt = async (at) => {
+    nowMs = at;
+    assert.deepEqual(await pipeline.poll({ workerFailing: false }), []);
+  };
+
+  // 中途（+30 秒）与差 1 秒到期（+59 秒）：都不重试，也不写「已经补完」。
+  await pollAt(t0 + 30000);
+  assert.equal(calls.length, 1, '失败后 30 秒：还没到期，不补写');
+  await pollAt(due1 - 1000);
+  assert.equal(calls.length, 1, '失败后 59 秒：还差 1 秒，不补写');
+  assert.equal(logs.some((line) => /已经补完/.test(line)), false, 'pending 非空只是没到期，不许说「已经补完」');
+
+  await pollAt(due1);
+  assert.equal(calls.length, 2, '失败后 60 秒：第 1 次补写');
+  assert.equal(calls.at(-1).at, due1, '补写就发生在这一拍');
+
+  await pollAt(due1 + 1000);
+  assert.equal(calls.length, 2, '第 1 次失败后 1 秒：第 2 档 5 分钟还没到期');
+  await pollAt(due2 - 1000);
+  assert.equal(calls.length, 2, '第 2 档差 1 秒：不补写');
+  await pollAt(due2);
+  assert.equal(calls.length, 3, '第 2 次补写在 5 分钟后');
+  assert.equal(calls.at(-1).at, due2);
+
+  await pollAt(due2 + 1000);
+  assert.equal(calls.length, 3, '第 3 档 15 分钟还没到期');
+  await pollAt(due3 - 1000);
+  assert.equal(calls.length, 3, '第 3 档差 1 秒：不补写');
+  await pollAt(due3);
+  assert.equal(calls.length, 4, '第 3 次补写在 15 分钟后（这次失败就到上限）');
+  assert.equal(calls.at(-1).at, due3);
+});
+
+test('W4g 补充 发现来源也受退避约束：退避没到期的目标，发现到了也不重写', async () => {
+  const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  let nowMs = t0;
+  const calls = [];
+  const state = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  const pipeline = createEventPipeline({
+    state,
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async (target) => {
+      calls.push({ at: nowMs, ref: target.ref });
+      throw new Error('看板写不进去');
+    },
+    logger: () => {},
+    // 发现通道每拍都返回同一个目标；updatedAt 跟时钟走，保证它每一拍都落在发现窗口里
+    // （窗口是「上次成功发现 - 2 分钟」，写死 t0 的话后面几拍会自然发现不到，验不出退避这道闸）。
+    listRecent: async ({ repo }) => [{ repo, number: 7, kind: 'issue', updatedAt: new Date(nowMs).toISOString() }],
+  });
+  // 事件路径先写失败一次：pending 里留下这条，第 1 次补写排在「失败时刻 + 60 秒」。
+  await assert.rejects(() => pipeline.onEvent(issueEvent('discovery-backoff-1', { issue: 7 })), /看板写不进去/);
+  const key = 'example/owner-a#7';
+  assert.equal(calls.length, 1, '事件路径写一次就失败');
+  assert.equal(state.pending.has(key), true, '失败先留在 pending');
+  const due1 = t0 + 60000;
+  const due2 = due1 + 5 * 60000;
+  const pollAt = async (at) => {
+    nowMs = at;
+    assert.deepEqual(await pipeline.poll({ workerFailing: true }), []);
+  };
+
+  // +30 秒与差 1 秒到期（+59 秒）：发现通道每拍都看到这个目标，但退避没到期，一个都不写。
+  await pollAt(t0 + 30000);
+  assert.equal(calls.length, 1, '失败后 30 秒：发现了也不重写');
+  await pollAt(due1 - 1000);
+  assert.equal(calls.length, 1, '失败后 59 秒：还差 1 秒，发现了也不重写');
+
+  await pollAt(due1);
+  assert.equal(calls.length, 2, '失败后 60 秒：到期，补写一次（这一拍又失败，下一档排到 5 分钟）');
+  assert.equal(calls.at(-1).at, due1, '补写就发生在这一拍');
+
+  // 第 2 次失败后排到 +5 分钟：差 1 秒（+4 分 59 秒）不写，到期写一次。
+  await pollAt(due2 - 1000);
+  assert.equal(calls.length, 2, '第 2 档差 1 秒：发现了也不重写');
+  await pollAt(due2);
+  assert.equal(calls.length, 3, '第 2 档到期：补写一次');
+  assert.equal(calls.at(-1).at, due2, '第 2 档补写就发生在这一拍');
+});
+
+test('W4g SC5 上限放弃：第 4 次失败后移出 pending、只写一行放弃日志、之后不再重试；ok:false 仍不 ack', async () => {
+  const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  let nowMs = t0;
+  const calls = [];
+  const logs = [];
+  const state = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  const pipeline = createEventPipeline({
+    state,
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async (target) => {
+      calls.push({ at: nowMs, ref: target.ref });
+      return { ok: false, written: 0, reason: 'lock-busy' };
+    },
+    logger: (line) => logs.push(line),
+  });
+  await assert.rejects(() => pipeline.onEvent(issueEvent('abandon-1', { issue: 7 })), /lock-busy/);
+  const key = 'example/owner-a#7';
+  assert.equal(state.pending.has(key), true, '写失败先留在 pending');
+
+  // 三档退避各补一次：第 4 次失败（事件路径 1 次 + 补写 3 次）就到上限。
+  const due1 = t0 + 60000;
+  const due2 = due1 + 5 * 60000;
+  const due3 = due2 + 15 * 60000;
+  for (const at of [due1, due2, due3]) {
+    nowMs = at;
+    await pipeline.poll({ workerFailing: false });
+  }
+  assert.equal(calls.length, 4, '事件路径 1 次 + 补写 3 次');
+  assert.equal(state.pending.has(key), false, '到上限就从 pending 移出');
+  assert.equal(state.retries.has(key), false, '退避记录也清掉');
+  const abandonLines = logs.filter((line) => /放弃补写/.test(line));
+  assert.equal(abandonLines.length, 1, '放弃日志只有一行');
+  assert.match(abandonLines[0], /example\/owner-a#7/);
+  assert.match(abandonLines[0], /lock-busy/, '放弃行带最后一次原因');
+  assert.match(abandonLines[0], /不再自动补写/);
+
+  const afterAbandon = calls.length;
+  nowMs = due3 + 60000;
+  await pipeline.poll({ workerFailing: false });
+  nowMs = due3 + 60 * 60000;
+  await pipeline.poll({ workerFailing: false });
+  assert.equal(calls.length, afterAbandon, '放弃之后 poll 不再重试它');
+  assert.equal(logs.filter((line) => /放弃补写/.test(line)).length, 1, '放弃日志仍只有一行');
+
+  // runEventChannel 侧（照 W4f SC5 的写法）：ok:false 不 ack，放弃补写之后这条事件仍留在 Worker 队列里。
+  const channelFixture = eventRunFixture();
+  const channelState = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  let t = 0;
+  let pendingPull = true;
+  const confirmed = [];
+  const channelPipeline = createEventPipeline({
+    state: channelState,
+    paths: channelFixture.paths,
+    write: true,
+    now: () => t,
+    syncOne: async () => ({ ok: false, written: 0, reason: 'lock-busy' }),
+    logger: () => {},
+  });
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 3 * 60 * 1000,
+    pull: async () => {
+      if (!pendingPull) return [];
+      pendingPull = false;
+      return [issueEvent('abandon-ack-1', { issue: 7 })];
+    },
+    poll: (options) => channelPipeline.poll(options),
+    confirm: async (ids) => confirmed.push(...ids),
+    onEvent: (event) => channelPipeline.onEvent(event),
+    hasPending: () => channelState.pending.size > 0,
+    latencyFile: path.join(tmpDir(), '.prio', 'latency.jsonl'),
+  });
+  assert.deepEqual(confirmed, [], 'ok:false 不 ack：这条事件没有被 confirm');
+});
+
+test('W4g SC6 flushSkips 只在 written === 0 时输出：写成功不留「单条读写跳过」，成功照旧写「完成」', async () => {
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  const runWith = async (syncOne) => {
+    const fixture = eventRunFixture();
+    const logs = [];
+    const pipeline = createEventPipeline({
+      state: createEventRunState({ allowedRepos: ['example/owner-a'] }),
+      paths: fixture.paths,
+      write: true,
+      now: () => t0,
+      syncOne,
+      logger: (line) => logs.push(line),
+      listRecent: async ({ repo }) => [{ repo, number: 7, kind: 'issue', updatedAt: new Date(t0).toISOString() }],
+    });
+    await pipeline.poll();
+    return logs;
+  };
+
+  // 写成功：syncEventItem 照样会往 stdout 写额度闸自己的日志，那不是跳过。
+  const okLogs = await runWith(async (target, ctx) => {
+    ctx.stdout.write('rate-recovery component=prio-run remaining=4200\n');
+    return { ok: true, written: 1, mode: 'write' };
+  });
+  assert.equal(okLogs.filter((line) => /单条读写跳过/.test(line)).length, 0, 'written > 0 不汇总成「跳过」');
+  assert.ok(okLogs.some((line) => /example\/owner-a#7 完成/.test(line)), '成功那次照旧写「完成」');
+
+  // 一条都没写：仍按 ref 汇总成一行。
+  const zeroLogs = await runWith(async (target, ctx) => {
+    ctx.stdout.write('额度不够：这一条不读也不写，留给下一拍\n');
+    return { ok: true, written: 0, mode: 'write', reason: 'rate-budget' };
+  });
+  const zeroSkips = zeroLogs.filter((line) => /单条读写跳过/.test(line));
+  assert.equal(zeroSkips.length, 1, 'written:0 仍按 ref 汇总成一行');
+  assert.match(zeroSkips[0], /example\/owner-a#7/);
+  assert.match(zeroSkips[0], /额度不够/);
+});
+
+test('W4g SC7 闸出错的 rate-unknown 行只有一个时间戳', async () => {
+  const fixture = eventRunFixture();
+  const nowMs = Date.parse('2026-11-01T12:00:00.000Z');
+  writeRateStateFile(fixture.paths.rateStateFile, { used: 0, nowMs });
+  // 真的日志函数：它自己会在行首加一个时间戳。
+  const logger = makeEventRunLogger(fixture.paths.logFile, { now: () => nowMs, stdout: null });
+  const calls = [];
+  const pipeline = createEventPipeline({
+    state: createEventRunState({ allowedRepos: ['example/owner-a'] }),
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async () => ({ written: 1 }),
+    logger,
+    // 口径错的预算：decideTick 自己抛错，走闸的 catch 分支（rate-unknown）。
+    budgets: { loop: 500, 'prio-run': 0, 'board-live': 140 },
+    listRecent: async ({ repo }) => {
+      calls.push(repo);
+      return [];
+    },
+  });
+  await pipeline.poll();
+  assert.deepEqual(calls, ['example/owner-a'], '闸自己出错就放行留痕：这一拍照常发现');
+  const text = fs.readFileSync(fixture.paths.logFile, 'utf8');
+  const line = text.split('\n').find((row) => row.includes('rate-unknown'));
+  assert.ok(line, '闸出错要留一行 rate-unknown');
+  const stamps = line.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g) || [];
+  assert.equal(stamps.length, 1, `rate-unknown 行只有日志器加的那一个时间戳：${line}`);
+});
+
+test('W4g SC8 预算文件读失败不缓存 null：下一拍重读到新预算，越界后不再发现', async () => {
+  const fixture = eventRunFixture();
+  const nowMs = Date.parse('2026-11-01T12:00:00.000Z');
+  fs.mkdirSync(path.dirname(fixture.paths.rateBudgetConfigFile), { recursive: true });
+  fs.writeFileSync(fixture.paths.rateBudgetConfigFile, '{ 这不是合法 JSON');
+  writeRateStateFile(fixture.paths.rateStateFile, { used: 10, nowMs });
+  const calls = [];
+  const logs = [];
+  const pipeline = createEventPipeline({
+    state: createEventRunState({ allowedRepos: ['example/owner-a'] }),
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async () => ({ written: 1 }),
+    logger: (line) => logs.push(line),
+    listRecent: async ({ repo }) => {
+      calls.push(repo);
+      return [];
+    },
+  });
+  await pipeline.poll();
+  assert.equal(calls.length, 1, '预算文件读失败：闸只按响应头判定，这一拍照常发现');
+  assert.ok(logs.some((line) => /额度预算配置无法使用/.test(line)), '读失败要留一行');
+
+  // 换成好预算：used 10 + reserve 6 > 13 → 越界。第二次 poll 必须用上新预算。
+  fs.writeFileSync(
+    fixture.paths.rateBudgetConfigFile,
+    JSON.stringify({ rateBudget: { loop: 500, 'prio-run': 13, 'board-live': 140 } }),
+  );
+  writeRateStateFile(fixture.paths.rateStateFile, { used: 10, nowMs });
+  await pipeline.poll();
+  assert.equal(calls.length, 1, '下一拍重读到新预算：listRecent 不再被调');
+  assert.ok(logs.some((line) => /额度不够/.test(line) && /over-budget/.test(line)), '日志写明越界');
+});
+
+test('W4g SC9 logQuiet 按类别去重：两仓同拍都读失败各出一行，不同类别互不吞掉', async () => {
+  const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  const logs = [];
+  const pipeline = createEventPipeline({
+    state: createEventRunState({ allowedRepos: ['example/owner-a', 'example/owner-b'] }),
+    paths: fixture.paths,
+    write: true,
+    now: () => t0,
+    syncOne: async () => ({ written: 1 }),
+    logger: (line) => logs.push(line),
+    listRecent: async ({ repo }) => {
+      throw new Error(`读失败：${repo}`);
+    },
+  });
+  await pipeline.poll();
+  const failLines = logs.filter((line) => /读失败/.test(line));
+  assert.equal(failLines.length, 2, '两个仓各一行，不被 60 秒去重吞掉');
+  assert.equal(failLines.filter((line) => line.includes('example/owner-a')).length, 1, 'owner-a 一行');
+  assert.equal(failLines.filter((line) => line.includes('example/owner-b')).length, 1, 'owner-b 一行');
+  assert.ok(
+    logs.some((line) => /没有待补的单条目标/.test(line)),
+    '同一拍里「单仓读失败」与「这一拍没有待补目标」两类都留下',
+  );
+});
+
 test('W4c SC10 延迟行带 written 标记：真写入为 true，无变化/dry-run/非授权仓为 false，老行不写这个键', async () => {
   // 真写入与无变化：syncOne 自己报 written。
   const writtenFixture = eventRunFixture();
@@ -2355,7 +2808,8 @@ test('W4c SC6 窄写入函数：payload 形状固定、ctx 只有状态目录；
     ['event', 'issue', 'linkAllowed', 'now', 'ref', 'repo', 'source'],
     'payload 形状固定',
   );
-  assert.deepEqual(calls[0].ctx, { dir: fixture.paths.stateDir, stdout: calls[0].ctx.stdout }, 'ctx 带状态目录与日志 sink');
+  assert.deepEqual(Object.keys(calls[0].ctx).sort(), ['dir', 'stdout'], 'ctx 只有状态目录与日志 sink 两个键');
+  assert.equal(calls[0].ctx.dir, fixture.paths.stateDir, 'ctx.dir 就是状态目录');
   assert.equal(typeof calls[0].ctx.stdout?.write, 'function', 'ctx.stdout 是日志 sink（W4f SC6）');
 
   // mode=disabled 且 ok：停写开关生效，这条不写、不设水位，但不抛错，所以可以 ack。

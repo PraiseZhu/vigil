@@ -13,9 +13,11 @@
 // 本进程整个挂掉 → 现有 30 分钟定时任务照旧收敛看板。兜底轮询补写「事件写过但没写成功」的单条目标，
 // 并（Worker 失败期间）每 60 秒对授权仓做一次发现：每仓 1 次只读 GraphQL（DISCOVERY_QUERY）拿最近更新的 PR/issue，
 // 把目标交给同一条单条写入路径。发现通道和整盘读共用 `prio-run` 这一格额度：发现前先过 decideTick
-// （purpose=non-essential、cost=GRAPHQL_COST_PER_REQUEST 即 6 点），闸不放行（超预算 / 剩余 <800 暂停）的这一拍一次都不发；
-// 每发一次实际请求用 chargeBudget 记账并写回 rate-budget.json（抛错也记）。没设 ACCEPTANCE_WATCHER_HOME 就不启用闸，只记一行。
-// 写失败的目标留在 pending 里，Worker 正常时也每 60 秒补写一拍（不跑发现）；
+// （purpose=non-essential、cost=0、reserve=GRAPHQL_COST_PER_REQUEST × 具体授权仓数），reserve 只进预算比较、不记账，
+// 闸不放行（超预算 / 剩余 <800 暂停）的这一拍一次都不发；每发一次实际请求用 chargeBudget 记账并写回 rate-budget.json
+// （抛错也记）——一拍只在这一处记点，闸不再重复记。没设 ACCEPTANCE_WATCHER_HOME 就不启用闸，只记一行。
+// 写失败的目标留在 pending 里，Worker 正常时也每 60 秒补写一拍（不跑发现）；补写通道按 60 秒 → 5 分钟 → 15 分钟退避，
+// 第 4 次失败放弃（写一行日志，事件仍不 ack，交给 Worker 重投与 30 分钟整盘）。
 // 本次故障期已处理的目标记在内存集合里（2 分钟重叠窗口内不重读），Worker 恢复（pull 成功）即清空。
 // 发现和事件补写合并去重，同一目标一拍只写一次；不整盘读，也不替现有定时任务做对账。
 //
@@ -68,6 +70,13 @@ export const EVENT_RUN_LOG_MAX_BYTES = 5 * 1024 * 1024;
 const QUIET_LOG_MS = 60 * 1000;
 /** 汇总一条目标的跳过原因时，每条最多留这么多字符（不把整条响应写进日志）。 */
 const SKIP_REASON_MAX = 160;
+/** 预算配置读失败后的重读间隔：补写/发现通道的拍间隔就是 60 秒，失败后下一拍重读（不永久 null）。 */
+export const BUDGET_CONFIG_RETRY_MS = 60 * 1000;
+/**
+ * 补写通道的退避（毫秒）：写失败后第 1 次补写在 60 秒后，第 2 次 5 分钟后，第 3 次 15 分钟后，第 4 次失败放弃。
+ * 只在内存、不落盘（与 handled 同口径）；只拦补写通道（source: 'poll'），事件路径照旧不受影响。
+ */
+export const RETRY_BACKOFF_MS = Object.freeze([60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000]);
 /** 兜底发现的时间水位：还没成功发现过（刚启动）回看 10 分钟；之后按上次成功发现减 2 分钟。 */
 export const DISCOVERY_LOOKBACK_MS = 10 * 60 * 1000;
 export const DISCOVERY_OVERLAP_MS = 2 * 60 * 1000;
@@ -277,6 +286,9 @@ export function createEventRunState({ allowedRepos = [] } = {}) {
     allowedRepos: new Set((allowedRepos || []).map((repo) => String(repo).toLowerCase())),
     watermarks: new Map(),
     pending: new Map(),
+    // 补写退避表（小写 ref → { attempts, nextAtMs, lastReason }）：形状与 pending 分开，pending 的值类型不变
+    // （仍是一个目标）。attempts = 已经重试过的次数，nextAtMs = 下一次允许补写的时刻。只在内存，不落盘。
+    retries: new Map(),
     // 本次故障期已处理的目标（小写 ref → 当时写进去的 updatedAt 毫秒）：2 分钟重叠窗口里同一个 updatedAt 不再重复写；
     // 目标之后又有更新（updatedAt 更大）照样重写。只在内存，Worker 恢复即清空。
     handled: new Map(),
@@ -472,6 +484,8 @@ export function createEventPipeline({
   if (!state || !paths) throw new EventRunConfigError('事件处理需要 state 和 paths');
   // 调用方自己拼的 state（不是 createEventRunState）也要有「本次故障期已处理」集合。
   if (!(state.handled instanceof Map)) state.handled = new Map();
+  // 补写退避表同理：形状和 pending 分开，pending 里仍然只放目标本身。
+  if (!(state.retries instanceof Map)) state.retries = new Map();
 
   // syncEventItem 写回来的几条静默跳过先进这里，写完由 flushSkips 按 ref 汇总成一行。
   let skipSink = null;
@@ -489,11 +503,13 @@ export function createEventPipeline({
   // 上次成功发现的时间：只存内存，进程重启后回到「回看 10 分钟」。
   let lastDiscoveryMs = null;
 
-  let lastQuietAt = -Infinity;
-  function logQuiet(text) {
+  // 静默日志按类别各自去重：同一拍里多仓读失败、额度不够、开关类互不吞掉（单仓读失败按仓名分开）。
+  const lastQuietAt = new Map();
+  function logQuiet(key, text) {
     const at = now();
-    if (at - lastQuietAt < QUIET_LOG_MS) return;
-    lastQuietAt = at;
+    const prev = lastQuietAt.get(key) ?? -Infinity;
+    if (at - prev < QUIET_LOG_MS) return;
+    lastQuietAt.set(key, at);
     logger(text);
   }
   function logOnce(key, text) {
@@ -521,7 +537,9 @@ export function createEventPipeline({
   }
 
   /**
-   * 单条写入：拼 payload → 走窄写入函数（写锁在 syncEventItem 里）。返回 { written, mode }；written > 0 才算真写进看板。
+   * 单条写入：拼 payload → 走窄写入函数（写锁在 syncEventItem 里）。
+   * 返回 { written, mode, reason }：written > 0 才算真写进看板；written === 0 的静默跳过（额度不够、每小时上限、
+   * 无变化）把 result.reason 带回去，由调用方决定算不算处理完成。
    * 先把目标记进 pending：写失败（含意外抛错）就留到下一拍补写通道，写成功才移出。
    */
   async function writeOne(target, { event = null, createdMs = null, source = 'event' } = {}) {
@@ -529,7 +547,7 @@ export function createEventPipeline({
     const key = String(target.ref).toLowerCase();
     state.pending.set(key, target);
     const linkAllowed = exists(paths.markerFile);
-    if (!linkAllowed) logQuiet('没有 mac-mini-stopped 标记：「关联 PR」这类 link 字段交给 syncOne 扣住，这里不绕过');
+    if (!linkAllowed) logQuiet('marker:link', '没有 mac-mini-stopped 标记：「关联 PR」这类 link 字段交给 syncOne 扣住，这里不绕过');
     const collected = [];
     skipSink = {
       write(chunk) {
@@ -541,6 +559,7 @@ export function createEventPipeline({
       },
     };
     let result;
+    let failure = null;
     try {
       result = await writeTarget({
         repo: target.repo,
@@ -551,19 +570,40 @@ export function createEventPipeline({
         linkAllowed,
         now: now(),
       });
+    } catch (error) {
+      failure = error;
     } finally {
       skipSink = null;
+    }
+    if (failure) {
+      // 失败（含 syncOne 抛错、ok:false）在这里统一登记补写计划：没有记录的就排到「失败时刻 + 60 秒」，
+      // 已有记录的（补写通道的一次重试）只更新原因、不动次数与下次时间——次数由 poll() 推进。
+      const failedAt = summarize(failure);
+      const planned = state.retries.get(key);
+      state.retries.set(
+        key,
+        planned
+          ? { ...planned, lastReason: failedAt }
+          : { attempts: 0, nextAtMs: now() + RETRY_BACKOFF_MS[0], lastReason: failedAt },
+      );
+      // 一条都没写（含抛错）：stdout 上攒的跳过原因才按 ref 汇总成一行。
       flushSkips(target.ref, collected);
+      throw failure;
     }
     // 停写开关在 syncOne 里生效（mode: 'disabled'）：没有写，也不推进事件水位，但这一条可以 ack。
     if (result.mode === 'disabled') {
       state.pending.delete(key);
-      return { written: 0, mode: 'disabled' };
+      state.retries.delete(key);
+      return { written: 0, mode: 'disabled', reason: summarize(result?.reason || '') };
     }
     if (Number.isFinite(createdMs)) state.watermarks.set(key, createdMs);
     state.pending.delete(key);
+    state.retries.delete(key);
     const written = Number(result?.written);
-    return { written: Number.isFinite(written) && written > 0 ? written : 0, mode: result.mode };
+    const count = Number.isFinite(written) && written > 0 ? written : 0;
+    // 成功写入时 stdout 上的行是额度闸自己的日志（rate-recovery / rate-unknown 等），不是跳过：不汇总。
+    if (count === 0) flushSkips(target.ref, collected);
+    return { written: count, mode: result.mode, reason: summarize(result?.reason || '') };
   }
 
   /** 处理一条事件。返回值 { written } 给延迟行用：只有真写进看板且回读成功才是 true。 */
@@ -584,7 +624,7 @@ export function createEventPipeline({
       return { written: false };
     }
     if (exists(paths.prioDisabledFile)) {
-      logQuiet('.prio/disabled 存在，自动写入已暂停：这条事件只确认不写');
+      logQuiet('prio:disabled', '.prio/disabled 存在，自动写入已暂停：这条事件只确认不写');
       return { written: false };
     }
     if (!write) {
@@ -629,8 +669,41 @@ export function createEventPipeline({
   let budgetConfig = budgets;
 
   /**
+   * 这一拍用的预算配置：注入的（或已经读到过的）直接用；读文件失败不写缓存，下一拍（约 60 秒后）无条件重读，
+   * 一次临时读失败不会让预算闸在这个进程里永久失效。没给文件路径就当没有预算，只按响应头剩余判定。
+   */
+  function budgetConfigForGate() {
+    if (budgetConfig !== undefined) return budgetConfig;
+    if (!budgetConfigFile) {
+      budgetConfig = null;
+      return null;
+    }
+    try {
+      budgetConfig = readBudgetFile(budgetConfigFile);
+      return budgetConfig;
+    } catch (error) {
+      logOnce(
+        `rate:budget:${summarize(error)}`,
+        `额度预算配置无法使用（${summarize(error)}）：发现只按响应头剩余判定，${Math.round(BUDGET_CONFIG_RETRY_MS / 1000)} 秒后的下一拍重读`,
+      );
+      return null;
+    }
+  }
+
+  /** 发现通道真正会发请求的授权仓数：含 `*` 的条目发现时跳过（口径同 discover()），不计入 reserve。 */
+  function discoverableRepoCount() {
+    let count = 0;
+    for (const repo of state.allowedRepos) {
+      if (!String(repo).includes('*')) count += 1;
+    }
+    return count;
+  }
+
+  /**
    * 发现前的额度闸（与整盘 prio-run 同一格预算，不另开组件名）。
-   * 成本按 GRAPHQL_COST_PER_REQUEST 保守预估（每个授权仓 1 次请求）；缺 ACCEPTANCE_WATCHER_HOME 时不启用，只记一行，不猜路径。
+   * 判定用 cost: 0 + reserve: 每仓一次请求的点数 × 具体授权仓数：reserve 只进预算比较、不记账，
+   * 点数只在每仓实际请求后由 createGraphqlListRecent 的 chargeOnce 记一次（否则一拍多记 6 点）。
+   * 缺 ACCEPTANCE_WATCHER_HOME 时不启用，只记一行，不猜路径。
    * 闸自己出错就放行 + 留痕（与 prio-run / prio-item 同一口径，不算静默 fail-open）。
    */
   function discoveryGate() {
@@ -639,32 +712,21 @@ export function createEventPipeline({
       return { allowed: true, enabled: false, reason: '' };
     }
     try {
-      if (budgetConfig === undefined) {
-        if (budgetConfigFile) {
-          try {
-            budgetConfig = readBudgetFile(budgetConfigFile);
-          } catch (error) {
-            logOnce(`rate:budget:${summarize(error)}`, `额度预算配置无法使用（${summarize(error)}）：发现只按响应头剩余判定`);
-            budgetConfig = null;
-          }
-        } else {
-          budgetConfig = null;
-        }
-      }
       const gate = decideTick({
         component: 'prio-run',
         purpose: 'non-essential',
         state: readRateState(rateStateFile),
         now: now(),
-        budgets: budgetConfig ?? null,
-        cost: discoveryCost,
+        budgets: budgetConfigForGate(),
+        cost: 0,
+        reserve: discoveryCost * discoverableRepoCount(),
       });
       writeRateState(rateStateFile, gate.state);
       if (gate.log) logger(gate.log);
       return { allowed: gate.allowed, enabled: true, reason: gate.reason || 'rate-gate' };
     } catch (error) {
       logger(
-        `${stamp(now)} rate-unknown component=prio-run identity=user remaining=unknown reason=rate-gate-error ${summarize(error)} 判定或写状态出错，这一拍照常发现`,
+        `rate-unknown component=prio-run identity=user remaining=unknown reason=rate-gate-error ${summarize(error)} 判定或写状态出错，这一拍照常发现`,
       );
       return { allowed: true, enabled: true, reason: 'rate-gate-error' };
     }
@@ -678,7 +740,7 @@ export function createEventPipeline({
   async function discover() {
     const repos = [...state.allowedRepos];
     if (!repos.length) {
-      logQuiet('Worker 连续失败，兜底发现这一拍没有授权仓，跳过');
+      logQuiet('discovery:no-repo', 'Worker 连续失败，兜底发现这一拍没有授权仓，跳过');
       return [];
     }
     const sinceMs = discoverySinceMs();
@@ -694,7 +756,8 @@ export function createEventPipeline({
         targets.push(...discoveryTargets({ repo, rows, sinceMs }));
         succeeded += 1;
       } catch (error) {
-        logQuiet(`兜底发现这一拍 ${repo} 读失败（${summarize(error)}）：跳过这个仓，其它仓照常`);
+        // 单仓读失败按仓名分别去重：两仓同拍都失败时各出一行。
+        logQuiet(`discovery:read-fail:${repo}`, `兜底发现这一拍 ${repo} 读失败（${summarize(error)}）：跳过这个仓，其它仓照常`);
       }
     }
     if (succeeded > 0) lastDiscoveryMs = now();
@@ -703,27 +766,37 @@ export function createEventPipeline({
 
   /**
    * 兜底轮询：Worker 连续失败时才被调用。两路来源合并去重：事件路径没写成功的目标 + 这一拍发现到的目标，
-   * 同一目标一拍只写一次，都走 writeTarget。不整盘读看板，也不返回事件（返回空数组）。
+   * 同一目标一拍只写一次，都走 writeTarget。待补目标按 60 秒 → 5 分钟 → 15 分钟退避补写，第 4 次失败放弃。
+   * 不整盘读看板，也不返回事件（返回空数组）。
    * 停写开关（.prio/disabled）存在时发现照跑、一个都不写，日志写明；dry-run 同样不写。
    * 发现通道报错（包括缺省「未配置」）先把待补目标写掉，再把错误抛出去：错误由调用方记日志，循环不退出。
    */
   async function poll({ workerFailing = true } = {}) {
     const queue = new Map();
-    // 待补目标一律进队列：它们是写失败留下的，不受「已处理」集合约束。
+    // 待补目标进队列：它们是写失败留下的，不受「已处理」集合约束；
+    // 退避没到期的这一拍先跳过（退避只拦补写通道，事件路径不受影响）。
     for (const [key, target] of state.pending) {
+      const planned = state.retries.get(key);
+      if (planned && planned.nextAtMs > now()) continue;
       queue.set(key, target);
     }
     let discoveryError = null;
+    // 闸拒绝时已经单独记过一行原因，不再打「没有待补目标」那类会误导的文案。
+    let gateRejected = false;
     if (workerFailing && typeof listRecent === 'function') {
       const gate = discoveryGate();
       if (!gate.allowed) {
-        logQuiet(`额度不够（${gate.reason}）：这一拍不做兜底发现，待补目标照旧补写，发现留给下一拍`);
+        gateRejected = true;
+        logQuiet('rate:not-allowed', `额度不够（${gate.reason}）：这一拍不做兜底发现，待补目标照旧补写，发现留给下一拍`);
       } else {
         try {
           const found = await discover();
           for (const target of found) {
             const key = String(target.ref).toLowerCase();
             if (queue.has(key)) continue;
+            // 退避同样拦发现来源：同一个目标退避没到期，这一拍不重写（否则每秒都“发现→失败”，退避形同虚设）。
+            const planned = state.retries.get(key);
+            if (planned && planned.nextAtMs > now()) continue;
             // 2 分钟重叠窗口里同一个 updatedAt 不重写；目标之后又有更新（updatedAt 更大）照样写。
             const doneAt = state.handled.get(key);
             if (doneAt !== undefined && !(Number.isFinite(target.updatedMs) && target.updatedMs > doneAt)) continue;
@@ -732,30 +805,61 @@ export function createEventPipeline({
           if (found.length) logger(`兜底发现到 ${found.length} 个目标：${found.map((target) => target.ref).join('、')}`);
         } catch (error) {
           discoveryError = error;
-          logQuiet(`兜底发现这一拍失败：${summarize(error)}`);
+          logQuiet('discovery:failed', `兜底发现这一拍失败：${summarize(error)}`);
         }
       }
     }
     const targets = [...queue.values()];
     if (!targets.length) {
-      if (!discoveryError && !workerFailing) logQuiet('Worker 正常，这一拍待补的单条目标已经补完');
-      else if (!discoveryError) logQuiet('Worker 连续失败，兜底轮询这一拍没有待补的单条目标（看板收敛交给现有的定时任务）');
+      // 「已经补完」只在 pending 真的空了才写：非空只是退避没到期。
+      if (!discoveryError && !gateRejected && state.pending.size === 0) {
+        if (!workerFailing) logQuiet('poll:idle', 'Worker 正常，这一拍待补的单条目标已经补完');
+        else logQuiet('poll:no-target', 'Worker 连续失败，兜底轮询这一拍没有待补的单条目标（看板收敛交给现有的定时任务）');
+      }
     } else if (exists(paths.prioDisabledFile)) {
-      logQuiet(`.prio/disabled 存在，自动写入已暂停：兜底这一拍有 ${targets.length} 个目标，只发现不写`);
+      logQuiet('poll:prio-disabled', `.prio/disabled 存在，自动写入已暂停：兜底这一拍有 ${targets.length} 个目标，只发现不写`);
     } else if (!write) {
-      logQuiet(`dry-run：兜底这一拍有 ${targets.length} 个目标，没有写；要真写请加 --write`);
+      logQuiet('poll:dry-run', `dry-run：兜底这一拍有 ${targets.length} 个目标，没有写；要真写请加 --write`);
     } else if (typeof syncOne !== 'function') {
-      logQuiet('单条读写模块未部署，兜底轮询这一拍补不了：等模块部署后再说');
+      logQuiet('poll:no-module', '单条读写模块未部署，兜底轮询这一拍补不了：等模块部署后再说');
     } else {
       for (const target of targets) {
         const key = String(target.ref).toLowerCase();
+        // 写入前的退避记录：有记录说明这一拍就是补写通道的一次重试，失败才推进次数与下次时间；
+        // 没记录的（这一拍刚发现 / 刚失败）由 writeOne 记下第一次补写时间（失败时刻 + 60 秒）。
+        const planned = state.retries.get(key) ?? null;
         try {
-          await writeOne(target, { source: 'poll' });
+          const outcome = await writeOne(target, { source: 'poll' });
           state.pending.delete(key);
-          state.handled.set(key, Number.isFinite(target.updatedMs) ? target.updatedMs : now());
-          logger(`兜底轮询补写 ${target.ref} 完成`);
+          state.retries.delete(key);
+          if (outcome.written > 0 || outcome.mode === 'disabled') {
+            state.handled.set(key, Number.isFinite(target.updatedMs) ? target.updatedMs : now());
+            logger(`兜底轮询补写 ${target.ref} 完成`);
+          } else {
+            // 一条都没写（额度不够、每小时上限、无变化）：不算完成、不进 handled，
+            // 下一拍靠 2 分钟重叠窗口重新发现再试（目标仍从 pending 移出，不留在这里重试）。
+            logger(`兜底轮询跳过 ${target.ref}（${outcome.reason || '没写任何目标'}）`);
+          }
         } catch (error) {
-          logger(`兜底轮询补写 ${target.ref} 失败：${summarize(error)}`);
+          const reason = summarize(error);
+          if (!planned) {
+            logger(`兜底轮询补写 ${target.ref} 失败：${reason}（${Math.round(RETRY_BACKOFF_MS[0] / 1000)} 秒后再补）`);
+            continue;
+          }
+          const attempts = planned.attempts + 1;
+          if (attempts >= RETRY_BACKOFF_MS.length) {
+            // 上限：从 pending 与退避表里都移除，只写一行放弃日志（同一个 key 只一行）；事件仍不 ack。
+            state.pending.delete(key);
+            state.retries.delete(key);
+            logOnce(
+              `abandon:${key}`,
+              `放弃补写 ${target.ref}：已重试 ${RETRY_BACKOFF_MS.length} 次，最后一次原因 ${reason}，这条不再自动补写（事件仍不 ack，交给 Worker 重投与 30 分钟整盘）`,
+            );
+          } else {
+            const waitMs = RETRY_BACKOFF_MS[attempts];
+            state.retries.set(key, { attempts, nextAtMs: now() + waitMs, lastReason: reason });
+            logger(`兜底轮询补写 ${target.ref} 失败：${reason}（${Math.round(waitMs / 60000)} 分钟后再补）`);
+          }
         }
       }
     }
@@ -763,7 +867,7 @@ export function createEventPipeline({
     return [];
   }
 
-  return { onEvent, poll, resetHandled: () => state.handled.clear() };
+  return { onEvent, poll };
 }
 
 /** 读授权仓清单（和 prio-run 共用一份文件与解析）。读不出来就当作空清单，宁可不写。 */
