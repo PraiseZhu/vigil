@@ -48,6 +48,26 @@ export function* readBaseDrift({ repo, baseTip, head, ghFn }) {
   return { head, baseTip, behindBy, mergeBaseAt };
 }
 
+// A head branch whose effective rules include `pull_request` (a stage branch whose stage PR targets main) takes
+// changes only through a PR. update-branch pushes a merge commit straight onto the head branch, so it is refused
+// there however far behind the PR is, and the PR would be tried again on every scan.
+export function headRulesRequirePr(pages) {
+  if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw new Error(`head-rules: expected pages of rules, got ${typeof pages}`);
+  return pages.flat().some((rule) => rule?.type === 'pull_request');
+}
+
+// Why a due sync is held back for the PR's head branch, or null. A read that fails holds it too: the sync is a write
+// to the PR that cannot be taken back, so it waits for a readable answer.
+export function* readHeadSyncHold({ repo, headRefName, ghFn }) {
+  if (typeof headRefName !== 'string' || !headRefName) return 'head-rules-unavailable';
+  try {
+    const pages = parse(yield () => ghFn(['api', `repos/${repo}/rules/branches/${encodeURIComponent(headRefName)}?per_page=100`, '--paginate', '--slurp']));
+    return headRulesRequirePr(pages) ? 'head-requires-pr' : null;
+  } catch {
+    return 'head-rules-unavailable';
+  }
+}
+
 export function baseDriftDue({ drift, now }) {
   if (!drift || !(drift.behindBy > 0)) return false;
   return drift.behindBy >= BASE_SYNC_MIN_BEHIND || Date.parse(now) - Date.parse(drift.mergeBaseAt) >= BASE_SYNC_MAX_AGE_MS;
