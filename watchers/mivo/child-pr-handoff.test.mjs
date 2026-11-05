@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { dispatchParams, processPr, readChildPrHandoff, rulesVersion, watcherPaths, REPO } from './bin/mivo-watcher.mjs';
+import { dispatchParams, processPr, readChildPrHandoff, rulesVersion, rulesVersionSource, childPrHandoffRule, watcherPaths, REPO } from './bin/mivo-watcher.mjs';
 import { childPrDraftPaths, childPrHandoffSpec, parseFrontMatterKind, renderChildPrHandoff } from './bin/mivo-repair.mjs';
 import { handoffPr, handoffReceipt } from './handoff.fixture.mjs';
 
@@ -118,7 +119,9 @@ test('dispatch message has no handoff text when the head takes direct pushes, th
 });
 
 test('the rules version covers the handoff text, so a session is refreshed when it changes', () => {
-  assert.match(rulesVersion(), /^[0-9a-f]{12}$/);
+  const source = rulesVersionSource();
+  assert.ok(source.includes(childPrHandoffRule({ taskPath: '/rules/tasks/rules.json', headRefName: 'rules' })), 'rules version source lacks the child PR handoff rule');
+  assert.equal(rulesVersion(), createHash('sha256').update(source).digest('hex').slice(0, 12));
 });
 
 // processPr: the decision is made once per delivery and recorded in the task

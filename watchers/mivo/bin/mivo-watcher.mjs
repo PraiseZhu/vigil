@@ -1020,8 +1020,8 @@ export function rulesVersionOf(message) {
   return String(message ?? '').match(new RegExp(`^${RULES_HEADER} ([0-9a-f]{12})：`))?.[1] ?? null;
 }
 let currentRulesVersion = null;
-export function rulesVersion() {
-  if (currentRulesVersion) return currentRulesVersion;
+// The text the rules version digests; exported so a test can check what it covers.
+export function rulesVersionSource() {
   const sample = (fresh) => dispatchParams({
     pr: { number: 0, id: 'PR_rules', headRefOid: '0'.repeat(40), title: 'rules' }, mapping: { title: 'rules' }, fresh,
     now: '1970-01-01T00:00:00Z', taskPath: '/rules/tasks/rules.json', home: '/rules', version: '-',
@@ -1033,8 +1033,10 @@ export function rulesVersion() {
     pr: { number: 0, id: 'PR_rules', headRefOid: '0'.repeat(40), title: 'rules', headRefName: 'rules' }, mapping: { title: 'rules' }, fresh: [finding],
     now: '1970-01-01T00:00:00Z', taskPath: '/rules/tasks/rules.json', home: '/rules', version: '-', childPrHandoff: { enabled: true },
   }).message;
-  currentRulesVersion = createHash('sha256').update([sample([]), sample([finding]), handoff, rulesRefreshMessage('-'), watchGuideMessage({ prNumber: 0 })].join('\n'))
-    .digest('hex').slice(0, 12);
+  return [sample([]), sample([finding]), handoff, rulesRefreshMessage('-'), watchGuideMessage({ prNumber: 0 })].join('\n');
+}
+export function rulesVersion() {
+  currentRulesVersion ??= createHash('sha256').update(rulesVersionSource()).digest('hex').slice(0, 12);
   return currentRulesVersion;
 }
 // Sent once per rules version to a bound session that has no task running, so it drops rules from older
