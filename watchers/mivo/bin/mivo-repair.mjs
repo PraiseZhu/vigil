@@ -1535,8 +1535,133 @@ function findOpenChildPr(task, branch, ghFn) {
   return pages.flat().find((pr) => pr?.head?.ref === branch && pr?.base?.ref === task.headRefName) ?? null;
 }
 
+// A head branch that takes changes only through a PR also takes the fix only through a child PR, and the target
+// repo's PR flow wants each PR to carry docs/pr/<PR number>/review.md and qa.md. The child PR's number is not known
+// until it is opened, so the repair session writes both files with the literal placeholder in the task's own
+// directory, and finalize fills the number in and pushes them as a second commit of the child branch.
+export const CHILD_PR_PLACEHOLDER = '<PR号>';
+const CHILD_PR_TEMPLATE_DIR = 'docs/pr/_template';
+const CHILD_PR_HANDOFF_FILES = [{ name: 'review.md', kind: 'review' }, { name: 'qa.md', kind: 'qa' }];
+const CHILD_PR_DRAFT_MAX_BYTES = 256 * 1024;
+
+// One place for the draft location, shared by the dispatch message and finalize: <tasks>/<dispatchId>.child-pr/.
+export function childPrDraftPaths(taskPath) {
+  const file = requireAbs(taskPath, 'task');
+  const dir = path.join(path.dirname(file), `${path.basename(file, '.json')}.child-pr`);
+  return { dir, review: path.join(dir, 'review.md'), qa: path.join(dir, 'qa.md') };
+}
+
+// What a task records when its head branch takes PRs only and the target repo has the handoff templates.
+export function childPrHandoffSpec(taskPath) {
+  return { enabled: true, draftDir: childPrDraftPaths(taskPath).dir, placeholder: CHILD_PR_PLACEHOLDER,
+    templateFiles: CHILD_PR_HANDOFF_FILES.map(({ name }) => `${CHILD_PR_TEMPLATE_DIR}/${name}`) };
+}
+
+// Both templates must be regular files in the fix commit: a repo without docs/pr/_template/ gets the plain child PR.
+export function childPrTemplatesPresent(worktree, head, gitFn) {
+  const wanted = CHILD_PR_HANDOFF_FILES.map(({ name }) => `${CHILD_PR_TEMPLATE_DIR}/${name}`);
+  const listed = gitOutput(['-C', worktree, 'ls-tree', head, '--', ...wanted], gitFn).split('\n');
+  return wanted.every((file) => listed.some((line) => /^100(?:644|755) blob [0-9a-f]+\t/.test(line) && line.endsWith(`\t${file}`)));
+}
+
+// Only the leading --- block counts, and only its single-valued kind.
+export function parseFrontMatterKind(text, label) {
+  const lines = String(text).replace(/^\uFEFF/, '').split(/\r?\n/);
+  if (lines[0]?.trim() !== '---') fail(`child PR handoff draft ${label} has no front matter; it must start with a --- block that sets kind`);
+  const end = lines.findIndex((line, index) => index > 0 && line.trim() === '---');
+  if (end < 0) fail(`child PR handoff draft ${label} front matter is not closed with ---`);
+  const line = lines.slice(1, end).find((entry) => /^kind\s*:/.test(entry));
+  if (!line) fail(`child PR handoff draft ${label} front matter has no kind field`);
+  return line.replace(/^kind\s*:/, '').replace(/\s+#.*$/, '').trim().replace(/^(['"])(.*)\1$/, '$2');
+}
+
+// Fails before anything is pushed, naming the file or field that is wrong.
+export function validateChildPrDrafts(taskPath) {
+  const paths = childPrDraftPaths(taskPath);
+  const drafts = {};
+  for (const { name, kind } of CHILD_PR_HANDOFF_FILES) {
+    const file = paths[kind];
+    let stat;
+    try { stat = fs.lstatSync(file); }
+    catch (error) {
+      if (error.code === 'ENOENT') fail(`child PR handoff draft missing: ${file}`);
+      fail(`child PR handoff draft ${name} is unreadable (${error.code ?? error.message}): ${file}`);
+    }
+    if (!stat.isFile()) fail(`child PR handoff draft ${name} is not a regular file: ${file}`);
+    if (stat.size > CHILD_PR_DRAFT_MAX_BYTES) fail(`child PR handoff draft ${name} is ${stat.size} bytes, over the ${CHILD_PR_DRAFT_MAX_BYTES} byte limit`);
+    const text = fs.readFileSync(file, 'utf8');
+    const actual = parseFrontMatterKind(text, name);
+    if (actual !== kind) fail(`child PR handoff draft ${name} front matter kind must be ${kind}, got ${actual || 'empty'}`);
+    if (!text.includes(CHILD_PR_PLACEHOLDER)) fail(`child PR handoff draft ${name} must write ${CHILD_PR_PLACEHOLDER} wherever the child PR number goes`);
+    drafts[kind] = text;
+  }
+  return drafts;
+}
+
+// Only the fixed token is replaced; nothing in the draft is interpreted.
+export function renderChildPrHandoff({ review, qa, childNumber }) {
+  if (!Number.isInteger(childNumber) || childNumber < 1) fail(`child PR number is invalid: ${String(childNumber)}`);
+  const fill = (text) => String(text).split(CHILD_PR_PLACEHOLDER).join(String(childNumber));
+  return { 'review.md': fill(review), 'qa.md': fill(qa) };
+}
+
+function expectedHandoffChange(number) {
+  return CHILD_PR_HANDOFF_FILES.map(({ name }) => `A\tdocs/pr/${number}/${name}`).sort();
+}
+
+// The commit must be one step on top of the fix commit and add exactly the two handoff files.
+function assertChildPrHandoffCommit({ worktree, validatedHead, commit, number, gitFn, label }) {
+  const parents = gitOutput(['-C', worktree, 'rev-list', '--parents', '-n', '1', commit], gitFn).trim().split(/\s+/);
+  const changed = gitOutput(['-C', worktree, 'diff-tree', '--no-commit-id', '--name-status', '-r', validatedHead, commit], gitFn)
+    .trim().split('\n').filter(Boolean).sort();
+  if (parents.length !== 2 || parents[0] !== commit || parents[1] !== validatedHead
+    || JSON.stringify(changed) !== JSON.stringify(expectedHandoffChange(number))) {
+    fail(`${label} is not a handoff commit for child PR #${number} (expected one commit over ${validatedHead.slice(0, 12)} adding only docs/pr/${number}/)`);
+  }
+}
+
+// The commit is built with plumbing and a throwaway index, so the PR worktree keeps HEAD at the validated head:
+// finalize can be run again and still sees the checkout it validated, and no docs commit lands on the local branch.
+function buildChildPrHandoffCommit({ worktree, validatedHead, number, files, gitFn, env }) {
+  const dir = `docs/pr/${number}`;
+  if (gitOutput(['-C', worktree, 'ls-tree', '-r', '--name-only', validatedHead, '--', dir], gitFn).trim()) {
+    fail(`${dir}/ already exists in the fix commit ${validatedHead.slice(0, 12)}; refusing to overwrite it with a handoff`);
+  }
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'vigil-child-handoff-'));
+  try {
+    const git = (args) => gitOutput(['-C', worktree, ...args], gitFn, { env: { ...env, GIT_INDEX_FILE: path.join(scratch, 'index') } }).trim();
+    git(['read-tree', validatedHead]);
+    for (const [name, content] of Object.entries(files)) {
+      const source = path.join(scratch, name);
+      fs.writeFileSync(source, content, { mode: 0o600 });
+      const blob = git(['hash-object', '-w', '--no-filters', '--', source]);
+      if (!/^[0-9a-f]{40}$/.test(blob)) fail(`git hash-object returned an unexpected id for ${name}`);
+      git(['update-index', '--add', '--cacheinfo', `100644,${blob},${dir}/${name}`]);
+    }
+    const tree = git(['write-tree']);
+    const commit = git(['commit-tree', tree, '-p', validatedHead, '-m', `docs: add child PR ${number} handoff`]);
+    if (!isSha(commit)) fail('git commit-tree returned an unexpected id for the handoff commit');
+    assertChildPrHandoffCommit({ worktree, validatedHead, commit, number, gitFn, label: 'the new commit' });
+    return commit;
+  } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+}
+
+// One push to a child ref through the repo's own hooks and the ownership fence. `source` is what git pushes
+// (HEAD for the fix, the handoff commit's id for the second push); `head` is the id the fence expects on the wire.
+function pushChildRef({ worktree, ref, source, head, gitFn, guard, validatedPolicy }) {
+  const hookPath = gitOutput(['-C', worktree, 'rev-parse', '--git-path', 'hooks'], gitFn).trim();
+  if (!hookPath) fail('effective Git hook directory unavailable');
+  const hooks = createPushHooks({ worktree, originalHooks: path.resolve(worktree, hookPath),
+    home: guard.home, taskPath: guard.taskPath, head, ref, gitBinary: GIT, validatedPolicy });
+  try {
+    gitOutput(['-C', worktree, '-c', `core.hooksPath=${hooks.dir}`, 'push', 'origin', `${source}:${ref}`], gitFn, { env: guard.env ?? process.env });
+  } finally { hooks.cleanup(); }
+}
+
 // Push the validated fix to its own branch and open (or reuse) a PR into the protected head branch.
 // Idempotent on retry: the child branch may already hold validatedHead and the PR may already exist.
+// When the task carries the handoff instruction and the fix commit has the repo's handoff templates, the child
+// PR also gets docs/pr/<its number>/review.md and qa.md as a second commit, pushed after the PR is open.
 export function deliverViaChildPr({ worktree, task, validatedHead, remoteHead, scs, gitFn, ghFn, originUrl = remoteUrl(task.repo), guard }) {
   if (!guard?.home || !guard.taskPath) fail('push ownership guard required');
   const checkout = assertWorktree(worktree, task, gitFn, originUrl);
@@ -1548,7 +1673,18 @@ export function deliverViaChildPr({ worktree, task, validatedHead, remoteHead, s
   const branch = childPrBranch(task, validatedHead);
   const ref = `refs/heads/${branch}`;
   const existing = gitOutput(['ls-remote', originUrl, ref], gitFn).split(/\s+/)[0];
-  if (existing && existing !== validatedHead) fail(`child branch ${branch} already holds another commit`);
+  const handoff = task.childPrHandoff?.enabled === true && childPrTemplatesPresent(worktree, validatedHead, gitFn);
+  if (existing && existing !== validatedHead) {
+    // A retry after the handoff commit was pushed: the branch, the PR and the files are all there already.
+    const done = handoff ? findOpenChildPr(task, branch, ghFn) : null;
+    if (!done) fail(`child branch ${branch} already holds another commit`);
+    assertChildPrHandoffCommit({ worktree, validatedHead, commit: existing, number: done.number, gitFn, label: `child branch ${branch} head` });
+    return { pushed: false, childPr: { number: done.number, url: done.html_url, branch, base: task.headRefName, head: existing,
+      codeHead: validatedHead, handoffCommit: existing } };
+  }
+  const verified = guard.verification;
+  const validatedPolicy = ['pass', 'baseline-only-failure'].includes(verified?.status) && verified.head === validatedHead && verified.policy?.file && verified.policy?.sha256
+    ? { policyFile: verified.policy.file, policySha256: verified.policy.sha256 } : null;
   let pushed = false;
   if (!existing) {
     // An earlier round's child PR still open: the fix waits for it instead of opening another one. Only a branch
@@ -1556,16 +1692,11 @@ export function deliverViaChildPr({ worktree, task, validatedHead, remoteHead, s
     const earlier = listOpenChildPrs({ repo: task.repo, number: task.number, headRefName: task.headRefName }, ghFn)
       .find((open) => open.branch !== branch);
     if (earlier) return { pushed: false, reused: true, childPr: earlier };
-    const hookPath = gitOutput(['-C', worktree, 'rev-parse', '--git-path', 'hooks'], gitFn).trim();
-    if (!hookPath) fail('effective Git hook directory unavailable');
-    const verified = guard.verification;
-    const validatedPolicy = ['pass', 'baseline-only-failure'].includes(verified?.status) && verified.head === validatedHead && verified.policy?.file && verified.policy?.sha256
-      ? { policyFile: verified.policy.file, policySha256: verified.policy.sha256 } : null;
-    const hooks = createPushHooks({ worktree, originalHooks: path.resolve(worktree, hookPath),
-      home: guard.home, taskPath: guard.taskPath, head: validatedHead, ref, gitBinary: GIT, validatedPolicy });
-    try {
-      gitOutput(['-C', worktree, '-c', `core.hooksPath=${hooks.dir}`, 'push', 'origin', `HEAD:${ref}`], gitFn, { env: guard.env ?? process.env });
-    } finally { hooks.cleanup(); }
+  }
+  // Checked before the branch is pushed or the PR is opened: a missing or malformed draft stops the delivery here.
+  const drafts = handoff ? validateChildPrDrafts(guard.taskPath) : null;
+  if (!existing) {
+    pushChildRef({ worktree, ref, source: 'HEAD', head: validatedHead, gitFn, guard, validatedPolicy });
     const after = gitOutput(['ls-remote', originUrl, ref], gitFn).split(/\s+/)[0];
     if (after !== validatedHead) fail('child branch changed after push; pushed commit requires reconciliation');
     pushed = true;
@@ -1578,7 +1709,15 @@ export function deliverViaChildPr({ worktree, task, validatedHead, remoteHead, s
       '-f', `body=${childPrBody(task, parent?.body, validatedHead, scs)}`, '-F', 'draft=false'], ghFn);
   }
   if (!Number.isInteger(pr?.number) || typeof pr.html_url !== 'string') fail('child PR creation returned an unexpected shape');
-  return { pushed, childPr: { number: pr.number, url: pr.html_url, branch, base: task.headRefName, head: validatedHead } };
+  const childPr = { number: pr.number, url: pr.html_url, branch, base: task.headRefName, head: validatedHead };
+  if (!drafts) return { pushed, childPr };
+  const files = renderChildPrHandoff({ ...drafts, childNumber: pr.number });
+  const handoffCommit = buildChildPrHandoffCommit({ worktree, validatedHead, number: pr.number, files, gitFn, env: guard.env ?? process.env });
+  // The repo's own pre-push hook runs again for this push (no validation receipt covers the new commit).
+  pushChildRef({ worktree, ref, source: handoffCommit, head: handoffCommit, gitFn, guard, validatedPolicy: null });
+  const landed = gitOutput(['ls-remote', originUrl, ref], gitFn).split(/\s+/)[0];
+  if (landed !== handoffCommit) fail('child branch changed after the handoff push; pushed commit requires reconciliation');
+  return { pushed, handoffPushed: true, childPr: { ...childPr, head: handoffCommit, codeHead: validatedHead, handoffCommit } };
 }
 
 export function pushIfNeeded(worktree, task, validatedHead, remoteHead, gitFn, originUrl = remoteUrl(task.repo), guard) {
@@ -1694,7 +1833,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
     // Blocked on the PR's current head: once the child PR merges, the head moves on its own and the watcher
     // treats that like an author push, delivering the feedback again so it is checked on the merged code.
     const { number: childNumber, url: childUrl } = delivered.childPr;
-    const delivery = delivered.reused ? `已有子 PR #${childNumber} 仍开着，本轮修复没有另开（${childUrl}）` : `修复已送子 PR #${childNumber}（${childUrl}）`;
+    const delivery = delivered.reused ? `已有子 PR #${childNumber} 仍开着，本轮修复没有另开（${childUrl}）` : `修复已送子 PR #${childNumber}（${childUrl}）${delivered.childPr.handoffCommit ? `，已附 docs/pr/${childNumber}/ 交接文件` : ''}`;
     return saveResult(paths, task, sessionId, {
       status: 'blocked', blockedKind: 'child-pr',
       reason: `${delivery}；${task.headRefName} 只能经 PR 合入，等子 PR 合入后在新 HEAD 上复核`,

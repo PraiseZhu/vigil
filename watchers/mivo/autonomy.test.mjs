@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { blocked, repairPaths } from './bin/mivo-repair.mjs';
+import { blocked, childPrDraftPaths, childPrHandoffSpec, repairPaths } from './bin/mivo-repair.mjs';
 import { dispatchParams, pollFingerprint, normalizePollSnapshot, scanOnce, watcherPaths, rulesVersion, feedbackItems, newFeedback } from './bin/mivo-watcher.mjs';
 import { acquireLock, readPr, writePr } from './bin/mivo-state.mjs';
 import { pendingEvents } from './bin/notify.mjs';
@@ -203,6 +203,39 @@ test('SC3 idle task with no result is recovered once after 30 minutes', (t) => {
   });
   assert.equal(recoveries.length, 1);
   assert.equal(result.prs[0].dispatch.reason, 'missing-result-recovery');
+});
+
+// 2026-11-05 child PR handoff: the recovery delivery repeats the decision the task recorded, it does not probe again.
+for (const handoff of [true, false]) test(`recovery of a task ${handoff ? 'dispatched with' : 'dispatched without'} the child PR handoff ${handoff ? 'repeats' : 'does not add'} the draft instruction`, (t) => {
+  const { paths } = homeOf(t);
+  const dispatchId = 'live-790-handoff';
+  seedBound(paths, {
+    pollFingerprint: 'old',
+    lastDispatch: { dispatchId, at: '2026-09-28T00:00:00Z', recoveryCount: 0 },
+    activeTask: { status: 'accepted', dispatchId, head: HEAD, sessionId: 'sess-790' },
+  });
+  const taskPath = path.join(paths.stateDir, 'tasks', `${dispatchId}.json`);
+  fs.mkdirSync(path.dirname(taskPath), { recursive: true });
+  fs.writeFileSync(taskPath, JSON.stringify({
+    dispatchId, nodeId, number: 790, repo: process.env.MIVO_WATCHER_TARGET_REPO, sessionId: 'sess-790',
+    headRefOid: HEAD, headRefName: 'fix/x', params: { message: 'fix' }, handoff: handoffReceipt({ ...listed, releaseEpoch: 'e' }),
+    feedback: [{ key: 'greptile:PRRT_1:c1', source: 'greptile', nativeId: 'PRRT_1:c1', body: '**P1** x' }],
+    ...(handoff ? { childPrHandoff: childPrHandoffSpec(taskPath) } : {}),
+  }));
+  const recoveries = [];
+  discover(paths, {
+    now: '2026-09-28T00:31:00Z',
+    collect: () => ({
+      pr: { id: nodeId, number: 790, state: 'OPEN', isDraft: false, sameRepository: true, author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' },
+      admissionVerified: true, checks: [], comments: [], reviews: [], threads: [], labels: [], mergeReady: false,
+      ci: { status: 'green', required: [] }, policy: { status: 'verified', required: [] },
+    }),
+    dispatchFn: (params) => { recoveries.push(params); return { target_session_id: 'sess-790' }; },
+  });
+  assert.equal(recoveries.length, 1);
+  assert.ok(recoveries[0].message.includes('OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY'));
+  assert.equal(recoveries[0].message.includes('子 PR 交接草稿'), handoff);
+  if (handoff) assert.ok(recoveries[0].message.includes(childPrDraftPaths(taskPath).review));
 });
 
 test('SC4 blocked writes the result while the PR lock is held and the next poll consumes it once', (t) => {

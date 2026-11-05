@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { adjudicationBrief, assertDisputesAdjudicated, assertOwner, finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/mivo-repair.mjs';
+import { adjudicationBrief, assertDisputesAdjudicated, assertOwner, childPrDraftPaths, childPrHandoffSpec, finalize, recheck, repairPaths, validate, watchWorktreePath } from './bin/mivo-repair.mjs';
 import { writePr } from './bin/mivo-state.mjs';
 import { ownershipGh } from './ownership-gh.fixture.mjs';
 
@@ -19,7 +19,8 @@ const finding = (priority, key = `thread:${priority}`) => ({
 // Every Git mutation is confined to this test's disposable repositories. gh is
 // entirely simulated; unexpected API calls fail instead of reaching the network.
 // childPrList: 'error' / 'malformed' make the open-child-PR listing (`pulls?state=open&base=`) throw / return a non-list.
-function fixture(t, { changed = true, lockfile = false, nodeModules = false, protectedHead = false, childPrList = 'ok' } = {}) {
+// templates: the repo ships docs/pr/_template/{review,qa}.md; handoff: the task was dispatched with the child PR handoff instruction.
+function fixture(t, { changed = true, lockfile = false, nodeModules = false, protectedHead = false, childPrList = 'ok', templates = false, handoff = templates } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-repair-scope-'));
   const home = path.join(root, 'watcher');
   const plugin = path.join(root, 'plugin');
@@ -28,6 +29,10 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
   const git = (...args) => execFileSync('git', args, {
     encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull },
+  }).trim();
+  const gitWithIndex = (indexFile, args) => execFileSync('git', args, {
+    encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull, GIT_INDEX_FILE: indexFile },
   }).trim();
   const previousPlugin = process.env.MIVO_PLUGIN_REPO;
   const previousGh = process.env.GH_BIN;
@@ -47,6 +52,10 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
   fs.mkdirSync(path.join(worktree, '.githooks'));
   fs.writeFileSync(path.join(worktree, '.githooks/pre-push'), '#!/bin/bash\nset -eu\nprintf "fixture checks passed\\n"\n');
   fs.writeFileSync(path.join(worktree, 'example.txt'), 'baseline\n');
+  if (templates) {
+    fs.mkdirSync(path.join(worktree, 'docs/pr/_template'), { recursive: true });
+    for (const kind of ['review', 'qa']) fs.writeFileSync(path.join(worktree, `docs/pr/_template/${kind}.md`), `---\nkind: ${kind}\npr: 0\n---\n`);
+  }
   if (lockfile) {
     fs.writeFileSync(path.join(worktree, 'package.json'), JSON.stringify({ name: 'fixture', private: true }));
     fs.writeFileSync(path.join(worktree, 'package-lock.json'), JSON.stringify({
@@ -75,6 +84,7 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
     releaseEpoch: 'opened:PR_790:2026-10-01T00:00:00Z' };
   task.handoff = { version: 1, id: 'handoff-fixture', repo: REPO, number: 790, nodeId: task.nodeId,
     head: sourceHead, releaseEpoch: task.releaseEpoch, author: 'ExampleUser' };
+  if (handoff) task.childPrHandoff = childPrHandoffSpec(taskPath);
   const saveTask = (feedback) => {
     task.feedback = feedback;
     // A stale or forged cached policy must not override the underlying feedback.
@@ -91,13 +101,14 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
   const pushCalls = [];
   const ghCalls = [];
   const childPrs = [];
-  const gitFn = (_binary, args) => {
+  const gitFn = (_binary, args, options) => {
     if (args.includes('push')) {
       pushCalls.push(args);
       // Check the destination before delegating even a test-only push.
       assert.equal(git('-C', worktree, 'remote', 'get-url', 'origin'), originUrl);
     }
-    const out = git(...args);
+    // Only the handoff commit's throwaway index is forwarded; the rest of the environment stays the fixture's.
+    const out = options?.env?.GIT_INDEX_FILE ? gitWithIndex(options.env.GIT_INDEX_FILE, args) : git(...args);
     if (args.includes('push')) remoteHead = git('--git-dir', originUrl, 'rev-parse', 'refs/heads/fix/scope');
     return out;
   };
@@ -161,7 +172,8 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
     feedbackKeys, evidence: ['synthetic fixture checked locally'] });
   const options = { home, taskPath, scReport, validatedHead: head, originUrl, gitFn, ghFn,
     env: { ...process.env, PREFLIGHT_SKIP: '0' } };
-  return { task, paths, worktree, sourceHead, head, options, saveTask, report, sc, pushCalls, ghCalls, childPrs,
+  return { task, taskPath, paths, worktree, sourceHead, head, options, saveTask, report, sc, pushCalls, ghCalls, childPrs, git,
+    remoteGit: (...args) => git('--git-dir', originUrl, ...args),
     remoteRef: (ref) => { try { return git('--git-dir', originUrl, 'rev-parse', '--verify', '--quiet', ref); } catch { return null; } },
     setCiConclusion: (value) => { ciConclusionValue = value; },
     remoteHead: () => git('--git-dir', originUrl, 'rev-parse', 'refs/heads/fix/scope'),
@@ -1340,4 +1352,199 @@ test('A-6 the review account marker still wins over the comment commit', () => {
   assertDisputesAdjudicated({ scs: codeSc(['already-fixed: ' + 'f'.repeat(40)]), workers: [], task: codeTask(item),
     fixedAfterReview: (sha, head) => { seen = head; return true; } });
   assert.equal(seen, reviewed);
+});
+
+// Child PR handoff: the repair session writes review.md and qa.md beside the task file with the literal placeholder
+// <PR号>; finalize fills in the child PR's number and pushes them as a second commit of the child branch.
+const handoffDraft = (kind, body = '') => `---\nkind: ${kind}\npr: <PR号>\n---\n\n# ${kind}：子 PR <PR号>\n${body}`;
+function writeDrafts(f, { review = handoffDraft('review'), qa = handoffDraft('qa') } = {}) {
+  const dir = childPrDraftPaths(f.taskPath).dir;
+  fs.mkdirSync(dir, { recursive: true });
+  if (review !== null) fs.writeFileSync(path.join(dir, 'review.md'), review);
+  if (qa !== null) fs.writeFileSync(path.join(dir, 'qa.md'), qa);
+  return dir;
+}
+async function validatedFix(f) {
+  assert.equal((await f.validate()).status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+}
+const childBranchOf = (f) => `vigil/pr-790-fix-${f.head.slice(0, 12)}`;
+const noPost = (f) => !f.ghCalls.some((args) => args[1] === '--method' && args[2] === 'POST');
+
+test('child PR handoff: the drafts become docs/pr/<child>/ in a second commit pushed after the PR is open', async (t) => {
+  const f = fixture(t, { protectedHead: true, templates: true });
+  await validatedFix(f);
+  const dir = writeDrafts(f);
+  const inner = f.options.gitFn;
+  const openPrsAtPush = [];
+  f.options.gitFn = (binary, args, options) => { if (args.includes('push')) openPrsAtPush.push(f.childPrs.length); return inner(binary, args, options); };
+  const result = f.finalize();
+  const branch = childBranchOf(f);
+  const { handoffCommit } = result.childPr;
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.blockedKind, 'child-pr');
+  assert.equal(result.pushed, false);
+  assert.equal(result.head, f.sourceHead);
+  assert.equal(f.remoteHead(), f.sourceHead);
+  assert.deepEqual(openPrsAtPush, [0, 1]);
+  assert.match(result.reason, /修复已送子 PR #800.*已附 docs\/pr\/800\/ 交接文件/);
+  assert.deepEqual(result.childPr, { number: 800, url: `https://github.com/${REPO}/pull/800`, branch, base: 'fix/scope',
+    head: handoffCommit, codeHead: f.head, handoffCommit });
+  // The second push goes to the child ref only, after the first one; the head branch is never pushed.
+  assert.equal(f.pushCalls.length, 2);
+  assert.ok(f.pushCalls[0].includes(`HEAD:refs/heads/${branch}`));
+  assert.ok(f.pushCalls[1].includes(`${handoffCommit}:refs/heads/${branch}`));
+  assert.ok(f.pushCalls.every((args) => !args.some((arg) => arg.endsWith(':refs/heads/fix/scope'))));
+  assert.equal(f.remoteRef(`refs/heads/${branch}`), handoffCommit);
+  // One commit on top of the fix, adding only the two files, with the number filled in.
+  assert.equal(f.remoteGit('rev-list', '--parents', '-n', '1', handoffCommit), `${handoffCommit} ${f.head}`);
+  assert.deepEqual(f.remoteGit('diff-tree', '--no-commit-id', '--name-status', '-r', f.head, handoffCommit).split('\n').sort(),
+    ['A\tdocs/pr/800/qa.md', 'A\tdocs/pr/800/review.md']);
+  assert.equal(f.remoteGit('log', '-1', '--format=%s', handoffCommit), 'docs: add child PR 800 handoff');
+  const review = f.remoteGit('show', `${handoffCommit}:docs/pr/800/review.md`);
+  const qa = f.remoteGit('show', `${handoffCommit}:docs/pr/800/qa.md`);
+  assert.match(review, /^---\nkind: review\npr: 800\n---\n\n# review：子 PR 800/);
+  assert.match(qa, /^---\nkind: qa\npr: 800\n---/);
+  assert.ok(!review.includes('<PR号>') && !qa.includes('<PR号>'));
+  // The PR worktree keeps the validated head and a clean tree; the drafts stay where the session wrote them.
+  assert.equal(f.git('-C', f.worktree, 'rev-parse', 'HEAD'), f.head);
+  assert.equal(f.git('-C', f.worktree, 'status', '--porcelain'), '');
+  assert.equal(f.git('-C', f.worktree, 'ls-tree', '-r', '--name-only', 'HEAD', '--', 'docs/pr/800'), '');
+  assert.ok(fs.readFileSync(path.join(dir, 'review.md'), 'utf8').includes('<PR号>'));
+});
+
+for (const [name, drafts, expected] of [
+  ['both drafts missing', null, /child PR handoff draft missing: .*review\.md/],
+  ['review.md missing', { review: null }, /child PR handoff draft missing: .*review\.md/],
+  ['qa.md missing', { qa: null }, /child PR handoff draft missing: .*qa\.md/],
+  ['review.md has the wrong kind', { review: handoffDraft('qa') }, /review\.md front matter kind must be review, got qa/],
+  ['qa.md has the wrong kind', { qa: handoffDraft('review') }, /qa\.md front matter kind must be qa, got review/],
+  ['qa.md has no front matter', { qa: '# qa <PR号>\n' }, /qa\.md has no front matter/],
+  ['qa.md has no kind', { qa: '---\npr: <PR号>\n---\n' }, /qa\.md front matter has no kind field/],
+  ['review.md has no placeholder', { review: '---\nkind: review\npr: 12\n---\n' }, /review\.md must write <PR号>/],
+]) {
+  test(`child PR handoff: ${name} — finalize stops before the child branch is pushed or a PR is opened`, async (t) => {
+    const f = fixture(t, { protectedHead: true, templates: true });
+    await validatedFix(f);
+    if (drafts) writeDrafts(f, drafts);
+    assert.throws(f.finalize, expected);
+    assert.equal(f.pushCalls.length, 0);
+    assert.equal(f.remoteRef(`refs/heads/${childBranchOf(f)}`), null);
+    assert.equal(f.remoteHead(), f.sourceHead);
+    assert.equal(f.childPrs.length, 0);
+    assert.ok(noPost(f));
+    assert.equal(fs.existsSync(path.join(f.paths.results, `${f.task.dispatchId}.json`)), false);
+  });
+}
+
+test('child PR handoff: a draft that is a symlink is refused', async (t) => {
+  const f = fixture(t, { protectedHead: true, templates: true });
+  await validatedFix(f);
+  const dir = writeDrafts(f);
+  const real = path.join(dir, 'real-qa.md');
+  fs.renameSync(path.join(dir, 'qa.md'), real);
+  fs.symlinkSync(real, path.join(dir, 'qa.md'));
+  assert.throws(f.finalize, /qa\.md is not a regular file/);
+  assert.equal(f.pushCalls.length, 0);
+  assert.equal(f.childPrs.length, 0);
+});
+
+test('child PR handoff: finalize retry after delivery writes, pushes and opens nothing again', async (t) => {
+  const f = fixture(t, { protectedHead: true, templates: true });
+  await validatedFix(f);
+  const dir = writeDrafts(f);
+  const first = f.finalize();
+  const branch = childBranchOf(f);
+  // The retry must not read the drafts: removing them proves it.
+  fs.rmSync(dir, { recursive: true });
+  const second = f.finalize();
+  assert.equal(f.pushCalls.length, 2);
+  assert.equal(f.childPrs.length, 1);
+  assert.equal(f.ghCalls.filter((args) => args[1] === '--method' && args[2] === 'POST').length, 1, 'the PR was opened once, by the first finalize');
+  assert.deepEqual(second.childPr, first.childPr);
+  assert.equal(f.remoteRef(`refs/heads/${branch}`), first.childPr.handoffCommit);
+  assert.equal(f.git('-C', f.worktree, 'rev-parse', 'HEAD'), f.head);
+});
+
+test('child PR handoff: a handoff push that failed is redone on retry without a second code push or PR', async (t) => {
+  const f = fixture(t, { protectedHead: true, templates: true });
+  await validatedFix(f);
+  writeDrafts(f);
+  const inner = f.options.gitFn;
+  let pushes = 0;
+  f.options.gitFn = (binary, args, options) => {
+    if (args.includes('push') && ++pushes === 2) throw new Error('handoff push rejected by hook');
+    return inner(binary, args, options);
+  };
+  assert.throws(f.finalize, /handoff push rejected by hook/);
+  const branch = childBranchOf(f);
+  // The code is on the child branch and the PR is open; only the docs commit is missing.
+  assert.equal(f.remoteRef(`refs/heads/${branch}`), f.head);
+  assert.equal(f.childPrs.length, 1);
+  assert.equal(f.git('-C', f.worktree, 'rev-parse', 'HEAD'), f.head);
+  f.options.gitFn = inner;
+  const result = f.finalize();
+  assert.equal(f.pushCalls.length, 2, 'one code push, one successful handoff push');
+  assert.ok(f.pushCalls[1].includes(`${result.childPr.handoffCommit}:refs/heads/${branch}`));
+  assert.equal(f.childPrs.length, 1);
+  assert.equal(f.ghCalls.filter((args) => args[1] === '--method' && args[2] === 'POST').length, 1);
+  assert.equal(f.remoteRef(`refs/heads/${branch}`), result.childPr.handoffCommit);
+  assert.equal(result.childPr.number, 800);
+  assert.equal(f.remoteGit('show', `${result.childPr.handoffCommit}:docs/pr/800/qa.md`).includes('pr: 800'), true);
+});
+
+test('child PR handoff: an earlier child PR that is still open is reused without drafts, pushes or a new PR', async (t) => {
+  const f = fixture(t, { protectedHead: true, templates: true });
+  await validatedFix(f);
+  f.childPrs.push(openChildPr(777));
+  const result = f.finalize();
+  assert.equal(result.blockedKind, 'child-pr');
+  assert.equal(result.childPr.number, 777);
+  assert.equal(result.childPr.handoffCommit, undefined);
+  assert.equal(f.pushCalls.length, 0);
+  assert.equal(f.childPrs.length, 1);
+  assert.ok(noPost(f));
+  assert.equal(fs.existsSync(childPrDraftPaths(f.taskPath).dir), false);
+});
+
+test('child PR handoff: a child branch that holds a commit other than the handoff commit is refused', async (t) => {
+  const f = fixture(t, { protectedHead: true, templates: true });
+  await validatedFix(f);
+  writeDrafts(f);
+  const branch = childBranchOf(f);
+  const stray = f.git('-C', f.worktree, 'commit-tree', `${f.head}^{tree}`, '-p', f.head, '-m', 'stray');
+  f.git('-C', f.worktree, 'push', 'origin', `${stray}:refs/heads/${branch}`);
+  f.childPrs.push(openChildPr(800, { head: { ref: branch, sha: stray, repo: { full_name: REPO } } }));
+  assert.throws(f.finalize, /child branch .* head is not a handoff commit for child PR #800/);
+  assert.equal(f.pushCalls.length, 0);
+  assert.ok(noPost(f));
+});
+
+for (const [name, options] of [
+  ['the task was dispatched with the handoff but the repo has no templates', { protectedHead: true, templates: false, handoff: true }],
+  ['the repo has templates but the task was dispatched without the handoff', { protectedHead: true, templates: true, handoff: false }],
+]) {
+  test(`child PR handoff: ${name} — the child PR flow is the plain one, with no drafts and no docs commit`, async (t) => {
+    const f = fixture(t, options);
+    await validatedFix(f);
+    const result = f.finalize();
+    const branch = childBranchOf(f);
+    assert.equal(result.blockedKind, 'child-pr');
+    assert.deepEqual(result.childPr, { number: 800, url: `https://github.com/${REPO}/pull/800`, branch, base: 'fix/scope', head: f.head });
+    assert.equal(f.pushCalls.length, 1);
+    assert.equal(f.remoteRef(`refs/heads/${branch}`), f.head);
+    assert.equal(f.remoteGit('ls-tree', '-r', '--name-only', f.head, '--', 'docs/pr/800'), '');
+    assert.doesNotMatch(result.reason, /交接文件/);
+    assert.equal(fs.existsSync(childPrDraftPaths(f.taskPath).dir), false);
+  });
+}
+
+test('child PR handoff: a head that takes direct pushes keeps the direct push, whatever the repo templates', async (t) => {
+  const f = fixture(t, { protectedHead: false, templates: true });
+  await validatedFix(f);
+  const result = f.finalize();
+  assert.notEqual(result.blockedKind, 'child-pr');
+  assert.equal(f.remoteHead(), f.head);
+  assert.equal(f.childPrs.length, 0);
+  assert.equal(fs.existsSync(childPrDraftPaths(f.taskPath).dir), false);
 });
