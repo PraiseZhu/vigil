@@ -1516,3 +1516,129 @@ test('SC5 未知字段名 fail-closed，在读令牌前退出', async () => {
     assert.equal(fs.existsSync(path.join(dir, 'changes.jsonl')), false);
   }
 });
+
+test('SC8 关联 PR 段遇到优先级降级时不整拍停写', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  // 同一份计划里有一条已确认的降级（P1 → P2）和一条 link：降级那一行属于优先级侧，本拍不可写字段。
+  seedChange(dir, 2, 'P1');
+  seedDebounce(dir, 2, confirmedDowngrade('P2'));
+  const seated = changeRows(dir).length;
+  const { writes, result } = await run(dir, ['--write', '--only-field', '关联 PR'], {
+    items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2', priority: 'P1' })],
+    prs: [closingPr(9, 1)],
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(writes.map((action) => action.fields), [{ '关联 PR': '#9(open,CI✓)' }], 'link 照写');
+  assert.equal(result.stop, '', '不整拍停写');
+  assert.equal(disabled(dir), false, '不建停写开关');
+  const alerts = readAlerts(dir);
+  assert.equal(alerts.some((alert) => alert.kind === 'prio-downgrade'), false, '不发 prio-downgrade');
+  assert.equal(alerts.length, 0);
+  assert.deepEqual(changeRows(dir).slice(seated).map((row) => row.field), ['关联 PR'], '优先级侧的降级本拍不写');
+});
+
+test('SC8 不带 --only-field 时降级仍整拍停写', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  seedChange(dir, 2, 'P1');
+  seedDebounce(dir, 2, confirmedDowngrade('P2'));
+  const { writes, result } = await run(dir, ['--write'], {
+    items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2', priority: 'P1' })],
+    prs: [closingPr(9, 1)],
+  });
+  assert.equal(writes.length, 0);
+  assert.equal(result.stop, 'downgrade');
+  assert.equal(disabled(dir), true);
+  assert.deepEqual(readAlerts(dir).map((alert) => alert.kind), ['prio-downgrade']);
+});
+
+test('SC9 --only-empty-to-p2 与 --only-field 同用时在读令牌前报错', async () => {
+  const message = /--only-empty-to-p2 不能和 --only-field 同用/;
+  const orders = [
+    ['--write', '--only-empty-to-p2', '--only-field', '关联 PR'],
+    ['--write', '--only-field', '关联 PR', '--only-empty-to-p2'],
+  ];
+  for (const argv of orders) {
+    assert.throws(() => parsePrioRunArgs(argv), message, argv.join(' '));
+    const dir = tmpDir();
+    allow(dir, [REPO]);
+    const { result, writes, seen, stderrText } = await run(dir, argv, { items: fills(1) });
+    assert.equal(result.exitCode, 1, argv.join(' '));
+    assert.match(result.error.message, message);
+    assert.match(stderrText, message);
+    assert.equal(seen.token, 0, '读令牌之前退出');
+    assert.equal(seen.load, 0, argv.join(' '));
+    assert.equal(seen.network, 0, argv.join(' '));
+    assert.equal(writes.length, 0, '0 次写');
+    assert.equal(disabled(dir), false);
+    assert.equal(fs.existsSync(path.join(dir, 'changes.jsonl')), false, 'changes.jsonl 不存在');
+  }
+});
+
+test('SC10 --max-per-tick 与 --only-field 关联 PR 同时生效', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const { writes, result } = await run(dir, ['--write', '--only-field', '关联 PR', '--max-per-tick', '1'], {
+    items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2' }), item(3, { id: 'PVTI_3' })],
+    prs: [closingPr(9, 1), closingPr(10, 2), closingPr(11, 3)],
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(writes.map((action) => action.fields), [{ '关联 PR': '#9(open,CI✓)' }], '每拍只写 1 条');
+  assert.equal(result.stop, '');
+  assert.equal(disabled(dir), false, '余下的只 defer，不建停写开关');
+  assert.equal(readAlerts(dir).length, 0, 'defer 不算告警');
+  assert.deepEqual(changeRows(dir).map((row) => row.item), [`${REPO}#1`], '只有写进去的那条留在 changes.jsonl');
+});
+
+test('SC11 --dry-run 加 --only-field 不写也不建 disabled', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const { writes, result } = await run(dir, ['--dry-run', '--only-field', '关联 PR'], {
+    items: [item(1, { id: 'PVTI_1' }), item(2)],
+    prs: [closingPr(9, 1)],
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(writes.length, 0, 'dry-run 一条都不写');
+  assert.equal(disabled(dir), false);
+  assert.equal(readAlerts(dir).length, 0);
+  assert.equal(fs.existsSync(path.join(dir, 'changes.jsonl')), false);
+});
+
+test('SC12 --only-field 关联 PR 没有 mac-mini-stopped 时仍只扣住', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const { writes, result, io } = await run(dir, ['--write', '--only-field', '关联 PR'], {
+    items: [item(1, { id: 'PVTI_1' })],
+    prs: [closingPr(9, 1)],
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(writes.length, 0, 'link 不写');
+  assert.match(io.text(), /扣住/);
+  assert.equal(readAlerts(dir).length, 0, '不算告警');
+  assert.equal(disabled(dir), false);
+  assert.equal(fs.existsSync(path.join(dir, 'mac-mini-stopped')), false, '本入口不建那个标记');
+});
+
+test('SC13 --only-field 关联 PR 时不发 prio-nonempty', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  // 计划里有一条升级（P2 → P1，已有优先级改成别的值）：不带 --only-field 时它会进 nonAuto 发 prio-nonempty。
+  seedChange(dir, 2, 'P2');
+  const { writes, result } = await run(dir, ['--write', '--only-field', '关联 PR'], {
+    items: [item(1, { id: 'PVTI_1' }), item(2, { priority: 'P2', labels: ['影响发布'], repoClass: 'mivo' })],
+    prs: [closingPr(9, 1)],
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(writes.map((action) => action.fields), [{ '关联 PR': '#9(open,CI✓)' }], 'link 照写');
+  const alerts = readAlerts(dir);
+  assert.equal(alerts.some((alert) => alert.kind === 'prio-nonempty'), false, '不发 prio-nonempty');
+  assert.equal(alerts.length, 0);
+  assert.equal(disabled(dir), false);
+  assert.equal(result.stop, '');
+});

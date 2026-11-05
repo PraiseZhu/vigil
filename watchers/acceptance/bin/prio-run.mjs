@@ -6,6 +6,8 @@
 // 告警只追加 alerts.jsonl，不推到别处。文案不带令牌、主机名、仓的全名。
 // `--only-field`：只让指定字段进写闸（取值只认「优先级」「关联 PR」）。只有「关联 PR」时持续模式才放行 link，
 // 仍受逐条回读、停写开关、每小时 50 条上限约束；其余取值（含不带）link 照旧 skip。
+// 带「关联 PR」时，优先级侧的降级/改空按「本拍不可写字段」排除：不停写、不建开关、不发 prio-downgrade。
+// 不能和 `--only-empty-to-p2` 同用，同时给就在读令牌之前报错退出。
 // `--only-empty-to-p2`：只写「空 → P2」这一子集，计划里的降级、改空、升级、空 → P1、关联 PR 静默排除，
 // 不 abort、不建停写开关、不发告警，只在 run 日志里记一行排除计数（分四类）。不带这个开关时行为不变。
 import fs from 'node:fs';
@@ -123,6 +125,9 @@ export function parsePrioRunArgs(argv) {
     throw new PrioRunError(`无法识别的参数：${arg}`, 'config');
   }
   if (out.write && out.dryRun) throw new PrioRunError('不能同时传 --dry-run 和 --write', 'config');
+  if (out.onlyField != null && out.onlyEmptyToP2) {
+    throw new PrioRunError('--only-empty-to-p2 不能和 --only-field 同用', 'config');
+  }
   return out;
 }
 
@@ -195,7 +200,8 @@ function priorityWord(value) {
  * 仍旧整拍停写——那是配置或字段错了，需要人看，不属于「授权只放宽到空 → P2」的范围。
  *
  * `onlyField`：只把指定字段当作可写。`'关联 PR'` 时 link 也走 allow，和空 → P1/P2 同一条路（授权仓、
- * 每拍与每小时名额、逐条回读、停写开关）；其余取值（含不带）link 照旧 skip。
+ * 每拍与每小时名额、逐条回读、停写开关），优先级侧的降级/改空按「本拍不可写字段」排除、不 abort；
+ * 其余取值（含不带）link 照旧 skip。
  */
 export function assessContinuousPlan(plan, {
   maxPerTick,
@@ -274,12 +280,17 @@ export function assessContinuousPlan(plan, {
       },
     };
   }
-  if (outOfScope.length > 0 || downgrades.length > 0) {
+  // `--only-field "关联 PR"` 时，优先级侧的降级/改空是本拍不可写字段：不 abort、不建停写开关、不发降级告警
+  // （降级告警由不带这个参数的那一段 cron 负责）。范围外变更仍整拍停写；其它取值（含不带）行为不变。
+  const blocking = onlyField === '关联 PR'
+    ? downgrades.filter((row) => row.change?.field === onlyField)
+    : downgrades;
+  if (outOfScope.length > 0 || blocking.length > 0) {
     return {
       abort: true,
       reason: outOfScope.length > 0 ? 'out-of-scope' : 'downgrade',
       outOfScope,
-      downgrades,
+      downgrades: blocking,
       nonAuto,
       hourlyStop: false,
       allow() { return 'skip'; },
@@ -305,6 +316,8 @@ export function assessContinuousPlan(plan, {
     nonAuto,
     hourlyStop,
     allow(change) {
+      // 本拍不可写字段（`--only-field` 以外的字段）静默排除：不写、不进 nonAuto，因此不发 prio-nonempty。
+      if (onlyField != null && change?.field !== onlyField) return 'skip';
       const kind = classifyPrioChange(change, { table }).kind;
       if (kind === 'link') {
         if (!linkWritable) return 'skip';
