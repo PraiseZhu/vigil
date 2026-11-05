@@ -157,3 +157,19 @@ test('an App function that throws or answers nonsense resolves nothing', () => {
     assert.ok(out.failed.every((x) => x.expected && x.actual), 'every failure names what was expected and what happened');
   }
 });
+
+// The reply must be the review server's own words, not a comment that quotes or extends them: the older sentence
+// stands alone (HTML comments aside), and the marker ends the reply.
+test('the marker-ending reply of the newer server wording is a fixed thread', () => {
+  const newer = `本轮在提交 \`${HEAD}\` 完成复核:本轮复核未再发现该问题(key=\`${KEY}\`)。已修复，由盯梢关闭；如仍有异议，可在此回复。审查运行:\`https://example.test/runs/1\`。\n\n${marker()}\n`;
+  assert.equal(hit(newer)?.key, KEY);
+});
+const notTheServerWords = {
+  'the older sentence quoted, then a word that it is still broken': () => hit(`> ${oldText()}\n\n这个还是没修好`),
+  'the older sentence with words added after it': () => hit(`${oldText()}\n还是没修好`),
+  'the older sentence with words before it': () => hit(`看下面：${oldText()}`),
+  'the older sentence only as a quote': () => hit(`> ${oldText()}`),
+  'words after the marker': () => hit(`${marker()}\n还是没修好`),
+  'the older sentence and a marker that does not end the reply': () => hit(`${oldText()}\n${marker()}\n还是没修好`),
+};
+for (const [name, run] of Object.entries(notTheServerWords)) test(`not fixed: ${name}`, () => assert.equal(run(), null));

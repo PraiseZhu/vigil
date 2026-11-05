@@ -118,6 +118,12 @@ export function isServerFixedThread(thread, currentHead) {
   const key = [...String(first.body ?? '').matchAll(FINDING_MARKER_RE)].at(-1)?.[1];
   if (!key) return null;
   const body = String(last.body ?? '');
+  // The server's own words, not a comment quoting or extending them: either the marker ends the reply, or the
+  // visible text (HTML comments aside) is exactly one older sentence.
+  const endsWithMarker = /<!--\s*mivo-review:thread-fixed\b[^>]*?-->\s*$/.test(body);
+  const visible = body.replace(/<!--[\s\S]*?-->/g, '').trim();
+  const sentences = [...visible.matchAll(OLD_FIXED_REPLY_RE)];
+  if (!endsWithMarker && !(sentences.length === 1 && sentences[0][0] === visible)) return null;
   const heads = [];
   const keys = [];
   for (const match of body.matchAll(OLD_FIXED_REPLY_RE)) { heads.push(match[1]); keys.push(match[2]); }
