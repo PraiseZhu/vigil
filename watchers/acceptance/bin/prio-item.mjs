@@ -582,6 +582,7 @@ export async function syncEventItem(payload = {}, ctx = {}) {
   const written = Number(result.written) || 0;
   const planned = Number(result.planned) || 0;
   const policySkipped = Number(result.policySkipped) || 0;
+  const skippedByPolicy = Array.isArray(result.skippedByPolicy) ? result.skippedByPolicy : [];
   // 真正「该写却没写成」的条数：计划里的条数减掉被写策略挡下的。
   const pending = Math.max(0, planned - policySkipped);
   let ok = true;
@@ -596,6 +597,11 @@ export async function syncEventItem(payload = {}, ctx = {}) {
   } else if (written === 0 && pending > 0) {
     ok = false;
     reason = reason || 'not-written';
+  } else if (reason === '' && skippedByPolicy.length > 0 && written < planned) {
+    // 被写策略挡下时把第一条的真实原因带出去（#324 SC1）：整条挡下是 written===0，
+    // 部分挡下（额度到顶、只写了前几条）同样要让日志看见为什么剩下的没写。
+    // 已有 reason（lock-busy / disabled / readback-mismatch 等）不覆盖，ok 判定不变。
+    reason = String(skippedByPolicy[0]?.reason || '');
   }
   return {
     ok,
@@ -605,7 +611,7 @@ export async function syncEventItem(payload = {}, ctx = {}) {
     written,
     planned,
     skipped: policySkipped,
-    skippedByPolicy: result.skippedByPolicy || [],
+    skippedByPolicy,
     reason,
     cost: result.cost ?? null,
     mode: result.mode || '',

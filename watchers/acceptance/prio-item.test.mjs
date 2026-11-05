@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { isReadOnlyGraphql } from './bin/github.mjs';
-import { BOARD_ITEMS_QUERY, ITEM_FIELD_QUERY, createReadGithub, runPrioSync } from './bin/prio-sync.mjs';
+import { BOARD_ITEMS_QUERY, ITEM_FIELD_QUERY, PRIO_HOURLY_MAX, createReadGithub, runPrioSync } from './bin/prio-sync.mjs';
 import {
   ITEM_QUERY,
   ITEM_TIMELINE_FIRST,
@@ -833,4 +833,136 @@ test('适配层：ref 与 repo#issue 对不上直接报错，不猜', async () =
     () => syncEventItem({ repo: REPO, issue: ITEM, ref: `${REPO}#999` }, { dir: env.dir, profile: env.profile }),
     /ref 与 repo#issue 不一致/,
   );
+});
+
+// ── #324 SC1：被写策略挡下时外层 reason 带出真实原因 ──
+
+/** 走一遍事件适配层：默认注入写函数、临时锁路径，不碰部署的 /tmp/prio-write.lock。 */
+async function eventSync(env, payload = {}, overrides = {}) {
+  const io = capture();
+  const gate = recorder();
+  const result = await syncEventItem(
+    { repo: REPO, issue: ITEM, ref: REF, now: T0, ...payload },
+    {
+      dir: env.dir,
+      profile: env.profile,
+      reader: env.reader,
+      write: gate.write,
+      stdout: io.stdout,
+      lockPath: path.join(env.dir, 'prio-write.lock'),
+      ...overrides,
+    },
+  );
+  return { result, gate, io };
+}
+
+test('#324 SC1 每小时上限整条挡下时 reason 是 hourly-limit', async () => {
+  const env = setup();
+  const rows = Array.from({ length: PRIO_HOURLY_MAX }, (_, index) => ({
+    at: new Date(T0 - 60_000 - index * 1000).toISOString(),
+    item: `${REPO}#${100 + index}`,
+    repo: REPO,
+    issue: 100 + index,
+    field: '优先级',
+    old: null,
+    new: 'P2',
+    basis: 'S1',
+  }));
+  fs.writeFileSync(path.join(env.dir, 'changes.jsonl'), `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+  env.reader = readerFor(fakeGithub(), env.profile);
+  const { result, gate } = await eventSync(env);
+  assert.equal(result.written, 0);
+  assert.equal(result.ok, true, '被写策略整条挡下不算失败');
+  assert.deepEqual(result.skippedByPolicy.map((row) => row.reason), ['hourly-limit']);
+  assert.equal(result.reason, 'hourly-limit');
+  assert.equal(gate.writes.length, 0);
+});
+
+test('#324 SC1 每拍上限挡下时 reason 是 per-tick-limit', async () => {
+  const env = setup();
+  fs.writeFileSync(path.join(env.dir, 'mac-mini-stopped'), 'ok\n');
+  fs.writeFileSync(path.join(env.dir, 'run.json'), `${JSON.stringify({ maxPerTick: 1 })}\n`);
+  // 一条条目两处变更：优先级先占掉唯一名额，关联 PR 被每拍上限挡下。
+  const fake = fakeGithub({ items: [itemNode({ priority: null, linkedPr: '' })], prs: [prNode({ number: 12 })] });
+  env.reader = readerFor(fake, env.profile);
+  const { result, gate } = await eventSync(env, { linkAllowed: true }, { readBack: async (change) => change.new });
+  assert.equal(result.planned, 2);
+  assert.equal(result.written, 1);
+  assert.equal(gate.writes.length, 1);
+  assert.deepEqual(result.skippedByPolicy.map((row) => row.reason), ['per-tick-limit']);
+  assert.equal(result.reason, 'per-tick-limit');
+});
+
+test('#324 SC1 授权清单外的仓挡下时 reason 是 repo-not-authorized', async () => {
+  const env = setup({ authorizedRepos: ['example-owner/other-repo'] });
+  env.reader = readerFor(fakeGithub(), env.profile);
+  const { result, gate } = await eventSync(env);
+  assert.equal(result.written, 0);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.skippedByPolicy.map((row) => row.reason), ['repo-not-authorized']);
+  assert.equal(result.reason, 'repo-not-authorized');
+  assert.equal(gate.writes.length, 0);
+});
+
+test('#324 SC1 关联 PR 被扣住时 reason 是 link-held', async () => {
+  const env = setup();
+  env.reader = readerFor(fakeGithub({ items: [itemNode({ priority: 'P2' })], prs: [prNode({ number: 12 })] }), env.profile);
+  const { result, gate } = await eventSync(env, { linkAllowed: false });
+  assert.equal(result.written, 0);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.skippedByPolicy.map((row) => row.reason), ['link-held']);
+  assert.equal(result.reason, 'link-held');
+  assert.equal(gate.writes.length, 0);
+});
+
+test('#324 SC1 关联 PR 会变少时 reason 是 link-shrink', async () => {
+  const env = setup();
+  fs.writeFileSync(path.join(env.dir, 'mac-mini-stopped'), 'ok\n');
+  // 看板上的关联 PR 文本就是上一次规则写入的值（写历史里有对应行），这一条只看到部分 PR：不收缩。
+  const lastLink = {
+    at: new Date(T0 - 60_000).toISOString(),
+    item: REF,
+    repo: REPO,
+    issue: ITEM,
+    field: '关联 PR',
+    old: '',
+    new: '#11(open) #12(open)',
+    basis: 'link 关联 PR 文本与看板不一致',
+  };
+  fs.writeFileSync(path.join(env.dir, 'changes.jsonl'), `${JSON.stringify(lastLink)}\n`);
+  const fake = fakeGithub({
+    items: [itemNode({ priority: 'P2', linkedPr: '#11(open) #12(open)' })],
+    prs: [prNode({ number: 12 })],
+  });
+  env.reader = readerFor(fake, env.profile);
+  const { result, gate } = await eventSync(env, { linkAllowed: true });
+  assert.equal(result.written, 0);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.skippedByPolicy.map((row) => row.reason), ['link-shrink']);
+  assert.equal(result.reason, 'link-shrink');
+  assert.equal(gate.writes.length, 0);
+});
+
+test('#324 SC1 没被写策略挡下时 reason 保持原样', async () => {
+  const env = setup();
+  const fake = fakeGithub({ readback: () => ({ node: { fieldValues: { nodes: [fieldValue('single', '优先级', 'P2')] } } }) });
+  env.reader = readerFor(fake, env.profile);
+  const { result } = await eventSync(env);
+  assert.equal(result.written, 1);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.skippedByPolicy, [], '没挡下时没有策略跳过记录');
+  assert.equal(result.reason, '', '写成了就还是空串');
+
+  // 额度闸这种本来就带原因的跳过：reason 出 'rate-budget'，不被 skippedByPolicy 改写。
+  const tight = setup();
+  const rateFile = path.join(tight.dir, 'rate-budget.json');
+  writeRateState(rateFile, {
+    version: 1,
+    components: { 'prio-run': { hourKey: Math.floor(T0 / 3_600_000), used: 5 } },
+  });
+  tight.reader = readerFor(fakeGithub(), tight.profile);
+  const stopped = await eventSync(tight, {}, { rateFile, budgets: { loop: 100, 'prio-run': 5, 'board-live': 100 } });
+  assert.equal(stopped.result.written, 0);
+  assert.deepEqual(stopped.result.skippedByPolicy, []);
+  assert.equal(stopped.result.reason, 'rate-budget');
 });

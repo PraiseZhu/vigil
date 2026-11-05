@@ -206,6 +206,88 @@ test('SC12 静态：新文件不含真实用户名、绝对家目录路径；只
   assert.doesNotMatch(localgit, /import\(/);
 });
 
+// #324 SC4：动态 import 的例外写在守卫自身，不再靠「把文件放到扫不到的目录」。
+// 允许清单只有 prio-item-loader.mjs，写法必须是字面量
+// `import(new URL(<字面量>, import.meta.url).href)`。
+// `<字面量>` 接受两种：字符串字面量（'./bin/prio-item.mjs'）或全大写常量标识符（SINGLE_ITEM_MODULE，
+// 且该常量必须在同一文件里直接绑定一个字符串字面量）——真实文件用的是后者，两者都是定死的字面量；裸变量 import(spec)、字符串拼接、
+// 表达式拼 URL 一律判失败，因为那些可以绕开静态检查。
+const ALLOWED_DYNAMIC_IMPORT = Object.freeze(['prio-item-loader.mjs']);
+const DYNAMIC_IMPORT_RE = /import\(/g;
+const LITERAL_DYNAMIC_IMPORT_RE = /import\(\s*new URL\(\s*(?:'[^'\n]*'|"[^"\n]*"|[A-Z][A-Z0-9_]*)\s*,\s*import\.meta\.url\s*\)\.href\s*\)/g;
+
+/** 纯函数（#324 SC4）：返回判定出的问题，空数组表示通过。fileName 只看文件名，允许清单按文件名列。 */
+export function checkDynamicImports(text, fileName) {
+  const source = String(text ?? '');
+  const problems = [];
+  const total = [...source.matchAll(DYNAMIC_IMPORT_RE)].length;
+  if (total === 0) return problems;
+  if (!ALLOWED_DYNAMIC_IMPORT.includes(fileName)) {
+    problems.push(`${fileName} 不在动态 import 允许清单里，却出现 ${total} 处`);
+    return problems;
+  }
+  const literal = [...source.matchAll(LITERAL_DYNAMIC_IMPORT_RE)].length;
+  if (total !== 1) problems.push(`${fileName} 只允许一处动态 import，实际 ${total} 处`);
+  if (literal !== total) {
+    problems.push(`${fileName} 的动态 import 必须写成 import(new URL(<字面量>, import.meta.url).href)`);
+  }
+  // 常量标识符形式：该常量必须在本文件里直接绑定一个字符串字面量，否则等于放过变量。
+  for (const match of source.matchAll(LITERAL_DYNAMIC_IMPORT_RE)) {
+    const ident = /new URL\(\s*([A-Z][A-Z0-9_]*)\s*,/.exec(match[0])?.[1];
+    if (ident && !new RegExp(`const\\s+${ident}\\s*=\\s*(?:'[^'\\n]*'|"[^"\\n]*")\\s*;`).test(source)) {
+      problems.push(`${fileName} 的 ${ident} 必须是直接绑定字符串字面量的常量`);
+    }
+  }
+  return problems;
+}
+
+test('#324 SC4/SC5 动态 import 的例外只给允许清单里的文件，且必须是字面量 URL 写法', () => {
+  // 扫描范围：watchers/acceptance 根目录的 .mjs（不含子目录）。测试文件本身要构造动态 import 的
+  // 正反例、也不进部署产物，这里只管生产模块；bin/*.mjs 那条禁令在上面，一字未改。
+  const rootModules = fs
+    .readdirSync(HERE)
+    .filter((entry) => entry.endsWith('.mjs') && !entry.endsWith('.test.mjs'));
+  assert.ok(rootModules.includes('prio-item-loader.mjs'), '扫描范围必须覆盖 prio-item-loader.mjs（不靠绕开目录）');
+  assert.deepEqual(ALLOWED_DYNAMIC_IMPORT, ['prio-item-loader.mjs'], '允许清单只列这一个文件');
+  for (const name of rootModules) {
+    assert.deepEqual(checkDynamicImports(read(path.join(HERE, name)), name), [], `${name} 动态 import 不合规`);
+  }
+  // 真实文件：唯一一处动态 import 就是允许的写法。
+  const loader = read(path.join(HERE, 'prio-item-loader.mjs'));
+  assert.equal([...loader.matchAll(DYNAMIC_IMPORT_RE)].length, 1, 'loader 里只留一处动态 import');
+  assert.deepEqual(checkDynamicImports(loader, 'prio-item-loader.mjs'), []);
+
+  // 正例：常量标识符与字符串字面量都算允许写法。
+  const dynamic = (args) => `const mod = await import(${args});`;
+  const literalUrl = "new URL('./bin/prio-item.mjs', import.meta.url).href";
+  assert.deepEqual(
+    checkDynamicImports(
+      `export const SINGLE_ITEM_MODULE = './bin/prio-item.mjs';\n${dynamic('new URL(SINGLE_ITEM_MODULE, import.meta.url).href')}`,
+      'prio-item-loader.mjs',
+    ),
+    [],
+  );
+  assert.deepEqual(checkDynamicImports(dynamic(literalUrl), 'prio-item-loader.mjs'), []);
+  assert.deepEqual(checkDynamicImports('const a = 1;', 'other-module.mjs'), []);
+
+  // 反例：裸变量、字符串拼接、表达式拼 URL 都判失败。
+  for (const bad of ['spec', "'./a' + x", 'new URL(x + y, import.meta.url).href']) {
+    assert.notDeepEqual(
+      checkDynamicImports(dynamic(bad), 'prio-item-loader.mjs'),
+      [],
+      `${bad} 这种写法必须判失败`,
+    );
+  }
+  // 清单外的文件即使写成合法形状也判失败。
+  assert.notDeepEqual(checkDynamicImports(dynamic(literalUrl), 'other-module.mjs'), []);
+  // 小写变量名、或全大写但不是字符串字面量绑定的名字，也判失败。
+  assert.notDeepEqual(checkDynamicImports(dynamic('new URL(spec, import.meta.url).href'), 'prio-item-loader.mjs'), []);
+  assert.notDeepEqual(
+    checkDynamicImports(`const MOD = getSpec();\n${dynamic('new URL(MOD, import.meta.url).href')}`, 'prio-item-loader.mjs'),
+    [],
+  );
+});
+
 test('#46 SC8 SESSION.md 写清有裁决结果时怎么做：成立 = 要修，不成立 = 通过并引用裁决，不再标有争议', () => {
   assert.match(session, /### 有裁决结果时/);
   assert.match(session, /`成立`：验收方对，这一条\*\*要修\*\*/);
