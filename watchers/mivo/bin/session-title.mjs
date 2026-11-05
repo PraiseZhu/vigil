@@ -57,7 +57,9 @@ export function shortTaskName({ task, prNumber, repo = MIVO_REPO } = {}) {
   const text = String(task ?? '').normalize('NFKC')
     .replace(/^(?:feat|fix|chore|docs|test|refactor|perf|build|ci)(?:\([^)]*\))?!?:\s*/i, '')
     .replace(/(?:\bPR\s*#?\s*|#)\d+\b/gi, '');
-  const chinese = (text.match(/\p{Script=Han}+/gu) ?? []).join('');
+  // 丨 (U+4E28) is a Han ideograph, but the title reserves it as the date separator: a stored title fed back as
+  // the task source (`#790-任务丨0928`) must not put a second 丨 into the generated name.
+  const chinese = (text.match(/\p{Script=Han}+/gu) ?? []).join('').replace(/丨/g, '');
   if (chinese.length >= 2) return Array.from(chinese).slice(0, MAX_TASK_LENGTH).join('');
   const source = String(task ?? '').toLowerCase();
   if (/changelog|release.notes/.test(source)) return '更新日志修复';
@@ -96,4 +98,19 @@ export function planSessionTitle({ pr, existing = {}, createdAt, repo, prefix = 
   }
   const taskName = shortTaskName({ task: pr.title, prNumber: pr.number, repo });
   return { title: repairSessionTitle({ task: pr.title, prNumber: pr.number, createdAt: titleDate, repo, prefix }), titleDate, taskName };
+}
+
+// A title describes the session it was written for. A session that is being created now (the previous one was
+// retired, or a retry dispatch creates instead of resuming) gets a freshly built title with the current prefix;
+// carrying the stored text over is how #1772's replacement sessions kept an unprefixed title after the prefix was
+// configured. Only the date is carried over, so the `丨MMDD` suffix still marks when the PR's repair started.
+export function newSessionTitle({ pr, existing = {}, createdAt, repo, prefix = sessionTitlePrefix() } = {}) {
+  if (!pr || typeof pr !== 'object') throw new Error('PR metadata is required');
+  const titleDate = sessionDate(existing.titleDate ?? existing.sessionCreatedAt ?? createdAt);
+  const taskName = shortTaskName({ task: pr.title, prNumber: pr.number, repo });
+  return {
+    title: repairSessionTitle({ task: pr.title, prNumber: pr.number, createdAt: titleDate, repo, prefix }),
+    titleDate,
+    taskName,
+  };
 }

@@ -244,6 +244,85 @@ test('ARCHIVED delivery starts successor and records predecessors', (t) => {
   assert.equal(entry.sessionId, 'sess-next');
 });
 
+// The title marker applies to sessions created from now on. A title written before the marker was configured
+// belongs to the session that carried it: once that session is retired, the replacement must take the current
+// prefix, not the stored text (2026-11-05: #1772's 15:45 and 18:55 replacements kept the unprefixed title).
+function withTitlePrefix(t, prefix) {
+  const previous = process.env.MIVO_SESSION_TITLE_PREFIX;
+  process.env.MIVO_SESSION_TITLE_PREFIX = prefix;
+  t.after(() => {
+    if (previous === undefined) delete process.env.MIVO_SESSION_TITLE_PREFIX;
+    else process.env.MIVO_SESSION_TITLE_PREFIX = previous;
+  });
+}
+
+test('a retired session is replaced by a session titled with the current prefix', (t) => {
+  const { paths } = homeOf(t);
+  withTitlePrefix(t, '修PR');
+  seedBound(paths, {
+    sessionId: 'sess-old', title: '#790-终态回执修复丨0928', titleDate: '2026-09-28',
+    lastDispatch: { dispatchId: 'live-790-done', at: '2026-09-28T00:00:00Z' },
+    activeTask: { dispatchId: 'live-790-done', status: 'complete' },
+  });
+  const calls = [];
+  const { collected, entry } = discover(paths, {
+    collect: collectFail,
+    dispatchFn: (p) => { calls.push(p); return { target_session_id: 'sess-new' }; },
+  });
+  assert.equal(collected, 1);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].target_session_id, undefined, 'a retired session must not be woken');
+  assert.equal(calls[0].title, '修PR#790-终态回执修复丨0928');
+  assert.equal(entry.sessionId, 'sess-new');
+  assert.equal(entry.title, '修PR#790-终态回执修复丨0928');
+});
+
+test('a session that is still bound keeps its stored title when the prefix is configured', (t) => {
+  const { paths } = homeOf(t);
+  withTitlePrefix(t, '修PR');
+  seedBound(paths, {
+    sessionId: 'sess-790', title: '#790-终态回执修复丨0928', titleDate: '2026-09-28',
+    lastDispatch: { dispatchId: 'live-790-run', at: '2026-09-28T00:00:00Z' },
+    activeTask: { dispatchId: 'live-790-run', status: 'waiting-ci' },
+  });
+  const calls = [];
+  const { entry } = discover(paths, {
+    collect: collectFail,
+    dispatchFn: (p) => { calls.push(p); return { target_session_id: 'sess-790' }; },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].target_session_id, 'sess-790');
+  assert.equal(calls[0].title, '#790-终态回执修复丨0928');
+  assert.equal(entry.sessionId, 'sess-790');
+  assert.equal(entry.title, '#790-终态回执修复丨0928');
+});
+
+test('a retry that creates a session titles it with the current prefix', (t) => {
+  const { paths } = homeOf(t);
+  withTitlePrefix(t, '修PR');
+  const handoff = claimHandoff(paths);
+  writePr(paths.home, nodeId, {
+    number: 790, nodeId, handoff, eligibilityInitialized: true, eligibility: 'active',
+    admissionVerified: true, admissionEpoch: handoff.releaseEpoch,
+    title: '#790-终态回执修复丨0928', titleDate: '2026-09-28',
+    pendingDispatch: {
+      dispatchId: 'live-790-old', status: 'retryable', attempts: 1, retryAt: '2026-09-28T00:00:00Z',
+      // The stored params were built before the prefix existed; the retry creates a session, so it must not reuse them.
+      params: { title: '#790-终态回执修复丨0928', message: 'stale' },
+    },
+  });
+  const calls = [];
+  const { entry } = discover(paths, {
+    prs: [{ ...listed, title: '终态回执修复' }],
+    collect: collectFail,
+    dispatchFn: (p) => { calls.push(p); return { target_session_id: 'sess-new' }; },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].target_session_id, undefined);
+  assert.equal(calls[0].title, '修PR#790-终态回执修复丨0928');
+  assert.equal(entry.sessionId, 'sess-new');
+});
+
 test('bound PR with nothing to deliver never probes the session', (t) => {
   const { paths } = homeOf(t);
   seedBound(paths, {

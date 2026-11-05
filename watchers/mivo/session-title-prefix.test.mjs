@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { planSession } from './bin/mivo-watcher.mjs';
-import { planSessionTitle, repairSessionTitle, sessionTitlePrefix, shortTaskName, SESSION_TITLE_PREFIX_ENV } from './bin/session-title.mjs';
+import { newSessionTitle, planSessionTitle, repairSessionTitle, sessionTitlePrefix, shortTaskName, SESSION_TITLE_PREFIX_ENV } from './bin/session-title.mjs';
 
 // The title marker is opt-in (MIVO_SESSION_TITLE_PREFIX / profile `sessionTitlePrefix`). Turning it on must only
 // change titles written from now on: existing sessions keep their title (prefixed or not) and their binding.
@@ -75,6 +75,25 @@ test('a bound session is reused, so turning the prefix on opens no second sessio
   assert.equal(planned.action, 'reuse');
   assert.equal(planned.sessionId, 'sess-558');
   assert.equal(planned.title, '#558-终态回执修复丨0928');
+});
+
+test('a new session takes the current prefix instead of the stored title', () => {
+  const existing = { title: '#558-终态回执修复丨0928', titleDate: date };
+  const created = newSessionTitle({ pr, existing, createdAt: '2026-09-30', prefix: '修PR' });
+  assert.equal(created.title, '修PR#558-终态回执修复丨0928', 'the stored title text belongs to the session that ended');
+  assert.equal(created.titleDate, date, 'the suffix keeps marking when the PR repair started');
+  // A PR with no stored date is titled with the new session's own date.
+  assert.equal(newSessionTitle({ pr, createdAt: '2026-09-30', prefix: 'PR' }).title, 'PR#558-终态回执修复丨0930');
+  // A stored title fed back as the task source must not duplicate the 丨 separator.
+  assert.equal(shortTaskName({ task: '#558-终态回执修复丨0928' }), '终态回执修复');
+});
+
+test('planning a create rebuilds the title while keeping the stored date', () => {
+  const existing = { nodeId: 'PR_558', sessionId: null, title: '#558-旧任务丨0928', titleDate: date };
+  const planned = planSession({ pr, existing, date: '2026-09-30' });
+  assert.equal(planned.action, 'create-intent');
+  assert.equal(planned.sessionId, null);
+  assert.equal(planned.title, '#558-终态回执修复丨0928', 'the seeded task name, not the stored title text');
 });
 
 test('the maintenance script accepts both the prefixed and the legacy form', () => {
