@@ -193,7 +193,8 @@ export function evaluatePublicReview({ snapshot: s, comments = s.comments, check
   };
   const unique = [...new Set(blockers)];
   const behindOnly = unique.length === 1 && unique[0] === 'behind';
-  const baseUpdateEligible = behindOnly && s.pr.baseRefName === 'main' && s.mergeable === 'MERGEABLE';
+  // integration/* is where BEHIND shows up (its ruleset requires branches to be up to date).
+  const baseUpdateEligible = behindOnly && /^(?:main|integration\/.+)$/.test(s.pr.baseRefName ?? '') && s.mergeable === 'MERGEABLE';
   if (!unique.length) {
     const reason = released ? 'protected-release' : current.state === 'APPROVED' ? 'current-approve' : 'current-report';
     return { ready: true, reason, blockers: [], baseUpdateEligible: false, ...evidence };

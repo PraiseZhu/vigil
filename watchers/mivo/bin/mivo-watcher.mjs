@@ -17,7 +17,7 @@ import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor, isMemberFeedb
 import {lifelineFeedback} from './mivo-lifeline-source.mjs';
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent, completedMemberFeedback, coveredFeedbackItems, replyToMemberFeedback, requestMemberReviewers } from './mivo-review-resolve.mjs';
 import { codeScanningFeedbackItems } from './mivo-code-scanning.mjs';
-import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck } from './mivo-pr-actions.mjs';
+import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck, readBaseDrift, isSyncableBase } from './mivo-pr-actions.mjs';
 import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath, findingMarkerOf } from './mivo-repair.mjs';
 import { PARSER_VERSION, canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
@@ -2357,7 +2357,10 @@ export function* processPr({
   // A task is dispatched on the head the watcher accepted at that moment (this also covers entries saved
   // before trustedHead existed).
   const dispatchedHead = ['accepted', 'queued'].includes(previous.activeTask?.status) && previous.activeTask.head === ownerPr.headRefOid;
-  const headChanged = sameHandoffEpoch && trusted !== ownerPr.headRefOid && !controlledHead && !dispatchedHead;
+  // The watcher's own base sync moved the head off the trusted one; that is not the author taking the PR back.
+  const syncedHead = ['reserved', 'accepted', 'uncertain'].includes(previous.baseUpdate?.status)
+    && previous.baseUpdate.head === trusted;
+  const headChanged = sameHandoffEpoch && trusted !== ownerPr.headRefOid && !controlledHead && !dispatchedHead && !syncedHead;
   const taskInFlight = Boolean(previous.pendingDispatch?.dispatchId) || (Boolean(previous.activeTask?.dispatchId)
     && !['complete', 'legacy-complete', 'blocked', 'waiting-ci'].includes(previous.activeTask?.status));
   const headChangeSince = headChanged ? previous.headChangeSince ?? now : null;
@@ -2643,11 +2646,21 @@ export function* processPr({
   ));
   if (!dryRun && !resultError && !admissionBlocked && fresh.length === 0 && !inFlight) {
     const saveEntry = (entry) => { previous = entry; state.prs[key] = entry; persistState(state, paths); return entry; };
-    const plan = planBaseUpdate({ snapshot: collected, entry: previous, fresh, now });
+    previous = yield* withBaseDrift({ entry: previous, collected, ghFn, now });
+    const drift = previous.baseDrift?.error ? null : previous.baseDrift ?? null;
+    let lastSyncAt = null;
+    let plan = planBaseUpdate({ snapshot: collected, entry: previous, fresh, now, drift, lastSyncAt });
+    // The spacing is across all PRs, and a round hands processPr only this PR's entry: read the others from disk,
+    // and only when a sync would otherwise go ahead.
+    if (plan.eligible) {
+      lastSyncAt = lastBaseSyncAtAcross(state, paths);
+      plan = planBaseUpdate({ snapshot: collected, entry: previous, fresh, now, drift, lastSyncAt });
+    }
+    previous = { ...previous, baseSyncRetryAt: plan.retryAt };
     if (plan.eligible) {
       const outcome = yield* updateBaseBranch({
         pr: ownerPr, entry: previous, snapshot: collected, ghFn,
-        ownershipSnapshot, save: saveEntry, now, dryRun, viewer, repo: REPO,
+        ownershipSnapshot, save: saveEntry, now, dryRun, viewer, repo: REPO, drift, lastSyncAt,
       });
       previous = outcome.entry;
       if (outcome.action.attempted) {
@@ -2661,6 +2674,9 @@ export function* processPr({
     // No self-dispatched review recheck: the pre-review is the only dispatcher. Once the reviewer's
     // threads are resolved it re-reviews the same head, and the reviewer applies the ruling records
     // posted in the resolve replies (#38).
+  } else if (previous.baseSyncRetryAt) {
+    // A repair or new feedback owns the PR now; the sync is planned again once it is done.
+    previous = { ...previous, baseSyncRetryAt: null };
   }
   const shouldDispatch = forceCreate || (fresh.length > 0 && !collected.mergeReady && canResume && !admissionBlocked && !inFlight);
   let dispatch = { attempted: false, bound: false, reason: 'no-new-feedback' };
@@ -3009,7 +3025,50 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
   return previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry && !normalized.overflow
     && !hasUnconsumedResult(previous, paths) && !needsCiRecheck(previous.activeTask) && !previous.recheckDeferredAt
     && !keelReopenDue && !intentMigrationDue && !escalateDue && !ciUnknownRecheckDue(previous, paths, now)
-    && !pendingActionDue(previous) && !scanRecheckDue(previous, now);
+    && !pendingActionDue(previous) && !scanRecheckDue(previous, now) && !baseSyncRetryDue(previous, now);
+}
+
+function baseSyncRetryDue(previous, now) {
+  const at = Date.parse(previous.baseSyncRetryAt ?? '');
+  return Number.isFinite(at) && Date.parse(now) >= at;
+}
+
+// The newest sync any of this watcher's PRs started, for the spacing between syncs. Read from the PR entries, which
+// are the only state the watcher persists.
+export function lastBaseSyncAt(state) {
+  let latest = null;
+  for (const entry of Object.values(state?.prs ?? {})) {
+    const update = entry?.baseUpdate;
+    if (!update || !['reserved', 'accepted', 'uncertain', 'updated'].includes(update.status)) continue;
+    const at = Date.parse(update.requestedAt ?? '');
+    if (Number.isFinite(at) && (latest == null || at > latest)) latest = at;
+  }
+  return latest == null ? null : new Date(latest).toISOString();
+}
+
+function lastBaseSyncAtAcross(state, paths) {
+  if (!isV2State(paths)) return lastBaseSyncAt(state);
+  const prs = {};
+  for (const entry of listPrs(paths.home)) if (entry?.nodeId) prs[String(entry.nodeId)] = entry;
+  return lastBaseSyncAt({ prs: { ...prs, ...state.prs } });
+}
+
+// The drift is read only when a sync could follow, and once per head and base tip (one compare call each time main
+// moves). A failed read is kept with its error and tried again on the next collection.
+export function* withBaseDrift({ entry, collected, ghFn, now }) {
+  const pr = collected?.pr ?? {};
+  const baseTip = collected?.baseTipOid ?? null;
+  const cached = entry?.baseDrift;
+  if (cached && !cached.error && cached.head === pr.headRefOid && cached.baseTip === baseTip) return entry;
+  const blockers = collected?.reviewEvidence?.blockers ?? [];
+  if (pr.state !== 'OPEN' || pr.isDraft || collected?.mergeable !== 'MERGEABLE' || !isSyncableBase(pr.baseRefName)
+    || !baseTip || blockers.includes('review-in-progress') || blockers.includes('discussion-hold')) return entry;
+  try {
+    const drift = yield* readBaseDrift({ repo: REPO, baseTip, head: pr.headRefOid, ghFn });
+    return { ...entry, baseDrift: { ...drift, at: now } };
+  } catch (error) {
+    return { ...entry, baseDrift: { head: pr.headRefOid, baseTip, error: String(error.message).slice(0, 200), at: now } };
+  }
 }
 
 export function* pollWorkflow({

@@ -17,37 +17,94 @@ export function baseUpdateKey({ nodeId, head, baseTip, releaseEpoch }) {
   return digest({ nodeId, head, baseTip, releaseEpoch });
 }
 
-export function planBaseUpdate({ snapshot, entry, fresh = [], now }) {
+// main's ruleset does not require branches to be up to date, so GitHub never reports a main PR as BEHIND and the
+// BEHIND-only path below never ran for one (2026-11-04: Ready PRs 15-47 commits behind main, one merge-ready at 36).
+// The drift is read from the compare API instead. A PR is brought up to date once it is this far behind, or once its
+// merge base is old enough that the pre-review's stale-rebase gate (3 days) is close. Each sync starts CI and a
+// re-review again, so a lower bar would keep a PR waiting in the review queue that much longer.
+export const BASE_SYNC_MIN_BEHIND = 10;
+export const BASE_SYNC_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+// At most one sync per watcher in this window, so a burst of merges into main does not restart every PR's CI at once.
+export const BASE_SYNC_SPACING_MS = 5 * 60 * 1000;
+// A sync GitHub refused is not tried again for the same head and base tip before this.
+export const BASE_SYNC_FAILED_COOLDOWN_MS = 60 * 60 * 1000;
+const SYNCABLE_BASE = /^(?:main|integration\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*)$/;
+const SHA = /^[0-9a-f]{40}$/i;
+
+export function isSyncableBase(baseRefName) {
+  return typeof baseRefName === 'string' && SYNCABLE_BASE.test(baseRefName) && !baseRefName.includes('..');
+}
+
+// How far the PR head is behind the base tip, and when the two last met. Compared against the base tip SHA, not
+// the branch name, so the answer belongs to the tip this round collected.
+export function* readBaseDrift({ repo, baseTip, head, ghFn }) {
+  if (!SHA.test(baseTip ?? '') || !SHA.test(head ?? '')) throw new Error('base-drift: base tip or head is not a full SHA');
+  const data = parse(yield () => ghFn(['api', `repos/${repo}/compare/${baseTip}...${head}?per_page=1`,
+    '--jq', '{behind_by: .behind_by, merge_base_date: .merge_base_commit.commit.committer.date}']));
+  const behindBy = data?.behind_by;
+  const mergeBaseAt = data?.merge_base_date;
+  if (!Number.isInteger(behindBy) || behindBy < 0) throw new Error(`base-drift: behind_by expected a non-negative integer, got ${typeof behindBy}`);
+  if (typeof mergeBaseAt !== 'string' || !Number.isFinite(Date.parse(mergeBaseAt))) throw new Error('base-drift: merge base date missing');
+  return { head, baseTip, behindBy, mergeBaseAt };
+}
+
+export function baseDriftDue({ drift, now }) {
+  if (!drift || !(drift.behindBy > 0)) return false;
+  return drift.behindBy >= BASE_SYNC_MIN_BEHIND || Date.parse(now) - Date.parse(drift.mergeBaseAt) >= BASE_SYNC_MAX_AGE_MS;
+}
+
+export function planBaseUpdate({ snapshot, entry, fresh = [], now, drift = null, lastSyncAt = null }) {
   const pr = snapshot?.pr ?? {};
   const evidence = snapshot?.reviewEvidence ?? {};
+  const blockers = evidence.blockers ?? [];
   const mergeState = String(snapshot?.mergeStateStatus ?? pr.mergeStateStatus ?? 'UNKNOWN').toUpperCase();
   const eligibleFromReview = evidence.baseUpdateEligible === true || snapshot?.baseUpdateEligible === true;
+  // A drift reading only counts for the head and base tip it was taken on.
+  const currentDrift = drift && drift.head === pr.headRefOid && drift.baseTip === snapshot?.baseTipOid ? drift : null;
+  const strictBehind = mergeState === 'BEHIND' && eligibleFromReview;
+  const driftDue = baseDriftDue({ drift: currentDrift, now });
   const inFlight = Boolean(entry?.activeTask) && !['complete', 'legacy-complete'].includes(entry.activeTask.status)
     && entry.activeTask.blockedKind !== 'author-reclaimed';
   const pendingDispatch = Boolean(entry?.pendingDispatch);
+  const key = baseUpdateKey({
+    nodeId: pr.id, head: pr.headRefOid, baseTip: snapshot?.baseTipOid, releaseEpoch: pr.releaseEpoch,
+  });
   const reason = (() => {
     if (pr.state !== 'OPEN' || pr.isDraft) return 'inactive';
-    if (pr.baseRefName !== 'main') return 'base-not-main';
+    if (!isSyncableBase(pr.baseRefName)) return 'base-not-syncable';
     if (snapshot?.mergeable !== 'MERGEABLE') return 'not-mergeable';
-    if (mergeState !== 'BEHIND') return `merge-state-${mergeState.toLowerCase()}`;
-    if (!eligibleFromReview) return evidence.reason ?? snapshot?.reviewReason ?? 'gates-not-clear';
+    if (!strictBehind && !driftDue) {
+      if (mergeState === 'BEHIND') return evidence.reason ?? snapshot?.reviewReason ?? 'gates-not-clear';
+      if (!currentDrift) return 'drift-unknown';
+      return currentDrift.behindBy === 0 ? 'up-to-date' : 'behind-below-threshold';
+    }
+    // A new head while the reviewer is reading the old one would throw its verdict away.
+    if (blockers.includes('review-in-progress')) return 'review-in-progress';
+    // Held for a maintainer: it is brought up to date when the discussion ends.
+    if (blockers.includes('discussion-hold')) return 'discussion-hold';
     if ((fresh ?? []).length) return 'fresh-feedback';
     if (inFlight) return 'repair-in-flight';
     if (pendingDispatch) return 'pending-dispatch';
     if (entry?.needsHuman) return 'needs-human';
     if (entry?.dispatchConflict) return 'dispatch-conflict';
     const current = entry?.baseUpdate;
-    if (current && current.key === baseUpdateKey({
-      nodeId: pr.id, head: pr.headRefOid, baseTip: snapshot.baseTipOid, releaseEpoch: pr.releaseEpoch,
-    }) && ['reserved', 'accepted', 'uncertain', 'updated'].includes(current.status)) {
+    if (current && current.key === key && ['reserved', 'accepted', 'uncertain', 'updated'].includes(current.status)) {
       return `already-${current.status}`;
     }
+    if (current && current.key === key && current.status === 'failed'
+      && Date.parse(now) - Date.parse(current.checkedAt ?? current.requestedAt) < BASE_SYNC_FAILED_COOLDOWN_MS) {
+      return 'failed-cooldown';
+    }
+    if (lastSyncAt && Date.parse(now) - Date.parse(lastSyncAt) < BASE_SYNC_SPACING_MS) return 'spacing';
     return 'eligible';
   })();
-  const key = baseUpdateKey({
-    nodeId: pr.id, head: pr.headRefOid, baseTip: snapshot.baseTipOid, releaseEpoch: pr.releaseEpoch,
-  });
-  return { eligible: reason === 'eligible', reason, key, now };
+  // Due but held back only by the spacing or a recent refusal: the PR has to be collected again at this time even
+  // though nothing on GitHub changed, or it would wait for the next merge into main.
+  const retryAt = reason === 'spacing' ? new Date(Date.parse(lastSyncAt) + BASE_SYNC_SPACING_MS).toISOString()
+    : reason === 'failed-cooldown'
+      ? new Date(Date.parse(entry.baseUpdate.checkedAt ?? entry.baseUpdate.requestedAt) + BASE_SYNC_FAILED_COOLDOWN_MS).toISOString()
+      : null;
+  return { eligible: reason === 'eligible', reason, key, now, strictBehind, driftDue, retryAt };
 }
 
 export function assertActionOwner({
@@ -80,9 +137,9 @@ function* readOwnership({ pr, ghFn }) {
 }
 
 export function* updateBaseBranch({
-  pr, entry, snapshot, ghFn, ownershipSnapshot, save, now, dryRun = false, viewer, repo,
+  pr, entry, snapshot, ghFn, ownershipSnapshot, save, now, dryRun = false, viewer, repo, drift = null, lastSyncAt = null,
 }) {
-  const plan = planBaseUpdate({ snapshot, entry, fresh: [], now });
+  const plan = planBaseUpdate({ snapshot, entry, fresh: [], now, drift, lastSyncAt });
   if (!plan.eligible) return { entry, action: { attempted: false, reason: plan.reason } };
   const expected = {
     nodeId: pr.id,
@@ -100,11 +157,15 @@ export function* updateBaseBranch({
   if (dryRun) return { entry, action: { attempted: false, reason: 'dry-run', key: plan.key } };
   // A snapshot taken from the round's batch read can be minutes old; update-branch writes to the PR, so its merge
   // state and base tip are read again for this one PR first.
+  // A sync for drift does not need BEHIND (main never reports it); it only stops if the PR now conflicts, which
+  // update-branch cannot merge and the repair session handles instead.
   if (mergeStateIsBatched(snapshot)) {
     const live = yield* readMergeState({ id: pr.id, ghFn });
-    if (String(live.mergeStateStatus ?? 'UNKNOWN').toUpperCase() !== 'BEHIND' || live.baseTipOid !== snapshot.baseTipOid) {
-      return { entry, action: { attempted: false, reason: 'merge-state-changed', key: plan.key } };
-    }
+    const liveState = String(live.mergeStateStatus ?? 'UNKNOWN').toUpperCase();
+    const moved = plan.strictBehind && !plan.driftDue
+      ? liveState !== 'BEHIND' || live.baseTipOid !== snapshot.baseTipOid
+      : ['DIRTY', 'DRAFT'].includes(liveState);
+    if (moved) return { entry, action: { attempted: false, reason: 'merge-state-changed', key: plan.key } };
   }
   const reserved = {
     ...entry,
