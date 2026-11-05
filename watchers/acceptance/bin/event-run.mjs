@@ -7,7 +7,7 @@
 // （缺省动态加载 bin/prio-item.mjs 的 syncEventItem，加载器在 ../prio-item-loader.mjs）。
 // 整盘读看板要 72–131 秒，事件路径一次都不整盘读。
 // 默认 dry-run（只算不写），--write 才真写。写锁只在 syncEventItem 内部抢（bin/prio-lock.mjs 的 withWriteLock，
-// 和整盘同一把 /tmp/prio-write.lock）：抢不到它返回 ok:false，这条事件不确认，留在 Worker 里下次再拉。
+// 和整盘同一把 /tmp/prio-write.lock）：挡住它的是整盘写阶段或另一个单条。抢不到它返回 ok:false，这条事件不确认，留在 Worker 里下次再拉。
 //
 // 三层回退：Worker 正常 → 每 2 秒拉事件；Worker 连续失败 pollAfterFailures 次（缺省 1 次：一次失败就兜底）→ 才跑 60 秒兜底轮询；
 // 本进程整个挂掉 → 现有 30 分钟定时任务照旧收敛看板。兜底轮询补写「事件写过但没写成功」的单条目标，
@@ -60,7 +60,7 @@ export { DEFAULT_POLL_AFTER_FAILURES };
 export const EVENT_TYPES = Object.freeze(['issues', 'issue_comment', 'pull_request', 'pull_request_review']);
 /**
  * 写锁的共用锁文件、重试间隔、最长等待只在 bin/prio-lock.mjs 有一份实现，这里只把常量转出去。
- * 事件路径不自己抢锁：真写由 syncEventItem 内部 withWriteLock 收口（抢不到它返回 ok:false, skipped:'lock-busy'）。
+ * 事件路径不自己抢锁：真写由 syncEventItem 内部 withWriteLock 收口。挡住它的是整盘写阶段或另一个单条（抢不到它返回 ok:false, skipped:'lock-busy'）。
  */
 export { LOCK_RETRY_MS, LOCK_WAIT_MAX_MS, WRITE_LOCK_FILE };
 /** 单条读写模块（W4-d 提供，可能还没部署）。加载器在 ../prio-item-loader.mjs，这里只转出去。 */
@@ -439,8 +439,8 @@ export function discoveryTargets({ repo, rows = [], sinceMs = null } = {}) {
 /**
  * 窄写入函数：事件路径与发现路径都只从这里写。payload 形状固定为
  * { repo, issue, ref, event, source, linkAllowed, now }，交给 syncOne 的 ctx 只有状态目录 { dir: stateDir }。
- * syncOne 是 #319 的 syncEventItem：它自己 withWriteLock 抢整盘那把锁，所以这里不再抢第二道锁。
- * syncOne 返回 result 时：ok === false 表示没写成功（抢不到锁、回读不一致等）——抛错（reason 进错误信息），
+ * syncOne 是 #319 的 syncEventItem：它自己 withWriteLock 抢整盘写阶段那把 `.item`，所以这里不再抢第二道锁。
+ * syncOne 返回 result 时：ok === false 表示没写成功（整盘写阶段或另一个单条占着、回读不一致等）——抛错（reason 进错误信息），
  * 调用方因此不 ack、不推进水位；mode === 'disabled' 且 ok 为 true 表示停写开关生效、这一条没写：
  * 不抛，由调用方决定可以 ack。written 只认 result.written > 0（真写进看板且回读一致）。
  */

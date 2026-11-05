@@ -950,6 +950,43 @@ function restoreUnwrittenDebounce(nextItems, saved, ref) {
   else delete nextItems[ref];
 }
 
+function sameJson(left, right) {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+}
+
+function readBackValue(raw) {
+  return raw && typeof raw === 'object' && !Array.isArray(raw) && Object.hasOwn(raw, 'value') ? raw.value : raw;
+}
+
+function mergeDebounceRef(dir, ref, state) {
+  const live = loadDebounceState(dir);
+  const items = { ...live.items };
+  if (state === undefined) delete items[ref];
+  else items[ref] = state;
+  saveDebounce(dir, items, live.prCiPresent ? live.prCi : undefined);
+}
+
+function saveDebounceCompared(dir, { nextItems, saved, writtenRefs, prCiOut, loaded }) {
+  const live = loadDebounceState(dir);
+  const merged = { ...live.items };
+  for (const [ref, state] of Object.entries(nextItems)) {
+    if (writtenRefs.has(ref)) continue;
+    const diskVal = Object.prototype.hasOwnProperty.call(live.items, ref) ? live.items[ref] : undefined;
+    const snapVal = Object.prototype.hasOwnProperty.call(saved, ref) ? saved[ref] : undefined;
+    if (sameJson(diskVal, snapVal)) merged[ref] = state;
+  }
+  for (const ref of Object.keys(saved)) {
+    if (Object.prototype.hasOwnProperty.call(nextItems, ref)) continue;
+    const diskVal = Object.prototype.hasOwnProperty.call(live.items, ref) ? live.items[ref] : undefined;
+    const snapVal = saved[ref];
+    if (sameJson(diskVal, snapVal)) delete merged[ref];
+  }
+  let prCi = live.prCiPresent ? live.prCi : undefined;
+  const snapPrCi = loaded.prCiPresent ? loaded.prCi : undefined;
+  if (sameJson(prCi, snapPrCi)) prCi = prCiOut;
+  saveDebounce(dir, merged, prCi);
+}
+
 function skipReport(skippedRepos) {
   if (skippedRepos.size === 0) return { lines: [], suffix: '' };
   const lines = [];
@@ -974,6 +1011,8 @@ function outWrite(stdout, text) {
  * 防抖状态只在 write 模式覆盖 dir/debounce.json。
  * dry-run 和已停用只在内存里算、照常打印计划，不创建、不改写 debounce.json。
  * 只有真写成功才追加 dir/changes.jsonl。
+ * withItemLock：整盘按条持锁入口。有则每条真写包进它；锁内先对照 change.old，陈旧跳过不停写。
+ * 无 withItemLock 时行为与现在相同（单条仍由外层锁包住 runOne，避免重入死锁）。
  */
 export async function runPrioSync({
   dir,
@@ -995,6 +1034,7 @@ export async function runPrioSync({
   onPlan = null,
   readBack = null,
   mergeState = false,
+  withItemLock = null,
 } = {}) {
   if (!dir) throw new Error('缺少状态目录');
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
@@ -1169,13 +1209,93 @@ export async function runPrioSync({
   const skippedRepos = new Map();
   const readbacks = [];
   const skippedAuto = [];
+  const skippedStale = [];
+  const skippedLockBusy = [];
+  const writtenRefs = new Set();
   let readbackMismatch = null;
   let stoppedByDisabled = false;
   let outOfScopeHit = null;
+  const useItemLock = typeof withItemLock === 'function';
   const restoreFrom = (start) => {
     for (let cursor = start; cursor < writes.length; cursor += 1) {
       restoreUnwrittenDebounce(nextItems, saved, writes[cursor].item);
     }
+  };
+  const recordChange = (change) => {
+    appendChange(dir, {
+      at: new Date(now).toISOString(),
+      item: change.item,
+      repo: change.repo,
+      issue: change.issue,
+      field: change.field,
+      old: change.old,
+      new: change.new,
+      basis: change.basis || '',
+    });
+  };
+  const commitWrite = async (change, { confirmOld = false } = {}) => {
+    if (typeof write !== 'function') throw new Error('真写需要写闸');
+    if (confirmOld && typeof readBack === 'function') {
+      const liveRaw = await readBack(change);
+      const live = readBackValue(liveRaw);
+      if (!sameValue(live, change.old)) {
+        if (sameValue(live, change.new)) {
+          recordChange(change);
+          written += 1;
+          writtenRefs.add(change.item);
+          if (useItemLock) mergeDebounceRef(dir, change.item, nextItems[change.item]);
+          return { kind: 'already-new' };
+        }
+        skippedStale.push({ item: change.item, field: change.field, live, old: change.old, new: change.new });
+        restoreUnwrittenDebounce(nextItems, saved, change.item);
+        return { kind: 'stale' };
+      }
+    }
+    const action = {
+      type: 'project.field.set',
+      dedupeKey: `prio:${change.item}:${change.field}:${show(change.old)}:${show(change.new)}:${now}`,
+      repo: change.repo,
+      issue: change.issue,
+      ownerLogin,
+      projectNumber,
+      fields: { [change.field]: change.new },
+      ref: change.item,
+    };
+    if (typeof change.itemId === 'string' && change.itemId) action.itemId = change.itemId;
+    assertPrioFields(action.fields);
+    try {
+      await write(action);
+    } catch (error) {
+      const reason = unresolvableRepoReason(error, change.repo);
+      if (reason == null) throw error;
+      skippedRepos.set(change.repo, { count: 1, reason });
+      restoreUnwrittenDebounce(nextItems, saved, change.item);
+      return { kind: 'unresolvable' };
+    }
+    if (typeof readBack === 'function') {
+      let actual;
+      try {
+        const raw = await readBack(change);
+        actual = readBackValue(raw);
+      } catch (error) {
+        recordChange(change);
+        written += 1;
+        writtenRefs.add(change.item);
+        if (useItemLock) mergeDebounceRef(dir, change.item, nextItems[change.item]);
+        throw error;
+      }
+      const row = { item: change.item, field: change.field, expected: change.new, actual };
+      readbacks.push(row);
+      if (!sameValue(actual, change.new)) {
+        readbackMismatch = row;
+        return { kind: 'mismatch' };
+      }
+    }
+    recordChange(change);
+    written += 1;
+    writtenRefs.add(change.item);
+    if (useItemLock) mergeDebounceRef(dir, change.item, nextItems[change.item]);
+    return { kind: 'written' };
   };
   for (let index = 0; index < writes.length; index += 1) {
     const change = writes[index];
@@ -1231,66 +1351,24 @@ export async function runPrioSync({
       restoreUnwrittenDebounce(nextItems, saved, change.item);
       continue;
     }
-    if (typeof write !== 'function') throw new Error('真写需要写闸');
-    const action = {
-      type: 'project.field.set',
-      dedupeKey: `prio:${change.item}:${change.field}:${show(change.old)}:${show(change.new)}:${now}`,
-      repo: change.repo,
-      issue: change.issue,
-      ownerLogin,
-      projectNumber,
-      fields: { [change.field]: change.new },
-      ref: change.item,
-    };
-    if (typeof change.itemId === 'string' && change.itemId) action.itemId = change.itemId;
-    assertPrioFields(action.fields);
-    try {
-      await write(action);
-    } catch (error) {
-      const reason = unresolvableRepoReason(error, change.repo);
-      if (reason == null) throw error;
-      skippedRepos.set(change.repo, { count: 1, reason });
-      restoreUnwrittenDebounce(nextItems, saved, change.item);
-      continue;
-    }
-    if (typeof readBack === 'function') {
-      let actual;
-      try {
-        const raw = await readBack(change);
-        actual = raw && typeof raw === 'object' && !Array.isArray(raw) && Object.hasOwn(raw, 'value') ? raw.value : raw;
-      } catch (error) {
-        appendChange(dir, {
-          at: new Date(now).toISOString(),
-          item: change.item,
-          repo: change.repo,
-          issue: change.issue,
-          field: change.field,
-          old: change.old,
-          new: change.new,
-          basis: change.basis || '',
-        });
-        written += 1;
-        throw error;
+    if (useItemLock) {
+      const locked = await withItemLock(async () => commitWrite(change, { confirmOld: true }));
+      if (!locked?.acquired) {
+        skippedLockBusy.push({ item: change.item, field: change.field, detail: locked?.detail || locked?.reason || 'lock-busy' });
+        restoreUnwrittenDebounce(nextItems, saved, change.item);
+        continue;
       }
-      const row = { item: change.item, field: change.field, expected: change.new, actual };
-      readbacks.push(row);
-      if (!sameValue(actual, change.new)) {
-        readbackMismatch = row;
+      if (locked.value?.kind === 'mismatch') {
         restoreFrom(index);
         break;
       }
+      continue;
     }
-    appendChange(dir, {
-      at: new Date(now).toISOString(),
-      item: change.item,
-      repo: change.repo,
-      issue: change.issue,
-      field: change.field,
-      old: change.old,
-      new: change.new,
-      basis: change.basis || '',
-    });
-    written += 1;
+    const outcome = await commitWrite(change);
+    if (outcome.kind === 'mismatch') {
+      restoreFrom(index);
+      break;
+    }
   }
   let prCiOut;
   if (mode === 'write' && carried?.changed) {
@@ -1299,7 +1377,21 @@ export async function runPrioSync({
     prCiOut = loaded.prCi;
   }
   // 只有真写才落盘。dry-run 和已停用的观测不能进下一拍；整文件保持原字节，原来没有就不创建。
-  if (mode === 'write') saveDebounce(dir, nextItems, prCiOut);
+  // 整盘按条持锁时：未写入的 ref 只在盘上仍等于开拍快照才写；prCi 同理。
+  if (mode === 'write') {
+    if (useItemLock) {
+      const locked = await withItemLock(async () => {
+        saveDebounceCompared(dir, { nextItems, saved, writtenRefs, prCiOut, loaded });
+      });
+      if (!locked?.acquired) {
+        for (const change of writes) {
+          if (!writtenRefs.has(change.item)) restoreUnwrittenDebounce(nextItems, saved, change.item);
+        }
+      }
+    } else {
+      saveDebounce(dir, nextItems, prCiOut);
+    }
+  }
   const report = skipReport(skippedRepos);
   for (const line of report.lines) outWrite(stdout, line);
   const excludedTotal = (Number.isInteger(presetExcluded) && presetExcluded > 0 ? presetExcluded : 0) + skippedHere;
@@ -1323,6 +1415,8 @@ export async function runPrioSync({
     aborted: gate.abort,
     outOfScopeHit,
     skippedAuto,
+    skippedStale,
+    skippedLockBusy,
   };
 }
 

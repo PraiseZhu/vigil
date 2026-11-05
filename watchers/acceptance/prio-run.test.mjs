@@ -9,7 +9,7 @@ import { REPO, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 import { DOWNGRADE_MIN_GAP_MS } from './bin/prio-score.mjs';
 import { ONLY_FIELD_NAMES, PRIO_HOURLY_MAX, PRIO_HOURLY_WINDOW_MS } from './bin/prio-sync.mjs';
 import { alertTextFor, hostFilesFromEnv, main, parseMaxPerTick, parsePrioRunArgs } from './bin/prio-run.mjs';
-import { hostPaths } from './host/paths.mjs';
+import { hostPaths, tryAcquireLock } from './host/paths.mjs';
 
 const T0 = Date.parse('2026-10-31T12:00:00.000Z');
 const HOUR = PRIO_HOURLY_WINDOW_MS;
@@ -87,6 +87,18 @@ function confirmedDowngrade(pending) {
   };
 }
 
+/** 锁内对照读返回 old，写后回读再走 onReadback（缺省返回 new）。 */
+function phasedReadBack(onReadback) {
+  const counts = new Map();
+  return async (change) => {
+    const key = `${change.item}\0${change.field}`;
+    const n = (counts.get(key) || 0) + 1;
+    counts.set(key, n);
+    if (n === 1) return change.old;
+    return onReadback ? onReadback(change) : change.new;
+  };
+}
+
 async function run(dir, args, extra = {}) {
   const writes = [];
   const seen = { token: 0, load: 0, network: 0 };
@@ -107,7 +119,9 @@ async function run(dir, args, extra = {}) {
       return extra.items || [];
     }),
     loadPrs: async () => extra.prs || [],
-    readBack: extra.readBack || (async (change) => change.new),
+    readBack: extra.readBack || phasedReadBack(),
+    lockPath: extra.lockPath || path.join(dir, 'prio-write.lock'),
+    lockOptions: extra.lockOptions,
     write: extra.write || (async (action) => {
       writes.push(structuredClone(action));
       if (extra.onWrite) await extra.onWrite(action, writes);
@@ -436,10 +450,10 @@ test('#233 SC6 回读不一致立刻停止余下写入，自动停写告警，�
   let reads = 0;
   const { writes, result } = await run(dir, ['--write'], {
     items: fills(2),
-    readBack: async (change) => {
+    readBack: phasedReadBack((change) => {
       reads += 1;
       return change.issue === 1 ? 'P0' : change.new;
-    },
+    }),
   });
   assert.equal(writes.length, 1);
   assert.equal(reads, 1);
@@ -800,7 +814,9 @@ function boardDeps(world, ghRun, extra = {}) {
     budgetFile: world.budgetFile,
     budgets: extra.budgets === undefined ? { loop: 500, 'prio-run': 300, 'board-live': 140 } : extra.budgets,
     tickSeconds: 180,
-    readBack: async (change) => change.new,
+    readBack: extra.readBack || phasedReadBack(),
+    lockPath: extra.lockPath || path.join(world.dir, 'prio-write.lock'),
+    lockOptions: extra.lockOptions,
     write: extra.write || (async () => {}),
     run: ghRun,
     fetchImpl: async () => {
@@ -939,7 +955,8 @@ test('#247 P1-1 宿主状态目录问 host/paths.mjs，不按 --state-dir 的布
     loadProfile: () => profile,
     budgets: { loop: 500, 'prio-run': 300, 'board-live': 140 },
     tickSeconds: 180,
-    readBack: async (change) => change.new,
+    readBack: phasedReadBack(),
+    lockPath: path.join(stateDir, 'prio-write.lock'),
     write: async () => {},
     run: gh,
     fetchImpl: async () => {
@@ -1391,10 +1408,10 @@ test('SC2 --only-field 关联 PR 时 link 放行并逐条回读', async () => {
   const { writes, result, io } = await run(dir, ['--write', '--only-field', '关联 PR'], {
     items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2' })],
     prs: [closingPr(9, 1), closingPr(10, 2)],
-    readBack: async (change) => {
+    readBack: phasedReadBack((change) => {
       reads.push({ item: change.item, field: change.field, itemId: change.itemId });
       return change.new;
-    },
+    }),
   });
   assert.equal(result.exitCode, 0);
   assert.deepEqual(writes.map((action) => action.fields), [
@@ -1421,10 +1438,10 @@ test('SC3 关联 PR 回读不一致立刻停写并告警', async () => {
   const { writes, result } = await run(dir, ['--write', '--only-field', '关联 PR'], {
     items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2' })],
     prs: [closingPr(9, 1), closingPr(10, 2)],
-    readBack: async (change) => {
+    readBack: phasedReadBack((change) => {
       reads.push(change.item);
       return change.issue === 1 ? '#9(open)' : change.new;
-    },
+    }),
   });
   assert.deepEqual(writes.map((action) => action.itemId), ['PVTI_1'], '第一条写完就停，余下的不写');
   assert.deepEqual(reads, [`${REPO}#1`], '只回读了一条，没有重试');
@@ -1644,4 +1661,84 @@ test('SC13 --only-field 关联 PR 时不发 prio-nonempty', async () => {
   assert.equal(alerts.length, 0);
   assert.equal(disabled(dir), false);
   assert.equal(result.stop, '');
+});
+
+test('SC1-边界7 整盘计划空→P2 而锁内已是 P1，跳过、不停写、本拍继续', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const counts = new Map();
+  const { writes, result } = await run(dir, ['--write'], {
+    items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2' })],
+    readBack: async (change) => {
+      const key = `${change.item}\0${change.field}`;
+      const n = (counts.get(key) || 0) + 1;
+      counts.set(key, n);
+      if (change.issue === 1) return 'P1';
+      if (n === 1) return change.old;
+      return change.new;
+    },
+  });
+  assert.equal(writes.length, 1, '陈旧那条不写，后面的继续');
+  assert.equal(writes[0].issue, 2);
+  assert.equal(result.stop, '');
+  assert.equal(disabled(dir), false);
+  assert.equal(readAlerts(dir).length, 0);
+  assert.equal(result.result.skippedStale.length, 1);
+  assert.equal(result.result.skippedStale[0].item, `${REPO}#1`);
+  assert.equal(result.result.written, 1);
+});
+
+test('SC1-边界8 锁内对照仍是 old、回读成无关值仍停写', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const counts = new Map();
+  const { writes, result } = await run(dir, ['--write'], {
+    items: fills(2),
+    readBack: async (change) => {
+      const key = `${change.item}\0${change.field}`;
+      const n = (counts.get(key) || 0) + 1;
+      counts.set(key, n);
+      if (n === 1) return change.old;
+      return change.issue === 1 ? 'P0' : change.new;
+    },
+  });
+  assert.equal(writes.length, 1, '对照读返回 old 才写，回读错值立刻停');
+  assert.equal(counts.get(`${REPO}#1\0优先级`), 2, '夹具：对照读 old、回读再返回错值');
+  assert.equal(result.stop, 'readback');
+  assert.equal(disabled(dir), true);
+  const [alert] = readAlerts(dir);
+  assert.match(alert.text, /读回来的值和要写的不一致/);
+  assert.equal(result.result.readbackMismatch.actual, 'P0');
+});
+
+test('SC1-边界10 整盘抢不到，该条本拍跳过，不 abort、不 disabled', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const lockFile = path.join(dir, 'prio-write.lock');
+  let now = 0;
+  let acquires = 0;
+  const { writes, result } = await run(dir, ['--write'], {
+    items: fills(2),
+    lockPath: lockFile,
+    lockOptions: {
+      retryMs: 5,
+      maxWaitMs: 5,
+      now: () => now,
+      sleep: async (ms) => { now += ms; },
+      tryAcquire: (file, opts) => {
+        acquires += 1;
+        if (acquires <= 2) return false;
+        return tryAcquireLock(file, opts);
+      },
+    },
+  });
+  assert.equal(writes.length, 1, '第一条抢不到跳过，第二条继续');
+  assert.equal(writes[0].issue, 2);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stop, '');
+  assert.equal(disabled(dir), false);
+  assert.equal(readAlerts(dir).length, 0);
+  assert.equal(result.result.skippedLockBusy.length, 1);
+  assert.equal(result.result.skippedLockBusy[0].item, `${REPO}#1`);
+  assert.equal(result.result.aborted, false);
 });
