@@ -2670,6 +2670,14 @@ export function* processPr({
     && !['invalid-result', 'missing-result-limit'].includes(previous.activeTask?.blockedKind)
     && !sameBlockedCause
   ));
+  // Remember that this head/base tip was collected while the threshold is on: the behind-threshold gate uses the
+  // record to avoid a full collection every round for a PR the plan declines (review in progress, merge-ready).
+  if (!dryRun && baseUpdateBehindThreshold() > 0
+    && typeof collected?.baseTipOid === 'string' && typeof collected?.pr?.headRefOid === 'string') {
+    previous = { ...previous, baseUpdateCheck: {
+      head: collected.pr.headRefOid, baseTip: collected.baseTipOid, at: now,
+    } };
+  }
   if (!dryRun && !resultError && !admissionBlocked && fresh.length === 0 && !inFlight) {
     const saveEntry = (entry) => { previous = entry; state.prs[key] = entry; persistState(state, paths); return entry; };
     const plan = planBaseUpdate({ snapshot: collected, entry: previous, fresh, now });
@@ -2866,10 +2874,12 @@ export function* processPr({
     }
     const prefix = [reclaimNote(previous, pr.headRefName), handoffNote, messagePrefix].filter(Boolean).join('\n');
     const pending = { ...dispatchIntent({ pr, mapping: dispatchMapping, fresh, now, paths, dryRun, messagePrefix: prefix, collected: { ...collected, handledFindings: handledFindingsFrom(paths, previous) } }), cursor: settledCursor };
-    previous = { ...previous, pendingDispatch: pending };
     if (dryRun) {
+      // A dry run only reports what it would do; persisting pendingDispatch would make the next live round treat
+      // the PR as already being delivered (the conflict gate and the retry path both read it from state).
       dispatch = { attempted: false, bound: false, reason: 'dry-run', pending };
     } else {
+      previous = { ...previous, pendingDispatch: pending };
       state.prs[key] = previous;
       persistState(state, paths);
       try {
@@ -3064,7 +3074,35 @@ export function conflictDispatchDue({ previous, snapshot, now }) {
 }
 
 // True when nothing on GitHub changed since the last settled round and no local work is due either.
-function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
+// A behind-threshold PR must be collected even when its fingerprint is stable, or the base update never runs for a
+// PR that is exactly the kind it targets (quiet and stale). The check is recorded per head/base tip so a PR the
+// plan declines (review in progress, merge-ready) is not collected every round.
+export const BASE_UPDATE_RECHECK_MS = 60 * 60 * 1000;
+export function baseUpdateCollectionDue({ previous, normalized, mergeIndex, now, behindThreshold = baseUpdateBehindThreshold() }) {
+  const threshold = Number.isSafeInteger(behindThreshold) && behindThreshold > 0 ? behindThreshold : 0;
+  if (!threshold || !(mergeIndex instanceof Map) || mergeIndex.blocked) return false;
+  const entry = mergeIndex.get(String(previous?.nodeId));
+  if (!entry || !Number.isSafeInteger(entry.behindBy) || entry.behindBy < threshold) return false;
+  const active = previous?.activeTask;
+  const running = Boolean(active)
+    && !['complete', 'legacy-complete', 'blocked'].includes(active.status)
+    && active.blockedKind !== 'author-reclaimed';
+  if (running || previous?.pendingDispatch || previous?.needsHuman || previous?.dispatchConflict) return false;
+  const head = normalized?.headRefOid ?? previous?.headRefOid;
+  const baseTip = entry.baseTipOid ?? normalized?.baseTipOid;
+  if (typeof head !== 'string' || typeof baseTip !== 'string') return false;
+  const current = previous?.baseUpdate;
+  if (current && current.head === head && current.baseTip === baseTip
+    && ['reserved', 'accepted', 'uncertain', 'updated'].includes(current.status)) return false;
+  const checked = previous?.baseUpdateCheck;
+  if (checked && checked.head === head && checked.baseTip === baseTip) {
+    const at = Date.parse(checked.at ?? '');
+    if (Number.isFinite(at) && Date.parse(now) - at < BASE_UPDATE_RECHECK_MS) return false;
+  }
+  return true;
+}
+
+function canSkipCollection({ previous, fingerprint, normalized, paths, now, mergeIndex = null }) {
   const pendingRetry = previous.pendingDispatch?.status === 'retryable';
   const recoveryDue = Boolean(readTaskForRecovery(previous, paths, now))
     // Out of deliveries and still silent: nothing on GitHub changes, so this alone must reach processPr.
@@ -3086,6 +3124,7 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
     && !hasUnconsumedResult(previous, paths) && !needsCiRecheck(previous.activeTask) && !previous.recheckDeferredAt
     && !keelReopenDue && !intentMigrationDue && !escalateDue && !ciUnknownRecheckDue(previous, paths, now)
     && !conflictDispatchDue({ previous, snapshot: normalized, now })
+    && !baseUpdateCollectionDue({ previous, normalized, mergeIndex, now })
     && !pendingActionDue(previous) && !scanRecheckDue(previous, now);
 }
 
@@ -3113,7 +3152,7 @@ export function* pollWorkflow({
   const remaining = () => Math.max(0, Math.min(deadline, prDeadline) - clock());
   const dryRun = !(enabled && allowDispatch && typeof dispatchFn === 'function');
   const number = Number(prNumber);
-  let previous = readPr(paths.home, nodeId) || { nodeId, number };
+  let previous = clearDryPending(readPr(paths.home, nodeId) || { nodeId, number });
   const report = [];
   const events = [];
   const snapshot = snapshotFn
@@ -3158,7 +3197,7 @@ export function* pollWorkflow({
   previous = yield* notifyDispatchConflictOnce({
     previous, key: nodeId, paths, now, dryRun, dispatchFn, remaining, pr: { number }, ghFn,
   });
-  if (canSkipCollection({ previous, fingerprint, normalized, paths, now })) {
+  if (canSkipCollection({ previous, fingerprint, normalized, paths, now, mergeIndex })) {
     // A pushed HEAD is still waiting for its in-flight result. GitHub itself has
     // not changed, so skip collection, but keep reporting the wait until it expires.
     if (previous.headChangeSince && Date.parse(now) - Date.parse(previous.headChangeSince) < HEAD_CHANGE_WAIT_MS) {
@@ -3567,7 +3606,7 @@ function* discoverOnePr(pr, ctx) {
     const snapshot = yield* fetchPollSnapshot({ nodeId: key, ghFn, mergeIndex });
     gateFingerprint = pollFingerprint(snapshot);
     if (!previous.headChangeSince && fullCollectFresh(previous, now, fullCollectMs)
-      && canSkipCollection({ previous, fingerprint: gateFingerprint, normalized: snapshot, paths, now })) {
+      && canSkipCollection({ previous, fingerprint: gateFingerprint, normalized: snapshot, paths, now, mergeIndex })) {
       report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'fingerprint-unchanged' } });
       return done();
     }

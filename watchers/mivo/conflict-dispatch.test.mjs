@@ -75,10 +75,10 @@ function collectedConflict(extra = {}) {
   };
 }
 
-function poll(paths, { snapshot, collect, dispatchFn }) {
+function poll(paths, { snapshot, collect, dispatchFn, enabled = true, allowDispatch = true }) {
   let collected = 0;
   const result = scanOnce({
-    mode: 'poll', enabled: true, allowDispatch: true, paths, now, nodeId, prNumber: 1746,
+    mode: 'poll', enabled, allowDispatch, paths, now, nodeId, prNumber: 1746,
     snapshotFn: () => snapshot,
     ghFn: (args) => (args[0] === 'api' ? 'owner' : args[0] === 'pr' && args[1] === 'view' ? JSON.stringify({ id: nodeId, state: 'OPEN' }) : '[]'),
     collect: (...args) => {
@@ -248,4 +248,39 @@ test('a running repair closes the gate instead of forcing a collection every rou
   });
   assert.equal(collected, 0);
   assert.equal(result.prs[0].dispatch.reason, 'fingerprint-unchanged');
+});
+
+test('a dry run does not persist a pending dispatch', (t) => {
+  const { paths } = homeOf(t);
+  seed(paths);
+  const tasksDir = path.join(paths.stateDir, 'tasks');
+  const before = fs.existsSync(tasksDir) ? fs.readdirSync(tasksDir).sort() : [];
+  let calls = 0;
+  const { result, entry } = poll(paths, {
+    snapshot: snap(),
+    collect: collectedConflict,
+    dispatchFn: () => { calls += 1; throw new Error('a dry run must not dispatch'); },
+    allowDispatch: false,
+  });
+  assert.equal(calls, 0);
+  assert.equal(result.prs[0].dispatch.reason, 'dry-run');
+  assert.ok(!entry.pendingDispatch, 'a dry run must not leave a pending dispatch in state');
+  const after = fs.existsSync(tasksDir) ? fs.readdirSync(tasksDir).sort() : [];
+  assert.deepEqual(after, before, 'a dry run must not write a task file');
+});
+
+test('a leftover dry pending dispatch is cleared and does not block the conflict gate', (t) => {
+  const { paths } = homeOf(t);
+  seed(paths, { pendingDispatch: { dispatchId: 'dry-1746-old', params: {}, at: now } });
+  let params;
+  const { result, entry } = poll(paths, {
+    snapshot: snap(),
+    collect: collectedConflict,
+    dispatchFn: (value) => { params = value; return { target_session_id: 'sess-1746' }; },
+  });
+  assert.equal(result.prs[0].dispatch.attempted, true);
+  assert.equal(result.prs[0].dispatch.bound, true);
+  assert.match(params.message, /"key":"conflict:merge-conflict"/);
+  assert.ok(entry.conflictDispatch);
+  assert.notEqual(entry.pendingDispatch?.dispatchId, 'dry-1746-old');
 });
