@@ -26,11 +26,7 @@ import {
 import {
   DEFAULT_POLL_AFTER_FAILURES,
   DISCOVERY_QUERY,
-  LOCK_RETRY_MS,
-  LOCK_WAIT_MAX_MS,
   SINGLE_ITEM_MODULE,
-  WriteLockBusyError,
-  acquireWriteLock,
   appendEventRunLog,
   createEventPipeline,
   createEventRunState,
@@ -42,13 +38,13 @@ import {
   parseEventRunArgs,
   readEventRunConfig,
   runEventRun,
-  writeLockHeld,
 } from './bin/event-run.mjs';
 import { isReadOnlyGraphql } from './bin/github.mjs';
+import { writeLockHeld } from './bin/prio-lock.mjs';
 import { renderPrioBoardSection } from './bin/prio-board-section.mjs';
 import { viewPrio } from './bin/prio-view.mjs';
 import { defaultStateDir, stateFiles } from './bin/prio-sync.mjs';
-import { tmpDir } from './fake-gh.fixture.mjs';
+import { tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SECRET = 'webhook-secret-test';
@@ -1493,7 +1489,6 @@ test('W4c SC2 事件白名单：非授权仓、非四类事件都不进写路径
     config: { ...configOf(fixture), write: true },
     fetchImpl: worker.fetchImpl,
     syncOne: async (target) => written.push(target.ref),
-    lock: async () => {},
   });
   assert.deepEqual(written, ['example/owner-a#7']);
   assert.deepEqual(worker.calls.ack, [['allow', 'other-repo', 'wrong-type']]);
@@ -1518,7 +1513,6 @@ test('W4c SC3 乱序：同一目标的旧事件晚到不覆盖新状态', async 
     config: { ...configOf(fixture), write: true },
     fetchImpl: worker.fetchImpl,
     syncOne: async (target) => written.push(target.ref),
-    lock: async () => {},
   });
   assert.deepEqual(written, ['example/owner-a#7'], '旧事件不触发第二次写');
   assert.ok(logs.some((line) => /乱序/.test(line)));
@@ -1533,7 +1527,6 @@ test('W4c SC3 重放：同一 deliveryId 只处理一次', async () => {
     config: { ...configOf(fixture), write: true },
     fetchImpl: worker.fetchImpl,
     syncOne: async (target) => written.push(target.ref),
-    lock: async () => {},
   });
   assert.deepEqual(written, ['example/owner-a#7']);
   assert.ok(logs.every((line) => !/乱序/.test(line)));
@@ -1541,41 +1534,39 @@ test('W4c SC3 重放：同一 deliveryId 只处理一次', async () => {
   assert.ok(worker.calls.ack[0].every((id) => id === 'dup'));
 });
 
-test('W4c SC4 抢不到写锁：每 2 秒重试、最多 10 秒，仍抢不到就抛错，事件不确认也不写', async () => {
-  let t = 0;
-  const sleeps = [];
-  await assert.rejects(
-    acquireWriteLock({
-      probe: () => ({ held: true, known: true }),
-      sleep: async (ms) => {
-        sleeps.push(ms);
-        t += ms;
-      },
-      now: () => t,
-    }),
-    /写锁一直被占用/,
-  );
-  assert.deepEqual(sleeps, Array(LOCK_WAIT_MAX_MS / LOCK_RETRY_MS).fill(LOCK_RETRY_MS));
-  assert.equal(LOCK_RETRY_MS * sleeps.length, LOCK_WAIT_MAX_MS);
-
+test('W4c SC4 单条写入抢不到写锁：不 ack、上报一次失败、不设水位（抢锁已在 syncEventItem 内部 withWriteLock）', async () => {
   const fixture = eventRunFixture();
   const worker = fakePullWorker({ batches: [[issueEvent('locked', { issue: 7 })]] });
-  const written = [];
+  const state = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  const calls = [];
   await runOneTick({
     config: { ...configOf(fixture), write: true },
     fetchImpl: worker.fetchImpl,
-    syncOne: async (target) => written.push(target.ref),
-    lock: async () => {
-      throw new WriteLockBusyError('写锁一直被占用：测试');
+    state,
+    // 真值形状见 bin/prio-item.mjs 的 syncEventItem：抢不到整盘那把锁就是这个返回值。
+    syncOne: async (payload) => {
+      calls.push(payload.ref);
+      return { ok: false, written: 0, planned: 0, skipped: 'lock-busy', reason: 'lock-busy', mode: 'write' };
     },
   });
-  assert.deepEqual(written, []);
+  assert.deepEqual(calls, ['example/owner-a#7'], '事件还是交给 syncOne 一次，由它内部抢锁');
   assert.deepEqual(worker.calls.ack, [], '抢不到锁那一拍不确认');
   assert.equal(worker.calls.fail.length, 1, '上报一次失败，事件留在 Worker 队列里');
-  assert.match(worker.calls.fail[0].error, /写锁/);
+  assert.match(worker.calls.fail[0].error, /lock-busy/);
+  assert.equal(state.watermarks.has('example/owner-a#7'), false, '没写成功不推进事件水位');
 });
 
-test('W4c SC4 写锁探测按 /proc/locks 判定：锁文件残留不算被占用', () => {
+test('W4c SC4 写锁实现只有 bin/prio-lock.mjs 一份：event-run 不再自己留探测/抢锁，事件路径也不抢第二道锁', async () => {
+  const mod = await import('./bin/event-run.mjs');
+  assert.equal(typeof mod.writeLockHeld, 'undefined', '探测整盘那把锁的 writeLockHeld 只在 prio-lock.mjs');
+  assert.equal(typeof mod.acquireWriteLock, 'undefined', '抢锁只在 prio-lock.mjs 的 withWriteLock（由 syncEventItem 调用）');
+  assert.equal(typeof mod.WriteLockBusyError, 'undefined', '抢锁失败的错误类型已经跟着实现一起搬走');
+  const src = fs.readFileSync(path.join(HERE, 'bin', 'event-run.mjs'), 'utf8');
+  assert.match(src, /from '\.\/prio-lock\.mjs'/, '常量从同目录现成模块静态 import');
+  assert.doesNotMatch(src, /procLocksFile|proc-locks/, '不再留第二份 /proc/locks 解析');
+});
+
+test('W4c SC4 写锁探测改由 bin/prio-lock.mjs 负责：锁文件残留不算被占，/proc/locks 列了算忙、读不到说探测不了', () => {
   const fixture = eventRunFixture();
   const lockFile = path.join(fixture.home, 'prio-write.lock');
   fs.writeFileSync(lockFile, '');
@@ -1606,7 +1597,7 @@ test('W4c SC4 写锁探测按 /proc/locks 判定：锁文件残留不算被占�
   );
 });
 
-test('W4c SC4 fd 形式的 flock 不进 /proc/locks 时，靠「有人开着锁文件」判定为忙', { skip: !fs.existsSync('/proc/self/fd') }, () => {
+test('W4c SC4 锁探测的 fd 形式（prio-lock.mjs）：flock 不进 /proc/locks 时，靠「有人开着锁文件」判定为忙', { skip: !fs.existsSync('/proc/self/fd') }, () => {
   const fixture = eventRunFixture();
   const lockFile = path.join(fixture.home, 'prio-write.lock');
   fs.writeFileSync(lockFile, '');
@@ -1634,7 +1625,6 @@ test('W4c SC4 写的时候如实传 linkAllowed：没有 mac-mini-stopped 是 fa
     config: { ...configOf(fixture), write: true },
     fetchImpl: first.fetchImpl,
     syncOne: async (target) => seen.push(target.linkAllowed),
-    lock: async () => {},
   });
   fs.writeFileSync(fixture.paths.markerFile, '');
   const second = fakePullWorker({ batches: [[issueEvent('b', { issue: 8 })]] });
@@ -1642,7 +1632,6 @@ test('W4c SC4 写的时候如实传 linkAllowed：没有 mac-mini-stopped 是 fa
     config: { ...configOf(fixture), write: true },
     fetchImpl: second.fetchImpl,
     syncOne: async (target) => seen.push(target.linkAllowed),
-    lock: async () => {},
   });
   assert.deepEqual(seen, [false, true]);
 });
@@ -1657,7 +1646,6 @@ test('W4c SC5 event-run.disabled 存在就空转：一条事件都不拉，日�
     syncOne: async () => {
       throw new Error('停用期间不该写');
     },
-    lock: async () => {},
   });
   assert.equal(worker.calls.pull, 0, '停用时不拉事件');
   assert.deepEqual(worker.calls.ack, []);
@@ -1675,7 +1663,6 @@ test('W4c SC5 .prio/disabled 存在时只确认不写', async () => {
     syncOne: async () => {
       writes += 1;
     },
-    lock: async () => {},
   });
   assert.equal(writes, 0);
   assert.deepEqual(worker.calls.ack, [['d1']]);
@@ -1729,7 +1716,6 @@ test('W4c SC6 兜底轮询只补写事件路径没写成功的那一条，不整
       }
       written.push(target.ref);
     },
-    lock: async () => {},
     logger: () => {},
   });
   await assert.rejects(() => pipeline.onEvent(issueEvent('p1', { issue: 7 })), /连不上看板/);
@@ -1757,7 +1743,6 @@ test('W4c SC6 兜底发现：Worker 失败期间发现授权仓最近更新的 P
       written.push(target.ref);
       return { written: 1 };
     },
-    lock: async () => {},
     logger: () => {},
     listRecent: async ({ repo, sinceMs }) => {
       calls.push({ repo, sinceMs });
@@ -1797,7 +1782,6 @@ test('W4c SC6 兜底发现的时间水位：首次回看 10 分钟，之后按�
     write: true,
     now: () => nowMs,
     syncOne: async () => ({ written: 0 }),
-    lock: async () => {},
     logger: () => {},
     listRecent: async ({ repo, sinceMs }) => {
       calls.push([repo, sinceMs]);
@@ -1828,7 +1812,6 @@ test('W4c SC6 .prio/disabled 存在时发现路径只发现不写，日志写明
       writes += 1;
       return { written: 1 };
     },
-    lock: async () => {},
     logger: (line) => logs.push(line),
     listRecent: async ({ repo }) => {
       discovered += 1;
@@ -1921,7 +1904,6 @@ test('W4c SC6 runEventRun 把发现的 reader 接进 poll：授权仓每仓一�
       written.push(payload.ref);
       return { ok: true, written: 1 };
     },
-    lock: async () => {},
     logger: () => {},
     reader: {
       async ownerGraphql(query, variables) {
@@ -1944,7 +1926,7 @@ test('W4c SC6 runEventRun 把发现的 reader 接进 poll：授权仓每仓一�
   assert.deepEqual(written.sort(), ['example/owner-a#7', 'example/owner-b#8']);
 });
 
-test('W4c SC6 延迟行带 written 标记：真写入为 true，无变化/dry-run/非授权仓为 false，老行不写这个键', async () => {
+test('W4c SC10 延迟行带 written 标记：真写入为 true，无变化/dry-run/非授权仓为 false，老行不写这个键', async () => {
   // 真写入与无变化：syncOne 自己报 written。
   const writtenFixture = eventRunFixture();
   const worker = fakePullWorker({ batches: [[issueEvent('w1', { issue: 7 }), issueEvent('w2', { issue: 8 })]] });
@@ -1952,7 +1934,6 @@ test('W4c SC6 延迟行带 written 标记：真写入为 true，无变化/dry-ru
     config: { ...configOf(writtenFixture), write: true },
     fetchImpl: worker.fetchImpl,
     syncOne: async (target) => ({ written: target.issue === 7 ? 1 : 0 }),
-    lock: async () => {},
   });
   const rows = readLatencyLog(writtenFixture.paths.latencyFile);
   assert.equal(rows.find((row) => row.deliveryId === 'w1')?.written, true, '写到看板并读回成功 = true');
@@ -1967,7 +1948,6 @@ test('W4c SC6 延迟行带 written 标记：真写入为 true，无变化/dry-ru
     config: configOf(dryFixture),
     fetchImpl: dryWorker.fetchImpl,
     syncOne: async () => ({ written: 1 }),
-    lock: async () => {},
   });
   const dryRows = readLatencyLog(dryFixture.paths.latencyFile);
   assert.equal(dryRows.find((row) => row.deliveryId === 'd1')?.written, false, 'dry-run = false');
@@ -2004,7 +1984,6 @@ test('W4c SC6 窄写入函数：payload 形状固定、ctx 只有状态目录；
       if (payload.issue === 8) return { ok: true, mode: 'disabled', written: 0 };
       return { ok: true, written: 1 };
     },
-    lock: async () => {},
     logger: () => {},
   });
   await assert.rejects(() => pipeline.onEvent(issueEvent('f1', { issue: 7 })), /看板字段不接受这个值/);
@@ -2048,9 +2027,15 @@ test('W4c SC7 单条读写模块未部署：不确认事件、日志写人话（
     '模块不在：加载器返回 null，不抛错',
   );
   assert.equal(
-    await loadSingleItemModule({ importer: async () => ({}) }),
+    await loadSingleItemModule({ importer: async () => ({ syncOneItem: async () => ({ ok: true }) }) }),
     null,
-    '模块在但没导出 syncOneItem：同样算未部署',
+    '模块在但只导出旧的 syncOneItem、没有 syncEventItem（#319 之前的导出名）：同样算未部署',
+  );
+  const fakeSync = async () => ({ ok: true });
+  assert.equal(
+    await loadSingleItemModule({ importer: async () => ({ syncEventItem: fakeSync }) }),
+    fakeSync,
+    '取的是 #319 的适配层导出 syncEventItem',
   );
   await assert.rejects(
     () => loadSingleItemModule({ importer: async () => { throw new Error('读模块时磁盘出错'); } }),
@@ -2063,16 +2048,135 @@ test('W4c SC7 单条读写模块未部署：不确认事件、日志写人话（
     config: { ...configOf(fixture), write: true },
     fetchImpl: worker.fetchImpl,
     loadModule: async () => null,
-    lock: async () => {},
   });
   assert.deepEqual(worker.calls.ack, [], '模块不在：这条事件不确认');
   assert.equal(worker.calls.fail.length, 1);
   assert.ok(logs.some((line) => /单条读写模块未部署/.test(line)));
 });
 
-// 预留：等 #319 合入真 syncEventItem 之后，在这里加一条「真 syncEventItem + 假 GitHub」的端到端实例：
-// 一条 issue 事件 → syncEventItem 单条读写 → 假 GitHub 只回该条 → 断言写入字段与读回结果。
-// 现在不写：仓库里还没有 syncEventItem，写了只能假设实现形状。
+// 端到端夹具：真的 bin/prio-item.mjs（经 prio-item-loader 加载）+ 假 GitHub、假写函数、假回读。
+// ITEM_QUERY 的返回形状按 bin/prio-item.mjs 里的查询造：一条看板条目、没有交叉引用 PR。
+function e2ePrioFixture() {
+  const fixture = eventRunFixture();
+  const { profile } = writeProfile(fixture.home);
+  const boardId = 'PVT_e2e_board';
+  const queries = [];
+  const reader = {
+    async ownerGraphql(query, variables) {
+      queries.push({ query, variables });
+      if (query !== e2eItemQuery) throw new Error('端到端事件路径只该发 ITEM_QUERY');
+      return {
+        rateLimit: { cost: 2, remaining: 4000, resetAt: '2026-11-01T13:00:00Z' },
+        user: { projectV2: { id: boardId } },
+        repository: {
+          issue: {
+            timelineItems: { nodes: [] },
+            projectItems: {
+              nodes: [
+                {
+                  id: 'PVTI_e2e_7',
+                  isArchived: false,
+                  updatedAt: '2026-11-01T00:00:00.000Z',
+                  project: { id: boardId, number: 7 },
+                  content: {
+                    __typename: 'Issue',
+                    number: 7,
+                    state: 'OPEN',
+                    updatedAt: '2026-11-01T00:00:00.000Z',
+                    repository: { nameWithOwner: 'example/owner-a' },
+                    labels: { nodes: [] },
+                  },
+                  fieldValues: {
+                    nodes: [
+                      { __typename: 'ProjectV2ItemFieldSingleSelectValue', name: 'Todo', field: { name: '状态' } },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        },
+      };
+    },
+  };
+  const writes = [];
+  const write = async (action) => {
+    writes.push(structuredClone(action));
+    return { ok: true };
+  };
+  const lockFile = path.join(fixture.paths.stateDir, 'prio-write.lock');
+  // 注入的 ctx 只有这一层：profile / reader / write / readBack / 锁路径都是测试给的，其余用真实现。
+  const syncOne = (payload, ctx) => e2eSyncEventItem(payload, {
+    ...ctx,
+    profile,
+    reader,
+    write,
+    readBack: async (change) => change.new,
+    lockPath: lockFile,
+    // 抢锁与额度都别用真时钟/真状态文件：锁最多等几毫秒，额度闸按「未启用」走。
+    lockOptions: { retryMs: 2, maxWaitMs: 6 },
+    env: {},
+  });
+  return { fixture, profile, reader, writes, lockFile, queries, syncOne };
+}
+
+let e2eItemQuery = null;
+let e2eSyncEventItem = null;
+
+test('W4c SC7 真 syncEventItem + 假 GitHub 端到端', async () => {
+  // 真加载器 + 真适配层：加载器取到的必须是 #319 的 syncEventItem，不是旧的 syncOneItem。
+  e2eSyncEventItem = await loadSingleItemModule();
+  assert.equal(typeof e2eSyncEventItem, 'function', '加载器要从 bin/prio-item.mjs 取到 syncEventItem');
+  e2eItemQuery = (await import('./bin/prio-item.mjs')).ITEM_QUERY;
+
+  const { fixture, writes, queries, syncOne } = e2ePrioFixture();
+  const state = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  const worker = fakePullWorker({ batches: [[issueEvent('e2e-1', { issue: 7 })]] });
+  await runOneTick({
+    config: { ...configOf(fixture), write: true },
+    fetchImpl: worker.fetchImpl,
+    state,
+    syncOne,
+  });
+
+  assert.equal(queries.length, 1, '一条事件只发一次单条查询');
+  assert.equal(writes.length, 1, '假 write 被调用一次');
+  assert.equal(writes[0].repo, 'example/owner-a');
+  assert.equal(writes[0].issue, 7);
+  assert.equal(writes[0].itemId, 'PVTI_e2e_7', '写的是这一条看板条目');
+  assert.deepEqual(Object.keys(writes[0].fields), ['优先级'], '空值只补优先级');
+  assert.equal(writes[0].fields['优先级'], 'P2');
+  assert.deepEqual(worker.calls.ack, [['e2e-1']], '写成功才确认这条事件');
+  assert.deepEqual(worker.calls.fail, [], '写成功不上报失败');
+  assert.equal(state.watermarks.has('example/owner-a#7'), true);
+  const rows = readLatencyLog(fixture.paths.latencyFile);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].deliveryId, 'e2e-1');
+  assert.equal(rows[0].written, true, '真写进看板且读回一致 = written:true');
+
+  // 同一套真实现，锁被另一个活的持有者占着：syncEventItem 自己返回 ok:false, skipped:'lock-busy'。
+  const locked = e2ePrioFixture();
+  const lockMarker = `${locked.lockFile}.item`;
+  fs.writeFileSync(lockMarker, `${JSON.stringify({ pid: process.pid, startedAt: '2026-11-01T00:00:00.000Z' })}\n`);
+  try {
+    const lockedState = createEventRunState({ allowedRepos: ['example/owner-a'] });
+    const lockedWorker = fakePullWorker({ batches: [[issueEvent('e2e-locked', { issue: 7 })]] });
+    await runOneTick({
+      config: { ...configOf(locked.fixture), write: true },
+      fetchImpl: lockedWorker.fetchImpl,
+      state: lockedState,
+      syncOne: locked.syncOne,
+    });
+    assert.equal(locked.writes.length, 0, '锁被占时一条都不写');
+    assert.deepEqual(lockedWorker.calls.ack, [], '锁被占不 ack，留到下次');
+    assert.equal(lockedWorker.calls.fail.length, 1, '上报一次失败');
+    assert.match(lockedWorker.calls.fail[0].error, /lock-busy/);
+    assert.equal(lockedState.watermarks.has('example/owner-a#7'), false, '没写成功不推进水位');
+    assert.deepEqual(readLatencyLog(locked.fixture.paths.latencyFile), [], '没确认的事件不进延迟行');
+  } finally {
+    fs.rmSync(lockMarker, { force: true });
+  }
+});
 
 test('W4c SC8 默认 dry-run 不写；--write 与 --dry-run 不能同时给', async () => {
   assert.equal(parseEventRunArgs([]).write, false);
@@ -2088,7 +2192,6 @@ test('W4c SC8 默认 dry-run 不写；--write 与 --dry-run 不能同时给', as
     syncOne: async () => {
       writes += 1;
     },
-    lock: async () => {},
   });
   assert.equal(writes, 0, '默认 dry-run 一次都不写');
   assert.deepEqual(worker.calls.ack, [['d1']]);
@@ -2121,7 +2224,6 @@ test('W4c SC8 --once 走 CLI 入口跑一拍：读 600 配置、处理一条事�
     paths: fixture.paths,
     fetchImpl: worker.fetchImpl,
     syncOne: async (target) => written.push(target.ref),
-    lock: async () => {},
     capture: true,
   });
   assert.equal(result.exitCode, 0);

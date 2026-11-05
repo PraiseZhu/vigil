@@ -4,10 +4,10 @@
 // 权限不是 600 就拒绝启动，日志里只写原因，绝不回显令牌内容。
 //
 // 事件路径只做「单条精确读写」：每条事件先定位到 owner/repo#number，再交给注入的 syncOne
-// （缺省动态加载 bin/prio-item.mjs，加载器在 ../prio-item-loader.mjs）。
+// （缺省动态加载 bin/prio-item.mjs 的 syncEventItem，加载器在 ../prio-item-loader.mjs）。
 // 整盘读看板要 72–131 秒，事件路径一次都不整盘读。
-// 默认 dry-run（只算不写），--write 才真写。真写之前探测 /tmp/prio-write.lock：
-// 抢不到每 2 秒重试、最多 10 秒，仍抢不到就抛错，本次事件不确认，留在 Worker 里下次再拉。
+// 默认 dry-run（只算不写），--write 才真写。写锁只在 syncEventItem 内部抢（bin/prio-lock.mjs 的 withWriteLock，
+// 和整盘同一把 /tmp/prio-write.lock）：抢不到它返回 ok:false，这条事件不确认，留在 Worker 里下次再拉。
 //
 // 三层回退：Worker 正常 → 每 2 秒拉事件；Worker 连续失败 pollAfterFailures 次（缺省 1 次：一次失败就兜底）→ 才跑 60 秒兜底轮询；
 // 本进程整个挂掉 → 现有 30 分钟定时任务照旧收敛看板。兜底轮询补写「事件写过但没写成功」的单条目标，
@@ -33,6 +33,7 @@ import {
   runEventChannel,
 } from './event-pull.mjs';
 import { prIssueRefs } from './pr-link.mjs';
+import { LOCK_RETRY_MS, LOCK_WAIT_MAX_MS, WRITE_LOCK_FILE } from './prio-lock.mjs';
 import { createReadGithub } from './prio-sync.mjs';
 import { readAuthorizedRepos } from './prio-run.mjs';
 import { SINGLE_ITEM_MODULE, loadSingleItemModule } from '../prio-item-loader.mjs';
@@ -42,10 +43,11 @@ export { DEFAULT_POLL_AFTER_FAILURES };
 
 /** 只处理这四类事件（Worker 侧也只订阅这四类）。其它类型到了也只确认不写。 */
 export const EVENT_TYPES = Object.freeze(['issues', 'issue_comment', 'pull_request', 'pull_request_review']);
-/** 现有写入入口共用的写锁。事件路径只借它，不改它的持有者。 */
-export const WRITE_LOCK_FILE = '/tmp/prio-write.lock';
-export const LOCK_RETRY_MS = 2000;
-export const LOCK_WAIT_MAX_MS = 10000;
+/**
+ * 写锁的共用锁文件、重试间隔、最长等待只在 bin/prio-lock.mjs 有一份实现，这里只把常量转出去。
+ * 事件路径不自己抢锁：真写由 syncEventItem 内部 withWriteLock 收口（抢不到它返回 ok:false, skipped:'lock-busy'）。
+ */
+export { LOCK_RETRY_MS, LOCK_WAIT_MAX_MS, WRITE_LOCK_FILE };
 /** 单条读写模块（W4-d 提供，可能还没部署）。加载器在 ../prio-item-loader.mjs，这里只转出去。 */
 export { SINGLE_ITEM_MODULE, loadSingleItemModule };
 export const EVENT_RUN_LOG_MAX_BYTES = 5 * 1024 * 1024;
@@ -59,14 +61,6 @@ export class EventRunConfigError extends Error {
   constructor(message, code = 'EVENT_RUN_CONFIG') {
     super(message);
     this.name = 'EventRunConfigError';
-    this.code = code;
-  }
-}
-
-export class WriteLockBusyError extends Error {
-  constructor(message, code = 'WRITE_LOCK_BUSY') {
-    super(message);
-    this.name = 'WriteLockBusyError';
     this.code = code;
   }
 }
@@ -191,127 +185,6 @@ export function readEventRunConfig({ env = process.env, homeDir = os.homedir(), 
     throw new EventRunConfigError(`配置无效「Worker 地址」：只接受 http(s)，实际协议：${parsed.protocol}`);
   }
   return { pullToken, workerUrl, paths: resolved };
-}
-
-/** 一条 /proc/locks 行的设备号写法：major:minor 各自 %02x。 */
-function deviceKey(stat) {
-  const value = BigInt(stat.dev);
-  const major = ((value >> 8n) & 0xfffn).toString(16).padStart(2, '0');
-  const minor = ((value & 0xffn) | ((value >> 12n) & ~0xffn)).toString(16).padStart(2, '0');
-  return `${major}:${minor}:${stat.ino}`;
-}
-
-/** /proc/locks 里是否已经列了这一条（file 形式的 flock 会列出来）。 */
-function listedInProcLocks(stat, { procLocksFile, fsImpl }) {
-  let text;
-  try {
-    text = fsImpl.readFileSync(procLocksFile, 'utf8');
-  } catch {
-    return null;
-  }
-  const key = deviceKey(stat);
-  for (const line of String(text).split('\n')) {
-    const parts = line.trim().split(/\s+/);
-    // 一行形如「12: FLOCK ADVISORY WRITE 3456 fe:10:7307 0 EOF」
-    if (parts.length < 6) continue;
-    if (parts[5] === key) return true;
-  }
-  return false;
-}
-
-/**
- * 有进程把这个锁文件开着吗：扫 /proc/<pid>/fd 的软链接。
- * 本机实测：`exec 8>锁文件; flock -n 8` 这种 fd 形式的 flock **不会**出现在 /proc/locks 里，
- * 但持锁进程一定开着这个 fd，所以这一路能把现有定时写入的锁看回来。
- * 代价：把「开着文件但没加锁」也算成忙（宁可少写一次，也不少锁一次）。
- */
-function openedBySomeProcess(file, { procDir, fsImpl }) {
-  let target;
-  try {
-    target = fsImpl.realpathSync(file);
-  } catch {
-    return null;
-  }
-  let pids;
-  try {
-    pids = fsImpl.readdirSync(procDir);
-  } catch {
-    return null;
-  }
-  for (const pid of pids) {
-    if (!/^\d+$/.test(pid)) continue;
-    const fdDir = path.join(procDir, pid, 'fd');
-    let fds;
-    try {
-      fds = fsImpl.readdirSync(fdDir);
-    } catch {
-      // 别人的进程读不到 fd 目录，跳过。
-      continue;
-    }
-    for (const fd of fds) {
-      let link;
-      try {
-        link = fsImpl.readlinkSync(path.join(fdDir, fd));
-      } catch {
-        continue;
-      }
-      if (link === target) return true;
-    }
-  }
-  return false;
-}
-
-/**
- * 写锁探测：锁文件不存在 = 空闲；/proc/locks 列了它 = 被占；有进程开着它 = 被占。
- * 两条都读不到（非 Linux）时返回 known:false，由调用方自己决定怎么说。
- *
- * 局限（过滤不了，只能如实写在这里）：Node 没有 flock 接口，bin/ 下又不许起子进程，
- * 所以本文件只能「探测」而不能「持有」这把锁。探测到空闲到真写之间有很窄的窗口，
- * 现有定时写入可能正好在这时拿到锁。这个窗口的代价是两边各写一次同一个白名单字段，
- * 不是数据错乱；要真互斥得让持锁的一方换实现，不在本次改动范围。
- */
-export function writeLockHeld({ file = WRITE_LOCK_FILE, procLocksFile = '/proc/locks', procDir = '/proc', fsImpl = fs } = {}) {
-  let stat;
-  try {
-    stat = fsImpl.statSync(file);
-  } catch {
-    // 锁文件还不存在：没有持有者，也没人开始占。
-    return { held: false, known: true, reason: 'missing' };
-  }
-  const listed = listedInProcLocks(stat, { procLocksFile, fsImpl });
-  if (listed === true) return { held: true, known: true, reason: 'proc-locks' };
-  const opened = openedBySomeProcess(file, { procDir, fsImpl });
-  if (opened === true) return { held: true, known: true, reason: 'open-fd' };
-  if (listed === null && opened === null) return { held: false, known: false, reason: 'no-proc' };
-  return { held: false, known: true, reason: 'free' };
-}
-
-/**
- * 抢写锁：每 retryMs 重试一次，总共最多等 maxWaitMs。仍被别人占着就抛 WriteLockBusyError，
- * 调用方因此不确认这条事件，留在 Worker 里下次再拉。
- * probe / sleep / now 都可注入，测试里用假时钟。
- */
-export async function acquireWriteLock({
-  file = WRITE_LOCK_FILE,
-  retryMs = LOCK_RETRY_MS,
-  maxWaitMs = LOCK_WAIT_MAX_MS,
-  probe = () => writeLockHeld({ file }),
-  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-  now = () => Date.now(),
-} = {}) {
-  const startedAt = now();
-  let waited = 0;
-  for (;;) {
-    const state = probe() || { held: false, known: true };
-    if (!state.held) return { waitedMs: waited, known: state.known !== false };
-    if (waited >= maxWaitMs) break;
-    const step = Math.min(retryMs, maxWaitMs - waited);
-    await sleep(step);
-    waited += step;
-  }
-  throw new WriteLockBusyError(
-    `写锁一直被占用：等了 ${Math.round((now() - startedAt) / 1000)} 秒还没抢到（${file}）。这条事件先不确认，留在 Worker 里下次再拉。`,
-  );
 }
 
 function numberOrNull(value) {
@@ -505,8 +378,10 @@ export function discoveryTargets({ repo, rows = [], sinceMs = null } = {}) {
 /**
  * 窄写入函数：事件路径与发现路径都只从这里写。payload 形状固定为
  * { repo, issue, ref, event, source, linkAllowed, now }，交给 syncOne 的 ctx 只有状态目录 { dir: stateDir }。
- * syncOne 返回 result 时：ok === false 表示没写成功——抛错（reason 进错误信息），调用方因此不 ack、不推进水位；
- * mode === 'disabled' 且 ok 为 true 表示停写开关生效、这一条没写：不抛，由调用方决定可以 ack。
+ * syncOne 是 #319 的 syncEventItem：它自己 withWriteLock 抢整盘那把锁，所以这里不再抢第二道锁。
+ * syncOne 返回 result 时：ok === false 表示没写成功（抢不到锁、回读不一致等）——抛错（reason 进错误信息），
+ * 调用方因此不 ack、不推进水位；mode === 'disabled' 且 ok 为 true 表示停写开关生效、这一条没写：
+ * 不抛，由调用方决定可以 ack。written 只认 result.written > 0（真写进看板且回读一致）。
  */
 export function createWriteTarget({ syncOne, stateDir }) {
   const ctx = { dir: stateDir };
@@ -521,18 +396,17 @@ export function createWriteTarget({ syncOne, stateDir }) {
 }
 
 /**
- * 事件处理与兜底轮询共用的一段逻辑：定位目标 → 过白名单与开关 → 抢锁 → 交给 syncOne 单条读写。
- * syncOne 是注入的依赖（缺省由 runEventRun 经 ../prio-item-loader.mjs 加载 bin/prio-item.mjs）。
- * 没有它就不写、也不假装写过。
+ * 事件处理与兜底轮询共用的一段逻辑：定位目标 → 过白名单与开关 → 交给 syncOne 单条读写。
+ * syncOne 是注入的依赖（缺省由 runEventRun 经 ../prio-item-loader.mjs 加载 bin/prio-item.mjs 的 syncEventItem）。
+ * 没有它就不写、也不假装写过。写锁不由这里拿：syncEventItem 内部自己 withWriteLock。
  * listRecent 是发现通道的读取依赖（形状见上方 DISCOVERY_QUERY 前面的注释）；不传就只补写 pending。
- * 抛错的三种情况都会让这条事件不确认：抢不到写锁、单条读写模块没部署、syncOne 自己报错。
+ * 单条读写模块没部署、syncOne 自己报错（含抢不到锁）都会让这条事件不确认。
  */
 export function createEventPipeline({
   state,
   paths,
   write = false,
   syncOne = null,
-  lock = acquireWriteLock,
   logger = () => {},
   now = () => Date.now(),
   exists = (file) => fs.existsSync(file),
@@ -567,10 +441,9 @@ export function createEventPipeline({
     return state.watermarks.get(String(ref).toLowerCase()) ?? null;
   }
 
-  /** 单条写入：抢锁 → 拼 payload → 走窄写入函数。返回 { written, mode }；written > 0 才算真写进看板。 */
+  /** 单条写入：拼 payload → 走窄写入函数（写锁在 syncEventItem 里）。返回 { written, mode }；written > 0 才算真写进看板。 */
   async function writeOne(target, { event = null, createdMs = null, source = 'event' } = {}) {
     if (!writeTarget) throw new Error('单条读写模块未部署');
-    await lock();
     const linkAllowed = exists(paths.markerFile);
     if (!linkAllowed) logQuiet('没有 mac-mini-stopped 标记：「关联 PR」这类 link 字段交给 syncOne 扣住，这里不绕过');
     const result = await writeTarget({
@@ -745,7 +618,6 @@ export async function runEventRun({
   channel = runEventChannel,
   until = null,
   signal,
-  lock = acquireWriteLock,
   exists = (file) => fs.existsSync(file),
   state = null,
   // 发现通道：缺省用只读 GraphQL（每仓 1 次调用）；profile / reader 可注入，测试里不碰真网络。
@@ -783,7 +655,6 @@ export async function runEventRun({
     paths,
     write,
     syncOne: typeof syncOneImpl === 'function' ? syncOneImpl : null,
-    lock,
     logger: log,
     now,
     exists,
@@ -896,7 +767,6 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       now,
       until,
       signal: deps.signal,
-      lock: deps.lock || acquireWriteLock,
       syncOne: deps.syncOne,
       loadModule: deps.loadModule || loadSingleItemModule,
       listRecent: deps.listRecent || null,

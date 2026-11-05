@@ -5,8 +5,11 @@
 export const SINGLE_ITEM_MODULE = './bin/prio-item.mjs';
 
 /**
- * 加载单条读写模块。文件不在、或者没导出 syncOneItem，都返回 null（调用方据此只确认不写），
+ * 加载单条读写模块。文件不在、或者没导出 syncEventItem，都返回 null（调用方据此只确认不写），
  * 其它加载错误照原样抛出去，不吞。
+ * 取的是 #319 的适配层导出 syncEventItem（不是内部的 syncOneItem）：它认 #318 的 payload 形状
+ * {repo, issue, ref, event, source, linkAllowed, now}，返回 {ok, written, planned, skipped, skippedByPolicy,
+ * reason, cost, mode, partialPrs, linkAllowed}，调用方据此决定要不要 ack。
  */
 export async function loadSingleItemModule({ importer = (spec) => import(spec) } = {}) {
   let mod;
@@ -20,5 +23,5 @@ export async function loadSingleItemModule({ importer = (spec) => import(spec) }
     }
     throw error;
   }
-  return typeof mod?.syncOneItem === 'function' ? mod.syncOneItem : null;
+  return typeof mod?.syncEventItem === 'function' ? mod.syncEventItem : null;
 }

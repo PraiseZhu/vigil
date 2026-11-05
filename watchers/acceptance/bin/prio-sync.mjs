@@ -23,6 +23,8 @@
 // 真写时，报错原文含 Could not resolve to a Repository 且含本条仓名：本拍跳过该仓（同仓后面的条目不再试），
 // 汇总和运行日志写明仓名、条数和原因（原因先脱敏）。不写入状态文件，下一拍再试。其它写失败仍整拍中止。--restore 不走这条。
 // content 为 null 大于 0 时，汇总在「排除」之后再追加「，读不到内容 N 条」。运行日志另写跳过计数和告警。
+// mergeState：只按传入的条目重建防抖，其余条目（含已不在看板上的）原样保留，给单条精确读写用（bin/prio-item.mjs）。
+// 不传时行为不变：防抖整份按这一次传入的条目重建。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -351,7 +353,8 @@ function remindedFile(dir) {
   return stateFiles(dir).reminded;
 }
 
-function macMiniStopped(dir) {
+/** 关联 PR 的停写标记在不在。也导出给单条路径：事件里带的 linkAllowed 要和这个标记对得上。 */
+export function macMiniStopped(dir) {
   // 只由人在确认 Mac mini 停写之后创建。这里只看它在不在，不创建。
   return fs.existsSync(stateFiles(dir).marker);
 }
@@ -651,7 +654,7 @@ function ciOf(node) {
   return '';
 }
 
-function mapPr(node) {
+export function mapPr(node) {
   const repo = node?.repository?.nameWithOwner;
   const number = Number(node?.number);
   if (!repo || !Number.isInteger(number) || number <= 0) return null;
@@ -991,6 +994,7 @@ export async function runPrioSync({
   onlyField = null,
   onPlan = null,
   readBack = null,
+  mergeState = false,
 } = {}) {
   if (!dir) throw new Error('缺少状态目录');
   const now = Number.isFinite(nowMs) ? nowMs : Date.now();
@@ -1110,7 +1114,7 @@ export async function runPrioSync({
   for (const [ref, state] of Object.entries(saved)) {
     if (Object.prototype.hasOwnProperty.call(nextItems, ref)) continue;
     const repo = repoOfRef(ref);
-    if (isExcludedRepo(repo, table) || (onlyRepo && repo.toLowerCase() !== onlyRepo.toLowerCase())) {
+    if (mergeState || isExcludedRepo(repo, table) || (onlyRepo && repo.toLowerCase() !== onlyRepo.toLowerCase())) {
       nextItems[ref] = state;
     }
   }
