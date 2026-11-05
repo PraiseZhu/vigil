@@ -11,7 +11,12 @@
 //
 // 三层回退：Worker 正常 → 每 2 秒拉事件；Worker 连续失败 pollAfterFailures 次（缺省 1 次：一次失败就兜底）→ 才跑 60 秒兜底轮询；
 // 本进程整个挂掉 → 现有 30 分钟定时任务照旧收敛看板。兜底轮询补写「事件写过但没写成功」的单条目标，
-// 并（Worker 失败期间）每 60 秒对授权仓做一次发现：用只读 REST 列最近更新的 PR/issue，把目标交给同一条单条写入路径。
+// 并（Worker 失败期间）每 60 秒对授权仓做一次发现：每仓 1 次只读 GraphQL（DISCOVERY_QUERY）拿最近更新的 PR/issue，
+// 把目标交给同一条单条写入路径。发现通道和整盘读共用 `prio-run` 这一格额度：发现前先过 decideTick
+// （purpose=non-essential、cost=GRAPHQL_COST_PER_REQUEST 即 6 点），闸不放行（超预算 / 剩余 <800 暂停）的这一拍一次都不发；
+// 每发一次实际请求用 chargeBudget 记账并写回 rate-budget.json（抛错也记）。没设 ACCEPTANCE_WATCHER_HOME 就不启用闸，只记一行。
+// 写失败的目标留在 pending 里，Worker 正常时也每 60 秒补写一拍（不跑发现）；
+// 本次故障期已处理的目标记在内存集合里（2 分钟重叠窗口内不重读），Worker 恢复（pull 成功）即清空。
 // 发现和事件补写合并去重，同一目标一拍只写一次；不整盘读，也不替现有定时任务做对账。
 //
 // 两个停写开关都遵守：<stateDir>/disabled（自动写入已暂停）→ 事件只确认不写；
@@ -35,7 +40,15 @@ import {
 import { prIssueRefs } from './pr-link.mjs';
 import { LOCK_RETRY_MS, LOCK_WAIT_MAX_MS, WRITE_LOCK_FILE } from './prio-lock.mjs';
 import { createReadGithub } from './prio-sync.mjs';
-import { readAuthorizedRepos } from './prio-run.mjs';
+import { hostFilesFromEnv, readAuthorizedRepos } from './prio-run.mjs';
+import {
+  GRAPHQL_COST_PER_REQUEST,
+  chargeBudget,
+  decideTick,
+  readBudgetFile,
+  readRateState,
+  writeRateState,
+} from './rate-budget.mjs';
 import { SINGLE_ITEM_MODULE, loadSingleItemModule } from '../prio-item-loader.mjs';
 
 /** 兜底轮询的门槛（缺省 1 次：一次失败就兜底）由 event-pull.mjs 定义，这里只是转发，免得两边各写一份。 */
@@ -53,6 +66,8 @@ export { SINGLE_ITEM_MODULE, loadSingleItemModule };
 export const EVENT_RUN_LOG_MAX_BYTES = 5 * 1024 * 1024;
 /** 停用 / 空转这类重复日志最多每 60 秒一条。 */
 const QUIET_LOG_MS = 60 * 1000;
+/** 汇总一条目标的跳过原因时，每条最多留这么多字符（不把整条响应写进日志）。 */
+const SKIP_REASON_MAX = 160;
 /** 兜底发现的时间水位：还没成功发现过（刚启动）回看 10 分钟；之后按上次成功发现减 2 分钟。 */
 export const DISCOVERY_LOOKBACK_MS = 10 * 60 * 1000;
 export const DISCOVERY_OVERLAP_MS = 2 * 60 * 1000;
@@ -132,6 +147,7 @@ export function eventRunPaths({ env = process.env, homeDir = os.homedir(), state
   const prioDir = absolute('EVENT_RUN_STATE_DIR', env.EVENT_RUN_STATE_DIR)
     || absolute('--state-dir', stateDir)
     || path.join(homeDir, 'acceptance', 'tools', '.prio');
+  const hostFiles = explicitWatcherHome(env) ? hostFilesFromEnv(env) : null;
   return {
     home,
     secretsDir,
@@ -146,6 +162,10 @@ export function eventRunPaths({ env = process.env, homeDir = os.homedir(), state
     markerFile: path.join(prioDir, 'mac-mini-stopped'),
     authorizedReposFile: path.join(prioDir, 'authorized-repos.json'),
     latencyFile: path.join(prioDir, 'latency.jsonl'),
+    // 额度状态与预算配置走宿主路径（和整盘 prio-run 同一份，不按 --state-dir 猜）：
+    // 没设 ACCEPTANCE_WATCHER_HOME 时是 null，调用方按「额度闸未启用」处理。
+    rateStateFile: hostFiles?.rateState ?? null,
+    rateBudgetConfigFile: hostFiles?.rateBudgetConfig ?? null,
   };
 }
 
@@ -257,6 +277,9 @@ export function createEventRunState({ allowedRepos = [] } = {}) {
     allowedRepos: new Set((allowedRepos || []).map((repo) => String(repo).toLowerCase())),
     watermarks: new Map(),
     pending: new Map(),
+    // 本次故障期已处理的目标（小写 ref → 当时写进去的 updatedAt 毫秒）：2 分钟重叠窗口里同一个 updatedAt 不再重复写；
+    // 目标之后又有更新（updatedAt 更大）照样重写。只在内存，Worker 恢复即清空。
+    handled: new Map(),
     logged: new Set(),
   };
 }
@@ -266,7 +289,7 @@ export function createEventRunState({ allowedRepos = [] } = {}) {
  *   listRecent({ repo, sinceMs }) => [{ repo, number, kind: 'pull'|'issue', updatedAt, body?, headRef? }]
  * 缺省实现走现有只读 GraphQL 通道（见下面的 createGraphqlListRecent）：每仓每分钟 1 次调用，
  * 低于「授权仓数 × 2」的上限（Worker 失败期间每 60 秒才一拍）。
- * updatedAt 早于 sinceMs 的行丢弃（与 REST 版一样按客户端过滤）。
+ * updatedAt 早于 sinceMs 的行丢弃（按客户端过滤）。
  */
 
 /**
@@ -321,8 +344,23 @@ export function createGraphqlListRecent({
   profile = null,
   loadProfile = loadAcceptanceProfile,
   createReader = createReadGithub,
+  rateStateFile = null,
+  cost = GRAPHQL_COST_PER_REQUEST,
+  component = 'prio-run',
+  now = () => Date.now(),
+  logger = () => {},
 } = {}) {
   let cached = reader;
+  // 发一次记一笔：不管成败都记（抛错的那次请求点数是真花出去的），写回文件而不是只改内存。
+  function chargeOnce() {
+    if (!rateStateFile) return;
+    try {
+      const state = readRateState(rateStateFile);
+      writeRateState(rateStateFile, chargeBudget(state, { component, cost, now: now() }));
+    } catch (error) {
+      logger(`额度记账失败（不影响发现）：${summarize(error)}`);
+    }
+  }
   return async function listRecent({ repo, sinceMs }) {
     if (!cached) {
       const loaded = profile || loadProfile();
@@ -330,7 +368,12 @@ export function createGraphqlListRecent({
     }
     const [owner, name] = String(repo || '').split('/');
     if (!owner || !name) return [];
-    const data = await cached.ownerGraphql(DISCOVERY_QUERY, { owner, name });
+    let data;
+    try {
+      data = await cached.ownerGraphql(DISCOVERY_QUERY, { owner, name });
+    } finally {
+      chargeOnce();
+    }
     return graphqlRecentRows({ repo, data, sinceMs });
   };
 }
@@ -343,13 +386,19 @@ export function createGraphqlListRecent({
  */
 export function discoveryTargets({ repo, rows = [], sinceMs = null } = {}) {
   const found = new Map();
-  const add = (rawRepo, rawNumber, via) => {
+  const add = (rawRepo, rawNumber, via, updatedMs) => {
     const name = String(rawRepo || '').trim();
     const number = numberOrNull(rawNumber);
     if (!name.includes('/') || !number) return;
     const ref = `${name}#${number}`;
-    if (found.has(ref.toLowerCase())) return;
-    found.set(ref.toLowerCase(), { repo: name, issue: number, ref, via });
+    const existing = found.get(ref.toLowerCase());
+    if (existing) {
+      if (Number.isFinite(updatedMs) && !(existing.updatedMs >= updatedMs)) existing.updatedMs = updatedMs;
+      return;
+    }
+    const target = { repo: name, issue: number, ref, via };
+    if (Number.isFinite(updatedMs)) target.updatedMs = updatedMs;
+    found.set(ref.toLowerCase(), target);
   };
   for (const row of rows || []) {
     const name = String(row?.repo || repo || '').trim();
@@ -366,10 +415,10 @@ export function discoveryTargets({ repo, rows = [], sinceMs = null } = {}) {
         headRefName: row.headRef,
       })) {
         const at = ref.lastIndexOf('#');
-        if (at > 0) add(ref.slice(0, at), ref.slice(at + 1), 'discover-pr');
+        if (at > 0) add(ref.slice(0, at), ref.slice(at + 1), 'discover-pr', updatedMs);
       }
     } else if (String(row?.kind) === 'issue') {
-      add(name, number, 'discover-issue');
+      add(name, number, 'discover-issue', updatedMs);
     }
   }
   return [...found.values()];
@@ -383,8 +432,9 @@ export function discoveryTargets({ repo, rows = [], sinceMs = null } = {}) {
  * 调用方因此不 ack、不推进水位；mode === 'disabled' 且 ok 为 true 表示停写开关生效、这一条没写：
  * 不抛，由调用方决定可以 ack。written 只认 result.written > 0（真写进看板且回读一致）。
  */
-export function createWriteTarget({ syncOne, stateDir }) {
-  const ctx = { dir: stateDir };
+export function createWriteTarget({ syncOne, stateDir, stdout = null }) {
+  // stdout 是日志 sink：syncEventItem 把「额度不够」「写锁被占」这类静默跳过写到这里，由调用方按 ref 汇总成一行。
+  const ctx = stdout ? { dir: stateDir, stdout } : { dir: stateDir };
   return async function writeTarget(payload) {
     const result = await syncOne(payload, ctx);
     if (result && result.ok === false) {
@@ -413,12 +463,27 @@ export function createEventPipeline({
   listRecent = null,
   discoveryLookbackMs = DISCOVERY_LOOKBACK_MS,
   discoveryOverlapMs = DISCOVERY_OVERLAP_MS,
+  // 额度闸：缺省用 paths 里的宿主文件（与整盘 prio-run 同一份），测试可单独注入。
+  rateStateFile = paths?.rateStateFile ?? null,
+  budgetConfigFile = paths?.rateBudgetConfigFile ?? null,
+  budgets = undefined,
+  discoveryCost = GRAPHQL_COST_PER_REQUEST,
 } = {}) {
   if (!state || !paths) throw new EventRunConfigError('事件处理需要 state 和 paths');
+  // 调用方自己拼的 state（不是 createEventRunState）也要有「本次故障期已处理」集合。
+  if (!(state.handled instanceof Map)) state.handled = new Map();
+
+  // syncEventItem 写回来的几条静默跳过先进这里，写完由 flushSkips 按 ref 汇总成一行。
+  let skipSink = null;
+  const stdoutSink = {
+    write(chunk) {
+      return skipSink ? skipSink.write(chunk) : true;
+    },
+  };
 
   // 事件路径和发现路径共用的窄写入函数；模块未部署时为空，调用方先判过再进来。
   const writeTarget = typeof syncOne === 'function'
-    ? createWriteTarget({ syncOne, stateDir: paths.stateDir })
+    ? createWriteTarget({ syncOne, stateDir: paths.stateDir, stdout: stdoutSink })
     : null;
 
   // 上次成功发现的时间：只存内存，进程重启后回到「回看 10 分钟」。
@@ -441,23 +506,62 @@ export function createEventPipeline({
     return state.watermarks.get(String(ref).toLowerCase()) ?? null;
   }
 
-  /** 单条写入：拼 payload → 走窄写入函数（写锁在 syncEventItem 里）。返回 { written, mode }；written > 0 才算真写进看板。 */
+  /**
+   * 把一条目标这一拍攒下的跳过原因汇总成一行日志：含 ref 与原因关键字，不逐行照抄，也不带令牌 / 整条响应。
+   * 这些行都是 syncEventItem 报 ok:true 的静默跳过（额度不够、每小时上限、关联 PR 不回退、写锁被占）。
+   */
+  function flushSkips(ref, lines) {
+    const reasons = [];
+    for (const line of lines) {
+      const text = String(line).trim().replace(/。$/, '').slice(0, SKIP_REASON_MAX);
+      if (text && !reasons.includes(text)) reasons.push(text);
+    }
+    if (!reasons.length) return;
+    logger(`单条读写跳过 ${ref}：${reasons.join('；')}`);
+  }
+
+  /**
+   * 单条写入：拼 payload → 走窄写入函数（写锁在 syncEventItem 里）。返回 { written, mode }；written > 0 才算真写进看板。
+   * 先把目标记进 pending：写失败（含意外抛错）就留到下一拍补写通道，写成功才移出。
+   */
   async function writeOne(target, { event = null, createdMs = null, source = 'event' } = {}) {
     if (!writeTarget) throw new Error('单条读写模块未部署');
+    const key = String(target.ref).toLowerCase();
+    state.pending.set(key, target);
     const linkAllowed = exists(paths.markerFile);
     if (!linkAllowed) logQuiet('没有 mac-mini-stopped 标记：「关联 PR」这类 link 字段交给 syncOne 扣住，这里不绕过');
-    const result = await writeTarget({
-      repo: target.repo,
-      issue: target.issue,
-      ref: target.ref,
-      event,
-      source,
-      linkAllowed,
-      now: now(),
-    });
+    const collected = [];
+    skipSink = {
+      write(chunk) {
+        for (const line of String(chunk ?? '').split('\n')) {
+          const text = line.trim();
+          if (text) collected.push(text);
+        }
+        return true;
+      },
+    };
+    let result;
+    try {
+      result = await writeTarget({
+        repo: target.repo,
+        issue: target.issue,
+        ref: target.ref,
+        event,
+        source,
+        linkAllowed,
+        now: now(),
+      });
+    } finally {
+      skipSink = null;
+      flushSkips(target.ref, collected);
+    }
     // 停写开关在 syncOne 里生效（mode: 'disabled'）：没有写，也不推进事件水位，但这一条可以 ack。
-    if (result.mode === 'disabled') return { written: 0, mode: 'disabled' };
-    if (Number.isFinite(createdMs)) state.watermarks.set(String(target.ref).toLowerCase(), createdMs);
+    if (result.mode === 'disabled') {
+      state.pending.delete(key);
+      return { written: 0, mode: 'disabled' };
+    }
+    if (Number.isFinite(createdMs)) state.watermarks.set(key, createdMs);
+    state.pending.delete(key);
     const written = Number(result?.written);
     return { written: Number.isFinite(written) && written > 0 ? written : 0, mode: result.mode };
   }
@@ -510,7 +614,7 @@ export function createEventPipeline({
         written += (await writeOne(target, { event, createdMs, source: 'event' })).written;
         state.pending.delete(key);
       } catch (error) {
-        // 留在 pending 里，等兜底轮询再补一次；同时把错误抛出去，让这条事件保持不确认。
+        // 留在 pending 里（writeOne 已经放好了），等兜底轮询再补一次；同时把错误抛出去，让这条事件保持不确认。
         throw error;
       }
     }
@@ -522,7 +626,55 @@ export function createEventPipeline({
     return lastDiscoveryMs == null ? now() - discoveryLookbackMs : lastDiscoveryMs - discoveryOverlapMs;
   }
 
-  /** 对每个授权仓列一次最近更新的 PR/issue，变回待写目标。读取抛错就交给 poll 记日志。 */
+  let budgetConfig = budgets;
+
+  /**
+   * 发现前的额度闸（与整盘 prio-run 同一格预算，不另开组件名）。
+   * 成本按 GRAPHQL_COST_PER_REQUEST 保守预估（每个授权仓 1 次请求）；缺 ACCEPTANCE_WATCHER_HOME 时不启用，只记一行，不猜路径。
+   * 闸自己出错就放行 + 留痕（与 prio-run / prio-item 同一口径，不算静默 fail-open）。
+   */
+  function discoveryGate() {
+    if (!rateStateFile) {
+      logOnce('rate:disabled', '额度闸未启用：没设 ACCEPTANCE_WATCHER_HOME，也没有显式给出额度状态文件；兜底发现这一拍照跑');
+      return { allowed: true, enabled: false, reason: '' };
+    }
+    try {
+      if (budgetConfig === undefined) {
+        if (budgetConfigFile) {
+          try {
+            budgetConfig = readBudgetFile(budgetConfigFile);
+          } catch (error) {
+            logOnce(`rate:budget:${summarize(error)}`, `额度预算配置无法使用（${summarize(error)}）：发现只按响应头剩余判定`);
+            budgetConfig = null;
+          }
+        } else {
+          budgetConfig = null;
+        }
+      }
+      const gate = decideTick({
+        component: 'prio-run',
+        purpose: 'non-essential',
+        state: readRateState(rateStateFile),
+        now: now(),
+        budgets: budgetConfig ?? null,
+        cost: discoveryCost,
+      });
+      writeRateState(rateStateFile, gate.state);
+      if (gate.log) logger(gate.log);
+      return { allowed: gate.allowed, enabled: true, reason: gate.reason || 'rate-gate' };
+    } catch (error) {
+      logger(
+        `${stamp(now)} rate-unknown component=prio-run identity=user remaining=unknown reason=rate-gate-error ${summarize(error)} 判定或写状态出错，这一拍照常发现`,
+      );
+      return { allowed: true, enabled: true, reason: 'rate-gate-error' };
+    }
+  }
+
+  /**
+   * 对每个授权仓列一次最近更新的 PR/issue，变回待写目标。
+   * 单仓读失败只记一行并跳过该仓，不把一个仓的错误变成整拍的失败；
+   * lastDiscoveryMs 只在至少一仓成功时推进。含 `*` 的授权项不支持通配，发现时跳过（事件路径不受影响）。
+   */
   async function discover() {
     const repos = [...state.allowedRepos];
     if (!repos.length) {
@@ -531,11 +683,21 @@ export function createEventPipeline({
     }
     const sinceMs = discoverySinceMs();
     const targets = [];
+    let succeeded = 0;
     for (const repo of repos) {
-      const rows = await listRecent({ repo, sinceMs });
-      targets.push(...discoveryTargets({ repo, rows, sinceMs }));
+      if (String(repo).includes('*')) {
+        logOnce(`star:${repo}`, `授权清单里的「${repo}」带 * 通配：发现通道只支持具体仓名，这一条跳过（事件路径照旧）`);
+        continue;
+      }
+      try {
+        const rows = await listRecent({ repo, sinceMs });
+        targets.push(...discoveryTargets({ repo, rows, sinceMs }));
+        succeeded += 1;
+      } catch (error) {
+        logQuiet(`兜底发现这一拍 ${repo} 读失败（${summarize(error)}）：跳过这个仓，其它仓照常`);
+      }
     }
-    lastDiscoveryMs = now();
+    if (succeeded > 0) lastDiscoveryMs = now();
     return targets;
   }
 
@@ -545,39 +707,52 @@ export function createEventPipeline({
    * 停写开关（.prio/disabled）存在时发现照跑、一个都不写，日志写明；dry-run 同样不写。
    * 发现通道报错（包括缺省「未配置」）先把待补目标写掉，再把错误抛出去：错误由调用方记日志，循环不退出。
    */
-  async function poll() {
+  async function poll({ workerFailing = true } = {}) {
     const queue = new Map();
-    for (const target of state.pending.values()) {
-      queue.set(String(target.ref).toLowerCase(), target);
+    // 待补目标一律进队列：它们是写失败留下的，不受「已处理」集合约束。
+    for (const [key, target] of state.pending) {
+      queue.set(key, target);
     }
     let discoveryError = null;
-    if (typeof listRecent === 'function') {
-      try {
-        const found = await discover();
-        for (const target of found) {
-          const key = String(target.ref).toLowerCase();
-          if (!queue.has(key)) queue.set(key, target);
+    if (workerFailing && typeof listRecent === 'function') {
+      const gate = discoveryGate();
+      if (!gate.allowed) {
+        logQuiet(`额度不够（${gate.reason}）：这一拍不做兜底发现，待补目标照旧补写，发现留给下一拍`);
+      } else {
+        try {
+          const found = await discover();
+          for (const target of found) {
+            const key = String(target.ref).toLowerCase();
+            if (queue.has(key)) continue;
+            // 2 分钟重叠窗口里同一个 updatedAt 不重写；目标之后又有更新（updatedAt 更大）照样写。
+            const doneAt = state.handled.get(key);
+            if (doneAt !== undefined && !(Number.isFinite(target.updatedMs) && target.updatedMs > doneAt)) continue;
+            queue.set(key, target);
+          }
+          if (found.length) logger(`兜底发现到 ${found.length} 个目标：${found.map((target) => target.ref).join('、')}`);
+        } catch (error) {
+          discoveryError = error;
+          logQuiet(`兜底发现这一拍失败：${summarize(error)}`);
         }
-        if (found.length) logger(`兜底发现到 ${found.length} 个目标：${found.map((target) => target.ref).join('、')}`);
-      } catch (error) {
-        discoveryError = error;
-        logQuiet(`兜底发现这一拍失败：${summarize(error)}`);
       }
     }
     const targets = [...queue.values()];
     if (!targets.length) {
-      if (!discoveryError) logQuiet('Worker 连续失败，兜底轮询这一拍没有待补的单条目标（看板收敛交给现有的定时任务）');
+      if (!discoveryError && !workerFailing) logQuiet('Worker 正常，这一拍待补的单条目标已经补完');
+      else if (!discoveryError) logQuiet('Worker 连续失败，兜底轮询这一拍没有待补的单条目标（看板收敛交给现有的定时任务）');
     } else if (exists(paths.prioDisabledFile)) {
-      logQuiet(`.prio/disabled 存在，自动写入已暂停：兜底这一拍发现到 ${targets.length} 个目标，只发现不写`);
+      logQuiet(`.prio/disabled 存在，自动写入已暂停：兜底这一拍有 ${targets.length} 个目标，只发现不写`);
     } else if (!write) {
-      logQuiet(`dry-run：兜底这一拍发现到 ${targets.length} 个目标，没有写；要真写请加 --write`);
+      logQuiet(`dry-run：兜底这一拍有 ${targets.length} 个目标，没有写；要真写请加 --write`);
     } else if (typeof syncOne !== 'function') {
       logQuiet('单条读写模块未部署，兜底轮询这一拍补不了：等模块部署后再说');
     } else {
       for (const target of targets) {
+        const key = String(target.ref).toLowerCase();
         try {
           await writeOne(target, { source: 'poll' });
-          state.pending.delete(String(target.ref).toLowerCase());
+          state.pending.delete(key);
+          state.handled.set(key, Number.isFinite(target.updatedMs) ? target.updatedMs : now());
           logger(`兜底轮询补写 ${target.ref} 完成`);
         } catch (error) {
           logger(`兜底轮询补写 ${target.ref} 失败：${summarize(error)}`);
@@ -588,7 +763,7 @@ export function createEventPipeline({
     return [];
   }
 
-  return { onEvent, poll };
+  return { onEvent, poll, resetHandled: () => state.handled.clear() };
 }
 
 /** 读授权仓清单（和 prio-run 共用一份文件与解析）。读不出来就当作空清单，宁可不写。 */
@@ -631,7 +806,14 @@ export async function runEventRun({
   const shared = state || createEventRunState({ allowedRepos: readAllowedRepos(paths.authorizedReposFile, log) });
   const syncOneImpl = syncOne !== undefined ? syncOne : await loadModule();
   // 懒创建在 createGraphqlListRecent 里：这里只把构造参数传进去，不读 profile、不建通道。
-  const discoverRecent = listRecent || createGraphqlListRecent({ reader, profile });
+  // 每发一次发现请求按 GRAPHQL_COST_PER_REQUEST 记进 rate-budget.json（与整盘 prio-run 同一格）。
+  const discoverRecent = listRecent || createGraphqlListRecent({
+    reader,
+    profile,
+    rateStateFile: paths.rateStateFile ?? null,
+    now,
+    logger: log,
+  });
   if (write && typeof syncOneImpl !== 'function') {
     log('单条读写模块未部署：事件只会被确认前先失败，不会写任何东西；等模块部署后再开 --write');
   }
@@ -647,7 +829,11 @@ export async function runEventRun({
       }
       return [];
     }
-    return pullFromWorker({ url: config.workerUrl, token: config.pullToken, fetchImpl });
+    return pullFromWorker({ url: config.workerUrl, token: config.pullToken, fetchImpl }).then((events) => {
+      // Worker 恢复（这一拍拉到了）：本次故障期「已处理」的集合清空，下一拍照常重新发现。
+      if (shared.handled?.size) shared.handled.clear();
+      return events;
+    });
   };
 
   const pipeline = createEventPipeline({
@@ -661,7 +847,7 @@ export async function runEventRun({
     listRecent: discoverRecent,
   });
 
-  const poll = async () => {
+  const poll = async (options = {}) => {
     if (disabled()) {
       const at = now();
       if (at - lastDisabledAt >= QUIET_LOG_MS) {
@@ -670,7 +856,7 @@ export async function runEventRun({
       }
       return [];
     }
-    return pipeline.poll();
+    return pipeline.poll(options);
   };
 
   return channel({
@@ -691,6 +877,8 @@ export async function runEventRun({
     onEvent: pipeline.onEvent,
     latencyFile: paths.latencyFile,
     pollAfterFailures,
+    // 有待补目标就跑一拍补写（Worker 正常也跑）；发现仍只在 Worker 失败时跑。
+    hasPending: () => shared.pending.size > 0,
   });
 }
 

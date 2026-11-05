@@ -211,6 +211,8 @@ function errorSummary(err) {
  * confirm 在处理成功（或放弃）之后调用，Worker 才清掉对应事件。
  * 兜底轮询的门槛是 pollAfterFailures：本拍开始时连续失败次数不到这个数就跳过轮询（不调用 poll），
  * 到点照样把下一拍的轮询时间往后推，否则循环会原地打转。拉取成功一次就把连续失败次数清零。
+ * hasPending 是第二条门槛：返回 true（还有事件写过但没写成功的目标）时，Worker 正常也每 pollIntervalMs 跑一拍补写，
+ * 不等失败计数或 Worker 重投 5 次。poll 收到的参数是 { workerFailing }：发现只在 Worker 失败时跑。
  * 每处理完一个事件追加一行延迟记录：receivedAt（Worker 收到）、pulledAt（本批拉到的时刻）、
  * processedAt（写完的时刻）、latencyMs、gatewayMs。
  */
@@ -229,6 +231,7 @@ export async function runEventChannel({
   pullIntervalMs = PULL_INTERVAL_MS,
   pollIntervalMs = POLL_INTERVAL_MS,
   pollAfterFailures = DEFAULT_POLL_AFTER_FAILURES,
+  hasPending = null,
 } = {}) {
   if (latencyFile && !path.isAbsolute(latencyFile)) {
     throw new Error(`latencyFile 必须是绝对路径：${latencyFile}`);
@@ -299,6 +302,9 @@ export async function runEventChannel({
     let failedThisTick = false;
     // 本拍开始时的连续失败次数：本拍自己的失败不算在门槛里，免得「失败那一拍立刻又跑轮询」。
     const failuresAtTickStart = consecutiveFailures;
+    // 待补写目标也按「本拍开始时」采样：这一拍新留下的 pending 等下一拍（每 pollIntervalMs 一次）才补写，
+    // 否则同一拍里写失败后立刻又重试一次，等于把重试变成同步重试。
+    const pendingAtTickStart = typeof hasPending === 'function' && Boolean(hasPending());
 
     if (workerUp && t >= nextPullAt) {
       try {
@@ -330,9 +336,11 @@ export async function runEventChannel({
     if (t >= nextPollAt) {
       // 不管这一拍跑不跑，都把下一次轮询时间往后推；否则循环会因为「等 0 毫秒」直接退出。
       nextPollAt = t + pollIntervalMs;
-      if (pollAfterFailures <= 0 || failuresAtTickStart >= pollAfterFailures) {
+      // 两条门槛：Worker 失败到门槛，或者还有待补写目标（写锁被占这类写失败）。
+      const dueByFailures = pollAfterFailures <= 0 || failuresAtTickStart >= pollAfterFailures;
+      if (dueByFailures || pendingAtTickStart) {
         try {
-          const events = await poll();
+          const events = await poll({ workerFailing: !workerUp });
           await acceptBatch(events, 'poll');
         } catch {
           // 轮询失败也不让循环退出。

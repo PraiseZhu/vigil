@@ -1761,7 +1761,7 @@ test('W4c SC6 兜底发现：Worker 失败期间发现授权仓最近更新的 P
   assert.deepEqual(
     calls.map((call) => call.repo),
     ['example/owner-a', 'example/owner-b'],
-    '每个授权仓每拍发现一次（每仓两种列表 → 每分钟 ≤ 授权仓数 × 2 次 REST）',
+    '每个授权仓每拍发现一次（每仓 1 次 GraphQL）',
   );
   assert.ok(calls.every((call) => call.sinceMs === nowMs - 10 * 60 * 1000), '进程刚起来：回看 10 分钟');
   assert.deepEqual(
@@ -1926,6 +1926,368 @@ test('W4c SC6 runEventRun 把发现的 reader 接进 poll：授权仓每仓一�
   assert.deepEqual(written.sort(), ['example/owner-a#7', 'example/owner-b#8']);
 });
 
+// ── W4-f：发现通道的额度闸、本次故障期已处理集合、pending 补写与可诊断性（issue #325）────
+
+/** 按宿主布局写一份额度状态文件：used 是 prio-run 这一格的本小时用量，remaining 是账号令牌的响应头剩余。 */
+function writeRateStateFile(file, { used = 0, remaining = null, nowMs = 0 } = {}) {
+  const state = {
+    version: 1,
+    identities: remaining == null
+      ? {}
+      : {
+        user: {
+          known: true,
+          remaining,
+          remainingRaw: String(remaining),
+          reset: new Date(nowMs + 30 * 60 * 1000).toISOString(),
+          resetRaw: '1750000000',
+          at: new Date(nowMs).toISOString(),
+          source: 'test',
+        },
+      },
+    components: used > 0
+      ? { 'prio-run': { hourKey: Math.floor(nowMs / 3600000), used, updatedAt: new Date(nowMs).toISOString() } }
+      : {},
+    recovery: null,
+    skips: { count: 0, lastAt: null, byKey: {} },
+  };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`);
+  return state;
+}
+
+test('W4f SC1 发现前过额度闸：over-budget / paused 这一拍 listRecent 一次都不调、不写，日志写明原因', async () => {
+  const nowMs = Date.parse('2026-11-01T12:00:00.000Z');
+  const runOnce = async ({ budgetUsed = null, remaining = null }) => {
+    const fixture = eventRunFixture();
+    assert.ok(fixture.paths.rateStateFile, '设了 ACCEPTANCE_WATCHER_HOME 就得给出额度状态文件路径');
+    assert.ok(fixture.paths.rateBudgetConfigFile, '也要给出预算配置路径');
+    if (budgetUsed != null) {
+      fs.mkdirSync(path.dirname(fixture.paths.rateBudgetConfigFile), { recursive: true });
+      fs.writeFileSync(
+        fixture.paths.rateBudgetConfigFile,
+        JSON.stringify({ rateBudget: { loop: 500, 'prio-run': 10, 'board-live': 140 } }),
+      );
+    }
+    writeRateStateFile(fixture.paths.rateStateFile, { used: budgetUsed ?? 0, remaining, nowMs });
+    const calls = [];
+    const written = [];
+    const logs = [];
+    const pipeline = createEventPipeline({
+      state: createEventRunState({ allowedRepos: ['example/owner-a'] }),
+      paths: fixture.paths,
+      write: true,
+      now: () => nowMs,
+      syncOne: async (target) => {
+        written.push(target.ref);
+        return { written: 1 };
+      },
+      logger: (line) => logs.push(line),
+      listRecent: async ({ repo }) => {
+        calls.push(repo);
+        return [{ repo, number: 7, kind: 'issue', updatedAt: new Date(nowMs).toISOString() }];
+      },
+    });
+    await pipeline.poll();
+    return { calls, written, logs };
+  };
+
+  // 预算闸：used 8 + cost 6 > 预算 10 → over-budget。
+  const overBudget = await runOnce({ budgetUsed: 8 });
+  assert.deepEqual(overBudget.calls, [], '额度闸拒绝：这一拍一次发现请求都不发');
+  assert.deepEqual(overBudget.written, [], '也不写任何目标');
+  assert.ok(overBudget.logs.some((line) => /额度不够/.test(line) && /over-budget/.test(line)), '日志写明原因');
+
+  // 响应头闸：剩余 700 < PAUSE_REMAINING(800) → paused。
+  const paused = await runOnce({ remaining: 700 });
+  assert.deepEqual(paused.calls, [], '剩余不够：这一拍一次发现请求都不发');
+  assert.deepEqual(paused.written, []);
+  assert.ok(paused.logs.some((line) => /额度不够/.test(line) && /remaining-below-800/.test(line)), '日志写明原因');
+});
+
+test('W4f SC2 每次实际发出的发现请求都记账：ownerGraphql 抛错也记一笔并写回 rate-budget.json', async () => {
+  const fixture = eventRunFixture();
+  const nowMs = Date.parse('2026-11-01T12:00:00.000Z');
+  // 先放一个基线用量：只断言增量，不断言绝对值。
+  writeRateStateFile(fixture.paths.rateStateFile, { used: 10, nowMs });
+  let attempts = 0;
+  const failing = createGraphqlListRecent({
+    reader: {
+      async ownerGraphql() {
+        attempts += 1;
+        throw new Error('HTTP 404：仓库地址不对');
+      },
+    },
+    rateStateFile: fixture.paths.rateStateFile,
+    now: () => nowMs,
+  });
+  await assert.rejects(() => failing({ repo: 'example/owner-a', sinceMs: 0 }), /HTTP 404/);
+  assert.equal(attempts, 1, '这一次请求确实发出去了（只是失败）');
+  const afterFailure = JSON.parse(fs.readFileSync(fixture.paths.rateStateFile, 'utf8'));
+  assert.equal(afterFailure.components['prio-run'].used, 10 + 6, '失败那一拍也记一笔（6 点），且已写回文件');
+
+  // 成功那一次同样记账：增量仍是 6。
+  const ok = createGraphqlListRecent({
+    reader: {
+      async ownerGraphql() {
+        attempts += 1;
+        return { repository: { pullRequests: { nodes: [] }, issues: { nodes: [] } } };
+      },
+    },
+    rateStateFile: fixture.paths.rateStateFile,
+    now: () => nowMs,
+  });
+  await ok({ repo: 'example/owner-a', sinceMs: 0 });
+  const afterOk = JSON.parse(fs.readFileSync(fixture.paths.rateStateFile, 'utf8'));
+  assert.equal(afterOk.components['prio-run'].used, 10 + 6 + 6, '成功那一次也记一笔');
+});
+
+test('W4f SC3 本次故障期已处理集合：重叠窗口内同一目标只写一次，pull 成功即清空', async () => {
+  const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  let nowMs = t0;
+  const written = [];
+  const state = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  const pipeline = createEventPipeline({
+    state,
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async (target) => {
+      written.push(target.ref);
+      return { written: 1 };
+    },
+    logger: () => {},
+    // 每拍都返回同一个目标：两次 poll 的 since 窗口都会覆盖到它。
+    listRecent: async ({ repo }) => [{ repo, number: 7, kind: 'issue', updatedAt: new Date(t0).toISOString() }],
+  });
+  await pipeline.poll();
+  nowMs = t0 + 60000;
+  await pipeline.poll();
+  assert.deepEqual(written, ['example/owner-a#7'], '两次 poll 都覆盖到它，只写一次');
+  assert.equal(state.handled.size, 1, '处理过的目标记进集合');
+
+  // Worker 恢复（pullFromWorker 成功）即清空。
+  const recovered = eventRunFixture();
+  const shared = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  shared.handled.set('example/owner-a#7', 0);
+  const worker = fakePullWorker({ batches: [[]] });
+  await runEventRun({
+    config: { ...configOf(recovered), write: true },
+    write: true,
+    syncOne: async () => ({ written: 1 }),
+    logger: () => {},
+    state: shared,
+    fetchImpl: worker.fetchImpl,
+    channel: async (deps) => {
+      await deps.pull();
+    },
+  });
+  assert.equal(shared.handled.size, 0, 'pull 成功 = Worker 恢复，集合清空');
+});
+
+test('W4f SC3 已处理集合不吞后来的更新：updatedAt 更大的同一目标照样重写', async () => {
+  const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  let nowMs = t0;
+  let updatedMs = t0;
+  const written = [];
+  const state = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  const pipeline = createEventPipeline({
+    state,
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async (target) => {
+      written.push(target.ref);
+      return { written: 1 };
+    },
+    logger: () => {},
+    listRecent: async ({ repo }) => [{ repo, number: 7, kind: 'issue', updatedAt: new Date(updatedMs).toISOString() }],
+  });
+  await pipeline.poll();
+  nowMs = t0 + 60000;
+  await pipeline.poll();
+  assert.equal(written.length, 1, '同一个 updatedAt 只写一次');
+  updatedMs = t0 + 90000;
+  nowMs = t0 + 120000;
+  await pipeline.poll();
+  assert.equal(written.length, 2, '故障期内目标又有更新，不能被已处理集合吞掉');
+});
+
+test('W4f SC4 发现目标写失败留在 pending，下一拍补写成功并移出', async () => {
+  const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  let nowMs = t0;
+  let failOnce = true;
+  const written = [];
+  const state = createEventRunState({ allowedRepos: ['example/owner-a'] });
+  const pipeline = createEventPipeline({
+    state,
+    paths: fixture.paths,
+    write: true,
+    now: () => nowMs,
+    syncOne: async (target) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('看板写不进去');
+      }
+      written.push(target.ref);
+      return { written: 1 };
+    },
+    logger: () => {},
+    listRecent: async ({ repo }) => [{ repo, number: 7, kind: 'issue', updatedAt: new Date(t0).toISOString() }],
+  });
+  await pipeline.poll();
+  assert.deepEqual(written, [], '第一次写失败');
+  assert.ok(state.pending.has('example/owner-a#7'), '写失败的目标留在 pending 里');
+  nowMs = t0 + 60000;
+  await pipeline.poll();
+  assert.deepEqual(written, ['example/owner-a#7'], '下一拍补写成功');
+  assert.equal(state.pending.has('example/owner-a#7'), false, '补完就移出 pending');
+});
+
+test('W4f SC5 Worker 正常但 ok:false（写锁被占）：hasPending 让 poll 每 60 秒补写一拍，ok:false 仍不 ack', async () => {
+  let t = 0;
+  let pending = false;
+  const polls = [];
+  const confirmed = [];
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 70000,
+    pull: async () => (pending ? [] : [issueEvent('lock-busy-1', { issue: 7 })]),
+    poll: async (options) => {
+      polls.push({ t, ...options });
+      pending = false; // 补写成功
+      return [];
+    },
+    confirm: async (ids) => confirmed.push(...ids),
+    onEvent: async () => {
+      pending = true; // 写锁被占：留在 pending，事件不确认
+      throw new Error('单条读写失败：example/owner-a#7（lock-busy）');
+    },
+    hasPending: () => pending,
+    latencyFile: path.join(tmpDir(), '.prio', 'latency.jsonl'),
+  });
+  assert.deepEqual(confirmed, [], 'ok:false 不 ack：事件留在 Worker 队列里');
+  assert.deepEqual(polls, [{ t: 60000, workerFailing: false }], 'Worker 正常也每 60 秒补写一拍，并告知 Worker 没失败（不跑发现）');
+});
+
+test('W4f SC6 ctx.stdout 接上日志 sink：静默跳过原因按 ref 汇总成一行', async () => {
+  const fixture = eventRunFixture();
+  const logs = [];
+  let writes = 0;
+  const pipeline = createEventPipeline({
+    state: createEventRunState({ allowedRepos: ['example/owner-a'] }),
+    paths: fixture.paths,
+    write: true,
+    now: () => 0,
+    syncOne: async (target, ctx) => {
+      writes += 1;
+      assert.equal(typeof ctx.stdout?.write, 'function', 'ctx 带 stdout sink');
+      ctx.stdout.write('额度不够：这一条不读也不写，留给下一拍\n');
+      ctx.stdout.write('\n');
+      ctx.stdout.write('写锁被占（lock-busy-item）：这一条不读也不写，留给下一次事件或 30 分钟整盘\n');
+      return { ok: true, written: 0, mode: 'write' };
+    },
+    logger: (line) => logs.push(line),
+  });
+  await pipeline.onEvent(issueEvent('skip-1', { issue: 7 }));
+  assert.equal(writes, 1, '静默跳过的这一条 syncOne 照常调了一次');
+  const skipLines = logs.filter((line) => /单条读写跳过/.test(line));
+  assert.equal(skipLines.length, 1, '按 ref 汇总成一行，不逐行照抄');
+  assert.match(skipLines[0], /example\/owner-a#7/, '行里有 ref');
+  assert.match(skipLines[0], /额度不够/);
+  assert.match(skipLines[0], /写锁被占/);
+  assert.equal(skipLines[0].includes('\n'), false, '就是一行');
+});
+
+test('W4f SC7 文案与实现一致：顶部注释写 GraphQL 每仓 1 次，测试里不再写 × 2 次 REST', () => {
+  const src = fs.readFileSync(path.join(HERE, 'bin', 'event-run.mjs'), 'utf8');
+  const head = src.split('\n').slice(0, 30).join('\n');
+  assert.match(head, /GraphQL/, '顶部注释写明发现走 GraphQL');
+  assert.match(head, /每仓 1 次/, '写明每仓 1 次请求');
+  assert.doesNotMatch(head, /只读 REST/, '不再写「只读 REST」');
+  const tests = fs.readFileSync(path.join(HERE, 'event-channel.test.mjs'), 'utf8');
+  // 只看发现那条用例的正文：整份文件里一定还有这条断言自己的字面量。
+  const start = tests.indexOf("test('W4c SC6 兜底发现：Worker 失败期间");
+  assert.ok(start > 0, '找得到发现通道那条用例');
+  const end = tests.indexOf('\ntest(', start + 10);
+  const block = tests.slice(start, end < 0 ? undefined : end);
+  assert.match(block, /每仓 1 次 GraphQL/, '断言文案改成每仓 1 次 GraphQL');
+  assert.equal(block.includes(['× 2', '次 REST'].join(' ')), false, '不再出现「× 2 次 REST」');
+});
+
+test('W4f SC8 discover 单仓读失败不牵连其它仓：失败仓跳过并记一行，水位只在有仓成功时推进', async () => {
+  const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  const written = [];
+  const since = [];
+  const logs = [];
+  const pipeline = createEventPipeline({
+    state: createEventRunState({ allowedRepos: ['example/owner-a', 'example/owner-b'] }),
+    paths: fixture.paths,
+    write: true,
+    now: () => t0,
+    syncOne: async (target) => {
+      written.push(target.ref);
+      return { written: 1 };
+    },
+    logger: (line) => logs.push(line),
+    listRecent: async ({ repo, sinceMs }) => {
+      since.push([repo, sinceMs]);
+      if (repo === 'example/owner-a') throw new Error('读失败：HTTP 502');
+      return [{ repo, number: 5, kind: 'issue', updatedAt: new Date(t0).toISOString() }];
+    },
+  });
+  await pipeline.poll();
+  assert.deepEqual(written, ['example/owner-b#5'], '失败仓不牵连：另一仓照常发现与写入');
+  assert.ok(logs.some((line) => /example\/owner-a/.test(line) && /读失败/.test(line)), '日志有一行失败说明');
+  assert.deepEqual(await pipeline.poll(), []);
+  assert.deepEqual(since.at(-1), ['example/owner-b', t0 - 2 * 60 * 1000], '至少一仓成功才推进水位：下一拍回看起点是上次成功减 2 分钟');
+});
+
+test('W4f SC9 授权清单里含 * 的条目在发现时跳过并记一行，其它仓照常，事件路径不受影响', async () => {
+  const fixture = eventRunFixture();
+  const t0 = Date.parse('2026-11-01T12:00:00.000Z');
+  fs.writeFileSync(
+    fixture.paths.authorizedReposFile,
+    JSON.stringify({ repos: ['example-org/*', 'example/owner-b'] }),
+  );
+  const calls = [];
+  const written = [];
+  const logs = [];
+  const pipeline = createEventPipeline({
+    state: createEventRunState({ allowedRepos: ['example-org/*', 'example/owner-b'] }),
+    paths: fixture.paths,
+    write: true,
+    now: () => t0,
+    syncOne: async (target) => {
+      written.push(target.ref);
+      return { written: 1 };
+    },
+    logger: (line) => logs.push(line),
+    listRecent: async ({ repo }) => {
+      calls.push(repo);
+      return [{ repo, number: 5, kind: 'issue', updatedAt: new Date(t0).toISOString() }];
+    },
+  });
+  await pipeline.poll();
+  assert.deepEqual(calls, ['example/owner-b'], '带 * 的条目不为它发请求，其它仓照常');
+  assert.deepEqual(written, ['example/owner-b#5']);
+  assert.ok(logs.some((line) => /example-org\/\*/.test(line) && /通配/.test(line)), '跳过的条目记一行');
+  // readAuthorizedRepos 的校验规则不变：含 * 的条目照样通过解析（发现时才是跳过点）。
+  const { readAuthorizedRepos } = await import('./bin/prio-run.mjs');
+  assert.deepEqual(
+    readAuthorizedRepos(fixture.paths.authorizedReposFile),
+    ['example-org/*', 'example/owner-b'],
+    '授权清单校验规则不变',
+  );
+});
+
 test('W4c SC10 延迟行带 written 标记：真写入为 true，无变化/dry-run/非授权仓为 false，老行不写这个键', async () => {
   // 真写入与无变化：syncOne 自己报 written。
   const writtenFixture = eventRunFixture();
@@ -1993,7 +2355,8 @@ test('W4c SC6 窄写入函数：payload 形状固定、ctx 只有状态目录；
     ['event', 'issue', 'linkAllowed', 'now', 'ref', 'repo', 'source'],
     'payload 形状固定',
   );
-  assert.deepEqual(calls[0].ctx, { dir: fixture.paths.stateDir }, 'ctx 只带状态目录');
+  assert.deepEqual(calls[0].ctx, { dir: fixture.paths.stateDir, stdout: calls[0].ctx.stdout }, 'ctx 带状态目录与日志 sink');
+  assert.equal(typeof calls[0].ctx.stdout?.write, 'function', 'ctx.stdout 是日志 sink（W4f SC6）');
 
   // mode=disabled 且 ok：停写开关生效，这条不写、不设水位，但不抛错，所以可以 ack。
   assert.deepEqual(await pipeline.onEvent(issueEvent('d1', { issue: 8 })), { written: false });
