@@ -355,6 +355,10 @@ export async function runEventChannel({
     if (until != null && nextAt >= until) break;
     const wait = nextAt - now();
     if (wait > 0) await sleep(wait);
-    else break;
+    // wait <= 0：这一拍已经把这 2 秒花掉了（nextPullAt / nextPollAt 在拍首按「本拍开始 + 间隔」推进），
+    // 直接进下一拍，不退出循环——否则单拍耗时超过拉取间隔就会让常驻拉取器静默退出。
+    // 退出的两条路不受影响：循环条件 running()（signal abort / until 到期）与上面的 nextAt >= until。
+    // wait 是 NaN（时钟异常）时保持原来「退出」的行为，免得循环空转。
+    else if (Number.isNaN(wait)) break;
   }
 }
