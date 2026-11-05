@@ -15,7 +15,8 @@ import { selectHandoff, isCurrentHandoff, implicitHandoff } from './mivo-handoff
 import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './mivo-state.mjs';
 import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor, isMemberFeedback, FEEDBACK_POLICY_VERSION } from './mivo-feedback-policy.mjs';
 import {lifelineFeedback} from './mivo-lifeline-source.mjs';
-import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent, completedMemberFeedback, coveredFeedbackItems, replyToMemberFeedback, requestMemberReviewers } from './mivo-review-resolve.mjs';
+import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent, completedMemberFeedback, coveredFeedbackItems, replyToMemberFeedback, requestMemberReviewers, partitionServerFixedThreads, resolveServerFixedThreads, SERVER_FIXED_REASON } from './mivo-review-resolve.mjs';
+import { resolveWithAppEnabled, resolveThreadsWithApp } from './mivo-app-token.mjs';
 import { codeScanningFeedbackItems } from './mivo-code-scanning.mjs';
 import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck, readBaseDrift, isSyncableBase } from './mivo-pr-actions.mjs';
 import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath, findingMarkerOf, childPrListArgs, parseOpenChildPrs } from './mivo-repair.mjs';
@@ -2265,7 +2266,7 @@ export function* processPr({
   dispatchFn, collect, ghFn, recheckFn, ownershipSnapshot, maintenanceSessionId,
   remaining, deadline, clock, resumeCursor, resetPrDeadline, allowCreate = true, messagePrefix = '', forceCreate = false,
   unlockForDispatch = null, relockForDispatch = null, getPrLockToken = () => null, keelRoot = keelLedgerRoot(),
-  dispatchReserveMs = DISPATCH_RESERVE_MS, mergeIndex = null,
+  dispatchReserveMs = DISPATCH_RESERVE_MS, mergeIndex = null, appResolveFn = resolveThreadsWithApp,
 } = {}) {
   const key = String(pr.id);
   let persistBlocked = false;
@@ -2458,17 +2459,40 @@ export function* processPr({
   // Keep the existing owner's recovery alive until its repair result completes.
   if (rawFresh.some(item=>item.source==='lifeline-doctor' && item.repairPolicy.canChangeCode)
     || (doctor.items.length && !['complete','legacy-complete'].includes(previous.activeTask?.status))) collected.mergeReady=false;
+  let autoClosedThisRound = [];
+  // Opt-in (off by default, and then nothing below it runs): threads the review server already re-checked and
+  // found fixed are resolved as the review App's bot, not dispatched. A failed resolve leaves the thread open,
+  // only logs, and never falls back to this watcher's own account (the cursor stays as it was, so a build with
+  // the switch off still delivers it).
+  const serverFixed = { ids: new Set(), held: [] };
+  if (!dryRun && resolveWithAppEnabled()) {
+    const { eligible } = partitionServerFixedThreads(collected.threads ?? [], ownerPr.headRefOid, previous);
+    if (eligible.length > 0) {
+      const outcome = yield* resolveServerFixedThreads({ eligible, previous, appResolveFn, repo: REPO, now });
+      previous = outcome.previous;
+      autoClosedThisRound = outcome.closed;
+      const failedIds = new Set(outcome.failed.map((failure) => failure.threadId));
+      serverFixed.ids = new Set(eligible.map((hit) => hit.threadId));
+      serverFixed.held = rawFresh.filter((item) => failedIds.has(item.threadId));
+      for (const { threadId, phase, expected, actual } of outcome.failed) {
+        events.push({ kind: 'server-fixed-thread-resolve-failed', number: pr.number, threadId, phase, expected, actual });
+      }
+      for (const { phase, expected, actual } of outcome.revokeFailures) {
+        events.push({ kind: 'server-fixed-thread-token-revoke-failed', number: pr.number, phase, expected, actual });
+      }
+    }
+  }
   // Autonomous P3 review-thread closure happens here, before any dispatch
   // accounting below sees these items — closed items never reach a session,
   // never need a human, and are never counted as pending feedback.
-  const autoClose = partitionAutoClose(rawFresh, { allItems: observed, threads: collected.threads ?? [] });
+  const autoClose = partitionAutoClose(serverFixed.ids.size ? rawFresh.filter((item) => !serverFixed.ids.has(item.threadId)) : rawFresh,
+    { allItems: observed, threads: collected.threads ?? [] });
   const autoCloseEligible = autoClose.eligible;
   let fresh = dropWaitingCiRevisionFlips(autoClose.remaining, previous, paths);
-  let autoClosedThisRound = [];
   if (autoCloseEligible.length > 0 && !dryRun) {
     const outcome = yield* autoCloseThreads({ eligible: autoCloseEligible, previous, ghFn, now });
     previous = outcome.previous;
-    autoClosedThisRound = outcome.closed;
+    autoClosedThisRound = [...autoClosedThisRound, ...outcome.closed];
   }
   const admitted = previous.admissionVerified === true || collected.admissionVerified === true;
   const admissionBlocked = collected.admissionVerified === false && previous.admissionVerified !== true;
@@ -2531,7 +2555,9 @@ export function* processPr({
       }
     } catch { /* keep pending items */ }
     const seen = new Set();
-    closable = closable.filter((item) => item?.threadId && !seen.has(item.threadId) && seen.add(item.threadId));
+    // A thread the App path resolved (or tried to) is not answered again with this account's token.
+    const appHandled = (threadId) => serverFixed.ids.has(threadId) || previous.autoClosedThreads?.[threadId]?.reason === SERVER_FIXED_REASON;
+    closable = closable.filter((item) => item?.threadId && !appHandled(item.threadId) && !seen.has(item.threadId) && seen.add(item.threadId));
     if (closable.length > 0) {
       const outcome = yield* closeRefutedThreads({
         items: closable, dispatchId: previous.activeTask?.dispatchId ?? closable[0].dispatchId, previous, ghFn, now, head: resultHead,
@@ -2624,7 +2650,8 @@ export function* processPr({
     revivedKeys = reopened.revived;
     const have = new Set(fresh.map((item) => item.key));
     fresh = [...fresh, ...observedAll.map((item) => ({ ...item, key: `${item.source}:${item.nativeId}` }))
-      .filter((item) => revivedKeys.includes(item.key) && !have.has(item.key) && item.actionable !== false && item.deferred !== true)];
+      .filter((item) => revivedKeys.includes(item.key) && !have.has(item.key) && item.actionable !== false && item.deferred !== true
+        && !serverFixed.ids.has(item.threadId))];
     // Reaching the limit and resetting in the same scan: markException below only sees the reopened task, so
     // the limit is reported here, from the state that hit it, and its exception record is carried over.
     if (limitReachedNow && previous !== limited) {
@@ -2706,7 +2733,7 @@ export function* processPr({
   let dispatch = { attempted: false, bound: false, reason: 'no-new-feedback' };
   // Advance only non-actionable observations until a delivery is acknowledged.
   const retainedCursor = { ...cursor };
-  for (const item of fresh) {
+  for (const item of [...fresh, ...serverFixed.held]) {
     if (Object.hasOwn(cursorBase, item.key)) retainedCursor[item.key] = cursorBase[item.key];
     else delete retainedCursor[item.key];
   }
@@ -2965,7 +2992,7 @@ function* scanWorkflow({
   ownershipSnapshot = collectPrOwnership,
   maintenanceSessionId = process.env.MIVO_MAINTENANCE_SESSION,
   clock = Date.now, budgetMs = ROUND_BUDGET_MS, perPrBudgetMs = ROUND_BUDGET_MS - DISPATCH_RESERVE_MS,
-  maxPrs = 1000,
+  maxPrs = 1000, appResolveFn = resolveThreadsWithApp,
 } = {}) {
   fs.mkdirSync(paths.stateDir, { recursive: true });
   const state = loadState(paths);
@@ -3025,7 +3052,7 @@ function* scanWorkflow({
     yield* processPr({
       pr, state, paths, now, events, report, viewer, dryRun, dispatchFn,
       collect, ghFn, recheckFn, ownershipSnapshot, maintenanceSessionId,
-      remaining, deadline, clock, resumeCursor,
+      remaining, deadline, clock, resumeCursor, appResolveFn,
       resetPrDeadline: () => { prDeadline = deadline; },
     });
     // A PR deferred for budget keeps its resume cursor only if no later PR advances it.
@@ -3135,7 +3162,7 @@ export function* pollWorkflow({
   // dispatch may use the rest of the round, and the PR lock is released while
   // the dispatch RPC is in flight (same rules as the create path).
   perPrBudgetMs = null, unlockForDispatch = null, relockForDispatch = null, getPrLockToken = () => null,
-  dispatchReserveMs = DISPATCH_RESERVE_MS, mergeIndex = null,
+  dispatchReserveMs = DISPATCH_RESERVE_MS, mergeIndex = null, appResolveFn = resolveThreadsWithApp,
 } = {}) {
   const started = clock();
   const deadline = started + Math.min(ROUND_BUDGET_MS, Math.max(1, budgetMs));
@@ -3213,7 +3240,7 @@ export function* pollWorkflow({
   const state = { version: 2, repo: REPO, prs: { [String(nodeId)]: previous } };
   yield* processPr({
     pr, previous, state, paths, now, events, report, viewer, dryRun, dispatchFn, collect, ghFn,
-    recheckFn, ownershipSnapshot, remaining, deadline, clock, allowCreate: false, dispatchReserveMs, mergeIndex,
+    recheckFn, ownershipSnapshot, remaining, deadline, clock, allowCreate: false, dispatchReserveMs, mergeIndex, appResolveFn,
     resetPrDeadline: () => { prDeadline = deadline; }, unlockForDispatch, relockForDispatch, getPrLockToken,
   });
   const latest = state.prs[String(nodeId)] || previous;
@@ -3340,7 +3367,7 @@ function* discoverOnePr(pr, ctx) {
   const {
     now, nowMs, enabled, allowDispatch, viewer, dryRun, dispatchFn, collect, ghFn, recheckFn, ownershipSnapshot,
     paths, clock, deadline, perPrBudgetMs, gitFn, env, markCursor, mergeIndex = null,
-    dispatchReserveMs = DISPATCH_RESERVE_MS, fullCollectMs = FULL_COLLECT_MS,
+    dispatchReserveMs = DISPATCH_RESERVE_MS, fullCollectMs = FULL_COLLECT_MS, appResolveFn = resolveThreadsWithApp,
   } = ctx;
   const report = [];
   const events = [];
@@ -3409,7 +3436,7 @@ function* discoverOnePr(pr, ctx) {
     }
     const polled = yield* pollWorkflow({
       now, enabled, allowDispatch, ghFn, collect, dispatchFn, paths, recheckFn, ownershipSnapshot,
-      clock, budgetMs: Math.max(1, deadline - clock()), perPrBudgetMs, dispatchReserveMs, nodeId: key, prNumber: pr.number, gitFn, env, mergeIndex,
+      clock, budgetMs: Math.max(1, deadline - clock()), perPrBudgetMs, dispatchReserveMs, nodeId: key, prNumber: pr.number, gitFn, env, mergeIndex, appResolveFn,
       unlockForDispatch, relockForDispatch, getPrLockToken,
     });
     const item = polled.prs?.[0] ?? { number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'poll-empty' } };
@@ -3444,7 +3471,7 @@ function* discoverOnePr(pr, ctx) {
       const inner = [];
       yield* processPr({
         pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
-        recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, dispatchReserveMs, forceCreate: true, mergeIndex,
+        recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, dispatchReserveMs, forceCreate: true, mergeIndex, appResolveFn,
         messagePrefix: `${watchSuccessorMessage({ prNumber: pr.number, predecessorId, reason: text.slice(0, 120), summary })}\n${guide}`,
         unlockForDispatch, relockForDispatch, getPrLockToken,
       });
@@ -3549,7 +3576,7 @@ function* discoverOnePr(pr, ctx) {
       const inner = [];
       yield* processPr({
         pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
-        recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, dispatchReserveMs, messagePrefix: guide, mergeIndex,
+        recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, dispatchReserveMs, messagePrefix: guide, mergeIndex, appResolveFn,
         unlockForDispatch, relockForDispatch, getPrLockToken,
       });
       let entry = state.prs[key] || previous;
@@ -3606,7 +3633,7 @@ function* discoverOnePr(pr, ctx) {
   const inner = [];
   yield* processPr({
     pr, previous, state, paths, now, events, report: inner, viewer, dryRun, dispatchFn, collect, ghFn,
-    recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, dispatchReserveMs, messagePrefix: guide, mergeIndex,
+    recheckFn, ownershipSnapshot, remaining, deadline, clock, resetPrDeadline, dispatchReserveMs, messagePrefix: guide, mergeIndex, appResolveFn,
     unlockForDispatch, relockForDispatch, getPrLockToken,
   });
   let entry = state.prs[key] || previous;
@@ -3707,6 +3734,7 @@ export function* discoverWorkflow({
   // reserve) is spent and handles a PR as soon as it turns Ready, gets a push, new feedback or a CI change. It does not
   // wait for slow collections. 0 = one pass only.
   followMs = 0, followUntilMs = null, sleepFn = sleep, dispatchReserveMs = DISPATCH_RESERVE_MS, fullCollectMs = FULL_COLLECT_MS, minCollectMs = MIN_COLLECT_MS,
+  appResolveFn = resolveThreadsWithApp,
 } = {}) {
   const started = clock();
   const deadline = started + Math.min(ROUND_BUDGET_MS, Math.max(1, budgetMs));
@@ -3746,7 +3774,7 @@ export function* discoverWorkflow({
   };
   const ctx = {
     now, nowMs, enabled, allowDispatch, viewer, dryRun, dispatchFn, collect, ghFn, recheckFn, ownershipSnapshot,
-    paths, clock, deadline, perPrBudgetMs, gitFn, env, markCursor, dispatchReserveMs, fullCollectMs, inFlight: new Set(),
+    paths, clock, deadline, perPrBudgetMs, gitFn, env, markCursor, dispatchReserveMs, fullCollectMs, inFlight: new Set(), appResolveFn,
   };
   const hardDeadline = followUntilMs ? started + followUntilMs : deadline;
   let known = null;
