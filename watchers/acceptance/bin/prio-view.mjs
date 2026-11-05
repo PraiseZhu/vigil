@@ -4,6 +4,7 @@
 // changes.jsonl / debounce.json / reminded.jsonl / run-YYYY-MM-DD.log 的形状
 // 与 prio-sync.mjs 的 appendChange、saveDebounce、remindOnce、main 运行头一致。
 // latency.jsonl 的形状与 event-pull.mjs 追加的行一致；没有样本时 p50/p95 显示「无数据」。
+// 行上有 written 字段时只收 written === true 的（真写入并回读成功）；老行没有这个字段，仍按原口径收。
 // 延迟按指标分两组各算，不混在一起：
 //   事件→写完 用 latencyMs（事件发生到写完，老行也有）；gateway 用 gatewayMs（Worker 收到到写完）。
 // 没有 gatewayMs 的行只进第一组，不会把 GitHub 那段算进本机延迟。两组的样本数各自记 n。
@@ -163,6 +164,8 @@ function freezeText(changes, nowMs, timeZone) {
 function percentiles(rows, key, maxValue = null) {
   const values = [];
   for (const row of rows) {
+    // written 只在真写入并回读成功时为 true；dry-run、无变化、写锁忙的是 false，不进样本。
+    if ('written' in (row || {}) && row.written !== true) continue;
     const value = row?.[key];
     if (typeof value !== 'number' || !Number.isFinite(value)) continue;
     if (maxValue != null && (value < 0 || value > maxValue)) continue;

@@ -1,5 +1,7 @@
 // 本机拉取端：每 2 秒向 Worker 拉一次队列。队列要等本机确认后 Worker 才删。
 // 拉取抛错视为 Worker 不可用：不抛出循环，改走 60 秒轮询，把漏掉的事件补回来。恢复后回到 2 秒。
+// 60 秒轮询只在 Worker 连续失败 pollAfterFailures 次（缺省 1 次：一次失败就兜底）之后才跑；Worker 正常时一次都不跑，
+// 免得每 60 秒白跑一次对账。传 0 就退回「每拍都跑」的旧行为。
 // onEvent 抛错不算 Worker 挂了：同批其余事件照常处理，下一拍仍按 2 秒拉。
 // 失败次数记在 Worker 上。同一条达到上限后确认移出，并在延迟记录里追加一行「放弃」。
 // 事件若只有元数据，调用方用 loadPayload 按需去取正文。这里不读令牌，也不自己发 GitHub 请求。
@@ -24,6 +26,8 @@ import { GATEWAY_MAX_MS } from './prio-score.mjs';
 
 export const PULL_INTERVAL_MS = 2000;
 export const POLL_INTERVAL_MS = 60 * 1000;
+/** Worker 连续失败多少次之后才跑兜底轮询。0 = 每拍都跑（旧行为）。缺省 1：一次失败就兜底，不等攒到第 3 次。 */
+export const DEFAULT_POLL_AFTER_FAILURES = 1;
 
 /** 常量定义在 prio-score.mjs（看板视图也算同一段延迟），这里继续按原名导出。 */
 export { GATEWAY_MAX_MS };
@@ -148,7 +152,8 @@ function eventAction(event) {
   return typeof action === 'string' ? action : null;
 }
 
-function appendLatency(file, event, { processedAtMs, pulledAtMs, source }) {
+/** 追加一条延迟记录。written 由调用方传入：只有布尔值才写这个键，老调用方不传时行形状不变。 */
+function appendLatency(file, event, { processedAtMs, pulledAtMs, source, written }) {
   const createdAt = event.created_at || event.createdAt || null;
   const delta = typeof createdAt === 'string' ? processedAtMs - Date.parse(createdAt) : null;
   // receivedAt 由 Worker 写。缺失、不是字符串、或解析不出时间时，gatewayMs 记 null，不抛错。
@@ -185,6 +190,7 @@ function appendLatency(file, event, { processedAtMs, pulledAtMs, source }) {
   };
   // 只在拒绝时留原因，正常行不带这个键。
   if (gatewayMsReject) row.gatewayMsReject = gatewayMsReject;
+  if (typeof written === 'boolean') row.written = written;
   appendLatencyRow(file, row);
 }
 
@@ -203,6 +209,8 @@ function errorSummary(err) {
  * payloadOmitted 的事件先交给 loadPayload，由调用方按需取回正文，再交给 onEvent。
  * 没有 loadPayload 时抛出「正文被省略」，走失败计数，不交给 onEvent。loadPayload 抛错同样算失败。
  * confirm 在处理成功（或放弃）之后调用，Worker 才清掉对应事件。
+ * 兜底轮询的门槛是 pollAfterFailures：本拍开始时连续失败次数不到这个数就跳过轮询（不调用 poll），
+ * 到点照样把下一拍的轮询时间往后推，否则循环会原地打转。拉取成功一次就把连续失败次数清零。
  * 每处理完一个事件追加一行延迟记录：receivedAt（Worker 收到）、pulledAt（本批拉到的时刻）、
  * processedAt（写完的时刻）、latencyMs、gatewayMs。
  */
@@ -220,12 +228,14 @@ export async function runEventChannel({
   latencyFile = defaultLatencyFile(),
   pullIntervalMs = PULL_INTERVAL_MS,
   pollIntervalMs = POLL_INTERVAL_MS,
+  pollAfterFailures = DEFAULT_POLL_AFTER_FAILURES,
 } = {}) {
   if (latencyFile && !path.isAbsolute(latencyFile)) {
     throw new Error(`latencyFile 必须是绝对路径：${latencyFile}`);
   }
   const seen = new Set();
   let workerUp = true;
+  let consecutiveFailures = 0;
   let nextPullAt = now();
   let nextPollAt = now();
 
@@ -251,9 +261,10 @@ export async function runEventChannel({
       const payload = await loadPayload(current);
       current = { ...current, payload };
     }
-    await onEvent(current, { source });
+    // onEvent 可以返回 { written }：只有真写入并回读成功才是 true，看板 p95 只收 true 的行。
+    const result = await onEvent(current, { source });
     seen.add(id);
-    if (latencyFile) appendLatency(latencyFile, current, { processedAtMs: now(), pulledAtMs, source });
+    if (latencyFile) appendLatency(latencyFile, current, { processedAtMs: now(), pulledAtMs, source, written: result?.written });
     return true;
   }
 
@@ -286,14 +297,18 @@ export async function runEventChannel({
   while (running()) {
     const t = now();
     let failedThisTick = false;
+    // 本拍开始时的连续失败次数：本拍自己的失败不算在门槛里，免得「失败那一拍立刻又跑轮询」。
+    const failuresAtTickStart = consecutiveFailures;
 
     if (workerUp && t >= nextPullAt) {
       try {
         const events = await pull();
+        consecutiveFailures = 0;
         nextPullAt = t + pullIntervalMs;
         await acceptBatch(events, 'worker', { confirmEvents: true });
       } catch {
         workerUp = false;
+        consecutiveFailures += 1;
         failedThisTick = true;
       }
     }
@@ -303,21 +318,26 @@ export async function runEventChannel({
       try {
         const events = await pull();
         workerUp = true;
+        consecutiveFailures = 0;
         nextPullAt = t + pullIntervalMs;
         await acceptBatch(events, 'worker', { confirmEvents: true });
       } catch {
         workerUp = false;
+        consecutiveFailures += 1;
       }
     }
 
     if (t >= nextPollAt) {
-      try {
-        const events = await poll();
-        await acceptBatch(events, 'poll');
-      } catch {
-        // 轮询失败也不让循环退出。
-      }
+      // 不管这一拍跑不跑，都把下一次轮询时间往后推；否则循环会因为「等 0 毫秒」直接退出。
       nextPollAt = t + pollIntervalMs;
+      if (pollAfterFailures <= 0 || failuresAtTickStart >= pollAfterFailures) {
+        try {
+          const events = await poll();
+          await acceptBatch(events, 'poll');
+        } catch {
+          // 轮询失败也不让循环退出。
+        }
+      }
     }
 
     if (!running()) break;

@@ -49,13 +49,14 @@ function remindedLine(row) {
   return `${JSON.stringify({ at: iso(T0), ...row })}\n`;
 }
 
-function latencyLine(latencyMs, deliveryId) {
+function latencyLine(latencyMs, deliveryId, extra = {}) {
   return `${JSON.stringify({
     deliveryId,
     createdAt: '2026-10-31T00:00:00.000Z',
     processedAt: iso(T0),
     latencyMs,
     source: 'worker',
+    ...extra,
   })}\n`;
 }
 
@@ -256,6 +257,22 @@ test('#199 SC5 没有延迟样本时 p50/p95 为无数据；20 个样本与手�
   assert.equal(onlyNull.latency.n, 0);
   assert.equal(onlyNull.latency.p50, null);
   assert.match(onlyNull.lines.find((entry) => entry.startsWith('关联 PR 延迟')), /p50 无数据 p95 无数据/);
+});
+
+test('#199 SC5b 延迟只收 written === true 的行；老行没有 written 字段时仍按原口径收', () => {
+  // 19 条老行（1000..19000，没有 written 字段）+ 1 条 written:true（30000）+ 1 条 written:false（999999）。
+  let latency = '';
+  for (let i = 1; i <= 19; i += 1) latency += latencyLine(i * 1000, `old${i}`);
+  latency += latencyLine(30000, 'written-true', { written: true });
+  latency += latencyLine(999999, 'written-false', { written: false });
+  const view = viewPrio(fresh({ latency }));
+  assert.equal(view.latency.n, 20, 'written:false 的那条不进样本');
+  assert.equal(view.latency.p50, 10000);
+  assert.equal(view.latency.p95, 19000, '999999 没被算进去');
+
+  const onlyFalse = viewPrio(fresh({ latency: latencyLine(1000, 'only-false', { written: false }) }));
+  assert.equal(onlyFalse.latency.n, 0);
+  assert.equal(onlyFalse.latency.p95, null);
 });
 
 test('W4-b SC1 延迟按指标分两组：事件→写完用 latencyMs，gateway 用 gatewayMs，两组不混', () => {
