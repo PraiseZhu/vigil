@@ -21,6 +21,7 @@ test('full source deploy preserves state and verifies all artifact hashes',t=>{
  assert.ok(FILES.includes('mivo-feedback-policy.mjs'));
  assert.ok(FILES.includes('mivo-state.mjs'));
  assert.ok(FILES.includes('mivo-ownership.mjs'));
+ assert.ok(FILES.includes('mivo-app-token.mjs'));
  assert.equal(fs.readFileSync(path.join(f.home,'deployments/fixture-release/before/mivo-watcher.mjs'),'utf8'),'old bytes');
 });
 test('state drift and source drift refuse before lease',t=>{

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { TRIAGE_REASONS, taskRepairPolicy, FEEDBACK_POLICY_VERSION } from './mivo-feedback-policy.mjs';
+import { isReviewerAuthor } from './public-review.mjs';
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 // Autonomous P3 review-thread closure. No human notification, no session dispatch.
@@ -85,6 +86,105 @@ export function* autoCloseThreads({ eligible = [], previous = {}, ghFn, now }) {
     results.push({ threadId, key: item.key ?? null });
   }
   return { previous: { ...previous, autoClosedThreads: closedThreads }, closed: results };
+}
+
+// Threads the review server has already re-checked and found fixed. Its reply says so in one of two forms (the
+// older sentence, or the thread-fixed marker) and names the head it checked. Everything is read from the
+// collected thread: the reply must be the last word on a thread the reviewer opened, written about the current
+// head and the finding that thread carries. Any doubt leaves the thread to the normal path.
+export const SERVER_FIXED_REASON = 'server-review-fixed';
+const FINDING_MARKER_RE = /<!--\s*mivo-finding\s+key=([0-9a-f]{12})\b/g;
+const THREAD_FIXED_MARKER_RE = /<!--\s*mivo-review:thread-fixed\b([^>]*?)-->/g;
+const OLD_FIXED_REPLY_RE = /本轮在提交\s*([0-9a-f]{40})\s*完成复核[:：]\s*本轮复核未再发现该问题[(（]\s*key=([0-9a-f]{12})\s*[)）][。.]\s*审查运行[:：]\s*\S+?[。.]\s*现由审查机代为\s*resolve[;；,，]\s*如仍有异议[,，]\s*可\s*unresolve\s*让审查机重看[。.]?/g;
+const HEAD40_RE = /^[0-9a-f]{40}$/;
+function threadCommentList(thread) {
+  return Array.isArray(thread?.comments) ? thread.comments : (thread?.comments?.nodes ?? []);
+}
+// API order is chronological; sort only when every comment carries a usable time, keeping ties in API order.
+function inThreadOrder(comments) {
+  const times = comments.map((comment) => Date.parse(comment?.createdAt ?? comment?.created_at ?? ''));
+  if (!times.every(Number.isFinite)) return comments;
+  return comments.map((comment, index) => ({ comment, time: times[index], index }))
+    .sort((a, b) => a.time - b.time || a.index - b.index).map((row) => row.comment);
+}
+export function isServerFixedThread(thread, currentHead) {
+  if (!HEAD40_RE.test(currentHead ?? '') || typeof thread?.id !== 'string' || !thread.id) return null;
+  if (thread.isResolved === true || commentsHasNextPage(thread)) return null;
+  const comments = inThreadOrder(threadCommentList(thread));
+  if (comments.length < 2) return null;
+  const first = comments[0];
+  const last = comments[comments.length - 1];
+  if (!isReviewerAuthor(first?.author ?? first?.user) || !isReviewerAuthor(last?.author ?? last?.user)) return null;
+  const key = [...String(first.body ?? '').matchAll(FINDING_MARKER_RE)].at(-1)?.[1];
+  if (!key) return null;
+  const body = String(last.body ?? '');
+  // The server's own words, not a comment quoting or extending them: either the marker ends the reply, or the
+  // visible text (HTML comments aside) is exactly one older sentence.
+  const endsWithMarker = /<!--\s*mivo-review:thread-fixed\b[^>]*?-->\s*$/.test(body);
+  const visible = body.replace(/<!--[\s\S]*?-->/g, '').trim();
+  const sentences = [...visible.matchAll(OLD_FIXED_REPLY_RE)];
+  if (!endsWithMarker && !(sentences.length === 1 && sentences[0][0] === visible)) return null;
+  const heads = [];
+  const keys = [];
+  for (const match of body.matchAll(OLD_FIXED_REPLY_RE)) { heads.push(match[1]); keys.push(match[2]); }
+  for (const match of body.matchAll(THREAD_FIXED_MARKER_RE)) {
+    const attrs = Object.fromEntries([...match[1].matchAll(/(\w+)=(\S+)/g)].map((pair) => [pair[1], pair[2]]));
+    heads.push(attrs.head ?? '');
+    keys.push(attrs.key ?? '');
+  }
+  if (heads.length === 0 || !heads.every((head) => head === currentHead) || !keys.every((claimed) => claimed === key)) return null;
+  return { threadId: thread.id, key, head: currentHead, commentId: typeof last.id === 'string' ? last.id : null };
+}
+// `skipped` holds threads this path already resolved on the same closing comment: a person who unresolved one
+// gets it back in the normal path instead of a second automatic resolve.
+export function partitionServerFixedThreads(threads = [], currentHead, previous = {}) {
+  const eligible = [];
+  const skipped = [];
+  const seen = new Set();
+  for (const thread of threads ?? []) {
+    const hit = isServerFixedThread(thread, currentHead);
+    if (!hit || seen.has(hit.threadId)) continue;
+    seen.add(hit.threadId);
+    const receipt = previous.autoClosedThreads?.[hit.threadId];
+    if (receipt?.reason === SERVER_FIXED_REASON && receipt.commentId === hit.commentId) skipped.push(hit);
+    else eligible.push(hit);
+  }
+  return { eligible, skipped };
+}
+const failureText = (value, fallback) => String(value ?? fallback).slice(0, 200);
+// One App-token resolve per call, for every hit thread. `appResolveFn` never falls back to another identity: a
+// thread it does not report as resolved stays open, with a failure that carries what was expected and what came
+// back. Receipts are written only for threads the App confirmed resolved.
+export function* resolveServerFixedThreads({ eligible = [], previous = {}, appResolveFn, repo, now }) {
+  const ids = new Set(eligible.map((hit) => hit.threadId));
+  let outcome;
+  try { outcome = yield () => appResolveFn({ threadIds: [...ids], repo }); }
+  catch (error) {
+    outcome = { resolved: [], failures: [{ phase: 'resolve', expected: 'appResolveFn returns {resolved, failures}', actual: `threw ${error?.name ?? 'Error'}` }] };
+  }
+  const reported = Array.isArray(outcome?.resolved) ? outcome.resolved : [];
+  const failures = Array.isArray(outcome?.failures) ? outcome.failures : [];
+  const resolvedIds = new Set(reported.filter((id) => ids.has(id)));
+  const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
+  const closed = [];
+  const failed = [];
+  for (const hit of eligible) {
+    if (resolvedIds.has(hit.threadId)) {
+      closedThreads[hit.threadId] = { at: now, key: hit.key, reason: SERVER_FIXED_REASON, head: hit.head, commentId: hit.commentId };
+      closed.push({ threadId: hit.threadId, key: hit.key, reason: SERVER_FIXED_REASON });
+      continue;
+    }
+    const why = failures.find((failure) => failure?.threadId === hit.threadId)
+      ?? failures.find((failure) => !failure?.threadId && failure?.phase !== 'revoke');
+    failed.push({
+      threadId: hit.threadId, key: hit.key, phase: failureText(why?.phase, 'unknown'),
+      expected: failureText(why?.expected, 'thread reported resolved'),
+      actual: failureText(why?.actual, Array.isArray(outcome?.failures) ? 'not reported resolved' : 'malformed outcome'),
+    });
+  }
+  const revokeFailures = failures.filter((failure) => failure?.phase === 'revoke')
+    .map((failure) => ({ phase: 'revoke', expected: failureText(failure.expected, ''), actual: failureText(failure.actual, '') }));
+  return { previous: { ...previous, autoClosedThreads: closedThreads }, closed, failed, revokeFailures };
 }
 
 // A repair session that verified an authorized P0/P1 thread does not hold records it as
