@@ -4,6 +4,8 @@
 // 每拍先看停写开关，再看每拍 / 每小时上限，然后调 prio-sync，写完一条就回读。
 // 降级、改空、白名单外、排除档、回读不一致、小时上限，都是写 .prio/disabled 并记一条告警。
 // 告警只追加 alerts.jsonl，不推到别处。文案不带令牌、主机名、仓的全名。
+// `--only-field`：只让指定字段进写闸（取值只认「优先级」「关联 PR」）。只有「关联 PR」时持续模式才放行 link，
+// 仍受逐条回读、停写开关、每小时 50 条上限约束；其余取值（含不带）link 照旧 skip。
 // `--only-empty-to-p2`：只写「空 → P2」这一子集，计划里的降级、改空、升级、空 → P1、关联 PR 静默排除，
 // 不 abort、不建停写开关、不发告警，只在 run 日志里记一行排除计数（分四类）。不带这个开关时行为不变。
 import fs from 'node:fs';
@@ -24,6 +26,7 @@ import {
 } from './rate-budget.mjs';
 import {
   ITEM_FIELD_QUERY,
+  ONLY_FIELD_NAMES,
   PRIO_HOURLY_MAX,
   PRIO_HOURLY_WINDOW_MS,
   PRIO_LIMIT_MAX,
@@ -88,6 +91,22 @@ export function parsePrioRunArgs(argv) {
     if (arg === '--only-empty-to-p2') {
       // 重复传是幂等的（还是「开」），不做布尔翻转。
       out.onlyEmptyToP2 = true;
+      continue;
+    }
+    if (arg === '--only-field') {
+      if (out.onlyField != null) throw new PrioRunError('重复的参数：--only-field', 'config');
+      const value = argv[i + 1];
+      if (typeof value !== 'string' || value.startsWith('--')) {
+        throw new PrioRunError('缺少 --only-field 的取值', 'config');
+      }
+      if (!ONLY_FIELD_NAMES.includes(value)) {
+        throw new PrioRunError(
+          `--only-field 期望「关联 PR」或「优先级」，实际：${value === '' ? '（空）' : value}`,
+          'config',
+        );
+      }
+      out.onlyField = value;
+      i += 1;
       continue;
     }
     if (arg === '--state-dir' || arg === '--max-per-tick' || arg === '--alerts-file') {
@@ -174,6 +193,9 @@ function priorityWord(value) {
  * 静默排除，不 abort、不建停写开关、不进 nonAuto（因此不会发 prio-downgrade / prio-nonempty 告警）；
  * 排除条数按四类累计，由调用方写进 run 日志。范围外（白名单字段、排除档仓）不在这个开关的授权里，
  * 仍旧整拍停写——那是配置或字段错了，需要人看，不属于「授权只放宽到空 → P2」的范围。
+ *
+ * `onlyField`：只把指定字段当作可写。`'关联 PR'` 时 link 也走 allow，和空 → P1/P2 同一条路（授权仓、
+ * 每拍与每小时名额、逐条回读、停写开关）；其余取值（含不带）link 照旧 skip。
  */
 export function assessContinuousPlan(plan, {
   maxPerTick,
@@ -182,6 +204,7 @@ export function assessContinuousPlan(plan, {
   allowRepos = [],
   table = null,
   onlyEmptyToP2 = false,
+  onlyField = null,
 } = {}) {
   const rows = (Array.isArray(plan) ? plan : []).map((change) => ({
     change,
@@ -263,14 +286,17 @@ export function assessContinuousPlan(plan, {
     };
   }
   const allowSet = new Set((allowRepos || []).map((repo) => String(repo).toLowerCase()));
-  const fills = rows
-    .filter((row) => row.kind === 'fill' && allowSet.has(String(row.change?.repo || '').toLowerCase()))
+  const linkWritable = onlyField === '关联 PR';
+  const targets = rows
+    .filter((row) => (row.kind === 'fill' || (linkWritable && row.kind === 'link'))
+      && (onlyField == null || row.change?.field === onlyField)
+      && allowSet.has(String(row.change?.repo || '').toLowerCase()))
     .map((row) => row.change)
     .sort(compareChange);
   const room = Math.max(0, Number(hourlyMax) - Number(hourlyUsed));
   const quota = Math.min(Number(maxPerTick) || 0, room);
-  const chosen = new Set(fills.slice(0, quota).map(changeKey));
-  const hourlyStop = fills.length > room;
+  const chosen = new Set(targets.slice(0, quota).map(changeKey));
+  const hourlyStop = targets.length > room;
   return {
     abort: false,
     reason: '',
@@ -280,8 +306,9 @@ export function assessContinuousPlan(plan, {
     hourlyStop,
     allow(change) {
       const kind = classifyPrioChange(change, { table }).kind;
-      if (kind === 'link') return 'skip';
-      if (kind !== 'fill') {
+      if (kind === 'link') {
+        if (!linkWritable) return 'skip';
+      } else if (kind !== 'fill') {
         nonAuto.push(change);
         return 'skip';
       }
@@ -613,6 +640,7 @@ export async function runContinuous(argv = [], deps = {}) {
       table,
       excludedCount: board.excludedCount,
       nullContent: board.nullContent,
+      onlyField: args.onlyField ?? null,
       // 写入时按闸放行；只带 --only-empty-to-p2 的 dry-run 也算一遍（只数不写，不动停写开关）。
       onPlan: wantWrite || args.onlyEmptyToP2
         ? (plan) => {
@@ -623,6 +651,7 @@ export async function runContinuous(argv = [], deps = {}) {
             allowRepos,
             table,
             onlyEmptyToP2: args.onlyEmptyToP2,
+            onlyField: args.onlyField ?? null,
           });
           if (assessment.onlyEmptyToP2) {
             const x = assessment.exclusions;

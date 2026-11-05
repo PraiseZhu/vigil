@@ -7,7 +7,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { REPO, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 import { DOWNGRADE_MIN_GAP_MS } from './bin/prio-score.mjs';
-import { PRIO_HOURLY_MAX, PRIO_HOURLY_WINDOW_MS } from './bin/prio-sync.mjs';
+import { ONLY_FIELD_NAMES, PRIO_HOURLY_MAX, PRIO_HOURLY_WINDOW_MS } from './bin/prio-sync.mjs';
 import { alertTextFor, hostFilesFromEnv, main, parseMaxPerTick, parsePrioRunArgs } from './bin/prio-run.mjs';
 import { hostPaths } from './host/paths.mjs';
 
@@ -1330,4 +1330,189 @@ test('#285 被排除的条目一条都不动：看板上的优先级/关联 PR �
     before.filter((_entry, index) => index !== 6),
     '被排除的 6 条整条记录写前写后完全相同',
   );
+});
+
+// ── #279 --only-field：只写一个字段；只有「关联 PR」时持续模式才放行 link ──
+
+function changeRows(dir) {
+  const file = path.join(dir, 'changes.jsonl');
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+}
+
+function closingPr(number, issue) {
+  return {
+    repo: REPO,
+    number,
+    title: 'fix',
+    body: `Closes #${issue}\n`,
+    state: 'open',
+    ci: 'pass',
+    headRefName: 'fix',
+  };
+}
+
+test('SC1 --only-field 优先级 时只写优先级，link 记 skip', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  // 计划里有 2 条空 → P2 和 1 条关联 PR：只带 --only-field 优先级 时，link 那条不写、不进 changes.jsonl。
+  const { writes, result } = await run(dir, ['--write', '--only-field', '优先级'], {
+    items: [item(1), item(2)],
+    prs: [closingPr(9, 1)],
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(writes.length, 2, '写入条数等于优先级变更数');
+  for (const action of writes) assert.deepEqual(action.fields, { 优先级: 'P2' });
+  assert.deepEqual(
+    [...new Set(changeRows(dir).map((row) => row.field))],
+    ['优先级'],
+    'changes.jsonl 只出现优先级行',
+  );
+  assert.equal(result.result.filteredByField, 1, 'link 那条按字段过滤掉，没进写闸');
+  const { assessment } = result;
+  assert.equal(
+    assessment.allow({ item: `${REPO}#1`, repo: REPO, issue: 1, field: '关联 PR', old: '', new: '#9(open,CI✓)' }),
+    'skip',
+    'link 记 skip',
+  );
+  assert.equal(
+    assessment.allow({ item: `${REPO}#1`, repo: REPO, issue: 1, field: '优先级', old: null, new: 'P2' }),
+    'write',
+  );
+  assert.equal(disabled(dir), false);
+  assert.equal(readAlerts(dir).length, 0);
+});
+
+test('SC2 --only-field 关联 PR 时 link 放行并逐条回读', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const reads = [];
+  const { writes, result, io } = await run(dir, ['--write', '--only-field', '关联 PR'], {
+    items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2' })],
+    prs: [closingPr(9, 1), closingPr(10, 2)],
+    readBack: async (change) => {
+      reads.push({ item: change.item, field: change.field, itemId: change.itemId });
+      return change.new;
+    },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(writes.map((action) => action.fields), [
+    { '关联 PR': '#9(open,CI✓)' },
+    { '关联 PR': '#10(open,CI✓)' },
+  ]);
+  assert.deepEqual(writes.map((action) => action.itemId), ['PVTI_1', 'PVTI_2']);
+  assert.equal(reads.length, writes.length, '每条写完都回读一次');
+  assert.deepEqual(reads.map((row) => row.field), ['关联 PR', '关联 PR']);
+  assert.deepEqual(reads.map((row) => row.itemId), ['PVTI_1', 'PVTI_2'], '按 itemId 回读该字段');
+  assert.deepEqual(changeRows(dir).map((row) => row.field), ['关联 PR', '关联 PR']);
+  assert.equal(result.stop, '');
+  assert.equal(disabled(dir), false);
+  assert.equal(readAlerts(dir).length, 0);
+  assert.equal(/扣住|不写关联 PR/.test(io.text()), false, '放行后不再打扣住那行');
+});
+
+test('SC3 关联 PR 回读不一致立刻停写并告警', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const reads = [];
+  const { writes, result } = await run(dir, ['--write', '--only-field', '关联 PR'], {
+    items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2' })],
+    prs: [closingPr(9, 1), closingPr(10, 2)],
+    readBack: async (change) => {
+      reads.push(change.item);
+      return change.issue === 1 ? '#9(open)' : change.new;
+    },
+  });
+  assert.deepEqual(writes.map((action) => action.itemId), ['PVTI_1'], '第一条写完就停，余下的不写');
+  assert.deepEqual(reads, [`${REPO}#1`], '只回读了一条，没有重试');
+  assert.equal(result.stop, 'readback');
+  assert.equal(disabled(dir), true);
+  const [alert] = readAlerts(dir);
+  assert.equal(alert.kind, 'prio-readback');
+  assert.match(alert.text, /读回来的值和要写的不一致/);
+  assert.match(alert.text, /没有自动重试/);
+  assert.equal(alert.text.includes(REPO), false);
+
+  // 下一拍仍停在 disabled 上：余下的那条不补写。
+  const next = await run(dir, ['--write', '--only-field', '关联 PR'], {
+    items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2' })],
+    prs: [closingPr(9, 1), closingPr(10, 2)],
+  });
+  assert.equal(next.writes.length, 0);
+  assert.equal(next.result.stop, 'disabled');
+});
+
+test('SC4 关联 PR 写入仍受每小时 50 条限制', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  for (let i = 0; i < PRIO_HOURLY_MAX - 1; i += 1) {
+    seedChange(dir, 1000 + i, 'P2', { at: T0 - 60 * 1000 });
+  }
+  // 第 1 条只有空 → P2（不在放行字段里），后两条是关联 PR：本拍只剩 1 个名额，写第 1 条 link，下一条不写。
+  const { writes, result } = await run(dir, ['--write', '--only-field', '关联 PR'], {
+    items: [item(1), item(2, { id: 'PVTI_2' }), item(3, { id: 'PVTI_3' })],
+    prs: [closingPr(9, 2), closingPr(10, 3)],
+  });
+  assert.equal(writes.length, 1, '窗口里已 49 条，这一拍只写 1 条');
+  assert.deepEqual(writes[0].fields, { '关联 PR': '#9(open,CI✓)' });
+  assert.equal(result.stop, 'hourly');
+  assert.equal(disabled(dir), true);
+  const [alert] = readAlerts(dir);
+  assert.equal(alert.kind, 'prio-hourly');
+  assert.match(alert.text, /只写到上限为止/);
+  const rows = changeRows(dir);
+  assert.equal(rows.length, PRIO_HOURLY_MAX - 1 + 1, 'changes.jsonl 只多了写进去的那 1 条');
+  assert.deepEqual(rows.filter((row) => row.field === '关联 PR').map((row) => row.item), [`${REPO}#2`]);
+});
+
+test('SC5 未知字段名 fail-closed，在读令牌前退出', async () => {
+  assert.deepEqual(ONLY_FIELD_NAMES, ['关联 PR', '优先级']);
+  assert.equal(parsePrioRunArgs(['--only-field', '优先级']).onlyField, '优先级');
+  assert.equal(parsePrioRunArgs(['--only-field', '关联 PR']).onlyField, '关联 PR');
+  assert.equal(parsePrioRunArgs([]).onlyField ?? null, null, '不带时行为不变');
+
+  const allowed = /--only-field 期望「关联 PR」或「优先级」，实际：/;
+  const unknown = ['验收', '状态', '', '   ', '优先级 ', ' 优先级', '优先级,关联 PR', 'PRIORITY'];
+  for (const value of unknown) {
+    const shown = value === '' ? '（空）' : value;
+    assert.throws(() => parsePrioRunArgs(['--only-field', value]), allowed, JSON.stringify(value));
+    const dir = tmpDir();
+    allow(dir, [REPO]);
+    const { result, writes, seen, stderrText } = await run(dir, ['--write', '--only-field', value], {
+      items: fills(1),
+    });
+    assert.equal(result.exitCode, 1, JSON.stringify(value));
+    assert.equal(writes.length, 0, '0 次写请求');
+    assert.equal(seen.token, 0, '读令牌之前退出');
+    assert.equal(seen.load, 0, JSON.stringify(value));
+    assert.equal(seen.network, 0, JSON.stringify(value));
+    assert.equal(fs.existsSync(path.join(dir, 'changes.jsonl')), false, 'changes.jsonl 不追加');
+    assert.equal(disabled(dir), false);
+    assert.match(result.error.message, allowed);
+    assert.equal(result.error.message.includes(`实际：${shown}`), true, `报错要写实际值：${JSON.stringify(value)}`);
+    assert.match(stderrText, /--only-field 期望/);
+  }
+
+  // 缺值、取值位置是另一个 -- 参数、重复出现：同样非 0 退出，一条都不写。
+  const malformed = [
+    [['--only-field'], /缺少 --only-field 的取值/],
+    [['--only-field', '--write'], /缺少 --only-field 的取值/],
+    [['--only-field', '--max-per-tick', '1'], /缺少 --only-field 的取值/],
+    [['--only-field', '优先级', '--only-field', '关联 PR'], /重复的参数：--only-field/],
+    [['--only-field', '关联 PR', '--only-field', '关联 PR'], /重复的参数：--only-field/],
+  ];
+  for (const [argv, message] of malformed) {
+    assert.throws(() => parsePrioRunArgs(argv), message, argv.join(' '));
+    const dir = tmpDir();
+    allow(dir, [REPO]);
+    const { result, writes, seen } = await run(dir, ['--write', ...argv], { items: fills(1) });
+    assert.equal(result.exitCode, 1, argv.join(' '));
+    assert.match(result.error.message, message);
+    assert.equal(writes.length, 0);
+    assert.equal(seen.token, 0);
+    assert.equal(fs.existsSync(path.join(dir, 'changes.jsonl')), false);
+  }
 });
