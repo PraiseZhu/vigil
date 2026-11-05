@@ -6,7 +6,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { createEventWorker } from './bin/event-worker.mjs';
+import {
+  ACK_BODY_LIMIT,
+  FAIL_BODY_LIMIT,
+  WEBHOOK_BODY_LIMIT,
+  createEventWorker,
+} from './bin/event-worker.mjs';
 import {
   PULL_INTERVAL_MS,
   POLL_INTERVAL_MS,
@@ -1442,4 +1447,283 @@ test('W4-a SC3 部署文件只有 SQLite 版 DO 绑定，没有密钥、令牌�
   assert.match(entry, /idFromName\('main'\)/);
   assert.doesNotMatch(entry, /node:fs/);
   assert.doesNotMatch(entry, /node:child_process/);
+});
+
+// W4-e：请求体大小上限。三条读 body 的路由（/webhook、/ack、/fail）都先看 content-length 快速拒绝，
+// 没有该头或声明偏小时按读到的累计字节数兜底，超限一律 413；/webhook 的 413 在验签之前返回。
+// 413 只回上限数字，不回显 body、不提 secret。
+
+// 可数读取次数的流：用来证明「超限就不再读」而不是「读完再判」。
+function countingStream(chunks, counter) {
+  let index = 0;
+  return new ReadableStream({
+    pull(controller) {
+      counter.reads += 1;
+      if (index >= chunks.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunks[index]);
+      index += 1;
+    },
+  });
+}
+
+function streamRequest(pathname, chunks, { headers = {}, counter = { reads: 0 } } = {}) {
+  const request = new Request(`https://example.invalid${pathname}`, {
+    method: 'POST',
+    headers,
+    body: countingStream(chunks, counter),
+    duplex: 'half',
+  });
+  return { request, counter };
+}
+
+function repeatChunk(byte, size) {
+  return new Uint8Array(size).fill(byte);
+}
+
+// 构造字节数正好为 size 的合法 webhook JSON：padding 全是 ASCII，字符数等于字节数。
+function exactSizeWebhookBody(size) {
+  const skeleton = {
+    created_at: '2026-10-31T00:00:00.000Z',
+    action: 'opened',
+    repository: { full_name: 'example-org/example-repo' },
+    issue: { number: 7 },
+    padding: '',
+  };
+  const base = JSON.stringify(skeleton).length;
+  return JSON.stringify({ ...skeleton, padding: 'x'.repeat(size - base) });
+}
+
+test('W4-e SC1 /webhook content-length 超限时直接 413：不打开 body 流、不入队', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  // 「一读就报错」的流：只要代码去读 body，worker.fetch 就会抛，不可能回 413。
+  const unreadable = new Request('https://example.invalid/webhook', {
+    method: 'POST',
+    headers: {
+      'content-length': String(WEBHOOK_BODY_LIMIT + 1),
+      'x-github-delivery': 'too-large-cl',
+      'x-github-event': 'issues',
+    },
+    body: new ReadableStream({
+      pull(controller) {
+        controller.error(new Error('body must not be read'));
+      },
+    }),
+    duplex: 'half',
+  });
+  const response = await worker.fetch(unreadable, env);
+  assert.equal(response.status, 413);
+  assert.deepEqual(await pullIds(worker, env), []);
+  // 413 只给上限，不回显 body 内容。
+  const text = await response.text();
+  assert.match(text, new RegExp(String(WEBHOOK_BODY_LIMIT)));
+  assert.doesNotMatch(text, /action|opened/);
+});
+
+test('W4-e SC1 没有 content-length（chunked）时累计超限即 413，不把整段读完', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  const chunks = Array.from({ length: 8 }, () => repeatChunk(0x78, 256 * 1024));
+  const { request, counter } = streamRequest('/webhook', chunks, {
+    headers: { 'x-github-delivery': 'too-large-stream', 'x-github-event': 'issues' },
+  });
+  assert.equal(request.headers.get('content-length'), null);
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 413);
+  assert.ok(counter.reads < chunks.length, `超限后应停止读取，实际读了 ${counter.reads}/${chunks.length} 块`);
+  assert.deepEqual(await pullIds(worker, env), []);
+});
+
+test('W4-e SC1 恶意 content-length 小于实际 body 时，按实际累计字节判 413', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  const chunks = Array.from({ length: 4 }, () => repeatChunk(0x78, 256 * 1024));
+  const { request } = streamRequest('/webhook', chunks, {
+    headers: {
+      'content-length': '16',
+      'x-github-delivery': 'lying-content-length',
+      'x-github-event': 'issues',
+    },
+  });
+  const response = await worker.fetch(request, env);
+  assert.equal(response.status, 413);
+  assert.deepEqual(await pullIds(worker, env), []);
+});
+
+test('W4-e SC1 body 字节数正好等于上限时通过：/webhook 204、/ack 204', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+
+  const body = exactSizeWebhookBody(WEBHOOK_BODY_LIMIT);
+  assert.equal(Buffer.byteLength(body), WEBHOOK_BODY_LIMIT);
+  const accepted = await worker.fetch(
+    new Request('https://example.invalid/webhook', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': String(WEBHOOK_BODY_LIMIT),
+        'x-hub-signature-256': sign(body, SECRET),
+        'x-github-delivery': 'at-limit',
+        'x-github-event': 'issues',
+      },
+      body,
+    }),
+    env,
+  );
+  assert.equal(accepted.status, 204);
+  const pulled = await worker.fetch(pullRequest(TOKEN), env);
+  const events = (await pulled.json()).events;
+  assert.deepEqual(events.map((event) => event.deliveryId), ['at-limit']);
+  // 整条事件超过单值上限（128 KiB），存成元数据但事件本身不丢。
+  assert.equal(events[0].payloadOmitted, true);
+  assert.equal(events[0].number, 7);
+
+  // 刚好等于 /ack 上限的合法确认体：JSON 骨架 12 字节，其余用 id 补满。
+  const ackBody = `{"ids":["${'a'.repeat(ACK_BODY_LIMIT - 12)}"]}`;
+  assert.equal(Buffer.byteLength(ackBody), ACK_BODY_LIMIT);
+  const acked = await worker.fetch(
+    new Request('https://example.invalid/ack', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        'content-type': 'application/json',
+        'content-length': String(ACK_BODY_LIMIT),
+      },
+      body: ackBody,
+    }),
+    env,
+  );
+  assert.equal(acked.status, 204);
+
+  // /fail 同一条边界：正好等于上限的合法失败体照常记一次失败。
+  const failSkeleton = JSON.stringify({ id: 'at-limit', error: '' }).length;
+  const failBody = JSON.stringify({ id: 'at-limit', error: 'x'.repeat(FAIL_BODY_LIMIT - failSkeleton) });
+  assert.equal(Buffer.byteLength(failBody), FAIL_BODY_LIMIT);
+  const failed = await worker.fetch(
+    new Request('https://example.invalid/fail', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        'content-type': 'application/json',
+        'content-length': String(FAIL_BODY_LIMIT),
+      },
+      body: failBody,
+    }),
+    env,
+  );
+  assert.equal(failed.status, 200);
+  assert.equal((await failed.json()).failures, 1);
+
+  // 只多一个字节就走 413：边界是「不超过上限」，不是「小于上限再加余量」。
+  const overBody = exactSizeWebhookBody(WEBHOOK_BODY_LIMIT + 1);
+  assert.equal(Buffer.byteLength(overBody), WEBHOOK_BODY_LIMIT + 1);
+  const rejected = await worker.fetch(webhookRequest(overBody, { delivery: 'over-limit' }), env);
+  assert.equal(rejected.status, 413);
+});
+
+test('W4-e SC1 限内的错签名 / 缺签名头 / 缺 secret 仍是 401，不受 413 逻辑影响', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  const body = JSON.stringify({ created_at: '2026-10-31T00:00:00.000Z', action: 'opened' });
+
+  const wrong = await worker.fetch(
+    webhookRequest(body, { delivery: 'wrong-sig', signature: sign(body, 'not-the-secret') }),
+    env,
+  );
+  assert.equal(wrong.status, 401);
+
+  const missing = await worker.fetch(
+    new Request('https://example.invalid/webhook', {
+      method: 'POST',
+      headers: { 'content-length': String(body.length), 'x-github-delivery': 'missing-sig' },
+      body,
+    }),
+    env,
+  );
+  assert.equal(missing.status, 401);
+
+  const noSecret = await worker.fetch(webhookRequest(body, { delivery: 'no-secret' }), { PULL_TOKEN: TOKEN });
+  assert.equal(noSecret.status, 401);
+
+  // 超限时 413 先于验签：签名是错的也回 413，且响应里没有请求内容和 secret。
+  const big = `${body}${'x'.repeat(WEBHOOK_BODY_LIMIT)}`;
+  const oversized = await worker.fetch(
+    webhookRequest(big, { delivery: 'too-large-bad-sig', signature: 'sha256=deadbeef' }),
+    env,
+  );
+  assert.equal(oversized.status, 413);
+  const text = await oversized.text();
+  assert.doesNotMatch(text, new RegExp(SECRET));
+  assert.doesNotMatch(text, /sha256=deadbeef/);
+
+  assert.deepEqual(await pullIds(worker, env), []);
+});
+
+test('W4-e SC1 /ack、/fail 超限 413 且不动队列；令牌不对时仍是 401', async () => {
+  const worker = createEventWorker();
+  const env = workerEnv();
+  await postWebhook(worker, env, smallPayload(), 'keep-me');
+
+  const bigJson = JSON.stringify({ ids: ['a'.repeat(ACK_BODY_LIMIT)] });
+  const ackTooLarge = await worker.fetch(
+    new Request('https://example.invalid/ack', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        'content-type': 'application/json',
+        'content-length': String(Buffer.byteLength(bigJson)),
+      },
+      body: bigJson,
+    }),
+    env,
+  );
+  assert.equal(ackTooLarge.status, 413);
+
+  // 没有 content-length 的 chunked 超限体同样 413。
+  const { request: chunkedAck } = streamRequest('/ack', [repeatChunk(0x7b, ACK_BODY_LIMIT + 1024)], {
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+  });
+  const chunked = await worker.fetch(chunkedAck, env);
+  assert.equal(chunked.status, 413);
+
+  const failTooLarge = await worker.fetch(
+    new Request('https://example.invalid/fail', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        'content-type': 'application/json',
+        'content-length': String(FAIL_BODY_LIMIT + 1),
+      },
+      body: JSON.stringify({ id: 'keep-me', error: 'x'.repeat(FAIL_BODY_LIMIT) }),
+    }),
+    env,
+  );
+  assert.equal(failTooLarge.status, 413);
+
+  // 413 没把队列清掉，也没记失败。
+  assert.deepEqual(await pullIds(worker, env), ['keep-me']);
+
+  // 授权在读 body 之前：令牌不对时即便 body 巨大也还是 401。
+  const badToken = await worker.fetch(
+    new Request('https://example.invalid/ack', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer wrong-pull-token',
+        'content-type': 'application/json',
+        'content-length': String(ACK_BODY_LIMIT + 1),
+      },
+      body: '{"ids":[]}',
+    }),
+    env,
+  );
+  assert.equal(badToken.status, 401);
+
+  const noToken = await worker.fetch(
+    new Request('https://example.invalid/fail', { method: 'POST', body: '{"id":"keep-me"}' }),
+    env,
+  );
+  assert.equal(noToken.status, 401);
 });
