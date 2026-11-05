@@ -18,7 +18,8 @@ const finding = (priority, key = `thread:${priority}`) => ({
 
 // Every Git mutation is confined to this test's disposable repositories. gh is
 // entirely simulated; unexpected API calls fail instead of reaching the network.
-function fixture(t, { changed = true, lockfile = false, nodeModules = false, protectedHead = false } = {}) {
+// childPrList: 'error' / 'malformed' make the open-child-PR listing (`pulls?state=open&base=`) throw / return a non-list.
+function fixture(t, { changed = true, lockfile = false, nodeModules = false, protectedHead = false, childPrList = 'ok' } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-repair-scope-'));
   const home = path.join(root, 'watcher');
   const plugin = path.join(root, 'plugin');
@@ -118,11 +119,15 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
     if (endpoint === `repos/${REPO}/rules/branches/fix%2Fscope?per_page=100`) return JSON.stringify([protectedHead
       ? [{ type: 'non_fast_forward' }, { type: 'pull_request', parameters: {} }] : []]);
     if (String(endpoint).startsWith(`repos/${REPO}/pulls?state=open&head=`)) return JSON.stringify([childPrs]);
+    if (String(endpoint).startsWith(`repos/${REPO}/pulls?state=open&base=`)) {
+      if (childPrList === 'error') throw new Error('HTTP 502');
+      return JSON.stringify(childPrList === 'malformed' ? { message: 'not a list' } : [childPrs]);
+    }
     if (endpoint === `repos/${REPO}/pulls/790`) return JSON.stringify({ number: 790, body: '任务 issue：example-org/example-plugin#12\n\nparent' });
     if (args[1] === '--method' && args[2] === 'POST' && args[3] === `repos/${REPO}/pulls`) {
       const field = (name) => args.find((a) => a.startsWith(`${name}=`)).slice(name.length + 1);
       const created = { number: 800 + childPrs.length, html_url: `https://github.com/${REPO}/pull/${800 + childPrs.length}`,
-        title: field('title'), body: field('body'), head: { ref: field('head') }, base: { ref: field('base') } };
+        title: field('title'), body: field('body'), head: { ref: field('head'), sha: head, repo: { full_name: REPO } }, base: { ref: field('base') } };
       childPrs.push(created);
       return JSON.stringify(created);
     }
@@ -1252,6 +1257,58 @@ test('protected head branch: finalize retry reuses the pushed child branch and t
   assert.equal(f.pushCalls.length, pushes);
   assert.equal(f.childPrs.length, 1);
   assert.deepEqual(second.childPr, first.childPr);
+});
+
+// 2026-11-05: a stage PR got a new child PR on every fix round while the earlier one was still open.
+const openChildPr = (number, overrides = {}) => ({ number, html_url: `https://github.com/${REPO}/pull/${number}`, title: 'fix: earlier', body: '',
+  head: { ref: 'vigil/pr-790-fix-aaaaaaaaaaaa', sha: 'c'.repeat(40), repo: { full_name: REPO } }, base: { ref: 'fix/scope' }, ...overrides });
+
+test('protected head branch: another child PR is still open — nothing is pushed or opened, the result points at it', async (t) => {
+  const f = fixture(t, { protectedHead: true });
+  assert.equal((await f.validate()).status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  f.childPrs.push(openChildPr(777));
+  const pushes = f.pushCalls.length;
+  const result = f.finalize();
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.blockedKind, 'child-pr');
+  assert.equal(result.pushed, false);
+  assert.equal(f.pushCalls.length, pushes);
+  assert.equal(f.remoteHead(), f.sourceHead);
+  assert.equal(f.remoteRef(`refs/heads/vigil/pr-790-fix-${f.head.slice(0, 12)}`), null);
+  assert.equal(f.childPrs.length, 1);
+  assert.ok(!f.ghCalls.some((args) => args[1] === '--method' && args[2] === 'POST'));
+  assert.deepEqual(result.childPr, { number: 777, url: `https://github.com/${REPO}/pull/777`,
+    branch: 'vigil/pr-790-fix-aaaaaaaaaaaa', base: 'fix/scope', head: 'c'.repeat(40) });
+  assert.match(result.reason, /已有子 PR #777 仍开着，本轮修复没有另开/);
+});
+
+test('protected head branch: open PRs that are not child PRs of this head do not hold the fix back', async (t) => {
+  const f = fixture(t, { protectedHead: true });
+  assert.equal((await f.validate()).status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  f.childPrs.push(
+    openChildPr(771, { head: { ref: 'vigil/pr-791-fix-aaaaaaaaaaaa', sha: 'c'.repeat(40), repo: { full_name: REPO } } }),
+    openChildPr(772, { base: { ref: 'main' } }),
+    openChildPr(773, { head: { ref: 'vigil/pr-790-fix-aaaaaaaaaaaa', sha: 'c'.repeat(40), repo: { full_name: 'example-fork/example-plugin' } } }),
+  );
+  const result = f.finalize();
+  const branch = `vigil/pr-790-fix-${f.head.slice(0, 12)}`;
+  assert.equal(result.blockedKind, 'child-pr');
+  assert.equal(f.remoteRef(`refs/heads/${branch}`), f.head);
+  assert.equal(result.childPr.branch, branch);
+  assert.equal(f.childPrs.length, 4);
+});
+
+for (const childPrList of ['error', 'malformed']) test(`protected head branch: an unreadable child PR list (${childPrList}) stops finalize before any push`, async (t) => {
+  const f = fixture(t, { protectedHead: true, childPrList });
+  assert.equal((await f.validate()).status, 'pass');
+  f.report([f.sc('pass', ['thread:P1'])]);
+  const pushes = f.pushCalls.length;
+  assert.throws(f.finalize);
+  assert.equal(f.pushCalls.length, pushes);
+  assert.equal(f.remoteRef(`refs/heads/vigil/pr-790-fix-${f.head.slice(0, 12)}`), null);
+  assert.equal(f.childPrs.length, 0);
 });
 
 for (const protectedHead of [false, 'error']) test(`head branch rules ${protectedHead ? 'unreadable' : 'without pull_request'}: keeps the direct push`, async (t) => {

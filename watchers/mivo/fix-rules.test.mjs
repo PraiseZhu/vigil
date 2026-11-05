@@ -1,4 +1,4 @@
-import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
+import { handoffPr, handoffReceipt, withAuthorHandoff, isChildPrList } from './handoff.fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -431,7 +431,7 @@ function scanHome(t) {
 function runScan(paths, listed, collect, dispatchFn, now = '2026-09-10T00:00:00Z') {
   return scanOnce({
     enabled: true, allowDispatch: true, paths, now,
-    ghFn: (args) => args[0] === 'api' ? 'owner' : JSON.stringify([listed]),
+    ghFn: (args) => isChildPrList(args) ? '[[]]' : args[0] === 'api' ? 'owner' : JSON.stringify([listed]),
     collect: (...args) => withAuthorHandoff(collect(...args), listed),
     ownershipSnapshot: function* () { return { pr: handoffPr(listed) }; }, dispatchFn,
   });
@@ -739,7 +739,7 @@ for (const withTask of [true,false,'legacy']) test(`discover claim-retry require
     params:{title:'t',message:'schedule-prefix\nOWNER_STANDING_AUTH: PR_PUSH_AND_REPLY',target_session_id:'s1'},
   }});
   let sent;const out=scanOnce({mode:'discover',enabled:true,allowDispatch:true,paths,now:'2026-09-10T01:00:00Z',
-    ghFn:args=>args[0]==='api'&&args[1]==='user'?'owner':args[0]==='pr'&&args[1]==='view'?JSON.stringify({id:'PR_1',state:'OPEN'}):args[0]==='pr'&&args[1]==='list'?JSON.stringify([{id:'PR_1',number:1,headRefOid:HEAD,isDraft:false,labels:[]}]):'[]',
+    ghFn:args=>isChildPrList(args)?'[[]]':args[0]==='api'&&args[1]==='user'?'owner':args[0]==='pr'&&args[1]==='view'?JSON.stringify({id:'PR_1',state:'OPEN'}):args[0]==='pr'&&args[1]==='list'?JSON.stringify([{id:'PR_1',number:1,headRefOid:HEAD,isDraft:false,labels:[]}]):'[]',
     ownershipSnapshot:function*(){return {pr:currentPr};},
     collect:()=>{throw Error('must not collect');},dispatchFn:p=>{sent=p;return {target_session_id:'s1',dispatch_id:id};},
   });

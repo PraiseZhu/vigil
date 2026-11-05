@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { failedOptionalActions } from './bin/mivo-ci.mjs';
 import { collectPr, scanOnce, watcherPaths, REPO } from './bin/mivo-watcher.mjs';
-import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
+import { handoffPr, handoffReceipt, withAuthorHandoff, isChildPrList } from './handoff.fixture.mjs';
 
 const repo = 'example-org/example-plugin';
 const head = 'a'.repeat(40);
@@ -121,7 +121,7 @@ test('a red optional check collected from check-runs is dispatched as repair fee
   const sent = [];
   const result = scanOnce({
     enabled: true, allowDispatch: true, paths, now: '2026-11-03T11:00:00Z',
-    ghFn: (args) => args[0] === 'api' ? 'owner' : JSON.stringify([listed]),
+    ghFn: (args) => isChildPrList(args) ? '[[]]' : args[0] === 'api' ? 'owner' : JSON.stringify([listed]),
     collect: () => withAuthorHandoff(collected, listed),
     ownershipSnapshot: function* () { return { pr: handoffPr(listed) }; },
     dispatchFn: (params) => { sent.push(params); return { target_session_id: 's1' }; },

@@ -10,7 +10,16 @@ const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
 const COMMENT = { id: 101, body: 'P1: example finding', user: { login: 'ExampleReviewer', type: 'User' }, updated_at: '2026-10-28T06:00:00Z' };
 
-function drive(gen) { let step = gen.next(); while (!step.done) step = gen.next(step.value()); return step.value; }
+// Same contract as the watcher's own driver: an effect that throws is thrown back into the generator.
+function drive(gen) {
+  let step = gen.next();
+  while (!step.done) {
+    let value;
+    try { value = step.value(); } catch (error) { step = gen.throw(error); continue; }
+    step = gen.next(value);
+  }
+  return step.value;
+}
 
 test('readDispatchGate fails closed on MERGED, CLOSED, invalid JSON and identity mismatch', () => {
   const pr = { id: 'PR_790', number: 790 };
@@ -22,7 +31,8 @@ test('readDispatchGate fails closed on MERGED, CLOSED, invalid JSON and identity
   assert.deepEqual(drive(readDispatchGate({ pr, ghFn: () => JSON.stringify({ id: 'PR_790', state: 'OPEN' }) })), { ok: true, state: 'OPEN' });
 });
 
-function harness(t, { collectedState = 'MERGED', includeCollectedPr = true, gateState = 'CLOSED' } = {}) {
+// childPrs: what `repos/<repo>/pulls?state=open&base=<head branch>` lists; childPrList 'error' makes that read throw.
+function harness(t, { collectedState = 'MERGED', includeCollectedPr = true, gateState = 'CLOSED', childPrs = [], childPrList = 'ok' } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-gate-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const paths = watcherPaths(home);
@@ -41,15 +51,28 @@ function harness(t, { collectedState = 'MERGED', includeCollectedPr = true, gate
   const sent = [];
   const report = [];
   const events = [];
+  const childPrReads = [];
   const gen = processPr({ pr, state, paths, now: '2026-10-28T07:00:00Z', events, report, viewer: 'owner', dryRun: false,
     dispatchFn: (params) => { sent.push(params); return { target_session_id: 'sess-790' }; },
     collect: () => collected, recheckFn: () => {},
-    ghFn: (args) => args[0] === 'pr' && args[1] === 'view' ? JSON.stringify({ id: 'PR_790', state: gateState }) : '{}',
+    ghFn: (args) => {
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'PR_790', state: gateState });
+      if (args[0] === 'api' && String(args[1]).startsWith(`repos/${REPO}/pulls?state=open&base=`)) {
+        childPrReads.push(args);
+        if (childPrList === 'error') throw new Error('HTTP 502');
+        return JSON.stringify(childPrList === 'malformed' ? { message: 'not a list' } : [childPrs]);
+      }
+      return '{}';
+    },
     ownershipSnapshot: function* () { return { pr: { ...pr, author: { login: 'owner' } } }; },
     remaining: () => 120000, deadline: Date.now() + 120000, clock: Date.now, allowCreate: false, keelRoot: '/tmp' });
   drive(gen);
-  return { sent, report, entry: state.prs.PR_790, feedback };
+  return { sent, report, entry: state.prs.PR_790, feedback, childPrReads };
 }
+
+// Shape of one item of the REST pulls listing, as far as the guard reads it.
+const childPr = (number, overrides = {}) => ({ number, html_url: `https://github.com/${REPO}/pull/${number}`,
+  head: { ref: 'vigil/pr-790-fix-aaaaaaaaaaaa', sha: HEAD, repo: { full_name: REPO } }, base: { ref: 'fix/x' }, ...overrides });
 
 test('processPr does not dispatch when the freshly collected PR is MERGED or CLOSED', (t) => {
   for (const state of ['MERGED', 'CLOSED']) {
@@ -67,3 +90,49 @@ test('processPr still dispatches an OPEN PR', (t) => {
   assert.equal(open.sent.length, 1);
   assert.equal(open.report[0].dispatch.attempted, true);
 });
+
+// 2026-11-05: a stage PR got a second, third ... fix PR for the same finding because every scan with unconsumed
+// feedback dispatched again while the first child PR (vigil/pr-<N>-fix-*) was still open.
+test('processPr holds the dispatch while a child PR into this head branch is open, and keeps the cursor', (t) => {
+  const h = harness(t, { collectedState: 'OPEN', gateState: 'OPEN', childPrs: [childPr(801)] });
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.report[0].dispatch.attempted, false);
+  assert.equal(h.report[0].dispatch.reason, 'child-pr-open');
+  assert.deepEqual(h.report[0].dispatch.childPrs, [801]);
+  assert.equal(h.entry.lastDispatchGuard.reason, 'child-pr-open');
+  assert.deepEqual(h.entry.feedbackCursor, {});
+  assert.equal(Boolean(h.entry.pendingDispatch), false);
+  assert.equal(h.childPrReads.length, 1);
+  assert.equal(h.childPrReads[0][1].includes('base=fix%2Fx'), true);
+});
+
+test('processPr dispatches as usual when no child PR is open, and reads the list once', (t) => {
+  const h = harness(t, { collectedState: 'OPEN', gateState: 'OPEN', childPrs: [] });
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.report[0].dispatch.attempted, true);
+  assert.equal(h.childPrReads.length, 1);
+});
+
+test('processPr ignores open PRs that are not this PR\'s child PRs', (t) => {
+  const h = harness(t, { collectedState: 'OPEN', gateState: 'OPEN', childPrs: [
+    childPr(802, { head: { ref: 'vigil/pr-791-fix-aaaaaaaaaaaa', sha: HEAD, repo: { full_name: REPO } } }),
+    childPr(803, { head: { ref: 'feature/other', sha: HEAD, repo: { full_name: REPO } } }),
+    childPr(804, { base: { ref: 'main' } }),
+    childPr(805, { head: { ref: 'vigil/pr-790-fix-aaaaaaaaaaaa', sha: HEAD, repo: { full_name: 'example-fork/example-plugin' } } }),
+    childPr(806, { head: { ref: 'vigil/pr-790-fix-bbbbbbbbbbbb', sha: HEAD, repo: null } }),
+  ] });
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.report[0].dispatch.attempted, true);
+});
+
+for (const childPrList of ['error', 'malformed']) {
+  test(`processPr holds the dispatch when the child PR list is unreadable (${childPrList})`, (t) => {
+    const h = harness(t, { collectedState: 'OPEN', gateState: 'OPEN', childPrList });
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.report[0].dispatch.attempted, false);
+    assert.equal(h.report[0].dispatch.reason, 'child-pr-check-unavailable');
+    assert.equal(h.entry.lastDispatchGuard.reason, 'child-pr-check-unavailable');
+    assert.deepEqual(h.entry.feedbackCursor, {});
+    assert.equal(Boolean(h.entry.pendingDispatch), false);
+  });
+}

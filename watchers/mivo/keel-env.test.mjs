@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
+import { handoffPr, handoffReceipt, withAuthorHandoff, isChildPrList } from './handoff.fixture.mjs';
 import { KEEL_FLOW_VERSION, keelNamespace, prepare, repairPaths } from './bin/mivo-repair.mjs';
 import { REPO, constrainRetryDispatch, dispatchParams, feedbackItems, newFeedback, pollFingerprint, processPr, reopenKeelBlocked, rulesVersion, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
 import { pendingEvents } from './bin/notify.mjs';
@@ -168,7 +168,7 @@ function runProcessPr(t, { keelRoot, dispatched }) {
   const listed = { ...pr }; delete listed.state; delete listed.author;
   const run = processPr({ pr: listed, state, paths, now: NOW, events, report, viewer: 'ExampleUser', dryRun: false,
     dispatchFn: (...args) => { dispatched.push(args); return forbidden(); },
-    collect: () => snapshot, ghFn: forbidden, recheckFn: forbidden, ownershipSnapshot: forbidden, maintenanceSessionId: null,
+    collect: () => snapshot, ghFn: (args) => isChildPrList(args) ? '[[]]' : forbidden(), recheckFn: forbidden, ownershipSnapshot: forbidden, maintenanceSessionId: null,
     remaining: () => 120000, deadline: Date.now() + 120000, clock: Date.now, resumeCursor: 0, allowCreate: false, forceCreate: false,
     keelRoot });
   let next = run.next(); while (!next.done) next = run.next(next.value());
@@ -220,7 +220,7 @@ function pollHarness(t, { blocked }) {
   const scan = now => scanOnce({
     mode: 'poll', enabled: true, allowDispatch: true, paths, now, nodeId: POLL_NODE, prNumber: 790,
     snapshotFn: () => pollSnap(),
-    ghFn: args => args[0] === 'api' ? 'owner' : '[]',
+    ghFn: args => isChildPrList(args) ? '[[]]' : args[0] === 'api' ? 'owner' : '[]',
     collect: (...args) => withAuthorHandoff({ pr: listed, checks: [], requiredChecks: [], ci: { status: 'green', required: [] }, comments: [COMMENT],
       reviews: [], threads: [], labels: [], mergeable: 'MERGEABLE', admissionVerified: true, requiredChecksGreen: true, mergeReady: false,
       policy: { status: 'verified' } }, args[0]),
@@ -340,7 +340,7 @@ function processHarness(t, { blocked = true } = {}) {
     const report = []; const events = [];
     const gen = processPr({ pr, state, paths, now: time, events, report, viewer: 'owner', dryRun: false,
       dispatchFn: params => { sent.push(params); return { target_session_id: 's1' }; },
-      collect: () => collected, ghFn: () => '{}', recheckFn: () => {},
+      collect: () => collected, ghFn: (args) => isChildPrList(args) ? '[[]]' : '{}', recheckFn: () => {},
       ownershipSnapshot: function* () { return { pr: { ...pr, author: { login: liveAuthor } } }; },
       remaining: () => remainingMs, deadline: Date.now() + 120000, clock: Date.now, allowCreate: false, keelRoot });
     let next = gen.next(); while (!next.done) next = gen.next(next.value());
