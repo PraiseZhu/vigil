@@ -1,5 +1,7 @@
 // 本机拉取端：每 2 秒向 Worker 拉一次队列。队列要等本机确认后 Worker 才删。
 // 拉取抛错视为 Worker 不可用：不抛出循环，改走 60 秒轮询，把漏掉的事件补回来。恢复后回到 2 秒。
+// 60 秒轮询只在 Worker 连续失败 pollAfterFailures 次（缺省 3 次）之后才跑；Worker 正常时一次都不跑，
+// 免得每 60 秒白跑一次对账。传 0 就退回「每拍都跑」的旧行为。
 // onEvent 抛错不算 Worker 挂了：同批其余事件照常处理，下一拍仍按 2 秒拉。
 // 失败次数记在 Worker 上。同一条达到上限后确认移出，并在延迟记录里追加一行「放弃」。
 // 事件若只有元数据，调用方用 loadPayload 按需去取正文。这里不读令牌，也不自己发 GitHub 请求。
@@ -13,6 +15,8 @@ import path from 'node:path';
 
 export const PULL_INTERVAL_MS = 2000;
 export const POLL_INTERVAL_MS = 60 * 1000;
+/** Worker 连续失败多少次之后才跑兜底轮询。0 = 每拍都跑（旧行为）。 */
+export const DEFAULT_POLL_AFTER_FAILURES = 3;
 
 export async function pullFromWorker({ url, token, fetchImpl = fetch }) {
   const response = await fetchImpl(url, {
@@ -115,6 +119,8 @@ function errorSummary(err) {
  * payloadOmitted 的事件先交给 loadPayload，由调用方按需取回正文，再交给 onEvent。
  * 没有 loadPayload 时抛出「正文被省略」，走失败计数，不交给 onEvent。loadPayload 抛错同样算失败。
  * confirm 在处理成功（或放弃）之后调用，Worker 才清掉对应事件。
+ * 兜底轮询的门槛是 pollAfterFailures：本拍开始时连续失败次数不到这个数就跳过轮询（不调用 poll），
+ * 到点照样把下一拍的轮询时间往后推，否则循环会原地打转。拉取成功一次就把连续失败次数清零。
  */
 export async function runEventChannel({
   now = () => Date.now(),
@@ -130,9 +136,11 @@ export async function runEventChannel({
   latencyFile = path.join('.prio', 'latency.jsonl'),
   pullIntervalMs = PULL_INTERVAL_MS,
   pollIntervalMs = POLL_INTERVAL_MS,
+  pollAfterFailures = DEFAULT_POLL_AFTER_FAILURES,
 } = {}) {
   const seen = new Set();
   let workerUp = true;
+  let consecutiveFailures = 0;
   let nextPullAt = now();
   let nextPollAt = now();
 
@@ -191,14 +199,18 @@ export async function runEventChannel({
   while (running()) {
     const t = now();
     let failedThisTick = false;
+    // 本拍开始时的连续失败次数：本拍自己的失败不算在门槛里，免得「失败那一拍立刻又跑轮询」。
+    const failuresAtTickStart = consecutiveFailures;
 
     if (workerUp && t >= nextPullAt) {
       try {
         const events = await pull();
+        consecutiveFailures = 0;
         nextPullAt = t + pullIntervalMs;
         await acceptBatch(events, 'worker', { confirmEvents: true });
       } catch {
         workerUp = false;
+        consecutiveFailures += 1;
         failedThisTick = true;
       }
     }
@@ -208,21 +220,26 @@ export async function runEventChannel({
       try {
         const events = await pull();
         workerUp = true;
+        consecutiveFailures = 0;
         nextPullAt = t + pullIntervalMs;
         await acceptBatch(events, 'worker', { confirmEvents: true });
       } catch {
         workerUp = false;
+        consecutiveFailures += 1;
       }
     }
 
     if (t >= nextPollAt) {
-      try {
-        const events = await poll();
-        await acceptBatch(events, 'poll');
-      } catch {
-        // 轮询失败也不让循环退出。
-      }
+      // 不管这一拍跑不跑，都把下一次轮询时间往后推；否则循环会因为「等 0 毫秒」直接退出。
       nextPollAt = t + pollIntervalMs;
+      if (pollAfterFailures <= 0 || failuresAtTickStart >= pollAfterFailures) {
+        try {
+          const events = await poll();
+          await acceptBatch(events, 'poll');
+        } catch {
+          // 轮询失败也不让循环退出。
+        }
+      }
     }
 
     if (!running()) break;

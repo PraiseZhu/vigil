@@ -1,5 +1,6 @@
-// W4 事件通道：Worker 校验 webhook 签名并入队，本机拉取循环每 2 秒拉一次，
-// 60 秒轮询兜底；延迟写到 .prio/latency.jsonl。
+// W4 事件通道：Worker 校验 webhook 签名并入队，本机拉取循环每 2 秒拉一次；
+// 60 秒轮询只在 Worker 连续失败到门槛（缺省 3 次）之后才兜底。
+// 延迟写到 .prio/latency.jsonl。W4-c 的常驻拉取器（bin/event-run.mjs）也在这份测试里。
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -15,6 +16,25 @@ import {
   readLatencyLog,
   runEventChannel,
 } from './bin/event-pull.mjs';
+import {
+  DEFAULT_POLL_AFTER_FAILURES,
+  LOCK_RETRY_MS,
+  LOCK_WAIT_MAX_MS,
+  SINGLE_ITEM_MODULE,
+  WriteLockBusyError,
+  acquireWriteLock,
+  appendEventRunLog,
+  createEventPipeline,
+  createEventRunState,
+  eventRunPaths,
+  eventTargets,
+  loadSingleItemModule,
+  main as eventRunMain,
+  parseEventRunArgs,
+  readEventRunConfig,
+  runEventRun,
+  writeLockHeld,
+} from './bin/event-run.mjs';
 import { tmpDir } from './fake-gh.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -292,7 +312,7 @@ test('SC2 同一个 delivery id 只入队一次，拉取和轮询也只处理一
   assert.deepEqual(handled, ['dup']);
 });
 
-test('SC3 假时钟下每 2 秒拉一次，兜底轮询每 60 秒一次', async () => {
+test('SC3 假时钟下每 2 秒拉一次；Worker 正常时兜底轮询一次都不跑', async () => {
   assert.equal(PULL_INTERVAL_MS, 2000);
   assert.equal(POLL_INTERVAL_MS, 60000);
   let t = 0;
@@ -319,7 +339,8 @@ test('SC3 假时钟下每 2 秒拉一次，兜底轮询每 60 秒一次', async 
   assert.equal(pullCalls.length, 60);
   assert.deepEqual(pullCalls.slice(0, 3), [0, 2000, 4000]);
   assert.equal(pullCalls.at(-1), 118000);
-  assert.deepEqual(pollCalls, [0, 60000]);
+  // Worker 一直健康：60 秒兜底轮询一次都不跑（W4-c：以前是无条件每 60 秒跑）。
+  assert.deepEqual(pollCalls, []);
 });
 
 test('SC3 Worker 挂掉时拉取循环不抛，退回 60 秒轮询，漏掉的事件由轮询补回', async () => {
@@ -334,6 +355,8 @@ test('SC3 Worker 挂掉时拉取循环不抛，退回 60 秒轮询，漏掉的�
       t += ms;
     },
     until: 66000,
+    // 门槛降到 1 次，用最少的假时钟拍数验证「挂了才会跑兜底轮询」。
+    pollAfterFailures: 1,
     pull: async () => {
       pullCalls.push(t);
       if (t >= 4000 && t < 60000) throw new Error('worker down');
@@ -361,7 +384,8 @@ test('SC3 Worker 挂掉时拉取循环不抛，退回 60 秒轮询，漏掉的�
     [0, 2000, 4000],
   );
   assert.equal(pullCalls.includes(6000), false);
-  assert.deepEqual(pollCalls, [0, 60000]);
+  // 第 1 次失败在 t=4000，所以 t=60000 那一拍才允许跑兜底轮询（t=0 那一拍没有失败，不跑）。
+  assert.deepEqual(pollCalls, [60000]);
   assert.ok(pullCalls.includes(60000));
   assert.ok(pullCalls.includes(62000));
   assert.deepEqual(handled, ['e1', 'missed']);
@@ -1234,4 +1258,551 @@ test('#189 SC4 同一份存储重建 Worker 后失败次数接着数，第 5 次
   assert.equal(abandoned[0].deliveryId, 'retry-189');
   assert.equal(abandoned[0].failures, 5);
   assert.match(abandoned[0].error, /boom-189/);
+});
+
+// ── W4-c：常驻拉取器 bin/event-run.mjs ────────────────────────────────────────
+// 夹具里的仓库名、用户、路径全是占位符（example/owner-a 这类），不含真实数据。
+
+function eventRunFixture({ tokenMode = 0o600, urlMode = 0o600, token = TOKEN, url = 'https://example.invalid/pull' } = {}) {
+  const home = tmpDir();
+  const secrets = path.join(home, 'acceptance', 'secrets');
+  fs.mkdirSync(secrets, { recursive: true });
+  const pullTokenFile = path.join(secrets, 'event-pull-token');
+  const workerUrlFile = path.join(secrets, 'event-worker-url');
+  fs.writeFileSync(pullTokenFile, `${token}\n`, { mode: 0o600 });
+  fs.chmodSync(pullTokenFile, tokenMode);
+  fs.writeFileSync(workerUrlFile, `${url}\n`, { mode: 0o600 });
+  fs.chmodSync(workerUrlFile, urlMode);
+  const env = {
+    ACCEPTANCE_WATCHER_HOME: path.join(home, 'acceptance', 'home'),
+    EVENT_RUN_STATE_DIR: path.join(home, 'acceptance', 'tools', '.prio'),
+  };
+  const paths = eventRunPaths({ env, homeDir: home });
+  fs.mkdirSync(paths.stateDir, { recursive: true });
+  // 授权清单默认给两个占位仓；要试白名单的用例自己覆盖这份文件。
+  fs.writeFileSync(paths.authorizedReposFile, JSON.stringify({ repos: ['example/owner-a', 'example/owner-b'] }));
+  return { home, secrets, env, paths, pullTokenFile, workerUrlFile };
+}
+
+function configOf(fixture) {
+  return { workerUrl: 'https://example.invalid/pull', pullToken: TOKEN, paths: fixture.paths };
+}
+
+/** 假 Worker：/pull 按批次吐事件，/ack 和 /fail 只记账。 */
+function fakePullWorker({ batches = [] } = {}) {
+  const calls = { pull: 0, ack: [], fail: [] };
+  const queue = [...batches];
+  const fetchImpl = async (url, init = {}) => {
+    const { pathname } = new URL(url);
+    if (pathname === '/pull') {
+      calls.pull += 1;
+      const events = queue.length ? queue.shift() : [];
+      return new Response(JSON.stringify({ events }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (pathname === '/ack') {
+      calls.ack.push(JSON.parse(init.body || '{}').ids);
+      return new Response('', { status: 204 });
+    }
+    if (pathname === '/fail') {
+      calls.fail.push(JSON.parse(init.body || '{}'));
+      return new Response(JSON.stringify({ failures: 1, abandoned: false }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response('no', { status: 404 });
+  };
+  return { fetchImpl, calls };
+}
+
+function issueEvent(deliveryId, { repo = 'example/owner-a', issue = 7, createdAt = '2026-11-01T00:00:00.000Z' } = {}) {
+  return {
+    deliveryId,
+    event: 'issues',
+    created_at: createdAt,
+    payload: { action: 'opened', repository: { full_name: repo }, issue: { number: issue } },
+  };
+}
+
+function prEvent(deliveryId, {
+  repo = 'example/owner-a',
+  number = 3,
+  body = '任务 issue：example/owner-a#7',
+  branch = 'feature/x',
+  createdAt = '2026-11-01T00:00:00.000Z',
+} = {}) {
+  return {
+    deliveryId,
+    event: 'pull_request',
+    created_at: createdAt,
+    payload: {
+      action: 'opened',
+      repository: { full_name: repo },
+      pull_request: { number, body, state: 'open', merged: false, head: { ref: branch } },
+    },
+  };
+}
+
+/** 跑一拍（假时钟：until=1，第一拍处理完就退）。返回日志行。 */
+async function runOneTick({ config, ...deps }) {
+  const logs = [];
+  let t = 0;
+  await runEventRun({
+    config,
+    until: 1,
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    logger: (line) => logs.push(line),
+    ...deps,
+  });
+  return logs;
+}
+
+test('W4c SC1 拉取令牌文件权限不是 600 就拒绝启动：日志写人话，且不回显令牌内容', async () => {
+  const fixture = eventRunFixture({ tokenMode: 0o644 });
+  const stderr = { text: '', write(chunk) { this.text += chunk; } };
+  const result = await eventRunMain(['--once'], {
+    env: fixture.env,
+    homeDir: fixture.home,
+    paths: fixture.paths,
+    stderr,
+    capture: true,
+    now: () => 0,
+  });
+  assert.equal(result.exitCode, 1);
+  assert.match(String(result.error?.message || ''), /权限必须是 600/);
+  const logged = fs.readFileSync(fixture.paths.logFile, 'utf8');
+  assert.match(logged, /启动失败/);
+  assert.match(logged, /600/);
+  assert.doesNotMatch(logged, new RegExp(TOKEN), '令牌内容不许进日志');
+  assert.doesNotMatch(stderr.text, new RegExp(TOKEN), '令牌内容不许打到 stderr');
+  assert.doesNotMatch(stderr.text, /event-pull-token[\s\S]*pull-token-test/);
+});
+
+test('W4c SC1 Worker 地址文件权限不是 600 也拒绝；两个文件都 600 时读得出配置，缺省路径在 ~/acceptance/secrets 下', () => {
+  const fixture = eventRunFixture({ urlMode: 0o640 });
+  assert.throws(
+    () => readEventRunConfig({ env: fixture.env, homeDir: fixture.home, paths: fixture.paths }),
+    /Worker 地址[\s\S]*600/,
+  );
+  fs.chmodSync(fixture.workerUrlFile, 0o600);
+  const config = readEventRunConfig({ env: fixture.env, homeDir: fixture.home, paths: fixture.paths });
+  assert.equal(config.workerUrl, 'https://example.invalid/pull');
+  assert.equal(config.pullToken, TOKEN);
+  assert.equal(config.paths.secretsDir, path.join(fixture.home, 'acceptance', 'secrets'));
+  assert.equal(config.paths.logFile, path.join(fixture.home, 'acceptance', 'home', 'state', 'host', 'event-run.log'));
+  assert.equal(config.paths.latencyFile, path.join(fixture.paths.stateDir, 'latency.jsonl'));
+  assert.equal(config.paths.disabledFile, path.join(fixture.paths.stateDir, 'event-run.disabled'));
+  assert.equal(config.paths.markerFile, path.join(fixture.paths.stateDir, 'mac-mini-stopped'));
+  // 认不出来的地址直接拒绝，不当成可用配置。
+  fs.writeFileSync(fixture.workerUrlFile, 'not-a-url\n', { mode: 0o600 });
+  fs.chmodSync(fixture.workerUrlFile, 0o600);
+  assert.throws(
+    () => readEventRunConfig({ env: fixture.env, homeDir: fixture.home, paths: fixture.paths }),
+    /不是合法 URL/,
+  );
+});
+
+test('W4c SC2 事件到 issue 的映射：issues / issue_comment 直接定位，PR 事件按任务 issue 行与分支反查', () => {
+  const refs = (event) => eventTargets(event).map((target) => target.ref);
+  assert.deepEqual(refs(issueEvent('d1', { issue: 7 })), ['example/owner-a#7']);
+  assert.deepEqual(
+    refs({
+      deliveryId: 'd2',
+      event: 'issue_comment',
+      payload: { repository: { full_name: 'example/owner-a' }, issue: { number: 8 }, comment: { body: '跟进一下' } },
+    }),
+    ['example/owner-a#8'],
+  );
+  // 评论挂在 PR 上：payload.issue.number 是 PR 号，要按正文的任务 issue 行反查，不能把 PR 号当 issue 号写。
+  assert.deepEqual(
+    refs({
+      deliveryId: 'd3',
+      event: 'issue_comment',
+      payload: {
+        repository: { full_name: 'example/owner-a' },
+        issue: { number: 55, pull_request: { url: 'https://example.invalid/pull/55' }, body: '任务 issue：example/owner-a#9' },
+      },
+    }),
+    ['example/owner-a#9'],
+  );
+  // PR 事件：正文的任务 issue 行 + 分支 acceptance/<号>-<号>-sc<k>，按 repo、号排序，同一条只算一次。
+  assert.deepEqual(
+    refs(prEvent('d4', { number: 3, body: '任务 issue：example/owner-a#7', branch: 'acceptance/12-13-sc1' })),
+    ['example/owner-a#7', 'example/owner-a#12', 'example/owner-a#13'],
+  );
+  assert.deepEqual(
+    refs(prEvent('d5', { number: 4, body: '', branch: 'acceptance/12-13-sc1' })),
+    ['example/owner-a#12', 'example/owner-a#13'],
+  );
+  // 定位不到、类型不在订阅里、没有仓库，都返回空数组（调用方只确认不写）。
+  assert.deepEqual(refs(prEvent('d6', { number: 5, body: '', branch: 'feature/x' })), []);
+  assert.deepEqual(
+    refs({ deliveryId: 'd7', event: 'workflow_run', payload: { repository: { full_name: 'example/owner-a' } } }),
+    [],
+  );
+  assert.deepEqual(refs({ deliveryId: 'd8', event: 'issues', payload: { issue: { number: 1 } } }), []);
+});
+
+test('W4c SC2 事件白名单：非授权仓、非四类事件都不进写路径，只确认', async () => {
+  const fixture = eventRunFixture();
+  fs.writeFileSync(fixture.paths.authorizedReposFile, JSON.stringify({ repos: ['example/owner-a'] }));
+  const written = [];
+  const worker = fakePullWorker({
+    batches: [[
+      issueEvent('allow', { repo: 'example/owner-a', issue: 7 }),
+      issueEvent('other-repo', { repo: 'example/owner-b', issue: 7 }),
+      {
+        deliveryId: 'wrong-type',
+        event: 'workflow_run',
+        created_at: '2026-11-01T00:00:00.000Z',
+        payload: { repository: { full_name: 'example/owner-a' }, workflow_run: { id: 1 } },
+      },
+    ]],
+  });
+  const logs = await runOneTick({
+    config: { ...configOf(fixture), write: true },
+    fetchImpl: worker.fetchImpl,
+    syncOne: async (target) => written.push(target.ref),
+    lock: async () => {},
+  });
+  assert.deepEqual(written, ['example/owner-a#7']);
+  assert.deepEqual(worker.calls.ack, [['allow', 'other-repo', 'wrong-type']]);
+  assert.ok(logs.some((line) => /不在授权清单/.test(line)));
+  assert.ok(logs.some((line) => /workflow_run/.test(line)));
+  const rows = readLatencyLog(fixture.paths.latencyFile);
+  // 跳过的三条也算「处理完」（都已确认）：延迟行按现有口径照样记，但只有 allow 这一条真的写了看板。
+  assert.deepEqual(rows.map((row) => row.deliveryId), ['allow', 'other-repo', 'wrong-type']);
+  assert.ok(rows.every((row) => row.source === 'worker'));
+});
+
+test('W4c SC3 乱序：同一目标的旧事件晚到不覆盖新状态', async () => {
+  const fixture = eventRunFixture();
+  const written = [];
+  const worker = fakePullWorker({
+    batches: [[
+      issueEvent('newer', { issue: 7, createdAt: '2026-11-01T00:00:09.000Z' }),
+      issueEvent('older', { issue: 7, createdAt: '2026-11-01T00:00:01.000Z' }),
+    ]],
+  });
+  const logs = await runOneTick({
+    config: { ...configOf(fixture), write: true },
+    fetchImpl: worker.fetchImpl,
+    syncOne: async (target) => written.push(target.ref),
+    lock: async () => {},
+  });
+  assert.deepEqual(written, ['example/owner-a#7'], '旧事件不触发第二次写');
+  assert.ok(logs.some((line) => /乱序/.test(line)));
+  assert.deepEqual(worker.calls.ack, [['newer', 'older']], '旧事件也确认掉，不堵队列');
+});
+
+test('W4c SC3 重放：同一 deliveryId 只处理一次', async () => {
+  const fixture = eventRunFixture();
+  const written = [];
+  const worker = fakePullWorker({ batches: [[issueEvent('dup', { issue: 7 }), issueEvent('dup', { issue: 7 })]] });
+  const logs = await runOneTick({
+    config: { ...configOf(fixture), write: true },
+    fetchImpl: worker.fetchImpl,
+    syncOne: async (target) => written.push(target.ref),
+    lock: async () => {},
+  });
+  assert.deepEqual(written, ['example/owner-a#7']);
+  assert.ok(logs.every((line) => !/乱序/.test(line)));
+  assert.equal(worker.calls.ack.length, 1);
+  assert.ok(worker.calls.ack[0].every((id) => id === 'dup'));
+});
+
+test('W4c SC4 抢不到写锁：每 2 秒重试、最多 10 秒，仍抢不到就抛错，事件不确认也不写', async () => {
+  let t = 0;
+  const sleeps = [];
+  await assert.rejects(
+    acquireWriteLock({
+      probe: () => ({ held: true, known: true }),
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        t += ms;
+      },
+      now: () => t,
+    }),
+    /写锁一直被占用/,
+  );
+  assert.deepEqual(sleeps, Array(LOCK_WAIT_MAX_MS / LOCK_RETRY_MS).fill(LOCK_RETRY_MS));
+  assert.equal(LOCK_RETRY_MS * sleeps.length, LOCK_WAIT_MAX_MS);
+
+  const fixture = eventRunFixture();
+  const worker = fakePullWorker({ batches: [[issueEvent('locked', { issue: 7 })]] });
+  const written = [];
+  await runOneTick({
+    config: { ...configOf(fixture), write: true },
+    fetchImpl: worker.fetchImpl,
+    syncOne: async (target) => written.push(target.ref),
+    lock: async () => {
+      throw new WriteLockBusyError('写锁一直被占用：测试');
+    },
+  });
+  assert.deepEqual(written, []);
+  assert.deepEqual(worker.calls.ack, [], '抢不到锁那一拍不确认');
+  assert.equal(worker.calls.fail.length, 1, '上报一次失败，事件留在 Worker 队列里');
+  assert.match(worker.calls.fail[0].error, /写锁/);
+});
+
+test('W4c SC4 写锁探测按 /proc/locks 判定：锁文件残留不算被占用', () => {
+  const fixture = eventRunFixture();
+  const lockFile = path.join(fixture.home, 'prio-write.lock');
+  fs.writeFileSync(lockFile, '');
+  const stat = fs.statSync(lockFile);
+  const fakeProc = path.join(fixture.home, 'locks.txt');
+  fs.writeFileSync(fakeProc, '7: FLOCK ADVISORY WRITE 4242 08:01:1 0 EOF\n');
+  assert.equal(writeLockHeld({ file: lockFile, procLocksFile: fakeProc }).held, false);
+  const dev = BigInt(stat.dev);
+  const major = ((dev >> 8n) & 0xfffn).toString(16).padStart(2, '0');
+  const minor = ((dev & 0xffn) | ((dev >> 12n) & ~0xffn)).toString(16).padStart(2, '0');
+  fs.writeFileSync(fakeProc, `7: FLOCK ADVISORY WRITE 4242 ${major}:${minor}:${stat.ino} 0 EOF\n`);
+  assert.equal(writeLockHeld({ file: lockFile, procLocksFile: fakeProc }).held, true);
+  assert.equal(writeLockHeld({ file: path.join(fixture.home, 'missing.lock'), procLocksFile: fakeProc }).held, false);
+  // 只有 /proc/locks 读不到、但 /proc 还在：靠 fd 扫描仍然能给出结论。
+  assert.deepEqual(writeLockHeld({ file: lockFile, procLocksFile: path.join(fixture.home, 'nope.txt') }), {
+    held: false,
+    known: true,
+    reason: 'free',
+  });
+  // 两条路都读不到（非 Linux）：明确说「探测不了」。
+  assert.deepEqual(
+    writeLockHeld({
+      file: lockFile,
+      procLocksFile: path.join(fixture.home, 'nope.txt'),
+      procDir: path.join(fixture.home, 'no-proc'),
+    }),
+    { held: false, known: false, reason: 'no-proc' },
+  );
+});
+
+test('W4c SC4 fd 形式的 flock 不进 /proc/locks 时，靠「有人开着锁文件」判定为忙', { skip: !fs.existsSync('/proc/self/fd') }, () => {
+  const fixture = eventRunFixture();
+  const lockFile = path.join(fixture.home, 'prio-write.lock');
+  fs.writeFileSync(lockFile, '');
+  const emptyProc = path.join(fixture.home, 'locks-empty.txt');
+  fs.writeFileSync(emptyProc, '');
+  // 本机实测：run-field.sh 那种 `exec 8>锁文件; flock -n 8` 不出现在 /proc/locks，
+  // 只有持锁进程开着那个 fd。所以「有进程开着这个文件」也要算忙（宁可少写一次）。
+  assert.equal(writeLockHeld({ file: lockFile, procLocksFile: emptyProc }).held, false);
+  const fd = fs.openSync(lockFile, 'r');
+  try {
+    const seen = writeLockHeld({ file: lockFile, procLocksFile: emptyProc });
+    assert.equal(seen.held, true, JSON.stringify(seen));
+    assert.equal(seen.reason, 'open-fd');
+  } finally {
+    fs.closeSync(fd);
+  }
+  assert.equal(writeLockHeld({ file: lockFile, procLocksFile: emptyProc }).held, false);
+});
+
+test('W4c SC4 写的时候如实传 linkAllowed：没有 mac-mini-stopped 是 false，有是 true', async () => {
+  const fixture = eventRunFixture();
+  const seen = [];
+  const first = fakePullWorker({ batches: [[issueEvent('a', { issue: 7 })]] });
+  await runOneTick({
+    config: { ...configOf(fixture), write: true },
+    fetchImpl: first.fetchImpl,
+    syncOne: async (target) => seen.push(target.linkAllowed),
+    lock: async () => {},
+  });
+  fs.writeFileSync(fixture.paths.markerFile, '');
+  const second = fakePullWorker({ batches: [[issueEvent('b', { issue: 8 })]] });
+  await runOneTick({
+    config: { ...configOf(fixture), write: true },
+    fetchImpl: second.fetchImpl,
+    syncOne: async (target) => seen.push(target.linkAllowed),
+    lock: async () => {},
+  });
+  assert.deepEqual(seen, [false, true]);
+});
+
+test('W4c SC5 event-run.disabled 存在就空转：一条事件都不拉，日志写人话', async () => {
+  const fixture = eventRunFixture();
+  fs.writeFileSync(fixture.paths.disabledFile, '');
+  const worker = fakePullWorker({ batches: [[issueEvent('ignored', { issue: 7 })]] });
+  const logs = await runOneTick({
+    config: { ...configOf(fixture), write: true },
+    fetchImpl: worker.fetchImpl,
+    syncOne: async () => {
+      throw new Error('停用期间不该写');
+    },
+    lock: async () => {},
+  });
+  assert.equal(worker.calls.pull, 0, '停用时不拉事件');
+  assert.deepEqual(worker.calls.ack, []);
+  assert.ok(logs.some((line) => /事件拉取已停用/.test(line)));
+});
+
+test('W4c SC5 .prio/disabled 存在时只确认不写', async () => {
+  const fixture = eventRunFixture();
+  fs.writeFileSync(fixture.paths.prioDisabledFile, '');
+  const worker = fakePullWorker({ batches: [[issueEvent('d1', { issue: 7 })]] });
+  let writes = 0;
+  const logs = await runOneTick({
+    config: { ...configOf(fixture), write: true },
+    fetchImpl: worker.fetchImpl,
+    syncOne: async () => {
+      writes += 1;
+    },
+    lock: async () => {},
+  });
+  assert.equal(writes, 0);
+  assert.deepEqual(worker.calls.ack, [['d1']]);
+  assert.ok(logs.some((line) => /disabled/.test(line)));
+});
+
+test('W4c SC6 兜底轮询只在 Worker 连续失败到门槛后才跑（缺省 3 次），正常时一次都不跑', async () => {
+  assert.equal(DEFAULT_POLL_AFTER_FAILURES, 3);
+  const runFake = async ({ fail = false, pollAfterFailures = undefined, until }) => {
+    let t = 0;
+    const pollCalls = [];
+    await runEventChannel({
+      now: () => t,
+      sleep: async (ms) => {
+        t += ms;
+      },
+      until,
+      ...(pollAfterFailures === undefined ? {} : { pollAfterFailures }),
+      pull: async () => {
+        if (fail) throw new Error('worker down');
+        return [];
+      },
+      poll: async () => {
+        pollCalls.push(t);
+        return [];
+      },
+      latencyFile: path.join(tmpDir(), '.prio', 'latency.jsonl'),
+    });
+    return pollCalls;
+  };
+  assert.deepEqual(await runFake({ until: 200000 }), [], 'Worker 正常：兜底轮询一次都不跑');
+  // 失败只发生在 60 秒节点上：t=4000 第 1 次、t=60000 第 2 次、t=120000 第 3 次，t=180000 那一拍才允许轮询。
+  assert.deepEqual(await runFake({ fail: true, until: 190000 }), [180000]);
+  assert.deepEqual(await runFake({ fail: true, until: 70000, pollAfterFailures: 1 }), [60000]);
+  assert.deepEqual(await runFake({ until: 130000, pollAfterFailures: 0 }), [0, 60000, 120000], '0 = 退回每拍都跑的旧行为');
+});
+
+test('W4c SC6 兜底轮询只补写事件路径没写成功的那一条，不整盘读', async () => {
+  const fixture = eventRunFixture();
+  const written = [];
+  let failOnce = true;
+  const pipeline = createEventPipeline({
+    state: createEventRunState({ allowedRepos: ['example/owner-a'] }),
+    paths: fixture.paths,
+    write: true,
+    syncOne: async (target) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('连不上看板');
+      }
+      written.push(target.ref);
+    },
+    lock: async () => {},
+    logger: () => {},
+  });
+  await assert.rejects(() => pipeline.onEvent(issueEvent('p1', { issue: 7 })), /连不上看板/);
+  assert.deepEqual(written, []);
+  assert.deepEqual(await pipeline.poll(), []);
+  assert.deepEqual(written, ['example/owner-a#7'], '兜底轮询把没写成功的那条补上');
+  assert.deepEqual(await pipeline.poll(), []);
+  assert.deepEqual(written, ['example/owner-a#7'], '补完之后没有待补目标');
+});
+
+test('W4c SC7 日志超过上限截断保留尾部，权限仍是 600', () => {
+  const fixture = eventRunFixture();
+  const file = path.join(fixture.home, 'state', 'host', 'event-run.log');
+  for (let i = 0; i < 200; i += 1) {
+    appendEventRunLog(file, `第 ${i} 行 ${'x'.repeat(40)}`, { maxBytes: 2000 });
+  }
+  const stat = fs.statSync(file);
+  const text = fs.readFileSync(file, 'utf8');
+  assert.ok(stat.size <= 2000, `截断后大小 ${stat.size}`);
+  assert.equal(stat.mode & 0o777, 0o600);
+  assert.match(text, /已截断较早内容/);
+  assert.match(text, /第 199 行/);
+  assert.doesNotMatch(text, /第 0 行/);
+});
+
+test('W4c SC7 单条读写模块未部署：不确认事件、日志写人话', async () => {
+  assert.equal(SINGLE_ITEM_MODULE, './bin/prio-item.mjs');
+  assert.equal(await loadSingleItemModule(), null, '本仓还没有单条读写模块，缺省加载应返回 null 而不是抛错');
+  const fixture = eventRunFixture();
+  const worker = fakePullWorker({ batches: [[issueEvent('m1', { issue: 7 })]] });
+  const logs = await runOneTick({
+    config: { ...configOf(fixture), write: true },
+    fetchImpl: worker.fetchImpl,
+    loadModule: async () => null,
+    lock: async () => {},
+  });
+  assert.deepEqual(worker.calls.ack, [], '模块不在：这条事件不确认');
+  assert.equal(worker.calls.fail.length, 1);
+  assert.ok(logs.some((line) => /单条读写模块未部署/.test(line)));
+});
+
+test('W4c SC8 默认 dry-run 不写；--write 与 --dry-run 不能同时给', async () => {
+  assert.equal(parseEventRunArgs([]).write, false);
+  assert.throws(() => parseEventRunArgs(['--write', '--dry-run']), /不能同时/);
+  assert.throws(() => parseEventRunArgs(['--poll-after-failures', 'abc']), /0 到 1000 的整数/);
+  assert.throws(() => parseEventRunArgs(['--what']), /无法识别的参数/);
+  const fixture = eventRunFixture();
+  const worker = fakePullWorker({ batches: [[issueEvent('d1', { issue: 7 })]] });
+  let writes = 0;
+  const logs = await runOneTick({
+    config: configOf(fixture),
+    fetchImpl: worker.fetchImpl,
+    syncOne: async () => {
+      writes += 1;
+    },
+    lock: async () => {},
+  });
+  assert.equal(writes, 0, '默认 dry-run 一次都不写');
+  assert.deepEqual(worker.calls.ack, [['d1']]);
+  assert.ok(logs.some((line) => /dry-run/.test(line)));
+});
+
+test('W4c SC9 拉起脚本草稿：flock -n + pgrep -fx + setsid nohup，不装 crontab、不写死本机路径', () => {
+  const src = fs.readFileSync(path.join(HERE, 'bin', 'event-run-ensure.sh'), 'utf8');
+  assert.match(src, /flock -n 9/);
+  assert.match(src, /pgrep -fx/);
+  assert.match(src, /setsid nohup/);
+  assert.doesNotMatch(src, /^\s*[^#\n]*crontab/m, '草稿不装 crontab，只在注释里提到它');
+  assert.doesNotMatch(src, /\/home\/[A-Za-z0-9._-]+/, '不写死本机绝对路径');
+  assert.doesNotMatch(src, /\/Users\/[A-Za-z0-9._-]+/);
+  assert.match(src, /\$\{HOME/);
+});
+
+test('W4c SC8 --once 走 CLI 入口跑一拍：读 600 配置、处理一条事件、写完日志退出', async () => {
+  const fixture = eventRunFixture();
+  const worker = fakePullWorker({ batches: [[issueEvent('cli-1', { issue: 7 })]] });
+  const written = [];
+  const result = await eventRunMain(['--once', '--write'], {
+    env: fixture.env,
+    homeDir: fixture.home,
+    paths: fixture.paths,
+    fetchImpl: worker.fetchImpl,
+    syncOne: async (target) => written.push(target.ref),
+    lock: async () => {},
+    capture: true,
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(written, ['example/owner-a#7']);
+  assert.deepEqual(worker.calls.ack, [['cli-1']]);
+  const logged = fs.readFileSync(fixture.paths.logFile, 'utf8');
+  assert.match(logged, /事件拉取器启动/);
+  assert.match(logged, /--write 真写/);
+  assert.match(logged, /事件拉取器已退出/);
+  assert.doesNotMatch(logged, new RegExp(TOKEN));
+});
+
+test('W4c SC8 事件路径不整盘读看板：event-run 只借用授权清单解析，不碰整板查询', () => {
+  const src = fs.readFileSync(path.join(HERE, 'bin', 'event-run.mjs'), 'utf8');
+  assert.match(src, /readAuthorizedRepos/);
+  assert.doesNotMatch(src, /loadBoardItems|loadPullRequests|runPrioSync|BOARD_ITEMS_QUERY|PR_SEARCH_QUERY/);
 });
