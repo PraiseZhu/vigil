@@ -92,6 +92,28 @@ test('SC4 类型可得时 bot 项必须是 Bot；类型拿不到的老数据只�
   assert.equal(isTrustedAuthor(authorOf(`${BOT}x`, 'Bot'), BOT_PROFILE), false);
 });
 
+test('SC10 GraphQL 的 Bot.login 不带 [bot] 后缀：类型是 Bot 时补后缀再比，User 一律不补', () => {
+  const bare = 'example-automation';
+  // 写 App 发出来的评论在 GraphQL 里就是 { login: 'app', __typename: 'Bot' }：认。
+  assert.equal(isTrustedAuthor(authorOf(bare, 'Bot'), BOT_PROFILE), true);
+  assert.equal(isTrustedAuthor(authorOf(bare.toUpperCase(), 'Bot'), BOT_PROFILE), true);
+  // 恰好叫这个名字的人（User）不补后缀，不能冒充 App。
+  assert.equal(isTrustedAuthor(authorOf(bare, 'User'), BOT_PROFILE), false);
+  // 没有类型信息时不猜：不带后缀的登录名不等于名单项（行为与改动前一致）。
+  assert.equal(isTrustedAuthor(bare, BOT_PROFILE), false);
+  assert.equal(isTrustedAuthor(authorOf(bare), BOT_PROFILE), false);
+  // 名单里没有这个 App / 名单为空：Type 是 Bot 也不放行。
+  assert.equal(isTrustedAuthor(authorOf(bare, 'Bot'), profileWith([])), false);
+  assert.equal(isTrustedAuthor(authorOf(bare, 'Bot'), profileWith([OTHER_BOT])), false);
+  // 本人是账号：Bot 身份叫成 ownerLogin 也不算本人。
+  assert.equal(isTrustedAuthor(authorOf(OWNER, 'Bot'), BOT_PROFILE), false);
+  // 轮次解析这一层同样认得出来：App bot 发的认领评论算本轮。
+  const claim = roundComment({ round: 1, status: '验收中', author: bare, databaseId: 9101 });
+  claim.author = { login: bare, __typename: 'Bot' };
+  const rounds = parseRounds([claim], loadHome({ trustedBotLogins: [BOT] }).profile);
+  assert.deepEqual(rounds.map((entry) => `${entry.round}:${entry.commentId}`), ['1:9101']);
+});
+
 test('SC5 手工拼的名单：不带 [bot] 的条目不生效，isBotLogin 只认 <名字>[bot]', () => {
   const handmade = { ownerLogin: OWNER, trustedBotLogins: ['StrangerUser', 'Stranger[bot]x', BOT] };
   assert.equal(isTrustedAuthor('StrangerUser', handmade), false);
