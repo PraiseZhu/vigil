@@ -3948,3 +3948,94 @@ test('W4-e SC1 /ack、/fail 超限 413 且不动队列；令牌不对时仍是 4
   );
   assert.equal(noToken.status, 401);
 });
+
+/**
+ * 假时钟 + 空转闸：now() 只读 t，sleep 只把 t 往前拨（不真的等）。
+ * now() 被调太多次说明循环在原地打转：直接抛错让用例失败，而不是把套件挂住。
+ */
+function loopFixClock({ nowLimit = 400 } = {}) {
+  let t = 0;
+  let nowCalls = 0;
+  return {
+    now: () => {
+      nowCalls += 1;
+      if (nowCalls > nowLimit) throw new Error(`now() 被调了 ${nowCalls} 次：循环没有按预期退出`);
+      return t;
+    },
+    sleep: async (ms) => {
+      assert.ok(ms > 0, `sleep 收到非正的等待：${ms}`);
+      t += ms;
+    },
+    advance: (ms) => {
+      t += ms;
+    },
+    at: () => t,
+  };
+}
+
+test('W4d 单拍耗时超过 2 秒（pull 花掉 2.5 秒）时拉取循环不退出，继续下一拍直到 until 到期', async () => {
+  const clock = loopFixClock();
+  const pullCalls = [];
+  const started = Date.now();
+  await runEventChannel({
+    now: clock.now,
+    sleep: clock.sleep,
+    until: 20000,
+    pull: async () => {
+      pullCalls.push(clock.at());
+      // 第 2 拍慢：本拍开始于 2000，pull 花了 2500 毫秒，回来已经 4500 —— nextPullAt（4000）已经过点。
+      if (pullCalls.length === 2) clock.advance(2500);
+      return [];
+    },
+    poll: async () => [],
+    latencyFile: path.join(tmpDir(), '.prio', 'latency.jsonl'),
+  });
+  assert.ok(Date.now() - started < 2000, '假时钟不应真的等 20 秒');
+  // 老代码在慢拍之后算出 wait = 4000 - 4500 < 0 就 break，这里只会是 [0, 2000]。
+  // 修好后：慢拍那一拍不退出，下一拍立刻在 4500 拉一次，之后回到 2 秒一拍，直到 nextPullAt 越过 until。
+  assert.deepEqual(pullCalls, [0, 2000, 4500, 6500, 8500, 10500, 12500, 14500, 16500, 18500]);
+});
+
+test('W4d 慢拍之后 signal abort 与 until 到期仍然正常退出，不会空转成死循环', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+
+  // signal abort：第 2 拍慢，第 3 拍 abort，循环当拍退出。
+  const controller = new AbortController();
+  const aborted = loopFixClock();
+  const pulledBeforeAbort = [];
+  await runEventChannel({
+    now: aborted.now,
+    sleep: aborted.sleep,
+    signal: controller.signal,
+    pull: async () => {
+      pulledBeforeAbort.push(aborted.at());
+      if (pulledBeforeAbort.length === 2) aborted.advance(2500);
+      if (pulledBeforeAbort.length === 3) controller.abort();
+      return [];
+    },
+    poll: async () => [],
+    latencyFile,
+  });
+  // 老代码在慢拍之后就 break，abort 这一拍根本跑不到。
+  assert.deepEqual(pulledBeforeAbort, [0, 2000, 4500]);
+  assert.equal(aborted.at(), 4500, 'abort 之后不该再往下等');
+
+  // until 到期：同样的慢拍，退出时刻仍由 nextAt >= until 决定。
+  const untilClock = loopFixClock();
+  const pulledBeforeUntil = [];
+  await runEventChannel({
+    now: untilClock.now,
+    sleep: untilClock.sleep,
+    until: 6000,
+    pull: async () => {
+      pulledBeforeUntil.push(untilClock.at());
+      if (pulledBeforeUntil.length === 2) untilClock.advance(2500);
+      return [];
+    },
+    poll: async () => [],
+    latencyFile,
+  });
+  // 慢拍之后一拍在 4500 拉一次，nextPullAt = 6500 >= until 6000，当拍退出；没有多余的空转等待。
+  assert.deepEqual(pulledBeforeUntil, [0, 2000, 4500]);
+  assert.equal(untilClock.at(), 4500, 'until 到期后不该再等');
+});
