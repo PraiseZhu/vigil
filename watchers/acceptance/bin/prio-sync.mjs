@@ -353,7 +353,8 @@ function remindedFile(dir) {
   return stateFiles(dir).reminded;
 }
 
-function macMiniStopped(dir) {
+/** 关联 PR 的停写标记在不在。也导出给单条路径：事件里带的 linkAllowed 要和这个标记对得上。 */
+export function macMiniStopped(dir) {
   // 只由人在确认 Mac mini 停写之后创建。这里只看它在不在，不创建。
   return fs.existsSync(stateFiles(dir).marker);
 }

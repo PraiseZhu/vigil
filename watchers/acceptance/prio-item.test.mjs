@@ -1,5 +1,6 @@
 // W4-d：单条精确读写。只读这一条 issue 的看板条目和它点名的 PR，写入仍走现有写闸与 changes.jsonl。
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -13,9 +14,13 @@ import {
   parseItemArgs,
   prNumbersInText,
   prsFromTimeline,
+  singleItemVerdict,
+  syncEventItem,
   syncOneItem,
 } from './bin/prio-item.mjs';
-import { OWNER, REPO, createFakeRun, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
+import { WRITE_LOCK_FILE, writeLockHeld } from './bin/prio-lock.mjs';
+import { writeRateState } from './bin/rate-budget.mjs';
+import { FLOCK_SKIP, OWNER, REPO, createFakeRun, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 
 const T0 = Date.parse('2026-10-31T12:00:00.000Z');
 const PROJECT = 7;
@@ -163,6 +168,11 @@ function setup(extra = {}) {
   const { profile } = writeProfile(home, extra);
   const dir = path.join(home, 'tools', '.prio');
   fs.mkdirSync(dir, { recursive: true });
+  // 授权清单与真部署一致：单条路径只写这个文件里的仓。测试默认只授权 REPO。
+  fs.writeFileSync(
+    path.join(dir, 'authorized-repos.json'),
+    `${JSON.stringify({ repos: extra.authorizedRepos || [REPO] })}\n`,
+  );
   return { home, profile, dir };
 }
 
@@ -207,6 +217,8 @@ async function sync(env, overrides = {}) {
     reader: env.reader,
     write: gate.write,
     stdout: io.stdout,
+    // 写锁路径可注入：不和部署抢 /tmp/prio-write.lock。
+    lockPath: path.join(env.dir, 'prio-write.lock'),
     ...overrides,
   });
   return { result, gate, io };
@@ -546,6 +558,8 @@ test('W4-d --write 才写；有停写开关时不写、也不读令牌', async (
     now: () => T0,
     stdout: io.stdout,
     write: gate.write,
+    // 真写默认抢 /tmp/prio-write.lock；测试注入临时路径，不和部署抢同一把。
+    lockPath: path.join(env.dir, 'prio-write.lock'),
     readToken: () => {
       throw new Error('注入了写函数就不该读令牌');
     },
@@ -563,6 +577,7 @@ test('W4-d --write 才写；有停写开关时不写、也不读令牌', async (
     now: () => T0,
     stdout: second.stdout,
     write: secondGate.write,
+    lockPath: path.join(env.dir, 'prio-write.lock'),
     readToken: () => {
       throw new Error('停写时不该读令牌');
     },
@@ -609,4 +624,213 @@ test('W4-d 两个参数解析都只认白名单字段与合法仓名', () => {
     stateDir: 'state-x',
     onlyField: '关联 PR',
   });
+});
+
+// ── #319 复审：写策略（P2-1 / P2-2）、写锁（P2-4）、事件适配层 ──
+
+test('P2-1 授权清单以外的仓一条都不写，原因写清', async () => {
+  const env = setup({ authorizedRepos: ['example-owner/other-repo'] });
+  const fake = fakeGithub();
+  env.reader = readerFor(fake, env.profile);
+  const { result, gate } = await sync(env, { apply: true });
+  assert.equal(gate.writes.length, 0);
+  assert.equal(result.written, 0);
+  assert.deepEqual(result.skippedByPolicy.map((row) => row.reason), ['repo-not-authorized']);
+  assert.equal(fs.existsSync(path.join(env.dir, 'changes.jsonl')), false);
+});
+
+test('P2-1 / P2-2 写策略：只放行 fill 与 upgrade，降级/改空/空→P0 留给整盘', () => {
+  const allowSet = new Set([REPO.toLowerCase()]);
+  const row = { item: REF, repo: REPO, issue: ITEM, field: '优先级' };
+  const verdict = (change, extra = {}) => singleItemVerdict({ ...row, ...change }, { allowSet, ...extra });
+
+  assert.deepEqual(verdict({ old: null, new: 'P2' }), { decision: 'write', kind: 'fill', reason: '' });
+  assert.equal(verdict({ old: 'P2', new: 'P1' }).decision, 'write', '升级要放行');
+  assert.equal(verdict({ old: 'P2', new: 'P1' }).kind, 'upgrade');
+  assert.equal(verdict({ old: 'P0', new: 'P2' }).reason, 'partial-prs-no-lower', 'partial 时降级不写');
+  assert.equal(verdict({ old: 'P2', new: '' }).reason, 'partial-prs-no-lower', '改空同样不写');
+  assert.equal(verdict({ old: 'P2', new: '' }, { partialPrs: false }).reason, 'no-lower-single-path', 'PR 看全了也不在单条写降级');
+  assert.equal(verdict({ old: null, new: 'P0' }).reason, 'waits-for-board', '空 → P0 由整盘那一拍处理');
+  assert.equal(singleItemVerdict({ ...row, repo: 'example-owner/other-repo', old: null, new: 'P2' }, { allowSet }).reason, 'repo-not-authorized');
+});
+
+test('P2-1 关联 PR 只写不收缩的，且要有 mac-mini-stopped', () => {
+  const allowSet = new Set([REPO.toLowerCase()]);
+  const row = { item: REF, repo: REPO, issue: ITEM, field: '关联 PR' };
+  const verdict = (change, extra = {}) => singleItemVerdict({ ...row, ...change }, { allowSet, ...extra });
+  assert.equal(verdict({ old: '#11(open) #12(open)', new: '#12(open)' }).reason, 'link-shrink');
+  assert.equal(verdict({ old: '', new: '#12(open)' }, { linkAllowed: false }).reason, 'link-held');
+  assert.deepEqual(verdict({ old: '#12(open)', new: '#12(open,CI✓)' }), { decision: 'write', kind: 'link', reason: '' });
+});
+
+test('P2-2 返回值带 partialPrs；标记不在时「关联 PR」不写（不是失败）', async () => {
+  const env = setup();
+  const fake = fakeGithub({ items: [itemNode({ priority: 'P2' })], prs: [prNode({ number: 12 })] });
+  env.reader = readerFor(fake, env.profile);
+  const { result, gate } = await sync(env, { apply: true });
+  assert.equal(result.partialPrs, true);
+  assert.equal(result.linkAllowed, false);
+  assert.equal(gate.writes.length, 0);
+  assert.equal(result.written, 0);
+  assert.deepEqual(result.skippedByPolicy.map((row) => row.reason), ['link-held']);
+});
+
+test('P2-1 每小时写入上限与整盘同一份 changes.jsonl：到顶就不写', async () => {
+  const env = setup();
+  const rows = Array.from({ length: 50 }, (_, index) => ({
+    at: new Date(T0 - 60_000 - index * 1000).toISOString(),
+    item: `${REPO}#${100 + index}`,
+    repo: REPO,
+    issue: 100 + index,
+    field: '优先级',
+    old: null,
+    new: 'P2',
+    basis: 'S1',
+  }));
+  fs.writeFileSync(path.join(env.dir, 'changes.jsonl'), `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+  const fake = fakeGithub();
+  env.reader = readerFor(fake, env.profile);
+  const { result, gate } = await sync(env, { apply: true });
+  assert.equal(result.hourlyUsed, 50);
+  assert.equal(gate.writes.length, 0);
+  assert.deepEqual(result.skippedByPolicy.map((row) => row.reason), ['hourly-limit']);
+});
+
+test('P2-1 额度预算和整盘同一个组件：预算不够时连只读查询都不发', async () => {
+  const env = setup();
+  const rateFile = path.join(env.dir, 'rate-budget.json');
+  writeRateState(rateFile, {
+    version: 1,
+    components: { 'prio-run': { hourKey: Math.floor(T0 / 3_600_000), used: 5 } },
+  });
+  const fake = fakeGithub();
+  env.reader = readerFor(fake, env.profile);
+  const { result, gate } = await sync(env, {
+    apply: true,
+    rateFile,
+    budgets: { loop: 100, 'prio-run': 5, 'board-live': 100 },
+  });
+  assert.equal(fake.queries.length, 0, '预算不够时不该读看板');
+  assert.equal(result.skipped, 'rate-budget');
+  assert.equal(result.rateReason, 'over-budget');
+  assert.equal(gate.writes.length, 0);
+});
+
+function waitUntil(predicate, timeoutMs = 5000) {
+  const startedAt = Date.now();
+  return new Promise((resolve) => {
+    const tick = () => {
+      if (predicate()) return resolve(true);
+      if (Date.now() - startedAt >= timeoutMs) return resolve(false);
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
+}
+
+test('P2-4 整盘持有写锁时，单条路径不读也不写（两者不会同时写）', { skip: FLOCK_SKIP }, async () => {
+  const env = setup();
+  const lockFile = path.join(env.dir, 'prio-write.lock');
+  fs.writeFileSync(lockFile, '');
+  // 模拟整盘那一拍：部署脚本用 `exec 8>锁文件; flock -n 8` 一直握着。
+  const child = spawn('flock', [lockFile, 'sleep', '20'], { stdio: 'ignore' });
+  try {
+    assert.equal(await waitUntil(() => writeLockHeld({ file: lockFile }).held === true), true, '没探测到整盘那把锁');
+    const fake = fakeGithub();
+    env.reader = readerFor(fake, env.profile);
+    const { result, gate } = await sync(env, { apply: true, lockPath: lockFile, lockOptions: { retryMs: 20, maxWaitMs: 200 } });
+    assert.equal(result.skipped, 'lock-busy');
+    assert.equal(result.written, 0);
+    assert.equal(fake.queries.length, 0, '锁被占时不该去读看板');
+    assert.equal(gate.writes.length, 0);
+  } finally {
+    child.kill('SIGKILL');
+  }
+});
+
+test('P2-4 两个单条写入者互斥：持有者文件在时第二条不写，释放后照常写', async () => {
+  const env = setup();
+  const lockFile = path.join(env.dir, 'prio-write.lock');
+  const markerFile = `${lockFile}.item`;
+  fs.writeFileSync(markerFile, `${JSON.stringify({ pid: process.pid, startedAt: new Date(T0).toISOString() })}\n`);
+  const fake = fakeGithub({ readback: () => ({ node: { fieldValues: { nodes: [fieldValue('single', '优先级', 'P2')] } } }) });
+  env.reader = readerFor(fake, env.profile);
+  const first = await sync(env, { apply: true, lockPath: lockFile, lockOptions: { retryMs: 20, maxWaitMs: 120 } });
+  assert.equal(first.result.skipped, 'lock-busy');
+  assert.equal(first.gate.writes.length, 0);
+  fs.unlinkSync(markerFile);
+  const second = await sync(env, { apply: true, lockPath: lockFile, lockOptions: { retryMs: 20, maxWaitMs: 120 } });
+  assert.equal(second.result.written, 1);
+  assert.equal(fs.existsSync(markerFile), false, '写完要释放持有者文件');
+});
+
+test('P2-4 默认锁路径就是整盘那把 /tmp/prio-write.lock', () => {
+  assert.equal(WRITE_LOCK_FILE, '/tmp/prio-write.lock');
+});
+
+test('适配层契约：真 import 的 syncEventItem 认 #318 的 payload 形状并写出', async () => {
+  // 加载器（#318 的 prio-item-loader.mjs）就是动态 import 这个文件再取函数，这里按同一路径真加载一次。
+  const mod = await import('./bin/prio-item.mjs');
+  assert.equal(typeof mod.syncEventItem, 'function', 'syncEventItem 必须导出，加载器才取得到');
+  const env = setup();
+  fs.writeFileSync(path.join(env.dir, 'mac-mini-stopped'), 'ok\n');
+  const fake = fakeGithub({ readback: () => ({ node: { fieldValues: { nodes: [fieldValue('single', '优先级', 'P2')] } } }) });
+  const gate = recorder();
+  const result = await mod.syncEventItem(
+    { repo: REPO, issue: ITEM, ref: REF, event: { event: 'issues' }, source: 'event', linkAllowed: true, now: T0 },
+    {
+      dir: env.dir,
+      profile: env.profile,
+      reader: readerFor(fake, env.profile),
+      write: gate.write,
+      stdout: capture().stdout,
+      lockPath: path.join(env.dir, 'prio-write.lock'),
+    },
+  );
+  assert.deepEqual(
+    {
+      ok: result.ok,
+      written: result.written,
+      planned: result.planned,
+      skipped: result.skipped,
+      reason: result.reason,
+      ref: result.ref,
+      repo: result.repo,
+      issue: result.issue,
+      partialPrs: result.partialPrs,
+      linkAllowed: result.linkAllowed,
+    },
+    { ok: true, written: 1, planned: 1, skipped: 0, reason: '', ref: REF, repo: REPO, issue: ITEM, partialPrs: true, linkAllowed: true },
+  );
+  assert.equal(gate.writes.length, 1);
+  assert.equal(gate.writes[0].fields['优先级'], 'P2');
+});
+
+test('适配层：apply 下 written===0 且还有该写的条数时 ok:false（调用方别 ack）', async () => {
+  const env = setup();
+  const fake = fakeGithub({ readback: () => ({ node: { fieldValues: { nodes: [fieldValue('single', '优先级', 'P1')] } } }) });
+  const gate = recorder();
+  const result = await syncEventItem(
+    { repo: REPO, issue: ITEM, ref: REF, now: T0, linkAllowed: false },
+    {
+      dir: env.dir,
+      profile: env.profile,
+      reader: readerFor(fake, env.profile),
+      write: gate.write,
+      stdout: capture().stdout,
+      lockPath: path.join(env.dir, 'prio-write.lock'),
+    },
+  );
+  assert.equal(result.planned, 1);
+  assert.equal(result.written, 0);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'readback-mismatch');
+});
+
+test('适配层：ref 与 repo#issue 对不上直接报错，不猜', async () => {
+  const env = setup();
+  await assert.rejects(
+    () => syncEventItem({ repo: REPO, issue: ITEM, ref: `${REPO}#999` }, { dir: env.dir, profile: env.profile }),
+    /ref 与 repo#issue 不一致/,
+  );
 });
