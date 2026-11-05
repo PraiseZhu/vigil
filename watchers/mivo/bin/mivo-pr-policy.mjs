@@ -11,13 +11,15 @@ function requiredKeySet(map) {
 
 // The review-pr check is the review verdict written after Ready (GitHub Actions, app 15368), not product CI.
 // Counting it would keep a Draft from ever turning Ready and would block repairs of the findings it reports.
-const REVIEW_VERDICT_CONTEXT = 'review-pr';
+// On integration/* the same verdict is the commit status "review-pr (integration)"; until the reviewer writes it,
+// counting it left every integration PR's CI unknown.
+const REVIEW_VERDICT_CONTEXTS = ['review-pr', 'review-pr (integration)'];
 const REVIEW_VERDICT_APPS = [null, 15368];
 
 function addRequired(required, context, appId, source) {
   assert(typeof context === 'string' && context.trim() === context && context.length > 0, 'invalid required context');
   assert(appId === null || Number.isSafeInteger(appId) && appId > 0, 'invalid required app');
-  if (context === REVIEW_VERDICT_CONTEXT && REVIEW_VERDICT_APPS.includes(appId)) return;
+  if (REVIEW_VERDICT_CONTEXTS.includes(context) && REVIEW_VERDICT_APPS.includes(appId)) return;
   if (appId === null) {
     const scoped = [...required.values()].filter((item) => item.context === context && item.appId != null);
     if (scoped.length) {

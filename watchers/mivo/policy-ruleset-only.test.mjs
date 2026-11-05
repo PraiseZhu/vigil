@@ -30,7 +30,7 @@ test('isBranchNotProtected reads the 404 from gh\'s output, and nothing else cou
 test('a PR into a ruleset-only branch gets a verified policy from the ruleset', () => {
   const view = { id: 'PR_1', number: 7, headRefOid: HEAD, baseRefOid: BASE, baseRefName: 'integration/x' };
   const rules = [[{ type: 'required_status_checks', ruleset_id: 9, parameters: { strict_required_status_checks_policy: true,
-    required_status_checks: [{ context: 'verify', integration_id: 15368 }] } }]];
+    required_status_checks: [{ context: 'verify', integration_id: 15368 }, { context: 'review-pr (integration)', integration_id: 15368 }] } }]];
   const file = { type: 'file', encoding: 'base64', content: Buffer.from(JSON.stringify({ on_main: ['verify'], pr_only: [] })).toString('base64') };
   const gh = (args) => {
     if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify(view);
@@ -43,6 +43,7 @@ test('a PR into a ruleset-only branch gets a verified policy from the ruleset', 
   };
   const policy = collectMivoPolicySync({ repo: REPO, number: 7, gh });
   assert.equal(policy.status, 'verified', policy.reason);
-  assert.deepEqual(policy.required.map((entry) => entry.context), ['verify']);
+  assert.deepEqual(policy.required.map((entry) => entry.context), ['verify'],
+    'the integration review verdict is the reviewer\'s, not CI: counted, it kept the PR\'s CI unknown until the review ran');
   assert.equal(policy.strictRequiredStatusChecks, true);
 });
