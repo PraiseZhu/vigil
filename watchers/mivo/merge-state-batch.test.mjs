@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { FOLLOW_INTERVAL_MS, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
 import { writePr } from './bin/mivo-state.mjs';
-import { collectMergeStates, collectPrOwnership, collectPrSnapshotSync, readMergeState } from './bin/mivo-pr-snapshot.mjs';
+import { collectBehindCounts, collectMergeStates, collectPrOwnership, collectPrSnapshotSync, readMergeState } from './bin/mivo-pr-snapshot.mjs';
 import { updateBaseBranch } from './bin/mivo-pr-actions.mjs';
 import { handoffPr, handoffReceipt, isFollowBatch, followBatchBody, isMergeBatch, mergeBatchBody, withAuthorHandoff } from './handoff.fixture.mjs';
 
@@ -300,4 +300,41 @@ test('a blocked index stops every path that would read a PR\'s own merge state, 
   const calls = [];
   assert.throws(() => collectPrSnapshotSync({ pr: { number: 1 }, ghFn: snapshotGh({ calls }), mergeIndex: blocked }), /merge-state-unavailable/);
   assert.equal(calls.filter(mentionsMergeState).length, 0);
+});
+
+// ---- behind counts ----
+// `Ref.compare` takes the head branch name, so it cannot ride the search above; one aliased request per round
+// replaces one REST call per PR.
+test('collectBehindCounts reads every listed head in one aliased query', () => {
+  const calls = [];
+  const index = new Map([
+    ['PR_1', { mergeStateStatus: 'UNSTABLE', baseTipOid: TIP }],
+    ['PR_2', { mergeStateStatus: 'DIRTY', baseTipOid: TIP }],
+  ]);
+  const ghFn = (args) => {
+    calls.push(args);
+    return JSON.stringify({ data: { a0: { baseRef: { compare: { behindBy: 46 } } }, a1: { baseRef: { compare: { behindBy: 3 } } } } });
+  };
+  const prs = [
+    { id: 'PR_1', headRefName: 'fix/1' }, { id: 'PR_2', headRefName: 'fix/2' }, { id: 'PR_3', headRefName: 'fix/3' },
+  ];
+  run(collectBehindCounts({ prs, index, ghFn }));
+  assert.equal(calls.length, 1, 'one request for every PR, not one per PR');
+  const query = calls[0].join(' ');
+  assert.match(query, /compare\(headRef:"fix\/1"\)/);
+  assert.match(query, /compare\(headRef:"fix\/2"\)/);
+  assert.doesNotMatch(query, /fix\/3/, 'a PR the merge batch does not know is left alone');
+  assert.equal(index.get('PR_1').behindBy, 46);
+  assert.equal(index.get('PR_2').behindBy, 3);
+  assert.equal(index.has('PR_3'), false);
+});
+
+test('collectBehindCounts leaves a failed compare unknown instead of guessing', () => {
+  const index = new Map([['PR_1', { mergeStateStatus: 'UNSTABLE', baseTipOid: TIP }]]);
+  const ghFn = () => JSON.stringify({
+    errors: [{ message: 'Could not resolve to a Ref' }],
+    data: { a0: { baseRef: { compare: null } } },
+  });
+  run(collectBehindCounts({ prs: [{ id: 'PR_1', headRefName: 'fix/1' }], index, ghFn }));
+  assert.equal(Object.hasOwn(index.get('PR_1'), 'behindBy'), false);
 });

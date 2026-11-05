@@ -10,14 +10,14 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { planSessionTitle, repairSessionTitle } from './session-title.mjs';
 import { collectPublicReview, evaluatePublicReview, isReviewerAuthor, reviewerFindingReviewIds, isReviewerCleanReport } from './public-review.mjs';
-import { collectPrSnapshot, collectPrOwnership, collectMergeStates, readMergeState, readMergeStatus, mergeStateIsBatched } from './mivo-pr-snapshot.mjs';
+import { collectPrSnapshot, collectPrOwnership, collectMergeStates, collectBehindCounts, readMergeState, readMergeStatus, mergeStateIsBatched } from './mivo-pr-snapshot.mjs';
 import { selectHandoff, isCurrentHandoff, implicitHandoff } from './mivo-handoff.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './mivo-state.mjs';
 import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor, isMemberFeedback, FEEDBACK_POLICY_VERSION } from './mivo-feedback-policy.mjs';
 import {lifelineFeedback} from './mivo-lifeline-source.mjs';
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent, completedMemberFeedback, coveredFeedbackItems, replyToMemberFeedback, requestMemberReviewers } from './mivo-review-resolve.mjs';
 import { codeScanningFeedbackItems } from './mivo-code-scanning.mjs';
-import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck } from './mivo-pr-actions.mjs';
+import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck, baseUpdateBehindThreshold } from './mivo-pr-actions.mjs';
 import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath, findingMarkerOf } from './mivo-repair.mjs';
 import { PARSER_VERSION, canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
@@ -327,7 +327,7 @@ function withPublisher(item, comment) {
   };
 }
 
-export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci, reviews = [], comments = [], threads = [], mergeable, receiptActor }) {
+export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci, reviews = [], comments = [], threads = [], mergeable, baseTipOid = null, receiptActor }) {
   const items = [];
   for (const item of failedRequiredCiItems({ pr, ci })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
   for (const item of failedOptionalCiItems({ pr, ci })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
@@ -383,7 +383,10 @@ export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci
       }, comment), { headSha: pr.headRefOid ?? null }));
     }
   }
-  if (mergeable === 'CONFLICTING') items.push(withCategory({ source: 'conflict', nativeId: 'merge-conflict', revision: pr.headRefOid, sha: pr.headRefOid, body: 'PR has merge conflicts with its base branch.', contentHash: digest({ mergeable }) }, { headSha: pr.headRefOid ?? null }));
+  // A conflict is identified by the head it sits on and the base tip it conflicts with: when main moves, it is a
+  // new conflict even though the head did not change, and it must reach a repair session instead of staying hidden
+  // behind the cursor stamp (2026-11-05: #1746 reported fingerprint-unchanged for hours).
+  if (mergeable === 'CONFLICTING') items.push(withCategory({ source: 'conflict', nativeId: 'merge-conflict', revision: pr.headRefOid, sha: pr.headRefOid, body: 'PR has merge conflicts with its base branch.', contentHash: digest({ mergeable, baseTip: baseTipOid ?? null }) }, { headSha: pr.headRefOid ?? null }));
   return items;
 }
 
@@ -1492,6 +1495,16 @@ export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor,
     labels: collected?.labels ?? previous.labels ?? [],
     mergeReady: collected?.mergeReady ?? previous.mergeReady ?? false,
     feedbackCursor: cursor ?? previous.feedbackCursor ?? {},
+    // The conflict went out with this task: the same head and base tip are not sent again (see conflictDispatchDue).
+    ...(Array.isArray(fresh) && fresh.some((item) => item?.key === CONFLICT_FEEDBACK_KEY)
+      && typeof collected?.baseTipOid === 'string'
+      ? { conflictDispatch: {
+        head: collected?.pr?.headRefOid ?? pr.headRefOid,
+        baseTip: collected.baseTipOid,
+        at: now,
+        dispatchId: thisId ?? null,
+      } }
+      : {}),
     sessionId: previous.sessionId ?? sessionId,
     scheduleId: previous.scheduleId,
     // The first confirmed receipt is the claim; later receipts must match it.
@@ -2437,6 +2450,13 @@ export function* processPr({
   const orphans = orphanedBotThreads({ previous, observed, cursorBase, paths, head: pr.headRefOid })
     .filter((item) => !newKeys.has(item.key));
   const rawFresh = [...newFresh, ...orphans];
+  // A conflict that has not been sent for this head/base tip yet is fresh even when the cursor still remembers the
+  // previous delivery: the session that received it is gone or blocked, and the PR is still CONFLICTING.
+  const conflictDue = conflictDispatchDue({ previous, snapshot: collected });
+  if (conflictDue && !rawFresh.some((item) => item.key === CONFLICT_FEEDBACK_KEY)) {
+    const conflictItem = observedAll.find((item) => item.source === 'conflict' && item.nativeId === 'merge-conflict');
+    if (conflictItem) rawFresh.push({ ...conflictItem, key: CONFLICT_FEEDBACK_KEY });
+  }
   // Green CI/review does not finish a newly confirmed local product failure.
   // Keep the existing owner's recovery alive until its repair result completes.
   if (rawFresh.some(item=>item.source==='lifeline-doctor' && item.repairPolicy.canChangeCode)
@@ -2987,6 +3007,22 @@ function* scanWorkflow({
     viewer, repo: REPO, prs: report, events, scan:state.scan, statePath: paths.statePath };
 }
 
+// A merge conflict is a standing condition, not an event: the PR stays CONFLICTING until someone merges main into
+// it, so the one-shot feedback cursor (head + mergeable) hides it as soon as the first attempt was delivered — even
+// when that attempt blocked or finished without resolving it. Each head/base-tip pair is sent to a repair session
+// once; a new head or a moved base is a new conflict and is dispatched again.
+export const CONFLICT_FEEDBACK_KEY = 'conflict:merge-conflict';
+export function conflictDispatchDue({ previous, snapshot }) {
+  if (String(snapshot?.mergeable ?? snapshot?.pr?.mergeable ?? '').toUpperCase() !== 'CONFLICTING') return false;
+  // The poll gate's normalized snapshot carries these at the top level; a full collection keeps the head in `pr`.
+  const head = snapshot?.headRefOid ?? snapshot?.pr?.headRefOid;
+  const baseTip = snapshot?.baseTipOid ?? snapshot?.pr?.baseTipOid;
+  if (typeof head !== 'string' || !/^[a-f0-9]{40}$/i.test(head)) return false;
+  if (typeof baseTip !== 'string' || !/^[a-f0-9]{40}$/i.test(baseTip)) return false;
+  const last = previous?.conflictDispatch;
+  return !(last && last.head === head && last.baseTip === baseTip);
+}
+
 // True when nothing on GitHub changed since the last settled round and no local work is due either.
 function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
   const pendingRetry = previous.pendingDispatch?.status === 'retryable';
@@ -3009,6 +3045,7 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
   return previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry && !normalized.overflow
     && !hasUnconsumedResult(previous, paths) && !needsCiRecheck(previous.activeTask) && !previous.recheckDeferredAt
     && !keelReopenDue && !intentMigrationDue && !escalateDue && !ciUnknownRecheckDue(previous, paths, now)
+    && !conflictDispatchDue({ previous, snapshot: normalized })
     && !pendingActionDue(previous) && !scanRecheckDue(previous, now);
 }
 
@@ -3657,6 +3694,13 @@ export function* discoverWorkflow({
   } catch (error) {
     ctx.mergeIndex = mergeIndexAfter(error);
     mergeStates = { batched: 0, error: String(error?.message ?? error).slice(0, 200) };
+  }
+  // Behind counts are only needed when the base-update threshold is on. They ride one aliased request per round
+  // (no per-PR REST), and a failure leaves them unknown instead of stopping the round: those PRs simply report
+  // `behind-unknown` until the next round reads them.
+  if (baseUpdateBehindThreshold(env) > 0 && ctx.mergeIndex instanceof Map && !ctx.mergeIndex.blocked) {
+    try { yield* collectBehindCounts({ prs: listed, index: ctx.mergeIndex, ghFn }); }
+    catch { /* unknown behind counts are reported per PR, never treated as zero */ }
   }
   const baselineAt = clock();
   const lateNumbers = new Set();

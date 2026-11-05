@@ -67,7 +67,9 @@ def _run_title_maintenance(home: Path, client) -> dict | None:
         session_id = change.get("sessionId")
         if not session_id or session_id in ids or entry.get("sessionId") != session_id:
             raise ValueError("title migration must preserve unique existing bindings")
-        if not re.fullmatch(r"#\d+-[^丨\r\n:#]{2,20}丨[0-9]{4}", change.get("title", "")):
+        # 无前缀（存量）与带配置前缀（如 PR#1704-…）都是合法标题；迁移请求只改已存在的绑定，
+        # 两种写法都接受，避免换前缀后把旧标题判成非法而放弃迁移。
+        if not re.fullmatch(r"(?:[A-Za-z][A-Za-z0-9_-]{0,15})?#\d+-[^丨\r\n:#]{2,20}丨[0-9]{4}", change.get("title", "")):
             raise ValueError("invalid canonical title")
         ids.add(session_id)
     target = request.get("targetSessionId")

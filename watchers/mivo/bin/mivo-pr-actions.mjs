@@ -1,9 +1,37 @@
 import { createHash } from 'node:crypto';
 import { collectPrOwnership, readMergeState, mergeStateIsBatched } from './mivo-pr-snapshot.mjs';
+import { optionalConfigStrict } from './profile.mjs';
 
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const UNCONFIRMED_MS = 5 * 60 * 1000;
 const REVIEW_UNCONFIRMED_MS = 10 * 60 * 1000;
+
+// How far behind `main` a PR may be before the watcher merges the base into its head on its own. 0 (the default)
+// keeps the old behaviour: only a BEHIND PR whose review gates are all clear is updated.
+export const BASE_UPDATE_BEHIND_ENV = 'MIVO_BASE_UPDATE_BEHIND_THRESHOLD';
+export function parseBehindThreshold(value) {
+  if (value === undefined || value === null || value === '') return 0;
+  if (typeof value === 'boolean' || typeof value === 'object') {
+    throw new Error(`${BASE_UPDATE_BEHIND_ENV} 必须是 ≥ 0 的整数（0 = 关闭），收到 ${JSON.stringify(value)}`);
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0) {
+    throw new Error(`${BASE_UPDATE_BEHIND_ENV} 必须是 ≥ 0 的整数（0 = 关闭），收到 ${JSON.stringify(value)}`);
+  }
+  return number;
+}
+export function baseUpdateBehindThreshold(env = process.env) {
+  return parseBehindThreshold(optionalConfigStrict('baseUpdateBehindThreshold', {
+    envVar: BASE_UPDATE_BEHIND_ENV, env, fallback: 0,
+  }));
+}
+
+// The review flow is mid-run on this head: updating the base now would move the head under it.
+function reviewInProgress(evidence = {}) {
+  return evidence.reviewInProgress === true
+    || evidence.reason === 'review-in-progress'
+    || (Array.isArray(evidence.blockers) && evidence.blockers.includes('review-in-progress'));
+}
 
 function parse(raw) {
   return typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -17,17 +45,46 @@ export function baseUpdateKey({ nodeId, head, baseTip, releaseEpoch }) {
   return digest({ nodeId, head, baseTip, releaseEpoch });
 }
 
-export function planBaseUpdate({ snapshot, entry, fresh = [], now }) {
+export function planBaseUpdate({ snapshot, entry, fresh = [], now, behindThreshold = baseUpdateBehindThreshold() }) {
   const pr = snapshot?.pr ?? {};
   const evidence = snapshot?.reviewEvidence ?? {};
   const mergeState = String(snapshot?.mergeStateStatus ?? pr.mergeStateStatus ?? 'UNKNOWN').toUpperCase();
   const eligibleFromReview = evidence.baseUpdateEligible === true || snapshot?.baseUpdateEligible === true;
   const inFlight = Boolean(entry?.activeTask) && !['complete', 'legacy-complete'].includes(entry.activeTask.status)
     && entry.activeTask.blockedKind !== 'author-reclaimed';
+  // Behind-threshold mode only waits for a repair that is actually working. A blocked or waiting-ci task is not
+  // running, and updating the base is exactly how a stale PR gets moving again.
+  const repairRunning = Boolean(entry?.activeTask)
+    && !['complete', 'legacy-complete', 'blocked', 'waiting-ci'].includes(entry.activeTask.status)
+    && entry.activeTask.blockedKind !== 'author-reclaimed';
   const pendingDispatch = Boolean(entry?.pendingDispatch);
+  const threshold = Number.isSafeInteger(behindThreshold) && behindThreshold > 0 ? behindThreshold : 0;
+  // Behind-threshold mode deliberately ignores the CI and review verdicts: a PR that trails main by N commits is
+  // updated even while its CI is red or its review is not clean. The other gates below still hold.
+  const behind = Number(snapshot?.behindBy);
+  const behindKnown = Number.isSafeInteger(behind) && behind >= 0;
   const reason = (() => {
     if (pr.state !== 'OPEN' || pr.isDraft) return 'inactive';
     if (pr.baseRefName !== 'main') return 'base-not-main';
+    if (threshold > 0) {
+      if (String(snapshot?.mergeable ?? 'UNKNOWN').toUpperCase() !== 'MERGEABLE') return 'not-mergeable';
+      if (!/^[a-f0-9]{40}$/i.test(String(snapshot?.baseTipOid ?? ''))) return 'base-tip-unknown';
+      if (!behindKnown) return 'behind-unknown';
+      if (behind < threshold) return 'behind-below-threshold';
+      if (reviewInProgress(evidence)) return 'review-in-progress';
+      if ((fresh ?? []).length) return 'fresh-feedback';
+      if (repairRunning) return 'repair-in-flight';
+      if (pendingDispatch) return 'pending-dispatch';
+      if (entry?.needsHuman) return 'needs-human';
+      if (entry?.dispatchConflict) return 'dispatch-conflict';
+      const current = entry?.baseUpdate;
+      if (current && current.key === baseUpdateKey({
+        nodeId: pr.id, head: pr.headRefOid, baseTip: snapshot.baseTipOid, releaseEpoch: pr.releaseEpoch,
+      }) && ['reserved', 'accepted', 'uncertain', 'updated'].includes(current.status)) {
+        return `already-${current.status}`;
+      }
+      return 'eligible';
+    }
     if (snapshot?.mergeable !== 'MERGEABLE') return 'not-mergeable';
     if (mergeState !== 'BEHIND') return `merge-state-${mergeState.toLowerCase()}`;
     if (!eligibleFromReview) return evidence.reason ?? snapshot?.reviewReason ?? 'gates-not-clear';
@@ -81,8 +138,10 @@ function* readOwnership({ pr, ghFn }) {
 
 export function* updateBaseBranch({
   pr, entry, snapshot, ghFn, ownershipSnapshot, save, now, dryRun = false, viewer, repo,
+  behindThreshold = baseUpdateBehindThreshold(),
 }) {
-  const plan = planBaseUpdate({ snapshot, entry, fresh: [], now });
+  const plan = planBaseUpdate({ snapshot, entry, fresh: [], now, behindThreshold });
+  const threshold = Number.isSafeInteger(behindThreshold) && behindThreshold > 0 ? behindThreshold : 0;
   if (!plan.eligible) return { entry, action: { attempted: false, reason: plan.reason } };
   const expected = {
     nodeId: pr.id,
@@ -99,8 +158,24 @@ export function* updateBaseBranch({
   assertActionOwner({ live, snapshot, entry, viewer, expected });
   if (dryRun) return { entry, action: { attempted: false, reason: 'dry-run', key: plan.key } };
   // A snapshot taken from the round's batch read can be minutes old; update-branch writes to the PR, so its merge
-  // state and base tip are read again for this one PR first.
-  if (mergeStateIsBatched(snapshot)) {
+  // state and base tip are read again for this one PR first. In behind-threshold mode the count is re-read too:
+  // the threshold is about the current base, not the one the round started with.
+  if (threshold > 0) {
+    const live = yield* readMergeState({ id: pr.id, ghFn, headRefName: pr.headRefName });
+    const liveBehind = Number(live.behindBy);
+    if (String(live.mergeable ?? 'UNKNOWN').toUpperCase() !== 'MERGEABLE'
+      || !Number.isSafeInteger(liveBehind) || liveBehind < threshold) {
+      return {
+        entry,
+        action: {
+          attempted: false,
+          reason: 'behind-recheck-failed',
+          key: plan.key,
+          behindBy: Number.isSafeInteger(liveBehind) ? liveBehind : null,
+        },
+      };
+    }
+  } else if (mergeStateIsBatched(snapshot)) {
     const live = yield* readMergeState({ id: pr.id, ghFn });
     if (String(live.mergeStateStatus ?? 'UNKNOWN').toUpperCase() !== 'BEHIND' || live.baseTipOid !== snapshot.baseTipOid) {
       return { entry, action: { attempted: false, reason: 'merge-state-changed', key: plan.key } };

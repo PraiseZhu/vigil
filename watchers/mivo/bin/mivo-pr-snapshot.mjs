@@ -73,7 +73,7 @@ function list(raw, label) {
 // read through the gh App router was ever merge-ready or BEHIND (last merge-ready notice #1170, 2026-10-20).
 // Selecting viewer keeps the query on the user identity (the router sends viewer queries there). One PR's query is
 // the fallback; a round reads every PR's merge state with one search (collectMergeStates).
-const tipQueryFor = (id) => `query{viewer{login} node(id:${quote(id)}){... on PullRequest{mergeStateStatus baseRef{name target{oid}}}}}`;
+const tipQueryFor = (id, headRefName = null) => `query{viewer{login} node(id:${quote(id)}){... on PullRequest{mergeStateStatus mergeable baseRef{name target{oid}${headRefName ? ` compare(headRef:${quote(headRefName)}){behindBy}` : ''}}}}}`;
 function mergeStateOf(node) {
   requireValue(node && typeof node === 'object', 'missing base tip');
   const baseTipOid = node.baseRef?.target?.oid;
@@ -82,11 +82,21 @@ function mergeStateOf(node) {
 }
 
 // Reads one PR's merge state and live base tip with its own query (the pre-batch behaviour). Used as the fallback
-// and as the last-moment re-read before an action that writes to GitHub.
-export function* readMergeState({ id, ghFn }) {
-  const payload = parse(yield () => ghFn(['api', 'graphql', '-f', `query=${tipQueryFor(id)}`]));
+// and as the last-moment re-read before an action that writes to GitHub. With a head branch name it also reads
+// how far that head is behind the base (`Ref.compare`), which the behind-threshold base update needs fresh.
+export function* readMergeState({ id, ghFn, headRefName = null }) {
+  const payload = parse(yield () => ghFn(['api', 'graphql', '-f', `query=${tipQueryFor(id, headRefName)}`]));
   requireValue(payload && !payload.errors?.length && payload.data?.node, 'missing base tip');
-  return { ...mergeStateOf(payload.data.node), source: 'query' };
+  const node = payload.data.node;
+  const state = { ...mergeStateOf(node), source: 'query' };
+  // The extra fields only exist when the caller asked for a comparable head; the plain re-read keeps its old shape.
+  if (!headRefName) return state;
+  const behindBy = node.baseRef?.compare?.behindBy;
+  return {
+    ...state,
+    mergeable: typeof node.mergeable === 'string' ? node.mergeable : null,
+    behindBy: Number.isSafeInteger(behindBy) && behindBy >= 0 ? behindBy : null,
+  };
 }
 
 // The poll gate only needs the merge state (its own query already carries the base tip), so a missing field stays
@@ -134,6 +144,29 @@ export function* collectMergeStates({ repo, viewer, ghFn }) {
     if (!result.pageInfo.hasNextPage) return index;
     after = result.pageInfo.endCursor;
     requireValue(typeof after === 'string' && after.length > 0, 'merge state cursor missing');
+  }
+  return index;
+}
+
+// How far each PR's head is behind its base (`Ref.compare`). The head branch name differs per PR, so it cannot
+// ride the search above; this is one aliased request per round for the listed PRs, never one request per PR.
+// A PR whose compare fails (fork head, deleted branch) simply stays without a count instead of failing the round.
+const BEHIND_ALIAS_LIMIT = 50;
+const HEAD_REF_PATTERN = /^[A-Za-z0-9_.\-/]+$/;
+export function* collectBehindCounts({ prs, index, ghFn }) {
+  requireValue(Array.isArray(prs) && index instanceof Map && typeof ghFn === 'function', 'invalid behind input');
+  const candidates = prs.filter((pr) => pr?.id && index.has(String(pr.id))
+    && typeof pr.headRefName === 'string' && HEAD_REF_PATTERN.test(pr.headRefName));
+  for (let start = 0; start < candidates.length; start += BEHIND_ALIAS_LIMIT) {
+    const batch = candidates.slice(start, start + BEHIND_ALIAS_LIMIT);
+    const fields = batch.map((pr, at) => `a${at}: node(id:${quote(String(pr.id))}){... on PullRequest{baseRef{compare(headRef:${quote(pr.headRefName)}){behindBy}}}}`);
+    const payload = parse(yield () => ghFn(['api', 'graphql', '-f', `query=query{${fields.join(' ')}}`]));
+    if (!payload?.data) continue;
+    batch.forEach((pr, at) => {
+      const behindBy = payload.data[`a${at}`]?.baseRef?.compare?.behindBy;
+      if (!Number.isSafeInteger(behindBy) || behindBy < 0) return;
+      index.set(String(pr.id), { ...index.get(String(pr.id)), behindBy });
+    });
   }
   return index;
 }
@@ -187,6 +220,7 @@ export function* collectPrSnapshot({ pr, ghFn, mergeIndex = null }) {
     : requiredChecks.length && requiredChecks.every((check) => ['SUCCESS', 'PENDING', 'QUEUED', 'IN_PROGRESS', 'WAITING', 'EXPECTED'].includes(check.state)) ? 'pending' : 'unknown';
   return { pr: { ...after, releaseEpoch, mergeStateStatus: liveMergeState }, checks, requiredChecks, reviews, comments, threads, labels: labelNodes.map((label) => label.name),
     mergeable: after.mergeable ?? 'UNKNOWN', mergeStateStatus: liveMergeState, baseTipOid, mergeStateSource: live.source,
+    behindBy: Number.isSafeInteger(live.behindBy) && live.behindBy >= 0 ? live.behindBy : null,
     reviewDecision: after.reviewDecision, requiredChecksGreen, ciStatus,
     ciPolicySource: 'gh-required-checks-only', unifiedPolicyVerified: false, identityVerified: true };
 }
