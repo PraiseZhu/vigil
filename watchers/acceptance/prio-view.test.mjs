@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { CHANGE_WINDOW_MS, MAX_CHANGES_PER_HOUR } from './bin/prio-score.mjs';
+import { CHANGE_WINDOW_MS, GATEWAY_MAX_MS, MAX_CHANGES_PER_HOUR } from './bin/prio-score.mjs';
 import { DEFAULT_STALE_MS, FREEZE_AT_CHANGES, viewPrio } from './bin/prio-view.mjs';
 
 const REPO = 'example/org-a';
@@ -258,6 +258,90 @@ test('#199 SC5 没有延迟样本时 p50/p95 为无数据；20 个样本与手�
   assert.match(onlyNull.lines.find((entry) => entry.startsWith('关联 PR 延迟')), /p50 无数据 p95 无数据/);
 });
 
+test('W4-b SC1 延迟按指标分两组：事件→写完用 latencyMs，gateway 用 gatewayMs，两组不混', () => {
+  const row = (deliveryId, extra) =>
+    `${JSON.stringify({
+      deliveryId,
+      createdAt: '2026-10-31T00:00:00.000Z',
+      receivedAt: '2026-10-31T00:00:04.000Z',
+      pulledAt: '2026-10-31T00:00:10.000Z',
+      processedAt: iso(T0),
+      source: 'worker',
+      ...extra,
+    })}\n`;
+  // 新行：gatewayMs 远小于 latencyMs。两组各取各的，不把 GitHub 那段算进本机延迟。
+  let latency = row('g1', { latencyMs: 9000, gatewayMs: 1000 });
+  latency += row('g2', { latencyMs: 9000, gatewayMs: 2000 });
+  latency += row('g3', { latencyMs: 9000, gatewayMs: 3000 });
+  latency += row('g4', { latencyMs: 9000, gatewayMs: 4000 });
+  // 老行没有 receivedAt / gatewayMs：只进「事件→写完」那一组，不拉低 gateway 的样本。
+  latency += JSON.stringify({
+    deliveryId: 'old',
+    createdAt: '2026-10-31T00:00:00.000Z',
+    processedAt: iso(T0),
+    latencyMs: 5000,
+    source: 'worker',
+  }) + '\n';
+  latency += row('null-gateway', { latencyMs: 6000, gatewayMs: null });
+  latency += row('bad-gateway', { latencyMs: 7000, gatewayMs: 'fast' });
+  const view = viewPrio(fresh({ latency }));
+  // 事件→写完：5000、6000、7000、9000×4 → n=7，p50 和 p95 都是 9000。
+  assert.equal(view.latency.n, 7);
+  assert.equal(view.latency.p50, 9000);
+  assert.equal(view.latency.p95, 9000);
+  // gateway：1000、2000、3000、4000 → n=4，p50 2000、p95 4000。
+  assert.equal(view.gatewayLatency.n, 4);
+  assert.equal(view.gatewayLatency.p50, 2000);
+  assert.equal(view.gatewayLatency.p95, 4000);
+  assert.match(
+    view.lines.find((entry) => entry.startsWith('关联 PR 延迟')),
+    /^关联 PR 延迟 事件→写完 p50 9000 p95 9000 \(n=7\)｜gateway p50 2000 p95 4000 \(n=4\)$/,
+  );
+
+  // 一组没样本时只影响这一组。
+  const gatewayOnly = viewPrio(fresh({ latency: row('only-gateway', { latencyMs: null, gatewayMs: 3000 }) }));
+  assert.equal(gatewayOnly.latency.n, 0);
+  assert.equal(gatewayOnly.gatewayLatency.n, 1);
+  assert.match(
+    gatewayOnly.lines.find((entry) => entry.startsWith('关联 PR 延迟')),
+    /事件→写完 p50 无数据 p95 无数据 \(n=0\)｜gateway p50 3000 p95 3000 \(n=1\)/,
+  );
+});
+
+test('W4-b #317 gatewayMs 只收 0—600000ms：负值和超过上限的值不进 gateway 组，latencyMs 那列不变', () => {
+  const row = (deliveryId, extra) =>
+    `${JSON.stringify({
+      deliveryId,
+      createdAt: '2026-10-31T00:00:00.000Z',
+      receivedAt: '2026-10-31T00:00:04.000Z',
+      pulledAt: '2026-10-31T00:00:10.000Z',
+      processedAt: iso(T0),
+      source: 'worker',
+      ...extra,
+    })}\n`;
+  const latency =
+    row('negative-gateway', { latencyMs: 8000, gatewayMs: -5 }) +
+    row('too-large-gateway', { latencyMs: 8000, gatewayMs: 900000 }) +
+    row('normal-gateway', { latencyMs: 8000, gatewayMs: 3000 });
+  const view = viewPrio(fresh({ latency }));
+  // gateway 组只有 3000 这一条；-5 和 900000 不算样本。
+  assert.equal(view.gatewayLatency.n, 1);
+  assert.equal(view.gatewayLatency.p50, 3000);
+  assert.equal(view.gatewayLatency.p95, 3000);
+  assert.match(
+    view.lines.find((entry) => entry.startsWith('关联 PR 延迟')),
+    /｜gateway p50 3000 p95 3000 \(n=1\)$/,
+  );
+  // latencyMs 那列不看这个范围：三条都算。
+  assert.equal(view.latency.n, 3);
+  assert.equal(view.latency.p50, 8000);
+
+  // 上限本身（600000）仍在范围内。
+  const atMax = viewPrio(fresh({ latency: row('at-max', { latencyMs: 8000, gatewayMs: GATEWAY_MAX_MS }) }));
+  assert.equal(atMax.gatewayLatency.n, 1);
+  assert.equal(atMax.gatewayLatency.p50, GATEWAY_MAX_MS);
+});
+
 test('#199 SC6 200 条 item 在 5 秒内返回', () => {
   let changes = '';
   const items = {};
@@ -278,7 +362,7 @@ test('#199 SC6 200 条 item 在 5 秒内返回', () => {
 test('#199 SC7 模块不 import 网络或文件模块、不读 process.env，输出不含令牌样式', () => {
   const source = fs.readFileSync(new URL('./bin/prio-view.mjs', import.meta.url), 'utf8');
   const imports = source.match(/^import\s.+$/gm) || [];
-  assert.deepEqual(imports, ["import { CHANGE_WINDOW_MS, MAX_CHANGES_PER_HOUR } from './prio-score.mjs';"]);
+  assert.deepEqual(imports, ["import { CHANGE_WINDOW_MS, GATEWAY_MAX_MS, MAX_CHANGES_PER_HOUR } from './prio-score.mjs';"]);
   assert.doesNotMatch(source, /\brequire\s*\(/);
   assert.doesNotMatch(source, /process\.env/);
   assert.doesNotMatch(source, /\bfetch\s*\(/);
