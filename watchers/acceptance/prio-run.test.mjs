@@ -1410,6 +1410,7 @@ test('SC2 --only-field 关联 PR 时 link 放行并逐条回读', async () => {
   assert.equal(disabled(dir), false);
   assert.equal(readAlerts(dir).length, 0);
   assert.equal(/扣住|不写关联 PR/.test(io.text()), false, '放行后不再打扣住那行');
+  assert.equal(io.text().includes('排除优先级侧降级'), false, '没有降级时不打排除计数');
 });
 
 test('SC3 关联 PR 回读不一致立刻停写并告警', async () => {
@@ -1525,7 +1526,7 @@ test('SC8 关联 PR 段遇到优先级降级时不整拍停写', async () => {
   seedChange(dir, 2, 'P1');
   seedDebounce(dir, 2, confirmedDowngrade('P2'));
   const seated = changeRows(dir).length;
-  const { writes, result } = await run(dir, ['--write', '--only-field', '关联 PR'], {
+  const { writes, result, io } = await run(dir, ['--write', '--only-field', '关联 PR'], {
     items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2', priority: 'P1' })],
     prs: [closingPr(9, 1)],
   });
@@ -1537,6 +1538,8 @@ test('SC8 关联 PR 段遇到优先级降级时不整拍停写', async () => {
   assert.equal(alerts.some((alert) => alert.kind === 'prio-downgrade'), false, '不发 prio-downgrade');
   assert.equal(alerts.length, 0);
   assert.deepEqual(changeRows(dir).slice(seated).map((row) => row.field), ['关联 PR'], '优先级侧的降级本拍不写');
+  assert.equal(result.assessment.excludedDowngradeClear, 1, '排除计数等于计划里的降级条数');
+  assert.match(io.text(), /按 --only-field "关联 PR" 排除优先级侧降级\/清空 1 条/);
 });
 
 test('SC8 不带 --only-field 时降级仍整拍停写', async () => {

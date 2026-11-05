@@ -315,6 +315,10 @@ export function assessContinuousPlan(plan, {
     downgrades,
     nonAuto,
     hourlyStop,
+    // 被 `--only-field "关联 PR"` 排除的优先级侧降级/改空条数，只给调用方写 run 日志用。
+    ...(onlyField === '关联 PR'
+      ? { excludedDowngradeClear: downgrades.filter((row) => row.change?.field !== onlyField).length }
+      : {}),
     allow(change) {
       // 本拍不可写字段（`--only-field` 以外的字段）静默排除：不写、不进 nonAuto，因此不发 prio-nonempty。
       if (onlyField != null && change?.field !== onlyField) return 'skip';
@@ -677,6 +681,11 @@ export async function runContinuous(argv = [], deps = {}) {
                 `按 --only-empty-to-p2 会写 ${list.length} 条：${list.length ? list.join('、') : '无'}\n`,
               );
             }
+          }
+          if (args.onlyField === '关联 PR' && (assessment.excludedDowngradeClear || 0) > 0) {
+            stdout.write(
+              `按 --only-field "关联 PR" 排除优先级侧降级/清空 ${assessment.excludedDowngradeClear} 条\n`,
+            );
           }
           if (!wantWrite) return null;
           if (assessment.abort) return { abort: true, reason: assessment.reason };
