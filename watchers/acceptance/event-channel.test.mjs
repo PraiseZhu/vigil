@@ -10,12 +10,16 @@ import { createEventWorker } from './bin/event-worker.mjs';
 import {
   PULL_INTERVAL_MS,
   POLL_INTERVAL_MS,
+  appendLatencyRow,
   defaultLatencyFile,
   latencyPercentiles,
   pullFromWorker,
   readLatencyLog,
   runEventChannel,
 } from './bin/event-pull.mjs';
+import { renderPrioBoardSection } from './bin/prio-board-section.mjs';
+import { viewPrio } from './bin/prio-view.mjs';
+import { defaultStateDir, stateFiles } from './bin/prio-sync.mjs';
 import { tmpDir } from './fake-gh.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -1338,6 +1342,14 @@ test('W4-b SC3 receivedAt 缺失、非法或不是字符串时 gatewayMs 记 nul
     assert.equal(typeof row.pulledAt, 'string');
   }
   assert.deepEqual(
+    rows.map((row) => [row.deliveryId, row.gatewayMsReject]),
+    [
+      ['no-received', 'received-at-missing'],
+      ['bad-received', 'received-at-invalid'],
+      ['not-string', 'received-at-missing'],
+    ],
+  );
+  assert.deepEqual(
     rows.map((row) => [row.deliveryId, row.latencyMs]),
     [
       ['no-received', 10000],
@@ -1345,6 +1357,112 @@ test('W4-b SC3 receivedAt 缺失、非法或不是字符串时 gatewayMs 记 nul
       ['not-string', 5000],
     ],
   );
+});
+
+test('W4-b SC3 gatewayMs 只收 0—600000ms：receivedAt 在将来或差超过 10 分钟时记 null 并留 gatewayMsReject', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const at = Date.parse('2026-10-31T00:00:10.000Z');
+  const created = '2026-10-31T00:00:00.000Z';
+  let t = at;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: at + 1,
+    pull: async () => [
+      // receivedAt 比写完还晚：差值为负，不当成样本。
+      { deliveryId: 'future-received', created_at: created, receivedAt: '2026-10-31T00:00:30.000Z' },
+      // 差 10 分钟 11 秒，超过上限。
+      { deliveryId: 'too-old', created_at: created, receivedAt: '2026-10-30T23:49:59.000Z' },
+      // 正好 600000ms：收。
+      { deliveryId: 'exactly-max', created_at: created, receivedAt: '2026-10-30T23:50:10.000Z' },
+      // 正好 0：收。
+      { deliveryId: 'zero', created_at: created, receivedAt: '2026-10-31T00:00:10.000Z' },
+    ],
+    poll: async () => [],
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 4);
+  assert.deepEqual(
+    rows.map((row) => [row.deliveryId, row.gatewayMs, row.gatewayMsReject ?? null]),
+    [
+      ['future-received', null, 'negative'],
+      ['too-old', null, 'too-large'],
+      ['exactly-max', 600000, null],
+      ['zero', 0, null],
+    ],
+  );
+  // 范围校验不影响 latencyMs（事件发生 → 写完）。
+  assert.deepEqual(
+    rows.map((row) => row.latencyMs),
+    [10000, 10000, 10000, 10000],
+  );
+});
+
+test('W4-b SC4 短写时按 offset 继续写完剩下的字节，不留下半行', () => {
+  const file = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const realWriteSync = fs.writeSync;
+  let calls = 0;
+  // 每次只写 7 个字节，强制走短写分支。fs 是单例，event-pull.mjs 用的是同一个对象。
+  fs.writeSync = (fd, buffer, offset, length) => {
+    calls += 1;
+    return realWriteSync(fd, buffer, offset, Math.min(7, length));
+  };
+  try {
+    appendLatencyRow(file, { deliveryId: 'short-write', padding: 'x'.repeat(100) });
+  } finally {
+    fs.writeSync = realWriteSync;
+  }
+  assert.ok(calls > 1, `应该发生多次写：${calls}`);
+  const lines = fs.readFileSync(file, 'utf8').split('\n').filter((line) => line.trim());
+  assert.equal(lines.length, 1);
+  const row = JSON.parse(lines[0]);
+  assert.equal(row.deliveryId, 'short-write');
+  assert.equal(row.padding.length, 100);
+});
+
+test('W4-b SC4 pulledAtMs 不是有限数时 pulledAt 记 null，事件不算失败', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const at = Date.parse('2026-10-31T00:00:10.000Z');
+  const controller = new AbortController();
+  const reports = [];
+  let nan = false;
+  await runEventChannel({
+    // 只在取这一批的 pulledAtMs 时给 NaN，写完的时刻恢复正常。
+    now: () => (nan ? Number.NaN : at),
+    sleep: async () => {},
+    signal: controller.signal,
+    pull: async () => {
+      nan = true;
+      return [
+        {
+          deliveryId: 'nan-pulled',
+          created_at: '2026-10-31T00:00:00.000Z',
+          receivedAt: '2026-10-31T00:00:09.000Z',
+        },
+      ];
+    },
+    poll: async () => [],
+    reportFailure: async (event) => {
+      reports.push(event.deliveryId);
+      return { failures: 1 };
+    },
+    onEvent: async () => {
+      nan = false;
+      controller.abort();
+    },
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].deliveryId, 'nan-pulled');
+  assert.equal(rows[0].pulledAt, null);
+  assert.equal(rows[0].processedAt, '2026-10-31T00:00:10.000Z');
+  assert.equal(rows[0].latencyMs, 10000);
+  assert.equal(rows[0].gatewayMs, 1000);
+  assert.deepEqual(reports, []);
 });
 
 test('W4-b SC4 首次追加时自动建目录，新文件权限 0600', async () => {
@@ -1401,11 +1519,43 @@ test('W4-b SC4 两个进程同时往同一个 latency.jsonl 追加：行数对�
   assert.equal(fs.statSync(latencyFile).mode & 0o777, 0o600);
 });
 
-test('W4-b SC5 延迟文件默认是绝对路径（~ 下的状态目录），传相对路径直接报错', async () => {
+test('W4-b SC5 延迟文件默认位置由 prio-sync 的状态目录拼出：event-pull 写的和看板读的是同一个文件', async () => {
   const fakeHome = path.join(tmpDir(), 'home-example');
-  assert.equal(defaultLatencyFile(fakeHome), path.join(fakeHome, 'acceptance', 'tools', '.prio', 'latency.jsonl'));
+  const stateDir = defaultStateDir(fakeHome);
+  const latencyFile = stateFiles(stateDir).latency;
+  // 期望路径从 prio-sync 的状态目录定义拼出来，不把 event-pull 里的实现表达式抄一遍。
+  assert.equal(defaultLatencyFile(fakeHome), latencyFile);
   assert.equal(path.isAbsolute(defaultLatencyFile()), true);
   assert.equal(defaultLatencyFile().endsWith(path.join('acceptance', 'tools', '.prio', 'latency.jsonl')), true);
+
+  // 写：event-pull 按默认位置追加一行。
+  const at = Date.parse('2026-10-31T00:00:10.000Z');
+  let t = at;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: at + 1,
+    pull: async () => [
+      {
+        deliveryId: 'same-file',
+        created_at: '2026-10-31T00:00:00.000Z',
+        receivedAt: '2026-10-31T00:00:09.000Z',
+      },
+    ],
+    poll: async () => [],
+    latencyFile: defaultLatencyFile(fakeHome),
+  });
+  assert.equal(readLatencyLog(latencyFile).length, 1);
+
+  // 读：看板那一节按同一个状态目录读 latency.jsonl，能看到刚写的样本。
+  const section = renderPrioBoardSection({ stateDir, nowMs: at + 1000 });
+  assert.match(
+    section,
+    /关联 PR 延迟 事件→写完 p50 10000 p95 10000 \(n=1\)｜gateway p50 1000 p95 1000 \(n=1\)/,
+  );
+
   await assert.rejects(
     runEventChannel({
       now: () => 0,
@@ -1416,5 +1566,46 @@ test('W4-b SC5 延迟文件默认是绝对路径（~ 下的状态目录），传
       latencyFile: path.join('.prio', 'latency.jsonl'),
     }),
     /latencyFile 必须是绝对路径/,
+  );
+});
+
+test('W4-b SC1 同一拍的 worker 行和 poll 行各进各的组：事件→写完两条，gateway 只数带 receivedAt 的', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const at = Date.parse('2026-10-31T00:00:10.000Z');
+  let t = at;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: at + 1,
+    pull: async () => [
+      {
+        deliveryId: 'from-worker',
+        created_at: '2026-10-31T00:00:00.000Z',
+        receivedAt: '2026-10-31T00:00:09.000Z',
+      },
+    ],
+    poll: async () => [{ deliveryId: 'from-poll', created_at: '2026-10-31T00:00:02.000Z' }],
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.deepEqual(
+    rows.map((row) => [row.deliveryId, row.source, row.latencyMs, row.gatewayMs]),
+    [
+      ['from-worker', 'worker', 10000, 1000],
+      ['from-poll', 'poll', 8000, null],
+    ],
+  );
+  const view = viewPrio({ latency: fs.readFileSync(latencyFile, 'utf8'), nowMs: at + 1000 });
+  // 事件→写完两条都在；gateway 只有 worker 那一条。
+  assert.equal(view.latency.n, 2);
+  assert.equal(view.latency.p50, 8000);
+  assert.equal(view.latency.p95, 10000);
+  assert.equal(view.gatewayLatency.n, 1);
+  assert.equal(view.gatewayLatency.p50, 1000);
+  assert.match(
+    view.lines.find((entry) => entry.startsWith('关联 PR 延迟')),
+    /^关联 PR 延迟 事件→写完 p50 8000 p95 10000 \(n=2\)｜gateway p50 1000 p95 1000 \(n=1\)$/,
   );
 });

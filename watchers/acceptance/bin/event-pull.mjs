@@ -8,7 +8,9 @@
 // 每处理完一个事件，往状态目录的 latency.jsonl 追加一行，记三段：Worker 收到（receivedAt，
 // 由 Worker 写进队列记录）、本机拉到（pulledAt）、本机写完（processedAt，也就是 writtenAt）。
 // latencyMs 仍是「事件发生 → 写完」；另记 gatewayMs = 写完 − Worker 收到，这才是 Worker 之后的本机耗时。
-// receivedAt 缺失或不是可解析的时间时 gatewayMs 记 null，不抛错，也不影响 latencyMs。
+// gatewayMs 只收 0 ≤ 值 ≤ GATEWAY_MAX_MS（10 分钟）的样本。receivedAt 缺失、解析不出、在将来（差值小于 0）
+// 或差得超过 10 分钟时，gatewayMs 记 null，并在同一行留 gatewayMsReject 说明原因；不抛错，也不影响 latencyMs。
+// pulledAt 取这一批拉到的时间；调用方给的时间不是有限数时记 null，不让写日志失败变成事件失败。
 // 目标：Worker 路径 p95 ≤ 10 秒，兜底轮询 ≤ 90 秒（60 秒一轮，留处理余量）。
 // 轮询函数由调用方注入（现有 60 秒轮询留在外面，这里不替换它）。不读令牌。
 // latencyFile 默认是绝对路径（~ 下的状态目录，和 prio-sync 的 stateFiles().latency 同一个位置）；
@@ -20,6 +22,9 @@ import path from 'node:path';
 
 export const PULL_INTERVAL_MS = 2000;
 export const POLL_INTERVAL_MS = 60 * 1000;
+
+/** gatewayMs 的上限：Worker 收到到写完超过 10 分钟就不是这一段的本机耗时，按坏数据记 null。 */
+export const GATEWAY_MAX_MS = 10 * 60 * 1000;
 
 /** 延迟文件默认位置。和 prio-sync.mjs 的 stateFiles().latency 是同一个路径，绝对路径，不随 cwd 变。 */
 export function defaultLatencyFile(homeDir = os.homedir()) {
@@ -95,18 +100,31 @@ export function latencyPercentiles(rows) {
   return { p50: at(0.5), p95: at(0.95), n: values.length };
 }
 
-/** 追加一行延迟记录。单次 write 写到 O_APPEND 描述符上；导出给测试用：两个进程同时追加不能出现半行。 */
+/** 追加一行延迟记录。写到 O_APPEND 描述符上；导出给测试用：两个进程同时追加不能出现半行。 */
 export function appendLatencyRow(file, row) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const line = `${JSON.stringify(row)}\n`;
-  // 以 O_APPEND 打开后一次性写完这一行。两个进程同时追加时，追加位置由内核定，行不会被切开。
+  const buffer = Buffer.from(`${JSON.stringify(row)}\n`, 'utf8');
+  // 以 O_APPEND 打开：追加位置由内核定，两个进程同时写也不会盖掉对方。
   // mode 只在新建文件时生效：第一次创建就是 0600。
   const fd = fs.openSync(file, 'a', 0o600);
   try {
-    fs.writeSync(fd, line);
+    // write 可能短写，按 offset 把剩下的接着写完，不能只写一次就关。
+    let offset = 0;
+    while (offset < buffer.length) {
+      const written = fs.writeSync(fd, buffer, offset, buffer.length - offset);
+      if (!(written > 0)) {
+        throw new Error(`写 latency.jsonl 未推进：offset ${offset}，本行 ${buffer.length} 字节`);
+      }
+      offset += written;
+    }
   } finally {
     fs.closeSync(fd);
   }
+}
+
+/** 时间戳转 ISO；不是有限数时给 null，不抛 RangeError。 */
+function toIsoOrNull(ms) {
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
 /** 事件所属仓、编号、动作。只写进本机延迟文件（方便按 PR 对号），取不到记 null。 */
@@ -135,19 +153,33 @@ function appendLatency(file, event, { processedAtMs, pulledAtMs, source }) {
   const receivedAt = typeof event.receivedAt === 'string' ? event.receivedAt : null;
   const receivedMs = receivedAt == null ? Number.NaN : Date.parse(receivedAt);
   const receivedOk = Number.isFinite(receivedMs);
-  appendLatencyRow(file, {
+  // 范围校验：负数说明 receivedAt 在将来（或时钟被拨过），超过 10 分钟不是这一段的本机耗时。
+  let gatewayMs = null;
+  let gatewayMsReject = null;
+  if (receivedAt == null) gatewayMsReject = 'received-at-missing';
+  else if (!receivedOk) gatewayMsReject = 'received-at-invalid';
+  else {
+    const candidate = processedAtMs - receivedMs;
+    if (candidate < 0) gatewayMsReject = 'negative';
+    else if (candidate > GATEWAY_MAX_MS) gatewayMsReject = 'too-large';
+    else gatewayMs = candidate;
+  }
+  const row = {
     deliveryId: event.deliveryId,
     createdAt,
     receivedAt: receivedOk ? receivedAt : null,
-    pulledAt: new Date(pulledAtMs).toISOString(),
+    pulledAt: toIsoOrNull(pulledAtMs),
     processedAt: new Date(processedAtMs).toISOString(),
     latencyMs: Number.isFinite(delta) ? delta : null,
-    gatewayMs: receivedOk ? processedAtMs - receivedMs : null,
+    gatewayMs,
     source,
     repo: eventRepo(event),
     number: eventNumber(event),
     action: eventAction(event),
-  });
+  };
+  // 只在拒绝时留原因，正常行不带这个键。
+  if (gatewayMsReject) row.gatewayMsReject = gatewayMsReject;
+  appendLatencyRow(file, row);
 }
 
 function errorSummary(err) {

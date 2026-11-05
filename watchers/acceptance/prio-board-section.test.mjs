@@ -67,7 +67,8 @@ test('#205 SC1 正常数据：标题、数据源、两条 item、延迟行在最
   assert.match(items[0], /依据/);
   assert.match(text, /第一条依据/);
   assert.match(text, /第二条依据/);
-  assert.match(lines.at(-1), /^关联 PR 延迟 p50 .+ p95 .+/);
+  // 延迟行按指标分两组（P2-1）：事件→写完在前往，gateway 在后，各自带 n。
+  assert.match(lines.at(-1), /^关联 PR 延迟 事件→写完 p50 .+ p95 .+ \(n=\d+\)｜gateway p50 .+ p95 .+ \(n=\d+\)$/);
   assert.equal(text.includes('停更红条'), false);
 });
 
