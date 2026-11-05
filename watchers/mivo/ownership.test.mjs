@@ -1,4 +1,4 @@
-import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
+import { handoffPr, handoffReceipt, withAuthorHandoff, isChildPrList } from './handoff.fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -11,7 +11,7 @@ function probe(t,{collectedPr=pr,livePr=pr,priorEpoch=pr.releaseEpoch,admission=
  const paths=watcherPaths(home);fs.mkdirSync(paths.stateDir,{recursive:true});
  fs.writeFileSync(paths.statePath,JSON.stringify({version:2,repo:REPO,prs:{[pr.id]:{number:1,nodeId:pr.id,sessionId:'original-session',eligibilityInitialized:true,eligibility:'active',admissionVerified:true,admissionEpoch:handoffPr({...pr,releaseEpoch:priorEpoch}).releaseEpoch,handoff:handoffReceipt(pr),activeTask:{status:'complete'}}}}));
  let calls=0;
- const result=scanOnce({enabled:true,allowDispatch:true,paths,now:'2026-09-10T00:00:00Z',ghFn:args=>args[0]==='api'?'owner':JSON.stringify([pr]),
+ const result=scanOnce({enabled:true,allowDispatch:true,paths,now:'2026-09-10T00:00:00Z',ghFn:args=>isChildPrList(args)?'[[]]':args[0]==='api'?'owner':JSON.stringify([pr]),
  collect:()=>withAuthorHandoff({pr:collectedPr,admissionVerified:admission,checks:[{name:'unit',state:'FAILURE',bucket:'fail'}],ci:{status:'failed',required:[{context:'unit',status:'failed',evidence:{id:1,runId:2,attempt:1}}]},policy:{status:'verified',required:[{context:'unit'}]},comments:[],reviews:[],threads:[],labels:[],mergeReady:false},pr),
  ownershipSnapshot:function*(){return {pr:livePr};},dispatchFn:params=>{calls++;assert.equal(params.target_session_id,'original-session');return {target_session_id:'original-session'};}});
  return {calls,result};

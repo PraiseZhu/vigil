@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { pollWorkflow, watcherPaths, feedbackItems, newFeedback, pollFingerprint, normalizePollSnapshot } from './bin/mivo-watcher.mjs';
 import { validateScs } from './bin/mivo-repair.mjs';
-import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
+import { handoffPr, handoffReceipt, withAuthorHandoff, isChildPrList } from './handoff.fixture.mjs';
 
 const ROOT = '/virtual/vigil-thread-close';
 
@@ -99,6 +99,7 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
     const gen = pollWorkflow({
       paths, now, nodeId: pr.id, prNumber: pr.number, enabled: true, allowDispatch: true, budgetMs: 120000, clock: () => 0, snapshotFn: () => snapshot,
       ghFn: (args) => {
+        if (isChildPrList(args)) return '[[]]';
         if (args[0] === 'api' && args[1] === 'user') return 'owner';
         calls.push(args);
         if (replyError && args.some((a) => String(a).includes('addPullRequestReviewThreadReply'))) throw new Error('simulated reply transport failure');

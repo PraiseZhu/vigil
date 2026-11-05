@@ -6,7 +6,7 @@ import path from 'node:path';
 import { DISPATCH_RESERVE_MS, normalizePollSnapshot, pollFingerprint, scanOnce, watcherPaths, watchDispatchConflictMessage } from './bin/mivo-watcher.mjs';
 import { planSessionTitle, repairSessionTitle } from './bin/session-title.mjs';
 import { readPr, writePr as writePrState } from './bin/mivo-state.mjs';
-import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
+import { handoffPr, handoffReceipt, withAuthorHandoff, isChildPrList } from './handoff.fixture.mjs';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'b'.repeat(40);
@@ -52,7 +52,7 @@ function poll(paths, { snapshot, collect, dispatchFn, enabled = true, recheckFn,
   const result = scanOnce({
     mode: 'poll', enabled, allowDispatch: true, paths, now, nodeId, prNumber: 790,
     snapshotFn: () => snapshot,
-    ghFn: (args) => args[0] === 'api' ? 'owner' : args[0] === 'pr' && args[1] === 'view' ? JSON.stringify({ id: nodeId, state: 'OPEN' }) : '[]',
+    ghFn: (args) => isChildPrList(args) ? '[[]]' : args[0] === 'api' ? 'owner' : args[0] === 'pr' && args[1] === 'view' ? JSON.stringify({ id: nodeId, state: 'OPEN' }) : '[]',
     collect: (...args) => {
       collected += 1;
       if (typeof collect === 'function') {

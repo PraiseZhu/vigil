@@ -133,6 +133,7 @@ function fakeGhMain() {
     if (state.fail === 'comments') { process.stderr.write('simulated comments unavailable'); process.exit(1); }
     return send([state.comments]);
   }
+  if (endpoint.includes('/pulls?state=open&base=')) return send([[]]);
   if (endpoint.includes('/rules/branches/')) return send([[]]);
   if (endpoint.includes('/branches/main')) return send({ protected: false });
   if (endpoint.includes('/contents/docs/sync/required-checks.json')) return send({ type: 'file', encoding: 'base64',

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { handoffPr, handoffReceipt, withAuthorHandoff } from './handoff.fixture.mjs';
+import { handoffPr, handoffReceipt, withAuthorHandoff, isChildPrList } from './handoff.fixture.mjs';
 import * as watcher from './bin/mivo-watcher.mjs';
 import { readPr, writePr } from './bin/mivo-state.mjs';
 
@@ -68,7 +68,7 @@ function poll(t, { entry, threads = [botThread()], head = HEAD, tasks = {} } = {
   const outcome = scanOnce({
     mode: 'poll', enabled: true, allowDispatch: true, paths, now: NOW, nodeId: NODE, prNumber: 791,
     snapshotFn: () => snapOf(head, threads),
-    ghFn: (args) => args[0] === 'api' ? 'owner' : '[]',
+    ghFn: (args) => isChildPrList(args) ? '[[]]' : args[0] === 'api' ? 'owner' : '[]',
     collect: (...args) => withAuthorHandoff({ pr, checks: [], requiredChecks: [], ci: { status: 'green', required: [] }, comments: [],
       reviews: [], threads, labels: [], mergeable: 'MERGEABLE', admissionVerified: true, requiredChecksGreen: true, mergeReady: false,
       policy: { status: 'verified', required: [] } }, args[0]),

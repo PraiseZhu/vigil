@@ -38,3 +38,7 @@ export const isMergeBatch = (args) => args[0] === 'api' && args[1] === 'graphql'
 export const mergeBatchBody = (prs, { status = 'CLEAN', tip = 'c'.repeat(40) } = {}) => JSON.stringify({ data: { search: {
   pageInfo: { hasNextPage: false, endCursor: null },
   nodes: prs.map((pr) => ({ id: pr.id, mergeStateStatus: typeof status === 'function' ? status(pr) : status, baseRef: { name: 'main', target: { oid: tip } } })) } } });
+
+// The watcher's read of the open PRs into a head branch (`pulls?state=open&base=<head>`, looking for child PRs).
+// Stubs answer it with `[[]]` (one empty page: none open) so a dispatch is not held back by a stub that never heard of it.
+export const isChildPrList = (args) => args[0] === 'api' && String(args[1] ?? '').includes('/pulls?state=open&base=');
