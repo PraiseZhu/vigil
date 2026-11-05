@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { planSession } from './bin/mivo-watcher.mjs';
-import { planSessionTitle, repairSessionTitle, sessionTitlePrefix, SESSION_TITLE_PREFIX_ENV } from './bin/session-title.mjs';
+import { planSessionTitle, repairSessionTitle, sessionTitlePrefix, shortTaskName, SESSION_TITLE_PREFIX_ENV } from './bin/session-title.mjs';
 
 // The title marker is opt-in (MIVO_SESSION_TITLE_PREFIX / profile `sessionTitlePrefix`). Turning it on must only
 // change titles written from now on: existing sessions keep their title (prefixed or not) and their binding.
@@ -33,8 +33,18 @@ test('profile.json can carry the prefix when the environment does not', (t) => {
   assert.equal(sessionTitlePrefix({ MIVO_WATCHER_HOME: home, [SESSION_TITLE_PREFIX_ENV]: 'GH' }), 'GH');
 });
 
+test('a Chinese prefix is accepted and leaves the task name alone', () => {
+  assert.equal(sessionTitlePrefix(prefixEnv('修PR')), '修PR');
+  const legacy = repairSessionTitle({ task: '终态回执修复', prNumber: 558, createdAt: date });
+  const chinese = repairSessionTitle({ task: '终态回执修复', prNumber: 558, createdAt: date, prefix: '修PR' });
+  assert.equal(chinese, '修PR#558-终态回执修复丨0928');
+  assert.equal(chinese, `修PR${legacy}`, 'the prefix must only prepend; the task name is unchanged');
+  assert.equal(shortTaskName({ task: 'feat: 终态回执修复' }), '终态回执修复');
+  assert.equal(planSessionTitle({ pr, existing: { title: chinese, titleDate: date }, createdAt: date, prefix: '修PR' }).title, chinese);
+});
+
 test('an invalid prefix fails closed instead of producing a broken title', () => {
-  for (const bad of ['1PR', 'P R', 'PR#', 'x'.repeat(17), 'pre丨fix']) {
+  for (const bad of ['修 PR', '修#PR', '修丨PR', '修:PR', 'x'.repeat(17)]) {
     assert.throws(() => sessionTitlePrefix(prefixEnv(bad)), /会话标题前缀无效/);
   }
 });
@@ -73,6 +83,6 @@ test('the maintenance script accepts both the prefixed and the legacy form', () 
   assert.ok(match);
   const re = new RegExp(`^${match[1]}$`, 'u');
   assert.equal(re.test('#558-终态回执修复丨0928'), true, 'legacy titles stay valid for a migration');
-  assert.equal(re.test('PR#558-终态回执修复丨0928'), true, 'a configured prefix is valid');
+  assert.equal(re.test('修PR#558-终态回执修复丨0928'), true, 'a Chinese prefix is valid');
   assert.equal(re.test('MivoPlugin-#558-终态回执修复丨 0928'), false);
 });

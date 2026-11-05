@@ -1,13 +1,14 @@
 import { optionalConfigStrict, requireConfig } from './profile.mjs';
 
 export const SESSION_TITLE_TIME_ZONE = 'Asia/Shanghai';
-// Optional marker in front of the `#N-` part, e.g. `PR#1704-task丨1104`. Off by default so the title
+// Optional marker in front of the `#N-` part, e.g. `修PR#1704-task丨1104`. Off by default so the title
 // format stays exactly what users know; a repo opts in through the environment or profile config.
 export const SESSION_TITLE_PREFIX_ENV = 'MIVO_SESSION_TITLE_PREFIX';
-const SESSION_TITLE_PREFIX_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,15}$/;
-// Both the old (`#N-…`) and the prefixed (`PR#N-…`) shape are canonical: titles written before the
+// Any printable marker (Chinese included); the separators and whitespace are reserved by the title shape.
+const SESSION_TITLE_PREFIX_PATTERN = /^[^\s#丨:]{1,16}$/u;
+// Both the old (`#N-…`) and the prefixed (`修PR#N-…`) shape are canonical: titles written before the
 // prefix existed, or under a different prefix, are kept as they are, never renamed or regenerated.
-const SESSION_TITLE_SHAPE = /^(?:[A-Za-z][A-Za-z0-9_-]{0,15})?#(\d+)-(.+)丨(\d{4})$/u;
+const SESSION_TITLE_SHAPE = /^(?:[^\s#丨:]{1,16})?#(\d+)-(.+)丨(\d{4})$/u;
 // 目标仓库在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
 const MIVO_REPO = requireConfig('targetRepo', {
   envVar: 'MIVO_WATCHER_TARGET_REPO',
@@ -25,7 +26,7 @@ export function sessionTitlePrefix(env = process.env) {
   const value = optionalConfigStrict('sessionTitlePrefix', { envVar: SESSION_TITLE_PREFIX_ENV, env, fallback: '' });
   if (value === undefined || value === null || value === '') return '';
   if (typeof value !== 'string' || !SESSION_TITLE_PREFIX_PATTERN.test(value)) {
-    throw new Error(`会话标题前缀无效：${SESSION_TITLE_PREFIX_ENV} 须为 1–16 位、以字母开头的字母/数字/下划线/连字符；留空表示不加前缀`);
+    throw new Error(`会话标题前缀无效：${SESSION_TITLE_PREFIX_ENV} 须为 1–16 位且不含空白、#、丨、冒号；留空表示不加前缀`);
   }
   return value;
 }
