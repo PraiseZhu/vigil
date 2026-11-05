@@ -5,14 +5,26 @@
 // 事件若只有元数据，调用方用 loadPayload 按需去取正文。这里不读令牌，也不自己发 GitHub 请求。
 // 没有 loadPayload 时不算处理成功：记一次失败，不交给 onEvent。满 5 次后确认移出，延迟记录写「正文被省略」。
 // loadPayload 抛错同样记一次失败。
-// 每处理完一个事件，把 created_at 到处理完成的时间差追加到 .prio/latency.jsonl。
+// 每处理完一个事件，往状态目录的 latency.jsonl 追加一行，记三段：Worker 收到（receivedAt，
+// 由 Worker 写进队列记录）、本机拉到（pulledAt）、本机写完（processedAt，也就是 writtenAt）。
+// latencyMs 仍是「事件发生 → 写完」；另记 gatewayMs = 写完 − Worker 收到，这才是 Worker 之后的本机耗时。
+// receivedAt 缺失或不是可解析的时间时 gatewayMs 记 null，不抛错，也不影响 latencyMs。
 // 目标：Worker 路径 p95 ≤ 10 秒，兜底轮询 ≤ 90 秒（60 秒一轮，留处理余量）。
 // 轮询函数由调用方注入（现有 60 秒轮询留在外面，这里不替换它）。不读令牌。
+// latencyFile 默认是绝对路径（~ 下的状态目录，和 prio-sync 的 stateFiles().latency 同一个位置）；
+// 以前默认是相对 cwd 的 .prio/latency.jsonl，从 cron 拉起时会把文件写到进程自己的 cwd 下。
+// 显式传入相对路径直接报错，不当成相对 cwd。
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 export const PULL_INTERVAL_MS = 2000;
 export const POLL_INTERVAL_MS = 60 * 1000;
+
+/** 延迟文件默认位置。和 prio-sync.mjs 的 stateFiles().latency 是同一个路径，绝对路径，不随 cwd 变。 */
+export function defaultLatencyFile(homeDir = os.homedir()) {
+  return path.join(homeDir, 'acceptance', 'tools', '.prio', 'latency.jsonl');
+}
 
 export async function pullFromWorker({ url, token, fetchImpl = fetch }) {
   const response = await fetchImpl(url, {
@@ -83,20 +95,58 @@ export function latencyPercentiles(rows) {
   return { p50: at(0.5), p95: at(0.95), n: values.length };
 }
 
-function appendRow(file, row) {
+/** 追加一行延迟记录。单次 write 写到 O_APPEND 描述符上；导出给测试用：两个进程同时追加不能出现半行。 */
+export function appendLatencyRow(file, row) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.appendFileSync(file, `${JSON.stringify(row)}\n`, { mode: 0o600 });
+  const line = `${JSON.stringify(row)}\n`;
+  // 以 O_APPEND 打开后一次性写完这一行。两个进程同时追加时，追加位置由内核定，行不会被切开。
+  // mode 只在新建文件时生效：第一次创建就是 0600。
+  const fd = fs.openSync(file, 'a', 0o600);
+  try {
+    fs.writeSync(fd, line);
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
-function appendLatency(file, event, processedAtMs, source) {
+/** 事件所属仓、编号、动作。只写进本机延迟文件（方便按 PR 对号），取不到记 null。 */
+function eventRepo(event) {
+  if (typeof event?.repo === 'string' && event.repo) return event.repo;
+  const fullName = event?.payload?.repository?.full_name;
+  return typeof fullName === 'string' ? fullName : null;
+}
+
+function eventNumber(event) {
+  if (Number.isInteger(event?.number)) return event.number;
+  const payload = event?.payload;
+  const candidates = [payload?.pull_request?.number, payload?.issue?.number, payload?.number];
+  return candidates.find((value) => Number.isInteger(value)) ?? null;
+}
+
+function eventAction(event) {
+  const action = event?.payload?.action;
+  return typeof action === 'string' ? action : null;
+}
+
+function appendLatency(file, event, { processedAtMs, pulledAtMs, source }) {
   const createdAt = event.created_at || event.createdAt || null;
   const delta = typeof createdAt === 'string' ? processedAtMs - Date.parse(createdAt) : null;
-  appendRow(file, {
+  // receivedAt 由 Worker 写。缺失、不是字符串、或解析不出时间时，gatewayMs 记 null，不抛错。
+  const receivedAt = typeof event.receivedAt === 'string' ? event.receivedAt : null;
+  const receivedMs = receivedAt == null ? Number.NaN : Date.parse(receivedAt);
+  const receivedOk = Number.isFinite(receivedMs);
+  appendLatencyRow(file, {
     deliveryId: event.deliveryId,
     createdAt,
+    receivedAt: receivedOk ? receivedAt : null,
+    pulledAt: new Date(pulledAtMs).toISOString(),
     processedAt: new Date(processedAtMs).toISOString(),
     latencyMs: Number.isFinite(delta) ? delta : null,
+    gatewayMs: receivedOk ? processedAtMs - receivedMs : null,
     source,
+    repo: eventRepo(event),
+    number: eventNumber(event),
+    action: eventAction(event),
   });
 }
 
@@ -115,6 +165,8 @@ function errorSummary(err) {
  * payloadOmitted 的事件先交给 loadPayload，由调用方按需取回正文，再交给 onEvent。
  * 没有 loadPayload 时抛出「正文被省略」，走失败计数，不交给 onEvent。loadPayload 抛错同样算失败。
  * confirm 在处理成功（或放弃）之后调用，Worker 才清掉对应事件。
+ * 每处理完一个事件追加一行延迟记录：receivedAt（Worker 收到）、pulledAt（本批拉到的时刻）、
+ * processedAt（写完的时刻）、latencyMs、gatewayMs。
  */
 export async function runEventChannel({
   now = () => Date.now(),
@@ -127,17 +179,20 @@ export async function runEventChannel({
   reportFailure,
   loadPayload,
   onEvent = async () => {},
-  latencyFile = path.join('.prio', 'latency.jsonl'),
+  latencyFile = defaultLatencyFile(),
   pullIntervalMs = PULL_INTERVAL_MS,
   pollIntervalMs = POLL_INTERVAL_MS,
 } = {}) {
+  if (latencyFile && !path.isAbsolute(latencyFile)) {
+    throw new Error(`latencyFile 必须是绝对路径：${latencyFile}`);
+  }
   const seen = new Set();
   let workerUp = true;
   let nextPullAt = now();
   let nextPollAt = now();
 
   function appendAbandon(file, event, result, err, source) {
-    appendRow(file, {
+    appendLatencyRow(file, {
       deliveryId: event?.deliveryId ?? null,
       event: event?.event ?? null,
       failures: result?.failures ?? null,
@@ -148,7 +203,7 @@ export async function runEventChannel({
     });
   }
 
-  async function handle(event, source) {
+  async function handle(event, source, pulledAtMs) {
     const id = event?.deliveryId;
     if (!id) return false;
     if (seen.has(id)) return true;
@@ -160,15 +215,17 @@ export async function runEventChannel({
     }
     await onEvent(current, { source });
     seen.add(id);
-    if (latencyFile) appendLatency(latencyFile, current, now(), source);
+    if (latencyFile) appendLatency(latencyFile, current, { processedAtMs: now(), pulledAtMs, source });
     return true;
   }
 
   async function acceptBatch(events, source, { confirmEvents = false } = {}) {
+    // 这一批拿到的时间。同一拍里多条事件共用它，处理耗时只进 processedAt。
+    const pulledAtMs = now();
     const confirmed = [];
     for (const event of events || []) {
       try {
-        if (await handle(event, source)) confirmed.push(event.deliveryId);
+        if (await handle(event, source, pulledAtMs)) confirmed.push(event.deliveryId);
       } catch (err) {
         // 处理出错：这条先不确认，同批剩下的照常处理。不要记成 Worker 挂了。
         if (typeof reportFailure !== 'function') continue;

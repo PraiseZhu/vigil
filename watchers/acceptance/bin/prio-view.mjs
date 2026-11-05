@@ -4,6 +4,8 @@
 // changes.jsonl / debounce.json / reminded.jsonl / run-YYYY-MM-DD.log 的形状
 // 与 prio-sync.mjs 的 appendChange、saveDebounce、remindOnce、main 运行头一致。
 // latency.jsonl 的形状与 event-pull.mjs 追加的行一致；没有样本时 p50/p95 显示「无数据」。
+// 延迟样本优先用 gatewayMs（Worker 收到 → 写完），没有或不是有限数时才退回 latencyMs（事件发生 → 写完）：
+// 老行没有 receivedAt，只有 latencyMs；两种口径混在一行里时按行各取可用值。
 // 已关闭、已排除的 item 本函数不判断，由调用方过滤。
 // 运行日志跨 UTC 日时，调用方要把前一天的日志拼在前面。
 //
@@ -154,11 +156,19 @@ function freezeText(changes, nowMs, timeZone) {
   return `冻结（1 小时内 ${recent.length} 次，约 ${formatPrioClock(oldestStillNeeded + CHANGE_WINDOW_MS, timeZone)} 解冻）`;
 }
 
+function sampleOf(row) {
+  const gateway = row?.gatewayMs;
+  if (typeof gateway === 'number' && Number.isFinite(gateway)) return gateway;
+  const latency = row?.latencyMs;
+  if (typeof latency === 'number' && Number.isFinite(latency)) return latency;
+  return null;
+}
+
 function percentiles(rows) {
   const values = [];
   for (const row of rows) {
-    const value = row?.latencyMs;
-    if (typeof value === 'number' && Number.isFinite(value)) values.push(value);
+    const value = sampleOf(row);
+    if (value != null) values.push(value);
   }
   values.sort((left, right) => left - right);
   if (!values.length) return { p50: null, p95: null, n: 0 };

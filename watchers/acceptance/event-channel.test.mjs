@@ -10,6 +10,7 @@ import { createEventWorker } from './bin/event-worker.mjs';
 import {
   PULL_INTERVAL_MS,
   POLL_INTERVAL_MS,
+  defaultLatencyFile,
   latencyPercentiles,
   pullFromWorker,
   readLatencyLog,
@@ -1234,4 +1235,186 @@ test('#189 SC4 同一份存储重建 Worker 后失败次数接着数，第 5 次
   assert.equal(abandoned[0].deliveryId, 'retry-189');
   assert.equal(abandoned[0].failures, 5);
   assert.match(abandoned[0].error, /boom-189/);
+});
+
+// W4-b：一条延迟行拆成三段（Worker 收到 / 本机拉到 / 写完）。
+// receivedAt 由 Worker 写进队列记录，pulledAt 由拉取端在 acceptBatch 里记，gatewayMs = 写完 − Worker 收到。
+// latencyMs 语义不变（事件发生 → 写完），现有断言照旧。
+
+test('W4-b SC1 Worker 存 receivedAt：/pull 带出 Worker 收到时间，正文被省略时也带', async () => {
+  const received = Date.parse('2026-10-31T00:00:05.000Z');
+  const worker = createEventWorker({ now: () => received });
+  const env = workerEnv();
+  await enqueueDelivery(worker, env, 'stamped');
+  const events = (await (await worker.fetch(pullRequest(TOKEN), env)).json()).events;
+  assert.equal(events.length, 1);
+  assert.equal(events[0].receivedAt, '2026-10-31T00:00:05.000Z');
+  assert.equal(events[0].created_at, '2026-10-31T00:00:00.000Z');
+
+  // 正文超上限、只留元数据时，receivedAt 不能跟着 payload 一起丢。
+  const tiny = createEventWorker({ now: () => received, maxValueBytes: 64 });
+  const tinyEnv = workerEnv();
+  const big = JSON.stringify({
+    created_at: '2026-10-31T00:00:00.000Z',
+    action: 'opened',
+    body: 'x'.repeat(4000),
+  });
+  const response = await tiny.fetch(webhookRequest(big, { delivery: 'stamped-omitted' }), tinyEnv);
+  assert.equal(response.status, 204);
+  const omitted = (await (await tiny.fetch(pullRequest(TOKEN), tinyEnv)).json()).events[0];
+  assert.equal(omitted.payloadOmitted, true);
+  assert.equal(omitted.receivedAt, '2026-10-31T00:00:05.000Z');
+});
+
+test('W4-b SC2 延迟行同时记 receivedAt / pulledAt / gatewayMs，latencyMs 仍按事件发生时间算', async () => {
+  const dir = tmpDir();
+  const latencyFile = path.join(dir, '.prio', 'latency.jsonl');
+  let t = Date.parse('2026-10-31T00:00:10.000Z');
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: Date.parse('2026-10-31T00:00:10.000Z') + 1,
+    pull: async () => [
+      {
+        deliveryId: 'three-segments',
+        event: 'pull_request',
+        created_at: '2026-10-31T00:00:00.000Z',
+        receivedAt: '2026-10-31T00:00:04.000Z',
+        payload: {
+          action: 'opened',
+          repository: { full_name: 'example-org/owner-a' },
+          pull_request: { number: 42 },
+        },
+      },
+    ],
+    poll: async () => [],
+    onEvent: async () => {
+      // 处理本身耗 1 秒：pulledAt 与 processedAt 就不会撞在同一毫秒上。
+      t += 1000;
+    },
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 1);
+  const [row] = rows;
+  assert.equal(row.deliveryId, 'three-segments');
+  assert.equal(row.createdAt, '2026-10-31T00:00:00.000Z');
+  assert.equal(row.receivedAt, '2026-10-31T00:00:04.000Z');
+  assert.equal(row.pulledAt, '2026-10-31T00:00:10.000Z');
+  assert.equal(row.processedAt, '2026-10-31T00:00:11.000Z');
+  assert.equal(row.latencyMs, 11000);
+  assert.equal(row.gatewayMs, 7000);
+  assert.equal(row.source, 'worker');
+  assert.equal(row.repo, 'example-org/owner-a');
+  assert.equal(row.number, 42);
+  assert.equal(row.action, 'opened');
+  assert.equal(fs.statSync(latencyFile).mode & 0o777, 0o600);
+});
+
+test('W4-b SC3 receivedAt 缺失、非法或不是字符串时 gatewayMs 记 null，latencyMs 照旧且不抛错', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  let t = Date.parse('2026-10-31T00:00:10.000Z');
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: Date.parse('2026-10-31T00:00:10.000Z') + 1,
+    pull: async () => [
+      { deliveryId: 'no-received', created_at: '2026-10-31T00:00:00.000Z' },
+      { deliveryId: 'bad-received', created_at: '2026-10-31T00:00:02.000Z', receivedAt: 'not-a-date' },
+      { deliveryId: 'not-string', created_at: '2026-10-31T00:00:05.000Z', receivedAt: 1761955200000 },
+    ],
+    poll: async () => [],
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 3);
+  for (const row of rows) {
+    assert.equal(row.gatewayMs, null);
+    assert.equal(row.receivedAt, null);
+    assert.equal(typeof row.pulledAt, 'string');
+  }
+  assert.deepEqual(
+    rows.map((row) => [row.deliveryId, row.latencyMs]),
+    [
+      ['no-received', 10000],
+      ['bad-received', 8000],
+      ['not-string', 5000],
+    ],
+  );
+});
+
+test('W4-b SC4 首次追加时自动建目录，新文件权限 0600', async () => {
+  const dir = tmpDir();
+  const latencyFile = path.join(dir, 'deep', 'nested', '.prio', 'latency.jsonl');
+  assert.equal(fs.existsSync(path.dirname(latencyFile)), false);
+  let t = 0;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: 1,
+    pull: async () => [{ deliveryId: 'first-row', created_at: '2026-10-31T00:00:00.000Z' }],
+    poll: async () => [],
+    latencyFile,
+  });
+  assert.equal(readLatencyLog(latencyFile).length, 1);
+  assert.equal(fs.statSync(latencyFile).mode & 0o777, 0o600);
+});
+
+test('W4-b SC4 两个进程同时往同一个 latency.jsonl 追加：行数对得上，没有半行', async () => {
+  const { spawn } = await import('node:child_process');
+  const { pathToFileURL } = await import('node:url');
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const moduleUrl = pathToFileURL(path.join(HERE, 'bin', 'event-pull.mjs')).href;
+  const script = path.join(tmpDir(), 'append-rows.mjs');
+  fs.writeFileSync(
+    script,
+    [
+      `import { appendLatencyRow } from ${JSON.stringify(moduleUrl)};`,
+      'const [file, tag, count] = process.argv.slice(2);',
+      'for (let i = 0; i < Number(count); i += 1) {',
+      "  appendLatencyRow(file, { deliveryId: `${tag}-${i}`, padding: 'x'.repeat(200) });",
+      '}',
+    ].join('\n'),
+  );
+  const write = (tag) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [script, latencyFile, tag, '100'], { stdio: 'ignore' });
+      child.on('error', reject);
+      child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`${tag} 退出码 ${code}`))));
+    });
+  await Promise.all([write('a'), write('b')]);
+  const lines = fs
+    .readFileSync(latencyFile, 'utf8')
+    .split('\n')
+    .filter((line) => line.trim());
+  assert.equal(lines.length, 200);
+  for (const line of lines) {
+    assert.doesNotThrow(() => JSON.parse(line), `出现半行：${line.slice(0, 80)}`);
+  }
+  assert.equal(new Set(lines.map((line) => JSON.parse(line).deliveryId)).size, 200);
+  assert.equal(fs.statSync(latencyFile).mode & 0o777, 0o600);
+});
+
+test('W4-b SC5 延迟文件默认是绝对路径（~ 下的状态目录），传相对路径直接报错', async () => {
+  const fakeHome = path.join(tmpDir(), 'home-example');
+  assert.equal(defaultLatencyFile(fakeHome), path.join(fakeHome, 'acceptance', 'tools', '.prio', 'latency.jsonl'));
+  assert.equal(path.isAbsolute(defaultLatencyFile()), true);
+  assert.equal(defaultLatencyFile().endsWith(path.join('acceptance', 'tools', '.prio', 'latency.jsonl')), true);
+  await assert.rejects(
+    runEventChannel({
+      now: () => 0,
+      sleep: async () => {},
+      until: 1,
+      pull: async () => [],
+      poll: async () => [],
+      latencyFile: path.join('.prio', 'latency.jsonl'),
+    }),
+    /latencyFile 必须是绝对路径/,
+  );
 });

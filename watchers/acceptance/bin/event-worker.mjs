@@ -5,6 +5,8 @@
 // 去重只读这一个 s: 键。队列长度用 queueCount，入队加一，确认减一。
 // 去重条数用 seenCount。只有超过上限时才 list s:，删掉过期的和最旧的。
 // /pull、/ack、/fail 仍按前缀 list 队列。
+// 每条事件另存 receivedAt（Worker 收到这条 webhook 的时间，ISO 字符串），/pull 时原样带出，
+// 本机拿它算 gatewayMs（Worker 收到 → 本机写完）。正文被省略、只留元数据时也照样带。
 // 单个值默认不超过 128 KiB。再大的 payload 只留元数据（delivery id、事件类型、仓库、编号），
 // 存储若直接拒绝写入，也同样改存元数据。拉取端再按需去取正文。
 // 队列最多 1000 条。超过就拒绝新事件并记一条告警，不丢掉最旧的。告警键 a:<deliveryId>，只留最近 50 条。
@@ -167,12 +169,13 @@ function omitPayload(record) {
   return next;
 }
 
-function eventRecord(seq, deliveryId, eventName, payload) {
+function eventRecord(seq, deliveryId, eventName, payload, nowMs) {
   return {
     seq,
     deliveryId,
     event: eventName,
     created_at: eventCreatedAt(payload),
+    receivedAt: Number.isFinite(nowMs) ? new Date(nowMs).toISOString() : null,
     payload,
     failures: 0,
     lastError: null,
@@ -184,6 +187,7 @@ function toPublicEvent(stored) {
     deliveryId: stored.deliveryId,
     event: stored.event,
     created_at: stored.created_at ?? null,
+    receivedAt: stored.receivedAt ?? null,
   };
   if (stored.payloadOmitted) {
     event.repo = stored.repo ?? null;
@@ -380,7 +384,7 @@ async function handleRequest(request, env, durable) {
       await putAlert(txn, deliveryId, `告警 队列已满 ${queueLimit}，拒绝新事件 ${deliveryId}`);
       return;
     }
-    await putQueueEvent(txn, eventRecord(seq, deliveryId, eventName, payload), maxValueBytes);
+    await putQueueEvent(txn, eventRecord(seq, deliveryId, eventName, payload, nowMs), maxValueBytes);
     await txn.put(QUEUE_COUNT_KEY, queueCount + 1);
   });
   if (badJson) return new Response('bad json', { status: 400 });

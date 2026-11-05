@@ -258,6 +258,39 @@ test('#199 SC5 没有延迟样本时 p50/p95 为无数据；20 个样本与手�
   assert.match(onlyNull.lines.find((entry) => entry.startsWith('关联 PR 延迟')), /p50 无数据 p95 无数据/);
 });
 
+test('W4-b SC1 延迟行优先用 gatewayMs（Worker 收到到写完），没有或非法时才退回 latencyMs', () => {
+  const row = (deliveryId, extra) =>
+    `${JSON.stringify({
+      deliveryId,
+      createdAt: '2026-10-31T00:00:00.000Z',
+      receivedAt: '2026-10-31T00:00:04.000Z',
+      pulledAt: '2026-10-31T00:00:10.000Z',
+      processedAt: iso(T0),
+      source: 'worker',
+      ...extra,
+    })}\n`;
+  // 新行：gatewayMs 远小于 latencyMs。取 gatewayMs 才不会把 GitHub 那段算进本机延迟。
+  let latency = row('g1', { latencyMs: 9000, gatewayMs: 1000 });
+  latency += row('g2', { latencyMs: 9000, gatewayMs: 2000 });
+  latency += row('g3', { latencyMs: 9000, gatewayMs: 3000 });
+  latency += row('g4', { latencyMs: 9000, gatewayMs: 4000 });
+  // 老行没有 receivedAt / gatewayMs：退回 latencyMs。
+  latency += JSON.stringify({
+    deliveryId: 'old',
+    createdAt: '2026-10-31T00:00:00.000Z',
+    processedAt: iso(T0),
+    latencyMs: 5000,
+    source: 'worker',
+  }) + '\n';
+  latency += row('null-gateway', { latencyMs: 6000, gatewayMs: null });
+  latency += row('bad-gateway', { latencyMs: 7000, gatewayMs: 'fast' });
+  const view = viewPrio(fresh({ latency }));
+  assert.equal(view.latency.n, 7);
+  assert.equal(view.latency.p50, 4000);
+  assert.equal(view.latency.p95, 7000);
+  assert.match(view.lines.find((entry) => entry.startsWith('关联 PR 延迟')), /p50 4000 p95 7000/);
+});
+
 test('#199 SC6 200 条 item 在 5 秒内返回', () => {
   let changes = '';
   const items = {};
