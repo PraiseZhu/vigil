@@ -157,6 +157,13 @@ PR 上的「盯梢停下了」评论按 (PR, head, blockedKind, 归一化原因)
 
 **同一 head 分支只留一个开着的子 PR**（#329）：子 PR 分支名带修复提交的 sha，每轮修复都是新分支，只查「本分支的 PR 是否开着」拦不住重复。所以两处都按 base 为该 head 分支的开着的 PR 列表去重，只认同仓、分支名以 `vigil/pr-<N>-fix-` 开头的那些。① `processPr` 在派发修复会话前读这份列表：有开着的子 PR 就不派发（`child-pr-open`，附子 PR 编号），读失败也不派发（`child-pr-check-unavailable`），两种情况游标都不前进，等子 PR 合入或关闭后同一批反馈照常重投。② `deliverViaChildPr` 在子 PR 分支还没推送时再读一次：已有别的子 PR 开着就不推新分支、不新开 PR，结果仍是 `blocked` / `child-pr`，`childPr` 指向已开的那个，原因写「已有子 PR #X 仍开着，本轮修复没有另开」；列表读失败时 `finalize` 报错退出，什么都不推。同一提交的重试（远端已有本分支）走原路径，复用自己的分支和 PR。
 
+**子 PR 自带交接文件**（#340）：目标仓有 `docs/pr/_template/review.md` 和 `qa.md` 时，子 PR 一开出来就带上自己的 `docs/pr/<子PR号>/review.md` 与 `qa.md`，目标仓的交接门禁才有文件可验。分工如下。
+- **派发**：任务可改代码时，`processPr` 读 head 分支的有效规则和 PR head SHA 下的两个模板（`readChildPrHandoff`）。规则含 `pull_request` 且两个模板都是普通文件，才在派给修复会话的说明里加「子 PR 交接草稿」一段，并把 `childPrHandoff`（`enabled`、`draftDir`、占位符 `<PR号>`、模板路径）写进 task 文件，重试和恢复派发沿用这份记录。head 分支可直推、目标仓没有模板、规则或模板读取失败时，说明里没有这段，task 里也没有该字段，行为与此前一致。
+- **修复会话**：在 task 文件旁的 `<dispatchId>.child-pr/` 目录写 `review.md`、`qa.md` 两个草稿。结构照 worktree 里的目标仓模板，front matter 的 `kind` 分别是 `review`、`qa`，子 PR 号写字面量 `<PR号>`（此时子 PR 还不存在）。草稿不复制进产品 worktree，会话也不自己提交、推送或开 PR。
+- **`finalize` 校验**：task 带 `childPrHandoff.enabled`、且修复提交里两份模板都在时，才要求草稿。推子分支、开子 PR 之前先校验：两个文件都在、都是普通文件（符号链接不收）、`kind` 对、含 `<PR号>`。不合格就报错并写明缺哪个文件或字段（例如 `child PR handoff draft missing: …/qa.md`、`qa.md front matter kind must be qa, got review`），子分支不推、PR 不开；补齐草稿后重新 `finalize` 即可。别的子 PR 仍开着、本轮只是复用它时，不要求草稿。
+- **`finalize` 填号推送**：修复提交推完、子 PR 开出来之后，把 `<PR号>` 换成子 PR 号，用 git 底层命令（临时 index）生成一个只新增 `docs/pr/<子PR号>/review.md`、`qa.md` 的提交（父提交是修复提交，说明为 `docs: add child PR <号> handoff`），再经同一套原 `pre-push` 钩子和归属守卫推到同一个子分支，并核对远端子分支 head 等于该提交。本地 worktree 的 HEAD 不动，所以 `finalize` 可以原样重跑。结果里的 `childPr` 多 `codeHead`（修复提交）和 `handoffCommit`，`head` 是子分支最终 head。
+- **重试不重复**：子分支已是「修复提交 + 交接提交」且子 PR 开着，什么都不写、不推、不开，直接返回同一结果（不再读草稿）。子分支只有修复提交、子 PR 已开而交接没推上（交接推送失败或进程中断）时，只补交接提交的那一次推送。子分支上是别的提交时报错，不覆盖。
+
 受控 push 可能先于结果回执可见。判断「HEAD 变了」的基准是本次交接认可过的最新 HEAD（`trustedHead`：Ready 时的 HEAD，之后每轮修复任务到达的 HEAD，以及任务派发时的 HEAD），所以第二轮及以后的修复不会被当成作者推送。同一 Ready 代次内，修复会话还在跑时出现的新 HEAD 先按 `head-change-unconfirmed` 等它自己的结果（最多 60 分钟），晚到的有效结果会重新触发消费，即使 PR 指纹没有再次变化。没有会话在跑、或等满 60 分钟，新 HEAD 就算作者自己的推送：没做完的任务作废、它负责的反馈重新投递；已经处理过的反馈不重投，也不额外消耗修复轮次；watcher 以新 HEAD 的隐式回执继续处理，不再永久暂停（事件 `author-push-superseded`）。真正的 Draft 或代次变化仍会永久撤销旧任务。
 
 运行中的命令不能保证被立即打断；这些检查是协作式边界检查，不是宿主对任意文件写入的强制拦截。
