@@ -212,7 +212,9 @@ function errorSummary(err) {
  * 兜底轮询的门槛是 pollAfterFailures：本拍开始时连续失败次数不到这个数就跳过轮询（不调用 poll），
  * 到点照样把下一拍的轮询时间往后推，否则循环会原地打转。拉取成功一次就把连续失败次数清零。
  * hasPending 是第二条门槛：返回 true（还有事件写过但没写成功的目标）时，Worker 正常也每 pollIntervalMs 跑一拍补写，
- * 不等失败计数或 Worker 重投 5 次。poll 收到的参数是 { workerFailing }：发现只在 Worker 失败时跑。
+ * 不等失败计数或 Worker 重投 5 次。补写通道自己有退避（60 秒 → 5 分钟 → 15 分钟，第 4 次失败放弃并移出 pending），
+ * 所以「有 pending」不一定这一拍真去写，门槛只看有没有待补目标，不在这里重复判退避。
+ * poll 收到的参数是 { workerFailing }：发现只在 Worker 失败时跑。
  * 每处理完一个事件追加一行延迟记录：receivedAt（Worker 收到）、pulledAt（本批拉到的时刻）、
  * processedAt（写完的时刻）、latencyMs、gatewayMs。
  */
