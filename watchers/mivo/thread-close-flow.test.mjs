@@ -7,6 +7,9 @@ import { pollWorkflow, watcherPaths, feedbackItems, newFeedback, pollFingerprint
 import { validateScs } from './bin/mivo-repair.mjs';
 import { handoffPr, handoffReceipt, withAuthorHandoff, isChildPrList } from './handoff.fixture.mjs';
 
+// The dispatch asks for child PR handoff drafts by reading the head rules and templates; those reads are not the replies and resolves counted below.
+const isHandoffProbe = (args) => args[0] === 'api' && /\/(?:rules\/branches|contents)\//.test(String(args[1] ?? ''));
+
 const ROOT = '/virtual/vigil-thread-close';
 
 function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = false, outdated = false, badCi = false, replyError = false, legacyIntent = false, frozen = null, deleteErrors = 0 } = {}) {
@@ -100,6 +103,7 @@ function fixture({ kind = 'fixed', waiting = false, human = false, unrelated = f
       paths, now, nodeId: pr.id, prNumber: pr.number, enabled: true, allowDispatch: true, budgetMs: 120000, clock: () => 0, snapshotFn: () => snapshot,
       ghFn: (args) => {
         if (isChildPrList(args)) return '[[]]';
+        if (isHandoffProbe(args)) return '{}';
         if (args[0] === 'api' && args[1] === 'user') return 'owner';
         calls.push(args);
         if (replyError && args.some((a) => String(a).includes('addPullRequestReviewThreadReply'))) throw new Error('simulated reply transport failure');
