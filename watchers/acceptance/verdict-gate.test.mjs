@@ -626,6 +626,46 @@ function boardCallsFor(github, ref) {
   return github.gateCalls.filter((action) => action.type === 'project.field.set' && action.ref === ref);
 }
 
+/**
+ * 把读回来的评论作者一律换成写 App 的 bot 身份：GraphQL 的 `Bot.login` 不带 `[bot]` 后缀，只有 __typename 说是 Bot。
+ * 写走 App 的仓（profile.apps.write）现场就是这个形状；issue 作者不动（issue 是本人建的）。
+ * 包在“读”这一侧：宿主自己的 github 和写闸自己的 github 都要包，否则写闸那份读还是本人作者，测不出问题。
+ */
+function botAuthored(client, { login = 'example-automation', type = 'Bot' } = {}) {
+  function walk(value) {
+    if (Array.isArray(value)) {
+      value.forEach(walk);
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    if (value.databaseId != null && value.author && typeof value.author.login === 'string') {
+      value.author = { login, __typename: type };
+    }
+    for (const item of Object.values(value)) walk(item);
+  }
+  const orig = client.graphql;
+  client.graphql = async (query, variables) => {
+    const data = await orig(query, variables);
+    walk(data);
+    return data;
+  };
+  return client;
+}
+
+test('认领：写 App 发的轮次评论（Bot.login 不带 [bot] 后缀）认得出来，看板照写、不记 board-claim-failed', async () => {
+  const { home, profile, paths } = setup({ profile: { trustedBotLogins: ['example-automation[bot]'] } });
+  const world = claimableWorld();
+  // 写闸和巡主侧读回来的评论都是写 App 的身份，跟现场一样。
+  const gate = createGate({ home, profile, github: botAuthored(gateGithub(world)), run: procRun, binding: null, which: async () => false });
+  const github = botAuthored(realGithubThroughGate({ profile, world, gate }));
+  const result = await claim(github, profile);
+  assert.equal(result.code, 0, result.err);
+  assert.equal(result.err, '', '认领后看板写「验收中」不该失败');
+  for (const ref of [ROOT_REF, `${REPO}#2`, `${OTHER_REPO}#7`]) assert.equal(world.get(ref).project['验收'], '验收中', ref);
+  assert.equal(readAlerts(paths).filter((alert) => alert.kind === 'board-claim-failed').length, 0);
+  assert.equal(readAlerts(paths).filter((alert) => alert.kind === 'gate-rejected').length, 0);
+});
+
 test('认领后看板外发失败：先查看板没写成 → 经写闸重试一次写成，不记 board-claim-failed', async () => {
   const { home, profile, paths } = setup();
   const world = claimableWorld();
