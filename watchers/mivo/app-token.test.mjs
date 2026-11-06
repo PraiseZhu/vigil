@@ -133,6 +133,29 @@ test('a token that cannot be revoked is reported as its own failure and does not
   assert.deepEqual(thrown.failures, [{ phase: 'revoke', expected: 'http 204', actual: 'request failed Error' }]);
 });
 
+// `canContinue` is asked before the mint and before every resolve; the first no ends the resolving, the rest are
+// reported as budget failures (not as resolve failures), and a minted token is still revoked.
+const spent = (...ids) => ids.map((threadId) => ({ threadId, phase: 'budget', expected: 'time left in the round', actual: 'round budget spent' }));
+test('canContinue: with no time before the mint nothing is requested; the first no after it stops the resolves and the token is still revoked', async () => {
+  const none = network();
+  assert.deepEqual(await call(none, { canContinue: () => false }), { resolved: [], failures: spent('PRRT_a', 'PRRT_b') });
+  assert.deepEqual(none.calls, [], 'no mint, so no token to use or revoke');
+  const answers = [true, true, false];
+  const net = network();
+  const out = await call(net, { canContinue: () => answers.shift() });
+  assert.deepEqual(out, { resolved: ['PRRT_a'], failures: spent('PRRT_b') });
+  assert.deepEqual(net.calls.map((c) => [c.method, c.url.split('/').pop()]), [['POST', 'access_tokens'], ['POST', 'graphql'], ['DELETE', 'token']]);
+  const all = await call(network(), { canContinue: () => true });
+  assert.deepEqual(all, { resolved: ['PRRT_a', 'PRRT_b'], failures: [] }, 'with time to spare it behaves as without');
+});
+
+test('canContinue that throws counts as no time left', async () => {
+  const net = network();
+  const out = await call(net, { canContinue: () => { throw new Error('clock broke'); } });
+  assert.deepEqual(out, { resolved: [], failures: spent('PRRT_a', 'PRRT_b') });
+  assert.deepEqual(net.calls, []);
+});
+
 test('no failure, success or anything else the call returns ever contains the token, the JWT, the key or a response body', async () => {
   const leaks = [TOKEN, 'Validation Failed', 'Resource not accessible', 'socket closed', 'PRIVATE KEY'];
   for (const plan of [{ mint: () => json(422, { message: `Validation Failed ${TOKEN}` }), }, {

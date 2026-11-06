@@ -98,6 +98,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 - **本人的 open PR**：在原有的采集流程里关闭，收据写在该 PR 的 `state/prs/<nodeId>.json`（`autoClosedThreads`），命中的讨论串不再派给修复会话。
 - **别的作者的 open 非 Draft PR**：这是整个功能新增的范围，**只关、不接管**。每轮 discover 在处理完本人 PR 之后读一次目标仓的 open PR 列表，对作者不是盯梢账号（不分大小写）的非 Draft PR 逐个读讨论串，命中就关。盯梢账号对这些 PR 只发 GraphQL 读请求；不派修复会话，不绑会话，不写交接，不进 `state/prs/`，不发评论或回帖。收据、上次扫描时间和上次失败（只含阶段、期望值、实际值）写在 `state/server-fixed.json`，PR 不再 open 时这条记录随之删除。
 - **节流**：同一个 PR 距上次扫描不满 `fullCollectMs`（默认 10 分钟）不再读。到期的按上次扫描时间由旧到新排队，没扫过的排最前。本轮剩余时间（整轮截止减 `dispatchReserveMs`）不够时，剩下的留给下一轮，没扫完的 PR 不记扫描时间，所以下一轮最先扫它们。读取失败、PR 在读取期间关闭、转 Draft、换作者或推了新提交，也不记扫描时间。App 失败算一次扫描，下次到期再试。
+- **一个 PR 的批量关闭也受剩余时间约束**：App 换令牌和逐条 resolve 前都先问「整轮截止 − `dispatchReserveMs` − 一次 App 请求的超时（15 秒）」之前还有没有时间；没有就不再发新的请求，直接撤销令牌（撤销一定会发），还没处理的讨论串留到下一轮。已经关掉的讨论串立即写收据；因时间没处理的讨论串不记失败、不出错误事件；这个 PR 也不记扫描时间（保持原来的时间戳，下一轮因为最旧而最先扫），本轮后面的 PR 不再扫，并报 `other-server-fixed-scan-deferred`（`remaining` 是含这个 PR 在内没扫完的 PR 数，`threads` 是这个 PR 里没处理的讨论串数）。本人 PR 的批量关闭不受此约束。
 - **事件**（`scope` 都是 `other-pr`）：`server-fixed-thread-resolved`、`server-fixed-thread-resolve-failed`（带 `phase` / `expected` / `actual`）、`server-fixed-thread-token-revoke-failed`、`other-server-fixed-scan-failed`（`stage` 是 `list` / `scan` / `state`）、`other-server-fixed-scan-deferred`。discover 的返回值多一项 `otherPrs: {scanned, closed, deferred}`，只在这条旁路执行时出现。
 
 ### validate 运行方式与证据（本地预检）

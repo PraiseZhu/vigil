@@ -50,7 +50,8 @@ const threadReads = (calls) => calls.map(threadReadOf).filter(Boolean);
 const isWrite = (args) => args.some((arg) => /^(?:-X|--method|--input)$/.test(String(arg)) || /mutation/.test(String(arg)))
   || (['pr', 'issue'].includes(args[0]) && ['comment', 'review', 'edit', 'close', 'merge', 'ready', 'create', 'reopen'].includes(args[1]));
 const spy = (answer) => { const log = []; const fn = (args) => { log.push(args); return typeof answer === 'function' ? answer(args) : answer; }; return Object.assign(fn, { log }); };
-const resolving = () => spy(({ threadIds }) => ({ resolved: threadIds, failures: [] }));
+// Logs what the App was asked to close; the round hands it a `canContinue` too, which the budget test below exercises.
+const resolving = () => { const log = []; const fn = ({ threadIds, repo }) => { log.push({ threadIds, repo }); return { resolved: threadIds, failures: [] }; }; return Object.assign(fn, { log }); };
 
 // The viewer's own PR needs a repair session (required CI failed), so a normal round has real work to do and shows what
 // the other authors' path must not touch.
@@ -368,6 +369,54 @@ test('a round with no time left before the other PRs start reads nothing of them
     collect: (pr) => { now += 130000; return failing(pr); } });
   assert.deepEqual(sideCalls(run.calls), []);
   assert.deepEqual(otherEvents(run), [{ kind: 'other-server-fixed-scan-deferred', scope: 'other-pr', reason: 'budget' }]);
+});
+
+// A logical clock and an App whose every request takes 14 s (inside the 15 s request timeout): the viewer's own PR has
+// used 100 s of the 165 s round, so the other PRs have 40 s left after the 25 s dispatch reserve.
+test('a slow App call stops resolving when the round runs out of time: the token is still revoked, earned receipts stay, and the rest is first next round', async (t) => {
+  let now = 1_000_000;
+  const started = now;
+  const nine = Array.from({ length: 9 }, (_, index) => fixedThread(index + 1));
+  const w = world(t, { others: [otherPr(900), otherPr(901)], threads: { PR_900: nine, PR_901: [fixedThread(20)] } });
+  const minutesAgo = (n) => new Date(Date.parse(NOW) - n * 60000).toISOString();
+  fs.writeFileSync(path.join(w.paths.stateDir, 'server-fixed.json'), JSON.stringify({ version: 1, repo: REPO, prs: {
+    PR_900: { number: 900, lastScannedAt: minutesAgo(30) }, PR_901: { number: 901, lastScannedAt: minutesAgo(20) } } }));
+  const requests = [];
+  const slowApp = (args) => resolveThreadsWithApp({ ...args, env: APP_ENV, readFile: () => KEY_PEM, fetchImpl: async (url, init) => {
+    requests.push([url.split('/').pop(), now - started]);
+    now += 14000;
+    if (url.endsWith('/access_tokens')) return { status: 201, json: async () => ({ token: TOKEN }) };
+    if (init.method === 'DELETE') return { status: 204 };
+    const tid = JSON.parse(init.body).variables.tid;
+    return { status: 200, json: async () => ({ data: { resolveReviewThread: { thread: { id: tid, isResolved: true } } } }) };
+  } });
+  const run = await round(w, { appResolveFn: slowApp, clock: () => now, budgetMs: 165000, dispatchReserveMs: 25000,
+    collect: (pr) => { now += 100000; return failing(pr); } });
+  // Mint at 100 s; one resolve at 114 s; at 128 s the cut-off (round end - reserve - one request timeout = 125 s) has passed,
+  // so the revoke goes out at once and the round is back at 142 s, well before its 165 s end.
+  assert.deepEqual(requests, [['access_tokens', 100000], ['graphql', 114000], ['token', 128000]]);
+  assert.ok(now - started < 165000, 'the App call is over before the round is');
+  const saved = readServerFixedState(w.paths).prs;
+  assert.deepEqual(Object.keys(saved.PR_900.autoClosedThreads), ['PRRT_1'], 'the thread that was closed has its receipt');
+  assert.equal(saved.PR_900.lastScannedAt, minutesAgo(30), 'a PR that was cut off is not stamped, so it stays the oldest');
+  assert.deepEqual(saved.PR_900.lastFailures ?? {}, {}, 'running out of time is not a failure of the threads left');
+  assert.equal(saved.PR_901.lastScannedAt, minutesAgo(20));
+  assert.deepEqual(threadReads(run.calls), ['PR_900'], 'the PR after it is not read');
+  assert.deepEqual(otherEvents(run), [
+    { kind: 'server-fixed-thread-resolved', scope: 'other-pr', number: 900, threadId: 'PRRT_1', key: KEY },
+    { kind: 'other-server-fixed-scan-deferred', scope: 'other-pr', reason: 'budget', remaining: 2, threads: 8 },
+  ]);
+  assert.deepEqual(run.out.otherPrs, { scanned: 0, closed: 1, deferred: 2 });
+  assert.deepEqual(run.calls.filter(isWrite), [], 'this account made no write call');
+  // Next round, with a fast App: the cut-off PR comes first, the thread that already has its receipt is not asked again.
+  const healthy = github();
+  const next = await round(w, { now: SOON, appResolveFn: healthy.appResolveFn });
+  assert.deepEqual(threadReads(next.calls), ['PR_900', 'PR_901']);
+  assert.equal(healthy.calls.filter((call) => call.url.endsWith('/graphql')).length, 8 + 1, 'eight left on #900, one on #901');
+  const after = readServerFixedState(w.paths).prs;
+  assert.equal(Object.keys(after.PR_900.autoClosedThreads).length, 9);
+  assert.equal(after.PR_900.lastScannedAt, SOON);
+  assert.equal(after.PR_901.lastScannedAt, SOON);
 });
 
 // state

@@ -16,7 +16,7 @@ import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_EN
 import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor, isMemberFeedback, FEEDBACK_POLICY_VERSION } from './mivo-feedback-policy.mjs';
 import {lifelineFeedback} from './mivo-lifeline-source.mjs';
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent, completedMemberFeedback, coveredFeedbackItems, replyToMemberFeedback, requestMemberReviewers, partitionServerFixedThreads, resolveServerFixedThreads, SERVER_FIXED_REASON } from './mivo-review-resolve.mjs';
-import { resolveWithAppEnabled, resolveThreadsWithApp } from './mivo-app-token.mjs';
+import { resolveWithAppEnabled, resolveThreadsWithApp, REQUEST_TIMEOUT_MS as APP_REQUEST_TIMEOUT_MS } from './mivo-app-token.mjs';
 import { codeScanningFeedbackItems } from './mivo-code-scanning.mjs';
 import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue, reconcileReviewRecheck, readBaseDrift, isSyncableBase, readHeadSyncHold } from './mivo-pr-actions.mjs';
 import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath, findingMarkerOf, childPrListArgs, parseOpenChildPrs, childPrDraftPaths, childPrHandoffSpec, CHILD_PR_PLACEHOLDER } from './mivo-repair.mjs';
@@ -3859,14 +3859,17 @@ function* readOtherPrThreads({ pr, viewer, ghFn, canContinue }) {
 
 // One PR: read its threads, resolve the recognized ones with the App in one call, return what to remember and report.
 // A failed resolve still counts as a look (it is retried after fullCollectMs and logged with expected and actual); the
-// thread stays open and nothing falls back to this account.
-function* scanOtherPr({ pr, record, viewer, ghFn, appResolveFn, now, canContinue }) {
+// thread stays open and nothing falls back to this account. `canResolve` is asked before the App's mint and before each
+// of its resolves; when it says no, the threads not yet tried are left for the next round: what was closed keeps its
+// receipt (record, closed, events come back with scanned:false), nothing is written for the rest, and the PR is not
+// stamped.
+function* scanOtherPr({ pr, record, viewer, ghFn, appResolveFn, now, canContinue, canResolve }) {
   const read = yield* readOtherPrThreads({ pr, viewer, ghFn, canContinue });
   if (!read.ok) return { scanned: false, reason: read.reason, events: [] };
   const { eligible } = partitionServerFixedThreads(read.threads, read.head, record);
   if (eligible.length === 0) return { scanned: true, record: { ...record, number: pr.number, lastScannedAt: now, lastFailures: {} }, closed: [], events: [] };
-  if (!canContinue()) return { scanned: false, reason: 'budget', events: [] };
-  const outcome = yield* resolveServerFixedThreads({ eligible, previous: record, appResolveFn, repo: REPO, now });
+  if (!canResolve()) return { scanned: false, reason: 'budget', events: [] };
+  const outcome = yield* resolveServerFixedThreads({ eligible, previous: record, appResolveFn, repo: REPO, now, canContinue: canResolve });
   const scope = 'other-pr';
   const events = outcome.closed.map(({ threadId, key }) => ({ kind: 'server-fixed-thread-resolved', scope, number: pr.number, threadId, key }));
   const lastFailures = {};
@@ -3877,6 +3880,10 @@ function* scanOtherPr({ pr, record, viewer, ghFn, appResolveFn, now, canContinue
   for (const { phase, expected, actual } of outcome.revokeFailures) {
     events.push({ kind: 'server-fixed-thread-token-revoke-failed', scope, number: pr.number, phase, expected, actual });
   }
+  if (outcome.deferred.length > 0) {
+    return { scanned: false, reason: 'budget', deferredThreads: outcome.deferred.length, closed: outcome.closed, events,
+      record: { ...record, number: pr.number, autoClosedThreads: outcome.previous.autoClosedThreads, lastFailures } };
+  }
   return { scanned: true, closed: outcome.closed, events,
     record: { number: pr.number, lastScannedAt: now, autoClosedThreads: outcome.previous.autoClosedThreads, lastFailures } };
 }
@@ -3886,6 +3893,9 @@ function* scanOtherPr({ pr, record, viewer, ghFn, appResolveFn, now, canContinue
 export function* discoverOtherPrs({ ghFn, viewer, paths, now, events, appResolveFn = resolveThreadsWithApp,
   fullCollectMs = FULL_COLLECT_MS, deadline, dispatchReserveMs = DISPATCH_RESERVE_MS, clock = Date.now }) {
   const canContinue = () => deadline - dispatchReserveMs - clock() > 0;
+  // The App's requests (mint, each resolve) may only start while one more request (the revoke) still ends inside that
+  // time too: the slowest one lasts REQUEST_TIMEOUT_MS, so the whole call is over before the dispatch reserve begins.
+  const canResolve = () => deadline - dispatchReserveMs - APP_REQUEST_TIMEOUT_MS - clock() > 0;
   const summary = { scanned: 0, closed: 0, deferred: 0 };
   const note = (event) => events.push({ scope: 'other-pr', ...event });
   const reasonOf = (error) => String(error?.message ?? error).slice(0, 200);
@@ -3904,12 +3914,13 @@ export function* discoverOtherPrs({ ghFn, viewer, paths, now, events, appResolve
   const due = nodes.filter((node) => isOtherPrCandidate(node, viewer) && otherPrScanDue(state.prs[String(node.id)], now, fullCollectMs))
     .sort((a, b) => lastScan(a) - lastScan(b) || a.number - b.number);
   for (const [index, pr] of due.entries()) {
-    const deferRest = () => { summary.deferred = due.length - index; note({ kind: 'other-server-fixed-scan-deferred', reason: 'budget', remaining: summary.deferred }); };
+    const deferRest = (extra = {}) => { summary.deferred = due.length - index; note({ kind: 'other-server-fixed-scan-deferred', reason: 'budget', remaining: summary.deferred, ...extra }); };
     if (!canContinue()) { deferRest(); break; }
     let result;
-    try { result = yield* scanOtherPr({ pr, record: state.prs[String(pr.id)] ?? {}, viewer, ghFn, appResolveFn, now, canContinue }); }
+    try { result = yield* scanOtherPr({ pr, record: state.prs[String(pr.id)] ?? {}, viewer, ghFn, appResolveFn, now, canContinue, canResolve }); }
     catch (error) { note({ kind: 'other-server-fixed-scan-failed', stage: 'scan', number: pr.number, reason: reasonOf(error) }); continue; }
-    if (!result.scanned) {
+    // A PR cut off partway still brings a record: the threads it did close keep their receipts.
+    if (!result.scanned && !result.record) {
       if (result.reason === 'budget') { deferRest(); break; }
       continue;
     }
@@ -3920,8 +3931,9 @@ export function* discoverOtherPrs({ ghFn, viewer, paths, now, events, appResolve
       writeServerFixedState(paths, state);
     } catch (error) { note({ kind: 'other-server-fixed-scan-failed', stage: 'state', number: pr.number, reason: reasonOf(error) }); }
     events.push(...result.events);
-    summary.scanned += 1;
     summary.closed += result.closed.length;
+    if (!result.scanned) { deferRest({ threads: result.deferredThreads }); break; }
+    summary.scanned += 1;
   }
   return summary;
 }
