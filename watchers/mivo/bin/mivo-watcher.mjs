@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { execFile, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { planSessionTitle, repairSessionTitle } from './session-title.mjs';
+import { newSessionTitle, planSessionTitle, repairSessionTitle } from './session-title.mjs';
 import { collectPublicReview, evaluatePublicReview, isReviewerAuthor, reviewerFindingReviewIds, isReviewerCleanReport } from './public-review.mjs';
 import { collectPrSnapshot, collectPrOwnership, collectMergeStates, readMergeState, readMergeStatus, mergeStateIsBatched } from './mivo-pr-snapshot.mjs';
 import { selectHandoff, isCurrentHandoff, implicitHandoff } from './mivo-handoff.mjs';
@@ -469,7 +469,10 @@ export function planSession({ pr, existing, date, task }) {
   return {
     action: 'create-intent',
     sessionId: null,
-    ...planSessionTitle({ pr: { ...pr, title: task ?? pr.title }, createdAt: date }),
+    // No session to resume: the title is built for the session being created, with the current prefix. A stored
+    // title belongs to the session that already ended (retired or never claimed), so it is not reused (see
+    // newSessionTitle); only its date is carried over.
+    ...newSessionTitle({ pr: { ...pr, title: task ?? pr.title }, existing: existing ?? {}, createdAt: date }),
     nodeId,
   };
 }
@@ -2884,13 +2887,19 @@ export function* processPr({
       report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'recovery-handoff-invalid' } });
       return;
     }
+    // A retry that will create a session (no target session) takes the current prefix too; only a retry that
+    // resumes an existing session keeps the stored title, which that session already carries. The same mapping
+    // goes to the receipt, so the title that was sent is the title that gets persisted.
+    const retryMapping = previous.pendingDispatch.params?.target_session_id
+      ? mapping
+      : { ...mapping, ...newSessionTitle({ pr, existing: mapping, createdAt: now }) };
     const pending = { ...previous.pendingDispatch, attempts: Number(previous.pendingDispatch.attempts ?? 1) + 1,
-      params: constrainRetryDispatch({ ...previous.pendingDispatch.params, title: mapping.title }, retryTask) };
+      params: constrainRetryDispatch({ ...previous.pendingDispatch.params, title: retryMapping.title }, retryTask) };
     state.prs[key] = { ...previous, pendingDispatch: pending };
     persistState(state, paths);
     try {
       const receipt = yield* yieldDispatch(() => dispatchFn(pending.params,{timeoutMs:Math.max(1,remaining())}));
-      const bound = applyDispatchReceipt({ state, pr, mapping,
+      const bound = applyDispatchReceipt({ state, pr, mapping: retryMapping,
         receipt: { ...receipt, dispatch_id: receipt?.dispatch_id ?? pending.dispatchId },
         now, cursor: pending.cursor ?? retainedCursor, collected, fresh: [], paths, recovery: pending.recovery === true });
       previous = yield* notifyDispatchConflictOnce({ previous: state.prs[key], key, paths, now, dryRun, dispatchFn, remaining, pr, ghFn });
@@ -2963,7 +2972,9 @@ export function* processPr({
       handoffNote = sessionHandoffNote({ pr, previous, paths });
       previous = { ...previous, sessionId: null, claimedAt: null,
         predecessors: [...(previous.predecessors ?? []), { sessionId: previous.sessionId, at: now, reason: 'task-complete', lastDispatch: previous.lastDispatch ?? null }] };
-      dispatchMapping = { ...mapping, sessionId: null };
+      // The session being replaced is retired: this dispatch creates a new one, so its title is rebuilt with the
+      // current prefix instead of reusing the stored text that belonged to the retired session.
+      dispatchMapping = planSession({ pr, existing: previous, date: now });
     }
     const prefix = [reclaimNote(previous, pr.headRefName), handoffNote, messagePrefix].filter(Boolean).join('\n');
     // Asked once per delivery, and only when this task may change code: it decides whether the session is told to
