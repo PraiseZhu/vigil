@@ -768,6 +768,161 @@ test('P2-4 默认锁路径就是整盘那把 /tmp/prio-write.lock', () => {
   assert.equal(WRITE_LOCK_FILE, '/tmp/prio-write.lock');
 });
 
+function fakeClock(start = T0) {
+  let now = start;
+  const sleeps = [];
+  return {
+    now: () => now,
+    sleeps,
+    async sleep(ms) {
+      sleeps.push(ms);
+      now += ms;
+    },
+    advance(ms) {
+      now += ms;
+    },
+  };
+}
+
+test('SC1-边界1 无 flock、无 .item（整盘读阶段）单条立即拿到锁并写入', async () => {
+  const env = setup();
+  const lockFile = path.join(env.dir, 'prio-write.lock');
+  const clock = fakeClock();
+  const fake = fakeGithub({ readback: () => ({ node: { fieldValues: { nodes: [fieldValue('single', '优先级', 'P2')] } } }) });
+  env.reader = readerFor(fake, env.profile);
+  const { result, gate } = await sync(env, {
+    apply: true,
+    lockPath: lockFile,
+    lockOptions: { retryMs: 20, maxWaitMs: 200, now: clock.now, sleep: clock.sleep },
+  });
+  assert.equal(result.skipped, undefined);
+  assert.equal(result.written, 1);
+  assert.equal(gate.writes.length, 1);
+  assert.equal(clock.sleeps.length, 0, '空闲时不该空等');
+  assert.equal(fs.existsSync(`${lockFile}.item`), false, '写完要释放持有者文件');
+});
+
+test('SC1-边界2 .item 在一条写的时限内释放，单条等到后写入', async () => {
+  const env = setup();
+  const lockFile = path.join(env.dir, 'prio-write.lock');
+  const markerFile = `${lockFile}.item`;
+  fs.writeFileSync(markerFile, `${JSON.stringify({ pid: process.pid, startedAt: new Date(T0).toISOString() })}\n`);
+  const clock = fakeClock();
+  const fake = fakeGithub({ readback: () => ({ node: { fieldValues: { nodes: [fieldValue('single', '优先级', 'P2')] } } }) });
+  env.reader = readerFor(fake, env.profile);
+  const { result, gate } = await sync(env, {
+    apply: true,
+    lockPath: lockFile,
+    lockOptions: {
+      retryMs: 40,
+      maxWaitMs: 200,
+      now: clock.now,
+      async sleep(ms) {
+        clock.sleeps.push(ms);
+        clock.advance(ms);
+        try {
+          fs.unlinkSync(markerFile);
+        } catch {
+          // 已经没了就算释放过。
+        }
+      },
+    },
+  });
+  assert.equal(result.written, 1);
+  assert.equal(gate.writes.length, 1);
+  assert.ok(clock.sleeps.length >= 1, '被占时至少等一次');
+  assert.ok(clock.sleeps.reduce((sum, ms) => sum + ms, 0) < 10_000, '不等整拍');
+});
+
+test('SC1-边界3 .item 被活进程占超过上限，单条 lock-busy 不读不写', async () => {
+  const env = setup();
+  const lockFile = path.join(env.dir, 'prio-write.lock');
+  const markerFile = `${lockFile}.item`;
+  fs.writeFileSync(markerFile, `${JSON.stringify({ pid: process.pid, startedAt: new Date(T0).toISOString() })}\n`);
+  const clock = fakeClock();
+  const fake = fakeGithub();
+  env.reader = readerFor(fake, env.profile);
+  const { result, gate } = await sync(env, {
+    apply: true,
+    lockPath: lockFile,
+    lockOptions: { retryMs: 40, maxWaitMs: 120, now: clock.now, sleep: clock.sleep },
+  });
+  assert.equal(result.skipped, 'lock-busy');
+  assert.equal(result.lock, 'marker');
+  assert.equal(result.written, 0);
+  assert.equal(fake.queries.length, 0, '锁被占时不该去读看板');
+  assert.equal(gate.writes.length, 0);
+  assert.ok(clock.sleeps.length >= 1);
+});
+
+test('SC1-边界4 假锁探测到 flock/open-fd 立即 lock-busy、0 次查询', async () => {
+  const env = setup();
+  const lockFile = path.join(env.dir, 'prio-write.lock');
+  const clock = fakeClock();
+  const fake = fakeGithub();
+  env.reader = readerFor(fake, env.profile);
+  const { result, gate } = await sync(env, {
+    apply: true,
+    lockPath: lockFile,
+    lockOptions: {
+      retryMs: 2000,
+      maxWaitMs: 10000,
+      probe: () => ({ held: true, known: true, reason: 'open-fd' }),
+      now: clock.now,
+      sleep: clock.sleep,
+    },
+  });
+  assert.equal(result.skipped, 'lock-busy');
+  assert.equal(result.lock, 'open-fd');
+  assert.equal(result.written, 0);
+  assert.equal(fake.queries.length, 0);
+  assert.equal(gate.writes.length, 0);
+  assert.equal(clock.sleeps.length, 0, 'flock/open-fd 忙时立即返回，不空等 10 秒');
+});
+
+test('SC1-边界4 真 flock 占着锁文件，单条立即 lock-busy、0 次查询', { skip: FLOCK_SKIP }, async () => {
+  const env = setup();
+  const lockFile = path.join(env.dir, 'prio-write.lock');
+  fs.writeFileSync(lockFile, '');
+  const child = spawn('flock', [lockFile, 'sleep', '20'], { stdio: 'ignore' });
+  const clock = fakeClock();
+  try {
+    assert.equal(await waitUntil(() => writeLockHeld({ file: lockFile }).held === true), true, '没探测到 flock');
+    const fake = fakeGithub();
+    env.reader = readerFor(fake, env.profile);
+    const started = Date.now();
+    const { result, gate } = await sync(env, {
+      apply: true,
+      lockPath: lockFile,
+      lockOptions: { retryMs: 2000, maxWaitMs: 10000, now: clock.now, sleep: clock.sleep },
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(result.skipped, 'lock-busy');
+    assert.ok(result.lock === 'proc-locks' || result.lock === 'open-fd', result.lock);
+    assert.equal(result.written, 0);
+    assert.equal(fake.queries.length, 0);
+    assert.equal(gate.writes.length, 0);
+    assert.equal(clock.sleeps.length, 0, 'flock 忙时立即返回，不空等');
+    assert.ok(elapsed < 1000, `立即返回，实际 ${elapsed}ms`);
+  } finally {
+    child.kill('SIGKILL');
+  }
+});
+
+test('SC1-边界6 空残留锁文件、无人开 fd、pid 已死的 .item，下一写入者能抢到', async () => {
+  const env = setup();
+  const lockFile = path.join(env.dir, 'prio-write.lock');
+  const markerFile = `${lockFile}.item`;
+  fs.writeFileSync(lockFile, '');
+  fs.writeFileSync(markerFile, `${JSON.stringify({ pid: 999999, startedAt: new Date(T0).toISOString() })}\n`);
+  const fake = fakeGithub({ readback: () => ({ node: { fieldValues: { nodes: [fieldValue('single', '优先级', 'P2')] } } }) });
+  env.reader = readerFor(fake, env.profile);
+  const { result, gate } = await sync(env, { apply: true, lockPath: lockFile, lockOptions: { retryMs: 20, maxWaitMs: 120 } });
+  assert.equal(result.written, 1);
+  assert.equal(gate.writes.length, 1);
+  assert.equal(fs.existsSync(markerFile), false);
+});
+
 test('适配层契约：真 import 的 syncEventItem 认 #318 的 payload 形状并写出', async () => {
   // 加载器（#318 的 prio-item-loader.mjs）就是动态 import 这个文件再取函数，这里按同一路径真加载一次。
   const mod = await import('./bin/prio-item.mjs');

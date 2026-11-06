@@ -21,7 +21,7 @@
 // 变的只是返回值里的原因标记，方便事后查是哪一类被挡。
 //
 // 写锁（复审 P2-4）：apply 必须带 lockPath，CLI 默认 /tmp/prio-write.lock（和整盘同一个文件，见 bin/prio-lock.mjs）。
-// 抢不到锁就整条不读、不写，原因写进返回值（skipped: 'lock-busy'）。
+// 挡住它的是整盘写阶段（正在写某一条）或另一个单条。抢不到锁就整条不读、不写，原因写进返回值（skipped: 'lock-busy'）。
 //
 // 已知限制（复审 P2-3，不改行为）：只靠分支名关联到这条 issue 的 PR 不会出现在 issue 的交叉引用 timeline 里，
 // 所以单条路径永远看不到它；这类 PR 的「关联 PR」文本只能由 30 分钟整盘那一拍补齐（整盘会按 PR 搜索结果收敛）。
@@ -502,7 +502,7 @@ export async function syncOneItem({
   if (!apply) return runOne();
   const got = await withWriteLock(runOne, { file: lockPath, ...(lockOptions || {}) });
   if (!got.acquired) {
-    out.write(`写锁被占（${got.detail || got.reason}）：这一条不读也不写，留给下一次事件或 30 分钟整盘\n`);
+    out.write(`写锁被占（${got.detail || got.reason}）：整盘写阶段或另一个单条占着，这一条不读也不写，留给下一次事件或 30 分钟整盘\n`);
     return {
       repo,
       issue: number,

@@ -37,6 +37,7 @@ import {
   readFieldValue,
   stateFiles,
 } from './bin/prio-sync.mjs';
+import { withWriteLock } from './bin/prio-lock.mjs';
 import { REPO, createFakeRun, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 
 const T0 = Date.parse('2026-10-31T12:00:00.000Z');
@@ -4673,4 +4674,179 @@ test('#255 SC8 第 12 节写明 --only-field 的取值、过滤位置、计数�
   assert.match(section, /restoreUnwrittenDebounce/);
   assert.match(section, /只数 `--only-field` 过滤之后真会调用写闸的条数/);
   assert.match(section, /退出码是 0/);
+});
+
+function otherDebounce(priority) {
+  return {
+    priority,
+    pending: null,
+    pendingHeld: false,
+    lastRecalcAt: null,
+    consecutive: 0,
+    changes: [],
+  };
+}
+
+test('SC1-边界5 整盘写循环与单条并发抢同一 marker，同一时刻只有一方 write/appendChange/saveDebounce', async () => {
+  const dir = tmpDir();
+  const lockFile = path.join(dir, 'prio-write.lock');
+  let inside = 0;
+  let maxInside = 0;
+  const withItemLock = async (fn) => withWriteLock(async () => {
+    inside += 1;
+    maxInside = Math.max(maxInside, inside);
+    try {
+      return await fn();
+    } finally {
+      inside -= 1;
+    }
+  }, { file: lockFile, retryMs: 10, maxWaitMs: 2000 });
+  const boardGate = recorder();
+  const itemGate = recorder();
+  const boardReads = new Map();
+  const itemReads = new Map();
+  const boardP = runPrioSync({
+    dir,
+    items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2' })],
+    prs: [],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: async (action) => {
+      boardGate.writes.push(structuredClone(action));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    },
+    stdout: capture().stdout,
+    readBack: async (change) => {
+      const key = `${change.item}\0${change.field}`;
+      const n = (boardReads.get(key) || 0) + 1;
+      boardReads.set(key, n);
+      return n === 1 ? change.old : change.new;
+    },
+    withItemLock,
+  });
+  const singleP = runPrioSync({
+    dir,
+    items: [item(3, { id: 'PVTI_3' })],
+    prs: [],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: async (action) => {
+      itemGate.writes.push(structuredClone(action));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    },
+    stdout: capture().stdout,
+    mergeState: true,
+    readBack: async (change) => {
+      const key = `${change.item}\0${change.field}`;
+      const n = (itemReads.get(key) || 0) + 1;
+      itemReads.set(key, n);
+      return n === 1 ? change.old : change.new;
+    },
+    withItemLock,
+  });
+  const [board, single] = await Promise.all([boardP, singleP]);
+  assert.equal(board.written + single.written, 3);
+  assert.equal(boardGate.writes.length + itemGate.writes.length, 3);
+  assert.equal(maxInside, 1, '同一时刻只有一方持 .item');
+  const state = readState(dir);
+  assert.equal(state.items[`${REPO}#1`].priority, 'P2');
+  assert.equal(state.items[`${REPO}#2`].priority, 'P2');
+  assert.equal(state.items[`${REPO}#3`].priority, 'P2');
+});
+
+test('SC1-边界5b 拍末 debounce 按开拍快照比较，不把单条已改的键打回', async () => {
+  const dir = tmpDir();
+  const lockFile = path.join(dir, 'prio-write.lock');
+  const seed = {
+    items: {
+      [`${REPO}#1`]: otherDebounce(null),
+      [`${REPO}#9`]: otherDebounce('P0'),
+    },
+    prCi: { [`${REPO}#80`]: { mark: 'pass', pending: 0 } },
+  };
+  fs.writeFileSync(path.join(dir, 'debounce.json'), `${JSON.stringify(seed)}\n`);
+  const withItemLock = (fn) => withWriteLock(fn, { file: lockFile, retryMs: 10, maxWaitMs: 2000 });
+  const boardReads = new Map();
+  let mutated = false;
+  const board = await runPrioSync({
+    dir,
+    items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2' })],
+    prs: [],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: async () => {
+      if (mutated) return;
+      mutated = true;
+      const live = JSON.parse(fs.readFileSync(path.join(dir, 'debounce.json'), 'utf8'));
+      live.items[`${REPO}#9`] = otherDebounce('P1');
+      live.prCi[`${REPO}#80`] = { mark: 'fail', pending: 2 };
+      live.items[`${REPO}#3`] = otherDebounce('P2');
+      fs.writeFileSync(path.join(dir, 'debounce.json'), `${JSON.stringify(live)}\n`);
+    },
+    stdout: capture().stdout,
+    readBack: async (change) => {
+      const key = `${change.item}\0${change.field}`;
+      const n = (boardReads.get(key) || 0) + 1;
+      boardReads.set(key, n);
+      return n === 1 ? change.old : change.new;
+    },
+    withItemLock,
+  });
+  assert.equal(board.written, 2);
+  const state = readState(dir);
+  assert.equal(state.items[`${REPO}#1`].priority, 'P2');
+  assert.equal(state.items[`${REPO}#2`].priority, 'P2');
+  assert.equal(state.items[`${REPO}#9`].priority, 'P1', '单条改过的 ref 保持单条写下的值');
+  assert.equal(state.items[`${REPO}#3`].priority, 'P2', '单条新键不能被拍末丢掉');
+  assert.deepEqual(state.prCi[`${REPO}#80`], { mark: 'fail', pending: 2 }, '单条改过的 prCi 不能打回');
+});
+
+test('SC1-边界9 两个 syncOneItem 并行共享 marker：written 合计与串行一致、debounce 无丢键', async () => {
+  const dir = tmpDir();
+  const lockFile = path.join(dir, 'prio-write.lock');
+  fs.writeFileSync(path.join(dir, 'debounce.json'), `${JSON.stringify({
+    items: {
+      [`${REPO}#9`]: otherDebounce('P0'),
+    },
+    prCi: { [`${REPO}#80`]: { mark: 'pass', pending: 0 } },
+  })}\n`);
+  const withItemLock = (fn) => withWriteLock(fn, { file: lockFile, retryMs: 10, maxWaitMs: 2000 });
+  const runOne = (number) => {
+    const gate = recorder();
+    const reads = new Map();
+    return runPrioSync({
+      dir,
+      items: [item(number, { id: `PVTI_${number}` })],
+      prs: [],
+      nowMs: T0,
+      apply: true,
+      ownerLogin: OWNER,
+      projectNumber: PROJECT,
+      write: gate.write,
+      stdout: capture().stdout,
+      mergeState: true,
+      readBack: async (change) => {
+        const key = `${change.item}\0${change.field}`;
+        const n = (reads.get(key) || 0) + 1;
+        reads.set(key, n);
+        return n === 1 ? change.old : change.new;
+      },
+      withItemLock,
+    }).then((result) => ({ result, gate }));
+  };
+  const [first, second] = await Promise.all([runOne(1), runOne(2)]);
+  const written = first.result.written + second.result.written;
+  assert.equal(written, 2);
+  const state = readState(dir);
+  assert.equal(state.items[`${REPO}#1`].priority, 'P2');
+  assert.equal(state.items[`${REPO}#2`].priority, 'P2');
+  assert.equal(state.items[`${REPO}#9`].priority, 'P0', '原有键不能丢');
+  assert.deepEqual(Object.keys(state.items).sort(), [`${REPO}#1`, `${REPO}#2`, `${REPO}#9`].sort());
+  assert.deepEqual(state.prCi, { [`${REPO}#80`]: { mark: 'pass', pending: 0 } }, '单条改过的 prCi 不能被拍末覆写丢掉');
 });

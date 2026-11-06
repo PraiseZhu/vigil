@@ -46,6 +46,7 @@ import {
   readRepoClassTable,
   runPrioSync,
 } from './prio-sync.mjs';
+import { BOARD_LOCK_WAIT_MAX_MS, WRITE_LOCK_FILE, withWriteLock } from './prio-lock.mjs';
 
 export const PRIO_TICK_DEFAULT = 10;
 /** 一次整板读的估计点数（实测单页 2 点、一次约 8 点）：只用来记 prio-run 的小时用量。 */
@@ -693,6 +694,13 @@ export async function runContinuous(argv = [], deps = {}) {
         }
         : null,
       readBack,
+      withItemLock: wantWrite
+        ? (fn) => withWriteLock(fn, {
+          file: deps.lockPath || WRITE_LOCK_FILE,
+          maxWaitMs: BOARD_LOCK_WAIT_MAX_MS,
+          ...(deps.lockOptions || {}),
+        })
+        : null,
     });
     writeStreak(dir, 0);
     const base = {
