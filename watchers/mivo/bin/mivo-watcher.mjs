@@ -2983,10 +2983,12 @@ export function* processPr({
     const childPrHandoff = !dryRun && taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }).canChangeCode
       ? yield* readChildPrHandoff({ headRefName: pr.headRefName ?? previous.headRefName, headSha: pr.headRefOid, ghFn }) : null;
     const pending = { ...dispatchIntent({ pr, mapping: dispatchMapping, fresh, now, paths, dryRun, messagePrefix: prefix, childPrHandoff, collected: { ...collected, handledFindings: handledFindingsFrom(paths, previous) } }), cursor };
-    previous = { ...previous, pendingDispatch: pending };
     if (dryRun) {
+      // A dry run only reports what it would do; keeping pendingDispatch in `previous` would let the later save
+      // persist it, and the next live round would then read the PR as already being delivered.
       dispatch = { attempted: false, bound: false, reason: 'dry-run', pending };
     } else {
+      previous = { ...previous, pendingDispatch: pending };
       state.prs[key] = previous;
       persistState(state, paths);
       try {
@@ -3254,7 +3256,10 @@ export function* pollWorkflow({
   const remaining = () => Math.max(0, Math.min(deadline, prDeadline) - clock());
   const dryRun = !(enabled && allowDispatch && typeof dispatchFn === 'function');
   const number = Number(prNumber);
-  let previous = readPr(paths.home, nodeId) || { nodeId, number };
+  const stored = readPr(paths.home, nodeId) || { nodeId, number };
+  // A dry round only reports what it would send. A pending delivery it left behind in state (older runs did) never
+  // reached the host, so it is dropped before any gate below reads it as a delivery in progress.
+  let previous = clearDryPending(stored);
   const report = [];
   const events = [];
   const snapshot = snapshotFn
@@ -3268,6 +3273,8 @@ export function* pollWorkflow({
     writePr(paths.home, nodeId, next);
     return next;
   };
+  // Saved now, not left to whichever save a later branch happens to reach: the early returns below would keep it.
+  if (previous !== stored) previous = save(previous);
   if (normalized.state === 'MERGED' || normalized.state === 'CLOSED') {
     const { dispatch } = yield* deliverClosedown({
       previous, prNumber: number, nodeId, state: normalized.state, paths, now, dryRun, dispatchFn, remaining,
@@ -3488,7 +3495,10 @@ function* discoverOnePr(pr, ctx) {
   const relockForDispatch = () => { prLock = acquireLock(paths.home, `pr-${key}`); return prLock; };
   const getPrLockToken = () => prLock.token ?? null;
   try {
-  let previous = readPr(paths.home, key) || { nodeId: key, number: pr.number };
+  const stored = readPr(paths.home, key) || { nodeId: key, number: pr.number };
+  // Same as the poll: a dry pending dispatch is cleared on disk before the awaiting-claim and fingerprint gates read it.
+  let previous = clearDryPending(stored);
+  if (previous !== stored) writePr(paths.home, key, previous);
   const guide = watchGuideMessage({ prNumber: pr.number });
   if (pr.isDraft === true) {
     const next = supersedeOnRedraft({ ...previous, headRefOid: pr.headRefOid, headRefName: pr.headRefName }, now);

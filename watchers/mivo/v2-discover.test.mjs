@@ -66,13 +66,13 @@ test('Ready without an author handoff never starts a repair session', (t) => {
   assert.equal(sends, 0);
 });
 
-function discover(paths, { now = '2026-09-28T00:00:00Z', prs = [listed], collect, dispatchFn, maxPrs, clock, budgetMs, perPrBudgetMs, ghExtra, node = graphqlNode(), git, authorHandoff = true } = {}) {
+function discover(paths, { now = '2026-09-28T00:00:00Z', prs = [listed], collect, dispatchFn, maxPrs, clock, budgetMs, perPrBudgetMs, ghExtra, node = graphqlNode(), git, authorHandoff = true, allowDispatch = true } = {}) {
   let collected = 0;
   // Closedown runs git cleanup; never let a test reach the real plugin repo.
   const plugin = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-discover-plugin-'));
   const gitCalls = [];
   const result = scanOnce({
-    mode: 'discover', enabled: true, allowDispatch: true, paths, now,
+    mode: 'discover', enabled: true, allowDispatch, paths, now,
     gitFn: git ?? ((_bin, args) => { gitCalls.push(args); return ''; }),
     env: { MIVO_PLUGIN_REPO: plugin },
     ghFn: (args) => {
@@ -202,6 +202,70 @@ test('bound PR with unchanged fingerprint costs one query: no collect, no dispat
   assert.equal(collected, 0);
   assert.equal(result.prs[0].dispatch.reason, 'fingerprint-unchanged');
   assert.equal(readPr(paths.home, nodeId).heartbeatAt, '2026-09-28T00:16:00Z');
+});
+
+// A dry round only reports what it would send. Persisting its preview as pendingDispatch made the next live round
+// read the PR as already being delivered, and the early gates (fingerprint skip, awaiting-claim) kept it on disk.
+const dryPending = { dispatchId: 'dry-790-old', params: { title: 't', message: 'preview' }, at: '2026-09-27T00:00:00Z' };
+
+test('a dry discover round reports the dispatch but leaves no pending delivery or task file behind', (t) => {
+  const { paths } = homeOf(t);
+  seedBound(paths, { pollFingerprint: 'old' });
+  const tasksDir = path.join(paths.stateDir, 'tasks');
+  const before = fs.existsSync(tasksDir) ? fs.readdirSync(tasksDir).sort() : [];
+  const { result, collected, entry } = discover(paths, {
+    allowDispatch: false,
+    collect: collectFail,
+    dispatchFn: () => { throw new Error('a dry run must not dispatch'); },
+  });
+  assert.equal(collected, 1);
+  assert.equal(result.prs[0].dispatch.reason, 'dry-run');
+  assert.ok(result.prs[0].dispatch.pending, 'the report still shows what would be sent');
+  assert.ok(!entry.pendingDispatch, 'the preview is not persisted as a pending delivery');
+  assert.deepEqual(fs.existsSync(tasksDir) ? fs.readdirSync(tasksDir).sort() : [], before, 'a dry run writes no task file');
+});
+
+test('a leftover dry pending delivery is cleared from a bound PR even when the fingerprint is unchanged', (t) => {
+  const { paths } = homeOf(t);
+  seedBound(paths, { pollFingerprint: SNAP_FINGERPRINT, pendingDispatch: dryPending });
+  const { result, collected, entry } = discover(paths, {
+    now: '2026-09-28T00:16:00Z',
+    dispatchFn: () => { throw new Error('should not dispatch'); },
+  });
+  assert.equal(collected, 0);
+  assert.equal(result.prs[0].dispatch.reason, 'fingerprint-unchanged');
+  assert.equal(entry.pendingDispatch, null);
+});
+
+function seedUnbound(paths, extra = {}) {
+  const handoff = handoffReceipt({ ...listed, releaseEpoch: 'e' });
+  writePr(paths.home, nodeId, {
+    number: 790, nodeId, eligibilityInitialized: true, eligibility: 'active', admissionVerified: true,
+    admissionEpoch: handoff.releaseEpoch, handoff, headRefName: 'fix/x', title: 'fix', ...extra,
+  });
+}
+
+test('a leftover dry pending delivery is cleared from an unbound PR before the fingerprint gate returns', (t) => {
+  const { paths } = homeOf(t);
+  seedUnbound(paths, { pollFingerprint: SNAP_FINGERPRINT, lastFullCollectAt: '2026-09-28T00:00:00Z', pendingDispatch: dryPending });
+  const { result, collected, entry } = discover(paths, {
+    dispatchFn: () => { throw new Error('should not dispatch'); },
+  });
+  assert.equal(collected, 0);
+  assert.equal(result.prs[0].dispatch.reason, 'fingerprint-unchanged');
+  assert.equal(entry.pendingDispatch, null);
+});
+
+test('a live pending delivery is left exactly as it was', (t) => {
+  const { paths } = homeOf(t);
+  const live = {
+    dispatchId: 'live-790-old', status: 'awaiting-claim', claimDeadline: '2026-09-29T00:00:00Z',
+    createdSessionId: 'sess-known', params: { title: 't', message: 'step 0', target_session_id: 'sess-known' },
+  };
+  seedUnbound(paths, { pendingDispatch: live });
+  const { result, entry } = discover(paths, { dispatchFn: () => { throw new Error('should not dispatch'); } });
+  assert.equal(result.prs[0].dispatch.reason, 'awaiting-claim');
+  assert.deepEqual(entry.pendingDispatch, live);
 });
 
 test('bound PR with changed fingerprint collects and dispatches to the bound session', (t) => {
