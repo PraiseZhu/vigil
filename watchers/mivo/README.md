@@ -215,6 +215,7 @@ PR 上的「盯梢停下了」评论按 (PR, head, blockedKind, 归一化原因)
 - **预算与派发预留**：采集可以用掉整轮预算里除派发预留（默认 25 秒）以外的全部时间，所以采集 60–100 秒的 PR 有新反馈时当轮就派发；只有采集结束时剩余不足派发预留才推迟（`dispatch-budget-deferred`），被推迟的 PR 下一轮排在最前面。
 - **没有修复会话的 Ready PR 也先走指纹闸**：每轮先用一次轻量 GraphQL 查询取指纹，覆盖 PR 更新时间、最近 20 条评论 / 10 条 review 的 id 与更新时间（旧评论被编辑也会变）、各线程最近 5 条评论的更新时间、最新提交的 `statusCheckRollup.state`、legacy commit status 的 contexts，以及 CheckRun 状态；head、冲突状态、标签、Draft 也在内。指纹没变、也没有 `collectRetry`、待补投或其他本地待办时跳过全量采集（约 40 次 `gh`）。只有**完整、可信**的采集才算收口：CI `unknown`、策略未核实、采集失败、被推迟、台账未恢复、派发未确认等都保留旧指纹并标 `collectRetry`，下一轮重新采集。另有兜底：距上次完整采集超过 `fullCollectMs`（默认 10 分钟）就强制全量采集一次，指纹看不到的变化最多延迟这么久。
 - **CI 终态缓存**：同一 PR 的多个必需检查的 job / run 查询并发执行；已完成（`completed`）的 job / run 按 `head SHA + job/run id` 缓存在 `state/kept-reads.json`（24 小时），同一 head 不再重复调用；未终态的每轮照常查询，run 被重跑（job 的 attempt 高于缓存的 run）时重新读取。
+- **冲突是持续状态，不受指纹闸和游标挡住**：PR 只要还是 `CONFLICTING`，就按「当前 head + 当前 base tip」派一次 `git merge origin/main` 修复；这一对发过之后就记进 `state/prs/<nodeId>.json` 的 `conflictDispatch`，同一对不再重发。head 变了立刻算新冲突；同一 head 下 base 动了，也要等冷却（`CONFLICT_REDISPATCH_MS`，60 分钟）过去才再派一次，避免 main 一天几十个 commit 变成反复派修复。派不出去的轮次（修复正在跑、有待投递、dispatch 冲突）会关掉这道闸，指纹闸照常跳过采集；被冷却挡住的冲突会保留旧游标，冷却结束后的下一轮照常派发。重试、认领重试和补投这类不带本轮反馈的投递，按原任务文件里记下的那一对写 `conflictDispatch`，不拿重试时才看到的新 base tip 冒充已发。
 - **派发并发**：Python 包装同时转发多个 `sessions.dispatch`；宿主同时最多接 16 个调用，包装自己最多同时发 12 个，多出来的排队，不报错。
 
 时间相关配置见上文「可选项」（`roundBudgetMs`、`dispatchReserveMs`、`followIntervalMs`、`fullCollectMs`、`scheduleTimeoutMs`）；`MIVO_WATCHER_FOLLOW_MS=0` 只跑全量一轮。
