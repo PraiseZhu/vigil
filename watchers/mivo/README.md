@@ -50,6 +50,8 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 
 | profile 字段 | 环境变量 | 默认值 |
 |---|---|---|
+| `ghLogin` | `VIGIL_GH_LOGIN` | 代码中的默认账号（`bin/mivo-identity.mjs` 的 `DEFAULT_LOGIN`）。watcher 以这个账号列出并处理自己的 PR；修复会话的提交身份也用它。优先级：环境变量 > profile > 默认账号。**mivo-repair / mivo-handoff 可能是不带调度命令环境变量的独立进程**，所以另一账号部署应写进 `config/profile.json` |
+| `ghUserId` | `VIGIL_GH_USER_ID` | 默认账号对应的 ID（仅当 `ghLogin` 等于默认账号时）。提交邮箱 `<id>+<login>@users.noreply.github.com`；配了别的账号却没配它时 `prepare` 按 `gh-user-unavailable` 拒绝 |
 | `watchHomes` | `MIVO_WATCHER_WATCH_HOMES`（逗号分隔） | `[]`（不内置任何路径） |
 | `lifelineConfigPath` | `MIVO_WATCHER_LIFELINE_CONFIG` | 未配置时不接收本地 Doctor 任务 |
 | `severityStandardPath` | `MIVO_SEVERITY_STANDARD_PATH` | 审查机发布的统一分级文件（审查仓的 `mivo/config/severity.md`，与前置审查同机检出的那份）。修复会话和裁决 Worker 只按它判 P0/P1/P2/P3；版本号是文件原始内容 sha256 的前 12 位，与审查机算法相同。未配置或读不到时不报错，但本轮审查账号的 P0/P1/P2 一律按成立处理、必须修，finalize 拒绝把它们记成 no-change |
@@ -63,6 +65,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | `validateStallMinutes` | `MIVO_VALIDATE_STALL_MINUTES` | `10`。连续无新输出（stdout/stderr 都没有新字节）超过它就终止整个进程组，收据记 `failureKind: validate-stalled`，不当作测试失败；规则同 `preflightTimeoutMinutes`。心跳不算输出 |
 | `preflightTimeoutMinutes` | `MIVO_PREFLIGHT_TIMEOUT_MINUTES` | `60`。只接受大于 0 的有限数字或非空十进制字符串；换算毫秒后须为不超过 2147483647 的安全整数。非法值直接报错，不静默回退。env 优先于 profile。validate 的 `npm ci`（如需）与仓库预检、以及未复用收据时的 `git push` 都用此时限；两阶段各自独立计时，不共享一笔总预算。显式 `options.timeout` 仍然优先。 |
 | `prePushLockWaitMinutes` | `MIVO_PREPUSH_LOCK_WAIT_MINUTES` | `60`。仓库 pre-push 因「已有一份 pre-push 在跑」退出时，validate 不记失败，而是每 5 秒探一次共用锁（`<git 公共目录>/pre-push.flock`，非阻塞探测、探完即放），空出后重跑预检；累计等待超过此值才写 `failureKind: preflight-lock-busy` 的收据，watcher 把它当短暂阻塞，30 分钟后交回重试。规则同 `preflightTimeoutMinutes`。 |
+| `sessionTitlePrefix` | `MIVO_SESSION_TITLE_PREFIX` | 空（标题仍是 `#1704-任务名丨1104`）。设为 `修PR` 时新建修复会话的标题是 `修PR#1704-任务名丨1104`（前缀可以是中文，1–16 位）。只影响新标题：已存在的会话标题（有无前缀、前缀是否与当前配置一致）都按原样识别，不会批量改名、不会重建绑定。修复会话退役后新开的会话、以及重试派发新建的会话，都按当前前缀重新生成标题（沿用该 PR 记下的标题日期）；只有复用同一个会话时才保持原标题。非法值（超过 16 位、含空白、`#`、`丨` 或冒号）直接报错 |
 
 拷一份 [`config/examples/mivo.profile.example.json`](../../config/examples/mivo.profile.example.json)
 到你的 watcher home 下的 `config/profile.json`，把占位值换成真实路径即可。`config/profile.json`
@@ -212,6 +215,7 @@ PR 上的「盯梢停下了」评论按 (PR, head, blockedKind, 归一化原因)
 - **预算与派发预留**：采集可以用掉整轮预算里除派发预留（默认 25 秒）以外的全部时间，所以采集 60–100 秒的 PR 有新反馈时当轮就派发；只有采集结束时剩余不足派发预留才推迟（`dispatch-budget-deferred`），被推迟的 PR 下一轮排在最前面。
 - **没有修复会话的 Ready PR 也先走指纹闸**：每轮先用一次轻量 GraphQL 查询取指纹，覆盖 PR 更新时间、最近 20 条评论 / 10 条 review 的 id 与更新时间（旧评论被编辑也会变）、各线程最近 5 条评论的更新时间、最新提交的 `statusCheckRollup.state`、legacy commit status 的 contexts，以及 CheckRun 状态；head、冲突状态、标签、Draft 也在内。指纹没变、也没有 `collectRetry`、待补投或其他本地待办时跳过全量采集（约 40 次 `gh`）。只有**完整、可信**的采集才算收口：CI `unknown`、策略未核实、采集失败、被推迟、台账未恢复、派发未确认等都保留旧指纹并标 `collectRetry`，下一轮重新采集。另有兜底：距上次完整采集超过 `fullCollectMs`（默认 10 分钟）就强制全量采集一次，指纹看不到的变化最多延迟这么久。
 - **CI 终态缓存**：同一 PR 的多个必需检查的 job / run 查询并发执行；已完成（`completed`）的 job / run 按 `head SHA + job/run id` 缓存在 `state/kept-reads.json`（24 小时），同一 head 不再重复调用；未终态的每轮照常查询，run 被重跑（job 的 attempt 高于缓存的 run）时重新读取。
+- **冲突是持续状态，不受指纹闸和游标挡住**：PR 只要还是 `CONFLICTING`，就按「当前 head + 当前 base tip」派一次 `git merge origin/main` 修复；这一对发过之后就记进 `state/prs/<nodeId>.json` 的 `conflictDispatch`，同一对不再重发。head 变了立刻算新冲突；同一 head 下 base 动了，也要等冷却（`CONFLICT_REDISPATCH_MS`，60 分钟）过去才再派一次，避免 main 一天几十个 commit 变成反复派修复。派不出去的轮次（修复正在跑、有待投递、dispatch 冲突）会关掉这道闸，指纹闸照常跳过采集；被冷却挡住的冲突会保留旧游标，冷却结束后的下一轮照常派发。重试、认领重试和补投这类不带本轮反馈的投递，按原任务文件里记下的那一对写 `conflictDispatch`，不拿重试时才看到的新 base tip 冒充已发。
 - **派发并发**：Python 包装同时转发多个 `sessions.dispatch`；宿主同时最多接 16 个调用，包装自己最多同时发 12 个，多出来的排队，不报错。
 
 时间相关配置见上文「可选项」（`roundBudgetMs`、`dispatchReserveMs`、`followIntervalMs`、`fullCollectMs`、`scheduleTimeoutMs`）；`MIVO_WATCHER_FOLLOW_MS=0` 只跑全量一轮。

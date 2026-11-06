@@ -146,6 +146,33 @@ test('unchanged fingerprint writes heartbeat and skips collect', (t) => {
   assert.equal(entry.heartbeatAt, now);
 });
 
+test('a leftover dry pending delivery is dropped by the poll even when nothing changed', (t) => {
+  const { paths } = homeOf(t);
+  seed(paths, {
+    pollFingerprint: pollFingerprint(snap()),
+    pendingDispatch: { dispatchId: 'dry-790-old', params: { title: 't', message: 'preview' }, at: now },
+  });
+  const { result, collected, entry } = poll(paths, { snapshot: snap() });
+  assert.equal(collected, 0);
+  assert.equal(result.prs[0].dispatch.reason, 'fingerprint-unchanged');
+  assert.equal(entry.pendingDispatch, null);
+});
+
+test('a dry poll round reports the dispatch and persists no pending delivery or task file', (t) => {
+  const { paths } = homeOf(t);
+  seed(paths, { pollFingerprint: 'old' });
+  const tasksDir = path.join(paths.stateDir, 'tasks');
+  const before = fs.existsSync(tasksDir) ? fs.readdirSync(tasksDir).sort() : [];
+  const { result, entry } = poll(paths, {
+    snapshot: snap(), enabled: false, collect: collectFailedCi,
+    dispatchFn: () => { throw new Error('a dry run must not dispatch'); },
+  });
+  assert.equal(result.prs[0].dispatch.reason, 'dry-run');
+  assert.ok(result.prs[0].dispatch.pending, 'the report still shows what would be sent');
+  assert.ok(!entry.pendingDispatch, 'the preview is not persisted as a pending delivery');
+  assert.deepEqual(fs.existsSync(tasksDir) ? fs.readdirSync(tasksDir).sort() : [], before);
+});
+
 test('a repair result written after the last poll is read even when the PR fingerprint is unchanged', (t) => {
   const { paths } = homeOf(t);
   seedInFlight(paths);

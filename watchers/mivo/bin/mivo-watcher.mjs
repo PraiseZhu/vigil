@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { execFile, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { planSessionTitle, repairSessionTitle } from './session-title.mjs';
+import { newSessionTitle, planSessionTitle, repairSessionTitle } from './session-title.mjs';
 import { collectPublicReview, evaluatePublicReview, isReviewerAuthor, reviewerFindingReviewIds, isReviewerCleanReport } from './public-review.mjs';
 import { collectPrSnapshot, collectPrOwnership, collectMergeStates, readMergeState, readMergeStatus, mergeStateIsBatched } from './mivo-pr-snapshot.mjs';
 import { selectHandoff, isCurrentHandoff, implicitHandoff } from './mivo-handoff.mjs';
@@ -328,7 +328,7 @@ function withPublisher(item, comment) {
   };
 }
 
-export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci, reviews = [], comments = [], threads = [], mergeable, receiptActor }) {
+export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci, reviews = [], comments = [], threads = [], mergeable, baseTipOid = null, receiptActor }) {
   const items = [];
   for (const item of failedRequiredCiItems({ pr, ci })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
   for (const item of failedOptionalCiItems({ pr, ci })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
@@ -384,7 +384,9 @@ export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci
       }, comment), { headSha: pr.headRefOid ?? null }));
     }
   }
-  if (mergeable === 'CONFLICTING') items.push(withCategory({ source: 'conflict', nativeId: 'merge-conflict', revision: pr.headRefOid, sha: pr.headRefOid, body: 'PR has merge conflicts with its base branch.', contentHash: digest({ mergeable }) }, { headSha: pr.headRefOid ?? null }));
+  // A conflict is identified by the head it sits on and the base tip it conflicts with: when main moves it is a new
+  // conflict even though the head did not change, and it must not stay hidden behind the old cursor stamp.
+  if (mergeable === 'CONFLICTING') items.push(withCategory({ source: 'conflict', nativeId: 'merge-conflict', revision: pr.headRefOid, sha: pr.headRefOid, body: 'PR has merge conflicts with its base branch.', contentHash: digest({ mergeable, baseTip: baseTipOid ?? null }) }, { headSha: pr.headRefOid ?? null }));
   return items;
 }
 
@@ -469,7 +471,10 @@ export function planSession({ pr, existing, date, task }) {
   return {
     action: 'create-intent',
     sessionId: null,
-    ...planSessionTitle({ pr: { ...pr, title: task ?? pr.title }, createdAt: date }),
+    // No session to resume: the title is built for the session being created, with the current prefix. A stored
+    // title belongs to the session that already ended (retired or never claimed), so it is not reused (see
+    // newSessionTitle); only its date is carried over.
+    ...newSessionTitle({ pr: { ...pr, title: task ?? pr.title }, existing: existing ?? {}, createdAt: date }),
     nodeId,
   };
 }
@@ -1491,6 +1496,31 @@ function sessionOwnerOf({ state, paths, sessionId, exceptKey }) {
   return entries.find(([key, entry]) => key !== exceptKey && entry?.sessionId === sessionId)?.[1] ?? null;
 }
 
+// The head/base-tip pair a confirmed delivery carried, for the conflict gate. A normal delivery carries it in its batch;
+// a retry, a claim retry or a recovery re-sends an earlier task with no batch, so the pair comes from that task's own
+// snapshot (never from the base tip seen now: that one was not sent). No conflict in the delivery, or no usable pair,
+// leaves the record alone.
+function conflictDispatchSent({ previous, pr, collected, fresh, dispatchId, paths, now }) {
+  let head = null;
+  let baseTip = null;
+  if (Array.isArray(fresh) && fresh.some((item) => item?.key === CONFLICT_FEEDBACK_KEY)) {
+    head = collected?.pr?.headRefOid ?? pr.headRefOid;
+    baseTip = collected?.baseTipOid;
+  } else if (dispatchId && previous.pendingDispatch?.dispatchId === dispatchId) {
+    const task = readDispatchTask(paths, dispatchId);
+    if (task.nodeId === pr.id && task.number === pr.number && task.repo === REPO
+        && Array.isArray(task.feedback) && task.feedback.some((item) => item?.key === CONFLICT_FEEDBACK_KEY)) {
+      head = task.prSnapshot?.pr?.headRefOid;
+      baseTip = task.prSnapshot?.pr?.baseTipOid;
+    }
+  }
+  if (!FULL_SHA.test(head ?? '') || !FULL_SHA.test(baseTip ?? '')) return null;
+  // A recovery re-sends the same dispatch: it must not restart the cooldown of the record it already made.
+  const prior = previous.conflictDispatch;
+  const at = prior?.dispatchId && prior.dispatchId === dispatchId ? prior.at : now;
+  return { head, baseTip, at, dispatchId: dispatchId ?? null };
+}
+
 export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor, collected, fresh, paths = watcherPaths(), recovery = false }) {
   const sessionId = receipt?.target_session_id;
   if (!sessionId) throw new Error('dispatch receipt missing target_session_id');
@@ -1540,6 +1570,7 @@ export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor,
     }
   }
   const retryCommit = keelRetryCommit(previous, now, recovery);
+  const conflictSent = conflictDispatchSent({ previous, pr, collected, fresh, dispatchId: thisId, paths, now });
   state.prs[key] = {
     ...previous,
     ...retryCommit.fields,
@@ -1551,6 +1582,7 @@ export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor,
     labels: collected?.labels ?? previous.labels ?? [],
     mergeReady: collected?.mergeReady ?? previous.mergeReady ?? false,
     feedbackCursor: cursor ?? previous.feedbackCursor ?? {},
+    ...(conflictSent ? { conflictDispatch: conflictSent } : {}),
     sessionId: previous.sessionId ?? sessionId,
     scheduleId: previous.scheduleId,
     // The first confirmed receipt is the claim; later receipts must match it.
@@ -2500,7 +2532,19 @@ export function* processPr({
   const newKeys = new Set(newFresh.map((item) => item.key));
   const orphans = orphanedBotThreads({ previous, observed, cursorBase, paths, head: pr.headRefOid })
     .filter((item) => !newKeys.has(item.key));
-  const rawFresh = [...newFresh, ...orphans];
+  let rawFresh = [...newFresh, ...orphans];
+  // A conflict that is due for this head is fresh even when the cursor still remembers an earlier delivery; one that
+  // is not due (same head inside the cooldown, a running repair, a pending delivery, a dispatch conflict) stays out of
+  // the batch, so the cooldown holds even when a moved base changed the item's content hash.
+  const conflictDue = conflictDispatchDue({ previous, snapshot: collected, now });
+  if (conflictDue) {
+    if (!rawFresh.some((item) => item.key === CONFLICT_FEEDBACK_KEY)) {
+      const conflictItem = observedAll.find((item) => item.source === 'conflict' && item.nativeId === 'merge-conflict');
+      if (conflictItem) rawFresh.push({ ...conflictItem, key: CONFLICT_FEEDBACK_KEY });
+    }
+  } else {
+    rawFresh = rawFresh.filter((item) => item.key !== CONFLICT_FEEDBACK_KEY);
+  }
   // Green CI/review does not finish a newly confirmed local product failure.
   // Keep the existing owner's recovery alive until its repair result completes.
   if (rawFresh.some(item=>item.source==='lifeline-doctor' && item.repairPolicy.canChangeCode)
@@ -2706,6 +2750,8 @@ export function* processPr({
     fresh = [...fresh, ...observedAll.map((item) => ({ ...item, key: `${item.source}:${item.nativeId}` }))
       .filter((item) => revivedKeys.includes(item.key) && !have.has(item.key) && item.actionable !== false && item.deferred !== true
         && !serverFixed.ids.has(item.threadId))];
+    // A revived task can bring a held conflict back; the cooldown still applies to it.
+    if (!conflictDue) fresh = fresh.filter((item) => item.key !== CONFLICT_FEEDBACK_KEY);
     // Reaching the limit and resetting in the same scan: markException below only sees the reopened task, so
     // the limit is reported here, from the state that hit it, and its exception record is carried over.
     if (limitReachedNow && previous !== limited) {
@@ -2721,12 +2767,16 @@ export function* processPr({
   const blockedItems = new Map((blockedTask.feedback ?? []).filter((item) => item?.key).map((item) => [item.key, item]));
   // "Same batch" means the same comments with the same words; an edit is new feedback.
   const inBlockedBatch = (item) => blockedItems.has(item.key) && sameFeedbackContent(blockedItems.get(item.key), item);
+  // A conflict that is due for this head is new information (a new head, or a cooled-off base move), so the "same
+  // blocked cause" guard must not swallow it: a blocked external task would otherwise keep the conflict forever.
+  const dueConflict = conflictDue && fresh.some((item) => item.key === CONFLICT_FEEDBACK_KEY);
   const sameBlockedCause = previous.eligibility === 'blocked'
     && previous.activeTask?.status === 'blocked'
     && (previous.activeTask.head ?? previous.activeTask.sourceHead) === pr.headRefOid
     && previous.activeTask.blockedKind === 'external'
     && (previous.rulesVersion == null || previous.rulesVersion === rulesVersion())
     && fresh.length > 0
+    && !dueConflict
     && fresh.every(inBlockedBatch);
   if (sameBlockedCause) {
     queueHumanNotice(paths.home, {
@@ -2804,6 +2854,16 @@ export function* processPr({
     if (Object.hasOwn(cursorBase, item.key)) retainedCursor[item.key] = cursorBase[item.key];
     else delete retainedCursor[item.key];
   }
+  // A conflict that is held back keeps its previous stamp (or none): it stays pending, and the next scan sees it again
+  // once the cooldown allows a dispatch. A held conflict is not in `fresh`, so the cursor a delivered batch commits
+  // (built from this one below) keeps it undelivered too: a successful batch of other feedback must not mark it sent.
+  if (!conflictDue) {
+    if (Object.hasOwn(cursorBase, CONFLICT_FEEDBACK_KEY)) retainedCursor[CONFLICT_FEEDBACK_KEY] = cursorBase[CONFLICT_FEEDBACK_KEY];
+    else delete retainedCursor[CONFLICT_FEEDBACK_KEY];
+  }
+  // What a delivered batch commits: the new stamps of the items it carried, on top of the retained cursor.
+  const settledCursor = { ...retainedCursor };
+  for (const item of fresh) settledCursor[item.key] = cursor[item.key] ?? settledCursor[item.key];
   // Revived keys stay out of the cursor until a delivery is acknowledged, so a skipped delivery repeats next scan.
   for (const key of revivedKeys) delete retainedCursor[key];
   const wantsDeliveryBeforeGate = shouldDispatch || recovery || previous.pendingDispatch?.status === 'retryable';
@@ -2884,13 +2944,19 @@ export function* processPr({
       report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'recovery-handoff-invalid' } });
       return;
     }
+    // A retry that will create a session (no target session) takes the current prefix too; only a retry that
+    // resumes an existing session keeps the stored title, which that session already carries. The same mapping
+    // goes to the receipt, so the title that was sent is the title that gets persisted.
+    const retryMapping = previous.pendingDispatch.params?.target_session_id
+      ? mapping
+      : { ...mapping, ...newSessionTitle({ pr, existing: mapping, createdAt: now }) };
     const pending = { ...previous.pendingDispatch, attempts: Number(previous.pendingDispatch.attempts ?? 1) + 1,
-      params: constrainRetryDispatch({ ...previous.pendingDispatch.params, title: mapping.title }, retryTask) };
+      params: constrainRetryDispatch({ ...previous.pendingDispatch.params, title: retryMapping.title }, retryTask) };
     state.prs[key] = { ...previous, pendingDispatch: pending };
     persistState(state, paths);
     try {
       const receipt = yield* yieldDispatch(() => dispatchFn(pending.params,{timeoutMs:Math.max(1,remaining())}));
-      const bound = applyDispatchReceipt({ state, pr, mapping,
+      const bound = applyDispatchReceipt({ state, pr, mapping: retryMapping,
         receipt: { ...receipt, dispatch_id: receipt?.dispatch_id ?? pending.dispatchId },
         now, cursor: pending.cursor ?? retainedCursor, collected, fresh: [], paths, recovery: pending.recovery === true });
       previous = yield* notifyDispatchConflictOnce({ previous: state.prs[key], key, paths, now, dryRun, dispatchFn, remaining, pr, ghFn });
@@ -2949,7 +3015,8 @@ export function* processPr({
     const policy = scriptNoChangePolicy(pr, fresh);
     const items = policy.items.map(({ key: itemKey, action, reason }) => ({ key: itemKey, action, reason }));
     if (!dryRun) {
-      previous = { ...previous, feedbackCursor: cursor, pendingFeedback: 0,
+      // A conflict held back by the cooldown keeps its old stamp: a no-change batch must not mark it delivered.
+      previous = { ...previous, feedbackCursor: settledCursor, pendingFeedback: 0,
         scriptNoChange: { at: now, head: pr.headRefOid, items } };
     }
     dispatch = { attempted: false, bound: false, reason: 'script-no-change', items };
@@ -2963,7 +3030,9 @@ export function* processPr({
       handoffNote = sessionHandoffNote({ pr, previous, paths });
       previous = { ...previous, sessionId: null, claimedAt: null,
         predecessors: [...(previous.predecessors ?? []), { sessionId: previous.sessionId, at: now, reason: 'task-complete', lastDispatch: previous.lastDispatch ?? null }] };
-      dispatchMapping = { ...mapping, sessionId: null };
+      // The session being replaced is retired: this dispatch creates a new one, so its title is rebuilt with the
+      // current prefix instead of reusing the stored text that belonged to the retired session.
+      dispatchMapping = planSession({ pr, existing: previous, date: now });
     }
     const prefix = [reclaimNote(previous, pr.headRefName), handoffNote, messagePrefix].filter(Boolean).join('\n');
     // Asked once per delivery, and only when this task may change code: it decides whether the session is told to
@@ -2971,18 +3040,20 @@ export function* processPr({
     // no GitHub read, like the gates above, so its preview carries no handoff text.
     const childPrHandoff = !dryRun && taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }).canChangeCode
       ? yield* readChildPrHandoff({ headRefName: pr.headRefName ?? previous.headRefName, headSha: pr.headRefOid, ghFn }) : null;
-    const pending = { ...dispatchIntent({ pr, mapping: dispatchMapping, fresh, now, paths, dryRun, messagePrefix: prefix, childPrHandoff, collected: { ...collected, handledFindings: handledFindingsFrom(paths, previous) } }), cursor };
-    previous = { ...previous, pendingDispatch: pending };
+    const pending = { ...dispatchIntent({ pr, mapping: dispatchMapping, fresh, now, paths, dryRun, messagePrefix: prefix, childPrHandoff, collected: { ...collected, handledFindings: handledFindingsFrom(paths, previous) } }), cursor: settledCursor };
     if (dryRun) {
+      // A dry run only reports what it would do; keeping pendingDispatch in `previous` would let the later save
+      // persist it, and the next live round would then read the PR as already being delivered.
       dispatch = { attempted: false, bound: false, reason: 'dry-run', pending };
     } else {
+      previous = { ...previous, pendingDispatch: pending };
       state.prs[key] = previous;
       persistState(state, paths);
       try {
         const receipt = yield* yieldDispatch(() => dispatchFn(pending.params,{timeoutMs:Math.max(1,remaining())}));
         const bound = applyDispatchReceipt({ state, pr, mapping: dispatchMapping,
           receipt: { ...receipt, dispatch_id: receipt?.dispatch_id ?? pending.dispatchId },
-          now, cursor, collected, fresh, paths });
+          now, cursor: settledCursor, collected, fresh, paths });
         previous = yield* notifyDispatchConflictOnce({ previous: state.prs[key], key, paths, now, dryRun, dispatchFn, remaining, pr, ghFn });
         const handedBack = orphans.filter((item) => bound.bound === true && fresh.some((row) => row.key === item.key));
         if (handedBack.length) {
@@ -3139,6 +3210,34 @@ function* scanWorkflow({
     viewer, repo: REPO, prs: report, events, scan:state.scan, statePath: paths.statePath };
 }
 
+// A merge conflict is a standing condition, not an event: the PR stays CONFLICTING until someone merges main into it,
+// so the one-shot feedback cursor (head + mergeable + base tip) hides it as soon as the first attempt was delivered,
+// even when that attempt blocked or finished without resolving it. A new head is a new conflict and is sent at once;
+// the same head is sent again only after CONFLICT_REDISPATCH_MS, so main moving every few minutes cannot turn one
+// conflict into a dispatch storm. A pair that cannot be dispatched right now (a repair running, a delivery pending, a
+// dispatch conflict) closes the gate, so the fingerprint gate can keep skipping the collection.
+export const CONFLICT_FEEDBACK_KEY = 'conflict:merge-conflict';
+export const CONFLICT_REDISPATCH_MS = 60 * 60 * 1000;
+const FULL_SHA = /^[a-f0-9]{40}$/i;
+export function conflictDispatchDue({ previous, snapshot, now }) {
+  if (String(snapshot?.mergeable ?? snapshot?.pr?.mergeable ?? '').toUpperCase() !== 'CONFLICTING') return false;
+  // The poll gate's normalized snapshot carries these at the top level; a full collection keeps the head in `pr`.
+  const head = snapshot?.headRefOid ?? snapshot?.pr?.headRefOid;
+  const baseTip = snapshot?.baseTipOid ?? snapshot?.pr?.baseTipOid;
+  if (!FULL_SHA.test(head ?? '') || !FULL_SHA.test(baseTip ?? '')) return false;
+  if (previous?.pendingDispatch || previous?.dispatchConflict) return false;
+  const active = previous?.activeTask;
+  const running = Boolean(active)
+    && !['complete', 'legacy-complete', 'blocked', 'waiting-ci'].includes(active.status)
+    && active.blockedKind !== AUTHOR_RECLAIMED;
+  if (running) return false;
+  const last = previous?.conflictDispatch;
+  if (!last || last.head !== head) return true;
+  if (last.baseTip === baseTip) return false;
+  const at = Date.parse(last.at ?? '');
+  return Number.isFinite(at) && Date.parse(now) - at >= CONFLICT_REDISPATCH_MS;
+}
+
 // True when nothing on GitHub changed since the last settled round and no local work is due either.
 function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
   const pendingRetry = previous.pendingDispatch?.status === 'retryable';
@@ -3161,6 +3260,7 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
   return previous.pollFingerprint === fingerprint && !pendingRetry && !recoveryDue && !previous.collectRetry && !normalized.overflow
     && !hasUnconsumedResult(previous, paths) && !needsCiRecheck(previous.activeTask) && !previous.recheckDeferredAt
     && !keelReopenDue && !intentMigrationDue && !escalateDue && !ciUnknownRecheckDue(previous, paths, now)
+    && !conflictDispatchDue({ previous, snapshot: normalized, now })
     && !pendingActionDue(previous) && !scanRecheckDue(previous, now) && !baseSyncRetryDue(previous, now);
 }
 
@@ -3243,7 +3343,10 @@ export function* pollWorkflow({
   const remaining = () => Math.max(0, Math.min(deadline, prDeadline) - clock());
   const dryRun = !(enabled && allowDispatch && typeof dispatchFn === 'function');
   const number = Number(prNumber);
-  let previous = readPr(paths.home, nodeId) || { nodeId, number };
+  const stored = readPr(paths.home, nodeId) || { nodeId, number };
+  // A dry round only reports what it would send. A pending delivery it left behind in state (older runs did) never
+  // reached the host, so it is dropped before any gate below reads it as a delivery in progress.
+  let previous = clearDryPending(stored);
   const report = [];
   const events = [];
   const snapshot = snapshotFn
@@ -3257,6 +3360,8 @@ export function* pollWorkflow({
     writePr(paths.home, nodeId, next);
     return next;
   };
+  // Saved now, not left to whichever save a later branch happens to reach: the early returns below would keep it.
+  if (previous !== stored) previous = save(previous);
   if (normalized.state === 'MERGED' || normalized.state === 'CLOSED') {
     const { dispatch } = yield* deliverClosedown({
       previous, prNumber: number, nodeId, state: normalized.state, paths, now, dryRun, dispatchFn, remaining,
@@ -3477,7 +3582,10 @@ function* discoverOnePr(pr, ctx) {
   const relockForDispatch = () => { prLock = acquireLock(paths.home, `pr-${key}`); return prLock; };
   const getPrLockToken = () => prLock.token ?? null;
   try {
-  let previous = readPr(paths.home, key) || { nodeId: key, number: pr.number };
+  const stored = readPr(paths.home, key) || { nodeId: key, number: pr.number };
+  // Same as the poll: a dry pending dispatch is cleared on disk before the awaiting-claim and fingerprint gates read it.
+  let previous = clearDryPending(stored);
+  if (previous !== stored) writePr(paths.home, key, previous);
   const guide = watchGuideMessage({ prNumber: pr.number });
   if (pr.isDraft === true) {
     const next = supersedeOnRedraft({ ...previous, headRefOid: pr.headRefOid, headRefName: pr.headRefName }, now);
