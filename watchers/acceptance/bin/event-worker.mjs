@@ -7,6 +7,9 @@
 // /pull、/ack、/fail 仍按前缀 list 队列。
 // 每条事件另存 receivedAt（Worker 收到这条 webhook 的时间，ISO 字符串），/pull 时原样带出，
 // 本机拿它算 gatewayMs（Worker 收到 → 本机写完）。正文被省略、只留元数据时也照样带。
+// /pull 另外给每条带 dequeuedAt（这次 /pull 把事件交给本机的时刻，ISO 字符串）：它只活在响应里，
+// 不写进队列记录，所以每次 /pull 都是当次时刻。本机拿它拆 Worker 段（dequeuedAt − receivedAt）
+// 与本机段（本机写完 − dequeuedAt）。时钟不是有限数、或超出 Date 能表示的范围时给 null，不当成 0。
 // 三条读 body 的路由都有字节上限（WEBHOOK_BODY_LIMIT / ACK_BODY_LIMIT / FAIL_BODY_LIMIT）：先看 content-length
 // 快速拒绝，没有该头或声明偏小时在读的过程中累计，超限一律 413 且不回显 body；/webhook 的 413 在验签之前返回。
 // 单个值默认不超过 128 KiB。再大的 payload 只留元数据（delivery id、事件类型、仓库、编号），
@@ -216,12 +219,20 @@ function eventRecord(seq, deliveryId, eventName, payload, nowMs) {
   };
 }
 
-function toPublicEvent(stored) {
+/** /pull 的交给本机时刻：不是有限数或超出 Date 范围时给 null，不抛 RangeError，也不写成 0。 */
+function dequeuedAtIso(nowMs) {
+  if (!Number.isFinite(nowMs)) return null;
+  const at = new Date(nowMs);
+  return Number.isNaN(at.getTime()) ? null : at.toISOString();
+}
+
+function toPublicEvent(stored, dequeuedAt) {
   const event = {
     deliveryId: stored.deliveryId,
     event: stored.event,
     created_at: stored.created_at ?? null,
     receivedAt: stored.receivedAt ?? null,
+    dequeuedAt,
   };
   if (stored.payloadOmitted) {
     event.repo = stored.repo ?? null;
@@ -370,10 +381,12 @@ async function handleRequest(request, env, durable) {
   const storage = durable.storage;
   if (request.method === 'GET' && url.pathname === '/pull') {
     if (!(await pullAuthorized(request, env.PULL_TOKEN))) return unauthorized();
+    // 交给本机的时刻按这次 /pull 现取：不进队列记录，本机用当次拿到的值写本机段。
+    const dequeuedAt = dequeuedAtIso(durable.now());
     let events = [];
     let alerts = [];
     await runInTransaction(storage, async (txn) => {
-      events = (await readQueue(txn)).map(toPublicEvent);
+      events = (await readQueue(txn)).map((stored) => toPublicEvent(stored, dequeuedAt));
       alerts = await readAlerts(txn);
     });
     return Response.json({ events, alerts });

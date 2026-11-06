@@ -8,11 +8,17 @@
 // 没有 loadPayload 时不算处理成功：记一次失败，不交给 onEvent。满 5 次后确认移出，延迟记录写「正文被省略」。
 // loadPayload 抛错同样记一次失败。
 // 每处理完一个事件，往状态目录的 latency.jsonl 追加一行，记三段：Worker 收到（receivedAt，
-// 由 Worker 写进队列记录）、本机拉到（pulledAt）、本机写完（processedAt，也就是 writtenAt）。
+// 由 Worker 写进队列记录）、Worker 交给本机（dequeuedAt，由 Worker 在每次 /pull 响应里给）、
+// 本机写完（processedAt，也就是 writtenAt）；拉取时刻另记 pulledAt。
 // latencyMs 仍是「事件发生 → 写完」；另记 gatewayMs = 写完 − Worker 收到，这才是 Worker 之后的本机耗时。
-// gatewayMs 只收 0 ≤ 值 ≤ GATEWAY_MAX_MS（10 分钟）的样本。receivedAt 缺失、不是字符串、解析不出、
-// 在将来（差值小于 0）或差得超过 10 分钟时，gatewayMs 记 null，并在同一行留 gatewayMsReject 说明原因；
-// 写完时刻不是有限数时同样记 null（processed-at-invalid）。这些情况都不抛错，也不影响 latencyMs。
+// workerMs = dequeuedAt − receivedAt，是 Worker 段（收到 webhook → 交给本机）；
+// 本机段不另设键，用 processedAt − dequeuedAt 相减即得。
+// gatewayMs 和 workerMs 都只收 0 ≤ 值 ≤ GATEWAY_MAX_MS（10 分钟）的样本。某个时间戳缺失、
+// 不是字符串、解析不出、在将来（差值小于 0）或差得超过 10 分钟时，对应那一项记 null，并在同一行
+// 留 gatewayMsReject / workerMsReject 说明原因（received-at-*、dequeued-at-*）。gatewayMs 在写完时刻
+// 不是有限数时记 null（processed-at-invalid）；workerMs = dequeuedAt − receivedAt，不看 processedAt。
+// dequeuedAt 有而 receivedAt 不可用时，workerMs 沿用同一个 received-at-* 原因。这些情况都不抛错，
+// 也不影响 latencyMs。
 // pulledAt 取这一批拉到的时间；调用方给的时间不是有限数时记 null，不让写日志失败变成事件失败。
 // 目标：Worker 路径 p95 ≤ 10 秒，兜底轮询 ≤ 90 秒（60 秒一轮，留处理余量）。
 // 轮询函数由调用方注入（现有 60 秒轮询留在外面，这里不替换它）。不读令牌。
@@ -175,14 +181,36 @@ function appendLatency(file, event, { processedAtMs, pulledAtMs, source, written
     else if (candidate > GATEWAY_MAX_MS) gatewayMsReject = 'too-large';
     else gatewayMs = candidate;
   }
+  // Worker 段：/pull 交给本机的时刻减 Worker 收到 webhook 的时刻。上下界与 gatewayMs 相同。
+  // dequeuedAt 由 Worker 在 /pull 响应里现给；老 Worker 不带这个键时记 null 并留原因，不静默当 0。
+  const hasDequeuedAt = event?.dequeuedAt != null;
+  const dequeuedAt = typeof event?.dequeuedAt === 'string' ? event.dequeuedAt : null;
+  const dequeuedMs = dequeuedAt == null ? Number.NaN : Date.parse(dequeuedAt);
+  const dequeuedOk = Number.isFinite(dequeuedMs);
+  let workerMs = null;
+  let workerMsReject = null;
+  if (!hasDequeuedAt) workerMsReject = 'dequeued-at-missing';
+  else if (dequeuedAt == null) workerMsReject = 'dequeued-at-not-string';
+  else if (!dequeuedOk) workerMsReject = 'dequeued-at-invalid';
+  // workerMs = dequeuedAt − receivedAt，不依赖 processedAt；两段共用同一个 receivedAt，
+  // 它不可用时直接沿用 gatewayMs 那边的原因，不另起一套词。
+  else if (!receivedOk) workerMsReject = gatewayMsReject;
+  else {
+    const candidate = dequeuedMs - receivedMs;
+    if (candidate < 0) workerMsReject = 'negative';
+    else if (candidate > GATEWAY_MAX_MS) workerMsReject = 'too-large';
+    else workerMs = candidate;
+  }
   const row = {
     deliveryId: event.deliveryId,
     createdAt,
     receivedAt: receivedOk ? receivedAt : null,
+    dequeuedAt: dequeuedOk ? dequeuedAt : null,
     pulledAt: toIsoOrNull(pulledAtMs),
     processedAt: toIsoOrNull(processedAtMs),
     latencyMs: Number.isFinite(delta) ? delta : null,
     gatewayMs,
+    workerMs,
     source,
     repo: eventRepo(event),
     number: eventNumber(event),
@@ -190,6 +218,7 @@ function appendLatency(file, event, { processedAtMs, pulledAtMs, source, written
   };
   // 只在拒绝时留原因，正常行不带这个键。
   if (gatewayMsReject) row.gatewayMsReject = gatewayMsReject;
+  if (workerMsReject) row.workerMsReject = workerMsReject;
   if (typeof written === 'boolean') row.written = written;
   appendLatencyRow(file, row);
 }
@@ -215,8 +244,8 @@ function errorSummary(err) {
  * 不等失败计数或 Worker 重投 5 次。补写通道自己有退避（60 秒 → 5 分钟 → 15 分钟，第 4 次失败放弃并移出 pending），
  * 所以「有 pending」不一定这一拍真去写，门槛只看有没有待补目标，不在这里重复判退避。
  * poll 收到的参数是 { workerFailing }：发现只在 Worker 失败时跑。
- * 每处理完一个事件追加一行延迟记录：receivedAt（Worker 收到）、pulledAt（本批拉到的时刻）、
- * processedAt（写完的时刻）、latencyMs、gatewayMs。
+ * 每处理完一个事件追加一行延迟记录：receivedAt（Worker 收到）、dequeuedAt（Worker 交给本机的时刻）、
+ * pulledAt（本批拉到的时刻）、processedAt（写完的时刻）、latencyMs、gatewayMs、workerMs。
  */
 export async function runEventChannel({
   now = () => Date.now(),
