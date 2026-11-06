@@ -752,6 +752,41 @@ export function constrainRetryDispatch(params, task) {
   ].join('\n') };
 }
 
+// A task frozen as retryable was built before the App path took some of its threads (the switch was off then, or the
+// reply that marks a thread fixed had not come yet). The session a retry wakes must not get them: they are cut from the
+// task and from every line of the message that names feedback, and the cursor stamps the frozen delivery would commit
+// for them go back to what this round decided (a thread the App path failed to resolve stays unmarked, so a build with
+// the switch off still delivers it). Returns null when none of the feedback is claimed: the frozen task goes out as is.
+export function withoutClaimedFeedback({ params, task, cursor, currentCursor = {}, isClaimed }) {
+  const feedback = Array.isArray(task?.feedback) ? task.feedback : [];
+  const claimed = (item) => Boolean(item?.threadId) && isClaimed(item.threadId);
+  const dropped = feedback.filter(claimed);
+  if (dropped.length === 0) return null;
+  const kept = feedback.filter((item) => !claimed(item));
+  const keptKeys = new Set(kept.map((item) => item?.key));
+  const repeatFindings = (task.repeatFindings ?? []).filter((item) => keptKeys.has(item?.feedbackKey));
+  const repairPolicy = taskRepairPolicy({ headRefOid: task.headRefOid, feedback: kept });
+  const message = String(params?.message ?? '').split('\n').flatMap((line) => {
+    if (/^fresh=\d+$/.test(line)) return [`fresh=${kept.length}`];
+    if (line.startsWith('feedback=')) return [`feedback=${JSON.stringify(promptFeedbackRows(kept))}`];
+    if (line.startsWith('repairPolicy=')) return [`repairPolicy=${JSON.stringify(repairPolicy)}`];
+    if (line.startsWith('重复出现的问题（')) return repeatFindings.length ? [repeatFindingRule(repeatFindings)] : [];
+    return [line];
+  }).join('\n');
+  const nextParams = { ...params, message };
+  let nextCursor = cursor;
+  if (cursor && typeof cursor === 'object') {
+    nextCursor = { ...cursor };
+    for (const item of dropped) {
+      if (!item?.key) continue;
+      if (Object.hasOwn(currentCursor, item.key)) nextCursor[item.key] = currentCursor[item.key];
+      else delete nextCursor[item.key];
+    }
+  }
+  return { dropped, kept, params: nextParams, cursor: nextCursor,
+    task: { ...task, feedback: kept, repeatFindings, repairPolicy, params: nextParams } };
+}
+
 // Prompt copy of a feedback body: markup and badges cost tokens on every turn of the
 // repair session. The full original stays in the task file (feedback[].body).
 export const PROMPT_FEEDBACK_MAX_CHARS = 1500;
@@ -768,6 +803,10 @@ export function promptFeedbackBody(body) {
   return text.length > PROMPT_FEEDBACK_MAX_CHARS
     ? `${text.slice(0, PROMPT_FEEDBACK_MAX_CHARS)}…[已截断，全文见 task 文件 feedback[].body]`
     : text;
+}
+
+export function promptFeedbackRows(feedback) {
+  return feedback.map(({ key, source, nativeId, revision, sha, body, category }) => ({ key, source, nativeId, revision, sha, body: promptFeedbackBody(body), category }));
 }
 
 // Compact facts the watcher already collected, so the repair session does not
@@ -953,7 +992,7 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       `nodeid=${pr.id}`,
       `head=${pr.headRefOid}`,
       `fresh=${fresh.length}`,
-      `feedback=${JSON.stringify(fresh.map(({ key, source, nativeId, revision, sha, body, category }) => ({ key, source, nativeId, revision, sha, body: promptFeedbackBody(body), category })))}`,
+      `feedback=${JSON.stringify(promptFeedbackRows(fresh))}`,
       `prIntent=${JSON.stringify(prIntent ?? { source: 'unavailable', text: '' })}`,
       INTENT_RULE,
       AUTO_ADVANCE_RULE,
@@ -2555,7 +2594,8 @@ export function* processPr({
   // only logs, and never falls back to this watcher's own account (the cursor stays as it was, so a build with
   // the switch off still delivers it).
   const serverFixed = { ids: new Set() };
-  if (!dryRun && resolveWithAppEnabled()) {
+  const appPathOn = !dryRun && resolveWithAppEnabled();
+  if (appPathOn) {
     const { eligible } = partitionServerFixedThreads(collected.threads ?? [], ownerPr.headRefOid, previous);
     if (eligible.length > 0) {
       const outcome = yield* resolveServerFixedThreads({ eligible, previous, appResolveFn, repo: REPO, now });
@@ -2577,6 +2617,11 @@ export function* processPr({
       }
     }
   }
+  // A thread the App path took this round, or resolved earlier and still resolved. The account's own reply and
+  // resolve below, and the retry of a frozen task, both leave such a thread alone.
+  const threadById = new Map((collected.threads ?? []).map((thread) => [thread?.id, thread]));
+  const appHandled = (threadId) => serverFixed.ids.has(threadId)
+    || (previous.autoClosedThreads?.[threadId]?.reason === SERVER_FIXED_REASON && threadById.get(threadId)?.isResolved === true);
   // Autonomous P3 review-thread closure happens here, before any dispatch
   // accounting below sees these items — closed items never reach a session,
   // never need a human, and are never counted as pending feedback.
@@ -2650,11 +2695,7 @@ export function* processPr({
       }
     } catch { /* keep pending items */ }
     const seen = new Set();
-    // A thread the App path took this round, or resolved earlier and still resolved, is not answered again with this
-    // account. Once a person reopens it, the existing path closes it as before.
-    const threadById = new Map((collected.threads ?? []).map((thread) => [thread?.id, thread]));
-    const appHandled = (threadId) => serverFixed.ids.has(threadId)
-      || (previous.autoClosedThreads?.[threadId]?.reason === SERVER_FIXED_REASON && threadById.get(threadId)?.isResolved === true);
+    // Such a thread is not answered again with this account. Once a person reopens it, the existing path closes it as before.
     closable = closable.filter((item) => item?.threadId && !appHandled(item.threadId) && !seen.has(item.threadId) && seen.add(item.threadId));
     if (closable.length > 0) {
       const outcome = yield* closeRefutedThreads({
@@ -2934,15 +2975,36 @@ export function* processPr({
     report.push({number:pr.number,dispatch:{attempted:false,reason:'dispatch-budget-deferred'}});
     return;
   }
-  if (!dryRun && previous.pendingDispatch?.status === 'retryable'
+  const retryDue = !dryRun && previous.pendingDispatch?.status === 'retryable'
     && Number(previous.pendingDispatch.attempts ?? 1) < 3
-    && Date.parse(previous.pendingDispatch.retryAt) <= Date.parse(now)) {
-    const retryTask = readDispatchTask(paths, previous.pendingDispatch.dispatchId);
+    && Date.parse(previous.pendingDispatch.retryAt) <= Date.parse(now);
+  const retryTask = retryDue ? readDispatchTask(paths, previous.pendingDispatch.dispatchId) : null;
+  // Switch on: threads the App path owns are cut from the frozen task before it is sent again. A recovery re-sends a
+  // task the session already holds, so it is left alone.
+  const retryCut = retryDue && appPathOn && previous.pendingDispatch.recovery !== true && taskOwnsPr(retryTask, previous, ownerPr)
+    ? withoutClaimedFeedback({ params: previous.pendingDispatch.params, task: retryTask, cursor: previous.pendingDispatch.cursor,
+      currentCursor: retainedCursor, isClaimed: appHandled }) : null;
+  if (retryCut && retryCut.kept.length === 0) {
+    // Nothing is left for a session to do: no wake-up. The App path has recorded what it closed; the frozen task file stays as a record.
+    const { dispatchId } = previous.pendingDispatch;
+    previous = { ...previous, pendingDispatch: null, abandonedDispatches: [...(previous.abandonedDispatches ?? []), dispatchId].filter(Boolean) };
+    state.prs[key] = previous;
+    persistState(state, paths);
+    events.push({ kind: 'retry-feedback-claimed-by-app', number: pr.number, dispatchId,
+      threadIds: [...new Set(retryCut.dropped.map((item) => item.threadId))], remaining: 0 });
+    dispatch = { attempted: false, bound: false, reason: 'retry-feedback-claimed-by-app' };
+  } else if (retryDue) {
     if (!taskOwnsPr(retryTask, previous, ownerPr)) {
       state.prs[key] = supersedeOnRedraft(previous, now);
       persistState(state, paths);
       report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false, reason: 'recovery-handoff-invalid' } });
       return;
+    }
+    if (retryCut) {
+      // The session reads this file (prepare, finalize): it must list the feedback it is asked to cover and no more.
+      atomic(path.join(paths.stateDir, 'tasks', `${previous.pendingDispatch.dispatchId}.json`), JSON.stringify(retryCut.task));
+      events.push({ kind: 'retry-feedback-claimed-by-app', number: pr.number, dispatchId: previous.pendingDispatch.dispatchId,
+        threadIds: [...new Set(retryCut.dropped.map((item) => item.threadId))], remaining: retryCut.kept.length });
     }
     // A retry that will create a session (no target session) takes the current prefix too; only a retry that
     // resumes an existing session keeps the stored title, which that session already carries. The same mapping
@@ -2951,7 +3013,8 @@ export function* processPr({
       ? mapping
       : { ...mapping, ...newSessionTitle({ pr, existing: mapping, createdAt: now }) };
     const pending = { ...previous.pendingDispatch, attempts: Number(previous.pendingDispatch.attempts ?? 1) + 1,
-      params: constrainRetryDispatch({ ...previous.pendingDispatch.params, title: retryMapping.title }, retryTask) };
+      ...(retryCut?.cursor ? { cursor: retryCut.cursor } : {}),
+      params: constrainRetryDispatch({ ...(retryCut?.params ?? previous.pendingDispatch.params), title: retryMapping.title }, retryCut?.task ?? retryTask) };
     state.prs[key] = { ...previous, pendingDispatch: pending };
     persistState(state, paths);
     try {
