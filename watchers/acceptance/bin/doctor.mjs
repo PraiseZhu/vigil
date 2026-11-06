@@ -199,16 +199,21 @@ export async function runDoctor({
   const gitPath = probeSet.which ? probeSet.which('git') : null;
   add('git 在 PATH 上', Boolean(gitPath), gitPath ? '找到 git' : 'PATH 里没有 git');
 
-  try {
-    const data = await api.graphql(VIEWER_QUERY);
-    const login = data?.viewer?.login;
-    add(
-      '令牌账号',
-      sameLogin(login, profile.ownerLogin),
-      login ? `令牌账号是 ${login}` : '读不到令牌账号',
-    );
-  } catch (error) {
-    add('令牌账号', false, firstLine(error?.message));
+  if (profile.appOnly) {
+    // 只用 App 模式不拿账号令牌查 viewer：这一项只确认开关开着，App 能不能用看下面按仓的检查。
+    add('令牌账号', true, '只用 App 模式：不用账号令牌查 viewer（看板读写仍用账号令牌，属已知例外）');
+  } else {
+    try {
+      const data = await api.graphql(VIEWER_QUERY);
+      const login = data?.viewer?.login;
+      add(
+        '令牌账号',
+        sameLogin(login, profile.ownerLogin),
+        login ? `令牌账号是 ${login}` : '读不到令牌账号',
+      );
+    } catch (error) {
+      add('令牌账号', false, firstLine(error?.message));
+    }
   }
 
   const explicitRepos = [

@@ -210,6 +210,29 @@ App 读到 401 / 403 / 404（读是 gh 的 HTTP 状态与 GraphQL 错误；`bran
 `token-request-failed`、`empty-token`、`app-not-configured`、`app-401`/`app-403`/`app-404`，旧外部命令路径另有 `command-failed`
 （日志里 `app=legacy`）。日志和报错里都不出现令牌。目标是 0 次回退；回退必须看得见。
 
+### 只用 App 模式：`appOnly`
+
+`profile.json` 写 `"appOnly": true`（默认 `false`，不写就是上面的老行为）后，**不再改用账号令牌**：
+
+| 情况 | 老行为 | `appOnly: true` |
+|---|---|---|
+| App 取不到令牌、或读 / 写被拒（401/403/404） | 回退账号令牌重试一次，记 `app-token-fallback` | 不发请求，抛 `AppOnlyError`，记 `app-only-blocked` |
+| 按 owner 盘点（只有 `$owner`）、搜索串只点名一个 owner（`repo:` / `user:` / `org:`） | 账号令牌 | 这个 owner 的 ①读 App；不在名单里就拒绝 |
+| `ownerGraphql` 的非看板查询（事件发现、按仓搜 PR） | 账号令牌 / 优先级写令牌 | 按 owner 走 ①读 App |
+| 宿主拉代码（`fetchBranch`，预取与修正轮镜像） | 账号令牌 | 这个 owner 的 ①读 App，不在 ①名单里用 ②写 App；都没有就拒绝 |
+| `viewer`、跨 owner 搜索、名单外 owner、不在 App 表里的写（如 `pr.merge`） | 账号令牌 | 拒绝（`kind=no-app-route`） |
+| **看板读写**（查询里有 `projectV2` / `ProjectV2` / `projectItems`，以及 `project.field.set`） | 账号令牌 / 优先级写令牌 | **不变，仍用账号令牌**：GitHub App 安装令牌访问不了个人账号名下的 Projects v2，这是唯一例外；看板迁到组织名下后才能去掉 |
+
+```
+<UTC 时间> app-only-blocked kind=<token-failed|auth-401|auth-403|not-found|no-app-route> repo=<owner/name 或 owner/*> app=<read|write> reason=<短码> 只用 App 模式：不改用账号令牌，这次请求没有发
+```
+
+- 必须同时配 `apps`；和 `appConfigPath` 互斥（它不按 owner 分流）。写错加载 profile 就报错。
+- 只在宿主生效：沙箱 profile 副本删掉 `appOnly`（沙箱里没有令牌，读写都经写闸，由写闸按 `appOnly` 发请求）。
+- `doctor` 的「令牌账号」一项在 `appOnly` 下不再用账号令牌查 `viewer`，直接标明开关已开。
+- 打开前先确认：`loop.log` 最近 24 小时的 `app-token-fallback` 都已消掉（每一条在 `appOnly` 下都会变成一次失败）；
+  ①读 App 有 Contents 读权限（拉代码要用）。回滚：把 `appOnly` 改回 `false`（或删掉这一键），重启 `loop` 与写闸 `serve`。
+
 **没装 App 的 owner 不要写进 `owners`**。读路径上名单外的 owner 直接用账号令牌（不浪费一趟）；写路径上如果该 App 配了
 但 owner 不在名单里，会记一行 `reason=owner-not-in-app-owners` 再回退——这是有意的，写不出去必须留痕。
 

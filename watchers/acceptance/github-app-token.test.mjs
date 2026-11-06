@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { appBotLogin, createGithub, defaultRun, WRITE_APP_ROLE } from './bin/github.mjs';
+import { AppOnlyError, appBotLogin, createGithub, defaultRun, isBoardGraphql, searchOwnerOf, WRITE_APP_ROLE } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { prepareSandboxProfile } from './host/sandbox.mjs';
 import { OWNER, createFakeRun, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
@@ -1152,4 +1152,163 @@ test('沙箱遮罩覆盖 apps 里的私钥：嵌套的 privateKeyFile 也进遮�
   const masked = maskList({ rawProfile: { apps: { read: { privateKeyFile: profile.apps.read.privateKeyFile } } }, profile, env: {} });
   assert.ok(masked.files.includes(fs.realpathSync(profile.apps.read.privateKeyFile)), '①的私钥被遮');
   assert.ok(masked.files.includes(fs.realpathSync(profile.apps.write.privateKeyFile)), '②的私钥被遮');
+});
+
+// ── 只用 App 模式（profile.appOnly）：不再改用账号令牌；只有看板（个人账号 Projects v2）是例外 ──
+const INVENTORY_Q = 'query ($owner: String!, $since: DateTime) { user(login: $owner) { issues(first: 1) { nodes { number } } } }';
+const SEARCH_Q = 'query ($q: String!) { search(type: ISSUE, first: 5, query: $q) { nodes { __typename } } }';
+const BOARD_Q = 'query ($login: String!, $projectNumber: Int!) { user(login: $login) { projectV2(number: $projectNumber) { id } } }';
+const VIEWER_Q = 'query { viewer { login } }';
+
+function appOnlySetup({ read = {}, write = {}, extra = {} } = {}) {
+  return appSetup({ read, write, extra: { appOnly: true, ...extra } });
+}
+
+test('appOnly 默认关：不配就是 false，老行为（含回退）一字不改', () => {
+  const { profile } = appSetup({ read: {} });
+  assert.equal(profile.appOnly, false);
+});
+
+test('appOnly 的 profile 校验：只认布尔；打开时必须配 apps', () => {
+  const home = tmpDir();
+  writeProfile(home, { profile: { appOnly: 'yes' } });
+  assert.throws(() => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }), /appOnly/);
+  const home2 = tmpDir();
+  writeProfile(home2, { profile: { appOnly: true } });
+  assert.throws(() => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home2 }), /appOnly.*apps|apps/);
+});
+
+test('appOnly：①读 App 被拒 404 → 不回退账号令牌，抛 AppOnlyError，记 app-only-blocked（无令牌）', async () => {
+  const { profile, loopLog } = appOnlySetup();
+  const run = createFakeRun({
+    onGraphql: (_p, { env }) =>
+      env.GH_TOKEN === READ_TOKENS[OWNER]
+        ? { code: 1, stdout: '', stderr: `gh: HTTP 404 (token ${READ_TOKENS[OWNER]})` }
+        : { repository: { issue: { id: 'I1' } } },
+  });
+  const github = createGithub({ profile, run, fetchImpl: appFetch() });
+  await assert.rejects(() => github.graphql(Q, { owner: OWNER, name: 'repo-a', number: 1 }), AppOnlyError);
+  assert.deepEqual(appTokensUsed(run), [READ_TOKENS[OWNER]], '只发了 App 那一次，没有账号令牌重试');
+  const log = readLog(loopLog);
+  assert.match(log, /app-only-blocked kind=not-found repo=ExampleUser\/repo-a app=read reason=app-404/);
+  assert.doesNotMatch(log, /app-token-fallback/);
+  assert.doesNotMatch(log, new RegExp(`${READ_TOKENS[OWNER]}|owner-token`));
+});
+
+test('appOnly：①读 App 取不到令牌（没装）→ 不发请求、抛错', async () => {
+  const { profile, loopLog } = appOnlySetup();
+  const run = createFakeRun({ onGraphql: () => ({ repository: { issue: { id: 'I1' } } }) });
+  const github = createGithub({ profile, run, fetchImpl: appFetch({ installs: { [READ_ID]: [OWNER_B], [WRITE_ID]: [] } }) });
+  await assert.rejects(() => github.graphql(Q, { owner: OWNER, name: 'repo-a', number: 1 }), AppOnlyError);
+  assert.equal(run.calls.filter((c) => c.cmd === 'gh').length, 0);
+  assert.match(readLog(loopLog), /app-only-blocked kind=token-failed repo=ExampleUser\/repo-a app=read reason=not-installed/);
+});
+
+test('appOnly：按 owner 盘点（只有 $owner）和单 owner 搜索走 ①读 App，不用账号令牌', async () => {
+  const { profile, loopLog } = appOnlySetup();
+  const run = createFakeRun({ onGraphql: () => ({ user: { issues: { nodes: [] } }, search: { nodes: [] } }) });
+  const github = createGithub({ profile, run, fetchImpl: appFetch() });
+  await github.graphql(INVENTORY_Q, { owner: OWNER, since: '2026-01-01T00:00:00Z' });
+  await github.graphql(SEARCH_Q, { q: `is:issue repo:${OWNER_B}/repo-b "marker"` });
+  assert.deepEqual(appTokensUsed(run), [READ_TOKENS[OWNER], READ_TOKENS[OWNER_B]]);
+  assert.equal(readLog(loopLog), '');
+});
+
+test('appOnly：搜索串跨 owner、viewer、名单外 owner → 没有 App 能接，拒绝且一个请求都不发', async () => {
+  const { profile, loopLog } = appOnlySetup({ read: { owners: [OWNER] } });
+  const run = createFakeRun({ onGraphql: () => ({}) });
+  const github = createGithub({ profile, run, fetchImpl: appFetch() });
+  await assert.rejects(() => github.graphql(SEARCH_Q, { q: `repo:${OWNER}/a repo:${OWNER_B}/b` }), AppOnlyError);
+  await assert.rejects(() => github.graphql(VIEWER_Q), AppOnlyError);
+  await assert.rejects(() => github.graphql(Q, { owner: OTHER_ORG, name: 'x', number: 1 }), AppOnlyError);
+  assert.equal(run.calls.filter((c) => c.cmd === 'gh').length, 0);
+  const log = readLog(loopLog);
+  assert.match(log, /kind=no-app-route repo=graphql reason=no-owner/);
+  assert.match(log, new RegExp(`kind=no-app-route repo=${OTHER_ORG}/x reason=owner-not-in-app-owners`));
+});
+
+test('appOnly：看板查询是唯一例外，照旧用账号令牌（App 访问不了个人账号的 Projects v2）', async () => {
+  const { profile, loopLog } = appOnlySetup();
+  const run = createFakeRun({ onGraphql: () => ({ user: { projectV2: { id: 'P1' } } }) });
+  const github = createGithub({ profile, run, fetchImpl: appFetch() });
+  await github.graphql(BOARD_Q, { login: OWNER, projectNumber: 1 });
+  await github.ownerGraphql(BOARD_Q, { login: OWNER, projectNumber: 1 });
+  assert.deepEqual(appTokensUsed(run), ['owner-token', 'owner-token']);
+  assert.equal(readLog(loopLog), '');
+});
+
+test('appOnly：ownerGraphql 的非看板查询（发现、按仓搜 PR）改走 ①读 App，不再用账号 / 优先级令牌', async () => {
+  const { profile } = appOnlySetup();
+  const run = createFakeRun({ onGraphql: () => ({ repository: { pullRequests: { nodes: [] } }, search: { nodes: [] } }) });
+  const github = createGithub({ profile, run, fetchImpl: appFetch() });
+  await github.ownerGraphql('query ($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { pullRequests(first: 1) { nodes { number } } } }', { owner: OWNER, name: 'repo-a' });
+  await github.ownerGraphql('query ($query: String!, $after: String) { search(query: $query, type: ISSUE, first: 1, after: $after) { nodes { __typename } } }', { query: `is:pr repo:${OWNER}/repo-a`, after: null });
+  assert.deepEqual(appTokensUsed(run), [READ_TOKENS[OWNER], READ_TOKENS[OWNER]]);
+});
+
+test('appOnly：②写 App 被拒 403 → 不回退账号令牌重放，抛 AppOnlyError', async () => {
+  const { profile, loopLog } = appOnlySetup();
+  const run = createFakeRun({
+    onApi: (_p, { env }) => (env.GH_TOKEN === WRITE_TOKENS[OWNER] ? { code: 1, stdout: '', stderr: 'gh: HTTP 403' } : { id: 1, html_url: 'https://example.test/c' }),
+  });
+  const github = createGithub({ profile, run, fetchImpl: appFetch() });
+  await assert.rejects(() => github.write({ type: 'comment.create', repo: `${OWNER}/repo-a`, issue: 1, body: 'w' }), AppOnlyError);
+  assert.deepEqual(appTokensUsed(run), [WRITE_TOKENS[OWNER]], '账号令牌一次都没用');
+  assert.match(readLog(loopLog), /app-only-blocked kind=auth-403 repo=ExampleUser\/repo-a app=write reason=app-403/);
+});
+
+test('appOnly：②写 App 名单外的 owner、不在 App 表里的写类型 → 拒绝；看板写 project.field.set 不拦', async () => {
+  const { profile, loopLog } = appOnlySetup({ write: { owners: [OWNER] } });
+  const run = createFakeRun({ onApi: () => ({ id: 1, html_url: 'https://example.test/c' }) });
+  const github = createGithub({ profile, run, fetchImpl: appFetch() });
+  await assert.rejects(() => github.write({ type: 'comment.create', repo: `${OWNER_B}/repo-b`, issue: 1, body: 'w' }), AppOnlyError);
+  assert.equal(run.calls.filter((c) => c.cmd === 'gh').length, 0);
+  assert.match(readLog(loopLog), /app-only-blocked kind=token-failed repo=ExampleOwnerB\/repo-b app=write reason=owner-not-in-app-owners/);
+  // 看板写：不经过 App 路由表，也不被 appOnly 拦（下游读不到看板时照常报看板错，不是 AppOnlyError）。
+  await assert.rejects(
+    () => github.write({ type: 'project.field.set', repo: `${OWNER}/repo-a`, issue: 1, fields: { 验收: '通过' } }),
+    (err) => !(err instanceof AppOnlyError),
+  );
+});
+
+test('isBoardGraphql / searchOwnerOf：看板查询与 mutation 都认得；搜索串只认单一 owner', () => {
+  assert.equal(isBoardGraphql(BOARD_Q), true);
+  assert.equal(isBoardGraphql('mutation ($p: ID!, $c: ID!) { addProjectV2ItemById(input: {projectId: $p, contentId: $c}) { item { id } } }'), true);
+  assert.equal(isBoardGraphql('query ($o: String!, $n: String!, $i: Int!) { repository(owner: $o, name: $n) { issue(number: $i) { projectItems(first: 1) { nodes { id } } } } }'), true);
+  assert.equal(isBoardGraphql(Q), false);
+  assert.equal(searchOwnerOf(`is:pr repo:${OWNER}/a`), OWNER.toLowerCase());
+  assert.equal(searchOwnerOf(`repo:${OWNER}/a repo:${OWNER}/b "x"`), OWNER.toLowerCase());
+  assert.equal(searchOwnerOf(`user:${OWNER} is:issue`), OWNER.toLowerCase());
+  assert.equal(searchOwnerOf(`repo:${OWNER}/a repo:${OWNER_B}/b`), null);
+  assert.equal(searchOwnerOf('is:issue "no owner"'), null);
+  assert.equal(searchOwnerOf(undefined), null);
+});
+
+test('appOnly 只在宿主生效：沙箱 profile 副本删掉 appOnly（沙箱里没有令牌，读写都经写闸）', () => {
+  const { profile } = appOnlySetup();
+  const roundDir = tmpDir();
+  const { profileFile } = prepareSandboxProfile({ profile, roundDir, repoRoot: '/repo', socketPath: path.join(roundDir, 'gate.sock') });
+  const copy = JSON.parse(fs.readFileSync(profileFile, 'utf8'));
+  assert.equal(Object.hasOwn(copy, 'appOnly'), false);
+});
+
+test('appOnly：宿主拉代码（fetchBranch）用 ①读 App 的令牌；名单外的 owner 直接拒绝、不跑 git', async () => {
+  const { profile, loopLog } = appOnlySetup({ read: { owners: [OWNER] } });
+  const gitCalls = [];
+  const run = createFakeRun({
+    onGit: (args, { env }) => {
+      gitCalls.push({ cmd: 'git', args, env });
+      if (args.includes('init')) fs.mkdirSync(args.at(-1), { recursive: true });
+      return { code: 0, stdout: '', stderr: '' };
+    },
+  });
+  const github = createGithub({ profile, run, fetchImpl: appFetch() });
+  await github.fetchBranch({ repo: `${OWNER}/repo-a`, branch: 'main', dir: path.join(tmpDir(), 'clone') });
+  const fetches = gitCalls.filter((c) => c.env?.GIT_CONFIG_VALUE_0);
+  assert.ok(fetches.length >= 1, '带令牌跑了 git fetch');
+  assert.ok(fetches.every((c) => tokenOf(c) === READ_TOKENS[OWNER]), '用的是 ①读 App 的令牌，不是账号令牌');
+  const before = gitCalls.filter((c) => c.env?.GIT_CONFIG_VALUE_0).length;
+  await assert.rejects(() => github.fetchBranch({ repo: `${OTHER_ORG}/x`, branch: 'main', dir: path.join(tmpDir(), 'clone') }), AppOnlyError);
+  assert.equal(gitCalls.filter((c) => c.env?.GIT_CONFIG_VALUE_0).length, before, '名单外 owner 不带任何令牌跑 git fetch');
+  assert.match(readLog(loopLog), new RegExp(`app-only-blocked kind=no-app-route repo=${OTHER_ORG}/x reason=owner-not-in-app-owners`));
 });

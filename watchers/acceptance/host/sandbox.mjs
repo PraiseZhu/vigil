@@ -446,6 +446,9 @@ export function prepareSandboxProfile({ profile, roundDir, repoRoot, socketPath 
   for (const key of Object.keys(copy)) {
     if (KEY_PATTERN.test(key) || key === 'appConfigPath' || key === 'appTokenCommand' || key === 'appOwners') delete copy[key];
   }
+  // 只用 App 模式只在宿主（写闸、盘点）上生效：沙箱里没有任何令牌，读写都经写闸，由写闸那边按 appOnly 发请求。
+  // 留着它，沙箱里遮成 /dev/null 的私钥会让每次读都被拒，而不是像现在这样交给写闸。
+  delete copy.appOnly;
   const placeholderToken = path.join(sandboxHome, 'placeholder.token');
   copy.githubTokenFile = placeholderToken;
   copy.writeCommand = [
