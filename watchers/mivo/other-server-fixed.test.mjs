@@ -72,8 +72,9 @@ function* ownership({ pr }) {
 }
 
 // A fake GitHub. `others` are the open PRs of other authors, `threads` their review threads by PR node id, `live`
-// what a per-PR read answers when it differs from the listing (a PR that moved between the two reads).
-function world(t, { others = [], threads = {}, live = {}, failList = false, onThreadRead = null, own = [ownListed()] } = {}) {
+// what a per-PR read answers when it differs from the listing (a PR that moved between the two reads). `pageSize` splits
+// the open-PR list into pages (0: one page); `onListPage(index)` runs when a page is asked for.
+function world(t, { others = [], threads = {}, live = {}, failList = false, onThreadRead = null, own = [ownListed()], pageSize = 0, onListPage = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'other-server-fixed-'));
   const plugin = fs.mkdtempSync(path.join(os.tmpdir(), 'other-server-fixed-plugin-'));
   t.after(() => { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(plugin, { recursive: true, force: true }); });
@@ -88,7 +89,13 @@ function world(t, { others = [], threads = {}, live = {}, failList = false, onTh
     if (args[0] === 'api' && args[1] === 'graphql') {
       if (isOtherList(args)) {
         if (failList) throw new Error('GraphQL: API rate limit exceeded');
-        return followBatchBody([...own, ...others].map(nodeOf));
+        const listed = [...own, ...others].map(nodeOf);
+        if (!pageSize) { onListPage?.(0); return followBatchBody(listed); }
+        // `pageSize` nodes per page; the cursor is the index of the first node of the next page.
+        const from = Number(/after:"(\d+)"/.exec(queryOf(args))?.[1] ?? 0);
+        const to = from + pageSize;
+        onListPage?.(from / pageSize);
+        return followBatchBody(listed.slice(from, to), { hasNextPage: to < listed.length, endCursor: to < listed.length ? String(to) : null });
       }
       const id = threadReadOf(args);
       if (id) {
@@ -369,6 +376,64 @@ test('a round with no time left before the other PRs start reads nothing of them
     collect: (pr) => { now += 130000; return failing(pr); } });
   assert.deepEqual(sideCalls(run.calls), []);
   assert.deepEqual(otherEvents(run), [{ kind: 'other-server-fixed-scan-deferred', scope: 'other-pr', reason: 'budget' }]);
+});
+
+// The list is read page by page (up to 10 pages) and each page costs time too. A logical clock: the viewer's own PR has
+// used 139 s of the 165 s round, the cut-off for new requests is 165 - 25 = 140 s, and every list page takes 11 s (inside
+// the 12 s timeout of one read). Eight open PRs in pages of two: all four pages would end at 183 s, past the 180 s the host allows.
+test('the list of open PRs stops at the round\'s cut-off: no page is asked after it, nothing is read, cleaned or stamped, and the next round lists in full', async (t) => {
+  let now = 1_000_000;
+  const started = now;
+  const pageStarts = [];
+  const w = world(t, { others: Array.from({ length: 7 }, (_, index) => otherPr(900 + index)), threads: { PR_906: [fixedThread(1)] }, pageSize: 2,
+    onListPage: () => { pageStarts.push(now - started); now += 11000; } });
+  const earlier = new Date(Date.parse(NOW) - 30 * 60000).toISOString();
+  // A record of a PR on the third page and one of a PR that is closed: a half-read list says nothing about either.
+  const saved = JSON.stringify({ version: 1, repo: REPO, prs: {
+    PR_904: { number: 904, lastScannedAt: earlier, autoClosedThreads: { PRRT_9: { reason: 'server-fixed', key: KEY } } },
+    PR_555: { number: 555, lastScannedAt: earlier } } });
+  const stateFile = path.join(w.paths.stateDir, 'server-fixed.json');
+  fs.writeFileSync(stateFile, saved);
+  const run = await round(w, { clock: () => now, budgetMs: 165000, dispatchReserveMs: 25000, collect: (pr) => { now += 139000; return failing(pr); } });
+  assert.deepEqual(pageStarts, [139000], 'one page began before the cut-off; the three after it were not asked');
+  assert.ok(now - started <= 165000, 'the round is back before its own end');
+  assert.deepEqual(threadReads(run.calls), []);
+  assert.equal(run.asked.log.length, 0);
+  assert.deepEqual(otherEvents(run), [{ kind: 'other-server-fixed-scan-deferred', scope: 'other-pr', reason: 'budget', stage: 'list' }]);
+  assert.deepEqual(run.out.otherPrs, { scanned: 0, closed: 0, deferred: null });
+  assert.equal(fs.readFileSync(stateFile, 'utf8'), saved, 'the state file is untouched: the half list neither stamps a PR nor drops a record');
+  assert.deepEqual(run.calls.filter(isWrite), [], 'this account made no write call');
+  // Next round, plenty of time: the whole list is read (4 pages), and the closed PR's record goes with the full picture.
+  pageStarts.length = 0;
+  const next = await round(w, { now: SOON, clock: () => now, budgetMs: 165000, dispatchReserveMs: 25000 });
+  assert.equal(pageStarts.length, 4);
+  assert.deepEqual(threadReads(next.calls), ['PR_900', 'PR_901', 'PR_902', 'PR_903', 'PR_905', 'PR_906', 'PR_904'], 'never-scanned PRs first, then #904 (scanned 30 minutes ago)');
+  assert.deepEqual(next.asked.log, [{ threadIds: ['PRRT_1'], repo: REPO }]);
+  assert.equal(readServerFixedState(w.paths).prs.PR_555, undefined);
+});
+
+test('a list that fits in the time is read in full, and a cut-off between two pages defers without a failure event', async (t) => {
+  // Cut-off after 140 s; a page takes 11 s. Starting at 80 s: pages begin at 80, 91, 102 and 113 s, so all four are read and
+  // the PRs are scanned after them.
+  let now = 1_000_000;
+  const started = now;
+  const pageStarts = [];
+  const others = Array.from({ length: 7 }, (_, index) => otherPr(900 + index));
+  const w = world(t, { others, threads: { PR_906: [fixedThread(1)] }, pageSize: 2, onListPage: () => { pageStarts.push(now - started); now += 11000; } });
+  const full = await round(w, { clock: () => now, budgetMs: 165000, dispatchReserveMs: 25000, collect: (pr) => { now += 80000; return failing(pr); } });
+  assert.deepEqual(pageStarts, [80000, 91000, 102000, 113000]);
+  assert.deepEqual(full.asked.log, [{ threadIds: ['PRRT_1'], repo: REPO }]);
+  assert.deepEqual(otherEvents(full).filter((event) => event.kind.endsWith('deferred') || event.kind.endsWith('failed')), []);
+  // Starting at 115 s only the pages that begin before 140 s are read (115, 126, 137 s); the fourth is not, so the list is not
+  // complete and nothing is scanned: no PR is dealt with on a partial picture, and it is not an error.
+  pageStarts.length = 0;
+  now = 2_000_000;
+  const late = world(t, { others, threads: { PR_906: [fixedThread(1)] }, pageSize: 2, onListPage: () => { pageStarts.push(now - 2_000_000); now += 11000; } });
+  const cut = await round(late, { clock: () => now, budgetMs: 165000, dispatchReserveMs: 25000, collect: (pr) => { now += 115000; return failing(pr); } });
+  assert.deepEqual(pageStarts, [115000, 126000, 137000]);
+  assert.deepEqual(otherEvents(cut), [{ kind: 'other-server-fixed-scan-deferred', scope: 'other-pr', reason: 'budget', stage: 'list' }]);
+  assert.deepEqual(threadReads(cut.calls), []);
+  assert.equal(cut.asked.log.length, 0);
 });
 
 // A logical clock and an App whose every request takes 14 s (inside the 15 s request timeout): the viewer's own PR has

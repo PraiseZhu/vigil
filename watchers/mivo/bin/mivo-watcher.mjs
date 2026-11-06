@@ -3766,11 +3766,14 @@ const batchQueryFor = (repo, after) => {
 };
 const BATCH_MAX_PAGES = 10;
 // Every open PR node of the repository, page by page, whoever wrote it. `queryFor` picks the fields to ask for; the
-// default is the follow beat's fingerprint query above.
-export function* readOpenPrNodes({ ghFn, repo = REPO, queryFor = batchQueryFor }) {
+// default is the follow beat's fingerprint query above. `canContinue`, when given, is asked before every page: once it
+// says no the answer is null (not the part of the list read so far), so a caller cannot take half a list for all of it.
+// Without it nothing is asked and the answer is always the full list.
+export function* readOpenPrNodes({ ghFn, repo = REPO, queryFor = batchQueryFor, canContinue = null }) {
   const nodes = [];
   let after = null;
   for (let page = 0; page < BATCH_MAX_PAGES; page += 1) {
+    if (canContinue && !canContinue()) return null;
     const payload = JSON.parse(yield () => ghFn(['api', 'graphql', '-f', `query=${queryFor(repo, after)}`]));
     const open = payload?.data?.repository?.pullRequests;
     if (payload?.errors?.length || !open || !Array.isArray(open.nodes) || typeof open.pageInfo?.hasNextPage !== 'boolean') throw new Error('Batch PR query incomplete');
@@ -3901,8 +3904,11 @@ export function* discoverOtherPrs({ ghFn, viewer, paths, now, events, appResolve
   const reasonOf = (error) => String(error?.message ?? error).slice(0, 200);
   if (!canContinue()) { note({ kind: 'other-server-fixed-scan-deferred', reason: 'budget' }); return { ...summary, deferred: null }; }
   let nodes;
-  try { nodes = yield* readOpenPrNodes({ ghFn, repo: REPO, queryFor: otherPrQueryFor }); }
+  // The list is read page by page, each page may take a while: it stops at the same cut-off as everything after it. A list
+  // cut short is not a list: no PR is scanned, no record is dropped or stamped, and the next round starts it again.
+  try { nodes = yield* readOpenPrNodes({ ghFn, repo: REPO, queryFor: otherPrQueryFor, canContinue }); }
   catch (error) { note({ kind: 'other-server-fixed-scan-failed', stage: 'list', reason: reasonOf(error) }); return summary; }
+  if (nodes === null) { note({ kind: 'other-server-fixed-scan-deferred', reason: 'budget', stage: 'list' }); return { ...summary, deferred: null }; }
   const openIds = new Set(nodes.filter((node) => node?.id).map((node) => String(node.id)));
   let state = readServerFixedState(paths);
   // A PR that is no longer open takes its record with it.

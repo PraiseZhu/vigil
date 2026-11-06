@@ -81,3 +81,22 @@ test('readOpenPrNodes asks for the fields of the query it is given', () => {
   run(readOpenPrNodes({ ghFn: (args) => { calls.push(args); return followBatchBody([]); }, repo: REPO, queryFor }));
   assert.deepEqual(calls, [['api', 'graphql', '-f', `query=query{marker(repo:"${REPO}",after:null)}`]]);
 });
+
+// The other-authors path gives the list a time check (`canContinue`), asked before every page; follow beats do not give one.
+test('readOpenPrNodes with canContinue asks it before every page and gives null, not a part of the list, when it says no', () => {
+  let open = 3;
+  const pages = [];
+  const ghFn = (args) => {
+    pages.push(args);
+    return followBatchBody([node(`PR_${pages.length}`)], { hasNextPage: true, endCursor: `c${pages.length}` });
+  };
+  const asked = [];
+  const canContinue = () => { asked.push(pages.length); open -= 1; return open >= 0; };
+  assert.equal(run(readOpenPrNodes({ ghFn, repo: REPO, canContinue })), null);
+  assert.equal(pages.length, 3, 'three pages were asked for, then the check said no');
+  assert.deepEqual(asked, [0, 1, 2, 3], 'the check comes before the first page too, and before each one after it');
+  // A check that always says yes changes nothing: the full list comes back.
+  const all = run(readOpenPrNodes({ ghFn: (args) => (/after/.test(queryOf(args)) ? followBatchBody([node('PR_2')]) : followBatchBody([node('PR_1')], { hasNextPage: true, endCursor: 'c1' })),
+    repo: REPO, canContinue: () => true }));
+  assert.deepEqual(all.map((item) => item.id), ['PR_1', 'PR_2']);
+});
