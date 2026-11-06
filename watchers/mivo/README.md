@@ -50,6 +50,8 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 
 | profile 字段 | 环境变量 | 默认值 |
 |---|---|---|
+| `ghLogin` | `VIGIL_GH_LOGIN` | 代码中的默认账号（`bin/mivo-identity.mjs` 的 `DEFAULT_LOGIN`）。watcher 以这个账号列出并处理自己的 PR；修复会话的提交身份也用它。优先级：环境变量 > profile > 默认账号。**mivo-repair / mivo-handoff 可能是不带调度命令环境变量的独立进程**，所以另一账号部署应写进 `config/profile.json` |
+| `ghUserId` | `VIGIL_GH_USER_ID` | 默认账号对应的 ID（仅当 `ghLogin` 等于默认账号时）。提交邮箱 `<id>+<login>@users.noreply.github.com`；配了别的账号却没配它时 `prepare` 按 `gh-user-unavailable` 拒绝 |
 | `watchHomes` | `MIVO_WATCHER_WATCH_HOMES`（逗号分隔） | `[]`（不内置任何路径） |
 | `lifelineConfigPath` | `MIVO_WATCHER_LIFELINE_CONFIG` | 未配置时不接收本地 Doctor 任务 |
 | `severityStandardPath` | `MIVO_SEVERITY_STANDARD_PATH` | 审查机发布的统一分级文件（审查仓的 `mivo/config/severity.md`，与前置审查同机检出的那份）。修复会话和裁决 Worker 只按它判 P0/P1/P2/P3；版本号是文件原始内容 sha256 的前 12 位，与审查机算法相同。未配置或读不到时不报错，但本轮审查账号的 P0/P1/P2 一律按成立处理、必须修，finalize 拒绝把它们记成 no-change |
