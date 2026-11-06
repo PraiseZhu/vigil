@@ -3795,6 +3795,137 @@ export function* readBatch({ ghFn, viewer, repo = REPO }) {
   return signatures;
 }
 
+// Other authors' PRs (switch resolveFixedThreadsWithApp). A thread the review server already re-checked and found
+// fixed (isServerFixedThread) is resolved as the review App's bot on every open, non-Draft PR of the repository, whoever
+// wrote it. This is the whole of it: no session, handoff, task, comment or reply, and no state/prs/ entry, because
+// the watcher does not own these PRs and only reads them with its own account. Receipts and scan times are kept in
+// state/server-fixed.json, which is the only thing this path writes. A PR is looked at again after fullCollectMs.
+const SERVER_FIXED_FILE = 'server-fixed.json';
+const OTHER_PR_THREAD_PAGES = 10;
+// Only what is needed to pick the PRs to look at; the threads are read per PR (otherPrThreadsQueryFor).
+const otherPrQueryFor = (repo, after) => {
+  const [owner, name] = repo.split('/');
+  return `query{repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){pullRequests(states:OPEN,first:100${after ? `,after:${JSON.stringify(after)}` : ''}){pageInfo{hasNextPage endCursor} nodes{id number isDraft headRefOid author{login}}}}}`;
+};
+// The PR's own fields come with every page, so a PR that closed, went Draft, changed hands or moved its head while
+// its threads were being read is noticed. A thread with more comments than one page is cut short on purpose:
+// isServerFixedThread then refuses it.
+const otherPrThreadsQueryFor = (id, after) => `query{node(id:${JSON.stringify(id)}){... on PullRequest{state isDraft headRefOid author{login} reviewThreads(first:100${after ? `,after:${JSON.stringify(after)}` : ''}){pageInfo{hasNextPage endCursor} nodes{id isResolved comments(first:100){pageInfo{hasNextPage endCursor} nodes{id body createdAt author{login __typename}}}}}}}}`;
+const isOtherAuthor = (login, viewer) => {
+  const them = String(login ?? '').trim().toLowerCase();
+  const me = String(viewer ?? '').trim().toLowerCase();
+  return them !== '' && me !== '' && them !== me;
+};
+const isOtherPrCandidate = (node, viewer) => Boolean(node?.id) && Number.isSafeInteger(node.number) && node.isDraft === false
+  && /^[0-9a-f]{40}$/.test(node.headRefOid ?? '') && isOtherAuthor(node.author?.login, viewer);
+
+const serverFixedFile = (paths) => path.join(paths.stateDir, SERVER_FIXED_FILE);
+export function readServerFixedState(paths) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(serverFixedFile(paths), 'utf8'));
+    if (saved?.version === 1 && saved.repo === REPO && saved.prs && typeof saved.prs === 'object' && !Array.isArray(saved.prs)) return saved;
+  } catch { /* none yet, or unreadable: a lost receipt costs at most one more look at the thread */ }
+  return { version: 1, repo: REPO, prs: {} };
+}
+function writeServerFixedState(paths, state) {
+  fs.mkdirSync(paths.stateDir, { recursive: true, mode: 0o700 });
+  atomic(serverFixedFile(paths), `${JSON.stringify(state, null, 2)}\n`);
+}
+// Never scanned counts as due. The caller sorts the oldest scan first, so a PR cut off by the budget is first next time.
+export const otherPrScanDue = (record, now, fullCollectMs) => {
+  const last = Date.parse(record?.lastScannedAt ?? '');
+  return !Number.isFinite(last) || Date.parse(now) - last >= fullCollectMs;
+};
+
+// Reads (and only reads) every thread of one PR. Anything short of a complete picture of a PR that is still open,
+// not Draft, someone else's and at the listed head gives {ok:false}: no App call is made and the PR is not stamped.
+function* readOtherPrThreads({ pr, viewer, ghFn, canContinue }) {
+  const threads = [];
+  let after = null;
+  for (let page = 0; page < OTHER_PR_THREAD_PAGES; page += 1) {
+    if (!canContinue()) return { ok: false, reason: 'budget' };
+    const payload = JSON.parse(yield () => ghFn(['api', 'graphql', '-f', `query=${otherPrThreadsQueryFor(pr.id, after)}`]));
+    const node = payload?.data?.node;
+    const batch = node?.reviewThreads;
+    if (payload?.errors?.length || !node || !Array.isArray(batch?.nodes) || typeof batch.pageInfo?.hasNextPage !== 'boolean') return { ok: false, reason: 'incomplete' };
+    if (node.state !== 'OPEN' || node.isDraft !== false || node.headRefOid !== pr.headRefOid || !isOtherAuthor(node.author?.login, viewer)) return { ok: false, reason: 'changed' };
+    threads.push(...batch.nodes);
+    if (!batch.pageInfo.hasNextPage) return { ok: true, head: node.headRefOid, threads };
+    after = batch.pageInfo.endCursor;
+    if (typeof after !== 'string' || !after) return { ok: false, reason: 'incomplete' };
+  }
+  return { ok: false, reason: 'incomplete' };
+}
+
+// One PR: read its threads, resolve the recognized ones with the App in one call, return what to remember and report.
+// A failed resolve still counts as a look (it is retried after fullCollectMs and logged with expected and actual); the
+// thread stays open and nothing falls back to this account.
+function* scanOtherPr({ pr, record, viewer, ghFn, appResolveFn, now, canContinue }) {
+  const read = yield* readOtherPrThreads({ pr, viewer, ghFn, canContinue });
+  if (!read.ok) return { scanned: false, reason: read.reason, events: [] };
+  const { eligible } = partitionServerFixedThreads(read.threads, read.head, record);
+  if (eligible.length === 0) return { scanned: true, record: { ...record, number: pr.number, lastScannedAt: now, lastFailures: {} }, closed: [], events: [] };
+  if (!canContinue()) return { scanned: false, reason: 'budget', events: [] };
+  const outcome = yield* resolveServerFixedThreads({ eligible, previous: record, appResolveFn, repo: REPO, now });
+  const scope = 'other-pr';
+  const events = outcome.closed.map(({ threadId, key }) => ({ kind: 'server-fixed-thread-resolved', scope, number: pr.number, threadId, key }));
+  const lastFailures = {};
+  for (const { threadId, phase, expected, actual } of outcome.failed) {
+    lastFailures[threadId] = { at: now, phase, expected, actual };
+    events.push({ kind: 'server-fixed-thread-resolve-failed', scope, number: pr.number, threadId, phase, expected, actual });
+  }
+  for (const { phase, expected, actual } of outcome.revokeFailures) {
+    events.push({ kind: 'server-fixed-thread-token-revoke-failed', scope, number: pr.number, phase, expected, actual });
+  }
+  return { scanned: true, closed: outcome.closed, events,
+    record: { number: pr.number, lastScannedAt: now, autoClosedThreads: outcome.previous.autoClosedThreads, lastFailures } };
+}
+
+// Runs last in a round, after the viewer's own PRs, and only with whatever is left of the round's time. Never throws:
+// a problem here is an event and the round's own results are untouched.
+export function* discoverOtherPrs({ ghFn, viewer, paths, now, events, appResolveFn = resolveThreadsWithApp,
+  fullCollectMs = FULL_COLLECT_MS, deadline, dispatchReserveMs = DISPATCH_RESERVE_MS, clock = Date.now }) {
+  const canContinue = () => deadline - dispatchReserveMs - clock() > 0;
+  const summary = { scanned: 0, closed: 0, deferred: 0 };
+  const note = (event) => events.push({ scope: 'other-pr', ...event });
+  const reasonOf = (error) => String(error?.message ?? error).slice(0, 200);
+  if (!canContinue()) { note({ kind: 'other-server-fixed-scan-deferred', reason: 'budget' }); return { ...summary, deferred: null }; }
+  let nodes;
+  try { nodes = yield* readOpenPrNodes({ ghFn, repo: REPO, queryFor: otherPrQueryFor }); }
+  catch (error) { note({ kind: 'other-server-fixed-scan-failed', stage: 'list', reason: reasonOf(error) }); return summary; }
+  const openIds = new Set(nodes.filter((node) => node?.id).map((node) => String(node.id)));
+  let state = readServerFixedState(paths);
+  // A PR that is no longer open takes its record with it.
+  if (Object.keys(state.prs).some((id) => !openIds.has(id))) {
+    state = { ...state, prs: Object.fromEntries(Object.entries(state.prs).filter(([id]) => openIds.has(id))) };
+    try { writeServerFixedState(paths, state); } catch (error) { note({ kind: 'other-server-fixed-scan-failed', stage: 'state', reason: reasonOf(error) }); return summary; }
+  }
+  const lastScan = (pr) => { const at = Date.parse(state.prs[String(pr.id)]?.lastScannedAt ?? ''); return Number.isFinite(at) ? at : -Infinity; };
+  const due = nodes.filter((node) => isOtherPrCandidate(node, viewer) && otherPrScanDue(state.prs[String(node.id)], now, fullCollectMs))
+    .sort((a, b) => lastScan(a) - lastScan(b) || a.number - b.number);
+  for (const [index, pr] of due.entries()) {
+    const deferRest = () => { summary.deferred = due.length - index; note({ kind: 'other-server-fixed-scan-deferred', reason: 'budget', remaining: summary.deferred }); };
+    if (!canContinue()) { deferRest(); break; }
+    let result;
+    try { result = yield* scanOtherPr({ pr, record: state.prs[String(pr.id)] ?? {}, viewer, ghFn, appResolveFn, now, canContinue }); }
+    catch (error) { note({ kind: 'other-server-fixed-scan-failed', stage: 'scan', number: pr.number, reason: reasonOf(error) }); continue; }
+    if (!result.scanned) {
+      if (result.reason === 'budget') { deferRest(); break; }
+      continue;
+    }
+    // Written as soon as this PR is done, from what is on disk now, so a cut-off round keeps every receipt it earned.
+    try {
+      state = readServerFixedState(paths);
+      state.prs[String(pr.id)] = result.record;
+      writeServerFixedState(paths, state);
+    } catch (error) { note({ kind: 'other-server-fixed-scan-failed', stage: 'state', number: pr.number, reason: reasonOf(error) }); }
+    events.push(...result.events);
+    summary.scanned += 1;
+    summary.closed += result.closed.length;
+  }
+  return summary;
+}
+
 // Tracks the PRs being handled so a follow beat never starts a second pass on the same PR.
 function* trackedPr(pr, ctx) {
   const key = String(pr.id);
@@ -3875,6 +4006,7 @@ export function* discoverWorkflow({
   }
   const baselineAt = clock();
   const lateNumbers = new Set();
+  let otherPrs = null;
   function* main() {
   yield* discoverPass(ordered, ctx, report, events);
     const listedIds = new Set(listed.map((pr) => String(pr.id)));
@@ -3916,6 +4048,10 @@ export function* discoverWorkflow({
         });
         report.push({ number: live.number, nodeId: staleKey, dispatch });
       } finally { staleLock.release(); }
+    }
+    // Opt-in, and last: the viewer's own PRs have used what they need of the round by now.
+    if (!dryRun && resolveWithAppEnabled()) {
+      otherPrs = yield* discoverOtherPrs({ ghFn, viewer, paths, now, events, appResolveFn, fullCollectMs, deadline, dispatchReserveMs, clock });
     }
   }
   function* follow() {
@@ -4003,7 +4139,8 @@ export function* discoverWorkflow({
   const closedownManual = listPrs(paths.home)
     .filter((entry) => entry?.closedownManual)
     .map((entry) => ({ number: entry.number, nodeId: entry.nodeId, ...entry.closedownManual }));
-  return { mode: 'discover', dispatch: !dryRun, viewer, repo: REPO, prs: report, events, closedownManual, mergeStates, scan: { cursor: index.cursor ?? 0, listed: listed.length } };
+  return { mode: 'discover', dispatch: !dryRun, viewer, repo: REPO, prs: report, events, closedownManual, mergeStates, scan: { cursor: index.cursor ?? 0, listed: listed.length },
+    ...(otherPrs ? { otherPrs } : {}) };
 }
 
 function driveSync(iterator, shared = { errors: [] }) {
