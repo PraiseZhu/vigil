@@ -3670,6 +3670,232 @@ test('W4-b SC1 同一拍的 worker 行和 poll 行各进各的组：事件→写
   );
 });
 
+// #335 SC3：把一条延迟行再拆成 Worker 段和本机段。
+// /pull 出口带 dequeuedAt（交给本机的时刻，每次 /pull 现取，不写进队列记录），
+// workerMs = dequeuedAt − receivedAt（Worker 段），processedAt − dequeuedAt 由本机自行相减。
+// gatewayMs 语义不变（processedAt − receivedAt）；两段都不把缺失值当成 0。
+
+test('#335 SC3 /pull 每条事件带当次时钟的 dequeuedAt，正文被省略时也带，且不写进队列记录', async () => {
+  let nowMs = Date.parse('2026-11-02T00:00:07.000Z');
+  const storage = sharedStorage();
+  const worker = createEventWorker({ storage, now: () => nowMs });
+  const env = workerEnv();
+  await enqueueDelivery(worker, env, 'dequeued-plain');
+
+  const first = (await (await worker.fetch(pullRequest(TOKEN), env)).json()).events;
+  assert.equal(first.length, 1);
+  assert.equal(first[0].dequeuedAt, '2026-11-02T00:00:07.000Z');
+  assert.equal(first[0].receivedAt, '2026-11-02T00:00:07.000Z');
+
+  // 第二次 /pull 现取时钟：dequeuedAt 跟着走，receivedAt 仍是入队时写进记录的值。
+  nowMs = Date.parse('2026-11-02T00:00:09.500Z');
+  const second = (await (await worker.fetch(pullRequest(TOKEN), env)).json()).events;
+  assert.equal(second.length, 1);
+  assert.equal(second[0].dequeuedAt, '2026-11-02T00:00:09.500Z');
+  assert.equal(second[0].receivedAt, '2026-11-02T00:00:07.000Z');
+
+  // 正文超上限、只留元数据时，dequeuedAt 也不能跟着 payload 一起丢。
+  const tiny = createEventWorker({ now: () => nowMs, maxValueBytes: 64 });
+  const tinyEnv = workerEnv();
+  const big = JSON.stringify({
+    created_at: '2026-10-31T00:00:00.000Z',
+    action: 'opened',
+    body: 'x'.repeat(4000),
+  });
+  assert.equal((await tiny.fetch(webhookRequest(big, { delivery: 'dequeued-omitted' }), tinyEnv)).status, 204);
+  const omitted = (await (await tiny.fetch(pullRequest(TOKEN), tinyEnv)).json()).events[0];
+  assert.equal(omitted.payloadOmitted, true);
+  assert.equal(omitted.dequeuedAt, '2026-11-02T00:00:09.500Z');
+
+  // 时钟不是有限数时给 null，不当成 0，也不抛 RangeError。
+  const nanWorker = createEventWorker({ now: () => Number.NaN });
+  const nanEnv = workerEnv();
+  await enqueueDelivery(nanWorker, nanEnv, 'dequeued-nan');
+  const nanEvents = (await (await nanWorker.fetch(pullRequest(TOKEN), nanEnv)).json()).events;
+  assert.equal(nanEvents.length, 1);
+  assert.equal(nanEvents[0].dequeuedAt, null);
+  assert.equal(nanEvents[0].receivedAt, null);
+
+  // 队列记录里不多出新键：/pull 的响应时刻不进存储。
+  const stored = await storage.get('q:1');
+  assert.equal(stored.deliveryId, 'dequeued-plain');
+  assert.equal('dequeuedAt' in stored, false);
+});
+
+test('#335 SC3 延迟行记 dequeuedAt 与 workerMs：workerMs = dequeuedAt − receivedAt，本机段可自行相减', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  let t = Date.parse('2026-11-02T00:00:10.000Z');
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: t + 1,
+    pull: async () => [
+      {
+        deliveryId: 'two-segments',
+        event: 'pull_request',
+        created_at: '2026-11-02T00:00:00.000Z',
+        receivedAt: '2026-11-02T00:00:04.000Z',
+        dequeuedAt: '2026-11-02T00:00:07.000Z',
+        payload: {
+          action: 'opened',
+          repository: { full_name: 'example-org/owner-a' },
+          pull_request: { number: 42 },
+        },
+      },
+    ],
+    poll: async () => [],
+    onEvent: async () => {
+      t += 1000;
+    },
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 1);
+  const [row] = rows;
+  assert.equal(row.receivedAt, '2026-11-02T00:00:04.000Z');
+  assert.equal(row.dequeuedAt, '2026-11-02T00:00:07.000Z');
+  assert.equal(row.processedAt, '2026-11-02T00:00:11.000Z');
+  // Worker 段 = 交出 − Worker 收到；本机段 = 写完 − 交出，两段相加仍是 gatewayMs。
+  assert.equal(row.workerMs, 3000);
+  assert.equal(Date.parse(row.processedAt) - Date.parse(row.dequeuedAt), 4000);
+  assert.equal(row.gatewayMs, 7000);
+  assert.equal(row.workerMs + 4000, row.gatewayMs);
+  // gatewayMs 语义没变（写成 − Worker 收到），没有 workerMsReject。
+  assert.equal(row.latencyMs, 11000);
+  assert.equal('workerMsReject' in row, false);
+  assert.equal('gatewayMsReject' in row, false);
+});
+
+test('#335 SC3 dequeuedAt 缺失或非法时 workerMs 记 null 并留 workerMsReject，latencyMs / gatewayMs 不受影响', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const at = Date.parse('2026-11-02T00:00:10.000Z');
+  let t = at;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: at + 1,
+    pull: async () => [
+      // 老 Worker：/pull 还不带 dequeuedAt。
+      { deliveryId: 'no-dequeued', created_at: '2026-11-02T00:00:00.000Z', receivedAt: '2026-11-02T00:00:04.000Z' },
+      {
+        deliveryId: 'bad-dequeued',
+        created_at: '2026-11-02T00:00:02.000Z',
+        receivedAt: '2026-11-02T00:00:04.000Z',
+        dequeuedAt: 'not-a-date',
+      },
+      {
+        deliveryId: 'number-dequeued',
+        created_at: '2026-11-02T00:00:05.000Z',
+        receivedAt: '2026-11-02T00:00:04.000Z',
+        dequeuedAt: 1761955200000,
+      },
+      {
+        deliveryId: 'object-dequeued',
+        created_at: '2026-11-02T00:00:06.000Z',
+        receivedAt: '2026-11-02T00:00:04.000Z',
+        dequeuedAt: { at: '2026-11-02T00:00:07.000Z' },
+      },
+      // dequeuedAt 有、receivedAt 没有：算不出 Worker 段，原因沿用 received-at-*（两段共用同一个 receivedAt）。
+      { deliveryId: 'no-received', created_at: '2026-11-02T00:00:08.000Z', dequeuedAt: '2026-11-02T00:00:07.000Z' },
+    ],
+    poll: async () => [],
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 5);
+  for (const row of rows) {
+    assert.equal(row.workerMs, null, row.deliveryId);
+    assert.equal(typeof row.workerMsReject, 'string', row.deliveryId);
+  }
+  assert.deepEqual(
+    rows.map((row) => [row.deliveryId, row.workerMsReject, row.dequeuedAt]),
+    [
+      ['no-dequeued', 'dequeued-at-missing', null],
+      ['bad-dequeued', 'dequeued-at-invalid', null],
+      ['number-dequeued', 'dequeued-at-not-string', null],
+      ['object-dequeued', 'dequeued-at-not-string', null],
+      ['no-received', 'received-at-missing', '2026-11-02T00:00:07.000Z'],
+    ],
+  );
+  // 算不出的只是 Worker 段：latencyMs 照旧，gatewayMs 只在前四条上照旧。
+  assert.deepEqual(
+    rows.map((row) => [row.deliveryId, row.latencyMs, row.gatewayMs, row.gatewayMsReject ?? null]),
+    [
+      ['no-dequeued', 10000, 6000, null],
+      ['bad-dequeued', 8000, 6000, null],
+      ['number-dequeued', 5000, 6000, null],
+      ['object-dequeued', 4000, 6000, null],
+      ['no-received', 2000, null, 'received-at-missing'],
+    ],
+  );
+});
+
+test('#335 SC3 workerMs 只收 0—600000ms：dequeuedAt 早于 receivedAt 或差超过 10 分钟时记 null 并留原因', async () => {
+  const latencyFile = path.join(tmpDir(), '.prio', 'latency.jsonl');
+  const at = Date.parse('2026-11-02T00:00:10.000Z');
+  const created = '2026-11-02T00:00:00.000Z';
+  let t = at;
+  await runEventChannel({
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    until: at + 1,
+    pull: async () => [
+      // dequeuedAt 比 receivedAt 还早：差值为负，不当成样本。
+      {
+        deliveryId: 'negative-worker',
+        created_at: created,
+        receivedAt: '2026-11-02T00:00:08.000Z',
+        dequeuedAt: '2026-11-02T00:00:05.000Z',
+      },
+      // 差 10 分钟 1 毫秒，超过上限。
+      {
+        deliveryId: 'too-slow-worker',
+        created_at: created,
+        receivedAt: '2026-11-01T23:49:59.999Z',
+        dequeuedAt: '2026-11-02T00:00:10.000Z',
+      },
+      // 正好 600000ms：收。
+      {
+        deliveryId: 'exactly-max-worker',
+        created_at: created,
+        receivedAt: '2026-11-01T23:50:10.000Z',
+        dequeuedAt: '2026-11-02T00:00:10.000Z',
+      },
+      // 正好 0：收。
+      {
+        deliveryId: 'zero-worker',
+        created_at: created,
+        receivedAt: '2026-11-02T00:00:10.000Z',
+        dequeuedAt: '2026-11-02T00:00:10.000Z',
+      },
+    ],
+    poll: async () => [],
+    latencyFile,
+  });
+  const rows = readLatencyLog(latencyFile);
+  assert.equal(rows.length, 4);
+  assert.deepEqual(
+    rows.map((row) => [row.deliveryId, row.workerMs, row.workerMsReject ?? null]),
+    [
+      ['negative-worker', null, 'negative'],
+      ['too-slow-worker', null, 'too-large'],
+      ['exactly-max-worker', 600000, null],
+      ['zero-worker', 0, null],
+    ],
+  );
+  // 范围校验不影响 latencyMs（事件发生 → 写完）。
+  assert.deepEqual(
+    rows.map((row) => row.latencyMs),
+    [10000, 10000, 10000, 10000],
+  );
+});
+
 // W4-e：请求体大小上限。三条读 body 的路由（/webhook、/ack、/fail）都先看 content-length 快速拒绝，
 // 没有该头或声明偏小时按读到的累计字节数兜底，超限一律 413；/webhook 的 413 在验签之前返回。
 // 413 只回上限数字，不回显 body、不提 secret。
