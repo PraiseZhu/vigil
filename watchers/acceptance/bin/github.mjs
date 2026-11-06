@@ -341,6 +341,44 @@ export class RateLimitError extends Error {
 }
 
 /**
+ * 只用 App 模式（profile.appOnly）下，这次请求本该改用账号令牌：不发请求，直接抛这个。
+ * `reason` 是 app-token-fallback 同一套短码（另加 `no-app-route`），方便 grep。
+ */
+export class AppOnlyError extends Error {
+  constructor(message, { kind = null, reason = null, repo = null } = {}) {
+    super(message);
+    this.name = 'AppOnlyError';
+    this.code = 'APP_ONLY_BLOCKED';
+    this.kind = kind;
+    this.reason = reason;
+    this.repo = repo;
+  }
+}
+
+/**
+ * 看板（个人账号名下的 Projects v2）的读写：GitHub App 安装令牌访问不了个人账号的 Projects v2，
+ * 所以只用 App 模式也只给这一类留账号令牌（含优先级写令牌），别的都不许。
+ */
+export function isBoardGraphql(query) {
+  return /projectV2|ProjectV2|projectItems/.test(String(query || ''));
+}
+
+/**
+ * 搜索串里只点名了一个 owner（`repo:o/n`、`user:o`、`org:o`，可以多次但必须同一个 owner）时返回它，
+ * 否则 null。只用 App 模式据此把搜索交给这个 owner 的 ①读 App。
+ */
+export function searchOwnerOf(text) {
+  if (typeof text !== 'string' || !text) return null;
+  const owners = new Set();
+  for (const match of text.matchAll(/(?:^|\s)(repo|user|org):("?)([A-Za-z0-9._/-]+)\2/g)) {
+    const value = match[3];
+    const owner = match[1] === 'repo' ? value.split('/')[0] : value;
+    if (owner) owners.add(owner.toLowerCase());
+  }
+  return owners.size === 1 ? [...owners][0] : null;
+}
+
+/**
  * `gh api --include` 的输出拆成响应头与正文。只有真以 HTTP 状态行开头时才拆，
  * 不然原样返回（老版本 gh、或测试替身只给正文）。
  */
@@ -703,6 +741,9 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
   const allAppTokens = () =>
     [configAppToken, ...[...appTokenCache.values()].map((entry) => entry.token), ...cmdTokenCache.values()].filter(Boolean);
   const writeFallback = fallbackLog || defaultFallbackLog(profile);
+  // 只用 App 模式：App 取不到 / 被拒、或这次请求没有 App 能接，都不再改用账号令牌，而是报错并记一行
+  // app-only-blocked。唯一例外是看板（isBoardGraphql / project.field.set），见 isBoardGraphql 的说明。
+  const appOnly = profile.appOnly === true;
 
   function appConfigFor(role) {
     return profile?.apps?.[role] || null;
@@ -919,6 +960,46 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     );
   }
 
+  /**
+   * 只用 App 模式下，readRouteFor 接不住的只读查询再找一次 owner：按 owner 盘点（只有 $owner）、
+   * 搜索串里只点名一个 owner（$q / $query）。这个 owner 在 ①读 App 名单里才走 App。
+   */
+  function appOnlyRouteFor(variables) {
+    if (!profile.apps) return null;
+    const owner =
+      typeof variables?.owner === 'string' && variables.owner
+        ? variables.owner
+        : searchOwnerOf(variables?.q ?? variables?.query);
+    if (!owner || !appCovers('read', owner)) return null;
+    const name = typeof variables?.name === 'string' && variables.name ? variables.name : '*';
+    return { mode: 'mint', role: 'read', owner, repo: `${owner}/${name}` };
+  }
+
+  /** 只用 App 模式：记一行 app-only-blocked（不含令牌），然后抛 AppOnlyError，这次请求不发。 */
+  function blockAppOnly(kind, repo, info = {}) {
+    const appField = info.role ? ` app=${info.role}` : '';
+    const reasonField = info.reason ? ` reason=${info.reason}` : '';
+    writeFallback(
+      `${new Date(nowFn()).toISOString()} app-only-blocked kind=${kind} repo=${repo}${appField}${reasonField} 只用 App 模式：不改用账号令牌，这次请求没有发`,
+    );
+    throw new AppOnlyError(`只用 App 模式拒绝改用账号令牌（${kind}${info.reason ? ` / ${info.reason}` : ''}，${repo}）`, {
+      kind,
+      reason: info.reason || null,
+      repo,
+    });
+  }
+
+  /** 只用 App 模式下没有 App 能接的请求（看板除外）：报出是哪个 owner、为什么没路由。 */
+  function blockNoRoute(variables, label) {
+    const owner =
+      typeof variables?.owner === 'string' && variables.owner
+        ? variables.owner
+        : searchOwnerOf(variables?.q ?? variables?.query);
+    const repo = owner ? `${owner}/${typeof variables?.name === 'string' && variables.name ? variables.name : '*'}` : label;
+    const reason = !profile.apps ? 'app-not-configured' : owner ? 'owner-not-in-app-owners' : 'no-owner';
+    blockAppOnly('no-app-route', repo, { reason });
+  }
+
   function getOwnerToken() {
     // 调用方已经从令牌文件读出内容时，只放在内存里，不再读一遍文件。
     if (typeof ownerToken === 'string' && ownerToken) return ownerToken;
@@ -1016,7 +1097,12 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
   }
 
   async function graphql(query, variables) {
-    const route = isReadOnlyGraphql(query) ? readRouteFor(variables) : null;
+    const readOnly = isReadOnlyGraphql(query);
+    const board = isBoardGraphql(query);
+    let route = readOnly ? readRouteFor(variables) : null;
+    // 只用 App 模式：看板查询照旧（例外）；其余只读查询再按 owner / 搜索串找一次 App。
+    if (appOnly && board) route = null;
+    else if (appOnly && !route && readOnly && !profile.appConfigPath) route = appOnlyRouteFor(variables);
     if (route) {
       const minted = await appReadToken(route);
       if (minted.token) {
@@ -1024,13 +1110,16 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
         const kind = appFallbackKind(first);
         if (!kind) return finishGraphql(first, minted.token, 'app');
         if (kind === 'auth-401') forgetAppToken(route);
+        if (appOnly) blockAppOnly(kind, route.repo, { role: route.role, reason: appRejectReason(kind) });
         logFallback(kind, route.repo, { role: route.role, reason: appRejectReason(kind) });
       } else {
+        if (appOnly) blockAppOnly(minted.error.kind, route.repo, { role: route.role, reason: minted.error.reason });
         logFallback(minted.error.kind, route.repo, { role: route.role, reason: minted.error.reason });
       }
       const ownerToken = getOwnerToken();
       return finishGraphql(await sendGraphql(ownerToken, query, variables), ownerToken, 'user');
     }
+    if (appOnly && !board && !profile.appConfigPath) blockNoRoute(variables, 'graphql');
     const token = await getReadToken();
     return finishGraphql(await sendGraphql(token, query, variables), token, profile.appConfigPath ? 'app' : 'user');
   }
@@ -1084,6 +1173,8 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
    */
   async function ownerGraphql(query, variables) {
     if (/^\s*mutation\b/.test(String(query || ''))) throw new Error('ownerGraphql 只做只读查询');
+    // 只用 App 模式：不是看板的查询（发现、按仓搜 PR）交给 graphql 按 owner 走 App，不用账号 / 优先级令牌。
+    if (appOnly && !isBoardGraphql(query)) return graphql(query, variables);
     if (!isReadOnlyGraphql(query)) return graphqlWrite(query, variables);
     if (usesPriorityToken()) return graphqlFetch(ownerToken, query, variables);
     const token = getOwnerToken();
@@ -1125,6 +1216,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
   }
 
   async function graphqlWrite(query, variables) {
+    if (appOnly && !isBoardGraphql(query)) blockNoRoute(variables, 'graphql-write');
     const token = getOwnerToken();
     if (usesPriorityToken()) return graphqlFetch(token, query, variables);
     const result = await runCmd('gh', ['api', 'graphql', '--input', '-'], {
@@ -1397,6 +1489,19 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     }
   }
 
+  /**
+   * 只用 App 模式下拉代码用的令牌：这个 owner 在 ①读 App 名单里就用 ①，否则在 ②写 App 名单里用 ②；
+   * 都不在、或取不到令牌，就记 app-only-blocked 并抛错，不拿账号令牌拉。
+   */
+  async function appFetchToken(repo) {
+    const owner = repo.split('/')[0];
+    const role = appCovers('read', owner) ? 'read' : appCovers('write', owner) ? 'write' : null;
+    if (!role) blockAppOnly('no-app-route', repo, { reason: profile.apps ? 'owner-not-in-app-owners' : 'app-not-configured' });
+    const minted = await mintRoleToken(role, owner);
+    if (!minted.token) blockAppOnly(minted.error.kind, repo, { role, reason: minted.error.reason });
+    return minted.token;
+  }
+
   async function fetchBranch({ repo, branch = 'main', dir, depth = 50 } = {}) {
     if (typeof repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || repo.startsWith('-')) {
       throw new Error(`fetchBranch 的仓名不合法：${repo}`);
@@ -1416,7 +1521,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
       fs.writeFileSync(path.join(gitDir, 'config'), MIRROR_CONFIG, { mode: 0o600 });
     }
     assertMirrorIntact(dir);
-    const token = getOwnerToken();
+    const token = appOnly ? await appFetchToken(repo) : getOwnerToken();
     const env = { ...gitEnv(token), ...MIRROR_ENV };
     // 令牌只在 GIT_CONFIG_* extraheader 里（gitEnv）；URL / argv / 配置里都不带。
     // --git-dir 指定宿主自己的镜像，钩子 / fsmonitor / 代理 / 凭据助手全关，只许 https。
@@ -1585,6 +1690,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     const owner = repo.split('/')[0];
     const minted = await mintRoleToken(role, owner);
     if (!minted.token) {
+      if (appOnly) blockAppOnly(minted.error.kind, repo, { role, reason: minted.error.reason });
       logFallback(minted.error.kind, repo, { role, reason: minted.error.reason });
       return directWrite(action);
     }
@@ -1594,6 +1700,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
       const kind = appFallbackKind({ code: 1, stderr: String(error?.message || '') });
       if (!kind) throw error;
       if (kind === 'auth-401') forgetAppToken({ mode: 'mint', role, owner });
+      if (appOnly) blockAppOnly(kind, repo, { role, reason: appRejectReason(kind) });
       logFallback(kind, repo, { role, reason: appRejectReason(kind) });
       return directWrite(action);
     }
@@ -1607,7 +1714,20 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     // 写闸（writeCommand）那条路上，发请求的身份由写闸那边决定；本 PR 不在那边换令牌。
     if (profile.writeCommand) return writeViaCommand(prepared);
     const role = writeRoleFor(prepared);
-    if (!role) return directWrite(prepared);
+    if (!role) {
+      // 只用 App 模式：只有看板写（project.field.set）可以不走 App，其余没 App 能接的写一律拒绝。
+      if (appOnly && prepared.type !== 'project.field.set') {
+        const repo = String(prepared.repo || prepared.type);
+        const owner = repo.split('/')[0];
+        const reason = !profile.apps
+          ? 'app-not-configured'
+          : !WRITE_APP_ROLE[prepared.type]
+            ? `type-not-app-routed:${prepared.type}`
+            : 'owner-not-in-app-owners';
+        blockAppOnly('no-app-route', owner && repo.includes('/') ? repo : prepared.type, { role: 'write', reason });
+      }
+      return directWrite(prepared);
+    }
     return directWriteWithApp(prepared, role);
   }
 

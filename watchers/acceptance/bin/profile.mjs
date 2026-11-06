@@ -407,6 +407,16 @@ export function loadAcceptanceProfile(env = process.env) {
     appOwners = [...raw.appOwners];
   }
 
+  // 只用 App 模式：App 取不到 / 被拒、或没有 App 能接的请求，一律报错，不再改用账号令牌（看板读写例外，
+  // App 访问不了个人账号名下的 Projects v2）。默认 false（老行为）。只认布尔 true，必须同时配 apps。
+  let appOnly = false;
+  if (Object.hasOwn(raw, 'appOnly') && raw.appOnly !== undefined && raw.appOnly !== null) {
+    if (typeof raw.appOnly !== 'boolean') throw invalid('appOnly', file, '应为 true 或 false');
+    appOnly = raw.appOnly;
+  }
+  if (appOnly && !apps) throw invalid('appOnly', file, '打开只用 App 模式时必须同时配 apps');
+  if (appOnly && appConfigPath) throw invalid('appOnly', file, '只用 App 模式不能和 appConfigPath 一起用（appConfigPath 不按 owner 分流）');
+
   // 身份白名单只多认配置里的 App bot：没配时是 []，判断逻辑和「只认 ownerLogin」完全一致。
   const trustedBotLogins = optionalBotLogins(raw, file);
 
@@ -436,6 +446,7 @@ export function loadAcceptanceProfile(env = process.env) {
     appConfigPath,
     appPrivateKeyFile,
     apps,
+    appOnly,
     appTokenCommand: appTokenCommand ? Object.freeze(appTokenCommand) : undefined,
     appOwners: Object.freeze(appOwners),
     trustedBotLogins: Object.freeze(trustedBotLogins),
