@@ -1001,10 +1001,22 @@ function saveDebounceCompared(dir, { nextItems, saved, writtenRefs, prCiOut, loa
     const snapVal = saved[ref];
     if (sameJson(diskVal, snapVal)) delete merged[ref];
   }
-  let prCi = live.prCiPresent ? live.prCi : undefined;
-  const snapPrCi = loaded.prCiPresent ? loaded.prCi : undefined;
-  if (sameJson(prCi, snapPrCi)) prCi = prCiOut;
-  saveDebounce(dir, merged, prCi);
+  // prCi 同一条：以盘上为底，按 ref 与开拍快照比较，单条改过的键不被整盘拍末打回。
+  const livePrCi = live.prCiPresent && live.prCi && typeof live.prCi === 'object' ? live.prCi : {};
+  const snapPrCi = loaded.prCiPresent && loaded.prCi && typeof loaded.prCi === 'object' ? loaded.prCi : {};
+  const outPrCi = prCiOut && typeof prCiOut === 'object' ? prCiOut : {};
+  const mergedPrCi = { ...livePrCi };
+  for (const [ref, state] of Object.entries(outPrCi)) {
+    const diskVal = Object.prototype.hasOwnProperty.call(livePrCi, ref) ? livePrCi[ref] : undefined;
+    const snapVal = Object.prototype.hasOwnProperty.call(snapPrCi, ref) ? snapPrCi[ref] : undefined;
+    if (sameJson(diskVal, snapVal)) mergedPrCi[ref] = state;
+  }
+  for (const ref of Object.keys(snapPrCi)) {
+    if (Object.prototype.hasOwnProperty.call(outPrCi, ref)) continue;
+    const diskVal = Object.prototype.hasOwnProperty.call(livePrCi, ref) ? livePrCi[ref] : undefined;
+    if (sameJson(diskVal, snapPrCi[ref])) delete mergedPrCi[ref];
+  }
+  saveDebounce(dir, merged, Object.keys(mergedPrCi).length > 0 ? mergedPrCi : undefined);
 }
 
 function skipReport(skippedRepos) {
