@@ -3765,27 +3765,34 @@ const batchQueryFor = (repo, after) => {
   return `query{repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){pullRequests(states:OPEN,first:100${after ? `,after:${JSON.stringify(after)}` : ''}){pageInfo{hasNextPage endCursor} nodes{id isDraft headRefOid updatedAt author{login} labels(first:30){nodes{name}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}}`;
 };
 const BATCH_MAX_PAGES = 10;
-export function* readBatch({ ghFn, viewer, repo = REPO }) {
-  const mine = String(viewer ?? '').toLowerCase();
-  const signatures = new Map();
+// Every open PR node of the repository, page by page, whoever wrote it. `queryFor` picks the fields to ask for; the
+// default is the follow beat's fingerprint query above.
+export function* readOpenPrNodes({ ghFn, repo = REPO, queryFor = batchQueryFor }) {
+  const nodes = [];
   let after = null;
   for (let page = 0; page < BATCH_MAX_PAGES; page += 1) {
-    const payload = JSON.parse(yield () => ghFn(['api', 'graphql', '-f', `query=${batchQueryFor(repo, after)}`]));
+    const payload = JSON.parse(yield () => ghFn(['api', 'graphql', '-f', `query=${queryFor(repo, after)}`]));
     const open = payload?.data?.repository?.pullRequests;
     if (payload?.errors?.length || !open || !Array.isArray(open.nodes) || typeof open.pageInfo?.hasNextPage !== 'boolean') throw new Error('Batch PR query incomplete');
-    for (const node of open.nodes) {
-      if (!node?.id || !mine || String(node.author?.login ?? '').toLowerCase() !== mine) continue;
-      signatures.set(String(node.id), JSON.stringify([
-        node.isDraft === true, node.headRefOid, node.updatedAt,
-        (node.labels?.nodes ?? []).map((item) => item?.name).filter(Boolean).sort(),
-        node.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null,
-      ]));
-    }
-    if (!open.pageInfo.hasNextPage) return signatures;
+    nodes.push(...open.nodes);
+    if (!open.pageInfo.hasNextPage) return nodes;
     after = open.pageInfo.endCursor;
     if (typeof after !== 'string' || !after) throw new Error('Batch PR query cursor missing');
   }
   throw new Error('Batch PR query has too many pages');
+}
+export function* readBatch({ ghFn, viewer, repo = REPO }) {
+  const mine = String(viewer ?? '').toLowerCase();
+  const signatures = new Map();
+  for (const node of yield* readOpenPrNodes({ ghFn, repo })) {
+    if (!node?.id || !mine || String(node.author?.login ?? '').toLowerCase() !== mine) continue;
+    signatures.set(String(node.id), JSON.stringify([
+      node.isDraft === true, node.headRefOid, node.updatedAt,
+      (node.labels?.nodes ?? []).map((item) => item?.name).filter(Boolean).sort(),
+      node.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null,
+    ]));
+  }
+  return signatures;
 }
 
 // Tracks the PRs being handled so a follow beat never starts a second pass on the same PR.
