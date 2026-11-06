@@ -15,7 +15,7 @@ const CONFIG = {
   privateKeyPath: { key: 'praisebuildPrivateKeyPath', envVar: 'MIVO_WATCHER_PRAISEBUILD_PRIVATE_KEY_PATH' },
 };
 const RESOLVE_MUTATION = 'mutation($tid:ID!){resolveReviewThread(input:{threadId:$tid}){thread{id isResolved}}}';
-const REQUEST_TIMEOUT_MS = 15000;
+export const REQUEST_TIMEOUT_MS = 15000;
 
 // Off unless asked for: the profile needs the boolean `true`, the environment variable `1` or `true`.
 // The environment variable wins when it is set at all. An unreadable profile counts as off.
@@ -57,14 +57,22 @@ const request = (fetchImpl, url, method, bearer, body) => fetchImpl(url, {
 const nameOf = (error) => String(error?.name ?? 'Error').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 40) || 'Error';
 
 // Never throws. Returns {resolved: [threadId...], failures: [{threadId?, phase, expected, actual}]}. A failure
-// carries the phase (config, mint, resolve, revoke), what was expected and the HTTP status or reason that came
+// carries the phase (config, mint, resolve, revoke, budget), what was expected and the HTTP status or reason that came
 // back; no response body, token, JWT or key material is ever copied into it.
+// `canContinue` (optional, synchronous) is asked before the mint and before every resolve request. The first "no"
+// ends the resolving: each thread not yet tried gets a `budget` failure (it was not attempted, so it is not a failed
+// thread) and a token that was minted is still revoked.
 export async function resolveThreadsWithApp({
-  threadIds = [], repo, env = process.env, fetchImpl = globalThis.fetch, readFile = fs.readFileSync, nowMs = Date.now,
+  threadIds = [], repo, env = process.env, fetchImpl = globalThis.fetch, readFile = fs.readFileSync, nowMs = Date.now, canContinue = null,
 } = {}) {
   const resolved = [];
   const failures = [];
   const ids = [...new Set((threadIds ?? []).filter((id) => typeof id === 'string' && id))];
+  const noTime = () => {
+    if (typeof canContinue !== 'function') return false;
+    try { return !canContinue(); } catch { return true; }
+  };
+  const failBudget = (threadIdsLeft) => failures.push(...threadIdsLeft.map((threadId) => ({ threadId, phase: 'budget', expected: 'time left in the round', actual: 'round budget spent' })));
   if (ids.length === 0) return { resolved, failures };
   const fail = (failure) => failures.push(failure);
   const repoName = /^[A-Za-z0-9_.-]+\/([A-Za-z0-9_.-]+)$/.exec(String(repo ?? ''))?.[1];
@@ -79,6 +87,7 @@ export async function resolveThreadsWithApp({
     fail({ phase: 'config', expected: 'private key readable and usable for RS256', actual: `unusable ${String(error?.code ?? nameOf(error))}`.slice(0, 80) });
     return { resolved, failures };
   }
+  if (noTime()) { failBudget(ids); return { resolved, failures }; }
   let token = null;
   try {
     const response = await request(fetchImpl, `${API}/app/installations/${config.installationId}/access_tokens`, 'POST', jwt,
@@ -92,7 +101,8 @@ export async function resolveThreadsWithApp({
     return { resolved, failures };
   }
   try {
-    for (const threadId of ids) {
+    for (const [index, threadId] of ids.entries()) {
+      if (noTime()) { failBudget(ids.slice(index)); break; }
       try {
         const response = await request(fetchImpl, `${API}/graphql`, 'POST', token, { query: RESOLVE_MUTATION, variables: { tid: threadId } });
         if (response.status !== 200) { fail({ threadId, phase: 'resolve', expected: 'http 200 with isResolved=true', actual: `http ${response.status}` }); continue; }

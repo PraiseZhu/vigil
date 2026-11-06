@@ -145,6 +145,24 @@ test('a failure with no thread (config, mint) applies to every unresolved thread
   assert.equal(resolvedOnly.revokeFailures.length, 1);
 });
 
+test('a thread the App left for lack of time is deferred: no receipt, no failure; canContinue reaches the App only when one is given', () => {
+  const repo = 'example-org/example-plugin';
+  const canContinue = () => true;
+  const calls = [];
+  const answer = { resolved: ['PRRT_a'], failures: [
+    { threadId: 'PRRT_b', phase: 'budget', expected: 'time left in the round', actual: 'round budget spent' },
+    { phase: 'revoke', expected: 'http 204', actual: 'http 500' }] };
+  const out = drive(resolveServerFixedThreads({ eligible: hits('PRRT_a', 'PRRT_b'), previous: {}, repo, now: 'NOW', canContinue,
+    appResolveFn: (args) => { calls.push(args); return answer; } }));
+  assert.deepEqual(calls, [{ threadIds: ['PRRT_a', 'PRRT_b'], repo, canContinue }]);
+  assert.deepEqual(out.closed.map((x) => x.threadId), ['PRRT_a']);
+  assert.deepEqual(out.failed, []);
+  assert.deepEqual(out.deferred, [{ threadId: 'PRRT_b', key: KEY }]);
+  assert.equal(out.previous.autoClosedThreads.PRRT_b, undefined);
+  assert.equal(out.revokeFailures.length, 1, 'a revoke failure is still reported');
+  assert.deepEqual(run({ resolved: ['PRRT_a', 'PRRT_b'], failures: [] }).out.deferred, [], 'nothing is deferred when the App closed them all');
+});
+
 test('an App function that throws or answers nonsense resolves nothing', () => {
   const thrown = run(new TypeError('secret-looking detail')).out;
   assert.deepEqual(thrown.closed, []);

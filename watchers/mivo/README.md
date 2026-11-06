@@ -60,6 +60,10 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 | `dispatchReserveMs` | `MIVO_WATCHER_DISPATCH_RESERVE_MS` | `25000`。给派发回执留的时间：采集结束时整轮只剩不足这个时间的 PR 才会 `dispatch-budget-deferred` |
 | `minCollectMs` | `MIVO_WATCHER_MIN_COLLECT_MS` | `15000`。整轮截止减派发预留后不足这个时间时，不再启动新的采集，留给下一轮 |
 | `fullCollectMs` | `MIVO_WATCHER_FULL_COLLECT_MS` | `600000`。无修复会话的 Ready PR 即使指纹没变，距上次完整采集超过它也强制全量采集一次 |
+| `resolveFixedThreadsWithApp` | `MIVO_WATCHER_RESOLVE_FIXED_THREADS_WITH_APP` | 关。profile 里写布尔 `true`，或环境变量写 `1` / `true`（环境变量只要设了就以它为准）才打开。打开后，审查机已复核修好的讨论串由 GitHub App 的 bot 关闭，覆盖目标仓**所有作者**的 open 非 Draft PR；范围和边界见下文「用 App 关闭审查机已复核修好的讨论串」 |
+| `praisebuildAppId` | `MIVO_WATCHER_PRAISEBUILD_APP_ID` | 无。App ID，纯数字；开关打开时必填 |
+| `praisebuildInstallationId` | `MIVO_WATCHER_PRAISEBUILD_INSTALLATION_ID` | 无。App 在目标仓的安装号，纯数字；开关打开时必填 |
+| `praisebuildPrivateKeyPath` | `MIVO_WATCHER_PRAISEBUILD_PRIVATE_KEY_PATH` | 无。App 私钥文件的绝对路径；开关打开时必填。私钥只在换令牌时读取，不进状态、任务或日志 |
 | `followIntervalMs` | `MIVO_WATCHER_FOLLOW_MS` | `15000`。轮内批量复查 open PR 变化的间隔；环境变量设为 `0` 只跑全量一轮 |
 | `validateConcurrency` | `MIVO_VALIDATE_CONCURRENCY` | `2`。同一 watcher home 同时运行的 validate 上限，正整数；非法值（0、负数、小数、空串、非数字）直接报错，不静默回退。超限的 validate 排队等槽位，**排队不是失败**：不记失败、不消耗重试或 missing-result 计数。持有槽位的进程崩溃后，槽位按 pid 存活判定回收，并先终止它遗留的进程组：命令经 `sh` 启动，`sh` 先把进程组号落盘到槽位旁的 `.pgid` 文件、确认持有者仍存活才 `exec` 真正的命令，所以持有者在 spawn 之后任意时刻崩溃，要么组号已落盘可被回收，要么命令根本没有开始 |
 | `validateStallMinutes` | `MIVO_VALIDATE_STALL_MINUTES` | `10`。连续无新输出（stdout/stderr 都没有新字节）超过它就终止整个进程组，收据记 `failureKind: validate-stalled`，不当作测试失败；规则同 `preflightTimeoutMinutes`。心跳不算输出 |
@@ -85,6 +89,21 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 过期世代、已降级的记录、变更证据与调用者自填的权限标记均不能授权写代码。
 普通作者评论仍按原来的调查权限处理；本地接入不改变 GitHub CI、审查或单写者要求，
 不把队列接收或分支修复当作正式业务部署完成。
+
+### 用 App 关闭审查机已复核修好的讨论串
+
+开关 `resolveFixedThreadsWithApp` 默认关；关着时 watcher 不为它多发任何请求，也不创建 `state/server-fixed.json`。打开时需要同时配好上表的 `praisebuildAppId`、`praisebuildInstallationId`、`praisebuildPrivateKeyPath`（缺一项或格式不对，该次关闭失败并记事件，讨论串保持打开）。每次关闭现换一个只对目标仓有 `contents` 和 `pull_requests` 写权限的短期令牌，用完立刻撤销；令牌不经过 `gh`，不写入状态、任务、事件或日志。App 出错时**不回落到盯梢账号**，讨论串保持打开。未启用派发的 dry run 一律不执行。
+
+什么样的讨论串会被关（两类 PR 同一条规则，`isServerFixedThread`）：未 resolve；评论没有被分页截断；首条是审查机账号发的且带 `mivo-finding` 标记；最后一条是同一审查机账号发的复核回复（严格的 `mivo-review:thread-fixed` 标记，或旧版整句）；回复里的 head 等于 PR 当前 head、key 与首条一致；复核回复之后没有任何人再评论。人类或 Greptile 开的讨论串、复核 head 不是当前 head 的、复核回复之后又有人评论的，都不关。同一条复核回复只关一次（收据记着回复的 comment id）；被人重新打开后审查机又回复新的复核，才会再关一次。
+
+两类 PR 的处理不同：
+
+- **本人的 open PR**：在原有的采集流程里关闭，收据写在该 PR 的 `state/prs/<nodeId>.json`（`autoClosedThreads`），命中的讨论串不再派给修复会话。
+- **别的作者的 open 非 Draft PR**：这是整个功能新增的范围，**只关、不接管**。每轮 discover 在处理完本人 PR 之后读一次目标仓的 open PR 列表，对作者不是盯梢账号（不分大小写）的非 Draft PR 逐个读讨论串，命中就关。盯梢账号对这些 PR 只发 GraphQL 读请求；不派修复会话，不绑会话，不写交接，不进 `state/prs/`，不发评论或回帖。收据、上次扫描时间和上次失败（只含阶段、期望值、实际值）写在 `state/server-fixed.json`，PR 不再 open 时这条记录随之删除。
+- **节流**：同一个 PR 距上次扫描不满 `fullCollectMs`（默认 10 分钟）不再读。到期的按上次扫描时间由旧到新排队，没扫过的排最前。本轮剩余时间（整轮截止减 `dispatchReserveMs`）不够时，剩下的留给下一轮，没扫完的 PR 不记扫描时间，所以下一轮最先扫它们。读取失败、PR 在读取期间关闭、转 Draft、换作者或推了新提交，也不记扫描时间。App 失败算一次扫描，下次到期再试。
+- **一个 PR 的批量关闭也受剩余时间约束**：App 换令牌和逐条 resolve 前都先问「整轮截止 − `dispatchReserveMs` − 一次 App 请求的超时（15 秒）」之前还有没有时间；没有就不再发新的请求，直接撤销令牌（撤销一定会发），还没处理的讨论串留到下一轮。已经关掉的讨论串立即写收据；因时间没处理的讨论串不记失败、不出错误事件；这个 PR 也不记扫描时间（保持原来的时间戳，下一轮因为最旧而最先扫），本轮后面的 PR 不再扫，并报 `other-server-fixed-scan-deferred`（`remaining` 是含这个 PR 在内没扫完的 PR 数，`threads` 是这个 PR 里没处理的讨论串数）。本人 PR 的批量关闭不受此约束。
+- **读 open PR 列表（分页）同样受剩余时间约束**：每页请求前都先问「整轮截止 − `dispatchReserveMs`」之前还有没有时间；没有就停止，这一轮不扫任何别人的 PR，不改任何扫描时间，也不清理任何 PR 的记录（半份列表不当整份用），下一轮重新从第一页读，并报 `other-server-fixed-scan-deferred`（`reason=budget`、`stage=list`，不是 `other-server-fixed-scan-failed`）。本人 PR 的 follow 批量读取不受此约束。
+- **事件**（`scope` 都是 `other-pr`）：`server-fixed-thread-resolved`、`server-fixed-thread-resolve-failed`（带 `phase` / `expected` / `actual`）、`server-fixed-thread-token-revoke-failed`、`other-server-fixed-scan-failed`（`stage` 是 `list` / `scan` / `state`）、`other-server-fixed-scan-deferred`。discover 的返回值多一项 `otherPrs: {scanned, closed, deferred}`，只在这条旁路执行时出现。
 
 ### validate 运行方式与证据（本地预检）
 

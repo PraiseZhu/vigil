@@ -154,11 +154,13 @@ export function partitionServerFixedThreads(threads = [], currentHead, previous 
 const failureText = (value, fallback) => String(value ?? fallback).slice(0, 200);
 // One App-token resolve per call, for every hit thread. `appResolveFn` never falls back to another identity: a
 // thread it does not report as resolved stays open, with a failure that carries what was expected and what came
-// back. Receipts are written only for threads the App confirmed resolved.
-export function* resolveServerFixedThreads({ eligible = [], previous = {}, appResolveFn, repo, now }) {
+// back. Receipts are written only for threads the App confirmed resolved. With a `canContinue` (handed to the App as
+// given), a thread the App left untried because the time ran out is `deferred`, neither closed nor failed: it has no
+// receipt and no failure, so the caller looks at it again next time. Without one the App is called exactly as before.
+export function* resolveServerFixedThreads({ eligible = [], previous = {}, appResolveFn, repo, now, canContinue }) {
   const ids = new Set(eligible.map((hit) => hit.threadId));
   let outcome;
-  try { outcome = yield () => appResolveFn({ threadIds: [...ids], repo }); }
+  try { outcome = yield () => appResolveFn({ threadIds: [...ids], repo, ...(canContinue ? { canContinue } : {}) }); }
   catch (error) {
     outcome = { resolved: [], failures: [{ phase: 'resolve', expected: 'appResolveFn returns {resolved, failures}', actual: `threw ${error?.name ?? 'Error'}` }] };
   }
@@ -168,10 +170,15 @@ export function* resolveServerFixedThreads({ eligible = [], previous = {}, appRe
   const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
   const closed = [];
   const failed = [];
+  const deferred = [];
   for (const hit of eligible) {
     if (resolvedIds.has(hit.threadId)) {
       closedThreads[hit.threadId] = { at: now, key: hit.key, reason: SERVER_FIXED_REASON, head: hit.head, commentId: hit.commentId };
       closed.push({ threadId: hit.threadId, key: hit.key, reason: SERVER_FIXED_REASON });
+      continue;
+    }
+    if (failures.some((failure) => failure?.threadId === hit.threadId && failure.phase === 'budget')) {
+      deferred.push({ threadId: hit.threadId, key: hit.key });
       continue;
     }
     const why = failures.find((failure) => failure?.threadId === hit.threadId)
@@ -184,7 +191,7 @@ export function* resolveServerFixedThreads({ eligible = [], previous = {}, appRe
   }
   const revokeFailures = failures.filter((failure) => failure?.phase === 'revoke')
     .map((failure) => ({ phase: 'revoke', expected: failureText(failure.expected, ''), actual: failureText(failure.actual, '') }));
-  return { previous: { ...previous, autoClosedThreads: closedThreads }, closed, failed, revokeFailures };
+  return { previous: { ...previous, autoClosedThreads: closedThreads }, closed, failed, deferred, revokeFailures };
 }
 
 // A repair session that verified an authorized P0/P1 thread does not hold records it as

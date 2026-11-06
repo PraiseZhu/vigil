@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readBatch } from './bin/mivo-watcher.mjs';
+import { readBatch, readOpenPrNodes } from './bin/mivo-watcher.mjs';
 import { followBatchBody } from './handoff.fixture.mjs';
 
 // 2026-11-04: the follow beat's `search` root is answered by the gh router as the personal account (about 4 reads a
@@ -57,4 +57,46 @@ test('an incomplete answer fails instead of returning a partial map', () => {
   assert.throws(bad({ data: { repository: null } }), /incomplete/);
   assert.throws(() => run(readBatch({ ghFn: () => followBatchBody([node('PR_1')], { hasNextPage: true, endCursor: null }), viewer: 'owner', repo: REPO })), /cursor missing/);
   assert.throws(() => run(readBatch({ ghFn: () => followBatchBody([node('PR_1')], { hasNextPage: true, endCursor: 'again' }), viewer: 'owner', repo: REPO })), /too many pages/);
+});
+
+// The other-authors path reads the same open-PR list without the viewer filter (watcher: readOpenPrNodes).
+test('readOpenPrNodes returns every open PR whoever wrote it, across pages, and fails on an incomplete answer', () => {
+  const queries = [];
+  const ghFn = (args) => {
+    queries.push(queryOf(args));
+    return queries.length === 1
+      ? followBatchBody([node('PR_1'), node('PR_2', { author: { login: 'someone-else' } })], { hasNextPage: true, endCursor: 'c1' })
+      : followBatchBody([node('PR_3', { author: null })]);
+  };
+  const nodes = run(readOpenPrNodes({ ghFn, repo: REPO }));
+  assert.deepEqual(nodes.map((item) => item.id), ['PR_1', 'PR_2', 'PR_3']);
+  assert.match(queries[1], /first:100,after:"c1"/);
+  assert.throws(() => run(readOpenPrNodes({ ghFn: () => JSON.stringify({ errors: [{ message: 'boom' }], data: null }), repo: REPO })), /incomplete/);
+  assert.throws(() => run(readOpenPrNodes({ ghFn: () => followBatchBody([node('PR_1')], { hasNextPage: true, endCursor: 'again' }), repo: REPO })), /too many pages/);
+});
+
+test('readOpenPrNodes asks for the fields of the query it is given', () => {
+  const calls = [];
+  const queryFor = (repo, after) => `query{marker(repo:${JSON.stringify(repo)},after:${JSON.stringify(after)})}`;
+  run(readOpenPrNodes({ ghFn: (args) => { calls.push(args); return followBatchBody([]); }, repo: REPO, queryFor }));
+  assert.deepEqual(calls, [['api', 'graphql', '-f', `query=query{marker(repo:"${REPO}",after:null)}`]]);
+});
+
+// The other-authors path gives the list a time check (`canContinue`), asked before every page; follow beats do not give one.
+test('readOpenPrNodes with canContinue asks it before every page and gives null, not a part of the list, when it says no', () => {
+  let open = 3;
+  const pages = [];
+  const ghFn = (args) => {
+    pages.push(args);
+    return followBatchBody([node(`PR_${pages.length}`)], { hasNextPage: true, endCursor: `c${pages.length}` });
+  };
+  const asked = [];
+  const canContinue = () => { asked.push(pages.length); open -= 1; return open >= 0; };
+  assert.equal(run(readOpenPrNodes({ ghFn, repo: REPO, canContinue })), null);
+  assert.equal(pages.length, 3, 'three pages were asked for, then the check said no');
+  assert.deepEqual(asked, [0, 1, 2, 3], 'the check comes before the first page too, and before each one after it');
+  // A check that always says yes changes nothing: the full list comes back.
+  const all = run(readOpenPrNodes({ ghFn: (args) => (/after/.test(queryOf(args)) ? followBatchBody([node('PR_2')]) : followBatchBody([node('PR_1')], { hasNextPage: true, endCursor: 'c1' })),
+    repo: REPO, canContinue: () => true }));
+  assert.deepEqual(all.map((item) => item.id), ['PR_1', 'PR_2']);
 });
