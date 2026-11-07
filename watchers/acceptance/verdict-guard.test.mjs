@@ -256,6 +256,66 @@ test('board --acceptance 通过：必须带 --checks；有 env-skipped → 退�
   assert.equal(fix.code, 0, fix.err);
 });
 
+test('#358 verdict：checks.test 写 env-skipped 但 note 已有执行计数 → 退出码 1、零写入，轮次仍是「验收中」（不标中断、宿主不写 env-unverified）', async () => {
+  const { profile, home } = setup();
+  const world = defaultTree();
+  world.get(ROOT_REF).state = 'closed';
+  const file = writeJsonFile(home, 'verdict-358.json', {
+    checks: { build: 'ran', typecheck: 'ran', test: { status: 'env-skipped', note: 'npm run test:unit：22632 passed / 206 failed（11 个套件受沙箱结构性限制）' } },
+    items: fullConclusions(),
+  });
+  const result = await helper(world, profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', file]);
+  assert.equal(result.code, 1, result.err);
+  assert.match(result.err, /env-skipped[\s\S]*已执行/);
+  assert.equal(world.writes.length, 0, '零写入：不标「中断」');
+  assert.match(rootComment(world).body, /第 1 轮：验收中/);
+  assert.equal(rootComment(world).body.includes(ENV_PROBLEM_PREFIX), false, '不写环境中断原因');
+});
+
+test('#358 close：verified.json 的 env-skipped note 已有执行计数 → 退出码 1、零写入，不勾选、不写看板、不关单', async () => {
+  const { profile, home } = setup();
+  const world = defaultTree();
+  const verified = writeJsonFile(home, 'verified-358.json', {
+    checks: { build: 'ran', typecheck: 'ran', test: { status: 'env-skipped', note: '1200 passed / 7 failed' } },
+    items: [{ ref: `${REPO}#2`, sc: 3 }],
+    manual: [],
+  });
+  const before = world.get(`${REPO}#2`).body;
+  const result = await helper(world, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
+  assert.equal(result.code, 1, result.err);
+  assert.match(result.err, /env-skipped[\s\S]*已执行/);
+  assert.equal(world.writes.length, 0, '零写入：不勾选、不写看板、不关单、不标中断');
+  assert.equal(world.get(`${REPO}#2`).body, before);
+  assert.match(rootComment(world).body, /第 1 轮：验收中/);
+});
+
+test('#358 board --acceptance 通过：--checks 的 env-skipped note 已有执行计数 → 退出码 1、零写入、不标中断', async () => {
+  const { profile, home } = setup();
+  const world = defaultTree();
+  const checks = writeJsonFile(home, 'checks-358.json', {
+    checks: { build: 'ran', typecheck: 'ran', test: { status: 'env-skipped', note: '19/19 passed' } },
+  });
+  const result = await helper(world, profile, ['board', '--issue', ROOT_REF, '--round', '1', '--acceptance', '通过', '--checks', checks]);
+  assert.equal(result.code, 1, result.err);
+  assert.match(result.err, /env-skipped[\s\S]*已执行/);
+  assert.equal(world.writes.length, 0, '零写入');
+  assert.match(rootComment(world).body, /第 1 轮：验收中/);
+});
+
+test('#358 真没跑（0 passed / 依赖装不上）仍按环境未验证：退出码 6、标「中断」', async () => {
+  const { profile, home } = setup();
+  const world = defaultTree();
+  world.get(ROOT_REF).state = 'closed';
+  const file = writeJsonFile(home, 'verdict-358-notrun.json', {
+    checks: { build: 'ran', typecheck: 'ran', test: { status: 'env-skipped', note: '依赖装不上，一个用例都没起来（0 passed）' } },
+    items: fullConclusions(),
+  });
+  const result = await helper(world, profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', file]);
+  assert.equal(result.code, 6, result.err);
+  assert.match(rootComment(world).body, /^\[验收机\] 第 1 轮：中断/m);
+  assert.ok(rootComment(world).body.includes(`原因：${ENV_PROBLEM_PREFIX}`));
+});
+
 test('环境未验证的中断：trigger 按环境退避重试（不是 up-to-date，也不当代码不通过）', async () => {
   const { profile, home } = setup();
   const world = defaultTree();

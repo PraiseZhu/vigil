@@ -9,6 +9,9 @@ import { hostPaths, progressFileFor, readAlerts } from './host/paths.mjs';
 import { roundDirFor, roundKey, runHostRound, startGateRelay } from './host/round.mjs';
 import { runTick } from './host/tick.mjs';
 import { run as procRun } from './host/proc.mjs';
+import { runHelper } from './bin/helper.mjs';
+import { runRound as runRoundStatus } from './bin/round.mjs';
+import { CLOCK, createFakeGithub, defaultTree, fullConclusions, writeJsonFile } from './session.fixture.mjs';
 import { OWNER, REPO, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import { ENV_PROBLEM_PREFIX } from './bin/trigger.mjs';
 import { appendCodePaths } from './bin/message.mjs';
@@ -732,6 +735,109 @@ test('裁决防线：别的原因的「中断」（不是环境问题）不写 e
     log: () => {},
   });
   assert.equal(readAlerts(hostPaths(fixture.home)).some((a) => a.kind === 'env-unverified'), false);
+});
+
+/** 宿主的 status 用真的 round.mjs status 命令读同一个假 GitHub：不写死状态，测的是 helper → 轮次评论 → 宿主这条链路。 */
+function realStatusRound(fixture, world, profile) {
+  return async (argv) => {
+    if (argv[0] !== 'status') return fixture.runRoundFake(argv);
+    let stdout = '';
+    let stderr = '';
+    const code = await runRoundStatus(argv, {
+      github: createFakeGithub(world),
+      profile,
+      now: () => Date.parse(CLOCK),
+      stdout: { write: (chunk) => (stdout += chunk) },
+      stderr: { write: (chunk) => (stderr += chunk) },
+    });
+    return { code, stdout, stderr };
+  };
+}
+
+/** pi 在沙箱里跑的是真的 helper：同一个假 GitHub world，退出码就是 helper 的退出码。 */
+function helperPi(calls, { world, profile, argv, onCode }) {
+  return (options) => {
+    calls.pi.push(options);
+    const exit = runHelper(argv, {
+      github: createFakeGithub(world),
+      profile,
+      now: () => Date.parse(CLOCK),
+      stdout: { write() {} },
+      stderr: { write() {} },
+    }).then((code) => {
+      onCode(code);
+      return { code };
+    });
+    return { pid: 555030, stdin: { write() {}, end() {} }, kill() {}, exit };
+  };
+}
+
+test('裁决防线#358：checks.test 写 env-skipped 但 note 有执行计数 → helper 退出码 1、轮次仍「验收中」，宿主不写 env-unverified', async () => {
+  const fixture = roundFixture();
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: fixture.home });
+  const world = defaultTree();
+  world.get(ROOT_REF).state = 'closed';
+  const verdictFile = writeJsonFile(fixture.home, 'verdict-358.json', {
+    checks: { build: 'ran', typecheck: 'ran', test: { status: 'env-skipped', note: '22632 passed / 206 failed（11 个套件受沙箱结构性限制）' } },
+    items: fullConclusions(),
+  });
+  let helperCode = null;
+  const code = await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: BWRAP_OK,
+    runRound: realStatusRound(fixture, world, profile),
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    spawnPi: helperPi(fixture.calls, {
+      world,
+      profile,
+      argv: ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', verdictFile],
+      onCode: (value) => (helperCode = value),
+    }),
+    meminfoPath: writeMeminfo(),
+    statusIntervalMs: 5,
+    log: () => {},
+  });
+  assert.equal(helperCode, 1, 'helper 在写之前拦下（不是退出码 6）');
+  assert.equal(code, 1, '轮次仍是「验收中」：宿主按 pi 退出处理，不按环境问题收尾');
+  const alerts = readAlerts(hostPaths(fixture.home));
+  assert.equal(alerts.some((entry) => entry.kind === 'env-unverified'), false, JSON.stringify(alerts));
+});
+
+test('裁决防线#358：真没跑（0 passed）→ helper 退出码 6、轮次「中断」，宿主写 env-unverified', async () => {
+  const fixture = roundFixture();
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: fixture.home });
+  const world = defaultTree();
+  world.get(ROOT_REF).state = 'closed';
+  const verdictFile = writeJsonFile(fixture.home, 'verdict-358-notrun.json', {
+    checks: { build: 'ran', typecheck: 'ran', test: { status: 'env-skipped', note: '依赖装不上，一个用例都没起来（0 passed）' } },
+    items: fullConclusions(),
+  });
+  let helperCode = null;
+  await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    run: BWRAP_OK,
+    runRound: realStatusRound(fixture, world, profile),
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    spawnPi: helperPi(fixture.calls, {
+      world,
+      profile,
+      argv: ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', verdictFile],
+      onCode: (value) => (helperCode = value),
+    }),
+    meminfoPath: writeMeminfo(),
+    statusIntervalMs: 5,
+    log: () => {},
+  });
+  assert.equal(helperCode, 6);
+  const alerts = readAlerts(hostPaths(fixture.home));
+  const envAlerts = alerts.filter((entry) => entry.kind === 'env-unverified');
+  assert.equal(envAlerts.length, 1, JSON.stringify(alerts));
+  assert.equal(envAlerts[0].issue, ROOT_REF);
+  assert.ok(envAlerts[0].reason.startsWith(ENV_PROBLEM_PREFIX), envAlerts[0].reason);
 });
 
 // build 项 CI 口径（host/build-ci.mjs）接进派发消息：口径关着时消息一字不差；开着时追加宿主只读查到的 CI 事实。
