@@ -101,6 +101,21 @@ test('non-main base is never base-update eligible', () => {
   const v = evaluatePublicReview(f);
   assert.equal(v.baseUpdateEligible, false);
 });
+// vigil#360: on a praise-qa App PR the App's own comment is the author's, as a person's is on their own PR. REST and
+// gh pr view spell the App differently; a person called praise-qa or another App still gives feedback.
+test('the praise-qa App\'s own comment on its PR is not new feedback; anyone else\'s is', () => {
+  const on = (user) => {
+    const s = fixture();
+    s.snapshot.pr.author = { login: 'app/praise-qa', is_bot: true };
+    s.snapshot.comments.push({ id: 16, user, created_at: '2026-09-10T00:12:00Z', body: 'QA 已复测' });
+    return evaluatePublicReview(s);
+  };
+  const own = on({ login: 'praise-qa[bot]', type: 'Bot' });
+  assert.equal(own.ready, true, own.reason);
+  for (const user of [{ login: 'praise-qa', type: 'User' }, { login: 'other-app[bot]', type: 'Bot' }, { login: 'owner', type: 'User' }]) {
+    assert.equal(on(user).reason, 'new-feedback', JSON.stringify(user));
+  }
+});
 test('a member comment already answered for this head does not count as new feedback', () => {
   const s = fixture();
   s.snapshot.comments.push({ id: 15, user: { login: 'teammate' }, created_at: '2026-09-10T00:12:00Z', body: 'please rename this' });

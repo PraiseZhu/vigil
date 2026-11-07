@@ -173,13 +173,14 @@ export function memoRepoReads(ghFn, store = null) {
 
 const LIST_FIELDS = 'number,id,headRefOid,headRefName,isDraft,labels,url,updatedAt,title';
 // Open PRs the watcher looks after: the viewer's own and the praise-qa App's (vigil#360). gh pr list takes one
-// author at a time and the router refuses --search, so it is two listings, merged by node id.
+// author at a time and the router refuses --search, so it is two listings, merged by node id. A listing that reaches
+// --limit may be cut short, so either one at the bound fails the round instead of passing for complete coverage.
 export function* listWatchedPrs({ ghFn, viewer, fields = LIST_FIELDS }) {
   const byId = new Map();
   for (const who of [['--author', viewer], ['--app', WATCHED_BOT_APP]]) {
     const listed = JSON.parse(yield () => ghFn(['pr', 'list', '--repo', REPO, ...who, '--state', 'open', '--limit', '1000', '--json', fields]));
     if (!Array.isArray(listed)) throw new Error('Open PR listing is not an array');
-    if (listed.length >= 1000) return listed;
+    if (listed.length >= 1000) throw new Error(`Open PR listing ${who.join(' ')} reached safety bound (1000 of 1000); cannot claim complete coverage`);
     for (const pr of listed) if (pr?.id && !byId.has(String(pr.id))) byId.set(String(pr.id), pr);
   }
   return [...byId.values()];
@@ -3245,7 +3246,6 @@ function* scanWorkflow({
   persistState(state,paths);
   const viewer = String(yield () => readViewer(ghFn, paths, clock)).trim();
   const listed = yield* listWatchedPrs({ ghFn, viewer, fields: LIST_FIELDS });
-  if (!Array.isArray(listed) || listed.length >= 1000) throw new Error('Open PR listing reached safety bound; cannot claim complete coverage');
   const report = [];
   const events = [];
   const dryRun = !(enabled && allowDispatch && typeof dispatchFn === 'function');

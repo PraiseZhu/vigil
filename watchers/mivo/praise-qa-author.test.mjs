@@ -53,11 +53,11 @@ test('SC2 one listing of the viewer\'s PRs and one of the praise-qa App\'s, merg
   assert.equal(calls.length, 2);
   assert.deepEqual(calls.map((args) => [args[args.indexOf('--repo') + 1], ...args.slice(4, 6)]), [[REPO, '--author', 'owner'], [REPO, '--app', 'praise-qa']]);
   for (const args of calls) assert.ok(!args.includes('--search'), 'the gh router refuses --search');
-  // A listing at the safety bound is handed back whole, so the caller refuses it instead of claiming full coverage.
-  const full = Array.from({ length: 1000 }, (_, i) => listedPr(i + 1));
-  const bounded = [];
-  assert.equal(run(listWatchedPrs({ ghFn: (args) => { bounded.push(args); return JSON.stringify(full); }, viewer: 'owner' })).length, 1000);
-  assert.equal(bounded.length, 1);
+  // A listing at --limit may be cut short: either one fails the round, so no listing ever stands in for the other.
+  const full = JSON.stringify(Array.from({ length: 1000 }, (_, i) => listedPr(i + 1)));
+  for (const at of ['--author', '--app']) {
+    assert.throws(() => run(listWatchedPrs({ ghFn: (args) => (args.includes(at) ? full : '[]'), viewer: 'owner' })), new RegExp(`${at} \\S+ reached safety bound`), at);
+  }
   assert.throws(() => run(listWatchedPrs({ ghFn: () => '{}', viewer: 'owner' })), /not an array/);
 });
 
