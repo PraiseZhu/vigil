@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { collectPrOwnershipSync } from './mivo-pr-snapshot.mjs';
-import { configuredLogin } from './mivo-identity.mjs';
+import { configuredLogin, isSameAuthor, isWatchedBotAuthor } from './mivo-identity.mjs';
 
 const same = (a, b) => typeof a === 'string' && a.length > 0 && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
@@ -12,6 +12,9 @@ const validId = value => (typeof value === 'string' && /^[A-Za-z0-9_-]+$/.test(v
   || (Number.isSafeInteger(value) && value > 0);
 const human = user => typeof user?.login === 'string' && user.login.length > 0
   && !/\[bot\]$/i.test(user.login) && user.type !== 'Bot' && user.__typename !== 'Bot' && user.is_bot !== true;
+// A Ready PR the praise-qa App opened is handed off by being Ready, like a person's (vigil#360). The App never
+// writes handoff comments, so selectHandoff still only accepts a person's comment receipt.
+const releasable = user => human(user) || isWatchedBotAuthor(user);
 const parse = raw => typeof raw === 'string' ? JSON.parse(raw) : raw;
 const requireValue = (ok, reason) => { if (!ok) throw new Error(`handoff: ${reason}`); };
 
@@ -26,7 +29,7 @@ function epochTime(pr) {
 
 function eligible(pr) {
   return pr?.state === 'OPEN' && pr.isDraft === false && pr.sameRepository === true
-    && pr.isCrossRepository !== true && human(pr.author) && sha(pr.headRefOid)
+    && pr.isCrossRepository !== true && releasable(pr.author) && sha(pr.headRefOid)
     && typeof pr.repo === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(pr.repo)
     && Number.isSafeInteger(pr.number) && pr.number > 0 && Number.isFinite(epochTime(pr));
 }
@@ -34,7 +37,7 @@ function eligible(pr) {
 export function isCurrentHandoff(receipt, pr, { allowHeadChange = false } = {}) {
   return !!(eligible(pr) && receipt?.version === 1 && typeof receipt.id === 'string' && validId(receipt.id)
     && same(receipt.repo, pr.repo) && receipt.number === pr.number && receipt.nodeId === pr.id
-    && receipt.releaseEpoch === pr.releaseEpoch && same(receipt.author, pr.author.login)
+    && receipt.releaseEpoch === pr.releaseEpoch && isSameAuthor(receipt.author, pr.author)
     && sha(receipt.head) && (allowHeadChange || same(receipt.head, pr.headRefOid)));
 }
 

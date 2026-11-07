@@ -50,7 +50,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 
 | profile 字段 | 环境变量 | 默认值 |
 |---|---|---|
-| `ghLogin` | `VIGIL_GH_LOGIN` | 代码中的默认账号（`bin/mivo-identity.mjs` 的 `DEFAULT_LOGIN`）。watcher 以这个账号列出并处理自己的 PR；修复会话的提交身份也用它。优先级：环境变量 > profile > 默认账号。**mivo-repair / mivo-handoff 可能是不带调度命令环境变量的独立进程**，所以另一账号部署应写进 `config/profile.json` |
+| `ghLogin` | `VIGIL_GH_LOGIN` | 代码中的默认账号（`bin/mivo-identity.mjs` 的 `DEFAULT_LOGIN`）。watcher 以这个账号列出并处理自己的 PR，另外也处理 praise-qa GitHub App 开的 PR（见「作者交接与取回」）；修复会话的提交身份也用它。优先级：环境变量 > profile > 默认账号。**mivo-repair / mivo-handoff 可能是不带调度命令环境变量的独立进程**，所以另一账号部署应写进 `config/profile.json` |
 | `ghUserId` | `VIGIL_GH_USER_ID` | 默认账号对应的 ID（仅当 `ghLogin` 等于默认账号时）。提交邮箱 `<id>+<login>@users.noreply.github.com`；配了别的账号却没配它时 `prepare` 按 `gh-user-unavailable` 拒绝 |
 | `watchHomes` | `MIVO_WATCHER_WATCH_HOMES`（逗号分隔） | `[]`（不内置任何路径） |
 | `lifelineConfigPath` | `MIVO_WATCHER_LIFELINE_CONFIG` | 未配置时不接收本地 Doctor 任务 |
@@ -99,7 +99,7 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 两类 PR 的处理不同：
 
 - **本人的 open PR**：在原有的采集流程里关闭，收据写在该 PR 的 `state/prs/<nodeId>.json`（`autoClosedThreads`），命中的讨论串不再派给修复会话。
-- **别的作者的 open 非 Draft PR**：这是整个功能新增的范围，**只关、不接管**。每轮 discover 在处理完本人 PR 之后读一次目标仓的 open PR 列表，对作者不是盯梢账号（不分大小写）的非 Draft PR 逐个读讨论串，命中就关。盯梢账号对这些 PR 只发 GraphQL 读请求；不派修复会话，不绑会话，不写交接，不进 `state/prs/`，不发评论或回帖。收据、上次扫描时间和上次失败（只含阶段、期望值、实际值）写在 `state/server-fixed.json`，PR 不再 open 时这条记录随之删除。
+- **别的作者的 open 非 Draft PR**：这是整个功能新增的范围，**只关、不接管**。每轮 discover 在处理完本人 PR 之后读一次目标仓的 open PR 列表，对作者既不是盯梢账号（不分大小写）、也不是 praise-qa App 的非 Draft PR 逐个读讨论串，命中就关。盯梢账号对这些 PR 只发 GraphQL 读请求；不派修复会话，不绑会话，不写交接，不进 `state/prs/`，不发评论或回帖。收据、上次扫描时间和上次失败（只含阶段、期望值、实际值）写在 `state/server-fixed.json`，PR 不再 open 时这条记录随之删除。
 - **节流**：同一个 PR 距上次扫描不满 `fullCollectMs`（默认 10 分钟）不再读。到期的按上次扫描时间由旧到新排队，没扫过的排最前。本轮剩余时间（整轮截止减 `dispatchReserveMs`）不够时，剩下的留给下一轮，没扫完的 PR 不记扫描时间，所以下一轮最先扫它们。读取失败、PR 在读取期间关闭、转 Draft、换作者或推了新提交，也不记扫描时间。App 失败算一次扫描，下次到期再试。
 - **一个 PR 的批量关闭也受剩余时间约束**：App 换令牌和逐条 resolve 前都先问「整轮截止 − `dispatchReserveMs` − 一次 App 请求的超时（15 秒）」之前还有没有时间；没有就不再发新的请求，直接撤销令牌（撤销一定会发），还没处理的讨论串留到下一轮。已经关掉的讨论串立即写收据；因时间没处理的讨论串不记失败、不出错误事件；这个 PR 也不记扫描时间（保持原来的时间戳，下一轮因为最旧而最先扫），本轮后面的 PR 不再扫，并报 `other-server-fixed-scan-deferred`（`remaining` 是含这个 PR 在内没扫完的 PR 数，`threads` 是这个 PR 里没处理的讨论串数）。本人 PR 的批量关闭不受此约束。
 - **读 open PR 列表（分页）同样受剩余时间约束**：每页请求前都先问「整轮截止 − `dispatchReserveMs`」之前还有没有时间；没有就停止，这一轮不扫任何别人的 PR，不改任何扫描时间，也不清理任何 PR 的记录（半份列表不当整份用），下一轮重新从第一页读，并报 `other-server-fixed-scan-deferred`（`reason=budget`、`stage=list`，不是 `other-server-fixed-scan-failed`）。本人 PR 的 follow 批量读取不受此约束。
@@ -144,6 +144,8 @@ validate 类阻塞重开前，watcher 比较上次阻塞时记录的五要素：
 ### 作者交接与取回
 
 **转 Ready 就是交接**（2026-10-15 起）。作者自己的 PR 不管是网页按钮、`gh pr ready` 还是 Keel `pr_ready` 转的 Ready，watcher 通常在 30 秒内接手（轮末约 40 秒内出现的留到下一轮开头，见下文「并行与跟进」）：没有评论回执时，按本次 Ready 代次和当前 HEAD 合成一份隐式回执（`implicit: true`），下游归属检查照常核对仓库、PR、作者和 Ready 代次。准入不再要求 CI 先全绿，必需检查失败和冲突直接成为修复反馈；审查流程不在线（`review-ingress-missing`）时才不接手。
+
+**praise-qa App 开的 PR 和本人的 PR 一样处理**（vigil#360）。每轮在 `gh pr list --author <登录名>` 之外再列一次 `gh pr list --app praise-qa`，按 node id 去重；这些 PR 转 Ready 后按上面的隐式回执接手，派修复会话、推送、回复和关讨论串都和本人 PR 相同，操作身份仍是 `ghLogin`。App 不写交接评论，App 账号发的交接评论也不算回执；App 的 Draft PR 不接手。比较作者时把各接口的写法（`app/praise-qa`、`praise-qa[bot]`、GraphQL 的 `praise-qa` + `__typename: Bot`）认作同一个 App，同名的真人账号 `praise-qa` 不算。
 
 下面的命令仍可用，作用变成「显式留一条交接记录」：
 
@@ -229,8 +231,8 @@ PR 上的「盯梢停下了」评论按 (PR, head, blockedKind, 归一化原因)
 
 - **不设并发上限**：一轮里所有 open PR 同时采集、同时派发，一轮耗时约等于最慢的那个 PR，不再随 PR 数量线性增长；某个 PR 出错不影响其他 PR，错误在所有 PR 结束后再抛出。`gh` 和复查 helper 走异步子进程，不阻塞其他 PR。
 - **同一轮共享仓库级查询**：分支规则、仓库变量、审查 workflow、钉住的 required-checks 文件和当前账号，每轮只查一次。
-- **合并状态每轮只读一次**：`mergeStateStatus` 和最新的 base 提交由一次 `gh api graphql` 的 search（`repo:… is:pr is:open author:<登录名>`，按页读全）取回，各 PR 的指纹查询和完整采集直接用这份结果；分流器会把任何要 `mergeStateStatus` 的读请求按个人账号回答，每个 PR 各读一次时同一秒十几条会把个人账号的限流用光（2026-11-04）。`gh pr view --json` 的字段里不含它。某个 PR 不在结果里、或批量读因非限流原因失败时，该 PR 回退为自己的单 PR 查询（行为和以前一样，只是没有节省）；取不到沿用 `UNKNOWN`。批量读被限流时不回退（逐 PR 再读一遍只会重复刚把限流用光的那阵突发，2026-11-04 实测同一秒 14 条全部失败）：需要合并状态的 PR 本轮报 `merge-state-unavailable` 并原样跳过，下一轮再处理。跟进节拍里有 PR 变化时，这些变化的 PR 共用一次刷新的批量读。会写 GitHub 的动作前用单 PR 查询复读一次：`update-branch` 之前：按 BEHIND 同步的要求仍是 BEHIND 且 base 提交没变，按落后提交数同步的只要求没变成冲突；`merge-ready` 通知前要求合并状态和 base 提交与快照一致，不一致就本轮不发（原因 `merge-ready-unconfirmed`，下一轮重新采集）。discover 的返回里 `mergeStates` 记录这次批量读命中的 PR 数和失败原因。
-- **按间隔批量跟进，与全量处理并行**：一轮 discover 先取一次基线，再同时做两件事——对所有 open PR 全量处理，以及按 `followIntervalMs`（默认 15 秒）的节拍发**一次**批量查询（`gh api graphql` 读仓库的 open PR 列表，按页读全后只留登录名自己的 PR：Draft、head、更新时间、标签和最新提交的 CI 汇总 state，只取汇总 state，不拉 contexts。它用仓库根字段而不是 `search`：分流器把 `search` 按个人账号回答，每分钟约 4 次就占了个人账号非逐 PR 的 GraphQL 流量的大头，仓库读则由 GitHub App 回答、用 App 自己的额度）。节拍不等慢采集：某个 PR 采集 100 秒时，其他 PR 的变化仍在下一个节拍内被发现并处理；正在处理的 PR 保留旧签名，空闲后下一拍再看。变化的 PR 先补一次 `gh pr list` 取完整信息再处理。没有变化时每个节拍只有这一次查询，一直查到整轮预算（上限 165 秒）末尾，节拍从启动后的基线算起、gh 的真实延迟会把最后一拍推到约 150–156 秒，所以一轮约 150–160 秒结束、两轮之间的检测空档约 20–30 秒；整轮最后约 40 秒（派发预留 25 秒 + 最小采集 15 秒）内查到的变化不再启动采集，只标 `collectRetry` 并记入 `index.deferredNumbers`，由下一轮开头最先处理。批量查询报错或被限流时按 2 倍间隔退避（上限 60 秒），连续失败 3 次（限流算 2 次）就不再跟进，本轮照常结束，不会因此失败。一轮上限 165 秒、实际约 150–160 秒结束，配合每分钟一次的 cron，两轮之间约 20–30 秒空档。
+- **合并状态每轮只读一次**：`mergeStateStatus` 和最新的 base 提交由一次 `gh api graphql` 的 search（`repo:… is:pr is:open author:<登录名> author:app/praise-qa`，多个 author 按「或」合并，按页读全）取回，各 PR 的指纹查询和完整采集直接用这份结果；分流器会把任何要 `mergeStateStatus` 的读请求按个人账号回答，每个 PR 各读一次时同一秒十几条会把个人账号的限流用光（2026-11-04）。`gh pr view --json` 的字段里不含它。某个 PR 不在结果里、或批量读因非限流原因失败时，该 PR 回退为自己的单 PR 查询（行为和以前一样，只是没有节省）；取不到沿用 `UNKNOWN`。批量读被限流时不回退（逐 PR 再读一遍只会重复刚把限流用光的那阵突发，2026-11-04 实测同一秒 14 条全部失败）：需要合并状态的 PR 本轮报 `merge-state-unavailable` 并原样跳过，下一轮再处理。跟进节拍里有 PR 变化时，这些变化的 PR 共用一次刷新的批量读。会写 GitHub 的动作前用单 PR 查询复读一次：`update-branch` 之前：按 BEHIND 同步的要求仍是 BEHIND 且 base 提交没变，按落后提交数同步的只要求没变成冲突；`merge-ready` 通知前要求合并状态和 base 提交与快照一致，不一致就本轮不发（原因 `merge-ready-unconfirmed`，下一轮重新采集）。discover 的返回里 `mergeStates` 记录这次批量读命中的 PR 数和失败原因。
+- **按间隔批量跟进，与全量处理并行**：一轮 discover 先取一次基线，再同时做两件事——对所有 open PR 全量处理，以及按 `followIntervalMs`（默认 15 秒）的节拍发**一次**批量查询（`gh api graphql` 读仓库的 open PR 列表，按页读全后只留登录名自己的和 praise-qa App 的 PR：Draft、head、更新时间、标签和最新提交的 CI 汇总 state，只取汇总 state，不拉 contexts。它用仓库根字段而不是 `search`：分流器把 `search` 按个人账号回答，每分钟约 4 次就占了个人账号非逐 PR 的 GraphQL 流量的大头，仓库读则由 GitHub App 回答、用 App 自己的额度）。节拍不等慢采集：某个 PR 采集 100 秒时，其他 PR 的变化仍在下一个节拍内被发现并处理；正在处理的 PR 保留旧签名，空闲后下一拍再看。变化的 PR 先补一次 `gh pr list` 取完整信息再处理。没有变化时每个节拍只有这一次查询，一直查到整轮预算（上限 165 秒）末尾，节拍从启动后的基线算起、gh 的真实延迟会把最后一拍推到约 150–156 秒，所以一轮约 150–160 秒结束、两轮之间的检测空档约 20–30 秒；整轮最后约 40 秒（派发预留 25 秒 + 最小采集 15 秒）内查到的变化不再启动采集，只标 `collectRetry` 并记入 `index.deferredNumbers`，由下一轮开头最先处理。批量查询报错或被限流时按 2 倍间隔退避（上限 60 秒），连续失败 3 次（限流算 2 次）就不再跟进，本轮照常结束，不会因此失败。一轮上限 165 秒、实际约 150–160 秒结束，配合每分钟一次的 cron，两轮之间约 20–30 秒空档。
 - **预算与派发预留**：采集可以用掉整轮预算里除派发预留（默认 25 秒）以外的全部时间，所以采集 60–100 秒的 PR 有新反馈时当轮就派发；只有采集结束时剩余不足派发预留才推迟（`dispatch-budget-deferred`），被推迟的 PR 下一轮排在最前面。
 - **没有修复会话的 Ready PR 也先走指纹闸**：每轮先用一次轻量 GraphQL 查询取指纹，覆盖 PR 更新时间、最近 20 条评论 / 10 条 review 的 id 与更新时间（旧评论被编辑也会变）、各线程最近 5 条评论的更新时间、最新提交的 `statusCheckRollup.state`、legacy commit status 的 contexts，以及 CheckRun 状态；head、冲突状态、标签、Draft 也在内。指纹没变、也没有 `collectRetry`、待补投或其他本地待办时跳过全量采集（约 40 次 `gh`）。只有**完整、可信**的采集才算收口：CI `unknown`、策略未核实、采集失败、被推迟、台账未恢复、派发未确认等都保留旧指纹并标 `collectRetry`，下一轮重新采集。另有兜底：距上次完整采集超过 `fullCollectMs`（默认 10 分钟）就强制全量采集一次，指纹看不到的变化最多延迟这么久。
 - **CI 终态缓存**：同一 PR 的多个必需检查的 job / run 查询并发执行；已完成（`completed`）的 job / run 按 `head SHA + job/run id` 缓存在 `state/kept-reads.json`（24 小时），同一 head 不再重复调用；未终态的每轮照常查询，run 被重跑（job 的 attempt 高于缓存的 run）时重新读取。

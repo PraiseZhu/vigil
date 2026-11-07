@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { collectPrOwnership, readMergeState, mergeStateIsBatched } from './mivo-pr-snapshot.mjs';
+import { isViewerOrWatchedBot } from './mivo-identity.mjs';
 
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const UNCONFIRMED_MS = 5 * 60 * 1000;
@@ -139,7 +140,7 @@ export function assertActionOwner({
   const fail = (reason) => { const error = new Error(reason); error.code = 'ACTION_OWNER'; throw error; };
   if (!pr || pr.state !== 'OPEN' || pr.isDraft === true) fail('inactive');
   if (pr.sameRepository === false) fail('cross-repository');
-  if (typeof viewer === 'string' && pr.author?.login !== viewer) fail('author-mismatch');
+  if (typeof viewer === 'string' && !isViewerOrWatchedBot(pr.author, viewer)) fail('author-mismatch');
   if (expected.nodeId && pr.id !== expected.nodeId) fail('node-mismatch');
   if (expected.number != null && Number(pr.number) !== Number(expected.number)) fail('number-mismatch');
   if (expected.head && pr.headRefOid !== expected.head) fail('head-mismatch');

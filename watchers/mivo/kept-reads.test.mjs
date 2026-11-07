@@ -114,11 +114,10 @@ test('two discover rounds in the same home use the configured login and never as
     assert.equal(result.viewer, 'ExampleUser');
   }
   assert.equal(gh.count(VIEWER), 0);
-  assert.equal(listArgs.length, 2);
-  for (const args of listArgs) {
-    assert.equal(args[args.indexOf('--author') + 1], 'ExampleUser');
-    assert.doesNotMatch(args.join(' '), /headRepository/);
-  }
+  // Each round lists the viewer's PRs and the praise-qa App's PRs.
+  assert.deepEqual(listArgs.map((args) => args.includes('--author') ? ['--author', args[args.indexOf('--author') + 1]] : ['--app', args[args.indexOf('--app') + 1]]),
+    [['--author', 'ExampleUser'], ['--app', 'praise-qa'], ['--author', 'ExampleUser'], ['--app', 'praise-qa']]);
+  for (const args of listArgs) assert.doesNotMatch(args.join(' '), /headRepository/);
 });
 
 test('only the login read is kept; a full /user read stays live', (t) => {

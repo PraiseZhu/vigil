@@ -10,7 +10,7 @@
 import { collectPrSnapshot } from './mivo-pr-snapshot.mjs';
 import { collectMivoCiSteps, REVIEW_INFRA_CHECKS } from './mivo-ci.mjs';
 import { requireConfig } from './profile.mjs';
-import { REVIEWER_BOT_LOGIN } from './mivo-identity.mjs';
+import { REVIEWER_BOT_LOGIN, isSameAuthor } from './mivo-identity.mjs';
 
 // 目标仓库与审查账号在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
 const REPO = requireConfig('targetRepo', {
@@ -176,7 +176,9 @@ export function evaluatePublicReview({ snapshot: s, comments = s.comments, check
   if (s.reviewDecision === 'CHANGES_REQUESTED' || [...latest.values()].some(r => r.state === 'CHANGES_REQUESTED')) blockers.push('review-veto');
   if ((s.labels ?? []).includes('awaiting-discussion')) blockers.push('discussion-hold');
   const verdict = current ?? released;
-  if (verdict && comments.some(c => at(c) > verdict.at && c.user?.login !== s.pr.author.login && c.body?.trim() && !handledComment(c, handledFeedback, head))) {
+  // The PR author's own comment is not feedback. REST names the praise-qa App `praise-qa[bot]` while gh pr view says
+  // `app/praise-qa`, so the two are compared as accounts, not strings (vigil#360).
+  if (verdict && comments.some(c => at(c) > verdict.at && !isSameAuthor(c.user, s.pr.author) && c.body?.trim() && !handledComment(c, handledFeedback, head))) {
     blockers.push('new-feedback');
   }
   const evidence = {

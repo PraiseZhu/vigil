@@ -219,7 +219,7 @@ test('第 20 秒出现的变化在下一个 15 秒间隔内被处理', (t) => {
 test('无变化时每个间隔只发一次批量查询，并一直查到整轮预算末尾（最后一拍在 150–165 秒内，一轮约 150–160 秒结束）', (t) => {
   const { batches, lists, result, elapsed } = tickFixture(t, { listFor: () => JSON.stringify([listedPr(942, { isDraft: true })]) });
   for (let i = 1; i < batches.length; i += 1) assert.equal(batches[i] - batches[i - 1], 15000);
-  assert.equal(lists.length, 1, 'only the opening listing uses gh pr list');
+  assert.deepEqual(lists, [0, 0], 'only the opening listing (own and praise-qa App) uses gh pr list');
   const budget = watcher.ROUND_BUDGET_MS;
   assert.ok(batches.at(-1) >= budget - 15000 && batches.at(-1) <= budget, `last batch ${batches.at(-1)} of ${budget}`);
   assert.ok(elapsed() >= budget - 15000 && elapsed() <= budget, `the quiet round ran ${elapsed()} ms of ${budget}`);

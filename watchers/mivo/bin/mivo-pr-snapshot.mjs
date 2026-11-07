@@ -1,4 +1,5 @@
 import { requireConfig } from './profile.mjs';
+import { WATCHED_BOT_APP } from './mivo-identity.mjs';
 
 // 目标仓库在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
 const DEFAULT_REPO = requireConfig('targetRepo', {
@@ -114,6 +115,7 @@ export const mergeStateIsBatched = (snapshot) => snapshot?.mergeStateSource === 
 // One search for every open PR of the viewer replaces one query per PR (2026-11-04: 16-19 per-PR queries in one
 // second used up the personal account's rate limit). A PR missing from the result keeps working through
 // readMergeState, so the batch only ever removes queries, it never decides a PR's state by omission.
+// The praise-qa App's PRs ride along (vigil#360): repeated author: qualifiers are OR-ed in one search.
 const MERGE_STATE_QUERY = 'query($q:String!,$after:String){viewer{login} search(query:$q,type:ISSUE,first:100,after:$after){pageInfo{hasNextPage endCursor} nodes{... on PullRequest{id mergeStateStatus baseRef{name target{oid}}}}}}';
 const MERGE_STATE_MAX_PAGES = 20;
 export function* collectMergeStates({ repo, viewer, ghFn }) {
@@ -121,7 +123,7 @@ export function* collectMergeStates({ repo, viewer, ghFn }) {
   const index = new Map();
   let after = null;
   for (let page = 0; page < MERGE_STATE_MAX_PAGES; page += 1) {
-    const args = ['api', 'graphql', '-f', `query=${MERGE_STATE_QUERY}`, '-f', `q=repo:${repo} is:pr is:open author:${viewer}`];
+    const args = ['api', 'graphql', '-f', `query=${MERGE_STATE_QUERY}`, '-f', `q=repo:${repo} is:pr is:open author:${viewer} author:app/${WATCHED_BOT_APP}`];
     if (after) args.push('-f', `after=${after}`);
     const payload = parse(yield () => ghFn(args));
     requireValue(payload && !payload.errors?.length, `merge state GraphQL errors: ${String(payload?.errors?.[0]?.message ?? '').slice(0, 120)}`);
