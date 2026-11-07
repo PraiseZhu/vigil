@@ -17,6 +17,60 @@ import { runVerdict } from './verdict.mjs';
 
 export const EXIT = Object.freeze({ OK: 0, FAIL: 1, CLAIM: 3, REJECTED: 4, SECRET: 5, ENV: 6 });
 
+// #358：env-skipped 只表示这项检查没跑。note 里已经有非零的通过/失败计数，就是「跑了但没过」被记成「没跑」。
+// helper 在动任何写操作之前拦下：退出码 1、零写入、不标「中断」、不写 env-unverified；由模型按事实改成
+// ran 并保留原始计数后重跑。不替模型改状态，也不因此判通过。0 不算：0 passed / 0 failed 仍是真的没跑。
+const EXECUTED_COUNT = Object.freeze([
+  /(\d[\d,]*)\s*(?:个|条|项|例)?\s*(?:用例)?\s*(?:passed|failed|通过|失败)/gi,
+  /(?:passed|failed|通过|失败)\s*[:：=]?\s*(\d[\d,]*)/gi,
+]);
+
+/** note 里有没有非零的通过/失败计数；有就返回那段原文，没有返回 null。 */
+function executedCount(note) {
+  for (const pattern of EXECUTED_COUNT) {
+    for (const match of String(note).matchAll(pattern)) {
+      const count = Number(match[1].replace(/,/g, ''));
+      if (Number.isFinite(count) && count > 0) return match[0].trim();
+    }
+  }
+  return null;
+}
+
+/** checks 里写成 env-skipped、note 却带着执行计数的项；返回 `key（note：…）` 列表。 */
+function contradictoryEnvSkipped(checks) {
+  if (!checks || typeof checks !== 'object' || Array.isArray(checks)) return [];
+  const out = [];
+  for (const [key, value] of Object.entries(checks)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    if (value.status !== 'env-skipped' || typeof value.note !== 'string') continue;
+    const executed = executedCount(value.note);
+    if (executed) out.push(`${key}（note：${executed}）`);
+  }
+  return out;
+}
+
+/** 判「通过」前先拦住「env-skipped 但 note 写着已执行」的 checks 文件：读不到就交给命令自己报错。 */
+function rejectContradictoryChecks(command, flags) {
+  let file;
+  if (command === 'verdict') file = flags.get('file');
+  else if (command === 'close') file = flags.get('verified');
+  else if (command === 'board' && flags.get('acceptance') === '通过') file = flags.get('checks');
+  if (typeof file !== 'string' || !file) return;
+  let checks;
+  try {
+    checks = JSON.parse(fs.readFileSync(file, 'utf8'))?.checks;
+  } catch {
+    return;
+  }
+  const bad = contradictoryEnvSkipped(checks);
+  if (!bad.length) return;
+  throw new Error(
+    `checks 把 ${bad.join('、')} 写成 env-skipped，但 note 写着已执行：这项其实跑了，不能记成「因环境没跑」。` +
+      '确实跑了就写 ran，并在 note 保留通过/失败计数和原始失败证据；没跑就删掉执行结果重跑。' +
+      '这条不替你把失败归因环境，也不因此判通过；helper 什么都不写（退出码 1），轮次不标「中断」。',
+  );
+}
+
 const COMMANDS = ['collect', 'progress', 'verdict', 'close', 'correct', 'push', 'board', 'done'];
 const NEEDS_ROUND = new Set(['progress', 'verdict', 'close', 'correct', 'push', 'board', 'done']);
 const ISSUE_PATTERN = /^([^/\s]+)\/([^#\s]+)#(\d+)$/;
@@ -250,6 +304,8 @@ export async function runHelper(argv, options = {}) {
 
   const context = { github, profile, ref, n, flags, now, stdout, stderr, git };
   try {
+    // #358：先拦自相矛盾的 checks，再动任何写操作（退出码 1、零写入、不标中断）。
+    rejectContradictoryChecks(command, flags);
     switch (command) {
       case 'collect': {
         const tree = await collectTree({ github, profile, ref });
