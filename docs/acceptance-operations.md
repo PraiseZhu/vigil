@@ -752,7 +752,7 @@ node watchers/acceptance/deploy-ff.mjs \
 - `--prio-lock` 要和 prio-sync 演练用的是同一把锁。两把锁都是非阻塞的，进程退出就放开。
 - 参数缺失时退出码 2，不部署。
 
-每次运行标准输出恰好两行：第一行是 JSON（`status`、`head`、`target`、`behind`、`lagging`、`reportLag`、`files`、`lines`、`reason`、`ts`），第二行是中文人话。落后时人话里带给 lead 的那句。
+每次运行标准输出通常是两行：第一行是 JSON（`status`、`head`、`target`、`behind`、`lagging`、`reportLag`、`files`、`lines`、`reason`、`ts`），第二行是中文人话。落后时人话里带给 lead 的那句。首读拿不到检查结果、同拍重读读到结果时，末尾再多一行说明（见下）。
 
 | 状态 | 退出码 | 类别 |
 |---|---|---|
@@ -771,6 +771,8 @@ node watchers/acceptance/deploy-ff.mjs \
 | `doctor-failed` | 17 | 已经快进，检查没过，不自动回退 |
 
 `waiting` 和 `ci-pending` 同属等待，不算异常。检查必须全部完成且结论都是 success、neutral 或 skipped，才算绿；全部是 skipped 也算绿。每条 check run 的 `head_sha` 必须等于当时 `origin/main` 的完整 sha，对不上就不拉。只读 check-runs（`/repos/<owner>/<repo>/commits/<sha>/check-runs`），不读 commit statuses。请求不带身份头；仓名从部署目录 `origin` 的配置地址推出。读到结果之后如果轮次空档没了，或者远端又前进了，只合并刚才核对过的那个完整 sha，不会去追新的 `origin/main`。
+
+读检查结果只读一次，例外只有一种：首读是 `ci-unknown`（空结果、`total_count` 和条数对不上、格式不认得、`head_sha` 对不上目标、非 200、超时、抛错）时，同一次运行里再读一次**同一个完整目标 sha**。第二次读到绿就照常快进并部署，不再等 5 分钟到下一拍；第二次读到 `ci-red` 或 `ci-pending` 就按那个状态收尾；两次都拿不到仍是 `ci-unknown`，不快进，照常写一条 `deploy-ci-unknown`。明确失败（`ci-red`）和等待（`ci-pending`）都是读到了的结论，不重读。重读只在读检查这一步发生，仍在差分、敏感批准、轮次空档复检和快进之前，不越过其中任何一道门；`fetch`、`merge --ff-only`、差分、`doctor` 都不重试。一次运行最多两个 GET（每个请求最多 `--timeout`，默认 15 秒）。重读拿到非 `ci-unknown` 结果时，标准输出在原来两行之后多一行 `检查结果首读读不到（ci-unknown）…` 说明；`deploy-ff.json` 的字段和告警去重键都不变。
 
 敏感清单（命中任一就不拉，除非批准了这个完整 sha）：
 

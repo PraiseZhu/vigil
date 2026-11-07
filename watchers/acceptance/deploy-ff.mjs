@@ -461,6 +461,23 @@ function ciReason(ci) {
   return '检查结果读不到或不认得';
 }
 
+/**
+ * 读检查结果：首读是 ci-unknown（空结果、格式不认得、非 200、超时、抛错）时，
+ * 同一次运行里再读一次同一个完整目标 sha。最多两个 GET，只重试「读检查」这一步；
+ * ci-red / ci-pending 是读到了的结论，不重读。两次都未知仍是 ci-unknown。
+ * 重读读到非 ci-unknown 时返回一行说明，调用方把它追加到标准输出。
+ */
+async function readCiWithReread({ repo, sha, fetchImpl, timeoutMs }) {
+  const first = await readCi({ repo, sha, fetchImpl, timeoutMs });
+  if (first !== 'ci-unknown') return { ci: first, note: null };
+  const second = await readCi({ repo, sha, fetchImpl, timeoutMs });
+  if (second === 'ci-unknown') return { ci: second, note: null };
+  return {
+    ci: second,
+    note: `检查结果首读读不到（ci-unknown），同拍重读一次后读到 ${second}，按 ${second} 判定。`,
+  };
+}
+
 export async function tryAcquire(lockPath) {
   fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
   fs.closeSync(fs.openSync(lockPath, 'a'));
@@ -565,7 +582,9 @@ async function complete(opts, decision, extra = {}) {
       || next.lagReportedFor !== state.lagReportedFor;
     if (changed) writeState(opts.stateFile, next);
   }
-  const stdout = formatResult(payload);
+  const text = formatResult(payload);
+  // 重读读到结果时，在原来两行之后多一行说明；JSON 行和人话行都不动。
+  const stdout = extra.note ? `${text}${oneLine(extra.note)}\n` : text;
   return {
     code: EXIT[payload.status] ?? 12,
     stdout,
@@ -611,52 +630,57 @@ export async function runDeploy(options) {
     runDoctor: options.runDoctor || defaultRunDoctor,
     runCheck: options.runCheck || defaultRunCheck,
   };
+  // 首读未知、重读读到结果时，这一拍的收尾多带一行说明。
+  let ciNote = null;
+  const conclude = (decision, extra = {}) => complete(opts, decision, { ...extra, note: ciNote });
   let selfHandle = null;
   let prioHandle = null;
   try {
     if (opts.assumePrioBlocked) {
-      return await complete(opts, decide({ selfLock: true, prioLock: false }));
+      return await conclude(decide({ selfLock: true, prioLock: false }));
     }
     if (!opts.locksHeld) {
       selfHandle = await tryAcquire(opts.selfLock);
-      if (!selfHandle.ok) return await complete(opts, decide({ selfLock: false }), { skipGit: true });
+      if (!selfHandle.ok) return await conclude(decide({ selfLock: false }), { skipGit: true });
       prioHandle = await tryAcquire(opts.prioLock);
-      if (!prioHandle.ok) return await complete(opts, decide({ selfLock: true, prioLock: false }));
+      if (!prioHandle.ok) return await conclude(decide({ selfLock: true, prioLock: false }));
     }
     const blocked = await idleBlock(opts);
-    if (blocked) return await complete(opts, decide({ idle: false, reason: blocked }));
+    if (blocked) return await conclude(decide({ idle: false, reason: blocked }));
     const status = opts.runGit(opts.deployDir, ['status', '--porcelain']);
     if (!status.ok || status.stdout.trim()) {
-      return await complete(opts, decide({
+      return await conclude(decide({
         dirty: true,
         reason: status.ok ? '工作区有未提交的改动' : '读工作区状态失败',
       }));
     }
     const fetched = opts.runGit(opts.deployDir, ['fetch', 'origin']);
     if (!fetched.ok) {
-      return await complete(opts, decide({ fetchOk: false, reason: oneLine(fetched.stderr) || '拉取远端失败' }));
+      return await conclude(decide({ fetchOk: false, reason: oneLine(fetched.stderr) || '拉取远端失败' }));
     }
     const afterFetch = readPointers(opts.runGit, opts.deployDir);
     if (!afterFetch.head || !afterFetch.target) {
-      return await complete(opts, decide({ fetchOk: false, reason: '读不到 HEAD 或目标提交' }));
+      return await conclude(decide({ fetchOk: false, reason: '读不到 HEAD 或目标提交' }));
     }
-    if (afterFetch.head === afterFetch.target) return await complete(opts, decide({ same: true }));
+    if (afterFetch.head === afterFetch.target) return await conclude(decide({ same: true }));
     const ancestor = opts.runGit(opts.deployDir, ['merge-base', '--is-ancestor', 'HEAD', afterFetch.target]);
-    if (!ancestor.ok) return await complete(opts, decide({ ancestor: false, reason: 'HEAD 不是目标提交的祖先' }));
+    if (!ancestor.ok) return await conclude(decide({ ancestor: false, reason: 'HEAD 不是目标提交的祖先' }));
     const remote = opts.runGit(opts.deployDir, ['config', '--get', 'remote.origin.url']);
     const repo = remote.ok ? repoFromOrigin(remote.stdout.trim()) : null;
-    const ci = await readCi({
+    const read = await readCiWithReread({
       repo,
       sha: afterFetch.target,
       fetchImpl: opts.fetchImpl,
       timeoutMs: opts.timeoutMs,
     });
-    if (ci !== 'green') return await complete(opts, decide({ ci, reason: ciReason(ci) }));
+    const ci = read.ci;
+    ciNote = read.note;
+    if (ci !== 'green') return await conclude(decide({ ci, reason: ciReason(ci) }));
     const diffBase = ['--no-renames', '--no-ext-diff', '--no-textconv', 'HEAD', afterFetch.target];
     const names = opts.runGit(opts.deployDir, ['diff', '--name-only', ...diffBase]);
     const diff = opts.runGit(opts.deployDir, ['diff', ...diffBase]);
     if (!names.ok || !diff.ok) {
-      return await complete(opts, decide({
+      return await conclude(decide({
         needsApproval: true,
         reason: '算不出待拉的改动文件，先停下来等人看',
       }));
@@ -671,7 +695,7 @@ export async function runDeploy(options) {
         const listed = hits.files.join('、');
         const rows = hits.lines.map((row) => `${row.file}:${row.line}`).join('、');
         const reason = `敏感改动需要批准 ${afterFetch.target}：${listed}${rows ? `；行 ${rows}` : ''}`;
-        return await complete(opts, decide({
+        return await conclude(decide({
           needsApproval: true,
           files: hits.files,
           lines: hits.lines,
@@ -681,21 +705,21 @@ export async function runDeploy(options) {
       usedApprovalFile = gate.viaFile;
     }
     const beforeMerge = await idleBlock(opts);
-    if (beforeMerge) return await complete(opts, decide({ idle: false, reason: beforeMerge }));
+    if (beforeMerge) return await conclude(decide({ idle: false, reason: beforeMerge }));
     const pulled = opts.runGit(opts.deployDir, ['merge', '--ff-only', afterFetch.target]);
     const headNow = opts.runGit(opts.deployDir, ['rev-parse', 'HEAD']);
     if (!pulled.ok || !headNow.ok || headNow.stdout.trim() !== afterFetch.target) {
-      return await complete(opts, decide({
+      return await conclude(decide({
         pullOk: false,
         reason: oneLine(pulled.stderr) || '快进后的 HEAD 不是刚才核对过的目标提交',
       }));
     }
     const post = await runPostDeploy(opts, files);
-    if (!post.ok) return await complete(opts, decide({ postOk: false, reason: post.reason, files: post.files }));
+    if (!post.ok) return await conclude(decide({ postOk: false, reason: post.reason, files: post.files }));
     if (usedApprovalFile && opts.approvalFile) {
       try { fs.unlinkSync(opts.approvalFile); } catch { /* 文件已经不在 */ }
     }
-    return await complete(opts, decide({ postOk: true }));
+    return await conclude(decide({ postOk: true }));
   } finally {
     if (prioHandle?.ok) await prioHandle.release();
     if (selfHandle?.ok) await selfHandle.release();
