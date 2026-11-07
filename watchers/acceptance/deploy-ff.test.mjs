@@ -1110,3 +1110,181 @@ test('#215 SC11 新增文件没有本机绝对路径和邮箱', () => {
   assert.equal(classifyChecks(null, 'a'.repeat(40)), 'ci-unknown');
   assert.equal(classifyChecks({ total_count: 0, check_runs: [] }, 'a'.repeat(40)), 'ci-unknown');
 });
+
+// ---- #347：首读拿不到检查结果时同拍再读一次（只重读读检查这一步） ----
+
+// 按调用顺序返回预设响应，并记下每次的 URL；响应用完后重复最后一个。
+function scripted(impls) {
+  const calls = [];
+  const fn = async (url, init) => {
+    calls.push({ url, init });
+    const impl = impls[Math.min(calls.length - 1, impls.length - 1)];
+    return impl(url, init);
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+// 重读读到结果的那一拍：原来两行之后多一行说明。
+function assertRunNote(result, status) {
+  const parts = result.stdout.split('\n');
+  assert.equal(parts.length, 4, result.stdout);
+  assert.equal(parts[3], '');
+  assert.match(parts[2], /重读/);
+  const json = JSON.parse(parts[0]);
+  assert.equal(json.status, status);
+  assert.equal(result.code, EXIT[status]);
+  return json;
+}
+
+function stateFields(file) {
+  return Object.keys(JSON.parse(fs.readFileSync(file, 'utf8'))).sort();
+}
+
+test('#347 SC1 首读空、同拍重读到绿就部署，多一行说明且不写 ci-unknown', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  const sha = commitAndPush(world, [{ path: 'docs/sc1-reread.md', content: 'reread\n' }], 'reread');
+  const fetchImpl = scripted([green(sha, { runs: [] }), green(sha)]);
+  const result = await deploy(world, { fetchImpl });
+  const parts = result.stdout.split('\n');
+  assert.equal(parts.length, 4, result.stdout);
+  const json = JSON.parse(parts[0]);
+  assert.equal(json.status, 'deployed');
+  assert.equal(result.code, EXIT.deployed);
+  assert.equal(result.after, sha);
+  assert.equal(fetchImpl.calls.length, 2);
+  for (const call of fetchImpl.calls) assert.ok(call.url.includes(sha), call.url);
+  assert.match(parts[2], /重读/);
+  assert.equal(readAlerts(world.alertsFile).some((row) => row.kind === 'deploy-ci-unknown'), false);
+});
+
+test('#347 SC2 两次都读不到仍 ci-unknown、不快进、只写一条提醒', { skip: FLOCK_SKIP }, async () => {
+  const cases = [
+    ['空列表', { runs: [] }, 15_000],
+    ['坏格式', { payload: { nope: true } }, 15_000],
+    ['500', { status: 500 }, 15_000],
+    ['抛错', { throwError: true }, 15_000],
+    ['超时', { hang: true }, 40],
+  ];
+  for (const [label, extra, timeoutMs] of cases) {
+    const world = makeWorld();
+    const sha = commitAndPush(world, [{ path: 'docs/sc2-reread.md', content: `${label}\n` }], label);
+    const fetchImpl = scripted([green(sha, extra), green(sha, extra)]);
+    const result = await deploy(world, { fetchImpl, timeoutMs });
+    assertRun(result, 'ci-unknown');
+    assert.equal(fetchImpl.calls.length, 2, label);
+    assert.equal(result.after, result.before, label);
+    assert.equal(result.calls.some((args) => args[0] === 'merge'), false, label);
+    const rows = readAlerts(world.alertsFile).filter((row) => row.kind === 'deploy-ci-unknown');
+    assert.equal(rows.length, 1, label);
+  }
+});
+
+test('#347 SC3 明确红不当成功也不重读；首读绿也只读一次', { skip: FLOCK_SKIP }, async () => {
+  const redWorld = makeWorld();
+  const redSha = commitAndPush(redWorld, [{ path: 'docs/sc3-red.md', content: 'red\n' }], 'red');
+  const redFetch = scripted([red(redSha)]);
+  const failed = await deploy(redWorld, { fetchImpl: redFetch });
+  assertRun(failed, 'ci-red');
+  assert.equal(redFetch.calls.length, 1);
+  assert.equal(failed.after, failed.before);
+  assert.equal(failed.calls.some((args) => args[0] === 'merge'), false);
+
+  const greenWorld = makeWorld();
+  const greenSha = commitAndPush(greenWorld, [{ path: 'docs/sc3-green.md', content: 'green\n' }], 'green');
+  const greenFetch = scripted([green(greenSha)]);
+  const deployed = await deploy(greenWorld, { fetchImpl: greenFetch });
+  assertRun(deployed, 'deployed');
+  assert.equal(greenFetch.calls.length, 1);
+  assert.equal(deployed.after, greenSha);
+});
+
+test('#347 SC4 最多重读一次：两次未知恰好两个请求，ci-pending 只读一次', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  const sha = commitAndPush(world, [{ path: 'docs/sc4-reread.md', content: 'sc4\n' }], 'sc4');
+  const unknown = scripted([green(sha, { runs: [] })]);
+  assertRun(await deploy(world, { fetchImpl: unknown }), 'ci-unknown');
+  assert.equal(unknown.calls.length, 2);
+
+  const pendingWorld = makeWorld();
+  const pendingSha = commitAndPush(pendingWorld, [{ path: 'docs/sc4-pending.md', content: 'p\n' }], 'pending');
+  const pending = scripted([
+    green(pendingSha, { runs: [{ status: 'in_progress', conclusion: null, head_sha: pendingSha }] }),
+  ]);
+  assertRun(await deploy(pendingWorld, { fetchImpl: pending }), 'ci-pending');
+  assert.equal(pending.calls.length, 1);
+});
+
+test('#347 SC5 重读只读同一个目标完整 sha，远端再前进也不改目标', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  const sha = commitAndPush(world, [{ path: 'docs/sc5-reread.md', content: 'sc5\n' }], 'sc5');
+  const fetchImpl = scripted([
+    green(sha, { runs: [] }),
+    (url, init) => {
+      commitAndPush(world, [{ path: 'docs/sc5-later.md', content: 'later\n' }], 'later');
+      git(world.deploy, ['fetch', 'origin']);
+      return green(sha)(url, init);
+    },
+  ]);
+  const result = await deploy(world, { fetchImpl });
+  assertRunNote(result, 'deployed');
+  assert.equal(fetchImpl.calls.length, 2);
+  for (const call of fetchImpl.calls) assert.ok(call.url.includes(sha), call.url);
+  const merges = result.calls.filter((args) => args[0] === 'merge');
+  assert.equal(merges.length, 1);
+  assert.deepEqual(merges[0], ['merge', '--ff-only', sha]);
+  assert.equal(result.after, sha);
+});
+
+test('#347 SC6 重读成功也不绕敏感批准和轮次空档复检', { skip: FLOCK_SKIP }, async () => {
+  const sensitiveWorld = makeWorld();
+  const sensitiveSha = commitAndPush(sensitiveWorld,
+    [{ path: 'watchers/acceptance/deploy-ff.mjs', content: 'export const self = 1;\n' }], 'sensitive');
+  const sensitiveFetch = scripted([green(sensitiveSha, { runs: [] }), green(sensitiveSha)]);
+  const blocked = await deploy(sensitiveWorld, { fetchImpl: sensitiveFetch });
+  const blockedJson = assertRunNote(blocked, 'needs-approval');
+  assert.equal(blockedJson.head, blocked.before);
+  assert.equal(blocked.after, blocked.before);
+  assert.equal(blocked.calls.some((args) => args[0] === 'merge'), false);
+
+  const busyWorld = makeWorld();
+  const busySha = commitAndPush(busyWorld, [{ path: 'docs/sc6-reread.md', content: 'sc6\n' }], 'sc6');
+  const busyFetch = scripted([
+    green(busySha, { runs: [] }),
+    (url, init) => {
+      fs.writeFileSync(path.join(busyWorld.host, 'rounds', 'appeared.json'), '{}\n');
+      return green(busySha)(url, init);
+    },
+  ]);
+  const waiting = await deploy(busyWorld, { fetchImpl: busyFetch });
+  assertRunNote(waiting, 'waiting');
+  assert.equal(waiting.after, waiting.before);
+  assert.equal(waiting.calls.some((args) => args[0] === 'merge'), false);
+});
+
+test('#347 SC7 重读成功多一行说明，提醒与状态文件字段不变', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  const sha = commitAndPush(world, [{ path: 'docs/sc7-reread.md', content: 'sc7\n' }], 'sc7');
+  const result = await deploy(world, { fetchImpl: scripted([green(sha, { runs: [] }), green(sha)]) });
+  const parts = result.stdout.split('\n');
+  assert.equal(parts.length, 4, result.stdout);
+  assert.equal(parts[3], '');
+  assert.ok(parts[2].trim().length > 0);
+  assert.equal(readAlerts(world.alertsFile).length, 0);
+  assert.deepEqual(stateFields(world.stateFile), ['alerted', 'lagReportedFor']);
+
+  const controlWorld = makeWorld();
+  const controlSha = commitAndPush(controlWorld, [{ path: 'docs/sc7-control.md', content: 'ctl\n' }], 'ctl');
+  const control = await deploy(controlWorld, { fetchImpl: green(controlSha) });
+  assertRun(control, 'deployed');
+  assert.deepEqual(stateFields(controlWorld.stateFile), ['alerted', 'lagReportedFor']);
+});
+
+test('#347 SC8 文档写清重读条件、次数、不重试的状态和说明行', () => {
+  const doc = fs.readFileSync(DOC, 'utf8');
+  assert.match(doc, /同一次运行里再读一次/);
+  assert.match(doc, /首读[\s\S]{0,80}ci-unknown/);
+  assert.match(doc, /ci-red[\s\S]{0,40}不重读/);
+  assert.match(doc, /最多.{0,10}两个 GET|两个 GET/);
+  assert.match(doc, /多一行/);
+});
