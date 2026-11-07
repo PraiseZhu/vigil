@@ -44,7 +44,7 @@ const otherPr = (number, extra = {}) => ({ number, id: `PR_${number}`, headRefOi
 
 const queryOf = (args) => String(args.find((arg) => String(arg).startsWith('query=')) ?? '');
 const isOtherList = (args) => queryOf(args).includes('nodes{id number isDraft');
-const threadReadOf = (args) => /node\(id:"([^"]+)"\)\{\.\.\. on PullRequest\{state isDraft headRefOid author\{login\} reviewThreads/.exec(queryOf(args))?.[1] ?? null;
+const threadReadOf = (args) => /node\(id:"([^"]+)"\)\{\.\.\. on PullRequest\{state isDraft headRefOid author\{login __typename\} reviewThreads/.exec(queryOf(args))?.[1] ?? null;
 const sideCalls = (calls) => calls.filter((args) => isOtherList(args) || threadReadOf(args));
 const threadReads = (calls) => calls.map(threadReadOf).filter(Boolean);
 const isWrite = (args) => args.some((arg) => /^(?:-X|--method|--input)$/.test(String(arg)) || /mutation/.test(String(arg)))
@@ -230,6 +230,17 @@ test('the viewer\'s own PR is not part of the other authors\' path, whatever the
   assert.deepEqual(threadReads(run.calls), []);
   assert.equal(run.asked.log.length, 0);
   assert.deepEqual(run.out.otherPrs, { scanned: 0, closed: 0, deferred: 0 });
+});
+
+// vigil#360: the praise-qa App's PRs are the watcher's own. A person named praise-qa, or another App, is another author.
+test('the praise-qa App\'s PR is not part of the other authors\' path; a person or another App of that name is', async (t) => {
+  const w = world(t, { others: [otherPr(904, { author: { login: 'praise-qa', __typename: 'Bot' } }),
+    otherPr(905, { author: { login: 'praise-qa', __typename: 'User' } }), otherPr(906, { author: { login: 'other-app', __typename: 'Bot' } })],
+  threads: { PR_904: [fixedThread(1)], PR_905: [fixedThread(2)], PR_906: [fixedThread(3)] } });
+  const run = await round(w);
+  assert.deepEqual(threadReads(run.calls).sort(), ['PR_905', 'PR_906']);
+  assert.deepEqual(run.asked.log.flatMap((call) => call.threadIds).sort(), ['PRRT_2', 'PRRT_3']);
+  assert.equal(readServerFixedState(w.paths).prs.PR_904, undefined);
 });
 
 test('a Draft PR of another author is not read', async (t) => {
@@ -539,7 +550,7 @@ test('switch off, follow mode: the follow beats read exactly what they read befo
   assert.deepEqual(normalize(run, crowded), normalize(baseline, alone));
   const batches = run.calls.filter(isFollowBatch);
   assert.ok(batches.length >= 3, 'the baseline read and at least two beats');
-  assert.ok(batches.every((args) => queryOf(args).includes('nodes{id isDraft headRefOid updatedAt author{login} labels(first:30){nodes{name}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}')),
+  assert.ok(batches.every((args) => queryOf(args).includes('nodes{id isDraft headRefOid updatedAt author{login __typename} labels(first:30){nodes{name}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}')),
     'every beat is the follow query as it was');
   assert.deepEqual(sideCalls(run.calls), []);
 });

@@ -32,3 +32,34 @@ export function isOwnLogin(login, env = process.env) {
   const l = login.toLowerCase();
   return l === configuredLogin(env).toLowerCase() || l === BOT_LOGIN;
 }
+
+// PR authors the watcher looks after: the configured account and the praise-qa GitHub App (vigil#360).
+// GitHub spells the App differently per API: `gh pr list/view` says `app/praise-qa` (is_bot), GraphQL says
+// `praise-qa` (__typename Bot), REST says `praise-qa[bot]`. A bare `praise-qa` without a Bot marker is a
+// person of that name, not the App.
+export const WATCHED_BOT_APP = BOT_LOGIN.slice(0, -'[bot]'.length);
+
+function toAuthorKey(author) {
+  const login = String((typeof author === 'string' ? author : author?.login) ?? '').trim().toLowerCase();
+  if (!login) return null;
+  if (login.startsWith('app/')) return `bot:${login.slice('app/'.length)}`;
+  if (login.endsWith('[bot]')) return `bot:${login.slice(0, -'[bot]'.length)}`;
+  const bot = typeof author === 'object' && (author.is_bot === true || author.type === 'Bot' || author.__typename === 'Bot');
+  return `${bot ? 'bot' : 'user'}:${login}`;
+}
+
+export const isWatchedBotAuthor = (author) => toAuthorKey(author) === `bot:${WATCHED_BOT_APP}`;
+
+export function isWatchedAuthor(author, env = process.env) {
+  const key = toAuthorKey(author);
+  return key !== null && (key === `user:${configuredLogin(env).toLowerCase()}` || key === `bot:${WATCHED_BOT_APP}`);
+}
+
+// Same GitHub account however each API spelled it.
+export function isSameAuthor(a, b) {
+  const key = toAuthorKey(a);
+  return key !== null && key === toAuthorKey(b);
+}
+
+// A PR the watcher may act on: written by the account it runs as (`viewer`), or by the praise-qa App.
+export const isViewerOrWatchedBot = (author, viewer) => isSameAuthor(author, viewer) || isWatchedBotAuthor(author);

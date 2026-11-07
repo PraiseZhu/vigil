@@ -127,8 +127,8 @@ test('after the full round, a PR that turns Ready is followed at the next follow
     dispatchFn: (params) => { sent.push({ at: now, title: params.title }); return { target_session_id: 'sess-821' }; },
     ownershipSnapshot: ownership,
   });
-  // Full listing at the start and once more when the batched query shows a change (no change, no listing).
-  assert.deepEqual(listings, [0, 45000]);
+  // Full listing (own and praise-qa App) at the start and once more when the batched query shows a change (no change, no listing).
+  assert.deepEqual(listings, [0, 0, 45000, 45000]);
   assert.deepEqual(sent.map((item) => item.at), [45000]);
   assert.deepEqual(result.prs.map((item) => [item.number, item.dispatch.reason ?? item.dispatch.attempted]),
     [[821, 'draft-author-owned'], [821, result.prs[1].dispatch.reason ?? true]]);

@@ -25,7 +25,7 @@ import { enqueueNotice } from './notify.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
 import { triageText } from './mivo-ci-triage.mjs';
 import { collectMivoCiSteps } from './mivo-ci.mjs';
-import { configuredLogin } from './mivo-identity.mjs';
+import { configuredLogin, isViewerOrWatchedBot, WATCHED_BOT_APP } from './mivo-identity.mjs';
 
 // 目标仓库在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
 export const REPO = requireConfig('targetRepo', {
@@ -169,6 +169,20 @@ export function memoRepoReads(ghFn, store = null) {
   };
   if (store) memo.ciCache = ciRunCache(store);
   return memo;
+}
+
+const LIST_FIELDS = 'number,id,headRefOid,headRefName,isDraft,labels,url,updatedAt,title';
+// Open PRs the watcher looks after: the viewer's own and the praise-qa App's (vigil#360). gh pr list takes one
+// author at a time and the router refuses --search, so it is two listings, merged by node id.
+export function* listWatchedPrs({ ghFn, viewer, fields = LIST_FIELDS }) {
+  const byId = new Map();
+  for (const who of [['--author', viewer], ['--app', WATCHED_BOT_APP]]) {
+    const listed = JSON.parse(yield () => ghFn(['pr', 'list', '--repo', REPO, ...who, '--state', 'open', '--limit', '1000', '--json', fields]));
+    if (!Array.isArray(listed)) throw new Error('Open PR listing is not an array');
+    if (listed.length >= 1000) return listed;
+    for (const pr of listed) if (pr?.id && !byId.has(String(pr.id))) byId.set(String(pr.id), pr);
+  }
+  return [...byId.values()];
 }
 
 function readViewer(ghFn, paths, clock) {
@@ -2462,7 +2476,7 @@ export function* processPr({
     report.push({ number: pr.number, nodeId: pr.id, dispatch: { attempted: false, reason: 'collection-failed' }, error: String(error.message).slice(0, 400) });
     return;
   }
-  if (collected.pr && (collected.pr.state !== 'OPEN' || collected.pr.isDraft || !collected.pr.sameRepository || collected.pr.author?.login !== viewer)) {
+  if (collected.pr && (collected.pr.state !== 'OPEN' || collected.pr.isDraft || !collected.pr.sameRepository || !isViewerOrWatchedBot(collected.pr.author, viewer))) {
     state.prs[key] = supersedeOnRedraft(base, now);
     persistState(state, paths);
     report.push({ number: pr.number, dispatch: {attempted:false,reason:'ownership-no-longer-released'} });
@@ -2963,7 +2977,7 @@ export function* processPr({
     try { live = yield* ownershipSnapshot({pr:{number:pr.number,repo:REPO},ghFn}); }
     catch { live = null; }
     if (!live || live.pr.state !== 'OPEN' || live.pr.isDraft || !live.pr.sameRepository
-      || live.pr.author.login !== viewer || live.pr.headRefOid !== collected.pr.headRefOid
+      || !isViewerOrWatchedBot(live.pr.author, viewer) || live.pr.headRefOid !== collected.pr.headRefOid
       || live.pr.baseRefOid !== collected.pr.baseRefOid || live.pr.releaseEpoch !== collected.pr.releaseEpoch) {
       state.prs[key] = {...previous, lastDispatchGuard:{at:now,reason:'ownership-changed-before-dispatch'}};
       report.push({number:pr.number,dispatch:{attempted:false,reason:'ownership-changed-before-dispatch'}});
@@ -3230,10 +3244,7 @@ function* scanWorkflow({
   state.receiptsUpdatedAt=now;
   persistState(state,paths);
   const viewer = String(yield () => readViewer(ghFn, paths, clock)).trim();
-  const listed = JSON.parse(yield () => ghFn([
-    'pr', 'list', '--repo', REPO, '--author', viewer, '--state', 'open', '--limit', '1000',
-    '--json', 'number,id,headRefOid,headRefName,isDraft,labels,url,updatedAt,title',
-  ]));
+  const listed = yield* listWatchedPrs({ ghFn, viewer, fields: LIST_FIELDS });
   if (!Array.isArray(listed) || listed.length >= 1000) throw new Error('Open PR listing reached safety bound; cannot claim complete coverage');
   const report = [];
   const events = [];
@@ -3744,7 +3755,7 @@ function* discoverOnePr(pr, ctx) {
         try { live = yield* ownershipSnapshot({ pr: { number: pr.number, repo: REPO }, ghFn }); }
         catch { /* A missing ownership response never authorizes another input. */ }
         const current = live?.pr && { ...pr, ...live.pr, repo: REPO };
-        if (!current || current.author?.login !== viewer || !taskOwnsPr(retryTask, previous, current)) {
+        if (!current || !isViewerOrWatchedBot(current.author, viewer) || !taskOwnsPr(retryTask, previous, current)) {
           if (current) writePr(paths.home, key, supersedeOnRedraft(previous, now));
           report.push({ number: pr.number, nodeId: key, dispatch: { attempted: false,
             reason: current ? 'recovery-handoff-invalid' : 'ownership-query-unavailable' } });
@@ -3933,7 +3944,7 @@ function* discoverPass(prs, ctx, report, events) {
 // GitHub App with its own limit (2026-11-04: this was most of the personal account's non-per-PR GraphQL traffic).
 const batchQueryFor = (repo, after) => {
   const [owner, name] = repo.split('/');
-  return `query{repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){pullRequests(states:OPEN,first:100${after ? `,after:${JSON.stringify(after)}` : ''}){pageInfo{hasNextPage endCursor} nodes{id isDraft headRefOid updatedAt author{login} labels(first:30){nodes{name}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}}`;
+  return `query{repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){pullRequests(states:OPEN,first:100${after ? `,after:${JSON.stringify(after)}` : ''}){pageInfo{hasNextPage endCursor} nodes{id isDraft headRefOid updatedAt author{login __typename} labels(first:30){nodes{name}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}}`;
 };
 const BATCH_MAX_PAGES = 10;
 // Every open PR node of the repository, page by page, whoever wrote it. `queryFor` picks the fields to ask for; the
@@ -3956,10 +3967,9 @@ export function* readOpenPrNodes({ ghFn, repo = REPO, queryFor = batchQueryFor, 
   throw new Error('Batch PR query has too many pages');
 }
 export function* readBatch({ ghFn, viewer, repo = REPO }) {
-  const mine = String(viewer ?? '').toLowerCase();
   const signatures = new Map();
   for (const node of yield* readOpenPrNodes({ ghFn, repo })) {
-    if (!node?.id || !mine || String(node.author?.login ?? '').toLowerCase() !== mine) continue;
+    if (!node?.id || !String(viewer ?? '').trim() || !isViewerOrWatchedBot(node.author, viewer)) continue;
     signatures.set(String(node.id), JSON.stringify([
       node.isDraft === true, node.headRefOid, node.updatedAt,
       (node.labels?.nodes ?? []).map((item) => item?.name).filter(Boolean).sort(),
@@ -3979,19 +3989,19 @@ const OTHER_PR_THREAD_PAGES = 10;
 // Only what is needed to pick the PRs to look at; the threads are read per PR (otherPrThreadsQueryFor).
 const otherPrQueryFor = (repo, after) => {
   const [owner, name] = repo.split('/');
-  return `query{repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){pullRequests(states:OPEN,first:100${after ? `,after:${JSON.stringify(after)}` : ''}){pageInfo{hasNextPage endCursor} nodes{id number isDraft headRefOid author{login}}}}}`;
+  return `query{repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)}){pullRequests(states:OPEN,first:100${after ? `,after:${JSON.stringify(after)}` : ''}){pageInfo{hasNextPage endCursor} nodes{id number isDraft headRefOid author{login __typename}}}}}`;
 };
 // The PR's own fields come with every page, so a PR that closed, went Draft, changed hands or moved its head while
 // its threads were being read is noticed. A thread with more comments than one page is cut short on purpose:
 // isServerFixedThread then refuses it.
-const otherPrThreadsQueryFor = (id, after) => `query{node(id:${JSON.stringify(id)}){... on PullRequest{state isDraft headRefOid author{login} reviewThreads(first:100${after ? `,after:${JSON.stringify(after)}` : ''}){pageInfo{hasNextPage endCursor} nodes{id isResolved comments(first:100){pageInfo{hasNextPage endCursor} nodes{id body createdAt author{login __typename}}}}}}}}`;
-const isOtherAuthor = (login, viewer) => {
-  const them = String(login ?? '').trim().toLowerCase();
-  const me = String(viewer ?? '').trim().toLowerCase();
-  return them !== '' && me !== '' && them !== me;
+const otherPrThreadsQueryFor = (id, after) => `query{node(id:${JSON.stringify(id)}){... on PullRequest{state isDraft headRefOid author{login __typename} reviewThreads(first:100${after ? `,after:${JSON.stringify(after)}` : ''}){pageInfo{hasNextPage endCursor} nodes{id isResolved comments(first:100){pageInfo{hasNextPage endCursor} nodes{id body createdAt author{login __typename}}}}}}}}`;
+// The praise-qa App's PRs are the watcher's own (vigil#360), so they are not other authors' PRs.
+const isOtherAuthor = (author, viewer) => {
+  const them = String(author?.login ?? '').trim();
+  return them !== '' && String(viewer ?? '').trim() !== '' && !isViewerOrWatchedBot(author, viewer);
 };
 const isOtherPrCandidate = (node, viewer) => Boolean(node?.id) && Number.isSafeInteger(node.number) && node.isDraft === false
-  && /^[0-9a-f]{40}$/.test(node.headRefOid ?? '') && isOtherAuthor(node.author?.login, viewer);
+  && /^[0-9a-f]{40}$/.test(node.headRefOid ?? '') && isOtherAuthor(node.author, viewer);
 
 const serverFixedFile = (paths) => path.join(paths.stateDir, SERVER_FIXED_FILE);
 export function readServerFixedState(paths) {
@@ -4022,7 +4032,7 @@ function* readOtherPrThreads({ pr, viewer, ghFn, canContinue }) {
     const node = payload?.data?.node;
     const batch = node?.reviewThreads;
     if (payload?.errors?.length || !node || !Array.isArray(batch?.nodes) || typeof batch.pageInfo?.hasNextPage !== 'boolean') return { ok: false, reason: 'incomplete' };
-    if (node.state !== 'OPEN' || node.isDraft !== false || node.headRefOid !== pr.headRefOid || !isOtherAuthor(node.author?.login, viewer)) return { ok: false, reason: 'changed' };
+    if (node.state !== 'OPEN' || node.isDraft !== false || node.headRefOid !== pr.headRefOid || !isOtherAuthor(node.author, viewer)) return { ok: false, reason: 'changed' };
     threads.push(...batch.nodes);
     if (!batch.pageInfo.hasNextPage) return { ok: true, head: node.headRefOid, threads };
     after = batch.pageInfo.endCursor;
@@ -4148,12 +4158,8 @@ export function* discoverWorkflow({
   const keptReads = keptReadStore(paths.stateDir, clock);
   let ghFn = memoRepoReads(baseGh, keptReads);
   const viewer = String(yield () => configuredLogin()).trim();
-  const listArgs = [
-    'pr', 'list', '--repo', REPO, '--author', viewer, '--state', 'open', '--limit', '1000',
-    '--json', 'number,id,headRefOid,headRefName,isDraft,labels,url,updatedAt,title',
-  ];
   let listedAt = clock();
-  const listed = JSON.parse(yield () => ghFn(listArgs));
+  const listed = yield* listWatchedPrs({ ghFn, viewer, fields: LIST_FIELDS });
   if (!Array.isArray(listed)) throw new Error('Open PR listing is not an array');
   migrateLegacy(paths.home, listed.map((pr) => pr.id));
   const report = [];
@@ -4294,7 +4300,7 @@ export function* discoverWorkflow({
       }
       let relisted;
       try {
-        relisted = JSON.parse(yield () => tickGh(listArgs));
+        relisted = yield* listWatchedPrs({ ghFn: tickGh, viewer, fields: LIST_FIELDS });
         if (!Array.isArray(relisted)) throw new Error('Open PR listing is not an array');
       } catch (error) { if (failed(error)) break; continue; }
       known = nextKnown;

@@ -58,7 +58,7 @@ test('collectMergeStates reads every page of the viewer\'s open PRs with one que
   const index = run(collectMergeStates({ repo: 'example-org/example-plugin', viewer: 'owner', ghFn }));
   assert.equal(calls.length, 2);
   assert.ok(calls.every(mentionsMergeState));
-  assert.ok(calls[0].includes('q=repo:example-org/example-plugin is:pr is:open author:owner'));
+  assert.ok(calls[0].includes('q=repo:example-org/example-plugin is:pr is:open author:owner author:app/praise-qa'));
   assert.deepEqual([...index.keys()], ['PR_1', 'PR_2', 'PR_3'], 'a PR without a valid base tip is left out, not guessed');
   assert.deepEqual(index.get('PR_2'), { mergeStateStatus: 'BEHIND', baseTipOid: TIP });
 });
