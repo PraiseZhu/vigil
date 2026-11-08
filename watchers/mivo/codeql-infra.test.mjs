@@ -140,6 +140,19 @@ test('a run with a job still going, or already re-run by someone else, is not re
   assert.equal(other.state.runs[600].action, 'rerun-by-other');
 });
 
+test('a run already re-run and red again from infrastructure tells a person once; a real failure there does not', () => {
+  const other = round({ checks: [qualityFail], gh: fakeGh({ run: { status: 'completed', run_attempt: 2 } }) });
+  assert.deepEqual(other.stillRed, ['Analyze (python)']);
+  assert.equal(other.notify, true);
+  assert.equal(other.state.notified, true);
+  const again = round({ checks: [qualityFail], state: other.state });
+  assert.equal(again.notify, false, 'once per head');
+  assert.deepEqual(again.calls, []);
+  const real = round({ checks: [qualityFail], gh: fakeGh({ annotations: realAnnotations, run: { status: 'completed', run_attempt: 2 } }) });
+  assert.equal(real.notify, false);
+  assert.equal(real.state.runs[600].action, 'not-infra');
+});
+
 test('a run still going is judged only once it finished, even when its annotations do not look like infrastructure yet', () => {
   for (const annotations of [[], realAnnotations]) {
     const running = round({ checks: [qualityFail], gh: fakeGh({ annotations, run: { status: 'in_progress', run_attempt: 1 } }) });
