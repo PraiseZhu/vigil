@@ -85,16 +85,17 @@ export function* superviseCodeqlInfra({ ci, repo, headSha, state, ghFn, now, dry
       continue;
     }
     try {
+      const run = JSON.parse(yield () => ghFn(['api', `repos/${repo}/actions/runs/${runId}`]));
+      // A run with a job still going is judged later, nothing recorded: GitHub refuses to re-run it, and its
+      // annotations may not all be there yet.
+      if (run?.status !== 'completed') continue;
+      if (Number(run.run_attempt ?? 1) > 1) { current.runs[runId] = { action: 'rerun-by-other', at: now, checkIds }; continue; }
       let infra = true;
       for (const job of jobs) {
         const annotations = JSON.parse(yield () => ghFn(['api', `repos/${repo}/check-runs/${job.checkId}/annotations?per_page=100`]));
         if (!isCodeqlInfraFailure(annotations)) { infra = false; break; }
       }
       if (!infra) { current.runs[runId] = { action: 'not-infra', at: now, checkIds }; continue; }
-      const run = JSON.parse(yield () => ghFn(['api', `repos/${repo}/actions/runs/${runId}`]));
-      // GitHub refuses to re-run a run that still has a job going: wait for it.
-      if (run?.status !== 'completed') continue;
-      if (Number(run.run_attempt ?? 1) > 1) { current.runs[runId] = { action: 'rerun-by-other', at: now, checkIds }; continue; }
       if (!dryRun) {
         yield () => ghFn(['api', '--method', 'POST', `repos/${repo}/actions/runs/${runId}/rerun-failed-jobs`]);
         current.runs[runId] = { action: 'rerun', at: now, checkIds };

@@ -140,6 +140,16 @@ test('a run with a job still going, or already re-run by someone else, is not re
   assert.equal(other.state.runs[600].action, 'rerun-by-other');
 });
 
+test('a run still going is judged only once it finished, even when its annotations do not look like infrastructure yet', () => {
+  for (const annotations of [[], realAnnotations]) {
+    const running = round({ checks: [qualityFail], gh: fakeGh({ annotations, run: { status: 'in_progress', run_attempt: 1 } }) });
+    assert.equal(running.state, null, 'nothing recorded while the run is going');
+    assert.ok(!running.calls.some((call) => call.includes('/annotations')), 'annotations are read after the run finished');
+    const finished = round({ checks: [qualityFail], state: running.state });
+    assert.deepEqual(finished.reran, ['600'], 'the 504 annotations that arrived later still count');
+  }
+});
+
 test('an unreadable annotation list is an error for this round only', () => {
   const failed = round({ checks: [qualityFail], gh: fakeGh({ failAnnotations: true }) });
   assert.deepEqual(failed.reran, []);
