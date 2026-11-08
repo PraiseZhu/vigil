@@ -316,6 +316,97 @@ test('#358 真没跑（0 passed / 依赖装不上）仍按环境未验证：退�
   assert.ok(rootComment(world).body.includes(`原因：${ENV_PROBLEM_PREFIX}`));
 });
 
+test('#358 边界：env-skipped 没写 note（{status} 无 note / 字符串 env-skipped）不被新护栏拦，仍走原路径退出码 6、标「中断」', async () => {
+  // 对象形式但没有 note：护栏只看 note 字符串，没有就交给原路径（环境未验证）。
+  const objectCase = setup();
+  const objectWorld = defaultTree();
+  objectWorld.get(ROOT_REF).state = 'closed';
+  const objectFile = writeJsonFile(objectCase.home, 'verdict-358-no-note.json', {
+    checks: { build: 'ran', typecheck: 'ran', test: { status: 'env-skipped' } },
+    items: fullConclusions(),
+  });
+  const objectResult = await helper(objectWorld, objectCase.profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', objectFile]);
+  assert.equal(objectResult.code, 6, objectResult.err);
+  assert.doesNotMatch(objectResult.err, /已执行/, '没 note 不该被新护栏拦');
+  assert.match(rootComment(objectWorld).body, /^\[验收机\] 第 1 轮：中断/m);
+  assert.ok(rootComment(objectWorld).body.includes(`原因：${ENV_PROBLEM_PREFIX}`));
+  assert.deepEqual(nonCommentWrites(objectWorld), [], '不关单、不勾选、不写看板');
+
+  // 字符串形式 'env-skipped'：没有 note 可看，同样不被拦。
+  const stringCase = setup();
+  const stringWorld = defaultTree();
+  stringWorld.get(ROOT_REF).state = 'closed';
+  const stringFile = writeJsonFile(stringCase.home, 'verdict-358-string.json', {
+    checks: { build: 'ran', typecheck: 'ran', test: 'env-skipped' },
+    items: fullConclusions(),
+  });
+  const stringResult = await helper(stringWorld, stringCase.profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', stringFile]);
+  assert.equal(stringResult.code, 6, stringResult.err);
+  assert.doesNotMatch(stringResult.err, /已执行/);
+  assert.match(rootComment(stringWorld).body, /^\[验收机\] 第 1 轮：中断/m);
+  assert.ok(rootComment(stringWorld).body.includes(`原因：${ENV_PROBLEM_PREFIX}`));
+});
+
+test('#358 边界：checks 文件是坏 JSON 时新护栏放行，由原命令自己报错（退出码 1、零写入、不写「中断」）', async () => {
+  const { profile, home } = setup();
+  const badFile = path.join(home, 'bad-358.json');
+  fs.writeFileSync(badFile, '{ "checks": { "test": ');
+
+  // verdict：原命令自己的 JSON 解析错误（不是护栏文案）。
+  const verdictWorld = defaultTree();
+  verdictWorld.get(ROOT_REF).state = 'closed';
+  const verdictResult = await helper(verdictWorld, profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', badFile]);
+  assert.equal(verdictResult.code, 1, verdictResult.err);
+  assert.match(verdictResult.err, /裁决文件不是合法 JSON/);
+  assert.doesNotMatch(verdictResult.err, /已执行/);
+  assert.equal(verdictWorld.writes.length, 0, '零写入');
+  assert.match(rootComment(verdictWorld).body, /第 1 轮：验收中/);
+
+  // close：原命令自己报「读不到已验证清单」。
+  const closeWorld = defaultTree();
+  const closeResult = await helper(closeWorld, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', badFile, '--verdict', PASS_VERDICT_FILE]);
+  assert.equal(closeResult.code, 1, closeResult.err);
+  assert.match(closeResult.err, /读不到已验证清单/);
+  assert.doesNotMatch(closeResult.err, /已执行/);
+  assert.equal(closeWorld.writes.length, 0, '零写入');
+  assert.match(rootComment(closeWorld).body, /第 1 轮：验收中/);
+
+  // board --acceptance 通过：原命令自己报「读不到 checks 文件」。
+  const boardWorld = defaultTree();
+  const boardResult = await helper(boardWorld, profile, ['board', '--issue', ROOT_REF, '--round', '1', '--acceptance', '通过', '--checks', badFile]);
+  assert.equal(boardResult.code, 1, boardResult.err);
+  assert.match(boardResult.err, /读不到 checks 文件/);
+  assert.doesNotMatch(boardResult.err, /已执行/);
+  assert.equal(boardWorld.writes.length, 0, '零写入');
+  assert.match(rootComment(boardWorld).body, /第 1 轮：验收中/);
+});
+
+test('#358 边界：checks 是数组 / 缺 checks 时新护栏放行，由 parseChecks 报「缺少 checks」（退出码 1、零写入）', async () => {
+  const { profile, home } = setup();
+
+  const arrayWorld = defaultTree();
+  arrayWorld.get(ROOT_REF).state = 'closed';
+  const arrayFile = writeJsonFile(home, 'verdict-358-array.json', {
+    checks: [{ status: 'env-skipped', note: '1200 passed' }],
+    items: fullConclusions(),
+  });
+  const arrayResult = await helper(arrayWorld, profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', arrayFile]);
+  assert.equal(arrayResult.code, 1, arrayResult.err);
+  assert.match(arrayResult.err, /缺少 checks/);
+  assert.doesNotMatch(arrayResult.err, /已执行/);
+  assert.equal(arrayWorld.writes.length, 0, '零写入');
+  assert.match(rootComment(arrayWorld).body, /第 1 轮：验收中/);
+
+  const missingWorld = defaultTree();
+  const missingFile = writeJsonFile(home, 'checks-358-missing.json', { items: [] });
+  const missingResult = await helper(missingWorld, profile, ['board', '--issue', ROOT_REF, '--round', '1', '--acceptance', '通过', '--checks', missingFile]);
+  assert.equal(missingResult.code, 1, missingResult.err);
+  assert.match(missingResult.err, /缺少 checks/);
+  assert.doesNotMatch(missingResult.err, /已执行/);
+  assert.equal(missingWorld.writes.length, 0, '零写入');
+  assert.match(rootComment(missingWorld).body, /第 1 轮：验收中/);
+});
+
 test('环境未验证的中断：trigger 按环境退避重试（不是 up-to-date，也不当代码不通过）', async () => {
   const { profile, home } = setup();
   const world = defaultTree();
