@@ -223,3 +223,17 @@ test('pr-hygiene 机器人通知（如「冲突已解决」）不进修复；人
   const human = feedbackRepairPolicy({ source: 'comment', nativeId: '2', body: '<!-- pr-hygiene:conflict --> 这里还有冲突要处理', user: { login: 'someone', type: 'User' }, authorAssociation: 'MEMBER' });
   assert.notEqual(human.action, 'ignore-infra');
 });
+
+test('审查机的维护者确认门通知不进修复；人贴同样标记、机器人不带标记的评论都不被吞', () => {
+  const body = '本 PR 命中维护者确认门（触发类别：技术架构调整）。作者在豁免名单内，确认门不拦。\n\n<!-- review-pr:product-gate kind=arch issue=https://example.invalid/issues/1 -->';
+  for (const user of [{ login: 'review-app[bot]', type: 'Bot' }, { login: 'review-app', __typename: 'Bot' }]) {
+    const policy = feedbackRepairPolicy({ source: 'comment', nativeId: '1', body, user });
+    assert.equal(policy.action, 'ignore-infra', user.login);
+    assert.equal(policy.reason, 'product-gate-notice');
+    assert.equal(policy.canChangeCode, false);
+  }
+  const human = feedbackRepairPolicy({ source: 'comment', nativeId: '2', body, user: { login: 'someone', type: 'User' }, authorAssociation: 'MEMBER' });
+  assert.equal(human.reason, 'member-feedback-triage');
+  const plainBot = feedbackRepairPolicy({ source: 'comment', nativeId: '3', body: '本 PR 改了受保护路径，已转人工审核。', user: { login: 'review-app[bot]', type: 'Bot' } });
+  assert.equal(plainBot.reason, 'unverified-review-source');
+});

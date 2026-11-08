@@ -106,6 +106,7 @@ export function noticeId(event = {}) {
   if (event.kind === 'keel-unavailable') return `keel-unavailable:${number}:${event.day ?? ''}`;
   if (event.kind === 'blocked-escalate') return `escalate:${number}:${event.head ?? ''}:${event.cause ?? event.blockedKind ?? ''}`;
   if (event.kind === 'excluded-head-ci-red') return `excluded-head-ci-red:${number}:${event.head ?? ''}`;
+  if (event.kind === 'codeql-infra-still-red') return `codeql-infra-still-red:${number}:${event.head ?? ''}`;
   if (event.kind === 'changelog-dispatch-unknown') return `changelog-dispatch-unknown:${number}:${event.dispatchId ?? ''}`;
   return `${event.kind}:${number}`;
 }
@@ -158,6 +159,10 @@ export function formatNoticeText(events = []) {
     if (event.kind === 'excluded-head-ci-red') {
       const checks = Array.isArray(event.checks) && event.checks.length ? `（${event.checks.join('、')}）` : '';
       return `PR #${number}${url} 是机器生成的 PR（如每日更新日志），必需检查${checks}在自动重跑一次失败的 job 后仍然是红的。盯梢不会为这类 PR 派修复会话，请打开链接看失败原因。`;
+    }
+    if (event.kind === 'codeql-infra-still-red') {
+      const checks = Array.isArray(event.checks) && event.checks.length ? `（${event.checks.join('、')}）` : '';
+      return `PR #${number}${url} 的 CodeQL 作业${checks}因为下载失败或服务端 5xx 挂掉，盯梢已自动重跑一次，仍然是红的。所有检查变绿前审查机不会接这个 PR，请打开链接看失败原因，必要时手动重跑。`;
     }
     if (event.kind === 'changelog-dispatch-unknown') {
       return `更新日志 PR #${number}${url} 派处理审查讨论的会话后没收到回执，不确定会话开没开出来。为免两个会话同时改同一个工作树，盯梢 24 小时内不再派。请在 Cindy 里找标题为「更新日志 PR #${number} 处理审查意见」的会话确认。`;

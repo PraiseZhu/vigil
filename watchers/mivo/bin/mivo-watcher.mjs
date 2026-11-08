@@ -25,6 +25,7 @@ import { enqueueNotice } from './notify.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
 import { triageText } from './mivo-ci-triage.mjs';
 import { collectMivoCiSteps } from './mivo-ci.mjs';
+import { superviseCodeqlInfra, codeqlInfraCheckDue } from './mivo-codeql-infra.mjs';
 import { configuredLogin, isViewerOrWatchedBot, WATCHED_BOT_APP } from './mivo-identity.mjs';
 
 // 目标仓库在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
@@ -2674,6 +2675,17 @@ export function* processPr({
     codeScanningStatus: collected.ci?.codeScanning?.status ?? null,
     scanCheckedAt: now,
   };
+  // A CodeQL Analyze job that died on a download / 5xx keeps the PR out of pre-review and no session repairs it:
+  // re-run it once per head (mivo-codeql-infra.mjs).
+  const codeqlInfra = yield* superviseCodeqlInfra({ ci: collected.ci, repo: REPO, headSha: ownerPr.headRefOid,
+    state: previous.codeqlInfraRerun, ghFn, now, dryRun });
+  if (codeqlInfra.state || previous.codeqlInfraRerun) previous = { ...previous, codeqlInfraRerun: codeqlInfra.state };
+  if (codeqlInfra.reran.length) events.push({ kind: 'codeql-infra-rerun', number: pr.number, head: ownerPr.headRefOid, runs: codeqlInfra.reran });
+  if (codeqlInfra.errors.length) events.push({ kind: 'codeql-infra-rerun-error', number: pr.number, errors: codeqlInfra.errors });
+  if (codeqlInfra.notify) {
+    events.push({ kind: 'codeql-infra-still-red', number: pr.number, head: ownerPr.headRefOid, checks: codeqlInfra.stillRed });
+    queueHumanNotice(paths.home, { kind: 'codeql-infra-still-red', number: pr.number, url: ownerPr.url ?? pr.url, head: ownerPr.headRefOid, checks: codeqlInfra.stillRed }, dryRun);
+  }
   const active = previous.activeTask;
   const waiting = active?.status === 'waiting-ci'
     || (active?.status === 'blocked' && ['required-ci', 'optional-ci', 'ci-transport'].includes(active.blockedKind));
@@ -3335,7 +3347,8 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
     && !hasUnconsumedResult(previous, paths) && !needsCiRecheck(previous.activeTask) && !previous.recheckDeferredAt
     && !keelReopenDue && !intentMigrationDue && !escalateDue && !ciUnknownRecheckDue(previous, paths, now)
     && !conflictDispatchDue({ previous, snapshot: normalized, now })
-    && !pendingActionDue(previous) && !scanRecheckDue(previous, now) && !baseSyncRetryDue(previous, now);
+    && !pendingActionDue(previous) && !scanRecheckDue(previous, now) && !baseSyncRetryDue(previous, now)
+    && !codeqlInfraCheckDue({ previous, snapshot: normalized, now, intervalMs: CI_UNKNOWN_RECHECK_MS });
 }
 
 // Only near the retry time: a PR that left the sync path before it (back to Draft, opted out) keeps the old value,
