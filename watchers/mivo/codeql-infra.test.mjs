@@ -151,6 +151,11 @@ test('a run already re-run and red again from infrastructure tells a person once
   const real = round({ checks: [qualityFail], gh: fakeGh({ annotations: realAnnotations, run: { status: 'completed', run_attempt: 2 } }) });
   assert.equal(real.notify, false);
   assert.equal(real.state.runs[600].action, 'not-infra');
+  const dry = round({ checks: [qualityFail], gh: fakeGh({ run: { status: 'completed', run_attempt: 2 } }), dryRun: true });
+  assert.equal(dry.notify, true);
+  assert.equal(dry.state, null, 'dry-run records nothing');
+  const live = round({ checks: [qualityFail], state: dry.state, gh: fakeGh({ run: { status: 'completed', run_attempt: 2 } }) });
+  assert.equal(live.notify, true, 'the real round after a dry-run still notifies');
 });
 
 test('a run still going is judged only once it finished, even when its annotations do not look like infrastructure yet', () => {

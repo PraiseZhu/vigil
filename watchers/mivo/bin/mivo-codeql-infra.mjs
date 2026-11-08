@@ -96,9 +96,9 @@ export function* superviseCodeqlInfra({ ci, repo, headSha, state, ghFn, now, dry
       }
       if (!infra) { current.runs[runId] = { action: 'not-infra', at: now, checkIds }; continue; }
       // Already re-run (by a person, or by a round whose record was lost) and red again from infrastructure: no second
-      // re-run, but a person still hears about it once.
+      // re-run, but a person still hears about it once. Dry-run records nothing, so a later real round still notifies.
       if (Number(run.run_attempt ?? 1) > 1) {
-        current.runs[runId] = { action: 'rerun-by-other', at: now, checkIds };
+        if (!dryRun) current.runs[runId] = { action: 'rerun-by-other', at: now, checkIds };
         out.stillRed.push(...jobs.map((job) => job.name));
         continue;
       }
