@@ -136,6 +136,9 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
   }
   // pr-hygiene workflow 的机器人通知（如「冲突已解决」）：冲突本身由 conflict 来源处理，通知被编辑一次就派一轮只会空转。
   if (isBotAuthor(item) && /<!--\s*pr-hygiene:/.test(String(item.body ?? ''))) return result('ignore-infra', [], 'pr-hygiene-notice');
+  // 审查机的维护者确认门通知（命中确认门、受保护路径转人工、已开通知 issue）：等的是维护者表态，修复会话不能也不该改代码，
+  // 派一轮只会按 no-change 收口（2026-11-07～08 八次 no-change 会话里七次由它触发）。
+  if (isBotAuthor(item) && /<!--\s*review-pr:product-gate\b/.test(String(item.body ?? ''))) return result('ignore-infra', [], 'product-gate-notice');
   if (!trustedReviewer(item)) {
     if (isMemberThread(item)) return result('code-fix', [], 'member-thread-triage');
     if (isMemberFeedback(item)) return result('code-fix', [], 'member-feedback-triage');
