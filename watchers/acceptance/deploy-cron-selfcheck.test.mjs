@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { expandMinutes, checkSchedule, classifyCrontab, fingerprint, nextNotification, REQUIRED_ARGS } from './bin/deploy-cron-selfcheck.mjs';
 
 const BIN = fileURLToPath(new URL('./bin/deploy-cron-selfcheck.mjs', import.meta.url));
+const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const DOCS = fileURLToPath(new URL('../../docs/acceptance-operations.md', import.meta.url));
 const SCRIPT = '/opt/example/deploy-ff.mjs';
 const ARGS = { '--deploy-dir': '/srv/example/deploy', '--host-state': '/srv/example/state' };
@@ -102,6 +103,15 @@ test('#367 读取失败与无 crontab 严格区分', () => {
   assert.equal(unclear.kind, 'unreadable');
 });
 
+test('#367 缺退出码不默认成 0：判读不出，不判缺失', () => {
+  const noCode = classifyCrontab({ text: `${entry()}\n`, exitCode: null, stderr: '', expect, statics: alwaysOk });
+  assert.equal(noCode.kind, 'unreadable');
+  assert.equal(noCode.detail, 'no-exit-code');
+  const badCode = classifyCrontab({ text: '', exitCode: Number.NaN, stderr: '', expect, statics: alwaysOk });
+  assert.equal(badCode.kind, 'unreadable');
+  assert.equal(badCode.detail, 'bad-exit-code');
+});
+
 test('#367 规范路径：符号链接/等价路径算同一条，不同文件不算', () => {
   const real = { '/srv/real/deploy-ff.mjs': '/srv/real/deploy-ff.mjs', '/srv/link/deploy-ff.mjs': '/srv/real/deploy-ff.mjs', '/srv/other/deploy-ff.mjs': '/srv/other/deploy-ff.mjs' };
   const statics = { isExecutable: () => true, realpath: (file) => real[file] ?? null };
@@ -178,6 +188,79 @@ function alertsOf(home) {
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
 }
+
+/** 按文档接线跑一遍：`crontab -l` 的输出先落文件，退出码与 stderr 显式传进去（不是管道）。 */
+function runWired(home) {
+  const read = spawnSync('sh', ['-c', `"${path.join(home, 'fakebin', 'crontab')}" -l`], { encoding: 'utf8' });
+  const outFile = path.join(home, 'crontab.out');
+  fs.writeFileSync(outFile, read.stdout || '');
+  const result = spawnSync(process.execPath, [
+    BIN, ...baseArgs(home),
+    '--crontab-file', outFile,
+    '--exit-code', String(read.status ?? 1),
+    '--stderr-text', read.stderr || '',
+  ], { encoding: 'utf8' });
+  return { ...result, out: result.stdout, err: result.stderr };
+}
+
+const stateOf = (result) => JSON.parse((result.out ?? result.stdout ?? '').split('\n')[0]);
+
+test('#367 CLI 黑盒：缺 --exit-code 判读不出，不报缺失', () => {
+  const home = makeHome();
+  fakeCrontab(home, { text: entry() });
+  const r = spawnSync(process.execPath, [BIN, ...baseArgs(home), '--stderr-text', ''], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.err);
+  assert.equal(stateOf(r).state, 'unreadable');
+  assert.equal(stateOf(r).detail, 'no-exit-code');
+  const alert = alertsOf(home)[0];
+  assert.equal(alert.kind, 'deploy-cron-unreadable');
+  assert.doesNotMatch(alert.reason, /找不到部署定时条目/);
+  assert.match(alert.reason, /不代表缺失/);
+});
+
+test('#367 CLI 黑盒：退出码非 0 且 stderr 为空 → 读取失败，不当无 crontab', () => {
+  const home = makeHome();
+  fakeCrontab(home, { exitCode: 1, stderr: '' });
+  const r = runWired(home);
+  assert.equal(r.status, 0, r.err);
+  assert.equal(stateOf(r).state, 'unreadable');
+  assert.equal(stateOf(r).detail, 'read-failed');
+  assert.equal(alertsOf(home)[0].kind, 'deploy-cron-unreadable');
+});
+
+test('#367 CLI 黑盒：整段 no crontab → 缺失（no-crontab）', () => {
+  const home = makeHome();
+  fakeCrontab(home, { exitCode: 1, stderr: 'no crontab for example' });
+  const r = runWired(home);
+  assert.equal(r.status, 0, r.err);
+  assert.equal(stateOf(r).state, 'missing');
+  assert.equal(stateOf(r).detail, 'no-crontab');
+  assert.equal(alertsOf(home)[0].kind, 'deploy-cron-missing');
+});
+
+test('#367 CLI 黑盒：混入其它错误文本的 no crontab 不算确定空 → 读取失败', () => {
+  const home = makeHome();
+  fakeCrontab(home, { exitCode: 1, stderr: 'no crontab for example\ncrontab: cannot open spool' });
+  const r = runWired(home);
+  assert.equal(r.status, 0, r.err);
+  assert.equal(stateOf(r).state, 'unreadable');
+  assert.equal(stateOf(r).detail, 'read-failed');
+  assert.doesNotMatch(alertsOf(home)[0].reason, /找不到部署定时条目/);
+});
+
+test('#367 CLI 黑盒：--exit-code 不是整数时退出 2，不静默当成 0', () => {
+  const home = makeHome();
+  const r = spawnSync(process.execPath, [BIN, ...baseArgs(home), '--exit-code', 'abc'], { encoding: 'utf8' });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /--exit-code 需要整数/);
+});
+
+test('#367 CLI --help：用法串给的是从仓根可跑的路径，并点名 --exit-code 必给', () => {
+  const r = spawnSync(process.execPath, [BIN, '--help'], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /node watchers\/acceptance\/bin\/deploy-cron-selfcheck\.mjs/);
+  assert.match(r.stdout, /--exit-code 必须给/);
+});
 
 test('#367 CLI 黑盒：有效条目首次健康 → 静默、无告警、只调 crontab -l', () => {
   const home = makeHome();
@@ -263,17 +346,56 @@ test('#367 CLI 黑盒：收到信号/参数缺失时失败可见（不是静默�
   assert.match(r.stderr, /缺必填参数/);
 });
 
-test('#367 文档里的示例命令形态可被真实执行', () => {
+test('#367 文档里的示例命令从仓根原样执行（路径从文档取，不锁死前缀）', () => {
+  const home = makeHome();
+  fakeCrontab(home, { text: entry() });
+  const block = fillDocBlock(docExampleBlock(), home);
+  const script = block.match(/^node\s+(\S+)/m);
+  assert.ok(script, '文档示例里找不到 node 命令');
+  assert.ok(fs.existsSync(path.join(REPO_ROOT, script[1])), `文档示例的脚本路径从仓根不可达：${script[1]}`);
+  const r = spawnSync('sh', ['-c', block], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    env: { ...process.env, PATH: `${path.join(home, 'fakebin')}:${process.env.PATH || ''}` },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(stateOf(r).state, 'ok', r.stdout);
+  assert.equal(alertsOf(home).length, 0);
+  assert.deepEqual(fs.readFileSync(path.join(home, 'calls.log'), 'utf8').trim().split('\n'), ['-l']);
+});
+
+/** 从文档 §15 取出那段示例代码块（含反斜杠续行，原样返回）。 */
+function docExampleBlock() {
   const doc = fs.readFileSync(DOCS, 'utf8');
   const section = doc.split('## 15. 部署定时自检（#367）')[1] || '';
   assert.ok(section.length > 0, '文档缺 #367 小节');
-  const line = section.split('\n').find((item) => item.startsWith('node bin/deploy-cron-selfcheck.mjs'));
-  assert.ok(line, '文档缺自检示例命令');
-  assert.match(line, /--home /);
-  assert.match(line, /--expect-script /);
-  const home = makeHome();
-  fakeCrontab(home, { text: entry() });
-  const r = runViaFakeCrontab(home);
-  assert.equal(r.status, 0, r.err);
-  assert.equal(JSON.parse(r.out.split('\n')[0]).state, 'ok');
-});
+  const lines = section.split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i].trim() !== '```sh') continue;
+    const end = lines.indexOf('```', i + 1);
+    if (end < 0) break;
+    const body = lines.slice(i + 1, end);
+    if (body.join('\n').includes('deploy-cron-selfcheck.mjs')) return body.join('\n');
+    i = end;
+  }
+  assert.fail('文档 §15 缺自检示例命令代码块');
+}
+
+/** 只换掉文档里的占位符，命令其余部分一个字都不改。 */
+function fillDocBlock(block, home) {
+  const values = {
+    '<验收机 home>': home,
+    '<部署脚本绝对路径>': SCRIPT,
+    '<部署目录>': FULL['--deploy-dir'],
+    '<宿主状态目录>': FULL['--host-state'],
+    '<自锁文件>': FULL['--self-lock'],
+    '<优先级锁文件>': FULL['--prio-lock'],
+    '<状态文件>': FULL['--state-file'],
+    '<告警文件>': FULL['--alerts'],
+    '<体检脚本>': FULL['--doctor-script'],
+  };
+  let out = block;
+  for (const [placeholder, value] of Object.entries(values)) out = out.split(placeholder).join(value);
+  assert.doesNotMatch(out, /<[^>\n]*>/, '文档示例里还有没替换的占位符');
+  return out;
+}

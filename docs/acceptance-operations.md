@@ -1026,15 +1026,24 @@ github-live 的手测（真的看板上跑 24 小时、以及合并后确认没�
 - 同一情形（同一分类、同一错法）只告警一次；分类或错法变了会再告警一次，不会被永久吞掉。无关的 cron 行、排序、行数变化不会让它重复报。
 - 只有真的从异常回到正常，才写一次恢复通知。
 
-示例（路径与参数换成该机实际值；crontab 文本由调用方用 stdin 传入，测试用临时 home 与假 crontab 命令注入）：
+示例（在仓根执行；路径与参数换成该机实际值）。先把 `crontab -l` 的输出、退出码、stderr 各自落到临时文件，再显式传进去——管道会把 `crontab` 的退出码换成下游进程的，`$?` 拿到的不是它：
 
 ```sh
-node bin/deploy-cron-selfcheck.mjs --home <验收机 home> --expect-script <部署脚本绝对路径> \
+tmpdir=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmpdir"' EXIT
+crontab -l >"$tmpdir/crontab.txt" 2>"$tmpdir/crontab.err"
+rc=$?
+
+node watchers/acceptance/bin/deploy-cron-selfcheck.mjs --home <验收机 home> \
+  --crontab-file "$tmpdir/crontab.txt" --exit-code "$rc" --stderr-text "$(cat "$tmpdir/crontab.err")" \
+  --expect-script <部署脚本绝对路径> \
   --expect-arg --deploy-dir=<部署目录> --expect-arg --host-state=<宿主状态目录> \
   --expect-arg --self-lock=<自锁文件> --expect-arg --prio-lock=<优先级锁文件> \
   --expect-arg --state-file=<状态文件> --expect-arg --alerts=<告警文件> \
   --expect-arg --doctor-script=<体检脚本>
 ```
+
+`--exit-code` 必须给（读取成功就写 0）：缺了它自检判「读不出 crontab」并告警，**不默认成 0**。否则权限、spool 之类的读失败会被误判成「条目缺失」，人照着处置建议补一条，反而补出重复条目。
 
 告警只追加到宿主告警文件（复用 `host/paths.mjs` 的 `appendAlert`，字段过脱敏），不推送到别处。文案讲三件事：发生了什么、影响什么、要不要人处理。
 
@@ -1042,7 +1051,7 @@ node bin/deploy-cron-selfcheck.mjs --home <验收机 home> --expect-script <部�
 
 回滚分两层，互不牵连：
 
-- 代码回滚：撤掉本节的三个文件改动——删掉 `bin/deploy-cron-selfcheck.mjs` 与 `deploy-cron-selfcheck.test.mjs`，**只撤掉这一节**，不要删整份运维文档，也不要动其它章节。
+- 代码回滚：撤掉本节的三个文件改动——删掉 `watchers/acceptance/bin/deploy-cron-selfcheck.mjs` 与 `watchers/acceptance/deploy-cron-selfcheck.test.mjs`，**只撤掉这一节**，不要删整份运维文档，也不要动其它章节。
 - 接线回滚：如果已经按上面的步骤挂到 `run-ensure`，删掉那一行调用即可。自检只读、不写 cron，不需要还原任何系统状态。
 
 状态文件在宿主状态目录下的 `deploy-cron-selfcheck.json`，删掉后下一次会按「首次」处理（正常就静默）。

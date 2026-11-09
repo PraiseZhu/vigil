@@ -203,6 +203,9 @@ function inspectCandidate(candidate, expect, statics) {
  * 「无 crontab」与「读取失败」严格分开：只有确定文本才算空，其余一律 unreadable（不吞错误）。
  */
 export function classifyCrontab({ text = '', exitCode = 0, stderr = '', expect, statics = {} }) {
+  // 没给退出码（null）或给的不是整数：判断不了读没读成功，按读取失败处理，不默认成 0。
+  if (exitCode === null) return { kind: UNREADABLE, detail: 'no-exit-code' };
+  if (!Number.isInteger(exitCode)) return { kind: UNREADABLE, detail: 'bad-exit-code' };
   if (exitCode !== 0) {
     if (isNoCrontab(stderr)) return { kind: MISSING, detail: 'no-crontab' };
     return { kind: UNREADABLE, detail: 'read-failed' };
@@ -288,7 +291,8 @@ function readInput(cli) {
   } catch {
     return { text: '', exitCode: cli.exitCode === null ? 1 : cli.exitCode, stderr: 'input-unreadable' };
   }
-  return { text, exitCode: cli.exitCode === null ? 0 : cli.exitCode, stderr: cli.stderrText };
+  // 退出码没传就原样留 null：交给 classifyCrontab 判「读不出」，不在这里补成 0。
+  return { text, exitCode: cli.exitCode, stderr: cli.stderrText };
 }
 
 export function readState(file) {
@@ -317,10 +321,12 @@ function dirname(file) {
 
 function usage() {
   return [
-    '用法：node bin/deploy-cron-selfcheck.mjs --home <验收机 home> --expect-script <部署脚本绝对路径>',
+    '用法（在仓根执行）：node watchers/acceptance/bin/deploy-cron-selfcheck.mjs',
+    '        --home <验收机 home> --expect-script <部署脚本绝对路径> --exit-code <n>',
     '        [--expect-arg <flag>=<value>]...   # 七必填参数逐个给期望值，缺一个就报参数不对',
-    '        [--crontab-file <文件>] [--exit-code <n>] [--stderr-text <文本>] [--dry-run]',
+    '        [--crontab-file <文件>] [--stderr-text <文本>] [--dry-run]',
     'crontab 文本从 --crontab-file 或 stdin 读；退出码与 stderr 由调用方传入（本文件不起子进程）。',
+    '--exit-code 必须给：crontab -l 的退出码缺了就判「读不出 crontab」，不默认成 0（否则读失败会被误判成缺失）。',
     '只读：不写 crontab、不改任何条目、不联网。',
   ].join('\n');
 }
@@ -338,8 +344,11 @@ function parseCli(argv) {
       if (at <= 0) throw new Error('--expect-arg 需要 <flag>=<value>');
       out.args[pair.slice(0, at)] = pair.slice(at + 1);
     } else if (key === '--crontab-file') out.file = take();
-    else if (key === '--exit-code') out.exitCode = Number(take());
-    else if (key === '--stderr-text') out.stderrText = take();
+    else if (key === '--exit-code') {
+      const raw = take();
+      if (raw === undefined || !/^-?\d+$/.test(raw.trim())) throw new Error('--exit-code 需要整数（例如 --exit-code 0）');
+      out.exitCode = Number(raw.trim());
+    } else if (key === '--stderr-text') out.stderrText = take();
     else if (key === '--dry-run') out.dryRun = true;
     else if (key === '--help' || key === '-h') out.help = true;
     else throw new Error(`不认识的参数：${key}`);
