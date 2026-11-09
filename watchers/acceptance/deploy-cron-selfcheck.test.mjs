@@ -11,6 +11,7 @@ const BIN = fileURLToPath(new URL('./bin/deploy-cron-selfcheck.mjs', import.meta
 const DOCS = fileURLToPath(new URL('../../docs/acceptance-operations.md', import.meta.url));
 const SCRIPT = '/opt/example/deploy-ff.mjs';
 const ARGS = { '--deploy-dir': '/srv/example/deploy', '--host-state': '/srv/example/state' };
+const INTERPRETER = process.execPath; // 用当前 node：CI 与本地都不需要额外的 /usr/bin/node
 const FULL = {
   '--deploy-dir': '/srv/example/deploy',
   '--host-state': '/srv/example/state',
@@ -22,7 +23,7 @@ const FULL = {
 };
 
 const entry = (args = FULL, script = SCRIPT, minute = '2-59/5') =>
-  `${minute} * * * * env -i PATH=/usr/bin:/bin HOME=/home/example /usr/bin/node ${script} ${Object.entries(args).map(([k, v]) => `${k} ${v}`).join(' ')} </dev/null >>/srv/example/deploy.log 2>>/srv/example/deploy.err`;
+  `${minute} * * * * env -i PATH=/usr/bin:/bin HOME=/home/example ${INTERPRETER} ${script} ${Object.entries(args).map(([k, v]) => `${k} ${v}`).join(' ')} </dev/null >>/srv/example/deploy.log 2>>/srv/example/deploy.err`;
 
 const expect = { script: SCRIPT, args: FULL };
 const alwaysOk = { isExecutable: () => true };
@@ -69,7 +70,7 @@ test('#367 未知语法：节拍写法认不出 → unknown-form', () => {
 test('#367 节拍不对：一天一次、间隔过大、限制到某小时', () => {
   assert.equal(classifyCrontab({ text: `${entry(FULL, SCRIPT, '0')}\n`, exitCode: 0, expect, statics: alwaysOk }).detail, 'schedule-gap');
   assert.equal(classifyCrontab({ text: `${entry(FULL, SCRIPT, '*/30')}\n`, exitCode: 0, expect, statics: alwaysOk }).detail, 'schedule-gap');
-  assert.equal(classifyCrontab({ text: `0-59/5 3 * * * env -i /usr/bin/node ${SCRIPT} ${Object.entries(FULL).map(([k, v]) => `${k} ${v}`).join(' ')}\n`, exitCode: 0, expect, statics: alwaysOk }).detail, 'schedule-scope');
+  assert.equal(classifyCrontab({ text: `0-59/5 3 * * * env -i ${INTERPRETER} ${SCRIPT} ${Object.entries(FULL).map(([k, v]) => `${k} ${v}`).join(' ')}\n`, exitCode: 0, expect, statics: alwaysOk }).detail, 'schedule-scope');
 });
 
 test('#367 参数不对：七个必填参数逐个缺席都报出对应字段', () => {
@@ -227,6 +228,18 @@ test('#367 CLI 黑盒：读取失败不报缺失、不吞错误', () => {
   assert.equal(r.status, 0, r.err);
   assert.equal(alertsOf(home)[0].kind, 'deploy-cron-unreadable');
   assert.doesNotMatch(alertsOf(home)[0].reason, /找不到部署定时条目/);
+});
+
+test('#367 CLI 黑盒：解释器不可执行（真路径校验，不用注入）→ 参数不对，不静默', () => {
+  const home = makeHome();
+  const broken = entry().replace(INTERPRETER, '/nonexistent/node-for-test');
+  fakeCrontab(home, { text: `${broken}\n` });
+  const r = runViaFakeCrontab(home);
+  assert.equal(r.status, 0, r.err);
+  const first = alertsOf(home)[0];
+  assert.equal(first.kind, 'deploy-cron-mismatch');
+  assert.match(first.reason, /参数/);
+  assert.equal(JSON.parse(r.out.split('\n')[0]).state, 'mismatch');
 });
 
 test('#367 CLI 黑盒：输出与告警安全（不含整份 cron、无关行、绝对路径、凭据）', () => {
