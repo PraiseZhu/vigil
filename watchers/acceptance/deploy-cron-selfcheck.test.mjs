@@ -29,6 +29,18 @@ const entry = (args = FULL, script = SCRIPT, minute = '2-59/5') =>
 const expect = { script: SCRIPT, args: FULL };
 const alwaysOk = { isExecutable: () => true };
 
+// 两份都没有目标部署条目、但无关行数不同（2 行 vs 5 行）的 crontab，用来验证指纹不看行数。
+const MISSING_TWO_LINES = '24,54 * * * * /srv/example/run.sh\n17 * * * * /srv/example/other.sh\n';
+const MISSING_FIVE_LINES = [
+  '24,54 * * * * /srv/example/run.sh',
+  '17 * * * * /srv/example/other.sh',
+  '3 1 * * * /srv/example/rotate.sh',
+  '8 2 * * 0 /srv/example/weekly.sh',
+  '*/10 * * * * /srv/example/ping.sh',
+].join('\n') + '\n';
+
+const classifyMissing = (text) => classifyCrontab({ text, exitCode: 0, expect, statics: alwaysOk });
+
 test('#367 有效条目：7 必填参数齐全、节拍每 5 分钟覆盖 → ok', () => {
   const verdict = classifyCrontab({ text: `${entry()}\n`, exitCode: 0, expect, statics: alwaysOk });
   assert.equal(verdict.kind, 'ok');
@@ -134,13 +146,24 @@ test('#367 无 crontab 只认整段确定文本：混入其它错误一律读取
 });
 
 test('#367 SC2 缺失告警带实际行数与匹配数，指纹仍不看行数', () => {
-  const text = '24,54 * * * * /srv/example/run.sh\n17 * * * * /srv/example/other.sh\n';
-  const verdict = classifyCrontab({ text, exitCode: 0, expect, statics: alwaysOk });
-  assert.equal(verdict.kind, 'missing');
-  const message = describe(verdict);
+  const two = classifyMissing(MISSING_TWO_LINES);
+  const five = classifyMissing(MISSING_FIVE_LINES);
+  // 两份文本都没有目标部署条目，只差无关行数：行数真的不同，分类与指纹必须相同。
+  assert.equal(two.kind, 'missing');
+  assert.equal(five.kind, 'missing');
+  assert.equal(two.stats.lines, 2);
+  assert.equal(five.stats.lines, 5);
+  assert.notEqual(two.stats.lines, five.stats.lines);
+  assert.equal(two.stats.matched, 0);
+  assert.equal(five.stats.matched, 0);
+  const message = describe(two);
   assert.match(message, /实际行数 2/);
   assert.match(message, /匹配数 0/);
-  assert.equal(fingerprint(verdict.kind, verdict.detail), fingerprint('missing', 'absent'));
+  assert.equal(fingerprint(two.kind, two.detail), fingerprint(five.kind, five.detail));
+  // 第一轮按 a 告警，第二轮换成只有无关行数不同的 b：同一情形，不再告警。
+  const first = nextNotification(null, two);
+  assert.equal(first.notify, 'deploy-cron-missing');
+  assert.equal(nextNotification(first.next, five).notify, null);
 });
 
 test('#367 SC2 读取输入文件失败不当缺失', () => {
@@ -154,8 +177,24 @@ test('#367 SC2 读取输入文件失败不当缺失', () => {
 });
 
 test('#367 指纹不含行号与计数：无关行变化不改指纹', () => {
-  assert.equal(fingerprint('missing', 'absent'), fingerprint('missing', 'absent'));
+  const two = classifyMissing(MISSING_TWO_LINES);
+  const five = classifyMissing(MISSING_FIVE_LINES);
+  assert.notEqual(two.stats.lines, five.stats.lines);
+  assert.equal(fingerprint(two.kind, two.detail), fingerprint(five.kind, five.detail));
+  // 错法键仍要区分：同类但字段不同，指纹必须不同。
   assert.notEqual(fingerprint('mismatch', '--alerts:absent'), fingerprint('mismatch', '--host-state:absent'));
+});
+
+test('#367 stats.lines 口径：只计非空行（注释行算行），空文本为 0 行且匹配数为 0', () => {
+  const empty = classifyMissing('');
+  assert.equal(empty.kind, 'missing');
+  assert.equal(empty.stats.lines, 0);
+  assert.equal(empty.stats.matched, 0);
+  // 注释行与空行（含只有空白的行）：注释算行，空行不算。
+  const commentsOnly = classifyMissing('# 运维手工维护，勿删\n\n   \n# 另一条说明\n');
+  assert.equal(commentsOnly.kind, 'missing');
+  assert.equal(commentsOnly.stats.lines, 2);
+  assert.equal(commentsOnly.stats.matched, 0);
 });
 
 test('#367 节奏：首次正常静默、同情形一次、真实恢复一次、情形变化可见', () => {
