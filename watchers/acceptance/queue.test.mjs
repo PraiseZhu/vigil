@@ -189,6 +189,69 @@ test('#62 SC3 一拍盘点：认领条目按优先级排，且不新增 GraphQL 
   assert.equal(readCount(reads), graphqlCalls, '排序不额外发读请求');
 });
 
+test('#62 SC5 多页盘点：只读请求数仍等于盘点页数（点数 = 页数 × 6，与改前一致）', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const PAGE = 100;
+  const PAGES = 3;
+  const nodesOf = (page) => {
+    const nodes = [];
+    for (let i = 0; i < PAGE; i += 1) {
+      const number = page * PAGE + i + 1;
+      nodes.push(
+        issueNode({
+          number,
+          createdAt: '2026-10-01T00:00:00.000Z',
+          prs: [
+            {
+              number: 5000 + number,
+              url: `https://github.com/${REPO}/pull/${5000 + number}`,
+              mergedAt: '2026-10-20T00:00:00.000Z',
+              repository: { nameWithOwner: REPO },
+            },
+          ],
+        }),
+      );
+    }
+    return nodes;
+  };
+  const run = createFakeRun({
+    onGraphql: (payload) => {
+      const page = payload.variables?.openAfter ? Number(payload.variables.openAfter) : 0;
+      const last = page + 1 >= PAGES;
+      return {
+        user: {
+          open: { nodes: nodesOf(page), pageInfo: { hasNextPage: !last, endCursor: last ? null : String(page + 1) } },
+          closed: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+        },
+      };
+    },
+  });
+  const github = createGithub({ profile, run });
+  // 优先级表整份塞满，确认读表不额外发请求、排序也不发请求。
+  const priorities = prioritySource(
+    Object.fromEntries(Array.from({ length: PAGE * PAGES }, (_, index) => [`${REPO}#${index + 1}`, ['P3', 'P0', 'P1', 'P2'][index % 4]])),
+  );
+  const { entries, reads } = await pollInventory({
+    github,
+    profile,
+    now: () => Date.parse('2026-10-24T00:00:00.000Z'),
+    priorities,
+    queueLog: () => {},
+  });
+  const graphqlCalls = run.calls.filter((call) => call.args.includes('graphql')).length;
+  assert.equal(entries.length, PAGE * PAGES);
+  assert.equal(reads, PAGES, `只读请求数 = 盘点页数（${PAGES}）`);
+  assert.equal(graphqlCalls, PAGES, '假 gh 实际收到的 graphql 调用数也等于页数');
+  assert.equal(run.calls.length - graphqlCalls, 0, '没有别的请求（看板快照是本地文件读）');
+  assert.equal(reads * 6, PAGES * 6, '点数按 tick 的口径算仍是页数 × 6，与改前相同');
+  // 排序生效：300 条按档位单调不减（P0 全在 P1 前，P1 全在 P2 前……），同档内 createdAt 相同故按 ref 升序。
+  // 夹具里第 n 条的档位：priorityRank 与 sortTaskQueue 用的是同一个函数。
+  const rankOfNumber = (number) => priorityRank(['P3', 'P0', 'P1', 'P2'][(number - 1) % 4]);
+  const ranks = entries.map((entry) => rankOfNumber(Number(entry.issue.split('#')[1])));
+  assert.deepEqual([...ranks].sort((left, right) => left - right), ranks, '档位顺序单调不减');
+});
+
 test('#62 SC3 poll 只用本地快照：快照新鲜时按优先级出条目', async () => {
   const { home } = writeProfile(tmpDir());
   const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
