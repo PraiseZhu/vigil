@@ -5,7 +5,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { expandMinutes, checkSchedule, classifyCrontab, fingerprint, nextNotification, REQUIRED_ARGS } from './bin/deploy-cron-selfcheck.mjs';
+import { expandMinutes, checkSchedule, classifyCrontab, describe, fingerprint, nextNotification, REQUIRED_ARGS } from './bin/deploy-cron-selfcheck.mjs';
 
 const BIN = fileURLToPath(new URL('./bin/deploy-cron-selfcheck.mjs', import.meta.url));
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -45,6 +45,18 @@ test('#367 缺失：没有任何目标条目 → missing', () => {
   const verdict = classifyCrontab({ text: '24,54 * * * * /srv/example/run.sh\n', exitCode: 0, expect, statics: alwaysOk });
   assert.equal(verdict.kind, 'missing');
   assert.equal(verdict.detail, 'absent');
+});
+
+test('#367 缺失告警带实际行数与匹配数，不打印内部 detail', () => {
+  const text = '24,54 * * * * /srv/example/run.sh\n# 另一条无关注释\n';
+  const verdict = classifyCrontab({ text, exitCode: 0, expect, statics: alwaysOk });
+  assert.equal(verdict.kind, 'missing');
+  assert.equal(verdict.detail, 'absent');
+  assert.deepEqual(verdict.stats, { lines: 2, matches: 0 });
+  const reason = describe(verdict);
+  assert.match(reason, /实际行数\s*2/);
+  assert.match(reason, /匹配数\s*0/);
+  assert.doesNotMatch(reason, /absent/);
 });
 
 test('#367 被注释：只有注释掉的目标条目 → commented，不误判缺失', () => {
@@ -272,6 +284,16 @@ test('#367 CLI 黑盒：有效条目首次健康 → 静默、无告警、只调
   assert.deepEqual(fs.readFileSync(path.join(home, 'calls.log'), 'utf8').trim().split('\n'), ['-l']);
 });
 
+test('#367 CLI 黑盒：首次正常静默，连状态文件都不写（下次仍按首次处理）', () => {
+  const home = makeHome();
+  fakeCrontab(home, { text: entry() });
+  const r = runViaFakeCrontab(home);
+  assert.equal(r.status, 0, r.err);
+  assert.equal(JSON.parse(r.out.split('\n')[0]).state, 'ok');
+  assert.equal(alertsOf(home).length, 0);
+  assert.equal(fs.existsSync(path.join(home, 'state', 'host', 'deploy-cron-selfcheck.json')), false);
+});
+
 test('#367 CLI 黑盒：缺失一次告警，同一情形第二轮不再告警，恢复只一次', () => {
   const home = makeHome();
   const cmd = fakeCrontab(home, { text: '24,54 * * * * /srv/example/run.sh\n' });
@@ -290,6 +312,18 @@ test('#367 CLI 黑盒：缺失一次告警，同一情形第二轮不再告警�
   assert.equal(after.length, 2);
   assert.equal(after[1].kind, 'deploy-cron-recovered');
   assert.match(after[1].reason, /已恢复正常/);
+});
+
+test('#367 CLI 黑盒：缺失告警写出实际行数与匹配数', () => {
+  const home = makeHome();
+  fakeCrontab(home, { text: '24,54 * * * * /srv/example/run.sh\n# 另一条无关注释' });
+  const r = runViaFakeCrontab(home);
+  assert.equal(r.status, 0, r.err);
+  const alert = alertsOf(home)[0];
+  assert.equal(alert.kind, 'deploy-cron-missing');
+  assert.match(alert.reason, /实际行数\s*2/);
+  assert.match(alert.reason, /匹配数\s*0/);
+  assert.doesNotMatch(alert.reason, /absent/);
 });
 
 test('#367 CLI 黑盒：同类但错法不同不被永久吞掉', () => {

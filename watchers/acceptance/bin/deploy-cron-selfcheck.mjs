@@ -207,18 +207,20 @@ export function classifyCrontab({ text = '', exitCode = 0, stderr = '', expect, 
   if (exitCode === null) return { kind: UNREADABLE, detail: 'no-exit-code' };
   if (!Number.isInteger(exitCode)) return { kind: UNREADABLE, detail: 'bad-exit-code' };
   if (exitCode !== 0) {
-    if (isNoCrontab(stderr)) return { kind: MISSING, detail: 'no-crontab' };
+    if (isNoCrontab(stderr)) return { kind: MISSING, detail: 'no-crontab', stats: { lines: 0, matches: 0 } };
     return { kind: UNREADABLE, detail: 'read-failed' };
   }
   const lines = String(text).split('\n');
   const found = candidatesFrom(lines, expect.script, statics);
   const active = found.filter((item) => !item.commented);
   const commented = found.filter((item) => item.commented);
+  // 告警要能自证确实扫过 crontab：只数非空行，匹配数按候选条目算；它们不进指纹，无关行变化不重复告警。
+  const stats = { lines: lines.filter((line) => line.trim() !== '').length, matches: found.length };
   if (active.length === 0) {
-    if (commented.length) return { kind: COMMENTED, detail: 'commented' };
+    if (commented.length) return { kind: COMMENTED, detail: 'commented', stats };
     // 有行看着像目标（文件名一致）但写法不在规范化结构里：报无法核实，不断言缺失。
-    if (plausible(lines, expect.script)) return { kind: UNKNOWN_FORM, detail: 'noncanonical-script-token' };
-    return { kind: MISSING, detail: 'absent' };
+    if (plausible(lines, expect.script)) return { kind: UNKNOWN_FORM, detail: 'noncanonical-script-token', stats };
+    return { kind: MISSING, detail: 'absent', stats };
   }
   if (active.length > 1) return { kind: DUPLICATE, detail: `entries:${active.length}` };
   return inspectCandidate(active[0], expect, statics);
@@ -272,7 +274,10 @@ const ADVICE = {
 export function describe(verdict) {
   if (verdict.kind === OK) return '部署定时条目正常，最近一次核对通过。不需要人处理。';
   const head = TEXT[verdict.kind] || '部署定时条目异常';
-  const detail = verdict.detail ? `（${verdict.detail}）` : '';
+  const stats = verdict.kind === MISSING && verdict.stats
+    ? `（实际行数 ${verdict.stats.lines}，匹配数 ${verdict.stats.matches}）`
+    : '';
+  const detail = stats || (verdict.detail ? `（${verdict.detail}）` : '');
   return `${head}${detail}。影响：${ADVICE[verdict.kind] || '要人看一下这一条。'}`;
 }
 
@@ -388,7 +393,9 @@ async function main(argv) {
   } else {
     process.stdout.write(`${JSON.stringify({ state: verdict.kind, detail: verdict.detail || '', notified: null })}\n${describe(verdict)}\n`);
   }
-  if (!cli.dryRun) writeState(stateFile, { ...next, updatedAt: new Date().toISOString() });
+  // 首次就是正常：不写任何东西（包括状态文件），下一次仍按首次处理；状态只在异常或恢复时落盘。
+  const firstHealthy = prev === null && verdict.kind === OK;
+  if (!cli.dryRun && !firstHealthy) writeState(stateFile, { ...next, updatedAt: new Date().toISOString() });
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname);
