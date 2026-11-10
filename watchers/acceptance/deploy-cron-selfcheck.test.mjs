@@ -29,6 +29,18 @@ const entry = (args = FULL, script = SCRIPT, minute = '2-59/5') =>
 const expect = { script: SCRIPT, args: FULL };
 const alwaysOk = { isExecutable: () => true };
 
+// 两份都没有目标部署条目、但无关行数不同（2 行 vs 5 行）的 crontab，用来验证指纹不看行数。
+const MISSING_TWO_LINES = '24,54 * * * * /srv/example/run.sh\n17 * * * * /srv/example/other.sh\n';
+const MISSING_FIVE_LINES = [
+  '24,54 * * * * /srv/example/run.sh',
+  '17 * * * * /srv/example/other.sh',
+  '3 1 * * * /srv/example/rotate.sh',
+  '8 2 * * 0 /srv/example/weekly.sh',
+  '*/10 * * * * /srv/example/ping.sh',
+].join('\n') + '\n';
+
+const classifyMissing = (text) => classifyCrontab({ text, exitCode: 0, expect, statics: alwaysOk });
+
 test('#367 有效条目：7 必填参数齐全、节拍每 5 分钟覆盖 → ok', () => {
   const verdict = classifyCrontab({ text: `${entry()}\n`, exitCode: 0, expect, statics: alwaysOk });
   assert.equal(verdict.kind, 'ok');
@@ -47,26 +59,49 @@ test('#367 缺失：没有任何目标条目 → missing', () => {
   assert.equal(verdict.detail, 'absent');
 });
 
-test('#367 缺失告警带实际行数与匹配数，不打印内部 detail', () => {
-  const text = '24,54 * * * * /srv/example/run.sh\n# 另一条无关注释\n';
-  const verdict = classifyCrontab({ text, exitCode: 0, expect, statics: alwaysOk });
-  assert.equal(verdict.kind, 'missing');
-  assert.equal(verdict.detail, 'absent');
-  assert.deepEqual(verdict.stats, { lines: 2, matches: 0 });
-  const reason = describe(verdict);
-  assert.match(reason, /实际行数\s*2/);
-  assert.match(reason, /匹配数\s*0/);
-  assert.doesNotMatch(reason, /absent/);
-});
-
 test('#367 被注释：只有注释掉的目标条目 → commented，不误判缺失', () => {
   const verdict = classifyCrontab({ text: `# ${entry()}\n`, exitCode: 0, expect, statics: alwaysOk });
   assert.equal(verdict.kind, 'commented');
+  // SC4：被注释时文案讲「被注释」，不出现缺失文案。
+  const message = describe(verdict);
+  assert.match(message, /被注释/);
+  assert.doesNotMatch(message, /找不到部署定时条目/);
 });
 
 test('#367 重复：两条有效条目 → duplicate', () => {
   const verdict = classifyCrontab({ text: `${entry()}\n${entry()}\n`, exitCode: 0, expect, statics: alwaysOk });
   assert.equal(verdict.kind, 'duplicate');
+});
+
+// 两条合格条目，中间夹无关行；行号口径是 1 起算（candidatesFrom 里 i + 1）。
+const DUPLICATE_LINES = ['# 说明行', entry(), '17 * * * * /srv/example/other.sh', entry()];
+const DUPLICATE_SHIFTED = ['*/10 * * * * /srv/example/ping.sh', '3 1 * * * /srv/example/rotate.sh', '# 无关注释', ...DUPLICATE_LINES];
+const classifyText = (lines) => classifyCrontab({ text: `${lines.join('\n')}\n`, exitCode: 0, expect, statics: alwaysOk });
+
+test('#367 SC4 重复带行号：两条合格条目中间夹无关行 → duplicate，文案给两条行号', () => {
+  const verdict = classifyText(DUPLICATE_LINES);
+  assert.equal(verdict.kind, 'duplicate');
+  // 行号不进 detail，detail 仍是稳定的计数键。
+  assert.equal(verdict.detail, 'entries:2');
+  assert.deepEqual(verdict.stats.entryLines, [2, 4]);
+  const message = describe(verdict);
+  assert.match(message, /第 2、4 行，共 2 条/);
+  assert.doesNotMatch(message, /找不到部署定时条目/);
+});
+
+test('#367 SC4 行号移动但指纹不变：同两条条目整体下移，指纹相同、第二轮不告警', () => {
+  const base = classifyText(DUPLICATE_LINES);
+  const shifted = classifyText(DUPLICATE_SHIFTED);
+  assert.equal(base.kind, 'duplicate');
+  assert.equal(shifted.kind, 'duplicate');
+  assert.deepEqual(base.stats.entryLines, [2, 4]);
+  assert.deepEqual(shifted.stats.entryLines, [5, 7]);
+  assert.notDeepEqual(base.stats.entryLines, shifted.stats.entryLines);
+  assert.equal(shifted.stats.lines, 7);
+  assert.equal(fingerprint(base.kind, base.detail), fingerprint(shifted.kind, shifted.detail));
+  const first = nextNotification(null, base);
+  assert.equal(first.notify, 'deploy-cron-duplicate');
+  assert.equal(nextNotification(first.next, shifted).notify, null);
 });
 
 test('#367 未知语法：变量拼接的写法 → unknown-form，不当缺失', () => {
@@ -145,9 +180,56 @@ test('#367 无 crontab 只认整段确定文本：混入其它错误一律读取
   assert.equal(zeroExit.detail, 'absent');
 });
 
+test('#367 SC2 缺失告警带实际行数与匹配数，指纹仍不看行数', () => {
+  const two = classifyMissing(MISSING_TWO_LINES);
+  const five = classifyMissing(MISSING_FIVE_LINES);
+  // 两份文本都没有目标部署条目，只差无关行数：行数真的不同，分类与指纹必须相同。
+  assert.equal(two.kind, 'missing');
+  assert.equal(five.kind, 'missing');
+  assert.equal(two.stats.lines, 2);
+  assert.equal(five.stats.lines, 5);
+  assert.notEqual(two.stats.lines, five.stats.lines);
+  assert.equal(two.stats.matched, 0);
+  assert.equal(five.stats.matched, 0);
+  const message = describe(two);
+  assert.match(message, /实际行数 2/);
+  assert.match(message, /匹配数 0/);
+  assert.equal(fingerprint(two.kind, two.detail), fingerprint(five.kind, five.detail));
+  // 第一轮按 a 告警，第二轮换成只有无关行数不同的 b：同一情形，不再告警。
+  const first = nextNotification(null, two);
+  assert.equal(first.notify, 'deploy-cron-missing');
+  assert.equal(nextNotification(first.next, five).notify, null);
+});
+
+test('#367 SC2 读取输入文件失败不当缺失', () => {
+  const home = makeHome();
+  const missing = path.join(home, 'no-such-crontab.txt');
+  const r = spawnSync(process.execPath, [BIN, ...baseArgs(home), '--crontab-file', missing, '--exit-code', '0', '--stderr-text', ''], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.err);
+  assert.equal(stateOf(r).state, 'unreadable');
+  assert.equal(stateOf(r).detail, 'read-failed');
+  assert.doesNotMatch(alertsOf(home)[0].reason, /找不到部署定时条目/);
+});
+
 test('#367 指纹不含行号与计数：无关行变化不改指纹', () => {
-  assert.equal(fingerprint('missing', 'absent'), fingerprint('missing', 'absent'));
+  const two = classifyMissing(MISSING_TWO_LINES);
+  const five = classifyMissing(MISSING_FIVE_LINES);
+  assert.notEqual(two.stats.lines, five.stats.lines);
+  assert.equal(fingerprint(two.kind, two.detail), fingerprint(five.kind, five.detail));
+  // 错法键仍要区分：同类但字段不同，指纹必须不同。
   assert.notEqual(fingerprint('mismatch', '--alerts:absent'), fingerprint('mismatch', '--host-state:absent'));
+});
+
+test('#367 stats.lines 口径：只计非空行（注释行算行），空文本为 0 行且匹配数为 0', () => {
+  const empty = classifyMissing('');
+  assert.equal(empty.kind, 'missing');
+  assert.equal(empty.stats.lines, 0);
+  assert.equal(empty.stats.matched, 0);
+  // 注释行与空行（含只有空白的行）：注释算行，空行不算。
+  const commentsOnly = classifyMissing('# 运维手工维护，勿删\n\n   \n# 另一条说明\n');
+  assert.equal(commentsOnly.kind, 'missing');
+  assert.equal(commentsOnly.stats.lines, 2);
+  assert.equal(commentsOnly.stats.matched, 0);
 });
 
 test('#367 节奏：首次正常静默、同情形一次、真实恢复一次、情形变化可见', () => {
@@ -284,14 +366,15 @@ test('#367 CLI 黑盒：有效条目首次健康 → 静默、无告警、只调
   assert.deepEqual(fs.readFileSync(path.join(home, 'calls.log'), 'utf8').trim().split('\n'), ['-l']);
 });
 
-test('#367 CLI 黑盒：首次正常静默，连状态文件都不写（下次仍按首次处理）', () => {
+test('#367 SC2 CLI 缺失告警带实际行数与匹配数', () => {
   const home = makeHome();
-  fakeCrontab(home, { text: entry() });
+  fakeCrontab(home, { text: '24,54 * * * * /srv/example/run.sh\n17 * * * * /srv/example/other.sh\n' });
   const r = runViaFakeCrontab(home);
   assert.equal(r.status, 0, r.err);
-  assert.equal(JSON.parse(r.out.split('\n')[0]).state, 'ok');
-  assert.equal(alertsOf(home).length, 0);
-  assert.equal(fs.existsSync(path.join(home, 'state', 'host', 'deploy-cron-selfcheck.json')), false);
+  const alert = alertsOf(home)[0];
+  assert.equal(alert.kind, 'deploy-cron-missing');
+  assert.match(alert.reason, /实际行数 2/);
+  assert.match(alert.reason, /匹配数 0/);
 });
 
 test('#367 CLI 黑盒：缺失一次告警，同一情形第二轮不再告警，恢复只一次', () => {
@@ -312,18 +395,6 @@ test('#367 CLI 黑盒：缺失一次告警，同一情形第二轮不再告警�
   assert.equal(after.length, 2);
   assert.equal(after[1].kind, 'deploy-cron-recovered');
   assert.match(after[1].reason, /已恢复正常/);
-});
-
-test('#367 CLI 黑盒：缺失告警写出实际行数与匹配数', () => {
-  const home = makeHome();
-  fakeCrontab(home, { text: '24,54 * * * * /srv/example/run.sh\n# 另一条无关注释' });
-  const r = runViaFakeCrontab(home);
-  assert.equal(r.status, 0, r.err);
-  const alert = alertsOf(home)[0];
-  assert.equal(alert.kind, 'deploy-cron-missing');
-  assert.match(alert.reason, /实际行数\s*2/);
-  assert.match(alert.reason, /匹配数\s*0/);
-  assert.doesNotMatch(alert.reason, /absent/);
 });
 
 test('#367 CLI 黑盒：同类但错法不同不被永久吞掉', () => {
