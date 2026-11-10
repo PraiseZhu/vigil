@@ -190,14 +190,15 @@ test('#140 反例（review-pr141）：交接早于最后一条登记（之后又
 
 const ROOT_TASK_KEYS = [
   'ref', 'repo', 'number', 'kind', 'tier', 'fork', 'state', 'closedAt', 'url', 'nodeId',
-  'body', 'bodyVersion', 'children', 'linkedPrs', 'rounds', 'outOfScope', 'leadHandoff', 'dispute',
+  'body', 'bodyVersion', 'defaultBranch', 'children', 'linkedPrs', 'rounds', 'outOfScope', 'leadHandoff', 'dispute',
 ];
 
-function prNode(number, mergedAt) {
+function prNode(number, mergedAt, baseRefName = 'main') {
   return {
     number,
     url: `https://example.test/pull/${number}`,
     mergedAt,
+    baseRefName,
     repository: { nameWithOwner: REPO },
   };
 }
@@ -450,7 +451,7 @@ test('#247 SC1 盘点请求数只随页数增长；已关单有变化仍被拉�
     state: 'CLOSED',
     closedAt: '2026-10-25T00:00:00.000Z',
     updatedAt: '2026-10-25T00:00:00.000Z',
-    prs: [{ number: 5, url: `https://github.com/${REPO}/pull/5`, mergedAt: '2026-10-25T01:00:00.000Z', repository: { nameWithOwner: REPO } }],
+    prs: [{ number: 5, url: `https://github.com/${REPO}/pull/5`, mergedAt: '2026-10-25T01:00:00.000Z', repository: { nameWithOwner: REPO }, baseRefName: 'main' }],
   });
   const seenOpenCursors = [];
   const calls = [];

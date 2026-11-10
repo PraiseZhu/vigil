@@ -16,7 +16,7 @@ const ISSUE_FIELDS = `id
         closedAt
         updatedAt
         author { login __typename }
-        repository { nameWithOwner }
+        repository { nameWithOwner defaultBranchRef { name } }
         parent { number repository { nameWithOwner } author { login __typename } }
         subIssues(first: 50) {
           nodes {
@@ -34,6 +34,7 @@ const ISSUE_FIELDS = `id
             number
             url
             mergedAt
+            baseRefName
             repository { nameWithOwner }
           }
         }
@@ -91,6 +92,47 @@ export { bodyVersion };
 
 function issueRef(repo, number) {
   return `${repo}#${number}`;
+}
+
+/**
+ * 仓库的默认分支：盘点里带了 `defaultBranchRef.name` 就用它；取不到（权限挡掉、老查询）才退 `'main'`。
+ * 默认分支不一定叫 main（组织仓、`main` 之后的默认分支都能改），判断「PR 合到哪个分支」必须用它。
+ */
+export function defaultBranchOf(issue) {
+  const name = issue?.repository?.defaultBranchRef?.name;
+  return typeof name === 'string' && name.trim() ? name.trim() : 'main';
+}
+
+/** 关联 PR 的合并目标分支：字段没取到（老查询 / 被挡掉）是 null，调用方按「不知道」处理。 */
+function baseOf(pr) {
+  const base = pr?.baseRefName;
+  return typeof base === 'string' && base.trim() ? base.trim() : null;
+}
+
+/** issue 节点上的关联 PR（含合并目标分支）。只做形状转换，不发请求。 */
+function linkedPrsOf(issue, repo) {
+  return (issue?.closedByPullRequestsReferences?.nodes || []).map((pr) => ({
+    ref: issueRef(pr.repository?.nameWithOwner || repo, pr.number),
+    mergedAt: pr.mergedAt || null,
+    url: pr.url,
+    base: baseOf(pr),
+  }));
+}
+
+/**
+ * 父单用：子 issue 已合并 PR 的目标分支，数据来自同一份盘点里这个子单自己的节点（不额外发请求）。
+ * 盘点里没有这个子单（关闭时间早于 startAt、作者不是我）时返回 null = 不知道它合到了哪。
+ */
+function childPrBase(childRef, byKey) {
+  const node = byKey?.get(childRef);
+  if (!node) return null;
+  const repo = node.repository?.nameWithOwner || childRef.slice(0, childRef.lastIndexOf('#'));
+  return {
+    defaultBranch: defaultBranchOf(node),
+    mergedPrs: linkedPrsOf(node, repo)
+      .filter((pr) => pr.mergedAt)
+      .map((pr) => ({ ref: pr.ref, base: pr.base })),
+  };
 }
 
 // 批准执行（approve-exec）的交接（#140）：lead 派出 owner 会话时在总 issue 上发「批准执行登记：…」，
@@ -166,11 +208,7 @@ function isRoot(issue, profile) {
 function toChildTask(issue, profile, ranked, repo, byKey) {
   if (issue.state !== 'CLOSED') return null;
   if (issue.closedAt && Date.parse(issue.closedAt) < Date.parse(profile.startAt)) return null;
-  const linkedPrs = (issue.closedByPullRequestsReferences?.nodes || []).map((pr) => ({
-    ref: issueRef(pr.repository?.nameWithOwner || repo, pr.number),
-    mergedAt: pr.mergedAt || null,
-    url: pr.url,
-  }));
+  const linkedPrs = linkedPrsOf(issue, repo);
   if (!linkedPrs.some((pr) => pr.mergedAt)) return null;
   if (parseMarker(issue.body) != null) return null;
 
@@ -207,12 +245,17 @@ function toChildTask(issue, profile, ranked, repo, byKey) {
     nodeId: issue.id,
     body: issue.body || '',
     bodyVersion: bodyVersion(issue.body),
-    children: ownerChildren.map((child) => ({
-      ref: issueRef(child.repository?.nameWithOwner || repo, child.number),
-      state: child.state === 'CLOSED' ? 'closed' : 'open',
-      closedAt: child.closedAt || null,
-      url: child.url,
-    })),
+    defaultBranch: defaultBranchOf(issue),
+    children: ownerChildren.map((child) => {
+      const childRef = issueRef(child.repository?.nameWithOwner || repo, child.number);
+      return {
+        ref: childRef,
+        state: child.state === 'CLOSED' ? 'closed' : 'open',
+        closedAt: child.closedAt || null,
+        url: child.url,
+        prBase: childPrBase(childRef, byKey),
+      };
+    }),
     linkedPrs,
     rounds,
     outOfScope,
@@ -261,17 +304,18 @@ function toTask(issue, profile, byKey) {
     nodeId: issue.id,
     body: issue.body || '',
     bodyVersion: bodyVersion(issue.body),
-    children: ownerChildren.map((child) => ({
-      ref: issueRef(child.repository?.nameWithOwner || repo, child.number),
-      state: child.state === 'CLOSED' ? 'closed' : 'open',
-      closedAt: child.closedAt || null,
-      url: child.url,
-    })),
-    linkedPrs: (issue.closedByPullRequestsReferences?.nodes || []).map((pr) => ({
-      ref: issueRef(pr.repository?.nameWithOwner || repo, pr.number),
-      mergedAt: pr.mergedAt || null,
-      url: pr.url,
-    })),
+    defaultBranch: defaultBranchOf(issue),
+    children: ownerChildren.map((child) => {
+      const childRef = issueRef(child.repository?.nameWithOwner || repo, child.number);
+      return {
+        ref: childRef,
+        state: child.state === 'CLOSED' ? 'closed' : 'open',
+        closedAt: child.closedAt || null,
+        url: child.url,
+        prBase: childPrBase(childRef, byKey),
+      };
+    }),
+    linkedPrs: linkedPrsOf(issue, repo),
     rounds,
     outOfScope,
     // 批准执行推进的任务：最近一条登记、最新一条 lead 交接（#140）。trigger 据此在 lead 交接前不开轮。

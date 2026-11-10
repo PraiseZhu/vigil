@@ -187,6 +187,7 @@ export function issueNode({
   subIssues = [],
   prs = [],
   comments = [],
+  defaultBranch = 'main',
   id,
 } = {}) {
   return {
@@ -200,7 +201,7 @@ export function issueNode({
     closedAt,
     updatedAt,
     author: { login: author },
-    repository: { nameWithOwner: repo },
+    repository: { nameWithOwner: repo, defaultBranchRef: defaultBranch ? { name: defaultBranch } : null },
     parent,
     subIssues: { nodes: subIssues },
     closedByPullRequestsReferences: { nodes: prs },

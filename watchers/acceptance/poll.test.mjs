@@ -285,7 +285,7 @@ test('SC4 poll 会列出 watch 档任务', async () => {
     number: 8,
     author: OWNER,
     linkedPrs: undefined,
-    prs: [{ number: 9, url: 'https://example.test/p/9', mergedAt: '2026-10-21T00:00:00.000Z', repository: { nameWithOwner: HANDOFF_REPO } }],
+    prs: [{ number: 9, url: 'https://example.test/p/9', mergedAt: '2026-10-21T00:00:00.000Z', baseRefName: 'main', repository: { nameWithOwner: HANDOFF_REPO } }],
   });
   const run = createFakeRun({ onGraphql: () => inventoryData({ open: [issue] }) });
   const github = createGithub({ profile, run });
@@ -369,11 +369,12 @@ test('安全 别人伪造的「中断」不触发退避', async () => {
   assert.equal(entry.nextRound, 2);
 });
 
-function mergedPr(number, mergedAt) {
+function mergedPr(number, mergedAt, baseRefName = 'main') {
   return {
     number,
     url: `https://example.test/pull/${number}`,
     mergedAt,
+    baseRefName,
     repository: { nameWithOwner: REPO },
   };
 }

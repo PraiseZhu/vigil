@@ -240,7 +240,9 @@ async function cmdStart({ flags, github, profile, now, stdout, stderr, alert }) 
   }
   const decision = shouldTrigger(task, { now, profile });
   if (!decision.trigger) {
-    stderr.write(`任务 ${task.ref} 现在不该验收${decision.reason ? `（${decision.reason}）` : ''}\n`);
+    // 合并目标分支不对（base-not-default / base-unknown）时把「哪个 PR 合到哪」一起打出来，人工排查不用再拉一次盘点。
+    const why = decision.message ? `${decision.reason}：${decision.message}` : decision.reason;
+    stderr.write(`任务 ${task.ref} 现在不该验收${decision.reason ? `（${why}）` : ''}\n`);
     return EXIT.NOTHING;
   }
   if (task.outOfScope?.length) {
