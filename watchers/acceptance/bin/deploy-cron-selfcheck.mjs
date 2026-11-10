@@ -205,7 +205,7 @@ function inspectCandidate(candidate, expect, statics) {
 export function classifyCrontab({ text = '', exitCode = 0, stderr = '', expect, statics = {} }) {
   const lines = String(text).split('\n');
   const lineCount = lines.filter((line) => line.trim() !== '').length;
-  const withStats = (verdict, matched = 0) => ({ ...verdict, stats: { lines: lineCount, matched } });
+  const withStats = (verdict, matched = 0, entryLines = []) => ({ ...verdict, stats: { lines: lineCount, matched, entryLines } });
   // 没给退出码（null）或给的不是整数：判断不了读没读成功，按读取失败处理，不默认成 0。
   if (exitCode === null) return withStats({ kind: UNREADABLE, detail: 'no-exit-code' });
   if (!Number.isInteger(exitCode)) return withStats({ kind: UNREADABLE, detail: 'bad-exit-code' });
@@ -222,7 +222,8 @@ export function classifyCrontab({ text = '', exitCode = 0, stderr = '', expect, 
     if (plausible(lines, expect.script)) return withStats({ kind: UNKNOWN_FORM, detail: 'noncanonical-script-token' }, found.length);
     return withStats({ kind: MISSING, detail: 'absent' }, found.length);
   }
-  if (active.length > 1) return withStats({ kind: DUPLICATE, detail: `entries:${active.length}` }, found.length);
+  // 行号只用于文案，不进指纹：无关行上下移动不该触发重复告警。
+  if (active.length > 1) return withStats({ kind: DUPLICATE, detail: `entries:${active.length}` }, found.length, active.map((item) => item.line));
   return withStats(inspectCandidate(active[0], expect, statics), found.length);
 }
 
@@ -278,7 +279,9 @@ export function describe(verdict) {
   if (verdict.kind === MISSING && verdict.stats) {
     parts.push(`实际行数 ${verdict.stats.lines}`, `匹配数 ${verdict.stats.matched}`);
   }
-  if (verdict.detail) parts.push(verdict.detail);
+  const entryLines = verdict.kind === DUPLICATE ? verdict.stats?.entryLines || [] : [];
+  if (entryLines.length >= 2) parts.push(`第 ${entryLines.join('、')} 行，共 ${entryLines.length} 条`);
+  else if (verdict.detail) parts.push(verdict.detail);
   const detail = parts.length ? `（${parts.join('，')}）` : '';
   return `${head}${detail}。影响：${ADVICE[verdict.kind] || '要人看一下这一条。'}`;
 }

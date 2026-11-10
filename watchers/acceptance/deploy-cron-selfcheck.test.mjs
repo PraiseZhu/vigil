@@ -62,11 +62,46 @@ test('#367 缺失：没有任何目标条目 → missing', () => {
 test('#367 被注释：只有注释掉的目标条目 → commented，不误判缺失', () => {
   const verdict = classifyCrontab({ text: `# ${entry()}\n`, exitCode: 0, expect, statics: alwaysOk });
   assert.equal(verdict.kind, 'commented');
+  // SC4：被注释时文案讲「被注释」，不出现缺失文案。
+  const message = describe(verdict);
+  assert.match(message, /被注释/);
+  assert.doesNotMatch(message, /找不到部署定时条目/);
 });
 
 test('#367 重复：两条有效条目 → duplicate', () => {
   const verdict = classifyCrontab({ text: `${entry()}\n${entry()}\n`, exitCode: 0, expect, statics: alwaysOk });
   assert.equal(verdict.kind, 'duplicate');
+});
+
+// 两条合格条目，中间夹无关行；行号口径是 1 起算（candidatesFrom 里 i + 1）。
+const DUPLICATE_LINES = ['# 说明行', entry(), '17 * * * * /srv/example/other.sh', entry()];
+const DUPLICATE_SHIFTED = ['*/10 * * * * /srv/example/ping.sh', '3 1 * * * /srv/example/rotate.sh', '# 无关注释', ...DUPLICATE_LINES];
+const classifyText = (lines) => classifyCrontab({ text: `${lines.join('\n')}\n`, exitCode: 0, expect, statics: alwaysOk });
+
+test('#367 SC4 重复带行号：两条合格条目中间夹无关行 → duplicate，文案给两条行号', () => {
+  const verdict = classifyText(DUPLICATE_LINES);
+  assert.equal(verdict.kind, 'duplicate');
+  // 行号不进 detail，detail 仍是稳定的计数键。
+  assert.equal(verdict.detail, 'entries:2');
+  assert.deepEqual(verdict.stats.entryLines, [2, 4]);
+  const message = describe(verdict);
+  assert.match(message, /第 2、4 行，共 2 条/);
+  assert.doesNotMatch(message, /找不到部署定时条目/);
+});
+
+test('#367 SC4 行号移动但指纹不变：同两条条目整体下移，指纹相同、第二轮不告警', () => {
+  const base = classifyText(DUPLICATE_LINES);
+  const shifted = classifyText(DUPLICATE_SHIFTED);
+  assert.equal(base.kind, 'duplicate');
+  assert.equal(shifted.kind, 'duplicate');
+  assert.deepEqual(base.stats.entryLines, [2, 4]);
+  assert.deepEqual(shifted.stats.entryLines, [5, 7]);
+  assert.notDeepEqual(base.stats.entryLines, shifted.stats.entryLines);
+  assert.equal(shifted.stats.lines, 7);
+  assert.equal(fingerprint(base.kind, base.detail), fingerprint(shifted.kind, shifted.detail));
+  const first = nextNotification(null, base);
+  assert.equal(first.notify, 'deploy-cron-duplicate');
+  assert.equal(nextNotification(first.next, shifted).notify, null);
 });
 
 test('#367 未知语法：变量拼接的写法 → unknown-form，不当缺失', () => {
