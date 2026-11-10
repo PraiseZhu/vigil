@@ -241,15 +241,18 @@ test('#62 SC5 真 notify：老根单不立即发，攒到摘要窗口才发一�
 
 // ---- tick 接线：写一条 alerts，同一天不重复写 ----
 
-function pollOutput(tasks) {
-  return async () => ({ code: 0, stdout: JSON.stringify({ entries: [], tasks, reads: 1 }), stderr: '' });
+function pollOutput(tasks, calls) {
+  return async (cmd, args) => {
+    calls.push([cmd, ...args]);
+    return { code: 0, stdout: JSON.stringify({ entries: [], tasks, reads: 1 }), stderr: '' };
+  };
 }
 
-async function tickAt(home, tasks, nowMs) {
+async function tickAt(home, tasks, nowMs, calls = []) {
   return runTick({
     home,
     env: { ...process.env },
-    run: pollOutput(tasks),
+    run: pollOutput(tasks, calls),
     spawnRound: () => 1,
     runRound: async () => ({ code: 0, stdout: '', stderr: '' }),
     notify: async () => ({ ok: true, sent: 0, digested: 0, pending: 0, deferred: 0, capped: 0, failed: [] }),
@@ -261,7 +264,11 @@ test('#62 SC5 tick 每拍把老根单写进 alerts.jsonl，同一天只写一次
   const { home } = writeProfile(tmpDir());
   const tasks = [rootTask()];
   const day1 = at(20 * DAY_MS);
-  const heartbeat = await tickAt(home, tasks, day1);
+  const calls = [];
+  const heartbeat = await tickAt(home, tasks, day1, calls);
+  assert.equal(calls.length, 1, '这一拍只跑了一次 poll；老根单那一步不自己读 GitHub');
+  assert.equal(calls[0][0], 'node');
+  assert.match(calls[0][1], /poll\.mjs$/, '唯一的一次子进程调用就是 poll');
   assert.equal(heartbeat.lastTick.ok, true);
   assert.deepEqual(heartbeat.lastTick.staleRoots, { candidates: 1, reported: 1 });
   let alerts = readAlerts(hostPaths(home)).filter((alert) => alert.kind === 'stale-root');

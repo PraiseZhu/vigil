@@ -568,6 +568,7 @@ Slack 自己的 `slack-failed`（重试用完）、`slack-history-failed`（读�
   不再符合条件的（已有 PR 合并、已关单、已进过验收）从状态里删掉，之后重新符合条件可以当天再报一次。
 - **阀值**：严格超过 7×24 小时（正好 7 天不报）；已关闭、有父的子 issue、已有轮次记录、这一拍就会触发的不报。
 - 心跳里带 `lastTick.staleRoots: {candidates, reported}`；这一步自己出错只写 `lastTick.staleRootsError`，不影响这一拍。
+- 「不触发原因」只落本地：`alerts.jsonl`（`kind: 'stale-root'`，含 `reason` / `url` / `ageDays`）+ 去重状态 `stale-root-digest.json`。这一步**不发任何 GitHub 请求**（读不读得到都不影响），也不写看板。
 
 ## 6. 上线顺序
 
