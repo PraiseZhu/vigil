@@ -5,7 +5,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { expandMinutes, checkSchedule, classifyCrontab, fingerprint, nextNotification, REQUIRED_ARGS } from './bin/deploy-cron-selfcheck.mjs';
+import { expandMinutes, checkSchedule, classifyCrontab, describe, fingerprint, nextNotification, REQUIRED_ARGS } from './bin/deploy-cron-selfcheck.mjs';
 
 const BIN = fileURLToPath(new URL('./bin/deploy-cron-selfcheck.mjs', import.meta.url));
 const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -131,6 +131,26 @@ test('#367 无 crontab 只认整段确定文本：混入其它错误一律读取
   const zeroExit = classifyCrontab({ text: '', exitCode: 0, stderr: 'no crontab for example\n', expect, statics: alwaysOk });
   assert.equal(zeroExit.kind, 'missing');
   assert.equal(zeroExit.detail, 'absent');
+});
+
+test('#367 SC2 缺失告警带实际行数与匹配数，指纹仍不看行数', () => {
+  const text = '24,54 * * * * /srv/example/run.sh\n17 * * * * /srv/example/other.sh\n';
+  const verdict = classifyCrontab({ text, exitCode: 0, expect, statics: alwaysOk });
+  assert.equal(verdict.kind, 'missing');
+  const message = describe(verdict);
+  assert.match(message, /实际行数 2/);
+  assert.match(message, /匹配数 0/);
+  assert.equal(fingerprint(verdict.kind, verdict.detail), fingerprint('missing', 'absent'));
+});
+
+test('#367 SC2 读取输入文件失败不当缺失', () => {
+  const home = makeHome();
+  const missing = path.join(home, 'no-such-crontab.txt');
+  const r = spawnSync(process.execPath, [BIN, ...baseArgs(home), '--crontab-file', missing, '--exit-code', '0', '--stderr-text', ''], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.err);
+  assert.equal(stateOf(r).state, 'unreadable');
+  assert.equal(stateOf(r).detail, 'read-failed');
+  assert.doesNotMatch(alertsOf(home)[0].reason, /找不到部署定时条目/);
 });
 
 test('#367 指纹不含行号与计数：无关行变化不改指纹', () => {
@@ -270,6 +290,17 @@ test('#367 CLI 黑盒：有效条目首次健康 → 静默、无告警、只调
   assert.equal(alertsOf(home).length, 0);
   assert.equal(JSON.parse(r.out.split('\n')[0]).state, 'ok');
   assert.deepEqual(fs.readFileSync(path.join(home, 'calls.log'), 'utf8').trim().split('\n'), ['-l']);
+});
+
+test('#367 SC2 CLI 缺失告警带实际行数与匹配数', () => {
+  const home = makeHome();
+  fakeCrontab(home, { text: '24,54 * * * * /srv/example/run.sh\n17 * * * * /srv/example/other.sh\n' });
+  const r = runViaFakeCrontab(home);
+  assert.equal(r.status, 0, r.err);
+  const alert = alertsOf(home)[0];
+  assert.equal(alert.kind, 'deploy-cron-missing');
+  assert.match(alert.reason, /实际行数 2/);
+  assert.match(alert.reason, /匹配数 0/);
 });
 
 test('#367 CLI 黑盒：缺失一次告警，同一情形第二轮不再告警，恢复只一次', () => {

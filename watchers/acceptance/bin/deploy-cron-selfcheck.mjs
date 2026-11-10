@@ -203,25 +203,27 @@ function inspectCandidate(candidate, expect, statics) {
  * 「无 crontab」与「读取失败」严格分开：只有确定文本才算空，其余一律 unreadable（不吞错误）。
  */
 export function classifyCrontab({ text = '', exitCode = 0, stderr = '', expect, statics = {} }) {
-  // 没给退出码（null）或给的不是整数：判断不了读没读成功，按读取失败处理，不默认成 0。
-  if (exitCode === null) return { kind: UNREADABLE, detail: 'no-exit-code' };
-  if (!Number.isInteger(exitCode)) return { kind: UNREADABLE, detail: 'bad-exit-code' };
-  if (exitCode !== 0) {
-    if (isNoCrontab(stderr)) return { kind: MISSING, detail: 'no-crontab' };
-    return { kind: UNREADABLE, detail: 'read-failed' };
-  }
   const lines = String(text).split('\n');
+  const lineCount = lines.filter((line) => line.trim() !== '').length;
+  const withStats = (verdict, matched = 0) => ({ ...verdict, stats: { lines: lineCount, matched } });
+  // 没给退出码（null）或给的不是整数：判断不了读没读成功，按读取失败处理，不默认成 0。
+  if (exitCode === null) return withStats({ kind: UNREADABLE, detail: 'no-exit-code' });
+  if (!Number.isInteger(exitCode)) return withStats({ kind: UNREADABLE, detail: 'bad-exit-code' });
+  if (exitCode !== 0) {
+    if (isNoCrontab(stderr)) return withStats({ kind: MISSING, detail: 'no-crontab' });
+    return withStats({ kind: UNREADABLE, detail: 'read-failed' });
+  }
   const found = candidatesFrom(lines, expect.script, statics);
   const active = found.filter((item) => !item.commented);
   const commented = found.filter((item) => item.commented);
   if (active.length === 0) {
-    if (commented.length) return { kind: COMMENTED, detail: 'commented' };
+    if (commented.length) return withStats({ kind: COMMENTED, detail: 'commented' }, found.length);
     // 有行看着像目标（文件名一致）但写法不在规范化结构里：报无法核实，不断言缺失。
-    if (plausible(lines, expect.script)) return { kind: UNKNOWN_FORM, detail: 'noncanonical-script-token' };
-    return { kind: MISSING, detail: 'absent' };
+    if (plausible(lines, expect.script)) return withStats({ kind: UNKNOWN_FORM, detail: 'noncanonical-script-token' }, found.length);
+    return withStats({ kind: MISSING, detail: 'absent' }, found.length);
   }
-  if (active.length > 1) return { kind: DUPLICATE, detail: `entries:${active.length}` };
-  return inspectCandidate(active[0], expect, statics);
+  if (active.length > 1) return withStats({ kind: DUPLICATE, detail: `entries:${active.length}` }, found.length);
+  return withStats(inspectCandidate(active[0], expect, statics), found.length);
 }
 
 /** 稳定指纹：只含分类与错法键，不含行号、时间、无关行数（无关 cron 行变化不触发重复告警）。 */
@@ -272,7 +274,12 @@ const ADVICE = {
 export function describe(verdict) {
   if (verdict.kind === OK) return '部署定时条目正常，最近一次核对通过。不需要人处理。';
   const head = TEXT[verdict.kind] || '部署定时条目异常';
-  const detail = verdict.detail ? `（${verdict.detail}）` : '';
+  const parts = [];
+  if (verdict.kind === MISSING && verdict.stats) {
+    parts.push(`实际行数 ${verdict.stats.lines}`, `匹配数 ${verdict.stats.matched}`);
+  }
+  if (verdict.detail) parts.push(verdict.detail);
+  const detail = parts.length ? `（${parts.join('，')}）` : '';
   return `${head}${detail}。影响：${ADVICE[verdict.kind] || '要人看一下这一条。'}`;
 }
 
@@ -289,7 +296,8 @@ function readInput(cli) {
   try {
     text = cli.file ? fs.readFileSync(cli.file, 'utf8') : fs.readFileSync(0, 'utf8');
   } catch {
-    return { text: '', exitCode: cli.exitCode === null ? 1 : cli.exitCode, stderr: 'input-unreadable' };
+    // 读输入文件本身失败也是「读不出」，不能拿调用方给的 exit-code 0 当成「条目缺失」。
+    return { text: '', exitCode: 1, stderr: 'input-unreadable' };
   }
   // 退出码没传就原样留 null：交给 classifyCrontab 判「读不出」，不在这里补成 0。
   return { text, exitCode: cli.exitCode, stderr: cli.stderrText };
