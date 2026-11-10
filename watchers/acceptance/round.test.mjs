@@ -43,7 +43,7 @@ function standaloneIssue({ number = 1, body = 'task body', comments = [] } = {})
       {
         number: 2,
         url: 'https://example.test/pull/2',
-        mergedAt: '2026-10-20T00:00:00.000Z',
+        mergedAt: '2026-10-20T00:00:00.000Z', baseRefName: 'main',
         repository: { nameWithOwner: REPO },
       },
     ],
@@ -234,7 +234,7 @@ function baseIssue(state) {
     parent: null,
     subIssues: { nodes: [] },
     closedByPullRequestsReferences: {
-      nodes: [{ number: 2, url: 'https://example.test/pull/2', mergedAt: '2026-10-20T00:00:00.000Z', repository: { nameWithOwner: REPO } }],
+      nodes: [{ number: 2, url: 'https://example.test/pull/2', mergedAt: '2026-10-20T00:00:00.000Z', baseRefName: 'main', repository: { nameWithOwner: REPO } }],
     },
     comments: { nodes: state.comments },
   };
@@ -344,7 +344,7 @@ test('#228 SC2 kind=child 的 start 返回 0，最后一行 JSON 含 round 和 c
       {
         number: 9,
         url: 'https://example.test/pull/9',
-        mergedAt: '2026-10-20T01:00:00.000Z',
+        mergedAt: '2026-10-20T01:00:00.000Z', baseRefName: 'main',
         repository: { nameWithOwner: REPO },
       },
     ],

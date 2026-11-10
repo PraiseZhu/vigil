@@ -849,7 +849,7 @@ test('poll：最新裁决是通过、issue 还开着 → passedButOpen；verdict
       body,
       state,
       closedAt: state === 'closed' ? '2026-10-23T00:00:00.000Z' : null,
-      prs: [{ number: 3, url: `https://github.com/${repo}/pull/3`, mergedAt: '2026-10-20T00:00:00.000Z' }],
+      prs: [{ number: 3, url: `https://github.com/${repo}/pull/3`, mergedAt: '2026-10-20T00:00:00.000Z', baseRefName: 'main' }],
     });
     if (passes >= 2) {
       world.addComment(`${repo}#1`, {
@@ -940,7 +940,7 @@ test('北京时间：beijingIso 带 +08:00、不带毫秒；trigger 新旧格式
     tier: 'auto',
     bodyVersion: bodyVersion(body),
     children: [],
-    linkedPrs: [{ ref: `${REPO}#3`, mergedAt: '2026-10-24T03:00:00Z' }],
+    linkedPrs: [{ ref: `${REPO}#3`, mergedAt: '2026-10-24T03:00:00Z', base: 'main' }],
     rounds: parseRounds([roundComment({
       round: 1,
       status: '通过',

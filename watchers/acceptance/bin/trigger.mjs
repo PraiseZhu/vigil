@@ -119,6 +119,80 @@ function issueClosed(state) {
 }
 
 /**
+ * PR 的合并目标分支相对仓库默认分支：'default'（合到默认分支）/ 'other'（合到别的分支）/ 'unknown'（字段没取到）。
+ * 纯函数，只看传进来的字段。
+ */
+export function baseClassOf(pr, defaultBranch) {
+  const base = typeof pr?.base === 'string' ? pr.base.trim() : '';
+  if (!base) return 'unknown';
+  return base === (defaultBranch || 'main') ? 'default' : 'other';
+}
+
+function prLabel(pr) {
+  return pr.base ? `${pr.ref}（base ${pr.base}）` : `${pr.ref}（目标分支未知）`;
+}
+
+/**
+ * 已合并 PR 的合并目标判定（临时防护）：只看「有没有合入默认分支的 PR」。
+ * - 至少一条合入默认分支 → 按默认分支验（其余不拦：工作已经进默认分支了）；
+ * - 一条都没有、但有已知的非默认分支 → 跳过（base-not-default）；
+ * - 一条都没有、目标分支又全取不到 → 也跳过（base-unknown）：宁可不验，也不拿错分支的代码开「要修」。
+ */
+export function mergedBaseDecision(merged, defaultBranch = 'main') {
+  const rows = (merged || []).map((pr) => ({ pr, kind: baseClassOf(pr, defaultBranch) }));
+  if (!rows.length) return { ok: true };
+  if (rows.some((row) => row.kind === 'default')) return { ok: true };
+  const known = rows.filter((row) => row.kind === 'other').map((row) => row.pr);
+  const unknown = rows.filter((row) => row.kind === 'unknown').map((row) => row.pr);
+  const prs = [...known, ...unknown].map((pr) => ({ ref: pr.ref, base: pr.base || null }));
+  if (!known.length) {
+    return {
+      ok: false,
+      reason: 'base-unknown',
+      base: null,
+      defaultBranch,
+      prs,
+      message: `合并的 PR ${unknown.map(prLabel).join('、')} 没取到目标分支，不知道是不是默认分支 ${defaultBranch}；验收机先不验（下一拍再查）。`,
+    };
+  }
+  return {
+    ok: false,
+    reason: 'base-not-default',
+    base: [...new Set(known.map((pr) => pr.base))].join('、'),
+    defaultBranch,
+    prs,
+    message: `PR ${[...known, ...unknown].map(prLabel).join('、')} 合入的不是默认分支 ${defaultBranch}；验收机只按默认分支验代码，等它合入 ${defaultBranch} 后再验。`,
+  };
+}
+
+/** 把合并目标判定包成 shouldTrigger 的返回形状（人话说明一起带出去）。 */
+function blockedByBase(decision) {
+  return {
+    trigger: false,
+    reason: decision.reason,
+    base: decision.base ?? null,
+    defaultBranch: decision.defaultBranch,
+    prs: decision.prs,
+    message: decision.message,
+  };
+}
+
+/**
+ * 父单用：任一子单的已合并 PR 全都不在它自己仓的默认分支上（或者全取不到目标分支）就不验——
+ * 子单的工作还在集成分支上，按默认分支验必然误判。
+ * 盘点里没有这个子单的 PR 数据（`prBase` 为 null）时不拦：拦了会把老父单永久卡住，比漏一次更糟。
+ */
+function parentBaseBlock(task) {
+  for (const child of task.children || []) {
+    const info = child?.prBase;
+    if (!info || !Array.isArray(info.mergedPrs) || !info.mergedPrs.length) continue;
+    const decision = mergedBaseDecision(info.mergedPrs, info.defaultBranch || task.defaultBranch);
+    if (!decision.ok) return { ...blockedByBase(decision), child: child.ref };
+  }
+  return null;
+}
+
+/**
  * 已关闭且 PR 已合并的子 issue（kind=child）。
  * 未关闭、修正标记、没有已合并 PR、父轮次进行中、父结论晚于子 issue 关闭，都不开轮。
  * 其余和独立 issue 同一套：没结论开一轮（reason 用 child-merged），结论后又合并了 PR 再开一轮。
@@ -128,6 +202,8 @@ function childDecision(task, { now, profile, f, dispute }) {
   if (parseMarker(task.body) != null) return { trigger: false, reason: 'correction-issue' };
   const merged = (task.linkedPrs || []).filter((pr) => pr.mergedAt);
   if (!merged.length) return { trigger: false, reason: 'no-merged-pr' };
+  const baseDecision = mergedBaseDecision(merged, task.defaultBranch);
+  if (!baseDecision.ok) return blockedByBase(baseDecision);
   if (task.parentLatestStatus === '验收中') return { trigger: false, reason: 'parent-in-progress' };
   const coveredAt = Date.parse(task.parentFinalFinishedAt || '');
   const closedAt = Date.parse(task.closedAt || '');
@@ -167,6 +243,8 @@ export function shouldTrigger(task, { now, profile }) {
 
   if (isParent) {
     if ((task.children || []).some(childOpen)) return { trigger: false, reason: 'children-open' };
+    const baseBlock = parentBaseBlock(task);
+    if (baseBlock) return baseBlock;
     if (awaitingLeadHandoff(task, f, now(), latestMs((task.children || []).map((child) => child.closedAt)))) {
       return { trigger: false, reason: 'awaiting-lead-handoff' };
     }
@@ -181,6 +259,8 @@ export function shouldTrigger(task, { now, profile }) {
 
   const merged = (task.linkedPrs || []).filter((pr) => pr.mergedAt);
   if (!merged.length) return { trigger: false, reason: 'no-merged-pr' };
+  const baseDecision = mergedBaseDecision(merged, task.defaultBranch);
+  if (!baseDecision.ok) return blockedByBase(baseDecision);
   if (awaitingLeadHandoff(task, f, now(), latestMs(merged.map((pr) => pr.mergedAt)))) {
     return { trigger: false, reason: 'awaiting-lead-handoff' };
   }

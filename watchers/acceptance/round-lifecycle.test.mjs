@@ -261,7 +261,7 @@ test('#228 SC10 已关闭且 PR 已合并的 child 走完 collect → close → 
     body: childBody,
     state: 'closed',
     closedAt: '2026-10-20T00:00:00.000Z',
-    prs: [{ number: 20, url: `https://github.com/${REPO}/pull/20`, mergedAt: '2026-10-20T01:00:00.000Z' }],
+    prs: [{ number: 20, url: `https://github.com/${REPO}/pull/20`, mergedAt: '2026-10-20T01:00:00.000Z', baseRefName: 'main' }],
   });
   world.addChild(parent.ref, child.ref);
   world.addComment(child.ref, roundComment({ round: 1, status: '验收中', bodyVersion: bodyVersion(childBody) }));

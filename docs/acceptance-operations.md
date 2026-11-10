@@ -485,6 +485,8 @@ fork 档必须是 `<ownerLogin>:<分支>`，别的前缀一律 4 `not-in-tree`�
 | `pr-merged-after-verdict` | 已有结论之后又有 PR 合并，只再开一轮 |
 | `up-to-date` | 已有结论，之后没有新合并、正文也没变 |
 | `body-changed` | 结论之后正文变了，沿用独立 issue 的判法 |
+| `base-not-default` | 已合并的 PR 都合在**非默认分支**上（比如集成分支），等合入默认分支再验 |
+| `base-unknown` | 关联 PR 的目标分支字段没取到，保守跳过（下一拍再查） |
 
 父 issue 不在同一次盘点清单里时，父状态留空：不把「没看到父节点」当成正在验收或已经覆盖。结论之后的争议裁决、lead 交接等待，也沿用独立 issue 的判法。总 issue（`kind: 'parent'`）和独立 issue（`kind: 'standalone'`）的触发判定不变。
 
@@ -497,6 +499,26 @@ node watchers/acceptance/bin/poll.mjs --json
 ```
 
 输出里 `kind` 为 `child` 的条目数，就是这一拍会开轮的子 issue 数。
+
+### 关联 PR 的目标分支（临时防护）
+
+验收轮的代码是宿主按**默认分支**检出的（`host/prefetch.mjs` 固定取 `refs/remotes/origin/main`）。feature PR 先合到集成分支（`integration/…`）、之后才随集成分支合回默认分支时，按默认分支验会把还没进默认分支的改动判成「要修」，再开一张修正子单——整条链都是误报。所以触发判定里加了一道临时防护：**关联 PR 的目标分支不是仓库默认分支就不进验收**。
+
+- 数据从哪来：`bin/tasks.mjs` 的盘点查询自己的 `closedByPullRequestsReferences` 多取一个 `baseRefName`，`issue.repository` 多取一个 `defaultBranchRef { name }`。两者一个是标量、一个是单对象，**不新增 connection**，每拍盘点请求数不变（点数 = 请求数 × `GRAPHQL_COST_PER_REQUEST`，所以点数也不变）。
+- 默认分支：用盘点里的 `defaultBranchRef.name`；取不到才退回 `main`。默认分支不叫 main 的仓按它自己的默认分支判。
+- 判定只看一件事：**有没有一个已经合入默认分支的 PR**。有就照常验（其余 PR 不拦）；一个都没有、且都是已知的非默认分支，返回 `base-not-default`；一个都没有、目标分支又全取不到，返回 `base-unknown`（宁可不验，也不拿错分支的代码开出「要修」）。
+- 总 issue：任一子单已合并的 PR 全都不在它自己仓的默认分支上时，总 issue 也不验（`base-not-default`，返回里带 `child`）。子单的 PR 目标分支来自同一份盘点里那个子单自己的工作节点，不额外发请求；盘点里没有这个子单（比如关闭时间早于 `startAt`）时不拦——拦了会把老总 issue 永久卡住。
+- 后果：不认领、不写轮次评论、不开修正子单，也不写 GitHub。已有的轮次记录不变；**非默认分支上的后续合并（含要修之后的修复 PR）都不会再触发复验**，因为代码不在默认分支上，复验必然误判。
+- 记录处：`<home>/state/host/loop.log` 一行一条，`kind` 就是 reason，不新增通知、不新增 GitHub 调用：
+
+```
+2026-11-10T08:50:26.000Z base-not-default issue=example-org/sample-repo#12 default=main base=integration/sample-feature prs=example-org/sample-repo#13@integration/sample-feature 验收机只按默认分支验代码，等合入默认分支后再验
+2026-11-10T08:50:26.000Z base-unknown issue=example-org/sample-repo#14 default=main base=unknown prs=example-org/sample-repo#15@unknown 验收机只按默认分支验代码，等合入默认分支后再验
+```
+
+手工排查也可以直接用只读盘点：`node watchers/acceptance/bin/poll.mjs --json --with-inventory` 的 `baseSkipped`（数组，每条带 `issue`、`reason`、`base`、`defaultBranch`、`prs`、`message`），或者 `node watchers/acceptance/bin/round.mjs start --issue <owner/repo#n>` 的 stderr（退出码 3）。
+
+这是临时防护：它选择「先不验」，不是「换成分支验」。按关联 PR 的目标分支检出并验收（或明确改为等合入默认分支再验的长期方案）由后续任务决定。修正轮（`host/prbot.mjs`）不受影响：修正 PR 的 base 只能是默认分支（写闸拦其它 base），不会出现「修正 PR 合到集成分支」这种组合。
 
 ## 5. 提醒与通知的分工
 
