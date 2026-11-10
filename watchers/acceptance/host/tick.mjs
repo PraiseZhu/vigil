@@ -12,6 +12,14 @@ import { runRound as runRoundCommand } from '../bin/round.mjs';
 import { appendAlert, hostPaths, isAlive, readAlerts, readLockPayload } from './paths.mjs';
 import { run as procRun, spawnBackground } from './proc.mjs';
 import { MAX_ROUNDS, readHostConfig, serialLockFiles } from './round.mjs';
+import {
+  STALE_ROOT_STATE_FILE,
+  digestDay,
+  readStaleRootState,
+  selectDueStaleRoots,
+  staleRootDigest,
+  writeStaleRootState,
+} from '../bin/stale-root.mjs';
 import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbot.mjs';
 import { clearStarted, readPrbotWait, rememberFound, starvedIssues, writePrbotWait } from './prbot-wait.mjs';
 import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
@@ -955,6 +963,40 @@ export async function runTick({
         heartbeat.lastTick.adjudicate = { started: scheduled.started, skipped: scheduled.skipped };
       } catch (error) {
         heartbeat.lastTick.adjudicateError = String(error?.message || error);
+      }
+    }
+
+    // 3c-2. 老根单每日汇总（#62）：开着超过 7 天、从来没进过验收的根 issue 每天报一次，只进摘要。
+    //     数据全用这一拍盘点已经在手里的任务清单，不额外读 GitHub、不写看板、不发实时通知。
+    //     自己 try/catch：报不了只记心跳，不让这一拍失败。
+    if (Array.isArray(inventoryTasks)) {
+      try {
+        const digestProfile = loadAcceptanceProfile({ ...env, ACCEPTANCE_WATCHER_HOME: home });
+        const nowMs = now();
+        const day = digestDay(nowMs);
+        if (!day) throw new Error('这一拍的时间读不出来，没法按日去重');
+        const rows = staleRootDigest(inventoryTasks, { nowMs, profile: digestProfile });
+        const file = path.join(paths.hostDir, STALE_ROOT_STATE_FILE);
+        const state = readStaleRootState(file);
+        const { due, next } = selectDueStaleRoots(rows, state, day);
+        for (const row of due) {
+          appendAlert(paths, {
+            kind: 'stale-root',
+            issue: row.ref,
+            reason: row.text,
+            detail: row.url || undefined,
+            url: row.url || undefined,
+            repo: row.repo || undefined,
+            ageDays: row.ageDays,
+            now,
+          });
+        }
+        if (due.length > 0 || JSON.stringify(next) !== JSON.stringify(state.days)) {
+          writeStaleRootState(file, { days: next });
+        }
+        heartbeat.lastTick.staleRoots = { candidates: rows.length, reported: due.length };
+      } catch (error) {
+        heartbeat.lastTick.staleRootsError = String(error?.message || error);
       }
     }
   } catch (error) {

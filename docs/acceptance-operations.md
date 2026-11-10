@@ -554,6 +554,21 @@ node watchers/acceptance/bin/poll.mjs --json
 `adjudicate-failed`、`adjudicate-timeout`、`adjudicate-needs-human`、`adjudicate-not-configured`；
 Slack 自己的 `slack-failed`（重试用完）、`slack-history-failed`（读频道历史失败）。
 
+### 老根单每日汇总（#62）
+
+开着超过 7 天、从来没进过验收（没有任何轮次记录）的根 issue（`kind` 为 `parent` / `standalone`，没有可信父 issue），
+如果这一拍 `shouldTrigger()` 也不触发（最常见是 `no-merged-pr`：没有已合并的 PR），它不会自己动，也不会出现在别处。
+这类单子由 `host/tick.mjs` 每拍算一遍（数据只用盘点已经在手里的任务清单，**不额外读 GitHub、不写看板**），
+按本机日期去重后写一条 `kind: 'stale-root'` 到 `alerts.jsonl`：`issue`、`reason`（人话，例如「没有已合并的 PR，
+验收机不会自动开始验收」）、`url`（完整 issue 链接）、`ageDays`。
+
+- **只进摘要，不发即时通知**：`kind: 'stale-root'` 不在 ping / 中断类名单里，走摘要那条路（最多每 60 分钟一条，摘要永不 @），
+  摘要行带单号、完整链接和原因；不新增实时告警路径。
+- **同一个 issue 每个本机日只报一次**：状态记在 `state/host/stale-root-digest.json`（`{version, days: {ref: 'YYYY-MM-DD'}}`）。
+  不再符合条件的（已有 PR 合并、已关单、已进过验收）从状态里删掉，之后重新符合条件可以当天再报一次。
+- **阀值**：严格超过 7×24 小时（正好 7 天不报）；已关闭、有父的子 issue、已有轮次记录、这一拍就会触发的不报。
+- 心跳里带 `lastTick.staleRoots: {candidates, reported}`；这一步自己出错只写 `lastTick.staleRootsError`，不影响这一拍。
+
 ## 6. 上线顺序
 
 1. **写配置**：`<home>/config/profile.json`（照 [`config/examples/acceptance.profile.example.json`](../config/examples/acceptance.profile.example.json)）
