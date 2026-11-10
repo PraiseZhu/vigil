@@ -242,6 +242,8 @@ function toChildTask(issue, profile, ranked, repo, byKey) {
     fork: ranked.fork,
     state: 'closed',
     closedAt: issue.closedAt || null,
+    // 认领顺序的第二个键（#62）：同优先级档里 issue 建得早的先。拿不到就当没有，排序时排到同档最后。
+    createdAt: issue.createdAt || null,
     url: issue.url,
     nodeId: issue.id,
     body: issue.body || '',
@@ -335,6 +337,8 @@ function toRootTask(issue, profile, ranked, repo, byKey) {
     fork: ranked.fork,
     state: issue.state === 'CLOSED' ? 'closed' : 'open',
     closedAt: issue.closedAt || null,
+    // 认领顺序的第二个键（#62）：同优先级档里 issue 建得早的先。拿不到就当没有，排序时排到同档最后。
+    createdAt: issue.createdAt || null,
     url: issue.url,
     nodeId: issue.id,
     body: issue.body || '',
