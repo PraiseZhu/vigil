@@ -26,6 +26,7 @@ import { optionalConfig, requireConfig } from './profile.mjs';
 import { triageText } from './mivo-ci-triage.mjs';
 import { collectMivoCiSteps } from './mivo-ci.mjs';
 import { superviseCodeqlInfra, codeqlInfraCheckDue } from './mivo-codeql-infra.mjs';
+import { superviseCiSelfHeal, heldBySelfHeal, ciSelfHealCheckDue, ciStall, CI_STALL_MS, CI_STALL_NOTICE_MS } from './mivo-ci-selfheal.mjs';
 import { configuredLogin, isViewerOrWatchedBot, WATCHED_BOT_APP } from './mivo-identity.mjs';
 
 // 目标仓库在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
@@ -307,7 +308,9 @@ function failedRequiredCiItems({ pr, ci }) {
 // Optional Actions checks that failed on this head (mivo-ci.mjs failedOptionalActions). Mivo's pre-review gate
 // wants every check green before it sends a PR to review, so these are repaired like required failures.
 function failedOptionalCiItems({ pr, ci }) {
-  if (!ci || ci.status === 'unknown' || !Array.isArray(ci.optional)) return [];
+  // Not gated on the required checks being readable: each item carries its own head-bound evidence, and an unknown
+  // required check beside a red optional one used to hide the only thing there was to repair (2026-11-10).
+  if (!ci || !Array.isArray(ci.optional)) return [];
   return ci.optional.filter((rule) => rule?.status === 'failed' && typeof rule.context === 'string').map((rule) => {
     const evidence = rule.evidence ?? {};
     const checkId = evidence.id ?? null;
@@ -324,6 +327,28 @@ function failedOptionalCiItems({ pr, ci }) {
       contentHash: digest({ context: rule.context, optional: true, status: rule.status, id: checkId, runId, url }),
     };
   });
+}
+
+// Required checks that cannot be read as green, failed or pending although every check on the head finished a while
+// ago (mivo-ci-selfheal.mjs ciStall). Nothing on GitHub changes any more, so without this item no round ever starts.
+function stalledCiItems({ pr, ci, now }) {
+  if (!now) return [];
+  const stall = ciStall({ ci, headSha: pr.headRefOid, now });
+  if (!stall) return [];
+  const lines = stall.rules.map((rule) => `- ${rule.context}: ${rule.reason}`);
+  const triage = { kind: 'stall', check: stall.rules.map((rule) => rule.context).join('、'), step: null,
+    hint: '逐条查清每个必需检查为什么没有成功结论：没跑起来就触发它（gh run rerun <run-id>，或按该 workflow 的触发条件重新触发）；被跳过就处理它依赖的 job；重复或来源不明就在 blocked 里写清证据。不是本 PR 代码引起的不要改代码。' };
+  return [{
+    source: 'ci',
+    actionable: true,
+    stallFailure: { verified: true, status: 'stalled', headSha: pr.headRefOid ?? null, round: stall.round, since: stall.since },
+    nativeId: 'stall',
+    revision: `stalled:${stall.round}`,
+    sha: pr.headRefOid ?? null,
+    body: [`required CI is still unknown after every check on this head finished (last one at ${stall.since}):`, ...lines, triageText(triage)].join('\n'),
+    ciTriage: triage,
+    contentHash: digest({ stall: true, head: pr.headRefOid ?? null, round: stall.round }),
+  }];
 }
 
 function withCategory(item, { headSha } = {}) {
@@ -344,8 +369,9 @@ function withPublisher(item, comment) {
   };
 }
 
-export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci, reviews = [], comments = [], threads = [], mergeable, baseTipOid = null, receiptActor }) {
+export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci, reviews = [], comments = [], threads = [], mergeable, baseTipOid = null, receiptActor, now = null }) {
   const items = [];
+  for (const item of stalledCiItems({ pr, ci, now })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
   for (const item of failedRequiredCiItems({ pr, ci })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
   for (const item of failedOptionalCiItems({ pr, ci })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
   for (const item of codeScanningFeedbackItems({ pr, scanning: ci?.codeScanning })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
@@ -1906,6 +1932,16 @@ export function consumeResult(previous, result, now) {
   };
 }
 
+// CI unknown since CI_STALL_MS ago: nothing changes on GitHub, so the fingerprint never moves; collect in full every
+// CI_STALL_RECHECK_MS so the stall diagnosis (and, later, the notice) can start.
+export const CI_STALL_RECHECK_MS = 15 * 60 * 1000;
+export function ciStallCheckDue(previous, now) {
+  const since = Date.parse(previous?.policyUnknownSince ?? '');
+  if (!Number.isFinite(since) || Date.parse(now) - since < CI_STALL_MS) return false;
+  const last = Date.parse(previous?.scanCheckedAt ?? '');
+  return !Number.isFinite(last) || Date.parse(now) - last >= CI_STALL_RECHECK_MS;
+}
+
 function needsCiRecheck(active) {
   return active?.status === 'waiting-ci'
     || (active?.status === 'blocked' && ['required-ci', 'optional-ci', 'ci-transport'].includes(active.blockedKind));
@@ -2578,7 +2614,15 @@ export function* processPr({
   previous = reconcileReviewRecheck({ entry: previous, snapshot: collected, now });
   const doctor = lifelineFeedback({...pr,...collected.pr,repo:REPO});
   if (doctor.error) events.push({kind:'doctor-source-blocked',number:pr.number,code:doctor.error});
-  const observed = feedbackItems({ pr, ...collected, receiptActor: viewer });
+  // Before any feedback is counted: a run that died on infrastructure, or left a required check skipped behind a
+  // failed job, is re-run here once per head, and its failure is held back from the repair session while the re-run
+  // is out (mivo-ci-selfheal.mjs). A held item keeps its cursor stamp, so it is delivered if the re-run never reports.
+  const selfHeal = yield* superviseCiSelfHeal({ ci: collected.ci, repo: REPO, headSha: pr.headRefOid, state: previous.ciSelfHeal, ghFn, now, dryRun });
+  if (selfHeal.state || previous.ciSelfHeal) { previous = { ...previous, ciSelfHeal: selfHeal.state }; base = { ...base, ciSelfHeal: selfHeal.state }; }
+  if (selfHeal.reran.length) events.push({ kind: 'ci-selfheal-rerun', number: pr.number, head: pr.headRefOid, runs: selfHeal.reran });
+  if (selfHeal.errors.length) events.push({ kind: 'ci-selfheal-rerun-error', number: pr.number, errors: selfHeal.errors });
+  const observed = feedbackItems({ pr, ...collected, receiptActor: viewer, now })
+    .map((item) => heldBySelfHeal(selfHeal.state, item, now) ? { ...item, deferred: true } : item);
   previous = migrateMemberFeedbackCursor(previous, observed);
   const cursorBase = previous.wasDraft === true && !authorPushed
     ? coveredCursor(previous.feedbackCursor, previous.feedbackLedger) : (previous.feedbackCursor || {});
@@ -2655,8 +2699,21 @@ export function* processPr({
   // An unreadable required-check policy is a watcher fault, not a red CI; reaching mergeable is the outcome the
   // author waits for. Both are reported once per transition so they can reach a person.
   const policyUnknown = collected.ci?.status === 'unknown';
+  // The clock belongs to one head: a push starts it again (an entry written before the head was recorded starts now).
+  const unknownSince = policyUnknown && base.policyUnknownSince && base.policyUnknownHead === pr.headRefOid ? base.policyUnknownSince : null;
+  // A check that is still running is not a stall, unless it has been "running" for the whole notice period: a job
+  // waiting for a runner or an approval that long will not finish by itself either.
+  const checksSettled = !(collected.ci?.checks ?? []).some((item) => String(item?.status ?? '').toLowerCase() !== 'completed'
+    && !(Date.parse(now) - (Date.parse(item?.started_at ?? item?.created_at ?? '') || Date.parse(now)) >= CI_STALL_NOTICE_MS));
   if (policyUnknown && !base.policyUnknownSince) {
     events.push({ kind: 'policy-unknown', number: pr.number, reason: String(collected.ci?.reason ?? collected.ci?.policy?.reason ?? '').slice(0, 200) });
+  }
+  // Unknown for this long means the diagnosis rounds are used up (or there was nothing a session could read): a person
+  // hears about it once per head instead of the PR waiting in silence (2026-11-10: 12 hours with no notice).
+  if (unknownSince && checksSettled && Date.parse(now) - Date.parse(unknownSince) >= CI_STALL_NOTICE_MS) {
+    const unknownRules = (collected.ci?.required ?? []).filter((rule) => rule.status === 'unknown').map((rule) => `${rule.context}: ${rule.reason ?? 'unknown'}`);
+    queueHumanNotice(paths.home, { kind: 'ci-stalled', number: pr.number, url: pr.url, head: pr.headRefOid, since: unknownSince,
+      checks: unknownRules.length ? unknownRules : [String(collected.ci?.reason ?? collected.ci?.policy?.reason ?? 'required-policy-unknown').slice(0, 200)] }, dryRun);
   }
   previous = {
     // `base` predates the auto-close step above; carry its receipt forward explicitly
@@ -2671,7 +2728,8 @@ export function* processPr({
     admissionVerified: admitted, admissionReason: collected.admissionReason ?? previous.admissionReason ?? null,
     admissionEpoch: admitted ? collected.pr?.releaseEpoch ?? previous.admissionEpoch : null,
     eligibilityInitialized: true, wasDraft: false,
-    policyUnknownSince: policyUnknown ? (base.policyUnknownSince ?? now) : null,
+    policyUnknownSince: policyUnknown ? (unknownSince ?? now) : null,
+    policyUnknownHead: policyUnknown ? pr.headRefOid : null,
     codeScanningStatus: collected.ci?.codeScanning?.status ?? null,
     scanCheckedAt: now,
   };
@@ -2703,7 +2761,11 @@ export function* processPr({
       }
     } catch (error) {
       // A transport failure is not a new agent task or proof of completion.
-      previous = { ...previous, lastRecheckError: { at: now, message: String(error.message).slice(0, 400) } };
+      // The helper's own words are on stderr; error.message is only the command line (2026-11-11: 33 PRs carried a
+      // recheck error that named no cause).
+      const detail = String(error.stderr ?? '').trim().split('\n').slice(-6).join('\n').slice(-600);
+      previous = { ...previous, lastRecheckError: { at: now, message: detail || String(error.message).slice(-400),
+        ...(error.killed || error.code === 'ETIMEDOUT' ? { timedOut: true } : {}) } };
       if (deadline-clock()<1000) state.scan={...state.scan,cursor:resumeCursor,deferredNumber:pr.number};
     }
   }
@@ -3348,7 +3410,9 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
     && !keelReopenDue && !intentMigrationDue && !escalateDue && !ciUnknownRecheckDue(previous, paths, now)
     && !conflictDispatchDue({ previous, snapshot: normalized, now })
     && !pendingActionDue(previous) && !scanRecheckDue(previous, now) && !baseSyncRetryDue(previous, now)
-    && !codeqlInfraCheckDue({ previous, snapshot: normalized, now, intervalMs: CI_UNKNOWN_RECHECK_MS });
+    && !codeqlInfraCheckDue({ previous, snapshot: normalized, now, intervalMs: CI_UNKNOWN_RECHECK_MS })
+    && !ciSelfHealCheckDue({ previous, snapshot: normalized, now, intervalMs: CI_UNKNOWN_RECHECK_MS })
+    && !ciStallCheckDue(previous, now);
 }
 
 // Only near the retry time: a PR that left the sync path before it (back to Draft, opted out) keeps the old value,
