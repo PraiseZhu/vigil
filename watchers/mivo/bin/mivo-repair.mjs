@@ -1939,18 +1939,46 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
 
 // Only what a session cannot settle itself blocks; product questions and untrue feedback are answered in the session.
 export const BLOCKED_KINDS = new Set(['external']);
+// A session that stops because the PR moved under it (the author or another session pushed, the handoff was replaced)
+// is not stuck on anything a person has to solve: the watcher judges the PR again from where it is now. Two weeks of
+// runs had 39 such rounds reported as `external`, each with a notice (2026-11-11). The kind is not the session's to
+// choose: it is read from the same ownership check the session ran, by the words this helper itself fails with.
+export const MOVED_BLOCK_KINDS = new Set(['stale-head', 'ownership-moved']);
+// `blocked` is also the way out when GitHub itself is failing, so the classification costs one read at most and any
+// failure of it leaves the kind the session gave. The handoff is compared from local state; the head from one PR view.
+// A head this dispatch pushed itself (a bound result with pushed:true on that head) is not a stale head.
+export function movedBlockKind({ paths, task, entry, ghFn = command } = {}) {
+  try {
+    const receipt = task.handoff;
+    const keys = ['version', 'id', 'repo', 'number', 'nodeId', 'head', 'releaseEpoch', 'author'];
+    if (entry?.activeTask?.blockedKind === AUTHOR_RECLAIMED) return 'ownership-moved';
+    // A handoff replaced on GitHub that this machine has not recorded yet is not seen here (that needs the timeline
+    // reads); the block then stays `external` for that one round and the watcher redispatches after its next poll.
+    if (!receipt || !entry?.handoff || keys.some((key) => receipt[key] !== entry.handoff[key]) || receipt.releaseEpoch !== task.releaseEpoch) return 'ownership-moved';
+    const pr = ghJson(['pr', 'view', String(task.number), '--repo', task.repo, '--json', 'state,isDraft,headRefOid'], ghFn);
+    if (pr.state !== 'OPEN' || pr.isDraft === true) return 'ownership-moved';
+    if (!isSha(pr.headRefOid) || pr.headRefOid === task.headRefOid) return null;
+    const file = path.join(paths.results, `${task.dispatchId}.json`);
+    if (fs.existsSync(file)) {
+      const result = readJson(file, 'repair result');
+      if (result?.dispatchId === task.dispatchId && result.pushed === true && result.head === pr.headRefOid) return null;
+    }
+    return 'stale-head';
+  } catch { return null; }
+}
 export function blocked({ home, taskPath, reason, kind = 'external', ghFn = command } = {}) {
   if (!BLOCKED_KINDS.has(kind)) fail(`blocked --kind must be one of ${[...BLOCKED_KINDS].join(', ')}, got ${JSON.stringify(kind)}`);
   const { paths, task } = taskFrom(home, taskPath);
   recordActivity(paths, task, 'blocked');
-  const { sessionId } = boundSession(paths, task);
+  const { sessionId, entry } = boundSession(paths, task);
   if (typeof reason !== 'string' || !reason.trim()) fail('blocked reason is required');
   if (isValidateFailureReason(reason) && !hasValidationReceipt(paths, task)) {
     fail('本轮还没有 validate 收据：以 validate/preflight 失败为由停下前，先运行同一 helper validate --validated-head <完整SHA>，以本轮结果为准（helper 会复用通过收据、按基线判定 main 自身的失败）。若是环境/工具故障（如 pathspec、submodule、worktree HEAD），在 reason 里写明具体故障。');
   }
   const validationBlock = latestFailedValidation(paths, task);
+  const moved = movedBlockKind({ paths, task, entry, ghFn });
   return saveResult(paths, task, sessionId, {
-    status: 'blocked', blockedKind: kind, reason: reason.trim(),
+    status: 'blocked', blockedKind: moved ?? kind, reason: reason.trim(),
     head: task.headRefOid, worktree: taskWorktree(task), ...(validationBlock ? { validationBlock } : {}),
   });
 }
