@@ -278,13 +278,13 @@ function toTask(issue, profile, byKey) {
     // #363：open 子 issue 里只有「验收机走过一轮、最后结论要修、此后修正子已关或正文已改」这一类放回根任务路径。
     // 其余 open 子 issue 和以前一样丢弃。
     if (issue.state !== 'OPEN') return null;
-    const reaccept = toRootTask(issue, profile, ranked, repo);
+    const reaccept = toRootTask(issue, profile, ranked, repo, byKey);
     return openChildReaccepts(reaccept, profile) ? reaccept : null;
   }
   if (issue.state === 'CLOSED' && issue.closedAt && Date.parse(issue.closedAt) < Date.parse(profile.startAt)) {
     return null;
   }
-  return toRootTask(issue, profile, ranked, repo);
+  return toRootTask(issue, profile, ranked, repo, byKey);
 }
 
 /**
@@ -301,7 +301,7 @@ function openChildReaccepts(task, profile) {
 }
 
 /** 根任务形状（standalone / parent）：收哪些字段、怎么算轮次都在这里，open 子 issue 放行后复用同一份。 */
-function toRootTask(issue, profile, ranked, repo) {
+function toRootTask(issue, profile, ranked, repo, byKey) {
   const ownerChildren = (issue.subIssues?.nodes || []).filter((child) =>
     isTrustedAuthor(child.author, profile),
   );
