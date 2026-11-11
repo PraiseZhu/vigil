@@ -36,6 +36,7 @@ test('a block is classified from local handoff state and one PR read', (t) => {
   const replaced = classify(t, { entry: { handoff: { ...task.handoff, id: 'h2' } } });
   assert.equal(replaced.kind, 'ownership-moved');
   assert.equal(replaced.calls.length, 0, 'a replaced handoff needs no GitHub read');
+  assert.equal(classify(t, { entry: {} }).kind, 'ownership-moved', 'no handoff on record');
 });
 
 test('a head this dispatch pushed itself is not a stale head; a failing GitHub read changes nothing', (t) => {

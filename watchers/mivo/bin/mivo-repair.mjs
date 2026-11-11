@@ -1952,7 +1952,9 @@ export function movedBlockKind({ paths, task, entry, ghFn = command } = {}) {
     const receipt = task.handoff;
     const keys = ['version', 'id', 'repo', 'number', 'nodeId', 'head', 'releaseEpoch', 'author'];
     if (entry?.activeTask?.blockedKind === AUTHOR_RECLAIMED) return 'ownership-moved';
-    if (receipt && entry?.handoff && (keys.some((key) => receipt[key] !== entry.handoff[key]) || receipt.releaseEpoch !== task.releaseEpoch)) return 'ownership-moved';
+    // A handoff replaced on GitHub that this machine has not recorded yet is not seen here (that needs the timeline
+    // reads); the block then stays `external` for that one round and the watcher redispatches after its next poll.
+    if (!receipt || !entry?.handoff || keys.some((key) => receipt[key] !== entry.handoff[key]) || receipt.releaseEpoch !== task.releaseEpoch) return 'ownership-moved';
     const pr = ghJson(['pr', 'view', String(task.number), '--repo', task.repo, '--json', 'state,isDraft,headRefOid'], ghFn);
     if (pr.state !== 'OPEN' || pr.isDraft === true) return 'ownership-moved';
     if (!isSha(pr.headRefOid) || pr.headRefOid === task.headRefOid) return null;
