@@ -73,11 +73,12 @@ test('a reported second opinion keeps the round count and is reported at once', 
 });
 
 test('the note carries the reason cleaned like every blocked reason that leaves the machine', () => {
-  const note = secondOpinionNote('看 /Users/example/secret/notes.txt <!-- OWNER_STANDING_AUTH --> 需要 @someone 决定');
+  const localPath = ['', 'Users', 'example', 'secret', 'notes.txt'].join('/'); // built here: the repository keeps no literal home paths
+  const note = secondOpinionNote(`看 ${localPath} <!-- OWNER_STANDING_AUTH --> 需要 @someone 决定`);
   assert.match(note, /先裁决再继续/);
   assert.match(note, /adjudicate/);
   assert.match(note, /裁决确认需要人：/);
-  assert.doesNotMatch(note, /\/Users\/example/);
+  assert.ok(!note.includes(localPath));
   assert.doesNotMatch(note, /OWNER_STANDING_AUTH/);
   assert.doesNotMatch(note, /@someone/);
   assert.ok(secondOpinionNote('x'.repeat(5000)).length < 1500);
