@@ -86,3 +86,14 @@ export function optionalConfigStrict(key, { envVar, env = process.env, fallback 
   if (profile && Object.hasOwn(profile, key)) return profile[key];
   return fallback;
 }
+
+/**
+ * 推送前自审试点的开关（默认关）。只接受布尔值或 true/false/1/0 字符串；其它值报错并写明字段名，
+ * 不把写错的值悄悄当成关。
+ */
+export function preflightSelfReviewEnabled(env = process.env) {
+  const value = optionalConfigStrict('preflightSelfReview', { envVar: 'MIVO_PREFLIGHT_SELF_REVIEW', env, fallback: false });
+  if (value === true || value === 'true' || value === '1') return true;
+  if (value === false || value === 'false' || value === '0') return false;
+  throw new Error(`配置「preflightSelfReview」（环境变量 MIVO_PREFLIGHT_SELF_REVIEW）必须是 true 或 false，实际是 ${JSON.stringify(value)}`);
+}

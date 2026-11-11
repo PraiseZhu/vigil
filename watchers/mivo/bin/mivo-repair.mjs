@@ -14,7 +14,7 @@ import { isCurrentHandoff } from './mivo-handoff.mjs';
 import { createPushHooks } from './mivo-pre-push.mjs';
 import { taskRepairPolicy, TRIAGE_REASONS } from './mivo-feedback-policy.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, readPr, writePr } from './mivo-state.mjs';
-import { optionalConfig, requireConfig } from './profile.mjs';
+import { optionalConfig, requireConfig, preflightSelfReviewEnabled } from './profile.mjs';
 import { acquireValidationSlot, runStreaming, validationConfig } from './mivo-validation-runtime.mjs';
 import { compareBaseline, verifyBaselineBinding } from './mivo-validation-baseline.mjs';
 import { configuredLogin, configuredUserId } from './mivo-identity.mjs';
@@ -996,8 +996,24 @@ export function validateScs(report, task) {
   return { scs: checked, feedbackCoverage: { mode: expected.size ? 'task-feedback' : 'legacy-empty', requiredKeys: [...expected], coveredKeys: [...covered], dispositions, complete: true }, workers: Array.isArray(report) ? null : validateWorkers(report?.workers) };
 }
 
+// Pilot (preflightSelfReview, off by default): a round that changed code must say that it reviewed its own diff.
+// Only the record is checked here; what the review found is the session's to act on.
+export function validateSelfReview(report, { enabled = preflightSelfReviewEnabled() } = {}) {
+  if (!enabled) return null;
+  const scs = Array.isArray(report) ? report : report?.scs;
+  if (!Array.isArray(scs) || !scs.some((sc) => sc?.status === 'pass')) return null; // nothing was changed
+  const record = Array.isArray(report) ? undefined : report?.selfReview;
+  const whole = (value) => Number.isInteger(value) && value >= 0;
+  const ok = record && typeof record === 'object' && [1, 2].includes(record.passes) && whole(record.found) && whole(record.fixed) && record.fixed <= record.found;
+  if (!ok) fail(`[SELF_REVIEW_MISSING] this round changed code and preflightSelfReview is on (expected: selfReview:{passes:1|2,found:n,fixed:m} with m<=n at the top of the SC report; actual: ${JSON.stringify(record ?? null)})`);
+  return { passes: record.passes, found: record.found, fixed: record.fixed };
+}
+
 function loadScs(scReport, task) {
-  return validateScs(readJson(requireAbs(scReport, 'sc-report'), 'SC report'), task);
+  const report = readJson(requireAbs(scReport, 'sc-report'), 'SC report');
+  const checked = validateScs(report, task);
+  const selfReview = validateSelfReview(report);
+  return selfReview ? { ...checked, selfReview } : checked;
 }
 
 function rejectSkip(env = process.env) {

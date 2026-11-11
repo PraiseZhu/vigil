@@ -22,7 +22,7 @@ import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue
 import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath, findingMarkerOf, childPrListArgs, parseOpenChildPrs, childPrDraftPaths, childPrHandoffSpec, CHILD_PR_PLACEHOLDER } from './mivo-repair.mjs';
 import { PARSER_VERSION, canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
-import { optionalConfig, requireConfig } from './profile.mjs';
+import { optionalConfig, requireConfig, preflightSelfReviewEnabled } from './profile.mjs';
 import { triageText } from './mivo-ci-triage.mjs';
 import { collectMivoCiSteps } from './mivo-ci.mjs';
 import { superviseCodeqlInfra, codeqlInfraCheckDue } from './mivo-codeql-infra.mjs';
@@ -1010,6 +1010,9 @@ export const WORKER_RULE = [
   '每个 Worker 交回结论后立即 archive_worker。SC JSON 里用 workers:[{purpose:"review"|"e2e"|"consult"|"adjudicate",agent,model,effort,providerId,workerId,verdict}] 记下本轮开过的每个 Worker，adjudicate 另带 rulings；helper 会拒绝超过 2 个顾问或顾问用 max/ultra 的报告。',
 ].join('');
 export const SIBLING_FIX_RULE = '对每条要修的 P0/P1/P2：检查同一函数及其调用方有没有同类问题，并一并修掉。同类问题联动修复不得突破允许路径和本 PR 范围。';
+// Pilot, off unless preflightSelfReview is set (2026-11-11): one PR took 25 rounds because the reviewer found about two
+// new findings in each round's own changes. The session reviews its own diff by the same standard before it pushes.
+export const SELF_REVIEW_RULE = '推送前自审（试点）：改完代码、运行 validate 之前，按上面的统一分级标准把本轮自己的改动审一遍——范围只限 git diff <任务 head>..HEAD，不审 PR 里本轮没动的部分。只找本轮改动引入的 P0/P1/P2，只修确认成立的；P3 不修，不借机扩大改动。修过就再审一遍，最多 2 遍。在 SC JSON 顶层写 selfReview:{passes:<1 或 2>,found:<发现的 P0–P2 条数>,fixed:<修掉的条数>}；本轮没有改代码就不写。';
 export const TEST_DOC_RULE = '测试、文档类意见直接修，不争、不开裁决：凡是指向测试文件、docs/ 或 *.md、本 PR 交接文件、PR 正文，或审查机类别属于测试/覆盖率/验证记录/交接的 P0/P1/P2，一律动手修（补或改测试，或如实改文档、验收写法、PR 正文），记 SC=pass。唯一例外：审查看的是旧 head，之后已有提交修掉了，在 evidence 写一行「already-fixed: <该提交 SHA>」，helper 会核对它在当前 HEAD 里且晚于审查的 head；否则 helper 拒收这类 no-change。';
 export function repeatFindingRule(repeat = []) {
   if (!repeat.length) return '';
@@ -1042,6 +1045,7 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       severityRule(),
       SIBLING_FIX_RULE,
       TEST_DOC_RULE,
+      ...(repairPolicy.canChangeCode && preflightSelfReviewEnabled() ? [SELF_REVIEW_RULE] : []),
       ...(repeatFindings.length ? [repeatFindingRule(repeatFindings)] : []),
       handledFindingsSummary(handledFindings),
       repairPolicy.canChangeCode ? 'OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY' : 'OWNER_STANDING_AUTH: NO_CODE_NO_PUSH_NO_EXTERNAL_REPLY',
