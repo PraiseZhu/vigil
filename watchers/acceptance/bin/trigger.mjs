@@ -241,8 +241,16 @@ export function shouldTrigger(task, { now, profile }) {
 
   if (task.kind === 'child') return childDecision(task, { now, profile, f, dispute });
 
+  // 重验任务（#363）带的是父 issue 的轮次：父还在验，子不能另开一轮。parent / standalone 都拦。
+  if (task.parentLatestStatus === '验收中') return { trigger: false, reason: 'parent-in-progress' };
+
   if (isParent) {
     if ((task.children || []).some(childOpen)) return { trigger: false, reason: 'children-open' };
+    const ownMerged = (task.linkedPrs || []).filter((pr) => pr.mergedAt);
+    if (ownMerged.length) {
+      const ownBase = mergedBaseDecision(ownMerged, task.defaultBranch);
+      if (!ownBase.ok) return blockedByBase(ownBase);
+    }
     const baseBlock = parentBaseBlock(task);
     if (baseBlock) return baseBlock;
     if (awaitingLeadHandoff(task, f, now(), latestMs((task.children || []).map((child) => child.closedAt)))) {

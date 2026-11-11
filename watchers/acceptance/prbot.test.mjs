@@ -6,11 +6,12 @@ import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion } from './bin/rounds.mjs';
 import { collectTasks } from './bin/tasks.mjs';
-import { hostPaths } from './host/paths.mjs';
+import { hostPaths, readAlerts } from './host/paths.mjs';
 import { appendPrbotEvent, readPrbotEvents } from './host/prbot-events.mjs';
 import {
   MAX_REFIX,
   READY_STALL_MS,
+  REACCEPT_TREE_MIN_MS,
   beijingIso,
   handoffFor,
   preflightCommands,
@@ -78,7 +79,15 @@ function inventoryNode(world, ref) {
         repository: { nameWithOwner: world.requireIssue(childRef).repo },
       })),
     },
-    closedByPullRequestsReferences: { nodes: [] },
+    closedByPullRequestsReferences: {
+      nodes: (issue.prs || []).map((pr) => ({
+        number: pr.number,
+        url: pr.url,
+        mergedAt: pr.mergedAt || null,
+        baseRefName: pr.baseRefName || 'main',
+        repository: { nameWithOwner: issue.repo },
+      })),
+    },
     comments: {
       nodes: issue.comments.map((comment) => ({
         id: comment.id,
@@ -1702,4 +1711,360 @@ test('#247 SC1 传了任务清单就不再发盘点查询；没传才自己拉',
     0,
     '这一拍已经盘点过，不再发全量盘点',
   );
+});
+
+test('#363 SC10 已验过要修、未挂载的 open 修正子也能被 discoverCorrections 发现', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const world = createWorld();
+  const root = world.addIssue({ number: 1, body: 'root', title: '总任务' });
+  world.addComment(
+    root.ref,
+    roundComment({
+      round: 1,
+      status: '要修',
+      bodyVersion: bodyVersion('root'),
+      startedAt: '2026-10-21T00:00:00.000Z',
+      finishedAt: '2026-10-22T00:00:00.000Z',
+      updatedAt: '2026-10-22T00:00:00.000Z',
+    }),
+  );
+  const child = world.addIssue({ number: 2, body: 'body v1', title: '子任务', parent: root.ref });
+  world.addChild(root.ref, child.ref);
+  world.addComment(
+    child.ref,
+    roundComment({
+      round: 2,
+      status: '要修',
+      bodyVersion: bodyVersion('body v1'),
+      startedAt: '2026-10-23T00:00:00.000Z',
+      finishedAt: '2026-10-23T12:00:00.000Z',
+      updatedAt: '2026-10-23T12:00:00.000Z',
+    }),
+  );
+  const correction = world.addIssue({
+    number: 9,
+    title: '修正：子任务 SC1',
+    body: `[验收机] 修正 · 总 ${REPO}#2 · 项 ${REPO}#2 SC1 · 第 2 轮`,
+  });
+
+  const github = {
+    async graphql(query, variables) {
+      if (query.includes('user(login')) {
+        return {
+          user: {
+            open: {
+              nodes: [inventoryNode(world, root.ref), inventoryNode(world, child.ref), inventoryNode(world, correction.ref)],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+            closed: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        };
+      }
+      return world.graphql({ query, variables });
+    },
+  };
+
+  const tasks = await collectTasks(github, profile);
+  assert.ok(tasks.some((task) => task.ref === child.ref), `期望收集到 ${child.ref}，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  const found = await discoverCorrections({ github, profile, tasks });
+  assert.deepEqual(found.map((entry) => entry.issue), [correction.ref]);
+  assert.equal(found[0].root, child.ref);
+  assert.equal(found[0].sc, 1);
+});
+
+test('#363 SC11 新收集的重验任务拉任务树有限频，间隔内第二次不读', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const world = createWorld();
+  const root = world.addIssue({ number: 1, body: 'root', title: '总任务' });
+  const child = world.addIssue({ number: 2, body: 'body v1', title: '子任务', parent: root.ref });
+  world.addChild(root.ref, child.ref);
+  world.addComment(
+    child.ref,
+    roundComment({
+      round: 1,
+      status: '要修',
+      bodyVersion: bodyVersion('body v1'),
+      startedAt: '2026-10-21T00:00:00.000Z',
+      finishedAt: '2026-10-22T00:00:00.000Z',
+      updatedAt: '2026-10-22T00:00:00.000Z',
+    }),
+  );
+  let treeReads = 0;
+  const github = {
+    async graphql(query, variables) {
+      if (query.includes('user(login')) {
+        return {
+          user: {
+            open: {
+              nodes: [inventoryNode(world, root.ref), inventoryNode(world, child.ref)],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+            closed: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        };
+      }
+      treeReads += 1;
+      return world.graphql({ query, variables });
+    },
+  };
+  const tasks = await collectTasks(github, profile);
+  const reaccept = tasks.find((task) => task.ref === child.ref);
+  assert.ok(reaccept);
+  assert.equal(reaccept.kind, 'standalone');
+  assert.equal(reaccept.parentRef, root.ref);
+  treeReads = 0;
+  const t0 = Date.parse('2026-10-24T00:00:00.000Z');
+  await discoverCorrections({ github, profile, tasks, home, now: () => t0 });
+  const firstReads = treeReads;
+  assert.ok(firstReads > 0, '首次仍拉任务树');
+  treeReads = 0;
+  await discoverCorrections({ github, profile, tasks, home, now: () => t0 + 60_000 });
+  assert.equal(treeReads, 0, '间隔内不重复拉');
+  treeReads = 0;
+  await discoverCorrections({ github, profile, tasks, home, now: () => t0 + REACCEPT_TREE_MIN_MS });
+  assert.equal(treeReads, firstReads, '间隔外再拉一次');
+});
+
+test('#363 SC11 限频时间戳在未来时当过期，照常拉树', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const world = createWorld();
+  const root = world.addIssue({ number: 1, body: 'root', title: '总任务' });
+  const child = world.addIssue({ number: 2, body: 'body v1', title: '子任务', parent: root.ref });
+  world.addChild(root.ref, child.ref);
+  world.addComment(
+    child.ref,
+    roundComment({
+      round: 1,
+      status: '要修',
+      bodyVersion: bodyVersion('body v1'),
+      startedAt: '2026-10-21T00:00:00.000Z',
+      finishedAt: '2026-10-22T00:00:00.000Z',
+      updatedAt: '2026-10-22T00:00:00.000Z',
+    }),
+  );
+  let treeReads = 0;
+  const github = {
+    async graphql(query, variables) {
+      if (query.includes('user(login')) {
+        return {
+          user: {
+            open: {
+              nodes: [inventoryNode(world, root.ref), inventoryNode(world, child.ref)],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+            closed: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        };
+      }
+      treeReads += 1;
+      return world.graphql({ query, variables });
+    },
+  };
+  const tasks = await collectTasks(github, profile);
+  const stampDir = path.join(hostPaths(home).prbotDir, 'reaccept-tree');
+  fs.mkdirSync(stampDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(
+    path.join(stampDir, 'example-owner__example-repo__2.json'),
+    JSON.stringify({ at: '2099-01-01T00:00:00.000Z' }),
+  );
+  treeReads = 0;
+  await discoverCorrections({
+    github,
+    profile,
+    tasks,
+    home,
+    now: () => Date.parse('2026-10-24T00:00:00.000Z'),
+  });
+  assert.ok(treeReads > 0, '未来时间戳不能把任务永久跳过');
+});
+
+test('#363 SC11 写限频状态失败不抛，其他任务照常发现', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const world = createWorld();
+  const root = world.addIssue({ number: 1, body: 'root', title: '总任务' });
+  const child = world.addIssue({ number: 2, body: 'body v1', title: '子任务', parent: root.ref });
+  world.addChild(root.ref, child.ref);
+  world.addComment(
+    child.ref,
+    roundComment({
+      round: 1,
+      status: '要修',
+      bodyVersion: bodyVersion('body v1'),
+      startedAt: '2026-10-21T00:00:00.000Z',
+      finishedAt: '2026-10-22T00:00:00.000Z',
+      updatedAt: '2026-10-22T00:00:00.000Z',
+    }),
+  );
+  const closed = world.addIssue({
+    number: 3,
+    body: 'closed child',
+    title: '已关闭子任务',
+    state: 'closed',
+    closedAt: '2026-10-23T00:00:00.000Z',
+    parent: root.ref,
+    prs: [{ number: 20, url: 'https://example.test/pull/20', mergedAt: '2026-10-22T00:00:00.000Z' }],
+  });
+  world.addChild(root.ref, closed.ref);
+  world.addComment(
+    closed.ref,
+    roundComment({
+      round: 1,
+      status: '要修',
+      bodyVersion: bodyVersion('closed child'),
+      startedAt: '2026-10-21T00:00:00.000Z',
+      finishedAt: '2026-10-22T00:00:00.000Z',
+      updatedAt: '2026-10-22T00:00:00.000Z',
+    }),
+  );
+  const correction = world.addIssue({
+    number: 9,
+    title: '修正：已关闭子任务 SC1',
+    body: `[验收机] 修正 · 总 ${REPO}#3 · 项 ${REPO}#3 SC1 · 第 1 轮`,
+  });
+  const github = {
+    async graphql(query, variables) {
+      if (query.includes('user(login')) {
+        return {
+          user: {
+            open: {
+              nodes: [inventoryNode(world, root.ref), inventoryNode(world, child.ref), inventoryNode(world, correction.ref)],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+            closed: { nodes: [inventoryNode(world, closed.ref)], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        };
+      }
+      return world.graphql({ query, variables });
+    },
+  };
+  const tasks = await collectTasks(github, profile);
+  const prbotDir = hostPaths(home).prbotDir;
+  fs.mkdirSync(prbotDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(prbotDir, 'reaccept-tree'), 'not-a-dir');
+  const t0 = Date.parse('2026-10-24T00:00:00.000Z');
+  const found = await discoverCorrections({ github, profile, tasks, home, now: () => t0 });
+  assert.deepEqual(found.map((entry) => entry.issue), [correction.ref]);
+  await discoverCorrections({ github, profile, tasks, home, now: () => t0 + 180_000 });
+  const paths = hostPaths(home);
+  const alerts = readAlerts(paths).filter((entry) => entry.kind === 'prbot-reaccept-stamp-failed');
+  assert.equal(alerts.length, 1, '24 小时窗口内只写一次');
+  assert.equal(alerts[0].issue, child.ref);
+  await discoverCorrections({ github, profile, tasks, home, now: () => t0 + 24 * 60 * 60 * 1000 });
+  const later = readAlerts(paths).filter((entry) => entry.kind === 'prbot-reaccept-stamp-failed');
+  assert.equal(later.length, 2, '窗口过后再报一次');
+});
+
+test('#363 SC11 拉树后 1 秒出现未挂载修正子，按 180 秒一拍推进，在 15 分钟 + 一拍内发现', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const world = createWorld();
+  const root = world.addIssue({ number: 1, body: 'root', title: '总任务' });
+  const child = world.addIssue({ number: 2, body: 'body v1', title: '子任务', parent: root.ref });
+  world.addChild(root.ref, child.ref);
+  world.addComment(
+    child.ref,
+    roundComment({
+      round: 1,
+      status: '要修',
+      bodyVersion: bodyVersion('body v1'),
+      startedAt: '2026-10-21T00:00:00.000Z',
+      finishedAt: '2026-10-22T00:00:00.000Z',
+      updatedAt: '2026-10-22T00:00:00.000Z',
+    }),
+  );
+  const github = {
+    async graphql(query, variables) {
+      if (query.includes('user(login')) {
+        const open = [...world.issues.keys()].map((ref) => inventoryNode(world, ref));
+        return {
+          user: {
+            open: { nodes: open, pageInfo: { hasNextPage: false, endCursor: null } },
+            closed: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        };
+      }
+      return world.graphql({ query, variables });
+    },
+  };
+  const t0 = Date.parse('2026-10-24T00:00:00.000Z');
+  const tickMs = 180_000;
+  let tasks = await collectTasks(github, profile);
+  await discoverCorrections({ github, profile, tasks, home, now: () => t0 });
+  world.addIssue({
+    number: 9,
+    title: '修正：子任务 SC1',
+    body: `[验收机] 修正 · 总 ${REPO}#2 · 项 ${REPO}#2 SC1 · 第 1 轮`,
+  });
+  let found = [];
+  let ticks = 0;
+  const deadline = t0 + REACCEPT_TREE_MIN_MS + tickMs;
+  for (let at = t0 + 1000; at <= deadline; at += tickMs) {
+    ticks += 1;
+    tasks = await collectTasks(github, profile);
+    found = await discoverCorrections({ github, profile, tasks, home, now: () => at });
+    if (found.some((entry) => entry.issue === `${REPO}#9`)) break;
+  }
+  assert.ok(found.some((entry) => entry.issue === `${REPO}#9`), `应在 15 分钟 + 一拍内发现，实际 ticks=${ticks} found=${JSON.stringify(found)}`);
+  assert.ok(ticks <= Math.floor(REACCEPT_TREE_MIN_MS / tickMs) + 1);
+});
+
+test('#363 SC12 已关闭 kind=child、未挂载的 open 修正子仍能被发现', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const world = createWorld();
+  const root = world.addIssue({ number: 1, body: 'root', title: '总任务' });
+  const child = world.addIssue({
+    number: 2,
+    body: 'closed child',
+    title: '子任务',
+    state: 'closed',
+    closedAt: '2026-10-23T00:00:00.000Z',
+    parent: root.ref,
+    prs: [{ number: 20, url: 'https://example.test/pull/20', mergedAt: '2026-10-22T00:00:00.000Z' }],
+  });
+  world.addChild(root.ref, child.ref);
+  world.addComment(
+    child.ref,
+    roundComment({
+      round: 1,
+      status: '要修',
+      bodyVersion: bodyVersion('closed child'),
+      startedAt: '2026-10-21T00:00:00.000Z',
+      finishedAt: '2026-10-22T00:00:00.000Z',
+      updatedAt: '2026-10-22T00:00:00.000Z',
+    }),
+  );
+  const correction = world.addIssue({
+    number: 9,
+    title: '修正：子任务 SC1',
+    body: `[验收机] 修正 · 总 ${REPO}#2 · 项 ${REPO}#2 SC1 · 第 1 轮`,
+  });
+  const github = {
+    async graphql(query, variables) {
+      if (query.includes('user(login')) {
+        return {
+          user: {
+            open: {
+              nodes: [inventoryNode(world, root.ref), inventoryNode(world, correction.ref)],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+            closed: { nodes: [inventoryNode(world, child.ref)], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        };
+      }
+      return world.graphql({ query, variables });
+    },
+  };
+  const tasks = await collectTasks(github, profile);
+  const closedChild = tasks.find((task) => task.ref === child.ref);
+  assert.equal(closedChild?.kind, 'child');
+  const t0 = Date.parse('2026-10-24T00:00:00.000Z');
+  const first = await discoverCorrections({ github, profile, tasks, home, now: () => t0 });
+  assert.deepEqual(first.map((entry) => entry.issue), [correction.ref]);
+  const second = await discoverCorrections({ github, profile, tasks, home, now: () => t0 + 60_000 });
+  assert.deepEqual(second.map((entry) => entry.issue), [correction.ref], 'kind=child 不受重验限频');
 });

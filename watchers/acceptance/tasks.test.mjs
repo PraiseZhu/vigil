@@ -486,3 +486,184 @@ test('#247 SC1 回归：评论窗口仍是 50 条（不改小），评论多的�
   assert.match(INVENTORY_QUERY, /comments\(last: 50\)/);
   assert.equal(LEAD_HANDOFF_COMMENT_WINDOW, 50);
 });
+
+// #363 有可信父的 open 子 issue：只要「已经验过、最后结论要修」就收集。
+// 开不开轮仍走 shouldTrigger；修正子仍开着这类当前不该开始的也留在清单里。
+const R1_START = '2026-10-21T00:00:00.000Z';
+const R1_FINISH = '2026-10-22T00:00:00.000Z';
+const CORRECTION_CLOSED_AFTER = '2026-10-23T00:00:00.000Z';
+const CORRECTION_CLOSED_BEFORE = '2026-10-20T12:00:00.000Z';
+
+function reacceptNodes({
+  finalStatus = '要修',
+  bodyNow = 'body v2',
+  bodyAtVerdict = bodyVersion('body v1'),
+  rounds = null,
+  correctionState = 'CLOSED',
+  correctionClosedAt = CORRECTION_CLOSED_AFTER,
+  parentAuthor = OWNER,
+  prs = [],
+} = {}) {
+  const parent = issueNode({
+    number: 1,
+    subIssues: [childNode({ number: 2, state: 'OPEN', closedAt: null })],
+  });
+  const child = issueNode({
+    number: 2,
+    state: 'OPEN',
+    body: bodyNow,
+    parent: { number: 1, repository: { nameWithOwner: REPO }, author: { login: parentAuthor } },
+    comments:
+      rounds ??
+      [
+        roundComment({
+          round: 1,
+          status: finalStatus,
+          bodyVersion: bodyAtVerdict,
+          startedAt: R1_START,
+          finishedAt: R1_FINISH,
+          updatedAt: R1_FINISH,
+          url: `https://example.test/${REPO}/issues/2#issuecomment-1`,
+        }),
+      ],
+    subIssues:
+      correctionState === null
+        ? []
+        : [childNode({ number: 9, state: correctionState, closedAt: correctionClosedAt })],
+    prs,
+  });
+  return { parent, child };
+}
+
+async function collectOnly(nodes) {
+  const { tasks, profile } = await tasksFrom(nodes.open, nodes.closed ?? []);
+  return { tasks, profile };
+}
+
+test('#363 SC1 第 1 轮要修后正文变更的 open 子 issue 不会被收集层丢弃（改动前失败：0 条）', async () => {
+  const nodes = reacceptNodes();
+  const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  assert.equal(found.kind, 'parent');
+  assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), { trigger: true, reason: 'body-changed' });
+});
+
+test('#363 SC2 修正子在结论之后关闭、正文未变的 open 子 issue 被收集，并接到 children-closed-after-verdict', async () => {
+  const nodes = reacceptNodes({ bodyNow: 'body v1' });
+  const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), {
+    trigger: true,
+    reason: 'children-closed-after-verdict',
+  });
+});
+
+test('#363 SC3 从未验过的 open 子 issue 仍被丢弃', async () => {
+  const nodes = reacceptNodes({ rounds: [] });
+  const { tasks } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  assert.deepEqual(tasks.map((task) => task.ref), [`${REPO}#1`]);
+});
+
+test('#363 SC3 已验过要修但正文未变、修正子仍 open 的，仍收集但不开轮', async () => {
+  const nodes = reacceptNodes({ bodyNow: 'body v1', correctionState: 'OPEN', correctionClosedAt: null });
+  const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), { trigger: false, reason: 'children-open' });
+});
+
+test('#363 SC3 修正子在结论之前就关闭、正文未变的，仍收集但不开轮', async () => {
+  const nodes = reacceptNodes({ bodyNow: 'body v1', correctionClosedAt: CORRECTION_CLOSED_BEFORE });
+  const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), { trigger: false, reason: 'up-to-date' });
+});
+
+test('#363 SC4 最后结论「通过」的 open 子 issue 不因正文变更重新收集', async () => {
+  const nodes = reacceptNodes({ finalStatus: '通过' });
+  const { tasks } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  assert.deepEqual(tasks.map((task) => task.ref), [`${REPO}#1`]);
+});
+
+test('#363 SC4 已关闭子 issue 仍按 toChildTask 产出 kind=child，父任务照旧', async () => {
+  const parent = issueNode({
+    number: 1,
+    subIssues: [childNode({ number: 2, state: 'CLOSED', closedAt: CHILD_CLOSED })],
+  });
+  const child = issueNode({
+    number: 2,
+    state: 'CLOSED',
+    closedAt: CHILD_CLOSED,
+    body: 'child body',
+    parent: ownerParent(1),
+    prs: [prNode(20, '2026-10-20T01:00:00.000Z')],
+  });
+  const { tasks } = await collectOnly({ open: [parent], closed: [child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found);
+  assert.equal(found.kind, 'child');
+});
+
+test('#363 SC4 父不可信时 open 子 issue 仍按根任务处理，行为不变', async () => {
+  const nodes = reacceptNodes({ parentAuthor: 'SomeoneElse', rounds: [] });
+  const { tasks } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, '父不可信 → 当根任务，原行为');
+  assert.equal(found.kind, 'parent');
+});
+
+test('#363 SC4 没有父的 open issue 行为不变', async () => {
+  const solo = issueNode({ number: 5, state: 'OPEN', comments: [roundComment({ round: 1, status: '要修', bodyVersion: bodyVersion('old'), startedAt: R1_START, finishedAt: R1_FINISH, updatedAt: R1_FINISH })] });
+  const { tasks } = await collectOnly({ open: [solo] });
+  assert.deepEqual(tasks.map((task) => task.ref), [`${REPO}#5`]);
+});
+
+test('#363 去重：同一子 issue 不因本改动出现两遍', async () => {
+  const nodes = reacceptNodes();
+  const { tasks } = await collectOnly({ open: [nodes.parent, nodes.child, nodes.child] });
+  const refs = tasks.map((task) => task.ref);
+  assert.equal(new Set(refs).size, refs.length);
+  assert.equal(refs.filter((ref) => ref === `${REPO}#2`).length, 1);
+});
+
+test('#363 SC8 父任务验收中时仍收集，不开轮（parent-in-progress）', async () => {
+  const nodes = reacceptNodes();
+  nodes.parent.comments = {
+    nodes: [roundComment({ round: 2, status: '验收中', startedAt: '2026-10-23T00:00:00.000Z' })],
+  };
+  const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  assert.equal(found.kind, 'parent');
+  assert.equal(found.parentLatestStatus, '验收中');
+  assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), { trigger: false, reason: 'parent-in-progress' });
+});
+
+test('#363 SC8 standalone 形状父任务验收中时也不开轮', async () => {
+  const nodes = reacceptNodes({
+    correctionState: null,
+    prs: [prNode(20, '2026-10-20T01:00:00.000Z')],
+  });
+  nodes.parent.comments = {
+    nodes: [roundComment({ round: 2, status: '验收中', startedAt: '2026-10-23T23:50:00.000Z' })],
+  };
+  const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  assert.equal(found.kind, 'standalone');
+  assert.equal(found.parentLatestStatus, '验收中');
+  assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), { trigger: false, reason: 'parent-in-progress' });
+});
+
+test('#363 SC9 重验任务自己的 PR 合入非默认分支时不开轮（base-not-default）', async () => {
+  const nodes = reacceptNodes({ prs: [prNode(20, '2026-10-20T01:00:00.000Z', 'release')] });
+  const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  const decision = shouldTrigger(found, { now: NOW, profile });
+  assert.equal(decision.trigger, false);
+  assert.equal(decision.reason, 'base-not-default');
+});

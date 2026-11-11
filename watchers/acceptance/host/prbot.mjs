@@ -15,7 +15,7 @@ import { beijingIso as roundsBeijingIso, bodyVersion, latestRound, parseRef, par
 import { collectTasks, repoTier } from '../bin/tasks.mjs';
 import { redact } from '../bin/redact.mjs';
 import { isTrustedAuthor } from '../bin/trusted-author.mjs';
-import { appendAlert, hostPaths, isAlive, readLockPayload, releaseLock, tryAcquireLock } from './paths.mjs';
+import { appendAlert, hostPaths, isAlive, readAlerts, readLockPayload, releaseLock, tryAcquireLock } from './paths.mjs';
 import { appendPrbotEvent } from './prbot-events.mjs';
 import { localEnv } from '../bin/localgit.mjs';
 import { run as procRun } from './proc.mjs';
@@ -38,6 +38,10 @@ export const MAX_REFIX = 2;
 export const MAX_CONFLICT = 3;
 export const MAX_HEAD_WAIT_MS = 60 * 60 * 1000;
 export const READY_STALL_MS = 24 * 60 * 60 * 1000;
+/** #363：本 PR 新收集的重验任务（kind 不是 child）拉任务树的最短间隔。kind=child / 根任务每拍照旧拉。 */
+export const REACCEPT_TREE_MIN_MS = 15 * 60 * 1000;
+/** 写限频状态失败的提醒窗口：与 `remindPollNotices` 的 POLL_NOTICE_WINDOW_MS 相同（24 小时）。 */
+const REACCEPT_STAMP_ALERT_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const MAX_ROUND_MS = 3 * 60 * 60 * 1000;
 export const WATCH_INTERVAL_MS = 2 * 60 * 1000;
 
@@ -259,6 +263,70 @@ export async function correctionPrecheck({ github, profile, issue, hostConfig })
   return { ...base, action: 'run' };
 }
 
+function reacceptTreeStampFile(paths, ref) {
+  const key = String(ref || '').replace(/[^\w.-]+/g, '__');
+  return path.join(paths.prbotDir, 'reaccept-tree', `${key}.json`);
+}
+
+function dueReacceptTree(paths, ref, nowMs) {
+  const file = reacceptTreeStampFile(paths, ref);
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    return true;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return true;
+  }
+  const at = Date.parse(parsed?.at || '');
+  if (!Number.isFinite(at)) return true;
+  // 时钟回拨或手工写成未来时间：当过期，照常拉树，免得这个任务一直不发现。
+  if (at > nowMs) return true;
+  return nowMs - at >= REACCEPT_TREE_MIN_MS;
+}
+
+function markReacceptTree(paths, ref, nowMs) {
+  const file = reacceptTreeStampFile(paths, ref);
+  let tmp;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    tmp = `${file}.${process.pid}.${nowMs}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify({ at: new Date(nowMs).toISOString() })}\n`, { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    if (tmp) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        // 残留清不掉也不挡发现。
+      }
+    }
+    try {
+      const recent = readAlerts(paths);
+      const seen = recent.some(
+        (alert) =>
+          alert.kind === 'prbot-reaccept-stamp-failed' &&
+          alert.issue === ref &&
+          nowMs - Date.parse(alert.ts || 0) < REACCEPT_STAMP_ALERT_WINDOW_MS,
+      );
+      if (seen) return;
+      appendAlert(paths, {
+        kind: 'prbot-reaccept-stamp-failed',
+        issue: ref,
+        reason: 'reaccept-tree-write-failed',
+        detail: String(error?.code || error?.message || error),
+        now: () => nowMs,
+      });
+    } catch {
+      // 提醒也写不下时不挡发现：宁可多拉树。
+    }
+  }
+}
+
 /**
  * 发现这一拍该开的修正轮。
  * `tasks` 是同一拍已经拉到的任务清单（#247 SC1）：传了就直接用，不再自己拉一遍全量盘点；
@@ -270,16 +338,22 @@ export async function discoverCorrections({ github, profile, now = () => Date.no
   // PAUSED 在：这一拍一个修正轮都不起（起了也是马上停）。
   if (paths && fs.existsSync(path.join(paths.prbotDir, 'PAUSED'))) return out;
   const tasks = Array.isArray(pulledTasks) ? pulledTasks : await collectTasks(github, profile);
+  const nowMs = now();
   for (const task of tasks) {
     if (task.tier !== 'auto') continue;
     const latest = latestRound(task.rounds);
     if (!latest || latest.status !== '要修') continue;
+    // #363：本 PR 新收集的重验任务（open 子 issue，kind 不是 child）进清单后，
+    // 每拍都拉树会把未挂载修正子的搜索放大。kind=child / 根任务仍每拍拉，行为与 main 一致。
+    const throttleReaccept = task.kind !== 'child' && Boolean(task.parentRef) && Boolean(paths);
+    if (throttleReaccept && !dueReacceptTree(paths, task.ref, nowMs)) continue;
     let tree;
     try {
       tree = await collectTree({ github, profile, ref: task.ref });
     } catch {
       continue;
     }
+    if (throttleReaccept) markReacceptTree(paths, task.ref, nowMs);
     for (const correction of tree.corrections) {
       if (correction.state !== 'open') continue;
       const marker = correction.marker;

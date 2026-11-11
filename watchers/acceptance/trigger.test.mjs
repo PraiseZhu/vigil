@@ -551,6 +551,31 @@ test('#224 SC6 父最新轮次验收中时子 issue 不触发', () => {
   assert.deepEqual(decision, { trigger: false, reason: 'parent-in-progress' });
 });
 
+test('#363 SC8 standalone 重验任务父验收中时不开轮（即使自身 PR 已合入默认分支、正文已变）', () => {
+  const body = 'body v2';
+  const task = {
+    ...standaloneTask({
+      body,
+      linkedPrs: [{ ref: `${REPO}#20`, mergedAt: '2026-10-20T01:00:00.000Z', base: 'main' }],
+      rounds: [
+        {
+          round: 1,
+          status: '要修',
+          bodyVersion: bodyVersion('body v1'),
+          finishedAt: '2026-10-22T00:00:00.000Z',
+          createdAt: '2026-10-22T00:00:00.000Z',
+        },
+      ],
+    }),
+    parentRef: `${REPO}#1`,
+    parentLatestStatus: '验收中',
+  };
+  assert.deepEqual(shouldTrigger(task, { now: nowAt('2026-10-24T00:00:00.000Z'), profile: { startAt: START_AT } }), {
+    trigger: false,
+    reason: 'parent-in-progress',
+  });
+});
+
 test('#224 SC7 父结论晚于子 issue 关闭不触发；早于或相等照常触发', () => {
   const covered = shouldTrigger(
     childTask({ parentFinalFinishedAt: '2026-10-21T00:00:00.000Z' }),

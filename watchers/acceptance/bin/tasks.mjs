@@ -272,10 +272,40 @@ function toTask(issue, profile, byKey) {
   const ranked = repoTier(repo, profile);
   if (!ranked) return null;
   if (!isTrustedAuthor(issue.author, profile)) return null;
-  if (!isRoot(issue, profile)) return toChildTask(issue, profile, ranked, repo, byKey);
+  if (!isRoot(issue, profile)) {
+    const childTask = toChildTask(issue, profile, ranked, repo, byKey);
+    if (childTask) return childTask;
+    // #363：open 子 issue 里只有「验收机走过一轮、最后结论要修」这一类放回根任务路径。
+    // 当前不该开始（修正子仍开着、父在验收中、合到非默认分支）仍收集，开轮交给 shouldTrigger。
+    // 其余 open 子 issue 和以前一样丢弃。
+    if (issue.state !== 'OPEN') return null;
+    const reaccept = toRootTask(issue, profile, ranked, repo, byKey);
+    const parent = issue.parent || {};
+    const parentRepo = parent.repository?.nameWithOwner || repo;
+    const parentRef = parent.number ? issueRef(parentRepo, parent.number) : null;
+    const parentIssue = parentRef && byKey ? byKey.get(parentRef) : null;
+    const parentRounds = parentIssue ? parseRounds(parentIssue.comments?.nodes || [], profile) : [];
+    reaccept.parentRef = parentRef;
+    reaccept.parentLatestStatus = latestRound(parentRounds)?.status || null;
+    reaccept.parentFinalFinishedAt = lastFinal(parentRounds)?.finishedAt || null;
+    return openChildReaccepts(reaccept) ? reaccept : null;
+  }
   if (issue.state === 'CLOSED' && issue.closedAt && Date.parse(issue.closedAt) < Date.parse(profile.startAt)) {
     return null;
   }
+  return toRootTask(issue, profile, ranked, repo, byKey);
+}
+
+/**
+ * #363：open 子 issue 进清单的资格。只认「最后结论是要修」。
+ * 开不开轮不在这里判：poll/start 仍走 shouldTrigger，修正轮发现要靠任务还在清单里。
+ */
+function openChildReaccepts(task) {
+  return lastFinal(task.rounds)?.status === '要修';
+}
+
+/** 根任务形状（standalone / parent）：收哪些字段、怎么算轮次都在这里，open 子 issue 放行后复用同一份。 */
+function toRootTask(issue, profile, ranked, repo, byKey) {
   const ownerChildren = (issue.subIssues?.nodes || []).filter((child) =>
     isTrustedAuthor(child.author, profile),
   );

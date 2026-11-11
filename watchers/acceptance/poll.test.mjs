@@ -110,6 +110,128 @@ test('SC11 没有任务时输出空列表', async () => {
   assert.deepEqual(entries, []);
 });
 
+test('#363 SC3 poll 收集到已验过要修、修正子仍开着的子 issue，但不列入该开始', async () => {
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: writeProfile(tmpDir()).home });
+  const parent = issueNode({
+    number: 1,
+    subIssues: [childNode({ number: 2, state: 'OPEN', closedAt: null })],
+  });
+  const child = issueNode({
+    number: 2,
+    state: 'OPEN',
+    body: 'body v1',
+    parent: { number: 1, repository: { nameWithOwner: REPO }, author: { login: OWNER } },
+    comments: [
+      roundComment({
+        round: 1,
+        status: '要修',
+        bodyVersion: bodyVersion('body v1'),
+        startedAt: '2026-10-21T00:00:00.000Z',
+        finishedAt: '2026-10-22T00:00:00.000Z',
+        updatedAt: '2026-10-22T00:00:00.000Z',
+      }),
+    ],
+    subIssues: [childNode({ number: 9, state: 'OPEN', closedAt: null })],
+  });
+  const run = createFakeRun({ onGraphql: () => inventoryData({ open: [parent, child] }) });
+  const github = createGithub({ profile, run });
+  const { entries, tasks } = await pollInventory({
+    github,
+    profile,
+    now: () => Date.parse('2026-10-24T00:00:00.000Z'),
+    loopLog: false,
+  });
+  assert.ok(tasks.some((task) => task.ref === `${REPO}#2`), '仍收集，供修正轮发现');
+  assert.equal(entries.some((entry) => entry.issue === `${REPO}#2`), false, 'poll 不把它列入该开始');
+});
+
+function reacceptPollChild({ kind, parentComments, prs, subIssues }) {
+  const parent = issueNode({
+    number: 1,
+    comments: parentComments,
+    subIssues: [childNode({ number: 2, state: 'OPEN', closedAt: null })],
+  });
+  const child = issueNode({
+    number: 2,
+    state: 'OPEN',
+    body: 'body v2',
+    parent: { number: 1, repository: { nameWithOwner: REPO }, author: { login: OWNER } },
+    comments: [
+      roundComment({
+        round: 1,
+        status: '要修',
+        bodyVersion: bodyVersion('body v1'),
+        startedAt: '2026-10-21T00:00:00.000Z',
+        finishedAt: '2026-10-22T00:00:00.000Z',
+        updatedAt: '2026-10-22T00:00:00.000Z',
+      }),
+    ],
+    subIssues,
+    prs,
+  });
+  return { parent, child, kind };
+}
+
+test('#363 SC8 poll parent 形状父任务验收中、自身 PR 已合入默认分支时仍收集，不开轮', async () => {
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: writeProfile(tmpDir()).home });
+  const { parent, child } = reacceptPollChild({
+    parentComments: [roundComment({ round: 2, status: '验收中', startedAt: '2026-10-23T23:50:00.000Z' })],
+    prs: [
+      {
+        number: 20,
+        url: 'https://example.test/pull/20',
+        mergedAt: '2026-10-20T01:00:00.000Z',
+        baseRefName: 'main',
+        repository: { nameWithOwner: REPO },
+      },
+    ],
+    subIssues: [childNode({ number: 9, state: 'CLOSED', closedAt: '2026-10-23T00:00:00.000Z' })],
+  });
+  const run = createFakeRun({ onGraphql: () => inventoryData({ open: [parent, child] }) });
+  const github = createGithub({ profile, run });
+  const { entries, tasks } = await pollInventory({
+    github,
+    profile,
+    now: () => Date.parse('2026-10-24T00:00:00.000Z'),
+    loopLog: false,
+  });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found);
+  assert.equal(found.kind, 'parent');
+  assert.equal(found.parentLatestStatus, '验收中');
+  assert.equal(entries.some((entry) => entry.issue === `${REPO}#2`), false);
+});
+
+test('#363 SC8 poll standalone 形状父任务验收中、自身 PR 已合入默认分支时仍收集，不开轮', async () => {
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: writeProfile(tmpDir()).home });
+  const { parent, child } = reacceptPollChild({
+    parentComments: [roundComment({ round: 2, status: '验收中', startedAt: '2026-10-23T23:50:00.000Z' })],
+    prs: [
+      {
+        number: 20,
+        url: 'https://example.test/pull/20',
+        mergedAt: '2026-10-20T01:00:00.000Z',
+        baseRefName: 'main',
+        repository: { nameWithOwner: REPO },
+      },
+    ],
+    subIssues: [],
+  });
+  const run = createFakeRun({ onGraphql: () => inventoryData({ open: [parent, child] }) });
+  const github = createGithub({ profile, run });
+  const { entries, tasks } = await pollInventory({
+    github,
+    profile,
+    now: () => Date.parse('2026-10-24T00:00:00.000Z'),
+    loopLog: false,
+  });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found);
+  assert.equal(found.kind, 'standalone');
+  assert.equal(found.parentLatestStatus, '验收中');
+  assert.equal(entries.some((entry) => entry.issue === `${REPO}#2`), false);
+});
+
 test('SC11 CLI poll.mjs --json 不发写请求', async () => {
   const { home } = writeProfile(tmpDir());
   const binDir = path.join(home, 'bin');
