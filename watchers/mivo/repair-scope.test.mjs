@@ -98,6 +98,10 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
   let remoteHead = sourceHead;
   let ciConclusionValue = 'success';
   const ciConclusion = () => ciConclusionValue;
+  // Extra fields of Actions run 555 (status / conclusion). failFromRead: N makes the Nth and later reads
+  // since setRun fail, so the CI collection can still read the run while the helper's own read cannot.
+  let runState = {};
+  let runReads = 0;
   const pushCalls = [];
   const ghCalls = [];
   const childPrs = [];
@@ -158,9 +162,11 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
       id: 101, run_id: 555, head_sha: remoteHead, run_attempt: 1,
       check_run_url: `https://api.github.com/repos/${REPO}/check-runs/101`,
     });
-    if (endpoint === `repos/${REPO}/actions/runs/555`) return JSON.stringify({
-      id: 555, repository: { full_name: REPO }, head_sha: remoteHead, run_attempt: 1,
-    });
+    if (endpoint === `repos/${REPO}/actions/runs/555`) {
+      const { failFromRead, ...fields } = runState;
+      if (++runReads >= (failFromRead ?? Infinity)) throw new Error('HTTP 502: Bad Gateway');
+      return JSON.stringify({ id: 555, repository: { full_name: REPO }, head_sha: remoteHead, run_attempt: 1, ...fields });
+    }
     if (args[0] === 'run' && args[1] === 'rerun') return '';
     if (String(endpoint).startsWith(`repos/${REPO}/commits/${remoteHead}/statuses`)) return JSON.stringify([[]]);
     assert.fail(`unexpected GitHub call: ${JSON.stringify(args)}`);
@@ -176,6 +182,8 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
     remoteGit: (...args) => git('--git-dir', originUrl, ...args),
     remoteRef: (ref) => { try { return git('--git-dir', originUrl, 'rev-parse', '--verify', '--quiet', ref); } catch { return null; } },
     setCiConclusion: (value) => { ciConclusionValue = value; },
+    setRun: (value) => { runState = value; runReads = 0; },
+    runReads: () => runReads,
     remoteHead: () => git('--git-dir', originUrl, 'rev-parse', 'refs/heads/fix/scope'),
     validate: () => validate(options), finalize: () => finalize(options) };
 }
@@ -289,6 +297,73 @@ test('SC7 no-change required-CI failure reruns failed jobs once, then escalates'
   assert.equal(second.status, 'blocked');
   assert.equal(second.blockedKind, 'external');
   assert.equal(f.ghCalls.filter((args) => args[0] === 'run' && args[1] === 'rerun').length, 1);
+});
+
+// #400: the checks still show the previous attempt while the rerun is running.
+function rerunPending(t) {
+  const f = fixture(t, { changed: false });
+  f.saveTask([finding('P2')]);
+  f.report([f.sc('no-change', ['thread:P2'])]);
+  f.setCiConclusion('failure');
+  assert.equal(f.finalize().status, 'waiting-ci');
+  const reruns = () => f.ghCalls.filter((args) => args[0] === 'run' && args[1] === 'rerun').length;
+  return { f, reruns };
+}
+
+for (const run of [{ status: 'queued' }, { status: 'in_progress' }, { status: 'completed', conclusion: 'success' }]) {
+  test(`#400 finalize keeps waiting while the rerun is ${run.conclusion ?? run.status}`, (t) => {
+    const { f, reruns } = rerunPending(t);
+    f.setRun(run);
+    const second = f.finalize();
+    assert.equal(second.status, 'waiting-ci');
+    assert.equal(second.blockedKind, undefined);
+    assert.equal(second.reason, 'waiting for the one no-change CI rerun to finish');
+    assert.equal(second.ciRetrigger.method, 'gh-rerun');
+    assert.equal(reruns(), 1, 'waiting must not spend a second rerun');
+  });
+}
+
+for (const [name, run] of [['finished red', { status: 'completed', conclusion: 'failure' }], ['unreadable', { status: 'in_progress', failFromRead: 2 }], ['without a status', {}]]) {
+  test(`#400 finalize escalates when the rerun is ${name}`, (t) => {
+    const { f, reruns } = rerunPending(t);
+    f.setRun(run);
+    const second = f.finalize();
+    assert.equal(second.status, 'blocked');
+    assert.equal(second.blockedKind, 'external');
+    assert.equal(second.reason, 'required CI still failed after one no-change retrigger');
+    if (run.failFromRead) assert.equal(f.runReads(), run.failFromRead, 'the read that failed must be the helper\'s own');
+    assert.equal(reruns(), 1);
+  });
+}
+
+test('#400 finalize stops waiting two hours after the rerun was requested', (t) => {
+  const { f } = rerunPending(t);
+  f.setRun({ status: 'in_progress' });
+  const ledger = path.join(f.paths.home, 'state', 'ci-retrigger', `${encodeURIComponent(f.task.nodeId)}.json`);
+  const aged = (ms) => {
+    const records = JSON.parse(fs.readFileSync(ledger, 'utf8'));
+    for (const record of Object.values(records)) record.at = new Date(Date.now() - ms).toISOString();
+    fs.writeFileSync(ledger, JSON.stringify(records));
+  };
+  aged(110 * 60 * 1000);
+  assert.equal(f.finalize().status, 'waiting-ci');
+  aged(130 * 60 * 1000);
+  const late = f.finalize();
+  assert.equal(late.status, 'blocked');
+  assert.equal(late.blockedKind, 'external');
+});
+
+test('#400 recheck keeps waiting while the rerun is in progress, then escalates once it finished red', (t) => {
+  const { f, reruns } = rerunPending(t);
+  f.setRun({ status: 'in_progress' });
+  const waiting = recheck(f.options);
+  assert.equal(waiting.status, 'waiting-ci');
+  assert.equal(waiting.reason, 'waiting for the one no-change CI rerun to finish');
+  f.setRun({ status: 'completed', conclusion: 'failure' });
+  const done = recheck(f.options);
+  assert.equal(done.status, 'blocked');
+  assert.equal(done.blockedKind, 'external');
+  assert.equal(reruns(), 1);
 });
 
 test('R4 replacing a required-CI task on the same head must not retrigger again', async (t) => {
