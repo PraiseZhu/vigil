@@ -2,7 +2,7 @@
 // finalize asks for, changes until the switch is set.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dispatchParams, SELF_REVIEW_RULE } from './bin/mivo-watcher.mjs';
+import { dispatchParams, SELF_REVIEW_RULE, selfReviewRequired } from './bin/mivo-watcher.mjs';
 import { validateSelfReview } from './bin/mivo-repair.mjs';
 import { preflightSelfReviewEnabled } from './bin/profile.mjs';
 
@@ -44,16 +44,23 @@ test('on: a round that may change code gets the rule (own diff only, at most 2 p
   assert.ok(!message(replyOnly).includes(SELF_REVIEW_RULE));
 });
 
-test('finalize asks for the record only when the switch is on and the round changed code', () => {
-  const changed = { scs: [{ id: 'SC1', status: 'pass' }] };
-  const unchanged = { scs: [{ id: 'SC1', status: 'no-change' }] };
-  assert.equal(validateSelfReview(changed, { enabled: false }), null);
-  assert.equal(validateSelfReview(unchanged, { enabled: true }), null);
-  assert.deepEqual(validateSelfReview({ ...changed, selfReview: { passes: 2, found: 3, fixed: 3 } }, { enabled: true }), { passes: 2, found: 3, fixed: 3 });
-  assert.deepEqual(validateSelfReview({ ...changed, selfReview: { passes: 1, found: 0, fixed: 0 } }, { enabled: true }), { passes: 1, found: 0, fixed: 0 });
-  assert.throws(() => validateSelfReview(changed, { enabled: true }), /\[SELF_REVIEW_MISSING\].*expected: selfReview.*actual: null/);
+test('whether a round is asked is decided once at dispatch; a switch that is not a boolean counts as off and stops nothing', (t) => {
+  withSwitch(t, 'true');
+  assert.equal(selfReviewRequired({ headRefOid: HEAD, fresh: fixable }), true);
+  assert.equal(selfReviewRequired({ headRefOid: HEAD, fresh: replyOnly }), false);
+  process.env.MIVO_PREFLIGHT_SELF_REVIEW = 'yes';
+  assert.equal(selfReviewRequired({ headRefOid: HEAD, fresh: fixable }), false);
+  assert.ok(!message(fixable).includes(SELF_REVIEW_RULE), 'the scan goes on without the rule');
+});
+
+test('finalize asks for the record only when the task asked for it and the round has commits', () => {
+  const asked = { required: true, changed: true };
+  assert.equal(validateSelfReview(undefined, { required: false, changed: true }), null, 'the task did not ask');
+  assert.equal(validateSelfReview(undefined, { required: true, changed: false }), null, 'no commit: a title or body fix has no diff to review');
+  assert.deepEqual(validateSelfReview({ passes: 2, found: 3, fixed: 3 }, asked), { passes: 2, found: 3, fixed: 3 });
+  assert.deepEqual(validateSelfReview({ passes: 1, found: 0, fixed: 0 }, asked), { passes: 1, found: 0, fixed: 0 });
+  assert.throws(() => validateSelfReview(undefined, asked), /\[SELF_REVIEW_MISSING\].*expected: selfReview.*actual: null/);
   for (const bad of [{ passes: 3, found: 1, fixed: 1 }, { passes: 1, found: 1, fixed: 2 }, { passes: 1, found: -1, fixed: 0 }, { passes: 1 }, 'done']) {
-    assert.throws(() => validateSelfReview({ ...changed, selfReview: bad }, { enabled: true }), /\[SELF_REVIEW_MISSING\]/, JSON.stringify(bad));
+    assert.throws(() => validateSelfReview(bad, asked), /\[SELF_REVIEW_MISSING\]/, JSON.stringify(bad));
   }
-  assert.throws(() => validateSelfReview([{ id: 'SC1', status: 'pass' }], { enabled: true }), /\[SELF_REVIEW_MISSING\]/, 'a bare array has nowhere to carry the record');
 });

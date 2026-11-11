@@ -1013,6 +1013,19 @@ export const SIBLING_FIX_RULE = '对每条要修的 P0/P1/P2：检查同一函�
 // Pilot, off unless preflightSelfReview is set (2026-11-11): one PR took 25 rounds because the reviewer found about two
 // new findings in each round's own changes. The session reviews its own diff by the same standard before it pushes.
 export const SELF_REVIEW_RULE = '推送前自审（试点）：改完代码、运行 validate 之前，按上面的统一分级标准把本轮自己的改动审一遍——范围只限 git diff <任务 head>..HEAD，不审 PR 里本轮没动的部分。只找本轮改动引入的 P0/P1/P2，只修确认成立的；P3 不修，不借机扩大改动。修过就再审一遍，最多 2 遍。在 SC JSON 顶层写 selfReview:{passes:<1 或 2>,found:<发现的 P0–P2 条数>,fixed:<修掉的条数>}；本轮没有改代码就不写。';
+// Whether a round is asked to review its own diff. Decided here, once, when the task is written: the rule goes into
+// the message and `selfReviewRequired` into the task file, and the helper checks the record by the task, so a switch
+// that changes between dispatch and finalize cannot ask a session for something it was never told. A switch that is
+// set to something that is not a boolean counts as off for the scan (one bad field must not stop every PR) and is
+// said on stderr, which the scheduler keeps with the run.
+let selfReviewConfigWarned = false;
+export function selfReviewRequired({ headRefOid, fresh }) {
+  let on = false;
+  try { on = preflightSelfReviewEnabled(); } catch (error) {
+    if (!selfReviewConfigWarned) { selfReviewConfigWarned = true; console.error(`[mivo-watcher] ${error.message}；按关闭处理`); }
+  }
+  return on && taskRepairPolicy({ headRefOid, feedback: fresh }).canChangeCode === true;
+}
 export const TEST_DOC_RULE = '测试、文档类意见直接修，不争、不开裁决：凡是指向测试文件、docs/ 或 *.md、本 PR 交接文件、PR 正文，或审查机类别属于测试/覆盖率/验证记录/交接的 P0/P1/P2，一律动手修（补或改测试，或如实改文档、验收写法、PR 正文），记 SC=pass。唯一例外：审查看的是旧 head，之后已有提交修掉了，在 evidence 写一行「already-fixed: <该提交 SHA>」，helper 会核对它在当前 HEAD 里且晚于审查的 head；否则 helper 拒收这类 no-change。';
 export function repeatFindingRule(repeat = []) {
   if (!repeat.length) return '';
@@ -1045,7 +1058,7 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       severityRule(),
       SIBLING_FIX_RULE,
       TEST_DOC_RULE,
-      ...(repairPolicy.canChangeCode && preflightSelfReviewEnabled() ? [SELF_REVIEW_RULE] : []),
+      ...(selfReviewRequired({ headRefOid: pr.headRefOid, fresh }) ? [SELF_REVIEW_RULE] : []),
       ...(repeatFindings.length ? [repeatFindingRule(repeatFindings)] : []),
       handledFindingsSummary(handledFindings),
       repairPolicy.canChangeCode ? 'OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY' : 'OWNER_STANDING_AUTH: NO_CODE_NO_PUSH_NO_EXTERNAL_REPLY',
@@ -1392,7 +1405,7 @@ function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix 
   const pending = { dispatchId, params: dispatchParams({ pr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, prIntent: prSnapshot?.prIntent, handledFindings: collected?.handledFindings ?? [], repeatFindings, childPrHandoff }), at: now, taskPath };
   if (!dryRun) {
     fs.mkdirSync(path.dirname(taskPath), { recursive: true });
-    atomic(taskPath, JSON.stringify({ dispatchId, repeatFindings, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: pr.id, number: pr.number, repo: REPO, headRefOid: pr.headRefOid, headRefName: pr.headRefName, prAuthor: collected?.pr?.author?.login ?? pr.author?.login ?? null, handoff: collected?.handoff, releaseEpoch: collected?.pr?.releaseEpoch, feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }), prSnapshot, severityStandard: taskSeverityStandard(), adjudicationRecord: ADJUDICATION_RECORD_VERSION, ...(handoffAsked ? { childPrHandoff: childPrHandoffSpec(taskPath) } : {}), params: pending.params, createdAt: now }));
+    atomic(taskPath, JSON.stringify({ dispatchId, ...(selfReviewRequired({ headRefOid: pr.headRefOid, fresh }) ? { selfReviewRequired: true } : {}), repeatFindings, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: pr.id, number: pr.number, repo: REPO, headRefOid: pr.headRefOid, headRefName: pr.headRefName, prAuthor: collected?.pr?.author?.login ?? pr.author?.login ?? null, handoff: collected?.handoff, releaseEpoch: collected?.pr?.releaseEpoch, feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }), prSnapshot, severityStandard: taskSeverityStandard(), adjudicationRecord: ADJUDICATION_RECORD_VERSION, ...(handoffAsked ? { childPrHandoff: childPrHandoffSpec(taskPath) } : {}), params: pending.params, createdAt: now }));
   }
   return pending;
 }

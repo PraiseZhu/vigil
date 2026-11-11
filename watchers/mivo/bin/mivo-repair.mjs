@@ -14,7 +14,7 @@ import { isCurrentHandoff } from './mivo-handoff.mjs';
 import { createPushHooks } from './mivo-pre-push.mjs';
 import { taskRepairPolicy, TRIAGE_REASONS } from './mivo-feedback-policy.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, readPr, writePr } from './mivo-state.mjs';
-import { optionalConfig, requireConfig, preflightSelfReviewEnabled } from './profile.mjs';
+import { optionalConfig, requireConfig } from './profile.mjs';
 import { acquireValidationSlot, runStreaming, validationConfig } from './mivo-validation-runtime.mjs';
 import { compareBaseline, verifyBaselineBinding } from './mivo-validation-baseline.mjs';
 import { configuredLogin, configuredUserId } from './mivo-identity.mjs';
@@ -996,24 +996,22 @@ export function validateScs(report, task) {
   return { scs: checked, feedbackCoverage: { mode: expected.size ? 'task-feedback' : 'legacy-empty', requiredKeys: [...expected], coveredKeys: [...covered], dispositions, complete: true }, workers: Array.isArray(report) ? null : validateWorkers(report?.workers) };
 }
 
-// Pilot (preflightSelfReview, off by default): a round that changed code must say that it reviewed its own diff.
-// Only the record is checked here; what the review found is the session's to act on.
-export function validateSelfReview(report, { enabled = preflightSelfReviewEnabled() } = {}) {
-  if (!enabled) return null;
-  const scs = Array.isArray(report) ? report : report?.scs;
-  if (!Array.isArray(scs) || !scs.some((sc) => sc?.status === 'pass')) return null; // nothing was changed
-  const record = Array.isArray(report) ? undefined : report?.selfReview;
+// Pilot (preflightSelfReview, off by default): a round whose task asked for a self-review and that pushed commits must
+// say that it reviewed its own diff. The task says whether it was asked (written at dispatch, see the watcher's
+// selfReviewRequired); "changed code" is a moved head, not an SC marked pass — a round that only edits the PR title
+// or body passes its SC without a commit and has no diff to review. Only the record is checked here.
+export function validateSelfReview(record, { required, changed }) {
+  if (required !== true || changed !== true) return null;
   const whole = (value) => Number.isInteger(value) && value >= 0;
   const ok = record && typeof record === 'object' && [1, 2].includes(record.passes) && whole(record.found) && whole(record.fixed) && record.fixed <= record.found;
-  if (!ok) fail(`[SELF_REVIEW_MISSING] this round changed code and preflightSelfReview is on (expected: selfReview:{passes:1|2,found:n,fixed:m} with m<=n at the top of the SC report; actual: ${JSON.stringify(record ?? null)})`);
+  if (!ok) fail(`[SELF_REVIEW_MISSING] this round has commits and its task asked for a self-review (expected: selfReview:{passes:1|2,found:n,fixed:m} with m<=n at the top of the SC report; actual: ${JSON.stringify(record ?? null)})`);
   return { passes: record.passes, found: record.found, fixed: record.fixed };
 }
 
 function loadScs(scReport, task) {
   const report = readJson(requireAbs(scReport, 'sc-report'), 'SC report');
   const checked = validateScs(report, task);
-  const selfReview = validateSelfReview(report);
-  return selfReview ? { ...checked, selfReview } : checked;
+  return !Array.isArray(report) && report?.selfReview !== undefined ? { ...checked, selfReviewRecord: report.selfReview } : checked;
 }
 
 function rejectSkip(env = process.env) {
@@ -1840,11 +1838,12 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   const branchHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
-  const { scs, feedbackCoverage, workers } = loadScs(scReport, task);
+  const { scs, feedbackCoverage, workers, selfReviewRecord } = loadScs(scReport, task);
   assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview: alreadyFixedProof({ worktree, validatedHead, gitFn }) });
   assertRepeatInventory({ scs, task });
   assertStandardAllowsDisputes({ scs, task });
-  const workersField = workers ? { workers } : {};
+  const selfReview = validateSelfReview(selfReviewRecord, { required: task.selfReviewRequired === true, changed: validatedHead !== task.headRefOid });
+  const workersField = { ...(workers ? { workers } : {}), ...(selfReview ? { selfReview } : {}) };
   const emptyRetrigger = allNoChange(scs) && isEmptyCiRetrigger(worktree, task.headRefOid, validatedHead, gitFn);
   assertTaskRepairScope(task, validatedHead, { emptyRetrigger });
   if (validatedHead !== task.headRefOid && scs.every((sc) => sc.status === 'no-change') && !emptyRetrigger) {
