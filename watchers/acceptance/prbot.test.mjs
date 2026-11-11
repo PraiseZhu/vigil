@@ -1765,3 +1765,49 @@ test('#363 SC10 已验过要修、修正子仍 open 的 open 子 issue 被收集
   assert.equal(found[0].root, child.ref);
   assert.equal(found[0].sc, 1);
 });
+
+test('#363 SC11 带 parentRef、没有仍开着的挂载子 issue 的重验任务，discover 不拉任务树', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const world = createWorld();
+  const root = world.addIssue({ number: 1, body: 'root', title: '总任务' });
+  for (const n of [2, 3, 4]) {
+    const child = world.addIssue({ number: n, body: `body ${n}`, title: `子任务 ${n}`, parent: root.ref });
+    world.addChild(root.ref, child.ref);
+    world.addComment(
+      child.ref,
+      roundComment({
+        round: 1,
+        status: '要修',
+        bodyVersion: bodyVersion(`body ${n}`),
+        startedAt: '2026-10-21T00:00:00.000Z',
+        finishedAt: '2026-10-22T00:00:00.000Z',
+        updatedAt: '2026-10-22T00:00:00.000Z',
+      }),
+    );
+  }
+  let treeReads = 0;
+  const github = {
+    async graphql(query, variables) {
+      if (query.includes('user(login')) {
+        return {
+          user: {
+            open: {
+              nodes: [1, 2, 3, 4].map((n) => inventoryNode(world, `${REPO}#${n}`)),
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+            closed: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        };
+      }
+      treeReads += 1;
+      return world.graphql({ query, variables });
+    },
+  };
+  const tasks = await collectTasks(github, profile);
+  assert.ok(tasks.some((task) => task.ref === `${REPO}#2` && task.parentRef === `${REPO}#1`));
+  treeReads = 0;
+  const found = await discoverCorrections({ github, profile, tasks });
+  assert.deepEqual(found, []);
+  assert.equal(treeReads, 0, '重验子 issue 没有仍开着的挂载子时不拉任务树');
+});

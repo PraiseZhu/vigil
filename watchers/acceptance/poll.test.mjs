@@ -145,11 +145,10 @@ test('#363 SC3 poll 收集到已验过要修、修正子仍开着的子 issue，
   assert.equal(entries.some((entry) => entry.issue === `${REPO}#2`), false, 'poll 不把它列入该开始');
 });
 
-test('#363 SC8 poll 父任务验收中时仍收集，不开轮', async () => {
-  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: writeProfile(tmpDir()).home });
+function reacceptPollChild({ kind, parentComments, prs, subIssues }) {
   const parent = issueNode({
     number: 1,
-    comments: [roundComment({ round: 2, status: '验收中', startedAt: '2026-10-23T00:00:00.000Z' })],
+    comments: parentComments,
     subIssues: [childNode({ number: 2, state: 'OPEN', closedAt: null })],
   });
   const child = issueNode({
@@ -167,6 +166,26 @@ test('#363 SC8 poll 父任务验收中时仍收集，不开轮', async () => {
         updatedAt: '2026-10-22T00:00:00.000Z',
       }),
     ],
+    subIssues,
+    prs,
+  });
+  return { parent, child, kind };
+}
+
+test('#363 SC8 poll parent 形状父任务验收中、自身 PR 已合入默认分支时仍收集，不开轮', async () => {
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: writeProfile(tmpDir()).home });
+  const { parent, child } = reacceptPollChild({
+    parentComments: [roundComment({ round: 2, status: '验收中', startedAt: '2026-10-23T23:50:00.000Z' })],
+    prs: [
+      {
+        number: 20,
+        url: 'https://example.test/pull/20',
+        mergedAt: '2026-10-20T01:00:00.000Z',
+        baseRefName: 'main',
+        repository: { nameWithOwner: REPO },
+      },
+    ],
+    subIssues: [childNode({ number: 9, state: 'CLOSED', closedAt: '2026-10-23T00:00:00.000Z' })],
   });
   const run = createFakeRun({ onGraphql: () => inventoryData({ open: [parent, child] }) });
   const github = createGithub({ profile, run });
@@ -176,7 +195,40 @@ test('#363 SC8 poll 父任务验收中时仍收集，不开轮', async () => {
     now: () => Date.parse('2026-10-24T00:00:00.000Z'),
     loopLog: false,
   });
-  assert.ok(tasks.some((task) => task.ref === `${REPO}#2`));
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found);
+  assert.equal(found.kind, 'parent');
+  assert.equal(found.parentLatestStatus, '验收中');
+  assert.equal(entries.some((entry) => entry.issue === `${REPO}#2`), false);
+});
+
+test('#363 SC8 poll standalone 形状父任务验收中、自身 PR 已合入默认分支时仍收集，不开轮', async () => {
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: writeProfile(tmpDir()).home });
+  const { parent, child } = reacceptPollChild({
+    parentComments: [roundComment({ round: 2, status: '验收中', startedAt: '2026-10-23T23:50:00.000Z' })],
+    prs: [
+      {
+        number: 20,
+        url: 'https://example.test/pull/20',
+        mergedAt: '2026-10-20T01:00:00.000Z',
+        baseRefName: 'main',
+        repository: { nameWithOwner: REPO },
+      },
+    ],
+    subIssues: [],
+  });
+  const run = createFakeRun({ onGraphql: () => inventoryData({ open: [parent, child] }) });
+  const github = createGithub({ profile, run });
+  const { entries, tasks } = await pollInventory({
+    github,
+    profile,
+    now: () => Date.parse('2026-10-24T00:00:00.000Z'),
+    loopLog: false,
+  });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found);
+  assert.equal(found.kind, 'standalone');
+  assert.equal(found.parentLatestStatus, '验收中');
   assert.equal(entries.some((entry) => entry.issue === `${REPO}#2`), false);
 });
 

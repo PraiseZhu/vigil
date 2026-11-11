@@ -637,6 +637,23 @@ test('#363 SC8 父任务验收中时仍收集，不开轮（parent-in-progress�
   const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
   const found = tasks.find((task) => task.ref === `${REPO}#2`);
   assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  assert.equal(found.kind, 'parent');
+  assert.equal(found.parentLatestStatus, '验收中');
+  assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), { trigger: false, reason: 'parent-in-progress' });
+});
+
+test('#363 SC8 standalone 形状父任务验收中时也不开轮', async () => {
+  const nodes = reacceptNodes({
+    correctionState: null,
+    prs: [prNode(20, '2026-10-20T01:00:00.000Z')],
+  });
+  nodes.parent.comments = {
+    nodes: [roundComment({ round: 2, status: '验收中', startedAt: '2026-10-23T23:50:00.000Z' })],
+  };
+  const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  assert.equal(found.kind, 'standalone');
   assert.equal(found.parentLatestStatus, '验收中');
   assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), { trigger: false, reason: 'parent-in-progress' });
 });

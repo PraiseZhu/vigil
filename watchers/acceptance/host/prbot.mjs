@@ -274,6 +274,10 @@ export async function discoverCorrections({ github, profile, now = () => Date.no
     if (task.tier !== 'auto') continue;
     const latest = latestRound(task.rounds);
     if (!latest || latest.status !== '要修') continue;
+    // #363：重验子 issue 挂在可信父下面。盘点已经带了它自己的 subIssues；
+    // 没有仍开着的挂载子 issue 时，这一拍不会发现开放修正子，不必再拉任务树。
+    // 总 issue / 独立 issue（没有 parentRef）仍按原样拉树：fork 档修正子本来就不挂。
+    if (task.parentRef && !(task.children || []).some((child) => child.state === 'open' || child.state === 'OPEN')) continue;
     let tree;
     try {
       tree = await collectTree({ github, profile, ref: task.ref });
