@@ -8,7 +8,7 @@ import path from 'node:path';
 import { blocked } from './bin/mivo-repair.mjs';
 import { REPO, scanOnce, watcherPaths, feedbackItems, newFeedback } from './bin/mivo-watcher.mjs';
 import { pendingEvents } from './bin/notify.mjs';
-import { statePaths, writePr } from './bin/mivo-state.mjs';
+import { statePaths, writePr, readPr } from './bin/mivo-state.mjs';
 import { handoffReceipt, isChildPrList } from './handoff.fixture.mjs';
 
 
@@ -111,6 +111,9 @@ test('helper to watcher: nothing to send for the second opinion → the block is
   w.scan('2026-11-11T10:01:00.000Z');
   assert.equal(w.sent.length, 0);
   assert.equal(pendingEvents(w.HOME).filter((event) => event.kind === 'blocked-escalate').length, 1, 'reported at once, not a round later');
+  // Recorded per head: a later blocked dispatch on this head is not handed back either (the report alone would only
+  // cover this one dispatch).
+  assert.deepEqual(readPr(w.HOME, nodeId).secondOpinion.map((item) => [item.head, item.outcome]), [[A, 'reported']]);
   w.collected.comments = comments; // it shows up again: the block was reported, so it is not handed back with a false note
   w.scan('2026-11-11T10:21:00.000Z');
   assert.equal(w.sent.length, 0);
