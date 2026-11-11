@@ -1996,6 +1996,57 @@ export function reopenMovedBlocked({ previous, paths, now, head }) {
   };
 }
 
+// A session that says "I cannot solve this" (blocked external) is often right, and often not: two weeks of runs sent
+// 65 such notices to a person (2026-11-11). The first such block on a head gets a second opinion before a person is
+// asked: the same feedback goes back once, with the stated reason and the order to put it to a read-only arbiter
+// first. The outcome is settled in the one round that judges it, with nothing in between: either the dispatch is
+// built in that round (the entry is recorded as delivered), or the block is reported as before (the entry is recorded
+// as reported and never handed back later). Blocks that already have their own way back (validate failures,
+// environment faults, rate limits, Keel) and blocks another path reopened or already reported are not touched.
+export function secondOpinionEligible(previous, head) {
+  const active = previous?.activeTask;
+  if (previous?.eligibility !== 'blocked' || active?.status !== 'blocked' || active.blockedKind !== 'external' || typeof active.dispatchId !== 'string') return false;
+  if (!head || (active.head ?? active.sourceHead) !== head) return false;
+  if (previous.lastException?.event?.dispatchId === active.dispatchId) return false; // already reported (an older build, or an earlier round)
+  const reason = String(active.reason ?? '');
+  if (isValidateClassBlock(active) || INFRA_BLOCK_REASON.test(reason) || TRANSIENT_BLOCK_REASON.test(reason) || KEEL_BLOCK_REASON.test(reason)) return false;
+  return !(previous.secondOpinion ?? []).some((item) => item.head === head);
+}
+// The feedback of the blocked task counts as undelivered for the round that judges the second opinion, so that the
+// same comments are fresh again without touching the stored cursor (a round that does not dispatch changes nothing).
+export function withoutBlockedBatch(cursor, previous, paths) {
+  const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', `${previous.activeTask.dispatchId}.json`));
+  if (!task || task.nodeId !== previous.nodeId) return cursor;
+  const next = { ...cursor };
+  for (const item of task.feedback ?? []) if (typeof item?.key === 'string') delete next[item.key];
+  return next;
+}
+export function recordSecondOpinion(previous, { head, now, outcome }) {
+  const active = previous.activeTask;
+  return { ...previous,
+    ...(outcome === 'delivered' ? { repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) - 1) } : {}),
+    secondOpinion: [...(previous.secondOpinion ?? []), { dispatchId: active.dispatchId, head, at: now, outcome, reason: noticeReason(active.reason) }].slice(-20) };
+}
+// True while the handed-back round is on its way: its dispatch was built for this block and is pending (a retry
+// window included) or already went out. The block is then not reported; a failed delivery is, as a dispatch error.
+export function secondOpinionInDelivery(previous) {
+  const active = previous?.activeTask;
+  if (active?.status !== 'blocked') return false;
+  if (!(previous.secondOpinion ?? []).some((item) => item.dispatchId === active.dispatchId && item.outcome === 'delivered')) return false;
+  return Boolean(previous.pendingDispatch) || Boolean(previous.lastDispatch?.dispatchId && previous.lastDispatch.dispatchId !== active.dispatchId);
+}
+// The lines that open the handed-back round: what stopped the last one, and what to do with it first. The reason is a
+// session's own words, cleaned like every blocked reason that leaves this machine (noticeReason).
+export function secondOpinionNote(reason) {
+  return [
+    '【先裁决再继续】上一轮修复会话以下面的原因停手（blocked），盯梢没有通知人，先把同一批反馈交还一次：',
+    `> ${noticeReason(reason)}`,
+    '本轮第一步：按 routing.json 的 adjudicate 档开一个只读裁决 Worker，把这段原因、任务反馈和你核实到的现状交给它，只问一件事——这个原因是否真的需要人来解决。',
+    '裁决认为可以继续（给了可行的做法，或原因已不成立）：按它的做法修完并正常收口。裁决认为确实需要人，或裁决 Worker 开不出来：再次调用 helper blocked，--reason 以「裁决确认需要人：」开头，写清需要人做的那一件事。同一提交上这是最后一次交还，第二次停手会直接通知人。',
+    '把这个裁决 Worker 记进 SC JSON 的 workers（purpose:"adjudicate"）。',
+  ].join('\n');
+}
+
 export function reopenExternalBlocked({ previous, paths, now, head }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind !== 'external' || active.blockedKind === AUTHOR_RECLAIMED) return previous;
@@ -2378,6 +2429,15 @@ export function markException(previous, now, events, { home, dryRun } = {}) {
     }
     return previous;
   }
+  // The handed-back round is on its way: nobody is asked yet. The block that follows it on the same head is reported.
+  if (secondOpinionInDelivery(previous) && !previous.dispatchError) return previous;
+  // The hand-back was built but its delivery was given up: besides the dispatch error below, the person gets the
+  // reason the session stopped for, which is what there is to decide.
+  if (previous.dispatchError && previous.activeTask?.status === 'blocked'
+    && (previous.secondOpinion ?? []).some((item) => item.dispatchId === previous.activeTask.dispatchId && item.outcome === 'delivered')) {
+    queueHumanNotice(home, { kind: 'blocked-escalate', number: previous.number, url: previous.url, head: previous.activeTask.head ?? previous.activeTask.sourceHead,
+      blockedKind: previous.activeTask.blockedKind, cause: blockedCause(previous.activeTask.blockedKind, previous.activeTask.reason) }, dryRun);
+  }
   const event = {
     kind: previous.dispatchError ? 'dispatch-blocked' : 'repair-blocked', number: previous.number, nodeId: previous.nodeId,
     sessionId: previous.sessionId, dispatchId: previous.dispatchError?.dispatchId ?? previous.activeTask?.dispatchId,
@@ -2674,8 +2734,12 @@ export function* processPr({
   const observed = feedbackItems({ pr, ...collected, receiptActor: viewer, now })
     .map((item) => heldBySelfHeal(selfHeal.state, item, now) ? { ...item, deferred: true } : item);
   previous = migrateMemberFeedbackCursor(previous, observed);
-  const cursorBase = previous.wasDraft === true && !authorPushed
+  // Judged once, here, for this round (see secondOpinionEligible): the blocked batch is offered again, and the round
+  // ends with the dispatch built or with the block reported.
+  const secondOpinion = !resultError && !dryRun && secondOpinionEligible(previous, pr.headRefOid);
+  const storedCursor = previous.wasDraft === true && !authorPushed
     ? coveredCursor(previous.feedbackCursor, previous.feedbackLedger) : (previous.feedbackCursor || {});
+  const cursorBase = secondOpinion ? withoutBlockedBatch(storedCursor, previous, paths) : storedCursor;
   const observedAll = [...observed, ...doctor.items.map(item=>withCategory(item,{headSha:pr.headRefOid}))];
   const { fresh: newFresh, cursor } = newFeedback(cursorBase, observedAll);
   const newKeys = new Set(newFresh.map((item) => item.key));
@@ -2957,6 +3021,7 @@ export function* processPr({
     && (previous.rulesVersion == null || previous.rulesVersion === rulesVersion())
     && fresh.length > 0
     && !dueConflict
+    && !secondOpinion
     && fresh.every(inBlockedBatch);
   if (sameBlockedCause) {
     queueHumanNotice(paths.home, {
@@ -3030,8 +3095,24 @@ export function* processPr({
   let dispatch = { attempted: false, bound: false, reason: 'no-new-feedback' };
   // Advance only non-actionable observations until a delivery is acknowledged.
   const retainedCursor = { ...cursor };
+  // Handed back only when the batch that was blocked is actually in this delivery: new feedback alone goes out as an
+  // ordinary round and the old block is reported.
+  const handBack = secondOpinion && fresh.some((item) => blockedItems.has(item.key));
+  // The blocked batch was only taken out of cursorBase to be offered again in this round. What was not seen this
+  // round keeps its stored stamp, so a round that does not deliver leaves the cursor as it found it. The exception is
+  // the rest of the blocked batch when part of it is handed back: it stays undelivered, so it is sent as soon as it is
+  // seen again instead of being counted as delivered with a task it was never in.
+  if (secondOpinion) {
+    for (const [stampKey, stamp] of Object.entries(storedCursor)) {
+      if (Object.hasOwn(retainedCursor, stampKey) || fresh.some((item) => item.key === stampKey)) continue;
+      if (handBack && blockedItems.has(stampKey)) continue;
+      retainedCursor[stampKey] = stamp;
+    }
+  }
+  // storedCursor, not cursorBase: a second-opinion round that does not deliver must leave the blocked batch's stamps
+  // as they were (cursorBase had them taken out only to make the batch fresh for this round).
   for (const item of fresh) {
-    if (Object.hasOwn(cursorBase, item.key)) retainedCursor[item.key] = cursorBase[item.key];
+    if (Object.hasOwn(storedCursor, item.key)) retainedCursor[item.key] = storedCursor[item.key];
     else delete retainedCursor[item.key];
   }
   // A conflict that is held back keeps its previous stamp (or none): it stays pending, and the next scan sees it again
@@ -3064,6 +3145,8 @@ export function* processPr({
       const held = !open.ok ? { reason: 'child-pr-check-unavailable', error: open.error }
         : open.childPrs.length ? { reason: 'child-pr-open', childPrs: open.childPrs.map((child) => child.number) } : null;
       if (held) {
+        // A second opinion that cannot go out now is not kept waiting behind the child PR: the block is reported.
+        if (secondOpinion) previous = markException(recordSecondOpinion(previous, { head: pr.headRefOid, now, outcome: 'reported' }), now, events, { home: paths.home, dryRun });
         state.prs[key] = { ...previous, lastDispatchGuard: { at: now, ...held } };
         persistState(state, paths);
         report.push({ number: pr.number, dispatch: { attempted: false, bound: false, ...held } });
@@ -3236,7 +3319,7 @@ export function* processPr({
       // current prefix instead of reusing the stored text that belonged to the retired session.
       dispatchMapping = planSession({ pr, existing: previous, date: now });
     }
-    const prefix = [reclaimNote(previous, pr.headRefName), handoffNote, messagePrefix].filter(Boolean).join('\n');
+    const prefix = [reclaimNote(previous, pr.headRefName), handoffNote, handBack ? secondOpinionNote(previous.activeTask.reason) : '', messagePrefix].filter(Boolean).join('\n');
     // Asked once per delivery, and only when this task may change code: it decides whether the session is told to
     // write child PR handoff drafts (the answer is also recorded in the task, so a retry keeps it). A dry run makes
     // no GitHub read, like the gates above, so its preview carries no handoff text.
@@ -3248,6 +3331,10 @@ export function* processPr({
       // persist it, and the next live round would then read the PR as already being delivered.
       dispatch = { attempted: false, bound: false, reason: 'dry-run', pending };
     } else {
+      if (handBack) previous = recordSecondOpinion(previous, { head: pr.headRefOid, now, outcome: 'delivered' });
+      // New feedback only: this delivery replaces the blocked task, so the old block is reported here, while it is
+      // still the active task.
+      else if (secondOpinion) previous = markException(recordSecondOpinion(previous, { head: pr.headRefOid, now, outcome: 'reported' }), now, events, { home: paths.home, dryRun });
       previous = { ...previous, pendingDispatch: pending };
       state.prs[key] = previous;
       persistState(state, paths);
@@ -3287,7 +3374,14 @@ export function* processPr({
     dispatch.reason = 'policy-unknown';
   }
   if (!persistBlocked) {
+  // No dispatch was built for the second opinion in this round (nothing to send, or a gate held it): the block is
+  // reported now, as it was before there was a second opinion, and it is not handed back later.
+  if (secondOpinion && secondOpinionEligible(previous, pr.headRefOid)) previous = recordSecondOpinion(previous, { head: pr.headRefOid, now, outcome: 'reported' });
+  const exceptionBefore = previous.lastException;
   previous = markException({ ...previous, lastPolicyStatus: collected.policy?.status ?? previous.lastPolicyStatus ?? null }, now, events, { home: paths.home, dryRun });
+  // A dry run sends no notice, so it must not record the block as reported either: the first live round would then
+  // neither hand it back nor tell anyone.
+  if (dryRun && previous.lastException !== exceptionBefore) previous = { ...previous, lastException: exceptionBefore };
   if (collected.mergeReady === true && (base.mergeReady !== true || base.mergeReadyHead !== pr.headRefOid)) {
     // The merge state came from the round's batch read, so it is read again for this PR right before the notice
     // goes out. If it moved, or cannot be confirmed, the notice waits for the next round, which collects the PR again
@@ -3447,7 +3541,8 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
   const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous
     || reopenInfraBlocked({ previous, paths, now, currentBase: { baseRefOid: normalized?.baseRefOid } }) !== previous
     || reopenExternalBlocked({ previous, paths, now, head: previous.headRefOid }) !== previous
-    || reopenMovedBlocked({ previous, paths, now, head: normalized?.headRefOid ?? previous.headRefOid }) !== previous;
+    || reopenMovedBlocked({ previous, paths, now, head: normalized?.headRefOid ?? previous.headRefOid }) !== previous
+    || secondOpinionEligible(previous, normalized?.headRefOid ?? previous.headRefOid);
   // The same holds for a PR an older build stopped on a product-intent conflict, or whose awaiting-discussion
   // label the watcher still has to take off (including after a failed DELETE): nothing changes on GitHub.
   const intentMigrationDue = reopenProductIntentBlocked({ previous, paths, now }) !== previous || legacyIntentLabelDue(previous)

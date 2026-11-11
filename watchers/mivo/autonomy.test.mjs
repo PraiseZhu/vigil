@@ -288,6 +288,8 @@ test('SC5 same blocked cause does not redispatch; it writes one escalate notice 
     pollFingerprint: 'old', eligibility: 'blocked', rulesVersion: rulesVersion(),
     lastDispatch: { dispatchId, at: '2026-09-28T00:00:00Z' },
     activeTask: { status: 'blocked', blockedKind: 'external', reason: 'no-permission: missing secret', dispatchId, head: HEAD, sessionId: 'sess-790' },
+    // This head already had its one second opinion (second-opinion.test.mjs): the block now waits for a person.
+    secondOpinion: [{ dispatchId: 'live-790-first', head: HEAD, at: '2026-09-27T23:00:00Z', outcome: 'delivered', reason: 'no-permission: missing secret' }],
   });
   const handoff = handoffReceipt({ ...listed, releaseEpoch: 'e' });
   fs.mkdirSync(path.join(paths.stateDir, 'tasks'), { recursive: true });

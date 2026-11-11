@@ -184,7 +184,7 @@ const pollSnap = () => ({
   state: 'OPEN', isDraft: false, headRefOid: POLL_HEAD, baseRefOid: 'b'.repeat(40), updatedAt: NOW, mergeable: 'MERGEABLE',
   labels: [], checkState: 'SUCCESS', commentCount: 1, reviewCount: 0, commentUpdatedAt: NOW, reviewUpdatedAt: null, unresolvedThreads: 0,
 });
-function pollScan(t, { reason, version = 2 }) {
+function pollScan(t, { reason, version = 2, secondOpinionUsed = true }) {
   const dir = home(t);
   const paths = watcherPaths(dir);
   fs.mkdirSync(paths.stateDir, { recursive: true });
@@ -199,6 +199,8 @@ function pollScan(t, { reason, version = 2 }) {
     admissionEpoch: handoff.releaseEpoch, handoff, headRefName: 'fix/x', title: 'fix', pollFingerprint: pollFingerprint(pollSnap()),
     feedbackCursor: cursor, repairRounds: 1,
     activeTask: { dispatchId: POLL_TASK, status: 'blocked', blockedKind: 'external', reason, head: POLL_HEAD, observedAt: NOW },
+    // This head already had its one second opinion (second-opinion.test.mjs): the block now waits for a person.
+    ...(secondOpinionUsed ? { secondOpinion: [{ dispatchId: 'earlier-task', head: POLL_HEAD, at: NOW, outcome: 'delivered', reason: 'earlier' }] } : {}),
   });
   let collected = 0;
   const outcome = scanOnce({
@@ -224,6 +226,14 @@ test('a frozen PR with an unchanged poll fingerprint still gets its swallowed fe
   assert.deepEqual(saved.keelReopened, [POLL_TASK]);
   assert.ok(!('comment:101' in saved.feedbackCursor) || saved.activeTask.dispatchId !== POLL_TASK,
     'the feedback is either pending again or already delivered in a new task');
+});
+
+// The light poll must not skip a block that still has its second opinion to be judged: nothing on GitHub changes for
+// it, so the fingerprint alone would leave it unjudged (and unreported) for good.
+test('an unchanged fingerprint does not short-circuit a first external block that is due a second opinion', t => {
+  const { collected, outcome } = pollScan(t, { reason: 'needs a maintainer decision on the interface', secondOpinionUsed: false });
+  assert.equal(collected, 1);
+  assert.notEqual(outcome.prs[0].dispatch.reason, 'fingerprint-unchanged');
 });
 
 test('an unchanged fingerprint still short-circuits for ordinary blocks and for keel- blocks inside the back-off window', t => {
