@@ -416,6 +416,7 @@ export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci
         source: isGreptileAuthor(author) ? 'greptile' : reviewerFinding ? 'mivo-review' : 'thread',
         actionable: thread.isResolved !== true,
         threadId: thread.id,
+        path: thread.path ?? null,
         nativeId: `${thread.id}:${comment.id ?? author ?? 'comment'}`,
         revision: `${thread.isResolved === true}:${thread.isOutdated === true}:${comment.updatedAt ?? comment.updated_at ?? comment.createdAt ?? ''}`,
         sha: pr.headRefOid ?? null,

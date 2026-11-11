@@ -1013,8 +1013,20 @@ function validationPolicy(worktree, task, gitFn, baseRefName = null) {
   const actual = fs.readFileSync(path.join(worktree, file), 'utf8').trim();
   if (expected && expected === actual) return { file, sourceHead: task.headRefOid, sha256: hash(actual) };
   const fromBase = baseHook(worktree, file, baseRefName, gitFn);
-  if (!actual || fromBase?.hook !== actual) fail('local preflight policy changed from the dispatched baseline');
-  return { file, sourceHead: task.headRefOid, sha256: hash(actual), fromBase: { baseRefName, mergeBase: fromBase.mergeBase } };
+  if (actual && fromBase?.hook === actual) return { file, sourceHead: task.headRefOid, sha256: hash(actual), fromBase: { baseRefName, mergeBase: fromBase.mergeBase } };
+  // The hook is the gate itself, so a session may not change it on its own. The one exception (user decision
+  // 2026-11-11): review feedback of this task that may change code and is written on this very file. Two weeks of
+  // runs had rounds whose fix was ready and could not be pushed because the finding was about the hook.
+  const named = hookFindingKeys(task, file);
+  if (!actual || !named.length) fail(`local preflight policy changed from the dispatched baseline (expected: the dispatched hook, the base branch's hook, or review feedback on ${file} that may change code; actual: none of them)`);
+  return { file, sourceHead: task.headRefOid, sha256: hash(actual), reviewedChange: { feedbackKeys: named } };
+}
+
+// Keys of this task's feedback that is written on `file` and is allowed to change code (P0/P1/P2 by the repair
+// policy computed from the item itself, never from a cached flag in the task).
+export function hookFindingKeys(task, file) {
+  const mayChangeCode = new Set(taskRepairPolicy(task).items.filter((item) => item.canChangeCode === true).map((item) => item.key));
+  return (task?.feedback ?? []).filter((item) => item?.path === file && mayChangeCode.has(item.key)).map((item) => item.key);
 }
 
 function baseHook(worktree, file, baseRefName, gitFn) {
