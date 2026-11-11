@@ -996,8 +996,22 @@ export function validateScs(report, task) {
   return { scs: checked, feedbackCoverage: { mode: expected.size ? 'task-feedback' : 'legacy-empty', requiredKeys: [...expected], coveredKeys: [...covered], dispositions, complete: true }, workers: Array.isArray(report) ? null : validateWorkers(report?.workers) };
 }
 
+// Pilot (preflightSelfReview, off by default): a round whose task asked for a self-review and that pushed commits must
+// say that it reviewed its own diff. The task says whether it was asked (written at dispatch, see the watcher's
+// selfReviewRequired); "changed code" is a moved head, not an SC marked pass — a round that only edits the PR title
+// or body passes its SC without a commit and has no diff to review. Only the record is checked here.
+export function validateSelfReview(record, { required, changed }) {
+  if (required !== true || changed !== true) return null;
+  const whole = (value) => Number.isInteger(value) && value >= 0;
+  const ok = record && typeof record === 'object' && [1, 2].includes(record.passes) && whole(record.found) && whole(record.fixed) && record.fixed <= record.found;
+  if (!ok) fail(`[SELF_REVIEW_MISSING] this round has commits with changes and its task asked for a self-review (expected: selfReview:{passes:1|2,found:n,fixed:m} with m<=n at the top of the SC report; actual: ${JSON.stringify(record ?? null)})`);
+  return { passes: record.passes, found: record.found, fixed: record.fixed };
+}
+
 function loadScs(scReport, task) {
-  return validateScs(readJson(requireAbs(scReport, 'sc-report'), 'SC report'), task);
+  const report = readJson(requireAbs(scReport, 'sc-report'), 'SC report');
+  const checked = validateScs(report, task);
+  return !Array.isArray(report) && report?.selfReview !== undefined ? { ...checked, selfReviewRecord: report.selfReview } : checked;
 }
 
 function rejectSkip(env = process.env) {
@@ -1824,12 +1838,14 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   const branchHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
-  const { scs, feedbackCoverage, workers } = loadScs(scReport, task);
+  const { scs, feedbackCoverage, workers, selfReviewRecord } = loadScs(scReport, task);
   assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview: alreadyFixedProof({ worktree, validatedHead, gitFn }) });
   assertRepeatInventory({ scs, task });
   assertStandardAllowsDisputes({ scs, task });
-  const workersField = workers ? { workers } : {};
   const emptyRetrigger = allNoChange(scs) && isEmptyCiRetrigger(worktree, task.headRefOid, validatedHead, gitFn);
+  // An empty commit that only re-triggers CI has no diff to review.
+  const selfReview = validateSelfReview(selfReviewRecord, { required: task.selfReviewRequired === true, changed: validatedHead !== task.headRefOid && !emptyRetrigger });
+  const workersField = { ...(workers ? { workers } : {}), ...(selfReview ? { selfReview } : {}) };
   assertTaskRepairScope(task, validatedHead, { emptyRetrigger });
   if (validatedHead !== task.headRefOid && scs.every((sc) => sc.status === 'no-change') && !emptyRetrigger) {
     fail('[REPAIR_SCOPE_NO_CODE] Changed HEAD requires an SC bound to an authorized fix; no-change cannot cover commits');
@@ -1917,7 +1933,7 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
   const remoteHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (!isSha(remoteHead)) fail('remote branch head is unavailable during recheck');
   const observedPrHead = ownership.pr.headRefOid;
-  const common = { head, scs, feedbackCoverage, ...(previous.workers ? { workers: previous.workers } : {}), keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
+  const common = { head, scs, feedbackCoverage, ...(previous.workers ? { workers: previous.workers } : {}), ...(previous.selfReview ? { selfReview: previous.selfReview } : {}), keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
   if (remoteHead !== observedPrHead) {
     return saveResult(paths, task, sessionId, { ...common, status: 'waiting-ci', reason: 'GitHub PR and remote branch views differ', checks: [],
       ci: { head, requiredGreen: false, requiredChecks: [], optionalFailures: [], pending: [], missing: ['github-remote-head-mismatch'] } }, { requirePrLock: true });

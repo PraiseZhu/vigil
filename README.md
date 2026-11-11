@@ -83,6 +83,7 @@ cp config/examples/mivo.profile.example.json "$HOME_DIR/config/profile.json"
 | `pluginRepoPath` | 是 | `MIVO_PLUGIN_REPO` | 目标仓在本机的检出目录（绝对路径），修复会话的 worktree 从这里开 |
 | `reviewerLogin` | 是 | `MIVO_WATCHER_REVIEWER_LOGIN` | 审查流程提交 review 的 GitHub 账号，用来判断「审查通过」和识别审查意见 |
 | `severityStandardPath` | 建议 | `MIVO_SEVERITY_STANDARD_PATH` | 分级标准（severity.md）的本机路径，派给修复会话的规则里带上它的全文；不配就不带 |
+| `preflightSelfReview` | 否 | `MIVO_PREFLIGHT_SELF_REVIEW` | 推送前自审试点，默认 `false`。打开后，可改代码的修复轮在规则里多一段：推送前按分级标准审一遍本轮自己的改动（最多 2 遍），并在 SC 报告顶层写 `selfReview`；有改动的提交（只为重跑 CI 的空提交不算）却没有这条记录时 `finalize` 拒绝。是否要求自审在派发时写进任务文件，之后改开关不影响已派出的任务。只接受 `true` / `false`（或 `1` / `0`），写成别的值按关闭处理，每轮运行结果的 `events` 里有一条 `config-invalid` 写明字段名。建议同时配好 `severityStandardPath`，否则规则里没有分级标准全文。开关对运行机上所有 PR 生效 |
 | `keelLedgerRoot` / `keelNamespace` | 用 KEEL 时 | `MIVO_KEEL_LEDGER_ROOT` / `MIVO_KEEL_NAMESPACE` | KEEL 台账目录和命名空间，修复会话按它们找 KEEL run |
 | `watchHomes` | 否 | `MIVO_WATCHER_WATCH_HOMES` | 本机所有 watcher home 列表，默认 `[]` |
 | `validateConcurrency` / `validateStallMinutes` / `preflightTimeoutMinutes` / `prePushLockWaitMinutes` | 否 | `MIVO_VALIDATE_CONCURRENCY` 等 | 本地验证的并发数和各类超时，默认值与含义见 [`docs/operations.md`](docs/operations.md#7-本地-validate-的并发日志与收据) |

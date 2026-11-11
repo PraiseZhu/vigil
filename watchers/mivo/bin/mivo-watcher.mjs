@@ -22,7 +22,7 @@ import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue
 import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath, findingMarkerOf, childPrListArgs, parseOpenChildPrs, childPrDraftPaths, childPrHandoffSpec, CHILD_PR_PLACEHOLDER } from './mivo-repair.mjs';
 import { PARSER_VERSION, canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
-import { optionalConfig, requireConfig } from './profile.mjs';
+import { optionalConfig, requireConfig, preflightSelfReviewEnabled } from './profile.mjs';
 import { triageText } from './mivo-ci-triage.mjs';
 import { collectMivoCiSteps } from './mivo-ci.mjs';
 import { superviseCodeqlInfra, codeqlInfraCheckDue } from './mivo-codeql-infra.mjs';
@@ -1010,6 +1010,22 @@ export const WORKER_RULE = [
   '每个 Worker 交回结论后立即 archive_worker。SC JSON 里用 workers:[{purpose:"review"|"e2e"|"consult"|"adjudicate",agent,model,effort,providerId,workerId,verdict}] 记下本轮开过的每个 Worker，adjudicate 另带 rulings；helper 会拒绝超过 2 个顾问或顾问用 max/ultra 的报告。',
 ].join('');
 export const SIBLING_FIX_RULE = '对每条要修的 P0/P1/P2：检查同一函数及其调用方有没有同类问题，并一并修掉。同类问题联动修复不得突破允许路径和本 PR 范围。';
+// Pilot, off unless preflightSelfReview is set (2026-11-11): one PR took 25 rounds because the reviewer found about two
+// new findings in each round's own changes. The session reviews its own diff by the same standard before it pushes.
+export const SELF_REVIEW_RULE = '推送前自审（试点）：改完代码、运行 validate 之前，按上面的统一分级标准把本轮自己的改动审一遍——范围只限 git diff <任务 head>..HEAD，不审 PR 里本轮没动的部分。只找本轮改动引入的 P0/P1/P2，只修确认成立的；P3 不修，不借机扩大改动。修过就再审一遍，最多 2 遍。在 SC JSON 顶层写 selfReview:{passes:<1 或 2>,found:<发现的 P0–P2 条数>,fixed:<修掉的条数>}；本轮没有提交（或只推了重跑 CI 的空提交）就不写。';
+// Whether a round is asked to review its own diff. Decided here, once, when the task is written: the rule goes into
+// the message and `selfReviewRequired` into the task file, and the helper checks the record by the task, so a switch
+// that changes between dispatch and finalize cannot ask a session for something it was never told. A switch that is
+// set to something that is not a boolean counts as off for the scan (one bad field must not stop every PR) and is
+// said on stderr, which the scheduler keeps with the run.
+export function selfReviewConfigProblem() {
+  try { preflightSelfReviewEnabled(); return null; } catch (error) { return String(error?.message ?? error); }
+}
+export function selfReviewRequired({ headRefOid, fresh }) {
+  let on = false;
+  try { on = preflightSelfReviewEnabled(); } catch { on = false; } // reported by the scan (selfReviewConfigProblem)
+  return on && taskRepairPolicy({ headRefOid, feedback: fresh }).canChangeCode === true;
+}
 export const TEST_DOC_RULE = '测试、文档类意见直接修，不争、不开裁决：凡是指向测试文件、docs/ 或 *.md、本 PR 交接文件、PR 正文，或审查机类别属于测试/覆盖率/验证记录/交接的 P0/P1/P2，一律动手修（补或改测试，或如实改文档、验收写法、PR 正文），记 SC=pass。唯一例外：审查看的是旧 head，之后已有提交修掉了，在 evidence 写一行「already-fixed: <该提交 SHA>」，helper 会核对它在当前 HEAD 里且晚于审查的 head；否则 helper 拒收这类 no-change。';
 export function repeatFindingRule(repeat = []) {
   if (!repeat.length) return '';
@@ -1023,7 +1039,7 @@ export function handledFindingsSummary(items = []) {
   if (!Array.isArray(items) || !items.length) return '此前各轮已处理 finding：无。';
   return `此前各轮已处理 finding：${items.map((item) => `${item.key}${item.file ? ` ${item.file}` : ''} ${item.summary}`.trim()).join('；')}`;
 }
-export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messagePrefix = '', keelVersion = KEEL_FLOW_VERSION, prIntent = null, version = null, handledFindings = [], repeatFindings = [], childPrHandoff = null }) {
+export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messagePrefix = '', keelVersion = KEEL_FLOW_VERSION, prIntent = null, version = null, handledFindings = [], repeatFindings = [], childPrHandoff = null, selfReview = null }) {
   const repairPolicy = taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh });
   const title = mapping.title || repairSessionTitle({ task: pr.title, prNumber: pr.number, createdAt: now });
   const params = {
@@ -1042,6 +1058,9 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       severityRule(),
       SIBLING_FIX_RULE,
       TEST_DOC_RULE,
+      // selfReview is given when a message is rendered again for a task that already exists (a recovery): the task says
+      // whether it was asked, whatever the switch is now.
+      ...((selfReview ?? selfReviewRequired({ headRefOid: pr.headRefOid, fresh })) ? [SELF_REVIEW_RULE] : []),
       ...(repeatFindings.length ? [repeatFindingRule(repeatFindings)] : []),
       handledFindingsSummary(handledFindings),
       repairPolicy.canChangeCode ? 'OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY' : 'OWNER_STANDING_AUTH: NO_CODE_NO_PUSH_NO_EXTERNAL_REPLY',
@@ -1388,7 +1407,7 @@ function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix 
   const pending = { dispatchId, params: dispatchParams({ pr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, prIntent: prSnapshot?.prIntent, handledFindings: collected?.handledFindings ?? [], repeatFindings, childPrHandoff }), at: now, taskPath };
   if (!dryRun) {
     fs.mkdirSync(path.dirname(taskPath), { recursive: true });
-    atomic(taskPath, JSON.stringify({ dispatchId, repeatFindings, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: pr.id, number: pr.number, repo: REPO, headRefOid: pr.headRefOid, headRefName: pr.headRefName, prAuthor: collected?.pr?.author?.login ?? pr.author?.login ?? null, handoff: collected?.handoff, releaseEpoch: collected?.pr?.releaseEpoch, feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }), prSnapshot, severityStandard: taskSeverityStandard(), adjudicationRecord: ADJUDICATION_RECORD_VERSION, ...(handoffAsked ? { childPrHandoff: childPrHandoffSpec(taskPath) } : {}), params: pending.params, createdAt: now }));
+    atomic(taskPath, JSON.stringify({ dispatchId, ...(selfReviewRequired({ headRefOid: pr.headRefOid, fresh }) ? { selfReviewRequired: true } : {}), repeatFindings, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: pr.id, number: pr.number, repo: REPO, headRefOid: pr.headRefOid, headRefName: pr.headRefName, prAuthor: collected?.pr?.author?.login ?? pr.author?.login ?? null, handoff: collected?.handoff, releaseEpoch: collected?.pr?.releaseEpoch, feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }), prSnapshot, severityStandard: taskSeverityStandard(), adjudicationRecord: ADJUDICATION_RECORD_VERSION, ...(handoffAsked ? { childPrHandoff: childPrHandoffSpec(taskPath) } : {}), params: pending.params, createdAt: now }));
   }
   return pending;
 }
@@ -3272,7 +3291,7 @@ export function* processPr({
       dispatchId: recovery.dispatchId,
       params: dispatchParams({ pr: { ...pr, headRefOid: recovery.task?.headRefOid ?? pr.headRefOid },
         mapping, fresh: recovery.task?.feedback ?? [], now, taskPath, home: paths.home, prIntent: recovery.task?.prSnapshot?.prIntent ?? null,
-        childPrHandoff: recovery.task?.childPrHandoff ?? null }),
+        childPrHandoff: recovery.task?.childPrHandoff ?? null, selfReview: recovery.task?.selfReviewRequired === true }),
       at: now, taskPath, recovery: true, cursor: retainedCursor,
     };
     state.prs[key] = { ...previous, pendingDispatch: pending };
@@ -4604,10 +4623,19 @@ async function driveAsync(iterator, shared = { spawned: [] }) {
   return step.value;
 }
 
+// A switch that is set to something unreadable is treated as off; every run result says so, in whatever mode, because
+// the result is what the scheduler keeps (the watcher's stderr is only shown when the run fails).
+export function withConfigProblems(result) {
+  const problem = selfReviewConfigProblem();
+  if (!problem || !result || typeof result !== 'object') return result;
+  return { ...result, events: [...(Array.isArray(result.events) ? result.events : []),
+    { kind: 'config-invalid', field: 'preflightSelfReview', treatedAs: 'off', message: problem.slice(0, 300) }] };
+}
+
 export function scanOnce(options = {}) {
   const iterator = options.mode === 'poll' ? pollWorkflow(options)
     : options.mode === 'discover' ? discoverWorkflow(options) : scanWorkflow(options);
-  return driveSync(iterator);
+  return withConfigProblems(driveSync(iterator));
 }
 
 export async function scanOnceAsync(options = {}) {
@@ -4615,7 +4643,7 @@ export async function scanOnceAsync(options = {}) {
   const workflow = mode === 'poll' ? pollWorkflow : mode === 'discover' ? discoverWorkflow : scanWorkflow;
   // discover/poll run PRs concurrently, so gh and the recheck helper must not block the event loop.
   const transport = mode === 'poll' || mode === 'discover' ? { ghFn: runGhAsync, recheckFn: recheckResultAsync } : {};
-  return driveAsync(workflow({ collect: collectPrAsync, ...transport, ...options }));
+  return withConfigProblems(await driveAsync(workflow({ collect: collectPrAsync, ...transport, ...options })));
 }
 
 export function createCindyStdinDispatch() {

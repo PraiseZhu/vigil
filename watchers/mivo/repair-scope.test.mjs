@@ -1136,6 +1136,36 @@ test('点名 hook 文件的只有 P3 意见，或可改代码的意见写在别�
   }
 });
 
+// 推送前自审试点：是否要求自审在派发时写进任务（selfReviewRequired），收口按任务和「有没有提交」判断，不读开关。
+function askSelfReview(f) {
+  f.task.selfReviewRequired = true;
+  f.saveTask(f.task.feedback);
+}
+test('任务要求自审：有提交而 SC 报告没有 selfReview 时 finalize 拒绝，补上记录后通过并写进结果', async (t) => {
+  const f = fixture(t);
+  askSelfReview(f);
+  const options = { ...f.options, validatedHead: f.head, runFn: () => 'fixture checks passed\n' };
+  await validate(options);
+  f.report([f.sc('pass', ['thread:P1'])]);
+  assert.throws(() => finalize(options), /\[SELF_REVIEW_MISSING\].*actual: null/);
+  const written = JSON.parse(fs.readFileSync(options.scReport, 'utf8'));
+  fs.writeFileSync(options.scReport, JSON.stringify({ ...written, selfReview: { passes: 1, found: 1, fixed: 1 } }));
+  const result = finalize(options);
+  assert.equal(result.status, 'complete');
+  assert.deepEqual(result.selfReview, { passes: 1, found: 1, fixed: 1 });
+});
+
+test('任务没要求自审：有提交也不需要 selfReview，与开关当前的值无关', async (t) => {
+  const before = process.env.MIVO_PREFLIGHT_SELF_REVIEW;
+  process.env.MIVO_PREFLIGHT_SELF_REVIEW = 'true';
+  t.after(() => { if (before === undefined) delete process.env.MIVO_PREFLIGHT_SELF_REVIEW; else process.env.MIVO_PREFLIGHT_SELF_REVIEW = before; });
+  const f = fixture(t);
+  const options = { ...f.options, validatedHead: f.head, runFn: () => 'fixture checks passed\n' };
+  await validate(options);
+  f.report([f.sc('pass', ['thread:P1'])]);
+  assert.equal(finalize(options).status, 'complete');
+});
+
 test('SC6 并发的两个 validate 对同一基线键只跑一次基线', async (t) => {
   const { f, route, outcome, baselineRuns } = baselineFixture(t);
   const slowBase = async () => { await new Promise((resolve) => setTimeout(resolve, 200)); return outcome(failLog(A))(); };
