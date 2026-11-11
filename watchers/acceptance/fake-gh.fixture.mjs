@@ -91,6 +91,29 @@ export function writeSecret(file, content = 'test-token-not-real') {
   return file;
 }
 
+/**
+ * 测试专用的合成进程表（#370）：写一个只输出给定行、**不转调真实 ps** 的 `ps` 可执行文件，返回它所在目录。
+ * 只把它拼进测试子进程的 PATH；调用方进程自己的 PATH 不变，宿主 ps 也不受影响。
+ */
+export function syntheticPsDir({ lines = [], prefix = 'synthetic-ps-' } = {}) {
+  const dir = tmpDir(prefix);
+  const quote = (line) => `'${String(line).replace(/'/g, `'\\''`)}'`;
+  const body = [
+    '#!/bin/sh',
+    '# 合成进程表（#370）：只输出固定内容，不调用真实 ps。',
+    ...lines.map((line) => `printf '%s\\n' ${quote(line)}`),
+  ].join('\n');
+  const bin = path.join(dir, 'ps');
+  fs.writeFileSync(bin, `${body}\n`, { mode: 0o755 });
+  fs.chmodSync(bin, 0o755);
+  return dir;
+}
+
+/** 把合成进程表目录拼到 env 的 PATH 最前面（只给测试子进程用，不外溢）。 */
+export function withSyntheticPath(dir, env = process.env) {
+  return { ...env, PATH: `${dir}${path.delimiter}${env.PATH ?? ''}` };
+}
+
 export function writeProfile(home, extra = {}) {
   const stateDir = path.join(home, 'state');
   const worktreeDir = path.join(home, 'worktrees');
@@ -164,6 +187,7 @@ export function issueNode({
   subIssues = [],
   prs = [],
   comments = [],
+  defaultBranch = 'main',
   id,
 } = {}) {
   return {
@@ -177,7 +201,7 @@ export function issueNode({
     closedAt,
     updatedAt,
     author: { login: author },
-    repository: { nameWithOwner: repo },
+    repository: { nameWithOwner: repo, defaultBranchRef: defaultBranch ? { name: defaultBranch } : null },
     parent,
     subIssues: { nodes: subIssues },
     closedByPullRequestsReferences: { nodes: prs },

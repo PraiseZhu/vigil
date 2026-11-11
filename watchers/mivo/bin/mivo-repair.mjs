@@ -12,7 +12,7 @@ import { collectMivoCiSync } from './mivo-ci.mjs';
 import { collectPrOwnershipSync } from './mivo-pr-snapshot.mjs';
 import { isCurrentHandoff } from './mivo-handoff.mjs';
 import { createPushHooks } from './mivo-pre-push.mjs';
-import { taskRepairPolicy } from './mivo-feedback-policy.mjs';
+import { taskRepairPolicy, TRIAGE_REASONS } from './mivo-feedback-policy.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, readPr, writePr } from './mivo-state.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
 import { acquireValidationSlot, runStreaming, validationConfig } from './mivo-validation-runtime.mjs';
@@ -996,8 +996,22 @@ export function validateScs(report, task) {
   return { scs: checked, feedbackCoverage: { mode: expected.size ? 'task-feedback' : 'legacy-empty', requiredKeys: [...expected], coveredKeys: [...covered], dispositions, complete: true }, workers: Array.isArray(report) ? null : validateWorkers(report?.workers) };
 }
 
+// Pilot (preflightSelfReview, off by default): a round whose task asked for a self-review and that pushed commits must
+// say that it reviewed its own diff. The task says whether it was asked (written at dispatch, see the watcher's
+// selfReviewRequired); "changed code" is a moved head, not an SC marked pass — a round that only edits the PR title
+// or body passes its SC without a commit and has no diff to review. Only the record is checked here.
+export function validateSelfReview(record, { required, changed }) {
+  if (required !== true || changed !== true) return null;
+  const whole = (value) => Number.isInteger(value) && value >= 0;
+  const ok = record && typeof record === 'object' && [1, 2].includes(record.passes) && whole(record.found) && whole(record.fixed) && record.fixed <= record.found;
+  if (!ok) fail(`[SELF_REVIEW_MISSING] this round has commits with changes and its task asked for a self-review (expected: selfReview:{passes:1|2,found:n,fixed:m} with m<=n at the top of the SC report; actual: ${JSON.stringify(record ?? null)})`);
+  return { passes: record.passes, found: record.found, fixed: record.fixed };
+}
+
 function loadScs(scReport, task) {
-  return validateScs(readJson(requireAbs(scReport, 'sc-report'), 'SC report'), task);
+  const report = readJson(requireAbs(scReport, 'sc-report'), 'SC report');
+  const checked = validateScs(report, task);
+  return !Array.isArray(report) && report?.selfReview !== undefined ? { ...checked, selfReviewRecord: report.selfReview } : checked;
 }
 
 function rejectSkip(env = process.env) {
@@ -1013,8 +1027,24 @@ function validationPolicy(worktree, task, gitFn, baseRefName = null) {
   const actual = fs.readFileSync(path.join(worktree, file), 'utf8').trim();
   if (expected && expected === actual) return { file, sourceHead: task.headRefOid, sha256: hash(actual) };
   const fromBase = baseHook(worktree, file, baseRefName, gitFn);
-  if (!actual || fromBase?.hook !== actual) fail('local preflight policy changed from the dispatched baseline');
-  return { file, sourceHead: task.headRefOid, sha256: hash(actual), fromBase: { baseRefName, mergeBase: fromBase.mergeBase } };
+  if (actual && fromBase?.hook === actual) return { file, sourceHead: task.headRefOid, sha256: hash(actual), fromBase: { baseRefName, mergeBase: fromBase.mergeBase } };
+  // The hook is the gate itself, so a session may not change it on its own. The one exception (user decision
+  // 2026-11-11): review feedback of this task that may change code and is written on this very file. Two weeks of
+  // runs had rounds whose fix was ready and could not be pushed because the finding was about the hook.
+  const named = hookFindingKeys(task, file);
+  if (!actual || !named.length) fail(`local preflight policy changed from the dispatched baseline (expected: the dispatched hook, the base branch's hook, or review feedback on ${file} that may change code; actual: none of them)`);
+  return { file, sourceHead: task.headRefOid, sha256: hash(actual), reviewedChange: { feedbackKeys: named } };
+}
+
+// Keys of this task's feedback that is written on `file` and is a confirmed P0/P1/P2 finding of a trusted reviewer.
+// "May change code" alone is not enough: a thread by any member or outside account is handed to the session to grade
+// (the triage reasons, no severity yet) and also may change code, so one comment on the hook would open the gate.
+// The policy is computed from the item itself, never from a cached flag in the task.
+const CONFIRMED_SEVERITY = new Set(['P0', 'P1', 'P2']);
+export function hookFindingKeys(task, file) {
+  const confirmed = new Set(taskRepairPolicy(task).items.filter((item) => item.canChangeCode === true && item.action === 'code-fix'
+    && !TRIAGE_REASONS.has(item.reason) && (item.severities ?? []).some((level) => CONFIRMED_SEVERITY.has(level))).map((item) => item.key));
+  return (task?.feedback ?? []).filter((item) => item?.path === file && confirmed.has(item.key)).map((item) => item.key);
 }
 
 function baseHook(worktree, file, baseRefName, gitFn) {
@@ -1452,6 +1482,24 @@ function retriggerRequiredCi({ paths, task, ci, ghFn, previous, sourceHead }) {
   return { retried: true, ciRetrigger };
 }
 
+// The one rerun spent on this head may still be running: until its jobs finish, GitHub keeps reporting the
+// previous attempt's failed checks (2026-11-11: #2142 was escalated ten minutes before its rerun went green).
+// A rerun that already finished green means the check snapshot in hand is stale. Only runs that still carry a
+// failed required check count. Past the wait, or when the run cannot be read, the caller keeps its blocked verdict.
+const RERUN_WAIT_MS = 2 * 60 * 60 * 1000;
+const RUN_ACTIVE_STATUSES = new Set(['queued', 'in_progress', 'requested', 'waiting', 'pending']);
+function rerunUnsettled({ task, ci, record, ghFn, now = Date.now() }) {
+  const at = Date.parse(record?.at ?? '');
+  if (record?.method !== 'gh-rerun' || !Number.isFinite(at) || now - at > RERUN_WAIT_MS) return false;
+  const failing = new Set(failedRunIds(ci));
+  return (record.runIds ?? []).map(String).filter((runId) => failing.has(runId)).some((runId) => {
+    let run;
+    try { run = ghJson(['api', `repos/${task.repo}/actions/runs/${runId}`], ghFn); } catch { return false; }
+    return RUN_ACTIVE_STATUSES.has(run?.status) || (run?.status === 'completed' && run?.conclusion === 'success');
+  });
+}
+const RERUN_WAITING_REASON = 'waiting for the one no-change CI rerun to finish';
+
 // A head branch whose effective rules include `pull_request` (e.g. an `integration/*` stage branch whose
 // stage PR targets main) rejects every direct push with GH013, so a direct push can never land (2026-11-04:
 // stage PR #1599 blocked five rounds in a row). A failed probe keeps the direct push: the push stays the gate.
@@ -1808,12 +1856,14 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   const branchHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
-  const { scs, feedbackCoverage, workers } = loadScs(scReport, task);
+  const { scs, feedbackCoverage, workers, selfReviewRecord } = loadScs(scReport, task);
   assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview: alreadyFixedProof({ worktree, validatedHead, gitFn }) });
   assertRepeatInventory({ scs, task });
   assertStandardAllowsDisputes({ scs, task });
-  const workersField = workers ? { workers } : {};
   const emptyRetrigger = allNoChange(scs) && isEmptyCiRetrigger(worktree, task.headRefOid, validatedHead, gitFn);
+  // An empty commit that only re-triggers CI has no diff to review.
+  const selfReview = validateSelfReview(selfReviewRecord, { required: task.selfReviewRequired === true, changed: validatedHead !== task.headRefOid && !emptyRetrigger });
+  const workersField = { ...(workers ? { workers } : {}), ...(selfReview ? { selfReview } : {}) };
   assertTaskRepairScope(task, validatedHead, { emptyRetrigger });
   if (validatedHead !== task.headRefOid && scs.every((sc) => sc.status === 'no-change') && !emptyRetrigger) {
     fail('[REPAIR_SCOPE_NO_CODE] Changed HEAD requires an SC bound to an authorized fix; no-change cannot cover commits');
@@ -1864,6 +1914,10 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
       status: 'waiting-ci', reason: 'retried required CI once after no-change',
       head: validatedHead, scs, feedbackCoverage, ...workersField, keel, verification, ci, checks: ci.requiredChecks, pushed, ciRetrigger: extra.ciRetrigger,
     });
+    if (extra.already && rerunUnsettled({ task, ci, record: extra.ciRetrigger, ghFn })) return saveResult(paths, task, sessionId, {
+      status: 'waiting-ci', reason: RERUN_WAITING_REASON,
+      head: validatedHead, scs, feedbackCoverage, ...workersField, keel, verification, ci, checks: ci.requiredChecks, pushed, ciRetrigger: extra.ciRetrigger,
+    });
     if (extra.already) return saveResult(paths, task, sessionId, {
       status: 'blocked', blockedKind: 'external',
       reason: 'required CI still failed after one no-change retrigger',
@@ -1901,7 +1955,7 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
   const remoteHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (!isSha(remoteHead)) fail('remote branch head is unavailable during recheck');
   const observedPrHead = ownership.pr.headRefOid;
-  const common = { head, scs, feedbackCoverage, ...(previous.workers ? { workers: previous.workers } : {}), keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
+  const common = { head, scs, feedbackCoverage, ...(previous.workers ? { workers: previous.workers } : {}), ...(previous.selfReview ? { selfReview: previous.selfReview } : {}), keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
   if (remoteHead !== observedPrHead) {
     return saveResult(paths, task, sessionId, { ...common, status: 'waiting-ci', reason: 'GitHub PR and remote branch views differ', checks: [],
       ci: { head, requiredGreen: false, requiredChecks: [], optionalFailures: [], pending: [], missing: ['github-remote-head-mismatch'] } }, { requirePrLock: true });
@@ -1925,6 +1979,12 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
         ci, checks: ci.requiredChecks, ciRetrigger: extra.ciRetrigger,
       }, { requirePrLock: true });
     }
+    if (extra.already && rerunUnsettled({ task, ci, record: extra.ciRetrigger, ghFn })) {
+      return saveResult(paths, task, sessionId, {
+        ...common, status: 'waiting-ci', reason: RERUN_WAITING_REASON,
+        ci, checks: ci.requiredChecks, ciRetrigger: extra.ciRetrigger,
+      }, { requirePrLock: true });
+    }
     if (extra.already) {
       return saveResult(paths, task, sessionId, {
         ...common, status: 'blocked', blockedKind: 'external',
@@ -1939,18 +1999,46 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
 
 // Only what a session cannot settle itself blocks; product questions and untrue feedback are answered in the session.
 export const BLOCKED_KINDS = new Set(['external']);
+// A session that stops because the PR moved under it (the author or another session pushed, the handoff was replaced)
+// is not stuck on anything a person has to solve: the watcher judges the PR again from where it is now. Two weeks of
+// runs had 39 such rounds reported as `external`, each with a notice (2026-11-11). The kind is not the session's to
+// choose: it is read from the same ownership check the session ran, by the words this helper itself fails with.
+export const MOVED_BLOCK_KINDS = new Set(['stale-head', 'ownership-moved']);
+// `blocked` is also the way out when GitHub itself is failing, so the classification costs one read at most and any
+// failure of it leaves the kind the session gave. The handoff is compared from local state; the head from one PR view.
+// A head this dispatch pushed itself (a bound result with pushed:true on that head) is not a stale head.
+export function movedBlockKind({ paths, task, entry, ghFn = command } = {}) {
+  try {
+    const receipt = task.handoff;
+    const keys = ['version', 'id', 'repo', 'number', 'nodeId', 'head', 'releaseEpoch', 'author'];
+    if (entry?.activeTask?.blockedKind === AUTHOR_RECLAIMED) return 'ownership-moved';
+    // A handoff replaced on GitHub that this machine has not recorded yet is not seen here (that needs the timeline
+    // reads); the block then stays `external` for that one round and the watcher redispatches after its next poll.
+    if (!receipt || !entry?.handoff || keys.some((key) => receipt[key] !== entry.handoff[key]) || receipt.releaseEpoch !== task.releaseEpoch) return 'ownership-moved';
+    const pr = ghJson(['pr', 'view', String(task.number), '--repo', task.repo, '--json', 'state,isDraft,headRefOid'], ghFn);
+    if (pr.state !== 'OPEN' || pr.isDraft === true) return 'ownership-moved';
+    if (!isSha(pr.headRefOid) || pr.headRefOid === task.headRefOid) return null;
+    const file = path.join(paths.results, `${task.dispatchId}.json`);
+    if (fs.existsSync(file)) {
+      const result = readJson(file, 'repair result');
+      if (result?.dispatchId === task.dispatchId && result.pushed === true && result.head === pr.headRefOid) return null;
+    }
+    return 'stale-head';
+  } catch { return null; }
+}
 export function blocked({ home, taskPath, reason, kind = 'external', ghFn = command } = {}) {
   if (!BLOCKED_KINDS.has(kind)) fail(`blocked --kind must be one of ${[...BLOCKED_KINDS].join(', ')}, got ${JSON.stringify(kind)}`);
   const { paths, task } = taskFrom(home, taskPath);
   recordActivity(paths, task, 'blocked');
-  const { sessionId } = boundSession(paths, task);
+  const { sessionId, entry } = boundSession(paths, task);
   if (typeof reason !== 'string' || !reason.trim()) fail('blocked reason is required');
   if (isValidateFailureReason(reason) && !hasValidationReceipt(paths, task)) {
     fail('本轮还没有 validate 收据：以 validate/preflight 失败为由停下前，先运行同一 helper validate --validated-head <完整SHA>，以本轮结果为准（helper 会复用通过收据、按基线判定 main 自身的失败）。若是环境/工具故障（如 pathspec、submodule、worktree HEAD），在 reason 里写明具体故障。');
   }
   const validationBlock = latestFailedValidation(paths, task);
+  const moved = movedBlockKind({ paths, task, entry, ghFn });
   return saveResult(paths, task, sessionId, {
-    status: 'blocked', blockedKind: kind, reason: reason.trim(),
+    status: 'blocked', blockedKind: moved ?? kind, reason: reason.trim(),
     head: task.headRefOid, worktree: taskWorktree(task), ...(validationBlock ? { validationBlock } : {}),
   });
 }

@@ -185,6 +185,9 @@ export function evaluateMivoCi({ policy, headSha, checks = [], statuses = [] }) 
     if (['QUEUED', 'IN_PROGRESS', 'PENDING', 'WAITING', 'REQUESTED'].includes(String(latest.status ?? latest.result).toUpperCase())) return result('pending', 'required-check-pending', latest);
     if (String(latest.result).toUpperCase() === 'SUCCESS' && (latest.kind === 'status' || String(latest.status).toUpperCase() === 'COMPLETED')) return result('green', 'required-check-success', latest);
     if (['FAILURE', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STARTUP_FAILURE', 'STALE', 'ERROR'].includes(String(latest.result).toUpperCase())) return result('failed', 'required-check-failed', latest);
+    // Skipped is not success for the pre-review (it wants every check green), and it has its own reason so that a check
+    // skipped behind a failed job can be told apart (mivo-ci-selfheal.mjs resolveSkippedRequired).
+    if (String(latest.result).toUpperCase() === 'SKIPPED') return result('unknown', 'required-check-skipped', latest);
     return result('unknown', 'required-check-not-success', latest);
   });
   return { status: required.some((item) => item.status === 'failed') ? 'failed' : required.some((item) => item.status === 'unknown') ? 'unknown' : required.some((item) => item.status === 'pending') ? 'pending' : 'green', required, policyHash: policy.policyHash, headSha };

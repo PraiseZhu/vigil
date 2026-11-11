@@ -74,7 +74,7 @@ function fakeGithub() {
     number: 1,
     body: ISSUE_BODY,
     comments: [disputedRound()],
-    prs: [{ number: 9, url: `https://github.com/${REPO}/pull/9`, mergedAt: '2026-10-20T00:00:00.000Z', repository: { nameWithOwner: REPO } }],
+    prs: [{ number: 9, url: `https://github.com/${REPO}/pull/9`, mergedAt: '2026-10-20T00:00:00.000Z', baseRefName: 'main', repository: { nameWithOwner: REPO } }],
   });
   return {
     writes,
@@ -402,7 +402,7 @@ function standaloneWithDispute(extraComments = []) {
     number: 1,
     body: ISSUE_BODY,
     comments: [disputedRound(), ...extraComments],
-    prs: [{ number: 9, url: `https://github.com/${REPO}/pull/9`, mergedAt: '2026-10-20T00:00:00.000Z', repository: { nameWithOwner: REPO } }],
+    prs: [{ number: 9, url: `https://github.com/${REPO}/pull/9`, mergedAt: '2026-10-20T00:00:00.000Z', baseRefName: 'main', repository: { nameWithOwner: REPO } }],
   });
 }
 
@@ -447,7 +447,7 @@ test('SC8 有争议只认最近一次出结论的轮次，且只认「- 有争�
     tier: 'auto',
     kind: 'standalone',
     rounds,
-    linkedPrs: [{ mergedAt: '2026-10-20T00:00:00.000Z' }],
+    linkedPrs: [{ mergedAt: '2026-10-20T00:00:00.000Z', base: 'main' }],
     bodyVersion: 'sha256:abc',
     dispute: { round: 2, items: [ITEM], adjudication: null },
   };

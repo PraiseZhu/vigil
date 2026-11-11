@@ -579,7 +579,7 @@ function writeFakeGh(binDir, tokenLog) {
         {
           number: 2,
           url: `https://example.invalid/${REPO}/pull/2`,
-          mergedAt: '2026-10-20T00:00:00.000Z',
+          mergedAt: '2026-10-20T00:00:00.000Z', baseRefName: 'main',
           repository: { nameWithOwner: REPO },
         },
       ],

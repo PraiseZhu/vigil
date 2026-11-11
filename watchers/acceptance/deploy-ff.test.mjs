@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { FLOCK_SKIP, tmpDir } from './fake-gh.fixture.mjs';
+import { FLOCK_SKIP, syntheticPsDir, tmpDir, withSyntheticPath } from './fake-gh.fixture.mjs';
 import {
   BUSY_PROCESS_RE,
   EXIT,
@@ -957,7 +957,9 @@ done
 exec "$REAL_GIT" "$@"
 `);
   fs.chmodSync(path.join(bin, 'git'), 0o755);
-  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, GIT_LOG: log, REAL_GIT: realGit };
+  // #370：进程表用合成数据，避免被宿主上真在跑的验收进程影响「轮次空档」判定。
+  const psDir = syntheticPsDir();
+  const env = { ...process.env, PATH: `${psDir}${path.delimiter}${bin}${path.delimiter}${process.env.PATH}`, GIT_LOG: log, REAL_GIT: realGit };
   const [left, right] = await Promise.all([spawnCli(world, env), spawnCli(world, env)]);
   const statuses = [left, right].map((item) => JSON.parse(item.stdout.split('\n')[0]).status).sort();
   assert.deepEqual(statuses, ['blocked-dirty', 'locked'], `${left.stderr}\n${right.stderr}\n${left.stdout}\n${right.stdout}`);
@@ -968,7 +970,8 @@ exec "$REAL_GIT" "$@"
 
 test('#215 SC9 命令行入口标准输出恰好两行', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
-  const result = await spawnCli(world);
+  // #370：空档判定用合成进程表（空表），不依赖宿主真实进程。
+  const result = await spawnCli(world, withSyntheticPath(syntheticPsDir()));
   assert.equal(result.code, EXIT['up-to-date']);
   const parts = result.stdout.split('\n');
   assert.equal(parts.length, 3, `${result.stdout}\n${result.stderr}`);
@@ -976,6 +979,18 @@ test('#215 SC9 命令行入口标准输出恰好两行', { skip: FLOCK_SKIP }, a
   assert.equal(json.status, 'up-to-date');
   assert.equal(parts[2], '');
 });
+
+// #370：三条忙碌分支各跑一次真实 CLI，进程表完全来自合成数据；生产判断仍生效（waiting + 退出码 30）。
+for (const busy of ['round.mjs', 'prbot.mjs', 'adjudicate.mjs']) {
+  test(`#370 SC3 合成进程表命中 ${busy} 时真实 CLI 返回 waiting 且退出码 30`, { skip: FLOCK_SKIP }, async () => {
+    const world = makeWorld();
+    const psDir = syntheticPsDir({ lines: [`node /tmp/synthetic/${busy}`] });
+    const result = await spawnCli(world, withSyntheticPath(psDir));
+    const json = assertRun(result, 'waiting');
+    assert.equal(json.reason, '有验收进程在跑');
+    assert.equal(result.code, 30);
+  });
+}
 
 test('#215 SC10 SC14 SC17 源码静态约束', () => {
   const hostImport = spawnSync('grep', ['-nE', String.raw`from '\./host/|from '\.\./host/|host/[a-z-]+\.mjs`, SCRIPT], { encoding: 'utf8' });

@@ -3,6 +3,7 @@
   "reviewerLogin": "ExampleUser",
   "pluginRepoPath": "/path/to/your-plugin-checkout",
   "severityStandardPath": "/path/to/review-skill-checkout/mivo/config/severity.md",
+  "preflightSelfReview": false,
   "keelLedgerRoot": "/path/to/keel-data-dir",
   "keelNamespace": "your-keel-namespace",
   "watchHomes": [

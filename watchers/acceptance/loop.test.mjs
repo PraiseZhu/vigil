@@ -1084,7 +1084,7 @@ test('#228 SC5 kind=child 夹具认领成功后创建 roundDir', async () => {
       {
         number: 9,
         url: 'https://example.test/pull/9',
-        mergedAt: '2026-10-20T01:00:00.000Z',
+        mergedAt: '2026-10-20T01:00:00.000Z', baseRefName: 'main',
         repository: { nameWithOwner: REPO },
       },
     ],

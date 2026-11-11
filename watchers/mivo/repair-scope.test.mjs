@@ -98,6 +98,10 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
   let remoteHead = sourceHead;
   let ciConclusionValue = 'success';
   const ciConclusion = () => ciConclusionValue;
+  // Extra fields of Actions run 555 (status / conclusion). failFromRead: N makes the Nth and later reads
+  // since setRun fail, so the CI collection can still read the run while the helper's own read cannot.
+  let runState = {};
+  let runReads = 0;
   const pushCalls = [];
   const ghCalls = [];
   const childPrs = [];
@@ -158,9 +162,11 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
       id: 101, run_id: 555, head_sha: remoteHead, run_attempt: 1,
       check_run_url: `https://api.github.com/repos/${REPO}/check-runs/101`,
     });
-    if (endpoint === `repos/${REPO}/actions/runs/555`) return JSON.stringify({
-      id: 555, repository: { full_name: REPO }, head_sha: remoteHead, run_attempt: 1,
-    });
+    if (endpoint === `repos/${REPO}/actions/runs/555`) {
+      const { failFromRead, ...fields } = runState;
+      if (++runReads >= (failFromRead ?? Infinity)) throw new Error('HTTP 502: Bad Gateway');
+      return JSON.stringify({ id: 555, repository: { full_name: REPO }, head_sha: remoteHead, run_attempt: 1, ...fields });
+    }
     if (args[0] === 'run' && args[1] === 'rerun') return '';
     if (String(endpoint).startsWith(`repos/${REPO}/commits/${remoteHead}/statuses`)) return JSON.stringify([[]]);
     assert.fail(`unexpected GitHub call: ${JSON.stringify(args)}`);
@@ -176,6 +182,8 @@ function fixture(t, { changed = true, lockfile = false, nodeModules = false, pro
     remoteGit: (...args) => git('--git-dir', originUrl, ...args),
     remoteRef: (ref) => { try { return git('--git-dir', originUrl, 'rev-parse', '--verify', '--quiet', ref); } catch { return null; } },
     setCiConclusion: (value) => { ciConclusionValue = value; },
+    setRun: (value) => { runState = value; runReads = 0; },
+    runReads: () => runReads,
     remoteHead: () => git('--git-dir', originUrl, 'rev-parse', 'refs/heads/fix/scope'),
     validate: () => validate(options), finalize: () => finalize(options) };
 }
@@ -289,6 +297,73 @@ test('SC7 no-change required-CI failure reruns failed jobs once, then escalates'
   assert.equal(second.status, 'blocked');
   assert.equal(second.blockedKind, 'external');
   assert.equal(f.ghCalls.filter((args) => args[0] === 'run' && args[1] === 'rerun').length, 1);
+});
+
+// #400: the checks still show the previous attempt while the rerun is running.
+function rerunPending(t) {
+  const f = fixture(t, { changed: false });
+  f.saveTask([finding('P2')]);
+  f.report([f.sc('no-change', ['thread:P2'])]);
+  f.setCiConclusion('failure');
+  assert.equal(f.finalize().status, 'waiting-ci');
+  const reruns = () => f.ghCalls.filter((args) => args[0] === 'run' && args[1] === 'rerun').length;
+  return { f, reruns };
+}
+
+for (const run of [{ status: 'queued' }, { status: 'in_progress' }, { status: 'completed', conclusion: 'success' }]) {
+  test(`#400 finalize keeps waiting while the rerun is ${run.conclusion ?? run.status}`, (t) => {
+    const { f, reruns } = rerunPending(t);
+    f.setRun(run);
+    const second = f.finalize();
+    assert.equal(second.status, 'waiting-ci');
+    assert.equal(second.blockedKind, undefined);
+    assert.equal(second.reason, 'waiting for the one no-change CI rerun to finish');
+    assert.equal(second.ciRetrigger.method, 'gh-rerun');
+    assert.equal(reruns(), 1, 'waiting must not spend a second rerun');
+  });
+}
+
+for (const [name, run] of [['finished red', { status: 'completed', conclusion: 'failure' }], ['unreadable', { status: 'in_progress', failFromRead: 2 }], ['without a status', {}]]) {
+  test(`#400 finalize escalates when the rerun is ${name}`, (t) => {
+    const { f, reruns } = rerunPending(t);
+    f.setRun(run);
+    const second = f.finalize();
+    assert.equal(second.status, 'blocked');
+    assert.equal(second.blockedKind, 'external');
+    assert.equal(second.reason, 'required CI still failed after one no-change retrigger');
+    if (run.failFromRead) assert.equal(f.runReads(), run.failFromRead, 'the read that failed must be the helper\'s own');
+    assert.equal(reruns(), 1);
+  });
+}
+
+test('#400 finalize stops waiting two hours after the rerun was requested', (t) => {
+  const { f } = rerunPending(t);
+  f.setRun({ status: 'in_progress' });
+  const ledger = path.join(f.paths.home, 'state', 'ci-retrigger', `${encodeURIComponent(f.task.nodeId)}.json`);
+  const aged = (ms) => {
+    const records = JSON.parse(fs.readFileSync(ledger, 'utf8'));
+    for (const record of Object.values(records)) record.at = new Date(Date.now() - ms).toISOString();
+    fs.writeFileSync(ledger, JSON.stringify(records));
+  };
+  aged(110 * 60 * 1000);
+  assert.equal(f.finalize().status, 'waiting-ci');
+  aged(130 * 60 * 1000);
+  const late = f.finalize();
+  assert.equal(late.status, 'blocked');
+  assert.equal(late.blockedKind, 'external');
+});
+
+test('#400 recheck keeps waiting while the rerun is in progress, then escalates once it finished red', (t) => {
+  const { f, reruns } = rerunPending(t);
+  f.setRun({ status: 'in_progress' });
+  const waiting = recheck(f.options);
+  assert.equal(waiting.status, 'waiting-ci');
+  assert.equal(waiting.reason, 'waiting for the one no-change CI rerun to finish');
+  f.setRun({ status: 'completed', conclusion: 'failure' });
+  const done = recheck(f.options);
+  assert.equal(done.status, 'blocked');
+  assert.equal(done.blockedKind, 'external');
+  assert.equal(reruns(), 1);
 });
 
 test('R4 replacing a required-CI task on the same head must not retrigger again', async (t) => {
@@ -1108,6 +1183,62 @@ test('合入 main 之后 PR 自己又改了 hook：仍按策略变更拦下', as
   const head = mergeMainWithNewHook(f, { prEditsHookAfter: true });
   await assert.rejects(validate({ ...f.options, validatedHead: head, runFn: () => 'fixture checks passed\n' }),
     /local preflight policy changed from the dispatched baseline/);
+});
+
+// 用户 2026-11-11 定：只有本任务里可改代码的审查意见正好写在 hook 文件上时，会话才可以改它。
+test('审查意见点名 hook 文件：PR 改 hook 放行并记下是哪条意见，finalize 复核通过', async (t) => {
+  const f = fixture(t);
+  f.saveTask([{ ...finding('P1'), path: '.githooks/pre-push' }]);
+  const head = mergeMainWithNewHook(f, { prEditsHookAfter: true });
+  const options = { ...f.options, validatedHead: head, runFn: () => 'fixture checks passed\n' };
+  const verification = await validate(options);
+  assert.equal(verification.status, 'pass');
+  assert.deepEqual(readReceipt(verification).policy.reviewedChange.feedbackKeys, ['thread:P1']);
+  f.report([f.sc('pass', ['thread:P1'])]);
+  assert.equal(finalize(options).status, 'complete');
+});
+
+test('点名 hook 文件的只有 P3 意见，或可改代码的意见写在别的文件上：仍然拦下，报错写明期望与实际', async (t) => {
+  for (const feedback of [
+    [finding('P1'), { ...finding('P3'), path: '.githooks/pre-push' }],
+    [{ ...finding('P1'), path: 'src/other.ts' }],
+  ]) {
+    const f = fixture(t);
+    f.saveTask(feedback);
+    const head = mergeMainWithNewHook(f, { prEditsHookAfter: true });
+    await assert.rejects(validate({ ...f.options, validatedHead: head, runFn: () => 'fixture checks passed\n' }),
+      /local preflight policy changed from the dispatched baseline \(expected: .*actual: none of them\)/);
+  }
+});
+
+// 推送前自审试点：是否要求自审在派发时写进任务（selfReviewRequired），收口按任务和「有没有提交」判断，不读开关。
+function askSelfReview(f) {
+  f.task.selfReviewRequired = true;
+  f.saveTask(f.task.feedback);
+}
+test('任务要求自审：有提交而 SC 报告没有 selfReview 时 finalize 拒绝，补上记录后通过并写进结果', async (t) => {
+  const f = fixture(t);
+  askSelfReview(f);
+  const options = { ...f.options, validatedHead: f.head, runFn: () => 'fixture checks passed\n' };
+  await validate(options);
+  f.report([f.sc('pass', ['thread:P1'])]);
+  assert.throws(() => finalize(options), /\[SELF_REVIEW_MISSING\].*actual: null/);
+  const written = JSON.parse(fs.readFileSync(options.scReport, 'utf8'));
+  fs.writeFileSync(options.scReport, JSON.stringify({ ...written, selfReview: { passes: 1, found: 1, fixed: 1 } }));
+  const result = finalize(options);
+  assert.equal(result.status, 'complete');
+  assert.deepEqual(result.selfReview, { passes: 1, found: 1, fixed: 1 });
+});
+
+test('任务没要求自审：有提交也不需要 selfReview，与开关当前的值无关', async (t) => {
+  const before = process.env.MIVO_PREFLIGHT_SELF_REVIEW;
+  process.env.MIVO_PREFLIGHT_SELF_REVIEW = 'true';
+  t.after(() => { if (before === undefined) delete process.env.MIVO_PREFLIGHT_SELF_REVIEW; else process.env.MIVO_PREFLIGHT_SELF_REVIEW = before; });
+  const f = fixture(t);
+  const options = { ...f.options, validatedHead: f.head, runFn: () => 'fixture checks passed\n' };
+  await validate(options);
+  f.report([f.sc('pass', ['thread:P1'])]);
+  assert.equal(finalize(options).status, 'complete');
 });
 
 test('SC6 并发的两个 validate 对同一基线键只跑一次基线', async (t) => {

@@ -364,6 +364,29 @@ test('recheck failure does not commit fingerprint', (t) => {
   assert.equal(entry.lastRecheckError.at, now);
 });
 
+// 2026-11-11: 33 PRs carried a recheck error that was only the helper's command line; the cause was on stderr.
+test('recheck failure records what the helper said on stderr, not the command line', (t) => {
+  const { paths } = homeOf(t);
+  seed(paths, {
+    pollFingerprint: pollFingerprint(snap()),
+    activeTask: { status: 'waiting-ci', evidenceVersion: 2, dispatchId: 'd1', head: HEAD },
+    lastDispatch: { dispatchId: 'd1' },
+  });
+  const failure = Object.assign(new Error(`Command failed: node ${'x'.repeat(500)} recheck`), { stderr: 'reading task\nmivo-repair: PR 状态锁占用，请稍后重试写结果\n' });
+  const { entry } = poll(paths, {
+    snapshot: snap({ commentCount: 8, commentUpdatedAt: '2026-09-28T05:00:00Z' }),
+    collect: () => ({
+      pr: { id: nodeId, number: 790, state: 'OPEN', isDraft: false, sameRepository: true, author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' },
+      admissionVerified: true, checks: [], comments: [], reviews: [], threads: [], labels: [], mergeReady: false,
+      ci: { status: 'green', required: [] }, policy: { status: 'verified', required: [] },
+    }),
+    dispatchFn: () => ({ target_session_id: 'sess-790' }),
+    recheckFn: () => { throw failure; },
+  });
+  assert.match(entry.lastRecheckError.message, /PR 状态锁占用/);
+  assert.doesNotMatch(entry.lastRecheckError.message, /Command failed/);
+});
+
 const waitingCollect = () => ({
   pr: { id: nodeId, number: 790, state: 'OPEN', isDraft: false, sameRepository: true, author: { login: 'owner' }, headRefOid: HEAD, baseRefOid: BASE, releaseEpoch: 'e' },
   admissionVerified: true, checks: [], comments: [], reviews: [], threads: [], labels: [], mergeReady: false,

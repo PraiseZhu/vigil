@@ -171,7 +171,7 @@ test('SC3 关闭勾选后按改后的正文记版本，trigger 不会因此重�
   // 独立任务：没有子 issue。
   const root = world.get(`${REPO}#1`);
   root.subIssues = [];
-  root.prs = [{ number: 12, url: `https://github.com/${REPO}/pull/12`, mergedAt: '2026-10-20T00:00:00.000Z' }];
+  root.prs = [{ number: 12, url: `https://github.com/${REPO}/pull/12`, mergedAt: '2026-10-20T00:00:00.000Z', baseRefName: 'main' }];
   const before = bodyVersion(root.body);
 
   const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN,
@@ -202,7 +202,8 @@ test('SC3 关闭勾选后按改后的正文记版本，trigger 不会因此重�
       bodyVersion: bodyVersion(edited),
       rounds,
       children: [],
-      linkedPrs: root.prs,
+      // linkedPrs 的形状和 tasks.mjs 交出来的一致：ref + mergedAt + 目标分支 base。
+      linkedPrs: root.prs.map((pr) => ({ ref: `${REPO}#${pr.number}`, mergedAt: pr.mergedAt, base: pr.baseRefName })),
     },
     { now: () => Date.parse('2026-10-25T00:00:00.000Z'), profile },
   );

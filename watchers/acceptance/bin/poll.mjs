@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-// 只读盘点：列出该开始的任务和卡住的轮次。不写 GitHub、不写本地缓存、不调模型。
+// 只读盘点：列出该开始的任务和卡住的轮次。不写 GitHub、不写本地缓存、不调模型；
+// 只有「合并目标分支不对」这一种情况会往 <home>/state/host/loop.log 落一行日志（不写缓存）。
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isVerdictOnly, loadAcceptanceProfile } from './profile.mjs';
@@ -46,6 +48,33 @@ export function homeOf(profile) {
 }
 
 /**
+ * 「因为合并目标分支不对而不验」的记录处：`<home>/state/host/loop.log` 一行一条，kind 就是 reason。
+ * 这不是缓存也不是通知，只是本地日志；写不下去（目录没了、没权限）不影响盘点。
+ */
+export function loopLogOf(profile) {
+  let file = null;
+  try {
+    file = hostPaths(homeOf(profile)).loopLog;
+  } catch {
+    return () => {};
+  }
+  return (line) => {
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(file, line.endsWith('\n') ? line : `${line}\n`);
+    } catch {
+      // 日志写不下去就算了，不挡盘点。
+    }
+  };
+}
+
+/** 合并目标分支不对时的日志行：时间和 kind 在前，后面跟可诊断的键值对。 */
+export function baseSkipLine(decision, now = () => Date.now()) {
+  const prs = (decision?.prs || []).map((pr) => `${pr.ref}@${pr.base || 'unknown'}`).join(',');
+  return `${new Date(now()).toISOString()} ${decision.reason} issue=${decision.issue} default=${decision.defaultBranch} base=${decision.base || 'unknown'} prs=${prs} 验收机只按默认分支验代码，等合入默认分支后再验`;
+}
+
+/**
  * 把一次响应头的剩余与 reset 记进本地状态（按令牌身份分开，SC9）。
  * 写不下去不影响这次读：判定那边会写成 rate-unknown。
  */
@@ -88,12 +117,14 @@ export async function poll({ github, profile, now = () => Date.now(), hostProgre
  * 不再让 `discoverCorrections` 自己又拉一遍全量盘点。
  * 返回值里的 `reads` 是这一拍真的发了几次只读请求（#247 P2-2）：用量记它，不写字面量。
  */
-export async function pollInventory({ github, profile, now = () => Date.now(), hostProgress }) {
+export async function pollInventory({ github, profile, now = () => Date.now(), hostProgress, loopLog } = {}) {
   const counted = countReads(github);
   const roundsApi = createRounds({ github: counted, profile, now });
   const hostProgressAt = hostProgress || defaultHostProgress(profile);
+  const log = loopLog === false ? () => {} : loopLog || loopLogOf(profile);
   const tasks = await collectTasks(counted, profile);
   const out = [];
+  const baseSkipped = [];
   for (const task of tasks) {
     const latest = latestRound(task.rounds);
     const progressAt = roundsApi.lastProgressAt(task.ref, latest?.round, latest);
@@ -105,6 +136,21 @@ export async function pollInventory({ github, profile, now = () => Date.now(), h
     });
     if (stale) out.push(stale);
     const decision = shouldTrigger(task, { now, profile });
+    if (decision.reason === 'base-not-default' || decision.reason === 'base-unknown') {
+      // 合并目标分支不对（或取不到）：不进验收、不开修正单。只落一行本地日志，不发通知、不写 GitHub。
+      const record = {
+        issue: task.ref,
+        kind: task.kind,
+        reason: decision.reason,
+        base: decision.base ?? null,
+        defaultBranch: decision.defaultBranch || task.defaultBranch || 'main',
+        prs: decision.prs || [],
+        child: decision.child ?? null,
+        message: decision.message || '',
+      };
+      baseSkipped.push(record);
+      log(baseSkipLine(record, now));
+    }
     if (decision.trigger && task.outOfScope?.length) {
       // 任务树里有名单外的仓：不派发，交给 tick 写提醒。
       out.push({ issue: task.ref, outOfScope: [...task.outOfScope] });
@@ -125,7 +171,7 @@ export async function pollInventory({ github, profile, now = () => Date.now(), h
       if (open) out.push(open);
     }
   }
-  return { entries: out, tasks, reads: counted.countedReads.reads };
+  return { entries: out, tasks, reads: counted.countedReads.reads, baseSkipped };
 }
 
 async function main(argv = process.argv.slice(2)) {
@@ -134,9 +180,9 @@ async function main(argv = process.argv.slice(2)) {
   try {
     const profile = loadAcceptanceProfile();
     const github = createGithub({ profile, onRateLimit: rateRecorder(profile) });
-    const { entries, tasks, reads } = await pollInventory({ github, profile });
+    const { entries, tasks, reads, baseSkipped } = await pollInventory({ github, profile });
     if (asJson) {
-      const payload = withInventory ? { entries, tasks, reads } : entries;
+      const payload = withInventory ? { entries, tasks, reads, baseSkipped } : entries;
       process.stdout.write(`${JSON.stringify(payload)}\n`);
     } else if (!entries.length) {
       process.stdout.write('');
@@ -154,6 +200,9 @@ async function main(argv = process.argv.slice(2)) {
           process.stdout.write(`${entry.issue} ${entry.kind} 下一轮 ${entry.nextRound} ${entry.bodyVersion}\n`);
         }
       }
+    }
+    for (const skipped of baseSkipped) {
+      process.stdout.write(`${skipped.issue} 暂不验收（${skipped.reason}）：${skipped.message}\n`);
     }
   } catch (error) {
     process.stderr.write(`${error.message || error}\n`);

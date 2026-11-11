@@ -419,7 +419,7 @@ test('环境未验证的中断：trigger 按环境退避重试（不是 up-to-da
   const rounds = parseRounds(world.get(ROOT_REF).comments, OWNER);
   assert.equal(rounds.at(-1).status, '中断');
   assert.ok(rounds.at(-1).reason.startsWith(ENV_PROBLEM_PREFIX));
-  const issue = { ref: ROOT_REF, kind: 'standalone', tier: 'auto', closedAt: null, bodyVersion: rounds.at(-1).bodyVersion, rounds, children: [], linkedPrs: [{ number: 12, mergedAt: '2026-10-20T00:00:00.000Z' }] };
+  const issue = { ref: ROOT_REF, kind: 'standalone', tier: 'auto', closedAt: null, bodyVersion: rounds.at(-1).bodyVersion, rounds, children: [], linkedPrs: [{ number: 12, mergedAt: '2026-10-20T00:00:00.000Z', base: 'main' }] };
   const soon = shouldTrigger(issue, { now: () => Date.parse(CLOCK) + 60_000, profile });
   assert.deepEqual([soon.trigger, soon.reason], [false, 'backoff'], JSON.stringify(soon));
   const later = shouldTrigger(issue, { now: () => Date.parse(CLOCK) + 31 * 60_000, profile });

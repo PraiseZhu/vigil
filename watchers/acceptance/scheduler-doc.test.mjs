@@ -117,7 +117,7 @@ function baseIssue(state) {
     parent: null,
     subIssues: { nodes: [] },
     closedByPullRequestsReferences: {
-      nodes: [{ number: 2, url: 'https://example.test/pull/2', mergedAt: '2026-10-20T00:00:00.000Z', repository: { nameWithOwner: REPO } }],
+      nodes: [{ number: 2, url: 'https://example.test/pull/2', mergedAt: '2026-10-20T00:00:00.000Z', baseRefName: 'main', repository: { nameWithOwner: REPO } }],
     },
     comments: { nodes: state.comments },
   };

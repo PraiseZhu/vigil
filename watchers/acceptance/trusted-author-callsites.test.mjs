@@ -213,7 +213,7 @@ function closedChild({ number, author, parentNumber, parentAuthor, subIssues = [
     closedAt: CHILD_CLOSED,
     body: 'child body',
     parent: { number: parentNumber, repository: { nameWithOwner: REPO }, author: parentAuthor },
-    prs: [{ number: 40, url: 'https://example.test/pull/40', mergedAt: '2026-10-20T01:00:00.000Z' }],
+    prs: [{ number: 40, url: 'https://example.test/pull/40', mergedAt: '2026-10-20T01:00:00.000Z', baseRefName: 'main' }],
     subIssues,
   });
 }

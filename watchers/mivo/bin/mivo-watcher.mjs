@@ -22,10 +22,11 @@ import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue
 import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath, findingMarkerOf, childPrListArgs, parseOpenChildPrs, childPrDraftPaths, childPrHandoffSpec, CHILD_PR_PLACEHOLDER } from './mivo-repair.mjs';
 import { PARSER_VERSION, canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
-import { optionalConfig, requireConfig } from './profile.mjs';
+import { optionalConfig, requireConfig, preflightSelfReviewEnabled } from './profile.mjs';
 import { triageText } from './mivo-ci-triage.mjs';
 import { collectMivoCiSteps } from './mivo-ci.mjs';
 import { superviseCodeqlInfra, codeqlInfraCheckDue } from './mivo-codeql-infra.mjs';
+import { superviseCiSelfHeal, heldBySelfHeal, ciSelfHealCheckDue, ciStall, CI_STALL_MS, CI_STALL_NOTICE_MS } from './mivo-ci-selfheal.mjs';
 import { configuredLogin, isViewerOrWatchedBot, WATCHED_BOT_APP } from './mivo-identity.mjs';
 
 // 目标仓库在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
@@ -307,7 +308,9 @@ function failedRequiredCiItems({ pr, ci }) {
 // Optional Actions checks that failed on this head (mivo-ci.mjs failedOptionalActions). Mivo's pre-review gate
 // wants every check green before it sends a PR to review, so these are repaired like required failures.
 function failedOptionalCiItems({ pr, ci }) {
-  if (!ci || ci.status === 'unknown' || !Array.isArray(ci.optional)) return [];
+  // Not gated on the required checks being readable: each item carries its own head-bound evidence, and an unknown
+  // required check beside a red optional one used to hide the only thing there was to repair (2026-11-10).
+  if (!ci || !Array.isArray(ci.optional)) return [];
   return ci.optional.filter((rule) => rule?.status === 'failed' && typeof rule.context === 'string').map((rule) => {
     const evidence = rule.evidence ?? {};
     const checkId = evidence.id ?? null;
@@ -324,6 +327,28 @@ function failedOptionalCiItems({ pr, ci }) {
       contentHash: digest({ context: rule.context, optional: true, status: rule.status, id: checkId, runId, url }),
     };
   });
+}
+
+// Required checks that cannot be read as green, failed or pending although every check on the head finished a while
+// ago (mivo-ci-selfheal.mjs ciStall). Nothing on GitHub changes any more, so without this item no round ever starts.
+function stalledCiItems({ pr, ci, now }) {
+  if (!now) return [];
+  const stall = ciStall({ ci, headSha: pr.headRefOid, now });
+  if (!stall) return [];
+  const lines = stall.rules.map((rule) => `- ${rule.context}: ${rule.reason}`);
+  const triage = { kind: 'stall', check: stall.rules.map((rule) => rule.context).join('、'), step: null,
+    hint: '逐条查清每个必需检查为什么没有成功结论：没跑起来就触发它（gh run rerun <run-id>，或按该 workflow 的触发条件重新触发）；被跳过就处理它依赖的 job；重复或来源不明就在 blocked 里写清证据。不是本 PR 代码引起的不要改代码。' };
+  return [{
+    source: 'ci',
+    actionable: true,
+    stallFailure: { verified: true, status: 'stalled', headSha: pr.headRefOid ?? null, round: stall.round, since: stall.since },
+    nativeId: 'stall',
+    revision: `stalled:${stall.round}`,
+    sha: pr.headRefOid ?? null,
+    body: [`required CI is still unknown after every check on this head finished (last one at ${stall.since}):`, ...lines, triageText(triage)].join('\n'),
+    ciTriage: triage,
+    contentHash: digest({ stall: true, head: pr.headRefOid ?? null, round: stall.round }),
+  }];
 }
 
 function withCategory(item, { headSha } = {}) {
@@ -344,8 +369,9 @@ function withPublisher(item, comment) {
   };
 }
 
-export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci, reviews = [], comments = [], threads = [], mergeable, baseTipOid = null, receiptActor }) {
+export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci, reviews = [], comments = [], threads = [], mergeable, baseTipOid = null, receiptActor, now = null }) {
   const items = [];
+  for (const item of stalledCiItems({ pr, ci, now })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
   for (const item of failedRequiredCiItems({ pr, ci })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
   for (const item of failedOptionalCiItems({ pr, ci })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
   for (const item of codeScanningFeedbackItems({ pr, scanning: ci?.codeScanning })) items.push(withCategory(item, { headSha: pr.headRefOid ?? null }));
@@ -390,6 +416,7 @@ export function feedbackItems({ pr, checks = [], requiredChecks = [], policy, ci
         source: isGreptileAuthor(author) ? 'greptile' : reviewerFinding ? 'mivo-review' : 'thread',
         actionable: thread.isResolved !== true,
         threadId: thread.id,
+        path: thread.path ?? null,
         nativeId: `${thread.id}:${comment.id ?? author ?? 'comment'}`,
         revision: `${thread.isResolved === true}:${thread.isOutdated === true}:${comment.updatedAt ?? comment.updated_at ?? comment.createdAt ?? ''}`,
         sha: pr.headRefOid ?? null,
@@ -983,6 +1010,22 @@ export const WORKER_RULE = [
   '每个 Worker 交回结论后立即 archive_worker。SC JSON 里用 workers:[{purpose:"review"|"e2e"|"consult"|"adjudicate",agent,model,effort,providerId,workerId,verdict}] 记下本轮开过的每个 Worker，adjudicate 另带 rulings；helper 会拒绝超过 2 个顾问或顾问用 max/ultra 的报告。',
 ].join('');
 export const SIBLING_FIX_RULE = '对每条要修的 P0/P1/P2：检查同一函数及其调用方有没有同类问题，并一并修掉。同类问题联动修复不得突破允许路径和本 PR 范围。';
+// Pilot, off unless preflightSelfReview is set (2026-11-11): one PR took 25 rounds because the reviewer found about two
+// new findings in each round's own changes. The session reviews its own diff by the same standard before it pushes.
+export const SELF_REVIEW_RULE = '推送前自审（试点）：改完代码、运行 validate 之前，按上面的统一分级标准把本轮自己的改动审一遍——范围只限 git diff <任务 head>..HEAD，不审 PR 里本轮没动的部分。只找本轮改动引入的 P0/P1/P2，只修确认成立的；P3 不修，不借机扩大改动。修过就再审一遍，最多 2 遍。在 SC JSON 顶层写 selfReview:{passes:<1 或 2>,found:<发现的 P0–P2 条数>,fixed:<修掉的条数>}；本轮没有提交（或只推了重跑 CI 的空提交）就不写。';
+// Whether a round is asked to review its own diff. Decided here, once, when the task is written: the rule goes into
+// the message and `selfReviewRequired` into the task file, and the helper checks the record by the task, so a switch
+// that changes between dispatch and finalize cannot ask a session for something it was never told. A switch that is
+// set to something that is not a boolean counts as off for the scan (one bad field must not stop every PR) and is
+// said on stderr, which the scheduler keeps with the run.
+export function selfReviewConfigProblem() {
+  try { preflightSelfReviewEnabled(); return null; } catch (error) { return String(error?.message ?? error); }
+}
+export function selfReviewRequired({ headRefOid, fresh }) {
+  let on = false;
+  try { on = preflightSelfReviewEnabled(); } catch { on = false; } // reported by the scan (selfReviewConfigProblem)
+  return on && taskRepairPolicy({ headRefOid, feedback: fresh }).canChangeCode === true;
+}
 export const TEST_DOC_RULE = '测试、文档类意见直接修，不争、不开裁决：凡是指向测试文件、docs/ 或 *.md、本 PR 交接文件、PR 正文，或审查机类别属于测试/覆盖率/验证记录/交接的 P0/P1/P2，一律动手修（补或改测试，或如实改文档、验收写法、PR 正文），记 SC=pass。唯一例外：审查看的是旧 head，之后已有提交修掉了，在 evidence 写一行「already-fixed: <该提交 SHA>」，helper 会核对它在当前 HEAD 里且晚于审查的 head；否则 helper 拒收这类 no-change。';
 export function repeatFindingRule(repeat = []) {
   if (!repeat.length) return '';
@@ -996,7 +1039,7 @@ export function handledFindingsSummary(items = []) {
   if (!Array.isArray(items) || !items.length) return '此前各轮已处理 finding：无。';
   return `此前各轮已处理 finding：${items.map((item) => `${item.key}${item.file ? ` ${item.file}` : ''} ${item.summary}`.trim()).join('；')}`;
 }
-export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messagePrefix = '', keelVersion = KEEL_FLOW_VERSION, prIntent = null, version = null, handledFindings = [], repeatFindings = [], childPrHandoff = null }) {
+export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messagePrefix = '', keelVersion = KEEL_FLOW_VERSION, prIntent = null, version = null, handledFindings = [], repeatFindings = [], childPrHandoff = null, selfReview = null }) {
   const repairPolicy = taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh });
   const title = mapping.title || repairSessionTitle({ task: pr.title, prNumber: pr.number, createdAt: now });
   const params = {
@@ -1015,6 +1058,9 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       severityRule(),
       SIBLING_FIX_RULE,
       TEST_DOC_RULE,
+      // selfReview is given when a message is rendered again for a task that already exists (a recovery): the task says
+      // whether it was asked, whatever the switch is now.
+      ...((selfReview ?? selfReviewRequired({ headRefOid: pr.headRefOid, fresh })) ? [SELF_REVIEW_RULE] : []),
       ...(repeatFindings.length ? [repeatFindingRule(repeatFindings)] : []),
       handledFindingsSummary(handledFindings),
       repairPolicy.canChangeCode ? 'OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY' : 'OWNER_STANDING_AUTH: NO_CODE_NO_PUSH_NO_EXTERNAL_REPLY',
@@ -1361,7 +1407,7 @@ function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix 
   const pending = { dispatchId, params: dispatchParams({ pr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, prIntent: prSnapshot?.prIntent, handledFindings: collected?.handledFindings ?? [], repeatFindings, childPrHandoff }), at: now, taskPath };
   if (!dryRun) {
     fs.mkdirSync(path.dirname(taskPath), { recursive: true });
-    atomic(taskPath, JSON.stringify({ dispatchId, repeatFindings, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: pr.id, number: pr.number, repo: REPO, headRefOid: pr.headRefOid, headRefName: pr.headRefName, prAuthor: collected?.pr?.author?.login ?? pr.author?.login ?? null, handoff: collected?.handoff, releaseEpoch: collected?.pr?.releaseEpoch, feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }), prSnapshot, severityStandard: taskSeverityStandard(), adjudicationRecord: ADJUDICATION_RECORD_VERSION, ...(handoffAsked ? { childPrHandoff: childPrHandoffSpec(taskPath) } : {}), params: pending.params, createdAt: now }));
+    atomic(taskPath, JSON.stringify({ dispatchId, ...(selfReviewRequired({ headRefOid: pr.headRefOid, fresh }) ? { selfReviewRequired: true } : {}), repeatFindings, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: pr.id, number: pr.number, repo: REPO, headRefOid: pr.headRefOid, headRefName: pr.headRefName, prAuthor: collected?.pr?.author?.login ?? pr.author?.login ?? null, handoff: collected?.handoff, releaseEpoch: collected?.pr?.releaseEpoch, feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }), prSnapshot, severityStandard: taskSeverityStandard(), adjudicationRecord: ADJUDICATION_RECORD_VERSION, ...(handoffAsked ? { childPrHandoff: childPrHandoffSpec(taskPath) } : {}), params: pending.params, createdAt: now }));
   }
   return pending;
 }
@@ -1906,6 +1952,16 @@ export function consumeResult(previous, result, now) {
   };
 }
 
+// CI unknown since CI_STALL_MS ago: nothing changes on GitHub, so the fingerprint never moves; collect in full every
+// CI_STALL_RECHECK_MS so the stall diagnosis (and, later, the notice) can start.
+export const CI_STALL_RECHECK_MS = 15 * 60 * 1000;
+export function ciStallCheckDue(previous, now) {
+  const since = Date.parse(previous?.policyUnknownSince ?? '');
+  if (!Number.isFinite(since) || Date.parse(now) - since < CI_STALL_MS) return false;
+  const last = Date.parse(previous?.scanCheckedAt ?? '');
+  return !Number.isFinite(last) || Date.parse(now) - last >= CI_STALL_RECHECK_MS;
+}
+
 function needsCiRecheck(active) {
   return active?.status === 'waiting-ci'
     || (active?.status === 'blocked' && ['required-ci', 'optional-ci', 'ci-transport'].includes(active.blockedKind));
@@ -1923,6 +1979,93 @@ export const INFRA_REOPEN_LIMIT = 3;
 export const TRANSIENT_BLOCK_REASON = /rate.?limit|速率限制|限流|配额|quota|互斥锁|pre-push\.flock|pre-push (?:锁|lock)|abuse detection|HTTP 50[0234]|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|Gateway Time-?out|ETIMEDOUT|ECONNRESET|EAI_AGAIN|socket hang up|i\/o timeout/i;
 export const TRANSIENT_RETRY_BACKOFF_MS = 30 * 60 * 1000;
 export const KEEL_LEDGER_HELD = 'keel-ledger-unavailable';
+// A round that stopped because the PR moved under it (mivo-repair.mjs MOVED_BLOCK_KINDS) is handed back without a
+// person: at once when the head is no longer the one the task was written for, and after a back-off when the head is
+// the same (the handoff was being replaced while the session checked), at most MOVED_RETRY_LIMIT times per head.
+export const MOVED_BLOCK_KINDS = new Set(['stale-head', 'ownership-moved']);
+export const MOVED_RETRY_BACKOFF_MS = 30 * 60 * 1000;
+export const MOVED_RETRY_LIMIT = 3;
+const movedRetriesOn = (previous, head) => (previous?.movedReopened ?? []).filter((item) => item.head === head && item.headChanged !== true).length;
+export function movedRetriesExhausted(previous, head) {
+  const active = previous?.activeTask;
+  return active?.status === 'blocked' && MOVED_BLOCK_KINDS.has(active.blockedKind)
+    && (active.head ?? active.sourceHead) === head && movedRetriesOn(previous, head) >= MOVED_RETRY_LIMIT;
+}
+export function reopenMovedBlocked({ previous, paths, now, head }) {
+  const active = previous?.activeTask;
+  if (active?.status !== 'blocked' || !MOVED_BLOCK_KINDS.has(active.blockedKind) || !head) return previous;
+  const dispatchId = active.dispatchId;
+  if (typeof dispatchId !== 'string') return previous;
+  const done = previous.movedReopened ?? [];
+  if (done.some((item) => item.dispatchId === dispatchId)) return previous;
+  const taskHead = active.head ?? active.sourceHead;
+  const headChanged = Boolean(taskHead && taskHead !== head);
+  if (!headChanged) {
+    if (movedRetriesOn(previous, head) >= MOVED_RETRY_LIMIT) return previous;
+    if (Date.parse(now) - Date.parse(active.observedAt ?? active.at ?? now) < MOVED_RETRY_BACKOFF_MS) return previous;
+  }
+  const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`));
+  if (!task || task.nodeId !== previous.nodeId) return previous;
+  const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
+  for (const item of task.feedback ?? []) if (typeof item?.key === 'string') delete feedbackCursor[item.key];
+  return {
+    ...previous, feedbackCursor, eligibility: 'active',
+    repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) - 1),
+    movedReopened: [...done, { dispatchId, at: now, head, headChanged, kind: active.blockedKind }].slice(-20),
+  };
+}
+
+// A session that says "I cannot solve this" (blocked external) is often right, and often not: two weeks of runs sent
+// 65 such notices to a person (2026-11-11). The first such block on a head gets a second opinion before a person is
+// asked: the same feedback goes back once, with the stated reason and the order to put it to a read-only arbiter
+// first. The outcome is settled in the one round that judges it, with nothing in between: either the dispatch is
+// built in that round (the entry is recorded as delivered), or the block is reported as before (the entry is recorded
+// as reported and never handed back later). Blocks that already have their own way back (validate failures,
+// environment faults, rate limits, Keel) and blocks another path reopened or already reported are not touched.
+export function secondOpinionEligible(previous, head) {
+  const active = previous?.activeTask;
+  if (previous?.eligibility !== 'blocked' || active?.status !== 'blocked' || active.blockedKind !== 'external' || typeof active.dispatchId !== 'string') return false;
+  if (!head || (active.head ?? active.sourceHead) !== head) return false;
+  if (previous.lastException?.event?.dispatchId === active.dispatchId) return false; // already reported (an older build, or an earlier round)
+  const reason = String(active.reason ?? '');
+  if (isValidateClassBlock(active) || INFRA_BLOCK_REASON.test(reason) || TRANSIENT_BLOCK_REASON.test(reason) || KEEL_BLOCK_REASON.test(reason)) return false;
+  return !(previous.secondOpinion ?? []).some((item) => item.head === head);
+}
+// The feedback of the blocked task counts as undelivered for the round that judges the second opinion, so that the
+// same comments are fresh again without touching the stored cursor (a round that does not dispatch changes nothing).
+export function withoutBlockedBatch(cursor, previous, paths) {
+  const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', `${previous.activeTask.dispatchId}.json`));
+  if (!task || task.nodeId !== previous.nodeId) return cursor;
+  const next = { ...cursor };
+  for (const item of task.feedback ?? []) if (typeof item?.key === 'string') delete next[item.key];
+  return next;
+}
+export function recordSecondOpinion(previous, { head, now, outcome }) {
+  const active = previous.activeTask;
+  return { ...previous,
+    ...(outcome === 'delivered' ? { repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) - 1) } : {}),
+    secondOpinion: [...(previous.secondOpinion ?? []), { dispatchId: active.dispatchId, head, at: now, outcome, reason: noticeReason(active.reason) }].slice(-20) };
+}
+// True while the handed-back round is on its way: its dispatch was built for this block and is pending (a retry
+// window included) or already went out. The block is then not reported; a failed delivery is, as a dispatch error.
+export function secondOpinionInDelivery(previous) {
+  const active = previous?.activeTask;
+  if (active?.status !== 'blocked') return false;
+  if (!(previous.secondOpinion ?? []).some((item) => item.dispatchId === active.dispatchId && item.outcome === 'delivered')) return false;
+  return Boolean(previous.pendingDispatch) || Boolean(previous.lastDispatch?.dispatchId && previous.lastDispatch.dispatchId !== active.dispatchId);
+}
+// The lines that open the handed-back round: what stopped the last one, and what to do with it first. The reason is a
+// session's own words, cleaned like every blocked reason that leaves this machine (noticeReason).
+export function secondOpinionNote(reason) {
+  return [
+    '【先裁决再继续】上一轮修复会话以下面的原因停手（blocked），盯梢没有通知人，先把同一批反馈交还一次：',
+    `> ${noticeReason(reason)}`,
+    '本轮第一步：按 routing.json 的 adjudicate 档开一个只读裁决 Worker，把这段原因、任务反馈和你核实到的现状交给它，只问一件事——这个原因是否真的需要人来解决。',
+    '裁决认为可以继续（给了可行的做法，或原因已不成立）：按它的做法修完并正常收口。裁决认为确实需要人，或裁决 Worker 开不出来：再次调用 helper blocked，--reason 以「裁决确认需要人：」开头，写清需要人做的那一件事。同一提交上这是最后一次交还，第二次停手会直接通知人。',
+    '把这个裁决 Worker 记进 SC JSON 的 workers（purpose:"adjudicate"）。',
+  ].join('\n');
+}
+
 export function reopenExternalBlocked({ previous, paths, now, head }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind !== 'external' || active.blockedKind === AUTHOR_RECLAIMED) return previous;
@@ -2293,6 +2436,27 @@ export function markException(previous, now, events, { home, dryRun } = {}) {
   // A reopened product-intent round is handed back to the watcher, not an incident.
   if (previous.activeTask?.blockedKind === 'product-intent-reopened' && !previous.dispatchError) return previous;
   if (previous.activeTask?.blockedKind === 'missing-result-reopened' && !previous.dispatchError) return previous;
+  // The PR moved under the session: the watcher hands the round back by itself. A person hears about it only once
+  // the retries on one head are used up.
+  if (MOVED_BLOCK_KINDS.has(previous.activeTask?.blockedKind) && !previous.dispatchError) {
+    const head = previous.activeTask.head ?? previous.activeTask.sourceHead;
+    // A round already handed back (the head moved, or the back-off passed) is not waiting for anyone.
+    const handedBack = (previous.movedReopened ?? []).some((item) => item.dispatchId === previous.activeTask.dispatchId);
+    if (!handedBack && movedRetriesExhausted(previous, head)) {
+      queueHumanNotice(home, { kind: 'blocked-escalate', number: previous.number, url: previous.url, head,
+        blockedKind: previous.activeTask.blockedKind, cause: blockedCause(previous.activeTask.blockedKind, previous.activeTask.reason) }, dryRun);
+    }
+    return previous;
+  }
+  // The handed-back round is on its way: nobody is asked yet. The block that follows it on the same head is reported.
+  if (secondOpinionInDelivery(previous) && !previous.dispatchError) return previous;
+  // The hand-back was built but its delivery was given up: besides the dispatch error below, the person gets the
+  // reason the session stopped for, which is what there is to decide.
+  if (previous.dispatchError && previous.activeTask?.status === 'blocked'
+    && (previous.secondOpinion ?? []).some((item) => item.dispatchId === previous.activeTask.dispatchId && item.outcome === 'delivered')) {
+    queueHumanNotice(home, { kind: 'blocked-escalate', number: previous.number, url: previous.url, head: previous.activeTask.head ?? previous.activeTask.sourceHead,
+      blockedKind: previous.activeTask.blockedKind, cause: blockedCause(previous.activeTask.blockedKind, previous.activeTask.reason) }, dryRun);
+  }
   const event = {
     kind: previous.dispatchError ? 'dispatch-blocked' : 'repair-blocked', number: previous.number, nodeId: previous.nodeId,
     sessionId: previous.sessionId, dispatchId: previous.dispatchError?.dispatchId ?? previous.activeTask?.dispatchId,
@@ -2430,6 +2594,7 @@ export function* processPr({
   if (!resultError) previous = reopenProductIntentBlocked({ previous, paths, now });
   if (!resultError) previous = reopenRoundLimitBlocked({ previous });
   if (!resultError) previous = reopenExternalBlocked({ previous, paths, now, head: pr.headRefOid });
+  if (!resultError) previous = reopenMovedBlocked({ previous, paths, now, head: pr.headRefOid });
   if (resultError) {
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.activeTask?.dispatchId ?? previous.lastDispatch?.dispatchId,
@@ -2578,10 +2743,22 @@ export function* processPr({
   previous = reconcileReviewRecheck({ entry: previous, snapshot: collected, now });
   const doctor = lifelineFeedback({...pr,...collected.pr,repo:REPO});
   if (doctor.error) events.push({kind:'doctor-source-blocked',number:pr.number,code:doctor.error});
-  const observed = feedbackItems({ pr, ...collected, receiptActor: viewer });
+  // Before any feedback is counted: a run that died on infrastructure, or left a required check skipped behind a
+  // failed job, is re-run here once per head, and its failure is held back from the repair session while the re-run
+  // is out (mivo-ci-selfheal.mjs). A held item keeps its cursor stamp, so it is delivered if the re-run never reports.
+  const selfHeal = yield* superviseCiSelfHeal({ ci: collected.ci, repo: REPO, headSha: pr.headRefOid, state: previous.ciSelfHeal, ghFn, now, dryRun });
+  if (selfHeal.state || previous.ciSelfHeal) { previous = { ...previous, ciSelfHeal: selfHeal.state }; base = { ...base, ciSelfHeal: selfHeal.state }; }
+  if (selfHeal.reran.length) events.push({ kind: 'ci-selfheal-rerun', number: pr.number, head: pr.headRefOid, runs: selfHeal.reran });
+  if (selfHeal.errors.length) events.push({ kind: 'ci-selfheal-rerun-error', number: pr.number, errors: selfHeal.errors });
+  const observed = feedbackItems({ pr, ...collected, receiptActor: viewer, now })
+    .map((item) => heldBySelfHeal(selfHeal.state, item, now) ? { ...item, deferred: true } : item);
   previous = migrateMemberFeedbackCursor(previous, observed);
-  const cursorBase = previous.wasDraft === true && !authorPushed
+  // Judged once, here, for this round (see secondOpinionEligible): the blocked batch is offered again, and the round
+  // ends with the dispatch built or with the block reported.
+  const secondOpinion = !resultError && !dryRun && secondOpinionEligible(previous, pr.headRefOid);
+  const storedCursor = previous.wasDraft === true && !authorPushed
     ? coveredCursor(previous.feedbackCursor, previous.feedbackLedger) : (previous.feedbackCursor || {});
+  const cursorBase = secondOpinion ? withoutBlockedBatch(storedCursor, previous, paths) : storedCursor;
   const observedAll = [...observed, ...doctor.items.map(item=>withCategory(item,{headSha:pr.headRefOid}))];
   const { fresh: newFresh, cursor } = newFeedback(cursorBase, observedAll);
   const newKeys = new Set(newFresh.map((item) => item.key));
@@ -2655,8 +2832,21 @@ export function* processPr({
   // An unreadable required-check policy is a watcher fault, not a red CI; reaching mergeable is the outcome the
   // author waits for. Both are reported once per transition so they can reach a person.
   const policyUnknown = collected.ci?.status === 'unknown';
+  // The clock belongs to one head: a push starts it again (an entry written before the head was recorded starts now).
+  const unknownSince = policyUnknown && base.policyUnknownSince && base.policyUnknownHead === pr.headRefOid ? base.policyUnknownSince : null;
+  // A check that is still running is not a stall, unless it has been "running" for the whole notice period: a job
+  // waiting for a runner or an approval that long will not finish by itself either.
+  const checksSettled = !(collected.ci?.checks ?? []).some((item) => String(item?.status ?? '').toLowerCase() !== 'completed'
+    && !(Date.parse(now) - (Date.parse(item?.started_at ?? item?.created_at ?? '') || Date.parse(now)) >= CI_STALL_NOTICE_MS));
   if (policyUnknown && !base.policyUnknownSince) {
     events.push({ kind: 'policy-unknown', number: pr.number, reason: String(collected.ci?.reason ?? collected.ci?.policy?.reason ?? '').slice(0, 200) });
+  }
+  // Unknown for this long means the diagnosis rounds are used up (or there was nothing a session could read): a person
+  // hears about it once per head instead of the PR waiting in silence (2026-11-10: 12 hours with no notice).
+  if (unknownSince && checksSettled && Date.parse(now) - Date.parse(unknownSince) >= CI_STALL_NOTICE_MS) {
+    const unknownRules = (collected.ci?.required ?? []).filter((rule) => rule.status === 'unknown').map((rule) => `${rule.context}: ${rule.reason ?? 'unknown'}`);
+    queueHumanNotice(paths.home, { kind: 'ci-stalled', number: pr.number, url: pr.url, head: pr.headRefOid, since: unknownSince,
+      checks: unknownRules.length ? unknownRules : [String(collected.ci?.reason ?? collected.ci?.policy?.reason ?? 'required-policy-unknown').slice(0, 200)] }, dryRun);
   }
   previous = {
     // `base` predates the auto-close step above; carry its receipt forward explicitly
@@ -2671,7 +2861,8 @@ export function* processPr({
     admissionVerified: admitted, admissionReason: collected.admissionReason ?? previous.admissionReason ?? null,
     admissionEpoch: admitted ? collected.pr?.releaseEpoch ?? previous.admissionEpoch : null,
     eligibilityInitialized: true, wasDraft: false,
-    policyUnknownSince: policyUnknown ? (base.policyUnknownSince ?? now) : null,
+    policyUnknownSince: policyUnknown ? (unknownSince ?? now) : null,
+    policyUnknownHead: policyUnknown ? pr.headRefOid : null,
     codeScanningStatus: collected.ci?.codeScanning?.status ?? null,
     scanCheckedAt: now,
   };
@@ -2703,7 +2894,11 @@ export function* processPr({
       }
     } catch (error) {
       // A transport failure is not a new agent task or proof of completion.
-      previous = { ...previous, lastRecheckError: { at: now, message: String(error.message).slice(0, 400) } };
+      // The helper's own words are on stderr; error.message is only the command line (2026-11-11: 33 PRs carried a
+      // recheck error that named no cause).
+      const detail = String(error.stderr ?? '').trim().split('\n').slice(-6).join('\n').slice(-600);
+      previous = { ...previous, lastRecheckError: { at: now, message: detail || String(error.message).slice(-400),
+        ...(error.killed || error.code === 'ETIMEDOUT' ? { timedOut: true } : {}) } };
       if (deadline-clock()<1000) state.scan={...state.scan,cursor:resumeCursor,deferredNumber:pr.number};
     }
   }
@@ -2845,6 +3040,7 @@ export function* processPr({
     && (previous.rulesVersion == null || previous.rulesVersion === rulesVersion())
     && fresh.length > 0
     && !dueConflict
+    && !secondOpinion
     && fresh.every(inBlockedBatch);
   if (sameBlockedCause) {
     queueHumanNotice(paths.home, {
@@ -2918,8 +3114,24 @@ export function* processPr({
   let dispatch = { attempted: false, bound: false, reason: 'no-new-feedback' };
   // Advance only non-actionable observations until a delivery is acknowledged.
   const retainedCursor = { ...cursor };
+  // Handed back only when the batch that was blocked is actually in this delivery: new feedback alone goes out as an
+  // ordinary round and the old block is reported.
+  const handBack = secondOpinion && fresh.some((item) => blockedItems.has(item.key));
+  // The blocked batch was only taken out of cursorBase to be offered again in this round. What was not seen this
+  // round keeps its stored stamp, so a round that does not deliver leaves the cursor as it found it. The exception is
+  // the rest of the blocked batch when part of it is handed back: it stays undelivered, so it is sent as soon as it is
+  // seen again instead of being counted as delivered with a task it was never in.
+  if (secondOpinion) {
+    for (const [stampKey, stamp] of Object.entries(storedCursor)) {
+      if (Object.hasOwn(retainedCursor, stampKey) || fresh.some((item) => item.key === stampKey)) continue;
+      if (handBack && blockedItems.has(stampKey)) continue;
+      retainedCursor[stampKey] = stamp;
+    }
+  }
+  // storedCursor, not cursorBase: a second-opinion round that does not deliver must leave the blocked batch's stamps
+  // as they were (cursorBase had them taken out only to make the batch fresh for this round).
   for (const item of fresh) {
-    if (Object.hasOwn(cursorBase, item.key)) retainedCursor[item.key] = cursorBase[item.key];
+    if (Object.hasOwn(storedCursor, item.key)) retainedCursor[item.key] = storedCursor[item.key];
     else delete retainedCursor[item.key];
   }
   // A conflict that is held back keeps its previous stamp (or none): it stays pending, and the next scan sees it again
@@ -2952,6 +3164,8 @@ export function* processPr({
       const held = !open.ok ? { reason: 'child-pr-check-unavailable', error: open.error }
         : open.childPrs.length ? { reason: 'child-pr-open', childPrs: open.childPrs.map((child) => child.number) } : null;
       if (held) {
+        // A second opinion that cannot go out now is not kept waiting behind the child PR: the block is reported.
+        if (secondOpinion) previous = markException(recordSecondOpinion(previous, { head: pr.headRefOid, now, outcome: 'reported' }), now, events, { home: paths.home, dryRun });
         state.prs[key] = { ...previous, lastDispatchGuard: { at: now, ...held } };
         persistState(state, paths);
         report.push({ number: pr.number, dispatch: { attempted: false, bound: false, ...held } });
@@ -3077,7 +3291,7 @@ export function* processPr({
       dispatchId: recovery.dispatchId,
       params: dispatchParams({ pr: { ...pr, headRefOid: recovery.task?.headRefOid ?? pr.headRefOid },
         mapping, fresh: recovery.task?.feedback ?? [], now, taskPath, home: paths.home, prIntent: recovery.task?.prSnapshot?.prIntent ?? null,
-        childPrHandoff: recovery.task?.childPrHandoff ?? null }),
+        childPrHandoff: recovery.task?.childPrHandoff ?? null, selfReview: recovery.task?.selfReviewRequired === true }),
       at: now, taskPath, recovery: true, cursor: retainedCursor,
     };
     state.prs[key] = { ...previous, pendingDispatch: pending };
@@ -3124,7 +3338,7 @@ export function* processPr({
       // current prefix instead of reusing the stored text that belonged to the retired session.
       dispatchMapping = planSession({ pr, existing: previous, date: now });
     }
-    const prefix = [reclaimNote(previous, pr.headRefName), handoffNote, messagePrefix].filter(Boolean).join('\n');
+    const prefix = [reclaimNote(previous, pr.headRefName), handoffNote, handBack ? secondOpinionNote(previous.activeTask.reason) : '', messagePrefix].filter(Boolean).join('\n');
     // Asked once per delivery, and only when this task may change code: it decides whether the session is told to
     // write child PR handoff drafts (the answer is also recorded in the task, so a retry keeps it). A dry run makes
     // no GitHub read, like the gates above, so its preview carries no handoff text.
@@ -3136,6 +3350,10 @@ export function* processPr({
       // persist it, and the next live round would then read the PR as already being delivered.
       dispatch = { attempted: false, bound: false, reason: 'dry-run', pending };
     } else {
+      if (handBack) previous = recordSecondOpinion(previous, { head: pr.headRefOid, now, outcome: 'delivered' });
+      // New feedback only: this delivery replaces the blocked task, so the old block is reported here, while it is
+      // still the active task.
+      else if (secondOpinion) previous = markException(recordSecondOpinion(previous, { head: pr.headRefOid, now, outcome: 'reported' }), now, events, { home: paths.home, dryRun });
       previous = { ...previous, pendingDispatch: pending };
       state.prs[key] = previous;
       persistState(state, paths);
@@ -3175,7 +3393,14 @@ export function* processPr({
     dispatch.reason = 'policy-unknown';
   }
   if (!persistBlocked) {
+  // No dispatch was built for the second opinion in this round (nothing to send, or a gate held it): the block is
+  // reported now, as it was before there was a second opinion, and it is not handed back later.
+  if (secondOpinion && secondOpinionEligible(previous, pr.headRefOid)) previous = recordSecondOpinion(previous, { head: pr.headRefOid, now, outcome: 'reported' });
+  const exceptionBefore = previous.lastException;
   previous = markException({ ...previous, lastPolicyStatus: collected.policy?.status ?? previous.lastPolicyStatus ?? null }, now, events, { home: paths.home, dryRun });
+  // A dry run sends no notice, so it must not record the block as reported either: the first live round would then
+  // neither hand it back nor tell anyone.
+  if (dryRun && previous.lastException !== exceptionBefore) previous = { ...previous, lastException: exceptionBefore };
   if (collected.mergeReady === true && (base.mergeReady !== true || base.mergeReadyHead !== pr.headRefOid)) {
     // The merge state came from the round's batch read, so it is read again for this PR right before the notice
     // goes out. If it moved, or cannot be confirmed, the notice waits for the next round, which collects the PR again
@@ -3334,7 +3559,9 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
   // without this it would never reach processPr, where reopenKeelBlocked hands its feedback back.
   const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous
     || reopenInfraBlocked({ previous, paths, now, currentBase: { baseRefOid: normalized?.baseRefOid } }) !== previous
-    || reopenExternalBlocked({ previous, paths, now, head: previous.headRefOid }) !== previous;
+    || reopenExternalBlocked({ previous, paths, now, head: previous.headRefOid }) !== previous
+    || reopenMovedBlocked({ previous, paths, now, head: normalized?.headRefOid ?? previous.headRefOid }) !== previous
+    || secondOpinionEligible(previous, normalized?.headRefOid ?? previous.headRefOid);
   // The same holds for a PR an older build stopped on a product-intent conflict, or whose awaiting-discussion
   // label the watcher still has to take off (including after a failed DELETE): nothing changes on GitHub.
   const intentMigrationDue = reopenProductIntentBlocked({ previous, paths, now }) !== previous || legacyIntentLabelDue(previous)
@@ -3348,7 +3575,9 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
     && !keelReopenDue && !intentMigrationDue && !escalateDue && !ciUnknownRecheckDue(previous, paths, now)
     && !conflictDispatchDue({ previous, snapshot: normalized, now })
     && !pendingActionDue(previous) && !scanRecheckDue(previous, now) && !baseSyncRetryDue(previous, now)
-    && !codeqlInfraCheckDue({ previous, snapshot: normalized, now, intervalMs: CI_UNKNOWN_RECHECK_MS });
+    && !codeqlInfraCheckDue({ previous, snapshot: normalized, now, intervalMs: CI_UNKNOWN_RECHECK_MS })
+    && !ciSelfHealCheckDue({ previous, snapshot: normalized, now, intervalMs: CI_UNKNOWN_RECHECK_MS })
+    && !ciStallCheckDue(previous, now);
 }
 
 // Only near the retry time: a PR that left the sync path before it (back to Draft, opted out) keeps the old value,
@@ -4394,10 +4623,19 @@ async function driveAsync(iterator, shared = { spawned: [] }) {
   return step.value;
 }
 
+// A switch that is set to something unreadable is treated as off; every run result says so, in whatever mode, because
+// the result is what the scheduler keeps (the watcher's stderr is only shown when the run fails).
+export function withConfigProblems(result) {
+  const problem = selfReviewConfigProblem();
+  if (!problem || !result || typeof result !== 'object') return result;
+  return { ...result, events: [...(Array.isArray(result.events) ? result.events : []),
+    { kind: 'config-invalid', field: 'preflightSelfReview', treatedAs: 'off', message: problem.slice(0, 300) }] };
+}
+
 export function scanOnce(options = {}) {
   const iterator = options.mode === 'poll' ? pollWorkflow(options)
     : options.mode === 'discover' ? discoverWorkflow(options) : scanWorkflow(options);
-  return driveSync(iterator);
+  return withConfigProblems(driveSync(iterator));
 }
 
 export async function scanOnceAsync(options = {}) {
@@ -4405,7 +4643,7 @@ export async function scanOnceAsync(options = {}) {
   const workflow = mode === 'poll' ? pollWorkflow : mode === 'discover' ? discoverWorkflow : scanWorkflow;
   // discover/poll run PRs concurrently, so gh and the recheck helper must not block the event loop.
   const transport = mode === 'poll' || mode === 'discover' ? { ghFn: runGhAsync, recheckFn: recheckResultAsync } : {};
-  return driveAsync(workflow({ collect: collectPrAsync, ...transport, ...options }));
+  return withConfigProblems(await driveAsync(workflow({ collect: collectPrAsync, ...transport, ...options })));
 }
 
 export function createCindyStdinDispatch() {
