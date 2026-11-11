@@ -3517,10 +3517,6 @@ function* scanWorkflow({
   state.updatedAt = now;
   state.viewer = viewer;
   persistState(state, paths);
-  // A switch that is set to something unreadable is treated as off; the run result says so, because that is what the
-  // scheduler keeps (the watcher's stderr is only shown when the run fails).
-  const configProblem = selfReviewConfigProblem();
-  if (configProblem) events.push({ kind: 'config-invalid', field: 'preflightSelfReview', message: configProblem.slice(0, 300), treatedAs: 'off' });
   return { mode: dryRun ? 'dry-run' : 'enabled', dispatch: !dryRun, launchAgentLoaded: false,
     viewer, repo: REPO, prs: report, events, scan:state.scan, statePath: paths.statePath };
 }
@@ -4627,10 +4623,19 @@ async function driveAsync(iterator, shared = { spawned: [] }) {
   return step.value;
 }
 
+// A switch that is set to something unreadable is treated as off; every run result says so, in whatever mode, because
+// the result is what the scheduler keeps (the watcher's stderr is only shown when the run fails).
+export function withConfigProblems(result) {
+  const problem = selfReviewConfigProblem();
+  if (!problem || !result || typeof result !== 'object') return result;
+  return { ...result, events: [...(Array.isArray(result.events) ? result.events : []),
+    { kind: 'config-invalid', field: 'preflightSelfReview', treatedAs: 'off', message: problem.slice(0, 300) }] };
+}
+
 export function scanOnce(options = {}) {
   const iterator = options.mode === 'poll' ? pollWorkflow(options)
     : options.mode === 'discover' ? discoverWorkflow(options) : scanWorkflow(options);
-  return driveSync(iterator);
+  return withConfigProblems(driveSync(iterator));
 }
 
 export async function scanOnceAsync(options = {}) {
@@ -4638,7 +4643,7 @@ export async function scanOnceAsync(options = {}) {
   const workflow = mode === 'poll' ? pollWorkflow : mode === 'discover' ? discoverWorkflow : scanWorkflow;
   // discover/poll run PRs concurrently, so gh and the recheck helper must not block the event loop.
   const transport = mode === 'poll' || mode === 'discover' ? { ghFn: runGhAsync, recheckFn: recheckResultAsync } : {};
-  return driveAsync(workflow({ collect: collectPrAsync, ...transport, ...options }));
+  return withConfigProblems(await driveAsync(workflow({ collect: collectPrAsync, ...transport, ...options })));
 }
 
 export function createCindyStdinDispatch() {

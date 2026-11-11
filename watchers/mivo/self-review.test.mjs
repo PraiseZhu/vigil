@@ -2,7 +2,7 @@
 // finalize asks for, changes until the switch is set.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dispatchParams, SELF_REVIEW_RULE, selfReviewRequired, selfReviewConfigProblem } from './bin/mivo-watcher.mjs';
+import { dispatchParams, SELF_REVIEW_RULE, selfReviewRequired, selfReviewConfigProblem, withConfigProblems } from './bin/mivo-watcher.mjs';
 import { validateSelfReview } from './bin/mivo-repair.mjs';
 import { preflightSelfReviewEnabled } from './bin/profile.mjs';
 
@@ -74,4 +74,17 @@ test('a message rendered again for an existing task follows the task, not the sw
   assert.ok(render(true).includes(SELF_REVIEW_RULE), 'the task was asked while the switch was on');
   process.env.MIVO_PREFLIGHT_SELF_REVIEW = 'true';
   assert.ok(!render(false).includes(SELF_REVIEW_RULE), 'the task was not asked');
+});
+
+test('an unreadable switch is said in the run result of every mode, with the field name; a readable one adds nothing', (t) => {
+  withSwitch(t, 'yes');
+  for (const result of [{ mode: 'discover', prs: [], events: [] }, { mode: 'poll', prs: [] }, { mode: 'enabled', prs: [], events: [{ kind: 'other' }] }]) {
+    const out = withConfigProblems(result);
+    const event = out.events.at(-1);
+    assert.deepEqual([event.kind, event.field, event.treatedAs], ['config-invalid', 'preflightSelfReview', 'off'], result.mode);
+    assert.equal(out.events.length, (result.events?.length ?? 0) + 1);
+  }
+  process.env.MIVO_PREFLIGHT_SELF_REVIEW = 'true';
+  const untouched = { mode: 'discover', prs: [], events: [] };
+  assert.equal(withConfigProblems(untouched), untouched);
 });
