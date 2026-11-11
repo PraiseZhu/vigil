@@ -120,7 +120,7 @@ test('a bot thread held by the current blocked task is left to the blocked-task 
   const { sent, outcome } = poll(t, { tasks: { [OLD_TASK]: [botKey()] }, entry: afterSupersede({ eligibility: 'blocked',
     activeTask: { dispatchId: OLD_TASK, status: 'blocked', blockedKind: 'external', reason: 'pre-push failed', head: HEAD },
     // This head already had its one second opinion (second-opinion.test.mjs): the block now waits for a person.
-    secondOpinion: [{ dispatchId: 'earlier-task', head: HEAD, at: NOW, reason: 'earlier' }] }) });
+    secondOpinion: [{ dispatchId: 'earlier-task', head: HEAD, at: NOW, outcome: 'delivered', reason: 'earlier' }] }) });
   assert.equal(sent.length, 0);
   assert.equal(outcome.prs[0].fresh, 0, 'not counted as new feedback either');
 });
