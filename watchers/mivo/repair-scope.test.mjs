@@ -1110,6 +1110,32 @@ test('合入 main 之后 PR 自己又改了 hook：仍按策略变更拦下', as
     /local preflight policy changed from the dispatched baseline/);
 });
 
+// 用户 2026-11-11 定：只有本任务里可改代码的审查意见正好写在 hook 文件上时，会话才可以改它。
+test('审查意见点名 hook 文件：PR 改 hook 放行并记下是哪条意见，finalize 复核通过', async (t) => {
+  const f = fixture(t);
+  f.saveTask([{ ...finding('P1'), path: '.githooks/pre-push' }]);
+  const head = mergeMainWithNewHook(f, { prEditsHookAfter: true });
+  const options = { ...f.options, validatedHead: head, runFn: () => 'fixture checks passed\n' };
+  const verification = await validate(options);
+  assert.equal(verification.status, 'pass');
+  assert.deepEqual(readReceipt(verification).policy.reviewedChange.feedbackKeys, ['thread:P1']);
+  f.report([f.sc('pass', ['thread:P1'])]);
+  assert.equal(finalize(options).status, 'complete');
+});
+
+test('点名 hook 文件的只有 P3 意见，或可改代码的意见写在别的文件上：仍然拦下，报错写明期望与实际', async (t) => {
+  for (const feedback of [
+    [finding('P1'), { ...finding('P3'), path: '.githooks/pre-push' }],
+    [{ ...finding('P1'), path: 'src/other.ts' }],
+  ]) {
+    const f = fixture(t);
+    f.saveTask(feedback);
+    const head = mergeMainWithNewHook(f, { prEditsHookAfter: true });
+    await assert.rejects(validate({ ...f.options, validatedHead: head, runFn: () => 'fixture checks passed\n' }),
+      /local preflight policy changed from the dispatched baseline \(expected: .*actual: none of them\)/);
+  }
+});
+
 test('SC6 并发的两个 validate 对同一基线键只跑一次基线', async (t) => {
   const { f, route, outcome, baselineRuns } = baselineFixture(t);
   const slowBase = async () => { await new Promise((resolve) => setTimeout(resolve, 200)); return outcome(failLog(A))(); };

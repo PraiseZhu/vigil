@@ -796,3 +796,10 @@ test('P2-only dispatch freezes code-fix policy', () => {
   assert.equal(p.canChangeCode,true); assert.equal(p.items[0].action,'code-fix');
   assert.deepEqual(p.allowedFeedbackKeys, [fresh[0].key]);
 });
+
+// The hook-change gate (mivo-repair.mjs hookFindingKeys) reads the file a review thread is written on from the task.
+test('a review thread item carries the file it is written on', () => {
+  const thread = { id: 'T1', path: '.githooks/pre-push', isResolved: false, comments: [{ id: 'C1', author: { login: 'ExampleReviewer' }, body: 'P1: the hook skips a step', createdAt: '2026-11-11T00:00:00Z' }] };
+  const item = feedbackItems({ pr, threads: [thread] }).find((entry) => entry.threadId === 'T1');
+  assert.equal(item.path, '.githooks/pre-push');
+});
