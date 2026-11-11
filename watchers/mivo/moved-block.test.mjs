@@ -15,17 +15,36 @@ const NEXT = 'b'.repeat(40);
 const BLOCKED_AT = '2026-11-11T06:00:00.000Z';
 const after = (ms) => new Date(Date.parse(BLOCKED_AT) + ms).toISOString();
 
-test('the kind comes from the ownership check itself, by the words the helper fails with', () => {
-  const kind = (message) => movedBlockKind({ home: 'h', taskPath: 't', ownerFn: () => { throw new Error(message); } });
-  assert.equal(kind(`task head is stale: ${HEAD} != ${NEXT}; no bound controlled-push result`), 'stale-head');
-  assert.equal(kind('handoff missing, revoked, or replaced; author must hand off again'), 'ownership-moved');
-  assert.equal(kind('handoff no longer matches OPEN non-draft PR identity, author, or release epoch'), 'ownership-moved');
-  assert.equal(kind('handoff revoked or replaced during ownership check'), 'ownership-moved');
-  assert.equal(kind('task superseded: the author reclaimed this PR (Ready -> Draft); wait for the next watcher dispatch'), 'ownership-moved');
-  // A transport error says nothing about ownership: the block stays what the session called it.
-  assert.equal(kind('gh: HTTP 502 Bad Gateway'), null);
-  assert.equal(kind('API rate limit exceeded'), null);
-  assert.equal(movedBlockKind({ home: 'h', taskPath: 't', ownerFn: () => ({ status: 'owned' }) }), null);
+const task = { dispatchId: 'd1', number: 1, repo: 'example-org/example-plugin', headRefOid: HEAD, releaseEpoch: 'e1',
+  handoff: { version: 1, id: 'h1', repo: 'example-org/example-plugin', number: 1, nodeId: 'PR_1', head: HEAD, releaseEpoch: 'e1', author: 'owner' } };
+function classify(t, { view = { state: 'OPEN', isDraft: false, headRefOid: HEAD }, entry = { handoff: task.handoff }, result = null, gh } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vigil-moved-kind-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  if (result) fs.writeFileSync(path.join(dir, 'd1.json'), JSON.stringify(result));
+  const calls = [];
+  const ghFn = gh ?? ((_bin, args) => { calls.push(args.join(' ')); return JSON.stringify(view); });
+  return { kind: movedBlockKind({ paths: { results: dir }, task, entry, ghFn }), calls };
+}
+
+test('a block is classified from local handoff state and one PR read', (t) => {
+  assert.equal(classify(t).kind, null, 'nothing moved: the kind stays what the session gave');
+  const moved = classify(t, { view: { state: 'OPEN', isDraft: false, headRefOid: NEXT } });
+  assert.equal(moved.kind, 'stale-head');
+  assert.equal(moved.calls.length, 1, 'one GitHub read');
+  assert.equal(classify(t, { view: { state: 'OPEN', isDraft: true, headRefOid: HEAD } }).kind, 'ownership-moved');
+  assert.equal(classify(t, { view: { state: 'MERGED', isDraft: false, headRefOid: HEAD } }).kind, 'ownership-moved');
+  const replaced = classify(t, { entry: { handoff: { ...task.handoff, id: 'h2' } } });
+  assert.equal(replaced.kind, 'ownership-moved');
+  assert.equal(replaced.calls.length, 0, 'a replaced handoff needs no GitHub read');
+});
+
+test('a head this dispatch pushed itself is not a stale head; a failing GitHub read changes nothing', (t) => {
+  const view = { state: 'OPEN', isDraft: false, headRefOid: NEXT };
+  assert.equal(classify(t, { view, result: { dispatchId: 'd1', pushed: true, head: NEXT } }).kind, null);
+  assert.equal(classify(t, { view, result: { dispatchId: 'd1', pushed: false, head: NEXT } }).kind, 'stale-head');
+  assert.equal(classify(t, { view, result: { dispatchId: 'other', pushed: true, head: NEXT } }).kind, 'stale-head');
+  assert.equal(classify(t, { gh: () => { throw new Error('gh: HTTP 502 Bad Gateway'); } }).kind, null);
+  assert.equal(classify(t, { gh: () => 'not json' }).kind, null);
   assert.deepEqual([...HELPER_KINDS].sort(), [...MOVED_BLOCK_KINDS].sort());
 });
 
@@ -96,4 +115,15 @@ test('an external block still reaches a person as before', (t) => {
   markException(previous, after(1000), events, { home, dryRun: false });
   assert.equal(events.length, 1);
   assert.equal(pendingEvents(home).length, 1);
+});
+
+test('a stale-head round that was handed back on the new head never asks for a person, whatever was retried before', (t) => {
+  const used = Array.from({ length: MOVED_RETRY_LIMIT }, (_, n) => ({ dispatchId: `old-${n}`, at: BLOCKED_AT, head: HEAD, headChanged: false }));
+  const { home, paths, previous } = setup(t, { extra: { movedReopened: used } });
+  const handedBack = reopenMovedBlocked({ previous, paths, now: after(1000), head: NEXT });
+  assert.equal(handedBack.eligibility, 'active');
+  const events = [];
+  markException(handedBack, after(2000), events, { home, dryRun: false });
+  assert.deepEqual(events, []);
+  assert.deepEqual(pendingEvents(home), []);
 });

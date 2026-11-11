@@ -2369,7 +2369,9 @@ export function markException(previous, now, events, { home, dryRun } = {}) {
   // the retries on one head are used up.
   if (MOVED_BLOCK_KINDS.has(previous.activeTask?.blockedKind) && !previous.dispatchError) {
     const head = previous.activeTask.head ?? previous.activeTask.sourceHead;
-    if (movedRetriesExhausted(previous, head)) {
+    // A round already handed back (the head moved, or the back-off passed) is not waiting for anyone.
+    const handedBack = (previous.movedReopened ?? []).some((item) => item.dispatchId === previous.activeTask.dispatchId);
+    if (!handedBack && movedRetriesExhausted(previous, head)) {
       queueHumanNotice(home, { kind: 'blocked-escalate', number: previous.number, url: previous.url, head,
         blockedKind: previous.activeTask.blockedKind, cause: blockedCause(previous.activeTask.blockedKind, previous.activeTask.reason) }, dryRun);
     }
@@ -2407,7 +2409,7 @@ export function markException(previous, now, events, { home, dryRun } = {}) {
 
 // A stuck PR has to be visible where its author looks (2026-10-15: blocked rounds only reached the
 // Mini's run log). Kinds the watcher resolves by itself on a later poll are not announced.
-const QUIET_BLOCKED_KINDS = new Set(['required-ci', 'optional-ci', 'ci-transport', 'head-drift', 'stale-head', 'ownership-moved', 'round-limit-reset', 'product-intent-reopened', 'missing-result-reopened', AUTHOR_RECLAIMED]);
+const QUIET_BLOCKED_KINDS = new Set(['required-ci', 'optional-ci', 'ci-transport', 'head-drift', 'round-limit-reset', 'product-intent-reopened', 'missing-result-reopened', AUTHOR_RECLAIMED]);
 const NOTICE_ATTEMPTS = 3;
 const NOTICE_HISTORY = 20;
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
