@@ -119,6 +119,14 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
     }
     // A failed optional Actions check blocks Mivo pre-review (every check must be green); its proof comes only
     // from failedOptionalCiItems, never from a comment or the gh pr checks list.
+    // CI that stayed unknown after every check finished (mivo-ci-selfheal.mjs ciStall); its proof comes only from stalledCiItems.
+    const stall = item.stallFailure;
+    if (stall) {
+      if (stall.verified !== true || stall.status !== 'stalled' || stall.headSha !== headSha) {
+        return result('needs-triage', [], 'invalid-ci-stall-evidence');
+      }
+      return result('required-ci-fix', [], 'verified-ci-stall');
+    }
     const optional = item.optionalFailure;
     if (optional) {
       if (optional.verified !== true || optional.status !== 'failed' || optional.headSha !== headSha) {

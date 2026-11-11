@@ -190,6 +190,7 @@ export function applyCiTriage(result, options = {}) {
   if (!result || !Array.isArray(result.required) || result.status === 'unknown') return result;
   const required = result.required.map((rule) => {
     if (rule.status !== 'failed') return rule;
+    if (rule.triage) return rule; // already classified where it was found (a check skipped behind a failed job)
     const { triage, defer } = triageRule(rule, { ...options, required: result.required });
     return defer ? { ...rule, status: 'pending', reason: defer, deferredFrom: 'failed', triage } : { ...rule, triage };
   });
@@ -202,6 +203,8 @@ const KIND_LABEL = {
   'waits-upstream': 'waits-upstream（等上游，修上游或重跑，不为它改代码）',
   aggregate: 'aggregate（汇总门，修下面的子 job）',
   infra: 'infra（取消/环境/外部，重跑或 blocked，不改代码）',
+  'skipped-upstream': 'skipped-upstream（必需检查被跳过：它依赖的 job 失败了，处理那个 job）',
+  stall: 'stall（所有检查都结束了，必需检查仍判不出通过：查清差什么并补上）',
   unknown: 'unknown（未能分类）',
 };
 

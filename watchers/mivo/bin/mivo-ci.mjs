@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { collectMivoPolicySteps, evaluateMivoCi } from './mivo-pr-policy.mjs';
 import { collectCodeScanningSteps } from './mivo-code-scanning.mjs';
 import { AGGREGATES, applyCiTriage, failingJobsOnHead } from './mivo-ci-triage.mjs';
+import { resolveSkippedRequired } from './mivo-ci-selfheal.mjs';
 
 const parse = raw => typeof raw === 'string' ? JSON.parse(raw) : raw;
 const check = (ok, reason) => { if (!ok) throw new Error(reason); };
@@ -116,7 +117,7 @@ export function* collectMivoCiSteps({ pr, ghFn, now = Date.now() }) {
     const statusPages = parse(yield () => ghFn(['api', `repos/${pr.repo}/commits/${pr.headRefOid}/statuses?per_page=100`, '--paginate', '--slurp']));
     check(Array.isArray(statusPages) && statusPages.every(Array.isArray), 'status pagination incomplete');
     const statuses = statusPages.flat().map(s => ({ ...s, sha: pr.headRefOid }));
-    const evaluated = evaluateMivoCi({ policy, headSha: pr.headRefOid, checks, statuses });
+    const evaluated = resolveSkippedRequired(evaluateMivoCi({ policy, headSha: pr.headRefOid, checks, statuses }), { checks, repo: pr.repo });
     // An aggregate (verify, Linux/Windows unit tests) is never the thing to fix: read the failed step of each
     // failed job below it so the repair session starts from the real cause. A failed read only drops the detail.
     if (evaluated.required?.some((rule) => rule.status === 'failed' && AGGREGATES.some((agg) => agg.context.test(rule.context)))) {

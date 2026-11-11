@@ -277,8 +277,15 @@ test('optional CI proof bound to another head is not repair authority', () => {
   assert.equal(policy.action, 'needs-triage');
   assert.equal(policy.reason, 'invalid-optional-ci-evidence');
 });
-test('unknown CI emits no optional items either', () => {
-  assert.equal(feedbackItems({ pr, ci: { status: 'unknown', required: [], optional: [optionalRed] } }).filter((item) => item.source === 'ci').length, 0);
+// 2026-11-10: a required check was skipped behind a failed optional job, CI read as unknown, and the unknown hid the
+// only thing there was to repair. The optional item is bound to the head by its own evidence, so it is delivered.
+test('a red optional check is still delivered while the required checks are unknown', () => {
+  const items = feedbackItems({ pr, ci: { status: 'unknown', required: [], optional: [optionalRed] } }).filter((item) => item.source === 'ci');
+  assert.equal(items.length, 1);
+  assert.equal(items[0].repairPolicy.action, 'required-ci-fix');
+});
+test('a CI collection that failed has no optional list and emits nothing', () => {
+  assert.equal(feedbackItems({ pr, ci: { status: 'unknown', required: [], reason: 'boom' } }).filter((item) => item.source === 'ci').length, 0);
 });
 test('optional Actions failure dispatches a repair round', (t) => {
   const { paths, listed } = scanHome(t);
