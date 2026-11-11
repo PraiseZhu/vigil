@@ -124,8 +124,9 @@ test('a job that failed on a server error is re-run; a real failure is left to t
   const lint = check('lint + tsc + unit + logging', 'failure', { id: 32, runId: 911 });
   const ci = { status: 'failed', required: [], checks: [unit, lint] };
   const { result, posts } = supervise({ ci, annotations: {
-    31: [{ annotation_level: 'failure', message: 'Error: Unexpected HTTP response: 503' }, { annotation_level: 'warning', message: 'Node 20 is deprecated' }],
-    32: [{ annotation_level: 'failure', message: "src/a.ts(3,1): error TS2322: Type 'string' is not assignable to type 'number'." }],
+    // The shape GitHub really reports: the error line plus the generic exit-code line of the failed step.
+    31: [{ annotation_level: 'failure', message: 'Error: Unexpected HTTP response: 503' }, { annotation_level: 'failure', message: 'Process completed with exit code 1.' }, { annotation_level: 'warning', message: 'Node 20 is deprecated' }],
+    32: [{ annotation_level: 'failure', message: "src/a.ts(3,1): error TS2322: Type 'string' is not assignable to type 'number'." }, { annotation_level: 'failure', message: 'Process completed with exit code 2.' }],
   } });
   assert.deepEqual(posts, [`api --method POST repos/${repo}/actions/runs/910/rerun-failed-jobs`]);
   assert.equal(result.state.runs['910'].action, 'rerun');
@@ -163,6 +164,8 @@ test('a refused re-run is reported and tried again on a later round', () => {
   assert.equal(result.state, null);
   assert.equal(result.errors.length, 1);
   assert.match(result.errors[0].error, /already running/);
+  const retry = supervise({ ci: { ...evaluate(checks), checks }, state: result.state, now: '2026-11-10T18:44:00Z' });
+  assert.equal(retry.posts.length, 1);
 });
 
 test('dry run asks for nothing and records nothing', () => {
@@ -190,6 +193,8 @@ test('annotations: only failure-level lines count, and all of them must be infra
   assert.equal(isInfraFailure([{ annotation_level: 'failure', message: 'HTTP status code: 502' }]), true);
   assert.equal(isInfraFailure([{ annotation_level: 'failure', message: 'connect ETIMEDOUT 140.82.112.5:443' }]), true);
   assert.equal(isInfraFailure([{ annotation_level: 'failure', message: 'Process completed with exit code 1.' }]), false);
+  assert.equal(isInfraFailure([{ annotation_level: 'failure', message: 'HTTP status code: 502' }, { annotation_level: 'failure', message: 'Process completed with exit code 1.' }]), true);
+  assert.equal(isInfraFailure([{ annotation_level: 'failure', message: 'expected 1 to be 2' }, { annotation_level: 'failure', message: 'HTTP 503' }]), false);
   assert.equal(isInfraFailure([{ annotation_level: 'warning', message: 'HTTP 503' }]), false);
   assert.equal(isInfraFailure([]), false);
 });
@@ -373,4 +378,28 @@ test('watcher round: the run behind a skipped required check is re-run and no se
   scan({ paths, listed, collected: later, now: '2026-11-10T18:48:00Z', sent, posts: morePosts, runAttempt: 2 });
   assert.deepEqual(morePosts, [], 'one re-run per run and head');
   assert.equal(sent.length, 1, 'the second failure goes to a repair session');
+});
+
+test('watcher round: the stall notice needs 6.5 hours of unknown on this head with every check finished; a push starts the clock again', (t) => {
+  const { paths, listed } = home(t);
+  const seedSince = (extra) => {
+    const state = JSON.parse(fs.readFileSync(paths.statePath, 'utf8'));
+    state.prs.PR_10 = { ...state.prs.PR_10, ...extra };
+    fs.writeFileSync(paths.statePath, JSON.stringify(state));
+  };
+  // The gate was skipped by its own condition: no failed job beside it, so CI is unknown.
+  const collected = collectPr(prRef, { ghFn: collectGh([gateSkipped]) });
+  assert.equal(collected.ci.status, 'unknown');
+  const now = '2026-11-11T02:00:00Z';
+  // Unknown for 7 hours, but that clock was started on another head.
+  seedSince({ policyUnknownSince: '2026-11-10T19:00:00Z', policyUnknownHead: 'd'.repeat(40) });
+  scan({ paths, listed, collected, now });
+  assert.deepEqual(pendingEvents(paths.home).filter((event) => event.kind === 'ci-stalled'), []);
+  assert.equal(JSON.parse(fs.readFileSync(paths.statePath, 'utf8')).prs.PR_10.policyUnknownSince, now);
+  // The same 7 hours on this head.
+  seedSince({ policyUnknownSince: '2026-11-10T19:00:00Z', policyUnknownHead: head });
+  scan({ paths, listed, collected, now: '2026-11-11T02:04:00Z' });
+  const events = pendingEvents(paths.home).filter((event) => event.kind === 'ci-stalled');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].since, '2026-11-10T19:00:00Z');
 });

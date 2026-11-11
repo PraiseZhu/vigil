@@ -2699,14 +2699,17 @@ export function* processPr({
   // An unreadable required-check policy is a watcher fault, not a red CI; reaching mergeable is the outcome the
   // author waits for. Both are reported once per transition so they can reach a person.
   const policyUnknown = collected.ci?.status === 'unknown';
+  // The clock belongs to one head: a push starts it again (an entry written before the head was recorded starts now).
+  const unknownSince = policyUnknown && base.policyUnknownSince && base.policyUnknownHead === pr.headRefOid ? base.policyUnknownSince : null;
+  const checksSettled = !(collected.ci?.checks ?? []).some((item) => String(item?.status ?? '').toLowerCase() !== 'completed');
   if (policyUnknown && !base.policyUnknownSince) {
     events.push({ kind: 'policy-unknown', number: pr.number, reason: String(collected.ci?.reason ?? collected.ci?.policy?.reason ?? '').slice(0, 200) });
   }
   // Unknown for this long means the diagnosis rounds are used up (or there was nothing a session could read): a person
   // hears about it once per head instead of the PR waiting in silence (2026-11-10: 12 hours with no notice).
-  if (policyUnknown && base.policyUnknownSince && Date.parse(now) - Date.parse(base.policyUnknownSince) >= CI_STALL_NOTICE_MS) {
+  if (unknownSince && checksSettled && Date.parse(now) - Date.parse(unknownSince) >= CI_STALL_NOTICE_MS) {
     const unknownRules = (collected.ci?.required ?? []).filter((rule) => rule.status === 'unknown').map((rule) => `${rule.context}: ${rule.reason ?? 'unknown'}`);
-    queueHumanNotice(paths.home, { kind: 'ci-stalled', number: pr.number, url: pr.url, head: pr.headRefOid, since: base.policyUnknownSince,
+    queueHumanNotice(paths.home, { kind: 'ci-stalled', number: pr.number, url: pr.url, head: pr.headRefOid, since: unknownSince,
       checks: unknownRules.length ? unknownRules : [String(collected.ci?.reason ?? collected.ci?.policy?.reason ?? 'required-policy-unknown').slice(0, 200)] }, dryRun);
   }
   previous = {
@@ -2722,7 +2725,8 @@ export function* processPr({
     admissionVerified: admitted, admissionReason: collected.admissionReason ?? previous.admissionReason ?? null,
     admissionEpoch: admitted ? collected.pr?.releaseEpoch ?? previous.admissionEpoch : null,
     eligibilityInitialized: true, wasDraft: false,
-    policyUnknownSince: policyUnknown ? (base.policyUnknownSince ?? now) : null,
+    policyUnknownSince: policyUnknown ? (unknownSince ?? now) : null,
+    policyUnknownHead: policyUnknown ? pr.headRefOid : null,
     codeScanningStatus: collected.ci?.codeScanning?.status ?? null,
     scanCheckedAt: now,
   };

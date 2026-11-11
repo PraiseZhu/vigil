@@ -23,6 +23,7 @@ export const SELFHEAL_MAX_RUN_ATTEMPT = 3;
 export const SELFHEAL_HOLD_MS = 45 * 60 * 1000;
 const SELFHEAL_MAX_JOBS_READ = 8;
 
+const GENERIC_FAILURE = /^Process completed with exit code \d+\.?$/;
 const RED = new Set(['failure', 'timed_out', 'startup_failure', 'cancelled']);
 const ANALYZE = /^Analyze \(/; // CodeQL jobs: mivo-codeql-infra.mjs
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -70,7 +71,9 @@ export function resolveSkippedRequired(result, { checks = [], repo } = {}) {
 
 /** True when the job reported failure annotations and every one of them is a server-side or runner error. */
 export function isInfraFailure(annotations) {
-  const failures = (Array.isArray(annotations) ? annotations : []).filter((a) => a?.annotation_level === 'failure');
+  // Every failed step also gets "Process completed with exit code N.": it says that a step failed, not why.
+  const failures = (Array.isArray(annotations) ? annotations : [])
+    .filter((a) => a?.annotation_level === 'failure' && !GENERIC_FAILURE.test(String(a.message ?? '').trim()));
   return failures.length > 0 && failures.every((a) => SELFHEAL_INFRA_PATTERNS.some((re) => re.test(String(a.message ?? ''))));
 }
 
