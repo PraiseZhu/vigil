@@ -282,13 +282,31 @@ function dueReacceptTree(paths, ref, nowMs) {
   }
   const at = Date.parse(parsed?.at || '');
   if (!Number.isFinite(at)) return true;
+  // 时钟回拨或手工写成未来时间：当过期，照常拉树，免得这个任务一直不发现。
+  if (at > nowMs) return true;
   return nowMs - at >= REACCEPT_TREE_MIN_MS;
 }
 
 function markReacceptTree(paths, ref, nowMs) {
   const file = reacceptTreeStampFile(paths, ref);
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(file, `${JSON.stringify({ at: new Date(nowMs).toISOString() })}\n`, { mode: 0o600 });
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const tmp = `${file}.${process.pid}.${nowMs}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify({ at: new Date(nowMs).toISOString() })}\n`, { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    try {
+      appendAlert(paths, {
+        kind: 'prbot-reaccept-stamp-failed',
+        issue: ref,
+        reason: 'reaccept-tree-write-failed',
+        detail: String(error?.code || error?.message || error),
+        now: () => nowMs,
+      });
+    } catch {
+      // 提醒也写不下时不挡发现：宁可多拉树。
+    }
+  }
 }
 
 /**
