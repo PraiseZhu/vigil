@@ -396,9 +396,19 @@ test('watcher round: the stall notice needs 6.5 hours of unknown on this head wi
   scan({ paths, listed, collected, now });
   assert.deepEqual(pendingEvents(paths.home).filter((event) => event.kind === 'ci-stalled'), []);
   assert.equal(JSON.parse(fs.readFileSync(paths.statePath, 'utf8')).prs.PR_10.policyUnknownSince, now);
+  assert.equal(JSON.parse(fs.readFileSync(paths.statePath, 'utf8')).prs.PR_10.policyUnknownHead, head);
+  // On this head for 7 hours, but a check started a while ago is still running: not a stall yet.
+  const running = (started) => ({ ...collected, ci: { ...collected.ci, checks: [...collected.ci.checks, { ...rest(check('Linux unit shard (1/4)', null, { id: 77, runId: 990, started, done: null, status: 'in_progress' })) }] } });
+  seedSince({ policyUnknownSince: '2026-11-10T19:00:00Z', policyUnknownHead: head });
+  scan({ paths, listed, collected: running('2026-11-11T01:30:00Z'), now: '2026-11-11T02:02:00Z' });
+  assert.deepEqual(pendingEvents(paths.home).filter((event) => event.kind === 'ci-stalled'), []);
+  // The same check "running" for the whole notice period will not finish by itself: a person hears about it.
+  scan({ paths, listed, collected: running('2026-11-10T19:00:00Z'), now: '2026-11-11T02:03:00Z' });
+  assert.equal(pendingEvents(paths.home).filter((event) => event.kind === 'ci-stalled').length, 1);
   // The same 7 hours on this head.
   seedSince({ policyUnknownSince: '2026-11-10T19:00:00Z', policyUnknownHead: head });
   scan({ paths, listed, collected, now: '2026-11-11T02:04:00Z' });
+  // Every check finished: the notice is the same one (one per head), with the time the unknown started.
   const events = pendingEvents(paths.home).filter((event) => event.kind === 'ci-stalled');
   assert.equal(events.length, 1);
   assert.equal(events[0].since, '2026-11-10T19:00:00Z');

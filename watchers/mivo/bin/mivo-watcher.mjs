@@ -2701,7 +2701,10 @@ export function* processPr({
   const policyUnknown = collected.ci?.status === 'unknown';
   // The clock belongs to one head: a push starts it again (an entry written before the head was recorded starts now).
   const unknownSince = policyUnknown && base.policyUnknownSince && base.policyUnknownHead === pr.headRefOid ? base.policyUnknownSince : null;
-  const checksSettled = !(collected.ci?.checks ?? []).some((item) => String(item?.status ?? '').toLowerCase() !== 'completed');
+  // A check that is still running is not a stall, unless it has been "running" for the whole notice period: a job
+  // waiting for a runner or an approval that long will not finish by itself either.
+  const checksSettled = !(collected.ci?.checks ?? []).some((item) => String(item?.status ?? '').toLowerCase() !== 'completed'
+    && !(Date.parse(now) - (Date.parse(item?.started_at ?? item?.created_at ?? '') || Date.parse(now)) >= CI_STALL_NOTICE_MS));
   if (policyUnknown && !base.policyUnknownSince) {
     events.push({ kind: 'policy-unknown', number: pr.number, reason: String(collected.ci?.reason ?? collected.ci?.policy?.reason ?? '').slice(0, 200) });
   }
