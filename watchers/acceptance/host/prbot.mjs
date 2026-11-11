@@ -15,7 +15,7 @@ import { beijingIso as roundsBeijingIso, bodyVersion, latestRound, parseRef, par
 import { collectTasks, repoTier } from '../bin/tasks.mjs';
 import { redact } from '../bin/redact.mjs';
 import { isTrustedAuthor } from '../bin/trusted-author.mjs';
-import { appendAlert, hostPaths, isAlive, readLockPayload, releaseLock, tryAcquireLock } from './paths.mjs';
+import { appendAlert, hostPaths, isAlive, readAlerts, readLockPayload, releaseLock, tryAcquireLock } from './paths.mjs';
 import { appendPrbotEvent } from './prbot-events.mjs';
 import { localEnv } from '../bin/localgit.mjs';
 import { run as procRun } from './proc.mjs';
@@ -40,6 +40,8 @@ export const MAX_HEAD_WAIT_MS = 60 * 60 * 1000;
 export const READY_STALL_MS = 24 * 60 * 60 * 1000;
 /** #363：本 PR 新收集的重验任务（kind 不是 child）拉任务树的最短间隔。kind=child / 根任务每拍照旧拉。 */
 export const REACCEPT_TREE_MIN_MS = 15 * 60 * 1000;
+/** 写限频状态失败的提醒窗口：与 `remindPollNotices` 的 POLL_NOTICE_WINDOW_MS 相同（24 小时）。 */
+const REACCEPT_STAMP_ALERT_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const MAX_ROUND_MS = 3 * 60 * 60 * 1000;
 export const WATCH_INTERVAL_MS = 2 * 60 * 1000;
 
@@ -289,13 +291,29 @@ function dueReacceptTree(paths, ref, nowMs) {
 
 function markReacceptTree(paths, ref, nowMs) {
   const file = reacceptTreeStampFile(paths, ref);
+  let tmp;
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    const tmp = `${file}.${process.pid}.${nowMs}.tmp`;
+    tmp = `${file}.${process.pid}.${nowMs}.tmp`;
     fs.writeFileSync(tmp, `${JSON.stringify({ at: new Date(nowMs).toISOString() })}\n`, { mode: 0o600 });
     fs.renameSync(tmp, file);
   } catch (error) {
+    if (tmp) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        // 残留清不掉也不挡发现。
+      }
+    }
     try {
+      const recent = readAlerts(paths);
+      const seen = recent.some(
+        (alert) =>
+          alert.kind === 'prbot-reaccept-stamp-failed' &&
+          alert.issue === ref &&
+          nowMs - Date.parse(alert.ts || 0) < REACCEPT_STAMP_ALERT_WINDOW_MS,
+      );
+      if (seen) return;
       appendAlert(paths, {
         kind: 'prbot-reaccept-stamp-failed',
         issue: ref,

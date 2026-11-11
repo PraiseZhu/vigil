@@ -1945,17 +1945,17 @@ test('#363 SC11 写限频状态失败不抛，其他任务照常发现', async (
   const prbotDir = hostPaths(home).prbotDir;
   fs.mkdirSync(prbotDir, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(prbotDir, 'reaccept-tree'), 'not-a-dir');
-  const found = await discoverCorrections({
-    github,
-    profile,
-    tasks,
-    home,
-    now: () => Date.parse('2026-10-24T00:00:00.000Z'),
-  });
+  const t0 = Date.parse('2026-10-24T00:00:00.000Z');
+  const found = await discoverCorrections({ github, profile, tasks, home, now: () => t0 });
   assert.deepEqual(found.map((entry) => entry.issue), [correction.ref]);
-  const alerts = readAlerts(hostPaths(home)).filter((entry) => entry.kind === 'prbot-reaccept-stamp-failed');
-  assert.equal(alerts.length, 1);
+  await discoverCorrections({ github, profile, tasks, home, now: () => t0 + 180_000 });
+  const paths = hostPaths(home);
+  const alerts = readAlerts(paths).filter((entry) => entry.kind === 'prbot-reaccept-stamp-failed');
+  assert.equal(alerts.length, 1, '24 小时窗口内只写一次');
   assert.equal(alerts[0].issue, child.ref);
+  await discoverCorrections({ github, profile, tasks, home, now: () => t0 + 24 * 60 * 60 * 1000 });
+  const later = readAlerts(paths).filter((entry) => entry.kind === 'prbot-reaccept-stamp-failed');
+  assert.equal(later.length, 2, '窗口过后再报一次');
 });
 
 test('#363 SC11 拉树后 1 秒出现未挂载修正子，按 180 秒一拍推进，在 15 分钟 + 一拍内发现', async () => {
