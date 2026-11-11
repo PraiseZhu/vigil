@@ -12,7 +12,7 @@ import { collectMivoCiSync } from './mivo-ci.mjs';
 import { collectPrOwnershipSync } from './mivo-pr-snapshot.mjs';
 import { isCurrentHandoff } from './mivo-handoff.mjs';
 import { createPushHooks } from './mivo-pre-push.mjs';
-import { taskRepairPolicy } from './mivo-feedback-policy.mjs';
+import { taskRepairPolicy, TRIAGE_REASONS } from './mivo-feedback-policy.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, readPr, writePr } from './mivo-state.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
 import { acquireValidationSlot, runStreaming, validationConfig } from './mivo-validation-runtime.mjs';
@@ -1022,11 +1022,15 @@ function validationPolicy(worktree, task, gitFn, baseRefName = null) {
   return { file, sourceHead: task.headRefOid, sha256: hash(actual), reviewedChange: { feedbackKeys: named } };
 }
 
-// Keys of this task's feedback that is written on `file` and is allowed to change code (P0/P1/P2 by the repair
-// policy computed from the item itself, never from a cached flag in the task).
+// Keys of this task's feedback that is written on `file` and is a confirmed P0/P1/P2 finding of a trusted reviewer.
+// "May change code" alone is not enough: a thread by any member or outside account is handed to the session to grade
+// (the triage reasons, no severity yet) and also may change code, so one comment on the hook would open the gate.
+// The policy is computed from the item itself, never from a cached flag in the task.
+const CONFIRMED_SEVERITY = new Set(['P0', 'P1', 'P2']);
 export function hookFindingKeys(task, file) {
-  const mayChangeCode = new Set(taskRepairPolicy(task).items.filter((item) => item.canChangeCode === true).map((item) => item.key));
-  return (task?.feedback ?? []).filter((item) => item?.path === file && mayChangeCode.has(item.key)).map((item) => item.key);
+  const confirmed = new Set(taskRepairPolicy(task).items.filter((item) => item.canChangeCode === true && item.action === 'code-fix'
+    && !TRIAGE_REASONS.has(item.reason) && (item.severities ?? []).some((level) => CONFIRMED_SEVERITY.has(level))).map((item) => item.key));
+  return (task?.feedback ?? []).filter((item) => item?.path === file && confirmed.has(item.key)).map((item) => item.key);
 }
 
 function baseHook(worktree, file, baseRefName, gitFn) {

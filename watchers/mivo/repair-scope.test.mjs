@@ -1127,6 +1127,9 @@ test('点名 hook 文件的只有 P3 意见，或可改代码的意见写在别�
   for (const feedback of [
     [finding('P1'), { ...finding('P3'), path: '.githooks/pre-push' }],
     [{ ...finding('P1'), path: 'src/other.ts' }],
+    // A person's thread on the hook is graded by the session first: it does not open the gate, whatever it claims.
+    [finding('P1'), { key: 'thread:member', source: 'thread', user: { login: 'ExampleMember', type: 'User' }, authorAssociation: 'MEMBER', body: '**P1**: the hook is wrong', path: '.githooks/pre-push' }],
+    [finding('P1'), { key: 'thread:outside', source: 'thread', user: { login: 'ExampleOutsider', type: 'User' }, authorAssociation: 'NONE', body: 'please change this hook', path: '.githooks/pre-push' }],
   ]) {
     const f = fixture(t);
     f.saveTask(feedback);
