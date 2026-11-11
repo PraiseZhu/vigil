@@ -223,4 +223,5 @@ git -C <配置插件仓> show <backupRef>:<file>
 - **已派出任务的 PR 已合并/关闭时，允许 no-change 收口。** 任务的所有 SC 都是 `no-change`、SC 证据和 feedback 覆盖完整，并且 `validatedHead` 等于派发时的 head 时，`finalize` 可以读 MERGED/CLOSED 的 PR 并写出完成结果。结果带 `completionKind: "pr-terminal-no-change"`、`terminalPr`（实际状态、head、读取时间、工作树是已校验干净还是关闭后已清理）和 `ci.status: "not-run"`；它不 push、不重跑 CI、不评论、不 resolve，也不声称 CI 通过。
 - 有 SC 为 `pass`、head 变过、SC 证据不完整、工作树脏、任务/会话/dispatch 身份不匹配、handoff 被撤回或 Keel 证据无效时，不走这个例外，仍按原来的 OPEN 校验处理。
 - 正常 complete 仍要求当前 head 的绿 CI。只有严格校验通过的 terminal no-change 回执可以跳过该条件；它也不会写入 feedback ledger，不会把审查意见标成已裁定。PR 重开后，旧终态回执只作为历史完成，原反馈可以重新派发。
+- **没改代码、必需检查失败时的那一次重跑。** `finalize` / `recheck` 对同一个 head 只重跑一次失败的 Actions run（`gh run rerun --failed`），结果先记 `waiting-ci`。之后再调用时先读这次重跑的 run：还在排队或运行中，或已经成功结束（手上的检查快照是旧的），继续记 `waiting-ci`（原因 `waiting for the one no-change CI rerun to finish`），不通知；run 已结束且不是成功、run 读不到、或重跑发起超过 2 小时，才记 `blocked external`（`required CI still failed after one no-change retrigger`）。
 - 已在派发队列里的任务不受影响；派发后 PR 才关闭时，finalize 的终态分支就是正常收口路径。watcher 在 closedown 时也会消费关闭后晚到的合法终态回执。

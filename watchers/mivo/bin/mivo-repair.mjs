@@ -1482,6 +1482,24 @@ function retriggerRequiredCi({ paths, task, ci, ghFn, previous, sourceHead }) {
   return { retried: true, ciRetrigger };
 }
 
+// The one rerun spent on this head may still be running: until its jobs finish, GitHub keeps reporting the
+// previous attempt's failed checks (2026-11-11: #2142 was escalated ten minutes before its rerun went green).
+// A rerun that already finished green means the check snapshot in hand is stale. Only runs that still carry a
+// failed required check count. Past the wait, or when the run cannot be read, the caller keeps its blocked verdict.
+const RERUN_WAIT_MS = 2 * 60 * 60 * 1000;
+const RUN_ACTIVE_STATUSES = new Set(['queued', 'in_progress', 'requested', 'waiting', 'pending']);
+function rerunUnsettled({ task, ci, record, ghFn, now = Date.now() }) {
+  const at = Date.parse(record?.at ?? '');
+  if (record?.method !== 'gh-rerun' || !Number.isFinite(at) || now - at > RERUN_WAIT_MS) return false;
+  const failing = new Set(failedRunIds(ci));
+  return (record.runIds ?? []).map(String).filter((runId) => failing.has(runId)).some((runId) => {
+    let run;
+    try { run = ghJson(['api', `repos/${task.repo}/actions/runs/${runId}`], ghFn); } catch { return false; }
+    return RUN_ACTIVE_STATUSES.has(run?.status) || (run?.status === 'completed' && run?.conclusion === 'success');
+  });
+}
+const RERUN_WAITING_REASON = 'waiting for the one no-change CI rerun to finish';
+
 // A head branch whose effective rules include `pull_request` (e.g. an `integration/*` stage branch whose
 // stage PR targets main) rejects every direct push with GH013, so a direct push can never land (2026-11-04:
 // stage PR #1599 blocked five rounds in a row). A failed probe keeps the direct push: the push stays the gate.
@@ -1896,6 +1914,10 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
       status: 'waiting-ci', reason: 'retried required CI once after no-change',
       head: validatedHead, scs, feedbackCoverage, ...workersField, keel, verification, ci, checks: ci.requiredChecks, pushed, ciRetrigger: extra.ciRetrigger,
     });
+    if (extra.already && rerunUnsettled({ task, ci, record: extra.ciRetrigger, ghFn })) return saveResult(paths, task, sessionId, {
+      status: 'waiting-ci', reason: RERUN_WAITING_REASON,
+      head: validatedHead, scs, feedbackCoverage, ...workersField, keel, verification, ci, checks: ci.requiredChecks, pushed, ciRetrigger: extra.ciRetrigger,
+    });
     if (extra.already) return saveResult(paths, task, sessionId, {
       status: 'blocked', blockedKind: 'external',
       reason: 'required CI still failed after one no-change retrigger',
@@ -1954,6 +1976,12 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
     if (extra.retried) {
       return saveResult(paths, task, sessionId, {
         ...common, status: 'waiting-ci', reason: 'retried required CI once after no-change',
+        ci, checks: ci.requiredChecks, ciRetrigger: extra.ciRetrigger,
+      }, { requirePrLock: true });
+    }
+    if (extra.already && rerunUnsettled({ task, ci, record: extra.ciRetrigger, ghFn })) {
+      return saveResult(paths, task, sessionId, {
+        ...common, status: 'waiting-ci', reason: RERUN_WAITING_REASON,
         ci, checks: ci.requiredChecks, ciRetrigger: extra.ciRetrigger,
       }, { requirePrLock: true });
     }
