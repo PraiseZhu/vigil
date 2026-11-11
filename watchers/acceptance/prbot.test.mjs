@@ -1703,3 +1703,65 @@ test('#247 SC1 传了任务清单就不再发盘点查询；没传才自己拉',
     '这一拍已经盘点过，不再发全量盘点',
   );
 });
+
+test('#363 SC10 已验过要修、修正子仍 open 的 open 子 issue 被收集后，discoverCorrections 能发现其下开着的修正子', async () => {
+  const { home } = writeProfile(tmpDir());
+  const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const world = createWorld();
+  const root = world.addIssue({ number: 1, body: 'root', title: '总任务' });
+  world.addComment(
+    root.ref,
+    roundComment({
+      round: 1,
+      status: '要修',
+      bodyVersion: bodyVersion('root'),
+      startedAt: '2026-10-21T00:00:00.000Z',
+      finishedAt: '2026-10-22T00:00:00.000Z',
+      updatedAt: '2026-10-22T00:00:00.000Z',
+    }),
+  );
+  const child = world.addIssue({ number: 2, body: 'body v1', title: '子任务', parent: root.ref });
+  world.addChild(root.ref, child.ref);
+  world.addComment(
+    child.ref,
+    roundComment({
+      round: 2,
+      status: '要修',
+      bodyVersion: bodyVersion('body v1'),
+      startedAt: '2026-10-23T00:00:00.000Z',
+      finishedAt: '2026-10-23T12:00:00.000Z',
+      updatedAt: '2026-10-23T12:00:00.000Z',
+    }),
+  );
+  const correction = world.addIssue({
+    number: 9,
+    title: '修正：子任务 SC1',
+    body: `[验收机] 修正 · 总 ${REPO}#2 · 项 ${REPO}#2 SC1 · 第 2 轮`,
+    parent: child.ref,
+  });
+  world.addChild(child.ref, correction.ref);
+
+  const github = {
+    async graphql(query, variables) {
+      if (query.includes('user(login')) {
+        return {
+          user: {
+            open: {
+              nodes: [inventoryNode(world, root.ref), inventoryNode(world, child.ref), inventoryNode(world, correction.ref)],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+            closed: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        };
+      }
+      return world.graphql({ query, variables });
+    },
+  };
+
+  const tasks = await collectTasks(github, profile);
+  assert.ok(tasks.some((task) => task.ref === child.ref), `期望收集到 ${child.ref}，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  const found = await discoverCorrections({ github, profile, tasks });
+  assert.deepEqual(found.map((entry) => entry.issue), [correction.ref]);
+  assert.equal(found[0].root, child.ref);
+  assert.equal(found[0].sc, 1);
+});

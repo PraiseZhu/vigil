@@ -487,8 +487,8 @@ test('#247 SC1 回归：评论窗口仍是 50 条（不改小），评论多的�
   assert.equal(LEAD_HANDOFF_COMMENT_WINDOW, 50);
 });
 
-// #363 有可信父的 open 子 issue：只有「已经验过、最后结论要修、并且此后修正子已关或正文已改」才放行。
-// 判定本身复用既有 shouldTrigger，这里只钉住收集层的放行/丢弃边界。
+// #363 有可信父的 open 子 issue：只要「已经验过、最后结论要修」就收集。
+// 开不开轮仍走 shouldTrigger；修正子仍开着这类当前不该开始的也留在清单里。
 const R1_START = '2026-10-21T00:00:00.000Z';
 const R1_FINISH = '2026-10-22T00:00:00.000Z';
 const CORRECTION_CLOSED_AFTER = '2026-10-23T00:00:00.000Z';
@@ -566,16 +566,20 @@ test('#363 SC3 从未验过的 open 子 issue 仍被丢弃', async () => {
   assert.deepEqual(tasks.map((task) => task.ref), [`${REPO}#1`]);
 });
 
-test('#363 SC3 已验过要修但正文未变、修正子仍 open 的，仍被丢弃', async () => {
+test('#363 SC3 已验过要修但正文未变、修正子仍 open 的，仍收集但不开轮', async () => {
   const nodes = reacceptNodes({ bodyNow: 'body v1', correctionState: 'OPEN', correctionClosedAt: null });
-  const { tasks } = await collectOnly({ open: [nodes.parent, nodes.child] });
-  assert.deepEqual(tasks.map((task) => task.ref), [`${REPO}#1`]);
+  const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), { trigger: false, reason: 'children-open' });
 });
 
-test('#363 SC3 修正子在结论之前就关闭、正文未变的，不误触发（仍被丢弃）', async () => {
+test('#363 SC3 修正子在结论之前就关闭、正文未变的，仍收集但不开轮', async () => {
   const nodes = reacceptNodes({ bodyNow: 'body v1', correctionClosedAt: CORRECTION_CLOSED_BEFORE });
-  const { tasks } = await collectOnly({ open: [nodes.parent, nodes.child] });
-  assert.deepEqual(tasks.map((task) => task.ref), [`${REPO}#1`]);
+  const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), { trigger: false, reason: 'up-to-date' });
 });
 
 test('#363 SC4 最后结论「通过」的 open 子 issue 不因正文变更重新收集', async () => {
@@ -623,4 +627,26 @@ test('#363 去重：同一子 issue 不因本改动出现两遍', async () => {
   const refs = tasks.map((task) => task.ref);
   assert.equal(new Set(refs).size, refs.length);
   assert.equal(refs.filter((ref) => ref === `${REPO}#2`).length, 1);
+});
+
+test('#363 SC8 父任务验收中时仍收集，不开轮（parent-in-progress）', async () => {
+  const nodes = reacceptNodes();
+  nodes.parent.comments = {
+    nodes: [roundComment({ round: 2, status: '验收中', startedAt: '2026-10-23T00:00:00.000Z' })],
+  };
+  const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  assert.equal(found.parentLatestStatus, '验收中');
+  assert.deepEqual(shouldTrigger(found, { now: NOW, profile }), { trigger: false, reason: 'parent-in-progress' });
+});
+
+test('#363 SC9 重验任务自己的 PR 合入非默认分支时不开轮（base-not-default）', async () => {
+  const nodes = reacceptNodes({ prs: [prNode(20, '2026-10-20T01:00:00.000Z', 'release')] });
+  const { tasks, profile } = await collectOnly({ open: [nodes.parent, nodes.child] });
+  const found = tasks.find((task) => task.ref === `${REPO}#2`);
+  assert.ok(found, `期望收集到 ${REPO}#2，实际 ${JSON.stringify(tasks.map((task) => task.ref))}`);
+  const decision = shouldTrigger(found, { now: NOW, profile });
+  assert.equal(decision.trigger, false);
+  assert.equal(decision.reason, 'base-not-default');
 });
