@@ -69,8 +69,8 @@ function world(t) {
   const sent = [];
   let failure = null;
   const failNext = (message) => { failure = message; };
-  const scan = (now) => scanOnce({
-    enabled: true, allowDispatch: true, paths, now, ghFn, collect: () => collected,
+  const scan = (now, { live = true } = {}) => scanOnce({
+    enabled: true, allowDispatch: live, paths, now, ghFn, collect: () => collected,
     ownershipSnapshot: function* () { return { pr: collected.pr }; },
     dispatchFn: (params) => {
       if (failure) { const message = failure; failure = null; throw new Error(message); }
@@ -79,7 +79,7 @@ function world(t) {
     keelRoot: os.tmpdir(),
   });
   const tasks = () => fs.readdirSync(path.join(paths.stateDir, 'tasks')).map((name) => JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'tasks', name), 'utf8')));
-  return { HOME, paths, repairGh, taskPathOf, scan, sent, tasks, collected, failNext };
+  return { HOME, paths, repairGh, taskPathOf, scan, sent, tasks, collected, failNext, deliveredCursor: delivered.cursor, comment };
 }
 
 test('helper to watcher: the first external block is handed back with its reason and no notice; the second one on the same head is reported', (t) => {
@@ -114,6 +114,7 @@ test('helper to watcher: nothing to send for the second opinion → the block is
   // Recorded per head: a later blocked dispatch on this head is not handed back either (the report alone would only
   // cover this one dispatch).
   assert.deepEqual(readPr(w.HOME, nodeId).secondOpinion.map((item) => [item.head, item.outcome]), [[A, 'reported']]);
+  assert.deepEqual(readPr(w.HOME, nodeId).feedbackCursor, w.deliveredCursor, 'a round that does not deliver leaves the cursor as it found it');
   w.collected.comments = comments; // it shows up again: the block was reported, so it is not handed back with a false note
   w.scan('2026-11-11T10:21:00.000Z');
   assert.equal(w.sent.length, 0);
@@ -131,4 +132,37 @@ test('helper to watcher: a delivery that fails and is retried is not reported in
   assert.equal(w.sent.length, 1);
   assert.match(JSON.stringify(w.sent[0]), /先裁决再继续/);
   assert.deepEqual(pendingEvents(w.HOME).filter((event) => event.kind === 'blocked-escalate'), []);
+});
+
+test('helper to watcher: only new feedback is there → it goes out as an ordinary round and the old block is reported', (t) => {
+  const w = world(t);
+  blocked({ home: w.HOME, taskPath: w.taskPathOf('live-790'), reason: REASON, ghFn: w.repairGh });
+  w.collected.comments = [{ ...w.comment, id: 502, body: 'A different question.' }];
+  w.scan('2026-11-11T10:01:00.000Z');
+  assert.equal(w.sent.length, 1);
+  assert.doesNotMatch(JSON.stringify(w.sent[0]), /先裁决再继续/, 'no note about a batch that is not in this delivery');
+  assert.deepEqual(readPr(w.HOME, nodeId).secondOpinion.map((item) => item.outcome), ['reported']);
+  assert.equal(pendingEvents(w.HOME).filter((event) => event.kind === 'blocked-escalate').length, 1);
+});
+
+test('helper to watcher: a dry run neither hands back nor records the block as reported; the first live round still hands it back', (t) => {
+  const w = world(t);
+  blocked({ home: w.HOME, taskPath: w.taskPathOf('live-790'), reason: REASON, ghFn: w.repairGh });
+  w.scan('2026-11-11T10:01:00.000Z', { live: false });
+  assert.equal(w.sent.length, 0);
+  assert.equal(readPr(w.HOME, nodeId).secondOpinion, undefined);
+  assert.equal(readPr(w.HOME, nodeId).lastException ?? null, null);
+  w.scan('2026-11-11T10:05:00.000Z');
+  assert.equal(w.sent.length, 1);
+  assert.match(JSON.stringify(w.sent[0]), /先裁决再继续/);
+});
+
+test('helper to watcher: a hand-back whose delivery is given up tells the person why the session stopped', (t) => {
+  const w = world(t);
+  blocked({ home: w.HOME, taskPath: w.taskPathOf('live-790'), reason: REASON, ghFn: w.repairGh });
+  w.failNext('socket closed before the receipt arrived');
+  w.scan('2026-11-11T10:01:00.000Z');
+  w.scan('2026-11-11T10:05:00.000Z');
+  const notices = pendingEvents(w.HOME).filter((event) => event.kind === 'blocked-escalate');
+  assert.ok(notices.some((event) => String(event.cause).includes('另一个仓库')), 'the reason the session stopped for reaches the person');
 });

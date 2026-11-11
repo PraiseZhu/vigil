@@ -2431,6 +2431,13 @@ export function markException(previous, now, events, { home, dryRun } = {}) {
   }
   // The handed-back round is on its way: nobody is asked yet. The block that follows it on the same head is reported.
   if (secondOpinionInDelivery(previous) && !previous.dispatchError) return previous;
+  // The hand-back was built but its delivery was given up: besides the dispatch error below, the person gets the
+  // reason the session stopped for, which is what there is to decide.
+  if (previous.dispatchError && previous.activeTask?.status === 'blocked'
+    && (previous.secondOpinion ?? []).some((item) => item.dispatchId === previous.activeTask.dispatchId && item.outcome === 'delivered')) {
+    queueHumanNotice(home, { kind: 'blocked-escalate', number: previous.number, url: previous.url, head: previous.activeTask.head ?? previous.activeTask.sourceHead,
+      blockedKind: previous.activeTask.blockedKind, cause: blockedCause(previous.activeTask.blockedKind, previous.activeTask.reason) }, dryRun);
+  }
   const event = {
     kind: previous.dispatchError ? 'dispatch-blocked' : 'repair-blocked', number: previous.number, nodeId: previous.nodeId,
     sessionId: previous.sessionId, dispatchId: previous.dispatchError?.dispatchId ?? previous.activeTask?.dispatchId,
@@ -3088,6 +3095,16 @@ export function* processPr({
   let dispatch = { attempted: false, bound: false, reason: 'no-new-feedback' };
   // Advance only non-actionable observations until a delivery is acknowledged.
   const retainedCursor = { ...cursor };
+  // The blocked batch was only taken out of cursorBase to be offered again in this round. What of it was not seen
+  // this round keeps its stored stamp, so a round that does not deliver leaves the cursor as it found it.
+  if (secondOpinion) {
+    for (const [stampKey, stamp] of Object.entries(storedCursor)) {
+      if (!Object.hasOwn(retainedCursor, stampKey) && !fresh.some((item) => item.key === stampKey)) retainedCursor[stampKey] = stamp;
+    }
+  }
+  // Handed back only when the batch that was blocked is actually in this delivery: new feedback alone goes out as an
+  // ordinary round and the old block is reported.
+  const handBack = secondOpinion && fresh.some((item) => blockedItems.has(item.key));
   // storedCursor, not cursorBase: a second-opinion round that does not deliver must leave the blocked batch's stamps
   // as they were (cursorBase had them taken out only to make the batch fresh for this round).
   for (const item of fresh) {
@@ -3298,7 +3315,7 @@ export function* processPr({
       // current prefix instead of reusing the stored text that belonged to the retired session.
       dispatchMapping = planSession({ pr, existing: previous, date: now });
     }
-    const prefix = [reclaimNote(previous, pr.headRefName), handoffNote, secondOpinion ? secondOpinionNote(previous.activeTask.reason) : '', messagePrefix].filter(Boolean).join('\n');
+    const prefix = [reclaimNote(previous, pr.headRefName), handoffNote, handBack ? secondOpinionNote(previous.activeTask.reason) : '', messagePrefix].filter(Boolean).join('\n');
     // Asked once per delivery, and only when this task may change code: it decides whether the session is told to
     // write child PR handoff drafts (the answer is also recorded in the task, so a retry keeps it). A dry run makes
     // no GitHub read, like the gates above, so its preview carries no handoff text.
@@ -3310,7 +3327,10 @@ export function* processPr({
       // persist it, and the next live round would then read the PR as already being delivered.
       dispatch = { attempted: false, bound: false, reason: 'dry-run', pending };
     } else {
-      if (secondOpinion) previous = recordSecondOpinion(previous, { head: pr.headRefOid, now, outcome: 'delivered' });
+      if (handBack) previous = recordSecondOpinion(previous, { head: pr.headRefOid, now, outcome: 'delivered' });
+      // New feedback only: this delivery replaces the blocked task, so the old block is reported here, while it is
+      // still the active task.
+      else if (secondOpinion) previous = markException(recordSecondOpinion(previous, { head: pr.headRefOid, now, outcome: 'reported' }), now, events, { home: paths.home, dryRun });
       previous = { ...previous, pendingDispatch: pending };
       state.prs[key] = previous;
       persistState(state, paths);
@@ -3353,7 +3373,11 @@ export function* processPr({
   // No dispatch was built for the second opinion in this round (nothing to send, or a gate held it): the block is
   // reported now, as it was before there was a second opinion, and it is not handed back later.
   if (secondOpinion && secondOpinionEligible(previous, pr.headRefOid)) previous = recordSecondOpinion(previous, { head: pr.headRefOid, now, outcome: 'reported' });
+  const exceptionBefore = previous.lastException;
   previous = markException({ ...previous, lastPolicyStatus: collected.policy?.status ?? previous.lastPolicyStatus ?? null }, now, events, { home: paths.home, dryRun });
+  // A dry run sends no notice, so it must not record the block as reported either: the first live round would then
+  // neither hand it back nor tell anyone.
+  if (dryRun && previous.lastException !== exceptionBefore) previous = { ...previous, lastException: exceptionBefore };
   if (collected.mergeReady === true && (base.mergeReady !== true || base.mergeReadyHead !== pr.headRefOid)) {
     // The merge state came from the round's batch read, so it is read again for this PR right before the notice
     // goes out. If it moved, or cannot be confirmed, the notice waits for the next round, which collects the PR again
