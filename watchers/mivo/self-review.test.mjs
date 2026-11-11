@@ -2,7 +2,7 @@
 // finalize asks for, changes until the switch is set.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dispatchParams, SELF_REVIEW_RULE, selfReviewRequired } from './bin/mivo-watcher.mjs';
+import { dispatchParams, SELF_REVIEW_RULE, selfReviewRequired, selfReviewConfigProblem } from './bin/mivo-watcher.mjs';
 import { validateSelfReview } from './bin/mivo-repair.mjs';
 import { preflightSelfReviewEnabled } from './bin/profile.mjs';
 
@@ -51,6 +51,9 @@ test('whether a round is asked is decided once at dispatch; a switch that is not
   process.env.MIVO_PREFLIGHT_SELF_REVIEW = 'yes';
   assert.equal(selfReviewRequired({ headRefOid: HEAD, fresh: fixable }), false);
   assert.ok(!message(fixable).includes(SELF_REVIEW_RULE), 'the scan goes on without the rule');
+  assert.match(selfReviewConfigProblem(), /preflightSelfReview.*"yes"/, 'what the scan puts into its run result');
+  process.env.MIVO_PREFLIGHT_SELF_REVIEW = 'true';
+  assert.equal(selfReviewConfigProblem(), null);
 });
 
 test('finalize asks for the record only when the task asked for it and the round has commits', () => {
@@ -63,4 +66,12 @@ test('finalize asks for the record only when the task asked for it and the round
   for (const bad of [{ passes: 3, found: 1, fixed: 1 }, { passes: 1, found: 1, fixed: 2 }, { passes: 1, found: -1, fixed: 0 }, { passes: 1 }, 'done']) {
     assert.throws(() => validateSelfReview(bad, asked), /\[SELF_REVIEW_MISSING\]/, JSON.stringify(bad));
   }
+});
+
+test('a message rendered again for an existing task follows the task, not the switch as it is now', (t) => {
+  const render = (selfReview) => dispatchParams({ pr, mapping: {}, fresh: fixable, now: '2026-11-11T00:00:00Z', taskPath: 'state/tasks/task.json', home: 'watch-home', selfReview }).message;
+  withSwitch(t, 'false');
+  assert.ok(render(true).includes(SELF_REVIEW_RULE), 'the task was asked while the switch was on');
+  process.env.MIVO_PREFLIGHT_SELF_REVIEW = 'true';
+  assert.ok(!render(false).includes(SELF_REVIEW_RULE), 'the task was not asked');
 });

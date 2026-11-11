@@ -1004,7 +1004,7 @@ export function validateSelfReview(record, { required, changed }) {
   if (required !== true || changed !== true) return null;
   const whole = (value) => Number.isInteger(value) && value >= 0;
   const ok = record && typeof record === 'object' && [1, 2].includes(record.passes) && whole(record.found) && whole(record.fixed) && record.fixed <= record.found;
-  if (!ok) fail(`[SELF_REVIEW_MISSING] this round has commits and its task asked for a self-review (expected: selfReview:{passes:1|2,found:n,fixed:m} with m<=n at the top of the SC report; actual: ${JSON.stringify(record ?? null)})`);
+  if (!ok) fail(`[SELF_REVIEW_MISSING] this round has commits with changes and its task asked for a self-review (expected: selfReview:{passes:1|2,found:n,fixed:m} with m<=n at the top of the SC report; actual: ${JSON.stringify(record ?? null)})`);
   return { passes: record.passes, found: record.found, fixed: record.fixed };
 }
 
@@ -1842,9 +1842,10 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview: alreadyFixedProof({ worktree, validatedHead, gitFn }) });
   assertRepeatInventory({ scs, task });
   assertStandardAllowsDisputes({ scs, task });
-  const selfReview = validateSelfReview(selfReviewRecord, { required: task.selfReviewRequired === true, changed: validatedHead !== task.headRefOid });
-  const workersField = { ...(workers ? { workers } : {}), ...(selfReview ? { selfReview } : {}) };
   const emptyRetrigger = allNoChange(scs) && isEmptyCiRetrigger(worktree, task.headRefOid, validatedHead, gitFn);
+  // An empty commit that only re-triggers CI has no diff to review.
+  const selfReview = validateSelfReview(selfReviewRecord, { required: task.selfReviewRequired === true, changed: validatedHead !== task.headRefOid && !emptyRetrigger });
+  const workersField = { ...(workers ? { workers } : {}), ...(selfReview ? { selfReview } : {}) };
   assertTaskRepairScope(task, validatedHead, { emptyRetrigger });
   if (validatedHead !== task.headRefOid && scs.every((sc) => sc.status === 'no-change') && !emptyRetrigger) {
     fail('[REPAIR_SCOPE_NO_CODE] Changed HEAD requires an SC bound to an authorized fix; no-change cannot cover commits');
@@ -1932,7 +1933,7 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
   const remoteHead = gitOutput(['ls-remote', originUrl, `refs/heads/${task.headRefName}`], gitFn).split(/\s+/)[0];
   if (!isSha(remoteHead)) fail('remote branch head is unavailable during recheck');
   const observedPrHead = ownership.pr.headRefOid;
-  const common = { head, scs, feedbackCoverage, ...(previous.workers ? { workers: previous.workers } : {}), keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
+  const common = { head, scs, feedbackCoverage, ...(previous.workers ? { workers: previous.workers } : {}), ...(previous.selfReview ? { selfReview: previous.selfReview } : {}), keel: previous.keel, verification, pushed: previous.pushed === true, remoteHead, observedPrHead };
   if (remoteHead !== observedPrHead) {
     return saveResult(paths, task, sessionId, { ...common, status: 'waiting-ci', reason: 'GitHub PR and remote branch views differ', checks: [],
       ci: { head, requiredGreen: false, requiredChecks: [], optionalFailures: [], pending: [], missing: ['github-remote-head-mismatch'] } }, { requirePrLock: true });
