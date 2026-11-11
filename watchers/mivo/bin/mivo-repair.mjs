@@ -1939,6 +1939,19 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
 
 // Only what a session cannot settle itself blocks; product questions and untrue feedback are answered in the session.
 export const BLOCKED_KINDS = new Set(['external']);
+// A session that stops because the PR moved under it (the author or another session pushed, the handoff was replaced)
+// is not stuck on anything a person has to solve: the watcher judges the PR again from where it is now. Two weeks of
+// runs had 39 such rounds reported as `external`, each with a notice (2026-11-11). The kind is not the session's to
+// choose: it is read from the same ownership check the session ran, by the words this helper itself fails with.
+export const MOVED_BLOCK_KINDS = new Set(['stale-head', 'ownership-moved']);
+export function movedBlockKind({ home, taskPath, ghFn = command, ownerFn = assertOwner } = {}) {
+  try { ownerFn({ home, taskPath, ghFn }); return null; } catch (error) {
+    const message = String(error?.message ?? error);
+    if (/task head is stale/.test(message)) return 'stale-head';
+    if (/handoff (?:missing, revoked, or replaced|no longer matches|PR or branch does not match|revoked or replaced)|task superseded/.test(message)) return 'ownership-moved';
+    return null; // a transport error or anything else says nothing about ownership
+  }
+}
 export function blocked({ home, taskPath, reason, kind = 'external', ghFn = command } = {}) {
   if (!BLOCKED_KINDS.has(kind)) fail(`blocked --kind must be one of ${[...BLOCKED_KINDS].join(', ')}, got ${JSON.stringify(kind)}`);
   const { paths, task } = taskFrom(home, taskPath);
@@ -1949,8 +1962,9 @@ export function blocked({ home, taskPath, reason, kind = 'external', ghFn = comm
     fail('本轮还没有 validate 收据：以 validate/preflight 失败为由停下前，先运行同一 helper validate --validated-head <完整SHA>，以本轮结果为准（helper 会复用通过收据、按基线判定 main 自身的失败）。若是环境/工具故障（如 pathspec、submodule、worktree HEAD），在 reason 里写明具体故障。');
   }
   const validationBlock = latestFailedValidation(paths, task);
+  const moved = movedBlockKind({ home, taskPath, ghFn });
   return saveResult(paths, task, sessionId, {
-    status: 'blocked', blockedKind: kind, reason: reason.trim(),
+    status: 'blocked', blockedKind: moved ?? kind, reason: reason.trim(),
     head: task.headRefOid, worktree: taskWorktree(task), ...(validationBlock ? { validationBlock } : {}),
   });
 }

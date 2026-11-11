@@ -1959,6 +1959,42 @@ export const INFRA_REOPEN_LIMIT = 3;
 export const TRANSIENT_BLOCK_REASON = /rate.?limit|速率限制|限流|配额|quota|互斥锁|pre-push\.flock|pre-push (?:锁|lock)|abuse detection|HTTP 50[0234]|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|Gateway Time-?out|ETIMEDOUT|ECONNRESET|EAI_AGAIN|socket hang up|i\/o timeout/i;
 export const TRANSIENT_RETRY_BACKOFF_MS = 30 * 60 * 1000;
 export const KEEL_LEDGER_HELD = 'keel-ledger-unavailable';
+// A round that stopped because the PR moved under it (mivo-repair.mjs MOVED_BLOCK_KINDS) is handed back without a
+// person: at once when the head is no longer the one the task was written for, and after a back-off when the head is
+// the same (the handoff was being replaced while the session checked), at most MOVED_RETRY_LIMIT times per head.
+export const MOVED_BLOCK_KINDS = new Set(['stale-head', 'ownership-moved']);
+export const MOVED_RETRY_BACKOFF_MS = 30 * 60 * 1000;
+export const MOVED_RETRY_LIMIT = 3;
+const movedRetriesOn = (previous, head) => (previous?.movedReopened ?? []).filter((item) => item.head === head && item.headChanged !== true).length;
+export function movedRetriesExhausted(previous, head) {
+  const active = previous?.activeTask;
+  return active?.status === 'blocked' && MOVED_BLOCK_KINDS.has(active.blockedKind)
+    && (active.head ?? active.sourceHead) === head && movedRetriesOn(previous, head) >= MOVED_RETRY_LIMIT;
+}
+export function reopenMovedBlocked({ previous, paths, now, head }) {
+  const active = previous?.activeTask;
+  if (active?.status !== 'blocked' || !MOVED_BLOCK_KINDS.has(active.blockedKind) || !head) return previous;
+  const dispatchId = active.dispatchId;
+  if (typeof dispatchId !== 'string') return previous;
+  const done = previous.movedReopened ?? [];
+  if (done.some((item) => item.dispatchId === dispatchId)) return previous;
+  const taskHead = active.head ?? active.sourceHead;
+  const headChanged = Boolean(taskHead && taskHead !== head);
+  if (!headChanged) {
+    if (movedRetriesOn(previous, head) >= MOVED_RETRY_LIMIT) return previous;
+    if (Date.parse(now) - Date.parse(active.observedAt ?? active.at ?? now) < MOVED_RETRY_BACKOFF_MS) return previous;
+  }
+  const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', `${dispatchId}.json`));
+  if (!task || task.nodeId !== previous.nodeId) return previous;
+  const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
+  for (const item of task.feedback ?? []) if (typeof item?.key === 'string') delete feedbackCursor[item.key];
+  return {
+    ...previous, feedbackCursor, eligibility: 'active',
+    repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) - 1),
+    movedReopened: [...done, { dispatchId, at: now, head, headChanged, kind: active.blockedKind }].slice(-20),
+  };
+}
+
 export function reopenExternalBlocked({ previous, paths, now, head }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind !== 'external' || active.blockedKind === AUTHOR_RECLAIMED) return previous;
@@ -2329,6 +2365,16 @@ export function markException(previous, now, events, { home, dryRun } = {}) {
   // A reopened product-intent round is handed back to the watcher, not an incident.
   if (previous.activeTask?.blockedKind === 'product-intent-reopened' && !previous.dispatchError) return previous;
   if (previous.activeTask?.blockedKind === 'missing-result-reopened' && !previous.dispatchError) return previous;
+  // The PR moved under the session: the watcher hands the round back by itself. A person hears about it only once
+  // the retries on one head are used up.
+  if (MOVED_BLOCK_KINDS.has(previous.activeTask?.blockedKind) && !previous.dispatchError) {
+    const head = previous.activeTask.head ?? previous.activeTask.sourceHead;
+    if (movedRetriesExhausted(previous, head)) {
+      queueHumanNotice(home, { kind: 'blocked-escalate', number: previous.number, url: previous.url, head,
+        blockedKind: previous.activeTask.blockedKind, cause: blockedCause(previous.activeTask.blockedKind, previous.activeTask.reason) }, dryRun);
+    }
+    return previous;
+  }
   const event = {
     kind: previous.dispatchError ? 'dispatch-blocked' : 'repair-blocked', number: previous.number, nodeId: previous.nodeId,
     sessionId: previous.sessionId, dispatchId: previous.dispatchError?.dispatchId ?? previous.activeTask?.dispatchId,
@@ -2361,7 +2407,7 @@ export function markException(previous, now, events, { home, dryRun } = {}) {
 
 // A stuck PR has to be visible where its author looks (2026-10-15: blocked rounds only reached the
 // Mini's run log). Kinds the watcher resolves by itself on a later poll are not announced.
-const QUIET_BLOCKED_KINDS = new Set(['required-ci', 'optional-ci', 'ci-transport', 'head-drift', 'round-limit-reset', 'product-intent-reopened', 'missing-result-reopened', AUTHOR_RECLAIMED]);
+const QUIET_BLOCKED_KINDS = new Set(['required-ci', 'optional-ci', 'ci-transport', 'head-drift', 'stale-head', 'ownership-moved', 'round-limit-reset', 'product-intent-reopened', 'missing-result-reopened', AUTHOR_RECLAIMED]);
 const NOTICE_ATTEMPTS = 3;
 const NOTICE_HISTORY = 20;
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
@@ -2466,6 +2512,7 @@ export function* processPr({
   if (!resultError) previous = reopenProductIntentBlocked({ previous, paths, now });
   if (!resultError) previous = reopenRoundLimitBlocked({ previous });
   if (!resultError) previous = reopenExternalBlocked({ previous, paths, now, head: pr.headRefOid });
+  if (!resultError) previous = reopenMovedBlocked({ previous, paths, now, head: pr.headRefOid });
   if (resultError) {
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.activeTask?.dispatchId ?? previous.lastDispatch?.dispatchId,
@@ -3396,7 +3443,8 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
   // without this it would never reach processPr, where reopenKeelBlocked hands its feedback back.
   const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous
     || reopenInfraBlocked({ previous, paths, now, currentBase: { baseRefOid: normalized?.baseRefOid } }) !== previous
-    || reopenExternalBlocked({ previous, paths, now, head: previous.headRefOid }) !== previous;
+    || reopenExternalBlocked({ previous, paths, now, head: previous.headRefOid }) !== previous
+    || reopenMovedBlocked({ previous, paths, now, head: normalized?.headRefOid ?? previous.headRefOid }) !== previous;
   // The same holds for a PR an older build stopped on a product-intent conflict, or whose awaiting-discussion
   // label the watcher still has to take off (including after a failed DELETE): nothing changes on GitHub.
   const intentMigrationDue = reopenProductIntentBlocked({ previous, paths, now }) !== previous || legacyIntentLabelDue(previous)
