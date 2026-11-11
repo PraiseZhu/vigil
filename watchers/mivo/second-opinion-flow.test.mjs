@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { blocked } from './bin/mivo-repair.mjs';
-import { REPO, scanOnce, watcherPaths } from './bin/mivo-watcher.mjs';
+import { REPO, scanOnce, watcherPaths, feedbackItems, newFeedback } from './bin/mivo-watcher.mjs';
 import { pendingEvents } from './bin/notify.mjs';
 import { statePaths, writePr } from './bin/mivo-state.mjs';
 import { handoffReceipt, isChildPrList } from './handoff.fixture.mjs';
@@ -23,7 +23,12 @@ function world(t) {
   const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'vigil-second-opinion-'));
   t.after(() => fs.rmSync(HOME, { recursive: true, force: true }));
   const handoff = { version: 1, id: 'handoff-fixture', repo: REPO, number, nodeId, head: A, releaseEpoch: RELEASE, author: 'owner' };
-  const feedback = { key: 'comment:501', source: 'comment', nativeId: '501', revision: '2026-11-11T09:00:00Z', contentHash: 'prior-content', sha: A, body: 'Please investigate this behavior.' };
+  // The delivered feedback carries the stamp the watcher itself computes: without the hand-back the same comment is
+  // not new, so a dispatch in this test can only come from the hand-back.
+  const comment = { id: 501, body: 'Please investigate this behavior.', author: { login: 'ExampleReviewer' }, user: { login: 'ExampleReviewer' },
+    authorAssociation: 'NONE', created_at: '2026-11-11T09:00:00Z', updated_at: '2026-11-11T09:00:00Z' };
+  const delivered = newFeedback({}, feedbackItems({ pr: { headRefOid: A }, comments: [comment], receiptActor: 'owner' }));
+  const feedback = delivered.fresh[0];
   const paths = watcherPaths(HOME);
   const v2 = statePaths(HOME);
   fs.mkdirSync(v2.prsDir, { recursive: true });
@@ -33,7 +38,7 @@ function world(t) {
   writePr(HOME, nodeId, {
     number, nodeId, url, sessionId: 'session-old', headRefOid: A, headRefName: 'fix/x', eligibility: 'active', eligibilityInitialized: true,
     admissionVerified: true, admissionEpoch: RELEASE, roundsEpoch: RELEASE, repairRounds: 2, handoff, trustedHead: { handoffId: handoff.id, head: A }, wasDraft: false,
-    feedbackCursor: { [feedback.key]: 'old-stamp' },
+    feedbackCursor: delivered.cursor,
     activeTask: { dispatchId: 'live-790', status: 'accepted', head: A, at: '2026-11-11T10:00:00.000Z', observedAt: '2026-11-11T10:00:00.000Z' },
   });
   const taskPathOf = (dispatchId) => path.join(paths.stateDir, 'tasks', `${dispatchId}.json`);
@@ -48,7 +53,7 @@ function world(t) {
   const collected = {
     pr: { ...view, repo: REPO, sameRepository: true, releaseEpoch: RELEASE },
     handoff: handoffReceipt({ ...view, repo: REPO, sameRepository: true, releaseEpoch: RELEASE }),
-    comments: [{ id: 501, body: feedback.body, author: { login: 'ExampleReviewer' }, user: { login: 'ExampleReviewer' }, authorAssociation: 'NONE', created_at: feedback.revision, updated_at: feedback.revision }],
+    comments: [comment],
     reviews: [], threads: [], labels: [], ci: { status: 'green', required: [], checks: [] },
     admissionVerified: true, admissionReason: 'fixture', mergeReady: false, mergeable: 'MERGEABLE',
   };
@@ -69,7 +74,7 @@ function world(t) {
     keelRoot: os.tmpdir(),
   });
   const tasks = () => fs.readdirSync(path.join(paths.stateDir, 'tasks')).map((name) => JSON.parse(fs.readFileSync(path.join(paths.stateDir, 'tasks', name), 'utf8')));
-  return { HOME, paths, repairGh, taskPathOf, scan, sent, tasks };
+  return { HOME, paths, repairGh, taskPathOf, scan, sent, tasks, collected };
 }
 
 test('helper to watcher: the first external block is handed back with its reason and no notice; the second one on the same head is reported', (t) => {
@@ -91,4 +96,14 @@ test('helper to watcher: the first external block is handed back with its reason
   const notices = pendingEvents(w.HOME).filter((event) => event.kind === 'blocked-escalate');
   assert.equal(notices.length, 1);
   assert.match(notices[0].cause, /裁决确认需要人/);
+});
+
+test('helper to watcher: when the hand-back finds nothing to dispatch, the block is reported instead of waiting in silence', (t) => {
+  const w = world(t);
+  blocked({ home: w.HOME, taskPath: w.taskPathOf('live-790'), reason: REASON, ghFn: w.repairGh });
+  w.collected.comments = []; // the comment the block was about is gone
+  w.scan('2026-11-11T10:01:00.000Z');
+  w.scan('2026-11-11T10:05:00.000Z');
+  assert.equal(w.sent.length, 0);
+  assert.equal(pendingEvents(w.HOME).filter((event) => event.kind === 'blocked-escalate').length, 1);
 });

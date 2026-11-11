@@ -2422,7 +2422,9 @@ export function markException(previous, now, events, { home, dryRun } = {}) {
     return previous;
   }
   // Handed back for a second opinion: nobody is asked yet. The block that follows it on the same head is reported.
-  if (secondOpinionGiven(previous) && !previous.dispatchError) return previous;
+  // Only while the hand-back is still open: when it led to no dispatch (the feedback is gone, a gate held it) the
+  // entry falls back to blocked, and then the block is reported like any other instead of waiting in silence.
+  if (secondOpinionGiven(previous) && previous.eligibility !== 'blocked' && !previous.dispatchError) return previous;
   const event = {
     kind: previous.dispatchError ? 'dispatch-blocked' : 'repair-blocked', number: previous.number, nodeId: previous.nodeId,
     sessionId: previous.sessionId, dispatchId: previous.dispatchError?.dispatchId ?? previous.activeTask?.dispatchId,

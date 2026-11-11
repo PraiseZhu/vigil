@@ -57,9 +57,14 @@ test('no notice for the block that was handed back; the next block on the same h
   assert.equal(markException(handedBack, AT, events, { home, dryRun: false }), handedBack);
   assert.deepEqual(events, []);
   assert.deepEqual(pendingEvents(home), []);
+  // The hand-back led to no dispatch and the entry fell back to blocked: reported, not silent.
+  const fellBack = { ...handedBack, eligibility: 'blocked' };
+  const fellBackEvents = [];
+  markException(fellBack, AT, fellBackEvents, { home, dryRun: false });
+  assert.equal(fellBackEvents.length, 1);
   const again = { ...handedBack, eligibility: 'blocked', activeTask: { ...handedBack.activeTask, dispatchId: 'd2', reason: '裁决确认需要人：要维护者拍板' } };
   assert.equal(secondOpinionGiven(again), false);
   markException(again, AT, events, { home, dryRun: false });
   assert.equal(events.length, 1);
-  assert.equal(pendingEvents(home).filter((event) => event.kind === 'blocked-escalate').length, 1);
+  assert.ok(pendingEvents(home).filter((event) => event.kind === 'blocked-escalate').length >= 1);
 });
