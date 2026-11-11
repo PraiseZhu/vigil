@@ -1996,6 +1996,49 @@ export function reopenMovedBlocked({ previous, paths, now, head }) {
   };
 }
 
+// A session that says "I cannot solve this" (blocked external) is often right, and often not: two weeks of runs sent
+// 65 such notices to a person (2026-11-11). Before a person hears about it the same feedback is handed back once per
+// head, with the stated reason and the order to put it to a read-only arbiter first. Blocks that already have their
+// own way back (validate failures, environment faults, rate limits, Keel) are not touched. The second block on the
+// same head is reported as before.
+export function secondOpinionEligible(previous, head) {
+  const active = previous?.activeTask;
+  if (active?.status !== 'blocked' || active.blockedKind !== 'external' || typeof active.dispatchId !== 'string') return false;
+  if (!head || (active.head ?? active.sourceHead) !== head) return false;
+  const reason = String(active.reason ?? '');
+  if (isValidateClassBlock(active) || INFRA_BLOCK_REASON.test(reason) || TRANSIENT_BLOCK_REASON.test(reason) || KEEL_BLOCK_REASON.test(reason)) return false;
+  return !(previous.secondOpinion ?? []).some((item) => item.head === head);
+}
+export function secondOpinionGiven(previous) {
+  const active = previous?.activeTask;
+  return active?.status === 'blocked' && (previous.secondOpinion ?? []).some((item) => item.dispatchId === active.dispatchId);
+}
+export function reopenForSecondOpinion({ previous, paths, now, head }) {
+  if (!secondOpinionEligible(previous, head)) return previous;
+  const active = previous.activeTask;
+  const task = readJsonOrNull(path.join(paths.stateDir, 'tasks', `${active.dispatchId}.json`));
+  if (!task || task.nodeId !== previous.nodeId) return previous;
+  const feedbackCursor = { ...(previous.feedbackCursor ?? {}) };
+  for (const item of task.feedback ?? []) if (typeof item?.key === 'string') delete feedbackCursor[item.key];
+  return {
+    ...previous, feedbackCursor, eligibility: 'active',
+    repairRounds: Math.max(0, Number(previous.repairRounds ?? 0) - 1),
+    secondOpinion: [...(previous.secondOpinion ?? []), { dispatchId: active.dispatchId, head, at: now, reason: String(active.reason ?? '').slice(0, 600) }].slice(-20),
+  };
+}
+// The line that opens the handed-back round: what stopped the last one, and what to do with it first.
+export function secondOpinionNote(previous) {
+  if (!secondOpinionGiven(previous)) return '';
+  const entry = previous.secondOpinion.find((item) => item.dispatchId === previous.activeTask.dispatchId);
+  return [
+    '【先裁决再继续】上一轮修复会话以下面的原因停手（blocked），盯梢没有通知人，先把同一批反馈交还一次：',
+    `> ${String(entry.reason).replace(/\s+/g, ' ').trim()}`,
+    '本轮第一步：按 routing.json 的 adjudicate 档开一个只读裁决 Worker，把这段原因、任务反馈和你核实到的现状交给它，只问一件事——这个原因是否真的需要人来解决。',
+    '裁决认为可以继续（给了可行的做法，或原因已不成立）：按它的做法修完并正常收口。裁决认为确实需要人，或裁决 Worker 开不出来：再次调用 helper blocked，--reason 以「裁决确认需要人：」开头，写清需要人做的那一件事。同一提交上这是最后一次交还，第二次停手会直接通知人。',
+    '把这个裁决 Worker 记进 SC JSON 的 workers（purpose:"adjudicate"）。',
+  ].join('\n');
+}
+
 export function reopenExternalBlocked({ previous, paths, now, head }) {
   const active = previous?.activeTask;
   if (active?.status !== 'blocked' || active.blockedKind !== 'external' || active.blockedKind === AUTHOR_RECLAIMED) return previous;
@@ -2378,6 +2421,8 @@ export function markException(previous, now, events, { home, dryRun } = {}) {
     }
     return previous;
   }
+  // Handed back for a second opinion: nobody is asked yet. The block that follows it on the same head is reported.
+  if (secondOpinionGiven(previous) && !previous.dispatchError) return previous;
   const event = {
     kind: previous.dispatchError ? 'dispatch-blocked' : 'repair-blocked', number: previous.number, nodeId: previous.nodeId,
     sessionId: previous.sessionId, dispatchId: previous.dispatchError?.dispatchId ?? previous.activeTask?.dispatchId,
@@ -2516,6 +2561,7 @@ export function* processPr({
   if (!resultError) previous = reopenRoundLimitBlocked({ previous });
   if (!resultError) previous = reopenExternalBlocked({ previous, paths, now, head: pr.headRefOid });
   if (!resultError) previous = reopenMovedBlocked({ previous, paths, now, head: pr.headRefOid });
+  if (!resultError) previous = reopenForSecondOpinion({ previous, paths, now, head: pr.headRefOid });
   if (resultError) {
     previous = { ...previous, eligibility: 'blocked', activeTask: {
       ...previous.activeTask, dispatchId: previous.activeTask?.dispatchId ?? previous.lastDispatch?.dispatchId,
@@ -3236,7 +3282,7 @@ export function* processPr({
       // current prefix instead of reusing the stored text that belonged to the retired session.
       dispatchMapping = planSession({ pr, existing: previous, date: now });
     }
-    const prefix = [reclaimNote(previous, pr.headRefName), handoffNote, messagePrefix].filter(Boolean).join('\n');
+    const prefix = [reclaimNote(previous, pr.headRefName), handoffNote, secondOpinionNote(previous), messagePrefix].filter(Boolean).join('\n');
     // Asked once per delivery, and only when this task may change code: it decides whether the session is told to
     // write child PR handoff drafts (the answer is also recorded in the task, so a retry keeps it). A dry run makes
     // no GitHub read, like the gates above, so its preview carries no handoff text.
@@ -3447,7 +3493,8 @@ function canSkipCollection({ previous, fingerprint, normalized, paths, now }) {
   const keelReopenDue = reopenKeelBlocked({ previous, paths, now }) !== previous
     || reopenInfraBlocked({ previous, paths, now, currentBase: { baseRefOid: normalized?.baseRefOid } }) !== previous
     || reopenExternalBlocked({ previous, paths, now, head: previous.headRefOid }) !== previous
-    || reopenMovedBlocked({ previous, paths, now, head: normalized?.headRefOid ?? previous.headRefOid }) !== previous;
+    || reopenMovedBlocked({ previous, paths, now, head: normalized?.headRefOid ?? previous.headRefOid }) !== previous
+    || reopenForSecondOpinion({ previous, paths, now, head: normalized?.headRefOid ?? previous.headRefOid }) !== previous;
   // The same holds for a PR an older build stopped on a product-intent conflict, or whose awaiting-discussion
   // label the watcher still has to take off (including after a failed DELETE): nothing changes on GitHub.
   const intentMigrationDue = reopenProductIntentBlocked({ previous, paths, now }) !== previous || legacyIntentLabelDue(previous)

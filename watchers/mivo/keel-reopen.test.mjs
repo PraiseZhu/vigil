@@ -199,6 +199,8 @@ function pollScan(t, { reason, version = 2 }) {
     admissionEpoch: handoff.releaseEpoch, handoff, headRefName: 'fix/x', title: 'fix', pollFingerprint: pollFingerprint(pollSnap()),
     feedbackCursor: cursor, repairRounds: 1,
     activeTask: { dispatchId: POLL_TASK, status: 'blocked', blockedKind: 'external', reason, head: POLL_HEAD, observedAt: NOW },
+    // This head already had its one second opinion (second-opinion.test.mjs): the block now waits for a person.
+    secondOpinion: [{ dispatchId: 'earlier-task', head: POLL_HEAD, at: NOW, reason: 'earlier' }],
   });
   let collected = 0;
   const outcome = scanOnce({
