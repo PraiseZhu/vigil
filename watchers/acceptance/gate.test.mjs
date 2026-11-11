@@ -866,10 +866,19 @@ test('SC9 serve 用真的 unix socket 且权限 600；请求串行（两条动�
   }
 });
 
+// 合并子进程环境：env 里显式写 undefined = 删掉这个变量。验收轮次的沙箱会把本轮真写闸的 socket 灌进
+// process.env，「预期没有 socket」的用例得能把它清干净，不然会把探针动作发给真写闸。
+// （实测 node 22 直接把 undefined 传给 spawn 就会删，但不同版本不保证这个行为，这里自己删。）
+function mergeEnv(extra) {
+  const env = { ...process.env, ...extra };
+  for (const key of Object.keys(extra)) if (extra[key] === undefined) delete env[key];
+  return env;
+}
+
 function runNode(args, { input = '', env = {} } = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, args, {
-      env: { ...process.env, ...env },
+      env: mergeEnv(env),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -886,26 +895,102 @@ function runNode(args, { input = '', env = {} } = {}) {
   });
 }
 
+const GATE_CLIENT = path.join(HERE_HOST, 'gate-client.mjs');
+const SANDBOX_GH = path.join(HERE_HOST, 'sandbox-bin', 'gh');
+
+// 沙箱里这两条本来就没有 socket：gate-client 不给 --socket，沙箱 gh 没有 ACCEPTANCE_GATE_SOCKET。
+// 显式删掉继承来的变量：沙箱 gh 今天就会拿它去连真写闸（验收轮次里跑 npm test 会记一条 query-not-allowed）；
+// gate-client 目前只认 argv、不读环境变量，属于潜在缺口，一起清掉免得以后加了环境变量兜底又漏。
+const NO_SOCKET_ENV = { ACCEPTANCE_GATE_SOCKET: undefined };
+
+function runNoSocketClient() {
+  return runNode([GATE_CLIENT], { input: '{}', env: NO_SOCKET_ENV });
+}
+
+function runNoSocketGh() {
+  return runNode([SANDBOX_GH, 'api', 'graphql', '--input', '-'], { input: '{}', env: NO_SOCKET_ENV });
+}
+
+// 计数用的假写闸：只记连接数，收到请求就回一条 query-not-allowed 再断开（真写闸拒绝没有 query 的动作时的样子）。
+function openCountingSocket() {
+  return new Promise((resolve, reject) => {
+    const socketPath = path.join(tmpDir(), 'inherited-gate.sock');
+    let connections = 0;
+    const open = new Set();
+    const payloads = [];
+    const server = net.createServer((socket) => {
+      connections += 1;
+      open.add(socket);
+      let buffer = '';
+      socket.on('data', (chunk) => {
+        buffer += chunk;
+        if (!buffer.includes('\n')) return;
+        payloads.push(buffer.slice(0, buffer.indexOf('\n')));
+        socket.end(`${JSON.stringify({ code: 4, body: { reason: 'query-not-allowed' } })}\n`);
+      });
+      socket.on('error', () => {});
+      socket.on('close', () => open.delete(socket));
+    });
+    server.once('error', reject);
+    server.listen(socketPath, () =>
+      resolve({
+        socketPath,
+        payloads,
+        get connections() {
+          return connections;
+        },
+        close: () =>
+          new Promise((done) => {
+            for (const socket of open) socket.destroy();
+            server.close(done);
+          }),
+      }),
+    );
+  });
+}
+
+test('runNode 合并环境：undefined 删掉继承来的变量，显式给值仍覆盖', async () => {
+  const saved = process.env.ACCEPTANCE_TEST_INHERITED;
+  process.env.ACCEPTANCE_TEST_INHERITED = 'from-parent';
+  const show = (name) =>
+    ['--input-type=module', '-e', `process.stdout.write(JSON.stringify({ value: process.env.${name} ?? null, present: '${name}' in process.env }))`];
+  try {
+    const deleted = await runNode(show('ACCEPTANCE_TEST_INHERITED'), { env: { ACCEPTANCE_TEST_INHERITED: undefined } });
+    assert.equal(deleted.code, 0, deleted.stderr);
+    assert.deepEqual(JSON.parse(deleted.stdout), { value: null, present: false }, 'undefined 要删掉变量');
+
+    const kept = await runNode(show('ACCEPTANCE_TEST_INHERITED'));
+    assert.equal(kept.code, 0, kept.stderr);
+    assert.deepEqual(JSON.parse(kept.stdout), { value: 'from-parent', present: true }, '不写就照旧继承');
+
+    const overridden = await runNode(show('ACCEPTANCE_TEST_INHERITED'), { env: { ACCEPTANCE_TEST_INHERITED: 'from-test' } });
+    assert.equal(overridden.code, 0, overridden.stderr);
+    assert.deepEqual(JSON.parse(overridden.stdout), { value: 'from-test', present: true }, '显式值覆盖继承来的值');
+  } finally {
+    if (saved === undefined) delete process.env.ACCEPTANCE_TEST_INHERITED;
+    else process.env.ACCEPTANCE_TEST_INHERITED = saved;
+  }
+});
+
 test('SC11 沙箱的 writeCommand（gate-client）：动作 JSON 进、结果 JSON 出，退出码照抄写闸', async () => {
   const { home, profile } = setupEnvironment();
   const world = defaultTree();
   const { server, socketPath } = await openGate({ home, profile, github: gateGithub(world), binding: bindingFor(world), which: async () => false });
-  const client = path.join(HERE_HOST, 'gate-client.mjs');
   try {
-    const ok = await runNode([client, '--socket', socketPath], {
+    const ok = await runNode([GATE_CLIENT, '--socket', socketPath], {
       input: JSON.stringify({ type: 'comment.create', repo: REPO, issue: 1, body: '经 gate-client', dedupeKey: 'client-1' }),
     });
     assert.equal(ok.code, 0, ok.stderr);
     const parsed = JSON.parse(ok.stdout);
     assert.ok(parsed.commentId, JSON.stringify(parsed));
 
-    const rejected = await runNode([client, '--socket', socketPath], {
+    const rejected = await runNode([GATE_CLIENT, '--socket', socketPath], {
       input: JSON.stringify({ type: 'pr.merge', repo: REPO, pr: 12, dedupeKey: 'client-2' }),
     });
     assert.equal(rejected.code, 4, rejected.stderr);
     assert.equal(JSON.parse(rejected.stdout).reason, 'not-allowed');
 
-    const noSocket = await runNode([client], { input: '{}' });
+    const noSocket = await runNoSocketClient();
     assert.equal(noSocket.code, 1);
     assert.match(noSocket.stderr, /--socket/);
   } finally {
@@ -917,9 +1002,8 @@ test('SC11 沙箱的 gh：只放行 gh api graphql --input -，其余一律拒�
   const { home, profile } = setupEnvironment();
   const world = defaultTree();
   const { server, socketPath } = await openGate({ home, profile, github: gateGithub(world), binding: bindingFor(world), which: async () => false });
-  const gh = path.join(HERE_HOST, 'sandbox-bin', 'gh');
   try {
-    const read = await runNode([gh, 'api', 'graphql', '--input', '-'], {
+    const read = await runNode([SANDBOX_GH, 'api', 'graphql', '--input', '-'], {
       env: { ACCEPTANCE_GATE_SOCKET: socketPath, GH_TOKEN: 'sandbox-should-not-use-this' },
       input: JSON.stringify({ query: ROOT_QUERY, variables: { owner: REPO.split('/')[0], name: REPO.split('/')[1], number: 1 } }),
     });
@@ -928,17 +1012,42 @@ test('SC11 沙箱的 gh：只放行 gh api graphql --input -，其余一律拒�
     assert.ok(parsed.data?.repository?.issue, JSON.stringify(parsed).slice(0, 200));
 
     for (const args of [['pr', 'list'], ['api', 'repos/' + REPO], ['issue', 'create']]) {
-      const refused = await runNode([gh, ...args], { env: { ACCEPTANCE_GATE_SOCKET: socketPath } });
+      const refused = await runNode([SANDBOX_GH, ...args], { env: { ACCEPTANCE_GATE_SOCKET: socketPath } });
       assert.equal(refused.code, 1, args.join(' '));
       assert.match(refused.stderr, /沙箱里只允许经写闸读/);
     }
 
-    const noSocket = await runNode([gh, 'api', 'graphql', '--input', '-'], { input: '{}' });
+    const noSocket = await runNoSocketGh();
     assert.equal(noSocket.code, 1);
     assert.match(noSocket.stderr, /沙箱里只允许经写闸读/);
   } finally {
     await server.close();
   }
+});
+
+test('SC11 验收轮次：预期没有 socket 的调用不继承真写闸 socket（计数服务收到 0 个连接）', async (t) => {
+  // 验收轮次的沙箱会往 process.env 里灌本轮真写闸的 socket。跑 npm test 时若继承过去，
+  // 沙箱 gh 这条会把 {}（没有 query）发给真写闸：真写闸记一条 query-not-allowed，用例拿到 4 也红。
+  // 计数服务照真写闸的样子回一条 query-not-allowed 就断开，不碰真写闸。
+  const counter = await openCountingSocket();
+  const saved = process.env.ACCEPTANCE_GATE_SOCKET;
+  process.env.ACCEPTANCE_GATE_SOCKET = counter.socketPath;
+  t.after(async () => {
+    if (saved === undefined) delete process.env.ACCEPTANCE_GATE_SOCKET;
+    else process.env.ACCEPTANCE_GATE_SOCKET = saved;
+    await counter.close();
+  });
+
+  const client = await runNoSocketClient();
+  assert.equal(client.code, 1, client.stderr);
+  assert.match(client.stderr, /--socket/);
+
+  const gh = await runNoSocketGh();
+  assert.equal(gh.code, 1, gh.stderr);
+  assert.match(gh.stderr, /沙箱里只允许经写闸读/);
+
+  assert.deepEqual(counter.payloads, []);
+  assert.equal(counter.connections, 0, '一次都不该连到继承来的写闸 socket');
 });
 
 test('SC11 沙箱里的 helper 读 GitHub：bin/github.mjs 起 gh 时把写闸 socket 带过去，读经写闸取回', async () => {
