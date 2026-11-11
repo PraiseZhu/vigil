@@ -380,6 +380,29 @@ test('watcher round: the run behind a skipped required check is re-run and no se
   assert.equal(sent.length, 1, 'the second failure goes to a repair session');
 });
 
+// The self-review pilot (self-review.test.mjs): what a round is asked is written into its task file at dispatch, and
+// the helper goes by the task. Checked on a real dispatch, because nothing else reads the file the watcher writes.
+test('watcher round: with the self-review switch on, the task of a round that may change code says so; with it off, the field is absent', (t) => {
+  const before = process.env.MIVO_PREFLIGHT_SELF_REVIEW;
+  t.after(() => { if (before === undefined) delete process.env.MIVO_PREFLIGHT_SELF_REVIEW; else process.env.MIVO_PREFLIGHT_SELF_REVIEW = before; });
+  const lint = check('lint + tsc + unit + logging', 'failure', { id: 61, runId: 960 });
+  const dispatchedTask = (value) => {
+    if (value === undefined) delete process.env.MIVO_PREFLIGHT_SELF_REVIEW; else process.env.MIVO_PREFLIGHT_SELF_REVIEW = value;
+    const { paths, listed } = home(t);
+    const gh = collectGh([lint]);
+    const collected = collectPr(prRef, { ghFn: (args) => (args[1] === `repos/${repo}/contents/docs/sync/required-checks.json?ref=${base}`
+      ? JSON.stringify({ type: 'file', encoding: 'base64', content: Buffer.from(JSON.stringify({ on_main: ['lint + tsc + unit + logging'], pr_only: [] })).toString('base64') }) : gh(args)) });
+    assert.equal(collected.ci.status, 'failed');
+    const sent = [];
+    scan({ paths, listed, collected, now: '2026-11-10T18:40:00Z', sent });
+    assert.equal(sent.length, 1);
+    const dir = path.join(paths.stateDir, 'tasks');
+    return JSON.parse(fs.readFileSync(path.join(dir, fs.readdirSync(dir)[0]), 'utf8'));
+  };
+  assert.equal(dispatchedTask('true').selfReviewRequired, true);
+  assert.equal(Object.hasOwn(dispatchedTask(undefined), 'selfReviewRequired'), false);
+});
+
 test('watcher round: the stall notice needs 6.5 hours of unknown on this head with every check finished; a push starts the clock again', (t) => {
   const { paths, listed } = home(t);
   const seedSince = (extra) => {
