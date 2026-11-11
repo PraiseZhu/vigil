@@ -3095,16 +3095,20 @@ export function* processPr({
   let dispatch = { attempted: false, bound: false, reason: 'no-new-feedback' };
   // Advance only non-actionable observations until a delivery is acknowledged.
   const retainedCursor = { ...cursor };
-  // The blocked batch was only taken out of cursorBase to be offered again in this round. What of it was not seen
-  // this round keeps its stored stamp, so a round that does not deliver leaves the cursor as it found it.
-  if (secondOpinion) {
-    for (const [stampKey, stamp] of Object.entries(storedCursor)) {
-      if (!Object.hasOwn(retainedCursor, stampKey) && !fresh.some((item) => item.key === stampKey)) retainedCursor[stampKey] = stamp;
-    }
-  }
   // Handed back only when the batch that was blocked is actually in this delivery: new feedback alone goes out as an
   // ordinary round and the old block is reported.
   const handBack = secondOpinion && fresh.some((item) => blockedItems.has(item.key));
+  // The blocked batch was only taken out of cursorBase to be offered again in this round. What was not seen this
+  // round keeps its stored stamp, so a round that does not deliver leaves the cursor as it found it. The exception is
+  // the rest of the blocked batch when part of it is handed back: it stays undelivered, so it is sent as soon as it is
+  // seen again instead of being counted as delivered with a task it was never in.
+  if (secondOpinion) {
+    for (const [stampKey, stamp] of Object.entries(storedCursor)) {
+      if (Object.hasOwn(retainedCursor, stampKey) || fresh.some((item) => item.key === stampKey)) continue;
+      if (handBack && blockedItems.has(stampKey)) continue;
+      retainedCursor[stampKey] = stamp;
+    }
+  }
   // storedCursor, not cursorBase: a second-opinion round that does not deliver must leave the blocked batch's stamps
   // as they were (cursorBase had them taken out only to make the batch fresh for this round).
   for (const item of fresh) {

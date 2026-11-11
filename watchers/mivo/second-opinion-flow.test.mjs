@@ -166,3 +166,24 @@ test('helper to watcher: a hand-back whose delivery is given up tells the person
   const notices = pendingEvents(w.HOME).filter((event) => event.kind === 'blocked-escalate');
   assert.ok(notices.some((event) => String(event.cause).includes('另一个仓库')), 'the reason the session stopped for reaches the person');
 });
+
+test('helper to watcher: part of the blocked batch is handed back → the part that was not seen stays undelivered', (t) => {
+  const w = world(t);
+  // The blocked task carried a second comment that this round does not see.
+  const other = { ...w.comment, id: 503, body: 'A second point in the same batch.' };
+  const both = newFeedback({}, feedbackItems({ pr: { headRefOid: A }, comments: [w.comment, other], receiptActor: 'owner' }));
+  const task = JSON.parse(fs.readFileSync(w.taskPathOf('live-790'), 'utf8'));
+  fs.writeFileSync(w.taskPathOf('live-790'), JSON.stringify({ ...task, feedback: both.fresh }));
+  writePr(w.HOME, nodeId, { ...readPr(w.HOME, nodeId), feedbackCursor: both.cursor });
+  blocked({ home: w.HOME, taskPath: w.taskPathOf('live-790'), reason: REASON, ghFn: w.repairGh });
+
+  w.scan('2026-11-11T10:01:00.000Z');
+  assert.equal(w.sent.length, 1);
+  assert.match(JSON.stringify(w.sent[0]), /先裁决再继续/);
+  assert.equal(Object.hasOwn(readPr(w.HOME, nodeId).feedbackCursor, 'comment:503'), false, 'not counted as delivered');
+  // Seen again while the handed-back round is still running: it waits as undelivered feedback, like any new comment.
+  w.collected.comments = [w.comment, other];
+  w.scan('2026-11-11T10:05:00.000Z');
+  assert.equal(Object.hasOwn(readPr(w.HOME, nodeId).feedbackCursor, 'comment:503'), false);
+  assert.ok(readPr(w.HOME, nodeId).pendingFeedback >= 1, 'counted as pending');
+});
