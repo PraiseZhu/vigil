@@ -23,6 +23,7 @@ import { enqueueNotice } from './notify.mjs';
 import { optionalConfig } from './profile.mjs';
 import { triageText } from './cindy-ci-triage.mjs';
 import { configuredLogin } from './cindy-identity.mjs';
+import { networkErrorPattern } from '../../acceptance/bin/net-errors.mjs';
 export const DISPATCH_PARAM_KEYS = Object.freeze(['title', 'message', 'target_session_id']);
 export const REPO = 'makecindy/cindy';
 const GH = process.env.GH_BIN ?? 'gh';
@@ -1456,7 +1457,8 @@ export const INFRA_REOPEN_LIMIT = 3;
 // GitHub rate limits and gateway errors pass on their own; an external block for one of them used to wait for a
 // new head or a new watcher version (Mivo #1648/#1674 on 2026-11-03). It is handed back after a back-off, counted
 // with the infra reopens, so a GitHub that stays down is retried a few times per admission epoch and then left alone.
-export const TRANSIENT_BLOCK_REASON = /rate.?limit|速率限制|限流|abuse detection|HTTP 50[0234]|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|Gateway Time-?out|ETIMEDOUT|ECONNRESET|EAI_AGAIN|socket hang up|i\/o timeout/i;
+const TRANSIENT_LOCAL = /rate.?limit|速率限制|限流|abuse detection|HTTP 50[0234]|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|Gateway Time-?out/i;
+export const TRANSIENT_BLOCK_REASON = new RegExp(`(?:${TRANSIENT_LOCAL.source})|(?:${networkErrorPattern(['timedOut', 'connReset', 'dnsAgain', 'socketHangUp', 'ioTimeout']).source})`, 'i');
 export const TRANSIENT_RETRY_BACKOFF_MS = 30 * 60 * 1000;
 export const KEEL_LEDGER_HELD = 'keel-ledger-unavailable';
 export function reopenExternalBlocked({ previous, paths, now, head }) {

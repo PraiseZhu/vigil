@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { MAX_READ_RETRIES_PER_TICK, createGithub } from './bin/github.mjs';
-import { classifyNetError } from './bin/net-errors.mjs';
+import { classifyNetError, isNetworkErrorText, networkErrorPattern } from './bin/net-errors.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { readAlerts, hostPaths } from './host/paths.mjs';
 import { MAX_TICK_READ_RETRIES, pollRetryable, readRetryBudget, runTick, withReadTimeout } from './host/tick.mjs';
@@ -236,4 +236,16 @@ test('#238 SC7 网络类关键词只定义在 net-errors.mjs', () => {
     }
   }
   assert.deepEqual(hits, [], `网络类关键词只能在 bin/net-errors.mjs 定义，其他文件请改为 import 或调用分类表`);
+});
+
+test('#238 SC7 导出的纯网络关键词可供看守拼正则，不含限流/5xx', () => {
+  assert.equal(isNetworkErrorText('read ECONNRESET'), true);
+  assert.equal(isNetworkErrorText('unexpected EOF'), true);
+  assert.equal(isNetworkErrorText('invalid UTF-8'), true);
+  assert.equal(isNetworkErrorText('API rate limit exceeded'), false);
+  assert.equal(isNetworkErrorText('HTTP 502'), false);
+  const re = networkErrorPattern(['connReset', 'timedOut']);
+  assert.equal(re.test('ECONNRESET'), true);
+  assert.equal(re.test('ETIMEDOUT'), true);
+  assert.equal(re.test('ENOTFOUND'), false);
 });

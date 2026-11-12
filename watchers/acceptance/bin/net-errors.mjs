@@ -30,6 +30,30 @@ const TRUNCATED_JSON_PATTERN = new RegExp(TRUNCATED_JSON, 'i');
 // 判断环境问题时也要认这些网络原因；连接被拒不重试，但确实不是代码失败。
 const EXTRA_NETWORK_SIGNAL = /ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|socket hang up/i;
 
+// 纯网络类关键词（连接/超时/DNS/截断/UTF-8），不含限流、5xx。看守拼自己的瞬时正则时从这里取。
+export const NETWORK_ERROR_PATTERNS = Object.freeze({
+  connReset: /ECONNRESET/,
+  timedOut: /ETIMEDOUT/,
+  dnsAgain: /EAI_AGAIN/,
+  notFound: /ENOTFOUND/,
+  connRefused: /ECONNREFUSED/,
+  socketHangUp: /socket hang up/i,
+  ioTimeout: /i\/o timeout/i,
+  unexpectedEof: /unexpected EOF/i,
+  invalidUtf8: /invalid UTF-8/i,
+});
+
+/** 按 key 拼一段纯网络正则；wordBoundary 时加上 \b，给 self-heal 这类要整词匹配的调用方。 */
+export function networkErrorPattern(keys, { flags = 'i', wordBoundary = false } = {}) {
+  const sources = keys.map((key) => {
+    const re = NETWORK_ERROR_PATTERNS[key];
+    if (!re) throw new Error(`unknown network pattern: ${key}`);
+    return re.source;
+  });
+  const joined = sources.join('|');
+  return new RegExp(wordBoundary ? `\\b(?:${joined})\\b` : joined, flags);
+}
+
 // App 令牌读失败时的回退类别：鉴权 / 权限 / 仓不可见。具体文案只在这里维护。
 const APP_FALLBACK_RULES = [
   ['auth-401', /\bHTTP 401\b|Bad credentials|Authentication failed|could not read Username|returned error: 401\b/i],
@@ -86,6 +110,12 @@ export function hasNetworkSignal(input) {
   const text = clip(textOf(input));
   if (EXTRA_NETWORK_SIGNAL.test(text)) return true;
   return RULES.some(([, pattern]) => pattern.test(text));
+}
+
+/** 这段文字是否命中纯网络关键词（不含限流、5xx）。 */
+export function isNetworkErrorText(input) {
+  const text = clip(textOf(input));
+  return Object.values(NETWORK_ERROR_PATTERNS).some((re) => re.test(text));
 }
 
 /** Slack 等 fetch 路径的 AbortSignal.timeout 错误名；只在这里认这两个名字。 */

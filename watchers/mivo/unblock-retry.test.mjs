@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { TRANSIENT_RETRY_BACKOFF_MS, isValidateClassBlock, reopenInfraBlocked } from './bin/mivo-watcher.mjs';
+import { TRANSIENT_BLOCK_REASON, TRANSIENT_RETRY_BACKOFF_MS, isValidateClassBlock, reopenInfraBlocked } from './bin/mivo-watcher.mjs';
 import { ensureCommitIdentity, privateIdentityCommits } from './bin/mivo-repair.mjs';
 
 const BLOCKED_AT = '2026-11-03T06:40:00.000Z';
@@ -89,6 +89,44 @@ test('only external blocks are retried as transient, and a failed validation rec
 
 // #1741 on 2026-11-04: validate could not get the shared pre-push lock, the receipt said "failed", and the block
 // was held to the strict validate rules even though nothing had failed.
+test('#238 SC7 TRANSIENT_BLOCK_REASON 网络/限流/5xx/配额 匹配与无关文本', () => {
+  const samples = [
+    ['read ECONNRESET', true],
+    ['connect ETIMEDOUT 10.0.0.1:443', true],
+    ['getaddrinfo EAI_AGAIN api.github.com', true],
+    ['socket hang up', true],
+    ['dial tcp: i/o timeout', true],
+    ['API rate limit exceeded', true],
+    ['GitHub GraphQL API 速率限制已耗尽', true],
+    ['触发限流，本轮跳过', true],
+    ['GitHub GraphQL API 配额用尽', true],
+    ['quota exceeded', true],
+    ['pre-push 互斥锁被占满', true],
+    ['pre-push.flock 一直被其他会话持有', true],
+    ['pre-push 锁拿不到', true],
+    ['pre-push lock busy', true],
+    ['abuse detection mechanism', true],
+    ['HTTP 500', true],
+    ['HTTP 502', true],
+    ['HTTP 503', true],
+    ['HTTP 504', true],
+    ['502 Bad Gateway', true],
+    ['503 Service Unavailable', true],
+    ['504 Gateway Timeout', true],
+    ['504 Gateway Time-out', true],
+    ['unexpected EOF', false],
+    ['invalid UTF-8', false],
+    ['ENOTFOUND api.github.com', false],
+    ['connect ECONNREFUSED', false],
+    ['expected 1 to be 2', false],
+    ['缺少目标仓写权限', false],
+    ['', false],
+  ];
+  for (const [text, want] of samples) {
+    assert.equal(TRANSIENT_BLOCK_REASON.test(text), want, text);
+  }
+});
+
 test('a validation receipt that only timed out on the pre-push lock is retried as transient', (t) => {
   const { paths, previous } = setup(t, {
     reason: '本轮 validate 等不到共用的 pre-push 锁，修复已本地提交未推送。',
