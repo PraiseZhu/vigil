@@ -11,6 +11,7 @@ const ISSUE_FIELDS = `id
         title
         body
         state
+        stateReason
         url
         createdAt
         closedAt
@@ -267,11 +268,15 @@ function toChildTask(issue, profile, ranked, repo, byKey) {
   };
 }
 
+// 按「不计划做」或「重复」关掉的 issue 是人决定不做了，不是做完了：不进验收（不开轮、不开修正子 issue）。
+const NOT_DONE_CLOSE_REASONS = new Set(['NOT_PLANNED', 'DUPLICATE']);
+
 function toTask(issue, profile, byKey) {
   const repo = issue.repository?.nameWithOwner;
   const ranked = repoTier(repo, profile);
   if (!ranked) return null;
   if (!isTrustedAuthor(issue.author, profile)) return null;
+  if (issue.state === 'CLOSED' && NOT_DONE_CLOSE_REASONS.has(issue.stateReason)) return null;
   if (!isRoot(issue, profile)) {
     const childTask = toChildTask(issue, profile, ranked, repo, byKey);
     if (childTask) return childTask;
