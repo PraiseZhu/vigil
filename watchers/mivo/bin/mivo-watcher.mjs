@@ -13,7 +13,7 @@ import { collectPublicReview, evaluatePublicReview, isReviewerAuthor, reviewerFi
 import { collectPrSnapshot, collectPrOwnership, collectMergeStates, readMergeState, readMergeStatus, mergeStateIsBatched } from './mivo-pr-snapshot.mjs';
 import { selectHandoff, isCurrentHandoff, implicitHandoff } from './mivo-handoff.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './mivo-state.mjs';
-import { feedbackRepairPolicy, taskRepairPolicy, taskFeedbackDigest, isGreptileAuthor, isMemberFeedback, FEEDBACK_POLICY_VERSION } from './mivo-feedback-policy.mjs';
+import { feedbackRepairPolicy, taskRepairPolicy, taskFeedbackDigest, humanAcceptanceClass, isGreptileAuthor, isMemberFeedback, FEEDBACK_POLICY_VERSION } from './mivo-feedback-policy.mjs';
 import {lifelineFeedback} from './mivo-lifeline-source.mjs';
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent, completedMemberFeedback, coveredFeedbackItems, replyToMemberFeedback, requestMemberReviewers, partitionServerFixedThreads, resolveServerFixedThreads, SERVER_FIXED_REASON } from './mivo-review-resolve.mjs';
 import { resolveWithAppEnabled, resolveThreadsWithApp, REQUEST_TIMEOUT_MS as APP_REQUEST_TIMEOUT_MS } from './mivo-app-token.mjs';
@@ -1072,6 +1072,7 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       '整体目标是按逐项权限处理本批反馈；获准修复才提交并 push，P3 只说明暂不修，未知严重度在会话里核实，不以回复冒充修复。required CI 通过或记录外部阻塞；不自行合并。',
       '必须项红先看 feedback 里 watcher 写好的分诊（分类/失败步骤/本地复现/处理，task 文件 feedback[].ciTriage 有结构化版本）：format 用 gh pr edit 改 PR 元数据、不改代码；code 先跑给出的本地命令复现再修；aggregate（verify 等汇总门）只修列出的失败子 job；waits-upstream（pr-ci-freshness、pr-format-gate 的 Windows 证据步）不为它改代码，上游没跑完或刚跑完时 watcher 已暂缓派发，派到你这里说明上游已收口：先修红的上游，上游全绿后对该门 gh run rerun <run-id> --failed 一次；infra 重跑一次或 blocked。分诊为 unknown 或与 ciErrors 不符时以日志为准。Windows 偶发：同 head 首次失败且日志命中基础设施特征（下载失败/runner 取消/超时/磁盘/网络）重跑一次，仍红当真实失败。可选 check（Greptile Review check、Windows trace A/B diagnostic、stale branch reminder 等非 required）不当必修。CodeQL 等任务内带 verified code-scanning evidence 的阻断告警同 required CI 核实修复；没权限/分析缺失是采集问题，不凭猜测修；禁止 dismiss/降阈值。',
       '要先复核再决定改不改的意见（repairPolicy 里 reason=member-thread-triage：仓库成员含作者本人留的 thread；member-feedback-triage：成员的 review 总评或 PR 主讨论区评论；greptile-p1-triage：Greptile 按它自己的标准打的 P0/P1/P2；thread-triage：严重度读不出或来源未核验的）：先按统一分级重新判定，拿不准用 Jev 并自己复现核实。确认成立的 P0/P1/P2 才改代码并记 SC=pass；P3、提问或不成立记 SC=no-change。两种情况 evidence 第一条都写一句给评论人看的人话结论（发生了什么 / 对本 PR 意味着什么 / 要不要改代码），watcher 会把它贴到该 thread 并 resolve；不要以「严重度未知」blocked 这类项。',
+      acceptanceGapRule(pr.number),
       '三审/Greptile：只修复核成立的 P0/P1/P2；reply-resolve 类别现仅表示 reply-only（P3）：用「发生了什么 / 对本 PR 意味着什么 / 要不要改代码」在当前会话说明，不改代码、不主动 GitHub 回复、不自动 resolve。混合/未知严重度 needs-triage 不授整条修复，在会话里核实。ignore-infra 不处理。与写明产品意图冲突的按上面「产品意图」处理。修复不设轮次上限，一直推进到可合并；获准冲突修复用 git merge origin/main，不 rebase/force push。',
       ...(taskPath ? [
         `task=${taskPath}`,
@@ -1104,6 +1105,8 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
 // Only for a head branch that takes PRs only and a repo with docs/pr/_template/: the fix then goes to a child PR, and
 // that PR must carry its own review.md and qa.md. Its number does not exist yet, so the session writes both drafts with
 // a placeholder and finalize fills it in. A head that takes direct pushes never sees this text.
+const acceptanceGapRule = (number) => `要人来做的验收（repairPolicy 里 reason=acceptance-gap：真机、付费账号或手测）：修复会话做不了，watcher 已通知 owner；不改代码，记 SC=no-change，evidence 第一条写「需要人执行验收，已通知 owner」；不得把验收文档里的状态改成「未执行」，也不得删掉已有的手测结论。reason=acceptance-gap-manual-result：owner 已在 PR 上写了手测结论（task 文件 feedback[].manualTestResult：结果、head、原评论），把它逐条写进 docs/pr/${number}/qa.md 和 review.md（写明测试包、head、每条 SC 的结果），不改产品代码，不把它改标「未执行」。`;
+
 export function childPrHandoffRule({ taskPath, headRefName }) {
   const { dir, review, qa } = childPrDraftPaths(taskPath);
   return [
@@ -1416,7 +1419,7 @@ function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix 
 // Feedback whose every item is deterministically non-actionable (explicit P3
 // reply-only, or infrastructure/clean summaries) needs no model turn: the
 // session would only write "no-change". Unknown severity still goes to a session.
-const SCRIPT_NO_CHANGE_ACTIONS = new Set(['reply-only', 'ignore-infra']);
+const SCRIPT_NO_CHANGE_ACTIONS = new Set(['reply-only', 'ignore-infra', 'human-acceptance']);
 export function scriptNoChangePolicy(pr, fresh) {
   if (!Array.isArray(fresh) || fresh.length === 0) return null;
   const policy = taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh });
@@ -2424,6 +2427,48 @@ export function recheckResultAsync({ paths, previous, timeoutMs = 30000, prLockT
   });
 }
 
+// The owner records a manual acceptance run on the PR with one line (the manual test process requires it on the PR):
+// <!-- manual-test-result:v1 issue=<N> pr=<M> head=<full sha> result=pass|fail -->
+const MANUAL_TEST_RESULT_RE = /<!--\s*manual-test-result:v1\s+issue=(\d+)\s+pr=(\d+)\s+head=([0-9a-f]{40})\s+result=(pass|fail)\s*-->/;
+export function withManualTestResults(fresh, { comments = [], pr } = {}) {
+  if (!Array.isArray(fresh) || !fresh.some((item) => humanAcceptanceClass(item))) return fresh;
+  const owner = String(pr?.author?.login ?? '').toLowerCase();
+  if (!owner) return fresh;
+  let latest = null;
+  for (const comment of Array.isArray(comments) ? comments : []) {
+    const author = comment?.author ?? comment?.user;
+    if (String(author?.login ?? '').toLowerCase() !== owner || author?.__typename === 'Bot' || author?.type === 'Bot') continue;
+    const match = MANUAL_TEST_RESULT_RE.exec(String(comment?.body ?? ''));
+    if (!match || Number(match[2]) !== Number(pr.number)) continue;
+    const at = comment.createdAt ?? comment.created_at ?? null;
+    const atMs = Date.parse(at ?? '');
+    if (latest && !(atMs > latest.atMs)) continue;
+    latest = { atMs, value: { result: match[4], issue: Number(match[1]), pr: Number(match[2]), head: match[3], author: author.login,
+      commentId: comment.id == null ? null : String(comment.id), url: comment.url ?? comment.html_url ?? null, at,
+      body: String(comment.body).slice(0, 4000) } };
+  }
+  if (!latest) return fresh;
+  return fresh.map((item) => (humanAcceptanceClass(item) ? { ...item, manualTestResult: latest.value } : item));
+}
+
+function acceptanceGapSummary(body) {
+  const line = String(body ?? '').replace(/<!--[^]*?-->/g, '').split(/\r?\n/).map((text) => text.trim()).find(Boolean) ?? '';
+  return line.replace(/^#+\s*/, '').slice(0, 200);
+}
+
+export function noticeAcceptanceGaps({ fresh, pr, home, dryRun, events }) {
+  const policy = taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh });
+  for (const gap of policy.items.filter((item) => item.action === 'human-acceptance')) {
+    const item = fresh.find((row) => row.key === gap.key);
+    const findingKey = findingMarkerOf(item?.body)?.key ?? gap.key;
+    const event = { kind: 'acceptance-gap', id: `acceptance-gap:${pr.number}:${findingKey}`, number: pr.number, url: pr.url ?? null,
+      head: pr.headRefOid, findingKey, summary: acceptanceGapSummary(item?.body),
+      ...(item?.manualTestResult ? { manualResult: item.manualTestResult.result } : {}) };
+    events.push({ kind: 'acceptance-gap', number: pr.number, findingKey });
+    queueHumanNotice(home, event, dryRun);
+  }
+}
+
 function blockedCause(kind, reason) {
   return `${kind ?? 'unknown'}:${String(reason ?? '').replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 200)}`;
 }
@@ -3023,6 +3068,10 @@ export function* processPr({
       previous = { ...previous, lastException: markException(limited, now, events, { home: paths.home, dryRun }).lastException };
     }
   }
+  // #386: acceptance only a person can run. The owner's manual result on the PR rides along for the session to write
+  // back; without one the owner gets one notice per finding, and a batch of only such findings wakes no session.
+  fresh = withManualTestResults(fresh, { comments: collected.comments ?? [], pr: collected.pr ?? pr });
+  noticeAcceptanceGaps({ fresh, pr, home: paths.home, dryRun, events });
   const terminal = ['blocked', 'complete', 'legacy-complete'].includes(previous.activeTask?.status);
   const inFlight = Boolean(previous.lastDispatch?.dispatchId) && !terminal && previous.activeTask?.status !== 'waiting-ci';
   const recovery = admitted && !collected.mergeReady && !resultError
