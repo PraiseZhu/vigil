@@ -172,6 +172,11 @@ export function formatNoticeText(events = []) {
     if (event.kind === 'changelog-dispatch-unknown') {
       return `更新日志 PR #${number}${url} 派处理审查讨论的会话后没收到回执，不确定会话开没开出来。为免两个会话同时改同一个工作树，盯梢 24 小时内不再派。请在 Cindy 里找标题为「更新日志 PR #${number} 处理审查意见」的会话确认。`;
     }
+    if (event.kind === 'deploy-drift') {
+      const files = (event.files ?? []).map((item) => `${item.name}（${item.kind === 'missing' ? '缺失' : '内容和部署时不一样'}）`).join('、');
+      const what = event.reason ? `部署清单读不出来（${event.reason}）` : `这些文件和部署时不一样：${files}`;
+      return `盯梢的运行目录和最近一次部署（${event.release ?? '未知版本'}）对不上：${what}。可能是只拷了一部分文件，或有人在运行目录直接改了文件。请用 deploy.mjs 重新部署；如果是有意保留的本机改动，用 \`deploy.mjs register-patch --home <运行目录> --file <文件名>\` 登记，登记后不再报。`;
+    }
     if (event.kind === 'blocked-escalate') {
       return `PR #${number}${url} 同一原因再次卡住（${event.cause ?? event.blockedKind ?? 'blocked'}），盯梢不再原样重投。请查看原因并处理。`;
     }

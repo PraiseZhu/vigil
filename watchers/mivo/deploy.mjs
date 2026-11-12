@@ -5,9 +5,10 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
+import {deploymentDrift,registerLocalPatch,writeDeployManifest} from './bin/mivo-deploy-drift.mjs';
 const here=path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_RUNTIME='/path/to/your/runtime/mivo-watcher';
-export const FILES=['mivo-pre-push.mjs','mivo-handoff.mjs','mivo-identity.mjs','mivo-lifeline-source.mjs','mivo-feedback-policy.mjs','mivo-ci.mjs','mivo-ci-triage.mjs','mivo-codeql-infra.mjs','mivo-ci-selfheal.mjs','mivo-pr-policy.mjs','mivo-pr-snapshot.mjs','mivo-pr-actions.mjs','mivo-code-scanning.mjs','mivo-repair.mjs','mivo-validation-runtime.mjs','mivo-validation-evidence.mjs','mivo-validation-baseline.mjs','mivo-review-resolve.mjs','mivo-app-token.mjs','mivo-state.mjs','mivo-ownership.mjs','mivo-watcher.mjs','notify.mjs','public-review.mjs','session-title.mjs','profile.mjs','mivo-watch-script.py','protocol.py','session-title-maintenance.py'];
+export const FILES=['mivo-pre-push.mjs','mivo-handoff.mjs','mivo-identity.mjs','mivo-lifeline-source.mjs','mivo-feedback-policy.mjs','mivo-ci.mjs','mivo-ci-triage.mjs','mivo-codeql-infra.mjs','mivo-ci-selfheal.mjs','mivo-deploy-drift.mjs','mivo-pr-policy.mjs','mivo-pr-snapshot.mjs','mivo-pr-actions.mjs','mivo-code-scanning.mjs','mivo-repair.mjs','mivo-validation-runtime.mjs','mivo-validation-evidence.mjs','mivo-validation-baseline.mjs','mivo-review-resolve.mjs','mivo-app-token.mjs','mivo-state.mjs','mivo-ownership.mjs','mivo-watcher.mjs','notify.mjs','public-review.mjs','session-title.mjs','profile.mjs','mivo-watch-script.py','protocol.py','session-title-maintenance.py'];
 // Entry points actually spawned/imported directly by the runtime. Any relative import reachable
 // from these (transitively) must be listed in FILES, or the runtime will 500 on `import()` with
 // a healthy-looking manifest (2026-09-29 incident: mivo-review-resolve.mjs was imported by
@@ -16,6 +17,14 @@ export const FILES=['mivo-pre-push.mjs','mivo-handoff.mjs','mivo-identity.mjs','
 const ENTRY_POINTS=['mivo-watcher.mjs','mivo-repair.mjs','mivo-handoff.mjs','mivo-pre-push.mjs'];
 const sha=file=>fs.existsSync(file)?createHash('sha256').update(fs.readFileSync(file)).digest('hex'):null;
 const requireValue=(v,m)=>{if(!v)throw Error(m);};
+// Which source commit the installed files came from, for the drift manifest. Best effort: a copy outside git has none.
+function sourceIdentity(){
+ try{
+  const commit=execFileSync('git',['-C',here,'rev-parse','HEAD'],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();
+  const dirty=execFileSync('git',['-C',here,'status','--porcelain','--','bin'],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim()!=='';
+  return {sourceCommit:/^[a-f0-9]{40}$/.test(commit)?commit:null,sourceDirty:dirty};
+ }catch{return {sourceCommit:null,sourceDirty:null};}
+}
 function relativeImportNames(file){
  if(!fs.existsSync(file))return [];
  const src=fs.readFileSync(file,'utf8');
@@ -114,6 +123,8 @@ export function apply(plan){
   }
   requireValue(stateFingerprint(plan.home)===plan.stateSha,'state changed during install');idle(plan.database,plan.sessionIds);
   requireValue(verify(plan.home).every(v=>v.source===v.runtime),'installed hash mismatch');
+  // The watcher compares bin/ with this once a day (mivo-deploy-drift.mjs); a partial copy no longer looks healthy.
+  writeDeployManifest({home:plan.home,release:plan.id,...sourceIdentity(),files:plan.files.map(item=>({name:item.name,sha256:item.source}))});
   const receipt={status:'installed',at:new Date().toISOString(),files:plan.files,stateChanged:false,sessionIds:plan.sessionIds,schedulerChanged:false,databaseChanged:false};
   fs.writeFileSync(path.join(record,'receipt.json'),JSON.stringify(receipt,null,2),{mode:0o600});return receipt;
  }catch(error){
@@ -134,7 +145,14 @@ if(process.argv[1]&&fs.realpathSync(process.argv[1])===fileURLToPath(import.meta
   requireValue(['--home','--database','--id','--plan'].every(k=>args.includes(k))&&path.isAbsolute(file),'explicit home/database/id/absolute plan required');
   const plan={version:1,home,database,id,files:verify(home),stateSha:stateFingerprint(home),sessionIds:identities(home)};
   validatePlan(plan);idle(database,plan.sessionIds);fs.writeFileSync(file,JSON.stringify(plan,null,2),{flag:'wx',mode:0o600});console.log(JSON.stringify({mode:'preview',plan:file,files:plan.files.length}));
+ }else if(mode==='drift'){
+  const home=get('--home');requireValue(args.includes('--home')&&path.isAbsolute(home),'--home required');
+  const result=deploymentDrift({home});console.log(JSON.stringify(result));
+  if(result.status!=='ok')process.exitCode=1;
+ }else if(mode==='register-patch'){
+  const home=get('--home'),name=get('--file');requireValue(args.includes('--home')&&path.isAbsolute(home)&&args.includes('--file'),'--home and --file required');
+  console.log(JSON.stringify({file:name,...registerLocalPatch({home,name})}));
  }else if(mode==='apply'){
   requireValue(args.includes('--plan'),'--plan required');console.log(JSON.stringify(apply(JSON.parse(fs.readFileSync(get('--plan'))))));
- }else throw Error(`use verify --home, preview --home --database --id --plan, or apply --plan (example runtime ${DEFAULT_RUNTIME})`);
+ }else throw Error(`use verify --home, drift --home, register-patch --home --file, preview --home --database --id --plan, or apply --plan (example runtime ${DEFAULT_RUNTIME})`);
 }
