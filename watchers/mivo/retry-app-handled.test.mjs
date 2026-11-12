@@ -8,6 +8,7 @@ import { handoffPr, handoffReceipt, withAuthorHandoff, isChildPrList } from './h
 import * as watcher from './bin/mivo-watcher.mjs';
 import { readPr, writePr } from './bin/mivo-state.mjs';
 import { resolveThreadsWithApp } from './bin/mivo-app-token.mjs';
+import { taskFeedbackDigest } from './bin/mivo-feedback-policy.mjs';
 
 // A task frozen by a delivery the host did not confirm (pendingDispatch.status = retryable) is sent again later. Threads
 // the App path took in between (switch on) must not reach the session that retry wakes up: they are cut from the
@@ -215,3 +216,16 @@ test('a retry of a missing-result recovery is left alone: it re-sends a task the
   assert.deepEqual(keysIn(run.sent[0].message), [...THREAD_1, ...THREAD_2]);
   assert.equal(w.task(frozen.dispatchId).feedback.length, 3);
 });
+
+test('#397 the feedback fingerprint follows the task file: recorded at dispatch, renewed when a retry cuts feedback, kept on bind', async (t) => {
+  const w = world(t);
+  const frozen = await w.freeze([fixedThread(1), openThread(2)]);
+  assert.equal(frozen.feedbackDigest, taskFeedbackDigest(w.task(frozen.dispatchId).feedback), 'recorded with the first delivery');
+  const run = await w.poll({ threads: [fixedThread(1), openThread(2)], now: DUE, switchValue: '1',
+    appResolveFn: spy({ resolved: ['PRRT_1'], failures: [] }) });
+  const cut = w.task(frozen.dispatchId).feedback;
+  assert.deepEqual(cut.map((item) => item.key), THREAD_2);
+  assert.notEqual(run.entry.activeTask.feedbackDigest, frozen.feedbackDigest, 'the cut task has a new fingerprint');
+  assert.equal(run.entry.activeTask.feedbackDigest, taskFeedbackDigest(cut), 'the bound task carries the fingerprint of the file the session reads');
+});
+

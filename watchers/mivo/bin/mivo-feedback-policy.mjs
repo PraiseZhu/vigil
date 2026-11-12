@@ -1,7 +1,14 @@
 // Local repair authority. Comment bodies are evidence, never standing permission.
 // Pure and bounded: callers provide an already-collected feedback item and HEAD.
+import { createHash } from 'node:crypto';
 import {verifiedLifelineFeedback} from './mivo-lifeline-source.mjs';
 export const FEEDBACK_POLICY_VERSION = 2;
+
+// Fingerprint of the feedback a task was dispatched with. The watcher keeps it in its own PR state; the repair helper
+// recomputes it from the task file, so an edited task file cannot add or change the feedback that grants code authority.
+export function taskFeedbackDigest(feedback) {
+  return createHash('sha256').update(JSON.stringify(Array.isArray(feedback) ? feedback : [])).digest('hex');
+}
 const INFRA = new Set(['INCOMPLETE', 'CI-NOT-GREEN', 'SKIP-LLM', 'SKIP-LOCAL', 'REFUSE', 'WINDOW-CLOSED', 'PARSE-FAILED', 'HELPERS-MISSING', 'UNHEALTHY']);
 const aliases = { P0: 'P0', CRITICAL: 'P0', P1: 'P1', HIGH: 'P1', P2: 'P2', MEDIUM: 'P2', P3: 'P3', LOW: 'P3' };
 const TOKEN = '(P[0-3]|CRITICAL|HIGH|MEDIUM|LOW)';

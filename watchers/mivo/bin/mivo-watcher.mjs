@@ -13,7 +13,7 @@ import { collectPublicReview, evaluatePublicReview, isReviewerAuthor, reviewerFi
 import { collectPrSnapshot, collectPrOwnership, collectMergeStates, readMergeState, readMergeStatus, mergeStateIsBatched } from './mivo-pr-snapshot.mjs';
 import { selectHandoff, isCurrentHandoff, implicitHandoff } from './mivo-handoff.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, listPrs, migrateLegacy, PR_LOCK_TOKEN_ENV, readPr, statePaths as v2StatePaths, withLock as withPrLock, writePr } from './mivo-state.mjs';
-import { feedbackRepairPolicy, taskRepairPolicy, isGreptileAuthor, isMemberFeedback, FEEDBACK_POLICY_VERSION } from './mivo-feedback-policy.mjs';
+import { feedbackRepairPolicy, taskRepairPolicy, taskFeedbackDigest, isGreptileAuthor, isMemberFeedback, FEEDBACK_POLICY_VERSION } from './mivo-feedback-policy.mjs';
 import {lifelineFeedback} from './mivo-lifeline-source.mjs';
 import { partitionAutoClose, autoCloseThreads, closeRefutedThreads, refutedThreads, fixedThreads, coveredThreadItems, sameFeedbackContent, completedMemberFeedback, coveredFeedbackItems, replyToMemberFeedback, requestMemberReviewers, partitionServerFixedThreads, resolveServerFixedThreads, SERVER_FIXED_REASON } from './mivo-review-resolve.mjs';
 import { resolveWithAppEnabled, resolveThreadsWithApp, REQUEST_TIMEOUT_MS as APP_REQUEST_TIMEOUT_MS } from './mivo-app-token.mjs';
@@ -1404,7 +1404,7 @@ function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix 
   const prSnapshot = compactPrSnapshot(collected, now);
   // The session is told to write the drafts only when it may change code, and the task records that it was told.
   const handoffAsked = childPrHandoff?.enabled === true && taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }).canChangeCode;
-  const pending = { dispatchId, params: dispatchParams({ pr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, prIntent: prSnapshot?.prIntent, handledFindings: collected?.handledFindings ?? [], repeatFindings, childPrHandoff }), at: now, taskPath };
+  const pending = { dispatchId, params: dispatchParams({ pr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, prIntent: prSnapshot?.prIntent, handledFindings: collected?.handledFindings ?? [], repeatFindings, childPrHandoff }), at: now, taskPath, feedbackDigest: taskFeedbackDigest(fresh) };
   if (!dryRun) {
     fs.mkdirSync(path.dirname(taskPath), { recursive: true });
     atomic(taskPath, JSON.stringify({ dispatchId, ...(selfReviewRequired({ headRefOid: pr.headRefOid, fresh }) ? { selfReviewRequired: true } : {}), repeatFindings, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: pr.id, number: pr.number, repo: REPO, headRefOid: pr.headRefOid, headRefName: pr.headRefName, prAuthor: collected?.pr?.author?.login ?? pr.author?.login ?? null, handoff: collected?.handoff, releaseEpoch: collected?.pr?.releaseEpoch, feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }), prSnapshot, severityStandard: taskSeverityStandard(), adjudicationRecord: ADJUDICATION_RECORD_VERSION, ...(handoffAsked ? { childPrHandoff: childPrHandoffSpec(taskPath) } : {}), params: pending.params, createdAt: now }));
@@ -1700,6 +1700,7 @@ export function applyDispatchReceipt({ state, pr, mapping, receipt, now, cursor,
       dispatchId: receipt.dispatch_id ?? previous.pendingDispatch?.dispatchId,
       sessionId: previous.sessionId ?? sessionId, head: pr.headRefOid, status: receipt.wake_kind === 'queued' ? 'queued' : 'accepted', at: now,
       hostTurnStatus: 'unverified',
+      ...(previous.pendingDispatch?.feedbackDigest ? { feedbackDigest: previous.pendingDispatch.feedbackDigest } : {}),
     },
     lastSeenAt: now,
     pendingFeedback: 0,
@@ -3255,6 +3256,7 @@ export function* processPr({
       : { ...mapping, ...newSessionTitle({ pr, existing: mapping, createdAt: now }) };
     const pending = { ...previous.pendingDispatch, attempts: Number(previous.pendingDispatch.attempts ?? 1) + 1,
       ...(retryCut?.cursor ? { cursor: retryCut.cursor } : {}),
+      ...(retryCut ? { feedbackDigest: taskFeedbackDigest(retryCut.task.feedback) } : {}),
       params: constrainRetryDispatch({ ...(retryCut?.params ?? previous.pendingDispatch.params), title: retryMapping.title }, retryCut?.task ?? retryTask) };
     state.prs[key] = { ...previous, pendingDispatch: pending };
     persistState(state, paths);
@@ -3293,6 +3295,9 @@ export function* processPr({
         mapping, fresh: recovery.task?.feedback ?? [], now, taskPath, home: paths.home, prIntent: recovery.task?.prSnapshot?.prIntent ?? null,
         childPrHandoff: recovery.task?.childPrHandoff ?? null, selfReview: recovery.task?.selfReviewRequired === true }),
       at: now, taskPath, recovery: true, cursor: retainedCursor,
+      // The session already holds this task: the fingerprint recorded when it was first sent stays the reference.
+      ...(previous.activeTask?.dispatchId === recovery.dispatchId && previous.activeTask?.feedbackDigest
+        ? { feedbackDigest: previous.activeTask.feedbackDigest } : {}),
     };
     state.prs[key] = { ...previous, pendingDispatch: pending };
     persistState(state, paths);
