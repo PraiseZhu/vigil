@@ -1,0 +1,75 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { checkBodyEdit, check, toWrite } from './host/gate-actions/pr-edit.mjs';
+import { correctionPrBody } from './host/prbot.mjs';
+import { REPO } from './fake-gh.fixture.mjs';
+
+// #171：写闸动作 pr.edit 只放行「验收对照」的状态 / 证据两列和「未执行的验证」段，其余正文一个字都不许变。
+
+const state = {
+  issue: `${REPO}#9`, prRepo: REPO, root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 2,
+  correctionFacts: { scText: 'SC1 导出按钮在空列表时禁用。验证：unit', why: '空列表时仍可点击' },
+  changedFiles: ['src/export.js'], preflight: { ok: true, commands: ['npm test'] },
+};
+const marker = { root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1 };
+const OLD = correctionPrBody(state, marker);
+const rowIndex = () => OLD.split('\n').findIndex((line) => /^\|\s*SC1\b/.test(line));
+const withRow = (status, evidence) => {
+  const all = OLD.split('\n');
+  const cells = all[rowIndex()].split('|');
+  cells[2] = ` ${status} `;
+  cells[3] = ` ${evidence} `;
+  all[rowIndex()] = cells.join('|');
+  return all.join('\n');
+};
+const replaceSection = (body, title, text) => body.replace(new RegExp(`(## ${title}\\n\\n)[\\s\\S]*?(\\n\\n## )`), `$1${text}$2`);
+
+test('#171 SC1 允许：验收对照的状态和证据列、未执行的验证段', () => {
+  assert.equal(rowIndex() > 0, true, '夹具里有 SC1 那一行');
+  const evidence = withRow('通过', 'CI test 通过：https://github.com/example-owner/example-repo/actions/runs/1');
+  assert.deepEqual(checkBodyEdit(OLD, evidence), { ok: true });
+  assert.deepEqual(checkBodyEdit(OLD, replaceSection(evidence, '未执行的验证', '- 无，CI 已跑完。')), { ok: true });
+  assert.deepEqual(checkBodyEdit(OLD, OLD), { ok: true }, '不改也放行');
+});
+
+test('#171 SC1 拒绝：首行、Closes 行、修正标记行、其它段、标题', () => {
+  const lines = OLD.split('\n');
+  const swap = (index, text) => lines.map((line, at) => (at === index ? text : line)).join('\n');
+  assert.equal(checkBodyEdit(OLD, swap(0, `任务 issue：${REPO}#5`)).reason, 'outside-editable', '首行');
+  assert.equal(checkBodyEdit(OLD, swap(1, 'Closes #5')).reason, 'outside-editable', 'Closes 行');
+  assert.equal(checkBodyEdit(OLD, swap(lines.length - 1, `[验收机] 修正 · 总 ${REPO}#5 · 项 ${REPO}#6 SC1 · 第 1 轮`)).reason, 'outside-editable', '修正标记行');
+  assert.equal(checkBodyEdit(OLD, replaceSection(OLD, '改了什么', '换掉')).reason, 'outside-editable', '其它段');
+  assert.equal(checkBodyEdit(OLD, OLD.replace('## 风险与回滚', '## 风险')).reason, 'outside-editable', '标题');
+  assert.equal(checkBodyEdit(OLD, `${OLD}\n## 新加一段\n\n内容`).reason, 'outside-editable', '新加一段');
+});
+
+test('#171 SC1 拒绝：验收对照的行数、验收项列、非法状态', () => {
+  const lines = OLD.split('\n');
+  const extra = [...lines.slice(0, rowIndex() + 1), '| SC2 多出来的一条 | 通过 | x |', ...lines.slice(rowIndex() + 1)].join('\n');
+  assert.equal(checkBodyEdit(OLD, extra).reason, 'table-shape');
+  const renamed = lines.map((line, at) => (at === rowIndex() ? line.replace('SC1 导出按钮', 'SC1 别的按钮') : line)).join('\n');
+  assert.equal(checkBodyEdit(OLD, renamed).reason, 'table-shape');
+  assert.equal(checkBodyEdit(OLD, withRow('搞定', 'x')).reason, 'bad-status');
+});
+
+test('#171 SC1 拒绝：改动里新写关单词、修正标记、任务 issue 行（GitHub 认正文任意位置）', () => {
+  for (const sneaky of ['Closes #1', 'fixes example-owner/example-repo#7', 'Resolves: https://github.com/example-owner/example-repo/issues/3']) {
+    assert.equal(checkBodyEdit(OLD, withRow('通过', sneaky)).reason, 'closing-keyword', sneaky);
+    assert.equal(checkBodyEdit(OLD, replaceSection(OLD, '未执行的验证', `- ${sneaky}`)).reason, 'closing-keyword', sneaky);
+  }
+  assert.equal(checkBodyEdit(OLD, replaceSection(OLD, '未执行的验证', `[验收机] 修正 · 总 ${REPO}#5 · 项 ${REPO}#6 SC1 · 第 1 轮`)).reason, 'correction-marker');
+  assert.equal(checkBodyEdit(OLD, replaceSection(OLD, '未执行的验证', `任务 issue：${REPO}#5`)).reason, 'task-issue-line');
+});
+
+test('#171 SC2 参数：带标题、head、base 等字段一律拒绝；只给 auto / fork 档', () => {
+  const ok = { type: 'pr.edit', repo: REPO, pr: 12, body: OLD };
+  assert.deepEqual(check(ok, { tier: 'auto' }), { ok: true });
+  assert.deepEqual(check(ok, { tier: 'fork' }), { ok: true });
+  assert.equal(check(ok, { tier: 'watch' }).reason, 'tier-not-allowed');
+  for (const key of ['title', 'head', 'base', 'branch', 'draft', 'state']) {
+    assert.equal(check({ ...ok, [key]: 'x' }, { tier: 'auto' }).reason, 'field-not-editable', key);
+  }
+  assert.equal(check({ ...ok, body: '' }, { tier: 'auto' }).reason, 'bad-action');
+  assert.equal(check({ ...ok, pr: 0 }, { tier: 'auto' }).reason, 'bad-action');
+  assert.deepEqual(toWrite({ ...ok, dedupeKey: 'k' }), { type: 'pr.edit', repo: REPO, pr: 12, body: OLD });
+});
