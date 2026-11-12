@@ -234,3 +234,11 @@ test('#171 只许纯文本只看改动的地方：旧正文原样留着的写法
   assert.deepEqual(checkBodyEdit(oddCell, rowIn(OLD, '通过', 'a&nbsp;b')), { ok: true }, '证据格没改、只改状态');
   assert.equal(checkBodyEdit(oddCell, rowIn(OLD, '通过', 'a&nbsp;b CI 通过')).reason, 'encoded-text', '证据格改了就整格检查');
 });
+
+// 第七轮复审 P1：行尾反斜杠是 Markdown 硬换行，渲染后「Closes」和下一行的「#19」之间只剩换行。
+test('#171 「未执行的验证」段里行尾反斜杠也拒', () => {
+  for (const text of ['- Closes\\\n#19', '- Closes\\\n\n#19', '- Closes \\\n#19', '- 末行\\']) {
+    assert.equal(checkBodyEdit(OLD, replaceSection(OLD, '未执行的验证', text)).reason, 'encoded-text', JSON.stringify(text));
+  }
+  assert.deepEqual(checkBodyEdit(OLD, replaceSection(OLD, '未执行的验证', '- 无，CI 已跑完。\n- `npm ci && npm test` 在 CI 跑过')), { ok: true });
+});
