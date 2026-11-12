@@ -36,19 +36,36 @@ const tidy = (text) => text
   .replace(/[\u2010-\u2015\u2212\ufe58\ufe63\uff0d]/g, '-')
   .replace(/\[([^\]]*)\]\(([^)]*)\)/g, '$1 $2')
   .replace(/[*`~]/g, '');
-// 同一段正文按三种顺序各抹平一次，任一份里出现的引用都算（第四轮复审 P1：只看删完标签的那份，
-// 藏在注释、标签名、属性里的关单词会跟着被删掉而放行，可原始正文里它还在）：
-// 不删标签的一份、先删标签再解码实体的一份（实体被注释或标签拆开）、先解码实体再删标签的一份。
+// 同一段正文按五种读法各抹平一次：不解码不删标签（GitHub 按原文认）、只解码实体、只删标签和注释、
+// 先删标签再解码（实体被注释或标签拆开）、先解码再删标签。GitHub 实际按哪种读法认关单词，我们不假定。
+// 比对按读法逐份比（第五轮复审）：每一种读法下，新正文认出的引用都得是旧正文在同一读法下已有的。
+// 这样不管 GitHub 是哪种读法，合并时都不会多关 issue；把各读法并成一个集合再比会互相洗白——
+// 旧正文 <!-- Closes #19 --> 只在不删标签的读法里有 #19，却能替新写的真 Closes #19 打掩护；
+// 新正文 Closes #1&#57; 解码后是旧的 #19，按原文认却是 #1。
 const views = (text) => {
   const base = String(text ?? '').replace(INVISIBLE, '');
   return [
+    tidy(base),
     tidy(decodeEntities(base)),
+    tidy(stripTags(base)),
     tidy(decodeEntities(stripTags(base))),
     tidy(stripTags(decodeEntities(base))),
   ];
 };
-const closingRefs = (text) => new Set(views(text).flatMap((view) => [...view.matchAll(CLOSING)].map((match) => match[1].toLowerCase())));
-const countOf = (text, pattern) => Math.max(...views(text).map((view) => [...view.replace(/\s+/g, ' ').matchAll(pattern)].length));
+const refsOf = (view) => new Set([...view.matchAll(CLOSING)].map((match) => match[1].toLowerCase()));
+const countIn = (view, pattern) => [...view.replace(/\s+/g, ' ').matchAll(pattern)].length;
+
+function introducedProblem(oldBody, newBody) {
+  const before = views(oldBody);
+  const after = views(newBody);
+  if (after.some((view, i) => {
+    const known = refsOf(before[i]);
+    return [...refsOf(view)].some((ref) => !known.has(ref));
+  })) return 'closing-keyword';
+  if (after.some((view, i) => countIn(view, MARKER) > countIn(before[i], MARKER))) return 'correction-marker';
+  if (after.some((view, i) => countIn(view, TASK_LINE) > countIn(before[i], TASK_LINE))) return 'task-issue-line';
+  return null;
+}
 
 export function check(action, { tier } = {}) {
   if (!tiers.includes(tier)) return { ok: false, reason: 'tier-not-allowed' };
@@ -85,13 +102,6 @@ const isDataRow = (line) => /^\s*\|/.test(line) && !/^\s*\|\s*:?-{2,}/.test(line
 
 // 整篇对比，不只看这一次新增的行（审查 P2：两次 pr.edit 可以把「Closes」和下一行的「#999」拼起来）：
 // 新正文里出现了旧正文没有的关单词引用、修正标记或「任务 issue」行，就拒绝。改不了的地方逐字相同，多出来的只能来自可改的两处。
-function introducedProblem(oldBody, newBody) {
-  const before = closingRefs(oldBody);
-  if ([...closingRefs(newBody)].some((ref) => !before.has(ref))) return 'closing-keyword';
-  if (countOf(newBody, MARKER) > countOf(oldBody, MARKER)) return 'correction-marker';
-  if (countOf(newBody, TASK_LINE) > countOf(oldBody, TASK_LINE)) return 'task-issue-line';
-  return null;
-}
 
 function sameLines(a, b) {
   return a.length === b.length && a.every((line, index) => line === b[index]);

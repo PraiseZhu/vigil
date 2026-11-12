@@ -178,3 +178,32 @@ test('#171 修正标记、任务 issue 行被标签拆开或藏进注释也拒',
   assert.equal(checkBodyEdit(OLD, withRow('通过', '<!-- [验收机]修正 -->')).reason, 'correction-marker');
   assert.equal(checkBodyEdit(OLD, withRow('通过', '任务<i></i> issue：x')).reason, 'task-issue-line');
 });
+
+// 第五轮复审：按读法逐份比。新正文在某种读法下认出的引用，旧正文在同一读法下必须已有；
+// 旧正文里只在某种读法下才有的引用，不能替新写的真关单词打掩护。
+const rowIn = (body, status, evidence) => body.split('\n').map((line) => {
+  if (!/^\|\s*SC1\b/.test(line)) return line;
+  const cells = line.split('|');
+  cells[2] = ` ${status} `;
+  cells[3] = ` ${evidence} `;
+  return cells.join('|');
+}).join('\n');
+
+test('#171 实体拆开的号按原文认是另一个 issue：拒', () => {
+  const before = rowIn(OLD, '待验证', 'Closes #19');
+  assert.equal(checkBodyEdit(before, rowIn(OLD, '通过', 'Closes #1&#57;')).reason, 'closing-keyword', '按原文认是 #1');
+});
+
+test('#171 旧正文只在某种读法下才有的引用，不替新写的真关单词打掩护', () => {
+  for (const hidden of ['<!-- Closes #19 -->', '<Closes #19>', '<div title="Closes #19">x</div>', 'Closes &#35;19', 'Closes #1&#57;']) {
+    const before = rowIn(OLD, '待验证', hidden);
+    assert.equal(checkBodyEdit(before, rowIn(OLD, '通过', `${hidden} Closes #19`)).reason, 'closing-keyword', JSON.stringify(hidden));
+  }
+});
+
+test('#171 旧正文原样留着的隐藏引用不误拒：只改状态和证据仍放行', () => {
+  const before = replaceSection(OLD, '未执行的验证', '<!-- Closes #19 --> Closes &#35;19 Closes #1&#57; 无');
+  assert.deepEqual(checkBodyEdit(before, rowIn(before, '通过', 'CI test 通过')), { ok: true });
+  const hiddenInRow = rowIn(OLD, '待验证', '<Closes #19>');
+  assert.deepEqual(checkBodyEdit(hiddenInRow, rowIn(OLD, '通过', '<Closes #19> CI 通过')), { ok: true });
+});
