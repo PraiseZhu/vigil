@@ -102,3 +102,34 @@ test('#171 修正标记和任务 issue 行拆成两行、两次写也拒', () =>
   assert.deepEqual(checkBodyEdit(OLD, half), { ok: true });
   assert.equal(checkBodyEdit(half, replaceSection(OLD, '未执行的验证', `- 任务\nissue：${REPO}#5`)).reason, 'task-issue-line');
 });
+
+// 复审 P1 / P2 与待核实：GH-号、下划线仓名不能被「抹平」成同一个、实体 / 全角 / HTML 标签 / 链接文字 / 不可见字符。
+test('#171 GH-号写法也拒（GitHub 认 closes gh-N）', () => {
+  for (const text of ['Closes GH-19', 'fixes gh-19', 'Resolves: GH-19']) {
+    assert.equal(checkBodyEdit(OLD, withRow('通过', text)).reason, 'closing-keyword', text);
+  }
+});
+
+test('#171 带下划线的跨仓 Closes 行不会被「去下划线同名仓」冒充', () => {
+  const crossOld = OLD.replace('Closes #9', 'Closes Other_Org/other_repo#9');
+  assert.notEqual(crossOld, OLD, '夹具换成跨仓 Closes 行');
+  const fake = crossOld.split('\n').map((line) => {
+    if (!/^\|\s*SC1\b/.test(line)) return line;
+    const cells = line.split('|');
+    cells[2] = ' 通过 ';
+    cells[3] = ' Closes OtherOrg/otherrepo#9 ';
+    return cells.join('|');
+  }).join('\n');
+  assert.equal(checkBodyEdit(crossOld, fake).reason, 'closing-keyword');
+  assert.deepEqual(checkBodyEdit(OLD, withRow('通过', '见 my_org/my_repo 的 fix_up 分支，无关单词')), { ok: true }, '仓名里的下划线照常');
+});
+
+test('#171 实体、全角、HTML 标签、链接文字、不可见字符包装的关单词都拒', () => {
+  const variants = ['Closes &#35;19', 'Closes &#035;19', 'Closes &#x23;19', 'Closes &num;19', 'Closes ＃19', 'Closes #１９',
+    '<b>Closes</b> #19', '<strong>Fixes</strong> #19', '[Closes](https://github.com/example-owner/example-repo/issues/19)',
+    'Closes⁠#19', 'Closes­ #19', 'Clo​ses #19'];
+  for (const text of variants) {
+    assert.equal(checkBodyEdit(OLD, withRow('通过', text)).reason, 'closing-keyword', JSON.stringify(text));
+  }
+  assert.deepEqual(checkBodyEdit(OLD, withRow('通过', 'CI 见 <https://github.com/example-owner/example-repo/actions/runs/1>')), { ok: true });
+});

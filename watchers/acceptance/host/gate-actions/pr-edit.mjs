@@ -13,12 +13,22 @@ export const EDITABLE_SECTIONS = Object.freeze(['验收对照', '未执行的验
 const STATUSES = new Set(['待验证', '通过', '未通过', '人工手测']);
 const MAX_BODY = 65536;
 const FORBIDDEN_KEYS = ['title', 'head', 'base', 'branch', 'draft', 'state'];
-// 关单词 + 引用（#号、owner/repo#号、issue / PR 链接）。宽一点比漏一点安全：分隔可以跨行、可以有冒号（半角全角）、
-// 尖括号、圆括号；链接可以不带 https、可以带 www。比对前先去掉 Markdown 的 * _ ` ~，包住关键字也认得出。
-const CLOSING = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b[\s:：<(\[]*((?:[\w.-]+\/[\w.-]+)?#\d+|(?:https?:\/\/)?(?:www\.)?github\.com\/[^\s)>\]]+\/(?:issues|pull)\/\d+)/gi;
+// 关单词 + 引用（#号、GH-号、owner/repo#号、issue / PR 链接）。宽一点比漏一点安全：分隔可以跨行、可以有冒号（半角全角）、
+// 尖括号、圆括号；链接可以不带 https、可以带 www。比对前先把正文「抹平」（plain）：
+// - Markdown 的 * ` ~ 全删；_ 只在词的两头删（`_Closes_` 要剥掉，`my_org/my_repo` 要保留，不然两个不同的仓会被当成同一个）；
+// - 常见行内 HTML 标签去掉、Markdown 链接 [文字](地址) 拆成「文字 地址」；
+// - #、数字的全角写法和 HTML 实体（&#35; &#x23; &num;）还原成 #；零宽、不可见分隔字符去掉。
+const CLOSING = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b[\s:：<(\[]*((?:[\w.-]+\/[\w.-]+)?#\d+|gh-\d+|(?:https?:\/\/)?(?:www\.)?github\.com\/[^\s)>\]]+\/(?:issues|pull)\/\d+)/gi;
 const MARKER = /\[验收机\]\s*修正/g;
 const TASK_LINE = /任务\s*issue\s*[:：]/gi;
-const plain = (text) => String(text ?? '').replace(/[*_`~]/g, '').replace(/\u200b|\u200c|\u200d|\ufeff/g, '');
+const INLINE_TAG = /<\/?(?:a|b|i|u|s|em|strong|code|span|sub|sup|kbd|del|ins|mark|small|big|tt)\b[^>]*>/gi;
+const plain = (text) => String(text ?? '')
+  .normalize('NFKC')
+  .replace(/&#0*35;|&#x0*23;|&num;/gi, '#')
+  .replace(/[\u00ad\u180e\u200b-\u200f\u2060-\u2064\ufeff]/g, '')
+  .replace(INLINE_TAG, '')
+  .replace(/\[([^\]]*)\]\(([^)]*)\)/g, '$1 $2')
+  .replace(/[*`~]|(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])/g, '');
 const closingRefs = (text) => new Set([...plain(text).matchAll(CLOSING)].map((match) => match[0].toLowerCase().replace(/\s+/g, ' ')));
 const countOf = (text, pattern) => [...plain(text).replace(/\s+/g, ' ').matchAll(pattern)].length;
 
