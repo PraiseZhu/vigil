@@ -22,6 +22,7 @@ import { planBaseUpdate, updateBaseBranch, reconcileBaseUpdate, pendingActionDue
 import { autoCleanupWatch, command as gitDefaultFn, validationMergeBase, KEEL_FLOW_VERSION, keelLedgerProblem, keelLedgerRoot, keelNamespace, keelRunIdFor, readActivityAt, ADJUDICATION_RECORD_VERSION, pluginRepoPath, watchWorktreePath, findingMarkerOf, childPrListArgs, parseOpenChildPrs, childPrDraftPaths, childPrHandoffSpec, CHILD_PR_PLACEHOLDER } from './mivo-repair.mjs';
 import { PARSER_VERSION, canonicalRuntime, runtimeSha256 } from './mivo-validation-evidence.mjs';
 import { enqueueNotice } from './notify.mjs';
+import { checkDeploymentDriftDaily } from './mivo-deploy-drift.mjs';
 import { optionalConfig, requireConfig, preflightSelfReviewEnabled } from './profile.mjs';
 import { triageText } from './mivo-ci-triage.mjs';
 import { collectMivoCiSteps } from './mivo-ci.mjs';
@@ -4581,8 +4582,24 @@ export function* discoverWorkflow({
   const closedownManual = listPrs(paths.home)
     .filter((entry) => entry?.closedownManual)
     .map((entry) => ({ number: entry.number, nodeId: entry.nodeId, ...entry.closedownManual }));
+  const deployDrift = dryRun ? null : deployDriftCheck({ home: paths.home, now, events });
   return { mode: 'discover', dispatch: !dryRun, viewer, repo: REPO, prs: report, events, closedownManual, mergeStates, scan: { cursor: index.cursor ?? 0, listed: listed.length },
-    ...(otherPrs ? { otherPrs } : {}) };
+    ...(otherPrs ? { otherPrs } : {}), ...(deployDrift ? { deployDrift } : {}) };
+}
+
+// Once a day: are the files in this runtime's bin/ still the ones deploy.mjs installed? A failed check is an event,
+// never a failed round.
+export function deployDriftCheck({ home, now, events, binDir = path.dirname(fileURLToPath(import.meta.url)) }) {
+  try {
+    const result = checkDeploymentDriftDaily({ home, binDir, now, notify: (event) => enqueueNotice(home, event) });
+    if (result.status === 'drift' || result.status === 'unreadable') {
+      events.push({ kind: 'deploy-drift', status: result.status, files: result.drifted.map(({ name, kind }) => ({ name, kind })), noticeId: result.noticeId });
+    }
+    return { status: result.status, drifted: (result.drifted ?? []).length };
+  } catch (error) {
+    events.push({ kind: 'deploy-drift-check-failed', error: String(error?.message ?? error).slice(0, 300) });
+    return { status: 'check-failed' };
+  }
 }
 
 function driveSync(iterator, shared = { errors: [] }) {
