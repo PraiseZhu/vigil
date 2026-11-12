@@ -52,9 +52,39 @@ function outsideModules(sourceDir){
  }
  return out;
 }
+// bin/../../acceptance/bin/net-errors.mjs 落在 runtime home 的上一级。同一父目录下的 cindy 与 mivo 共用这一份。
+function outsideDest(runtime,rel){
+ return path.resolve(path.join(runtime,'bin'),rel);
+}
+function outsideBackupPath(record,rel){
+ return path.join(record,'before','outside',rel.replaceAll('..','__up__'));
+}
+function backupOutsideModules(runtime,record,sourceDir=path.join(here,'bin')){
+ const backups=[];
+ for(const rel of outsideModules(sourceDir)){
+  const dest=outsideDest(runtime,rel),existed=fs.existsSync(dest);
+  if(existed){
+   const backup=outsideBackupPath(record,rel);
+   fs.mkdirSync(path.dirname(backup),{recursive:true,mode:0o700});
+   fs.copyFileSync(dest,backup);
+  }
+  backups.push({rel,existed});
+ }
+ return backups;
+}
+function rollbackOutsideModules(runtime,record,backups){
+ for(const {rel,existed} of [...backups].reverse()){
+  const dest=outsideDest(runtime,rel);
+  if(existed){
+   const backup=outsideBackupPath(record,rel),tmp=dest+`.rollback-${process.pid}`;
+   fs.mkdirSync(path.dirname(dest),{recursive:true,mode:0o700});
+   fs.copyFileSync(backup,tmp);fs.chmodSync(tmp,0o755);fs.renameSync(tmp,dest);
+  }else if(fs.existsSync(dest))fs.unlinkSync(dest);
+ }
+}
 function installOutsideModules(runtime,sourceDir=path.join(here,'bin')){
  for(const rel of outsideModules(sourceDir)){
-  const src=path.resolve(sourceDir,rel),dest=path.resolve(path.join(runtime,'bin'),rel);
+  const src=path.resolve(sourceDir,rel),dest=outsideDest(runtime,rel);
   requireValue(fs.existsSync(src),`deploy missing companion module: ${rel}`);
   fs.mkdirSync(path.dirname(dest),{recursive:true,mode:0o700});
   const tmp=dest+`.install-${process.pid}`;
@@ -74,7 +104,9 @@ export function checkManifestCompleteness(sourceDir=path.join(here,'bin')){
 }
 export function verify(runtime,source=path.join(here,'bin')) {
  checkManifestCompleteness(source);
- return FILES.map(name=>({name,source:sha(path.join(source,name)),runtime:sha(path.join(runtime,'bin',name))}));
+ const binFiles=FILES.map(name=>({name,source:sha(path.join(source,name)),runtime:sha(path.join(runtime,'bin',name))}));
+ const extras=[...outsideModules(source)].sort().map(name=>({name,source:sha(path.resolve(source,name)),runtime:sha(outsideDest(runtime,name))}));
+ return [...binFiles,...extras];
 }
 function identitiesFromState(state){
  const ids=Object.values(state.prs||{}).map(v=>v.sessionId).filter(Boolean).sort();
@@ -115,7 +147,11 @@ export function validatePlan(plan,sourceDir=path.join(here,'bin')){
  checkManifestCompleteness(sourceDir);
  requireValue(plan?.version===1&&path.isAbsolute(plan.home)&&path.isAbsolute(plan.database)&&plan.database.endsWith('.db'),'invalid runtime/database');
  requireValue(/^[a-z0-9][a-z0-9-]{1,80}$/.test(plan.id),'invalid release id');
- requireValue(Array.isArray(plan.files)&&plan.files.length===FILES.length&&new Set(plan.files.map(f=>f.name)).size===FILES.length&&plan.files.every(f=>FILES.includes(f.name)&&/^[a-f0-9]{64}$/.test(f.source)&&(f.runtime===null||/^[a-f0-9]{64}$/.test(f.runtime))),'invalid artifact manifest');
+ const allowedOutside=outsideModules(sourceDir);
+ const binItems=(plan.files??[]).filter(f=>FILES.includes(f.name));
+ const extraItems=(plan.files??[]).filter(f=>!FILES.includes(f.name));
+ requireValue(Array.isArray(plan.files)&&binItems.length===FILES.length&&new Set(binItems.map(f=>f.name)).size===FILES.length&&binItems.every(f=>/^[a-f0-9]{64}$/.test(f.source)&&(f.runtime===null||/^[a-f0-9]{64}$/.test(f.runtime))),'invalid artifact manifest');
+ requireValue(extraItems.every(f=>allowedOutside.has(f.name)&&/^[a-f0-9]{64}$/.test(f.source)&&(f.runtime===null||/^[a-f0-9]{64}$/.test(f.runtime))),'invalid artifact manifest');
  requireValue(/^[a-f0-9]{64}$/.test(plan.stateSha),'missing state identity');
  requireValue(Array.isArray(plan.sessionIds),'missing session identities');
 }
@@ -127,36 +163,39 @@ export function apply(plan){
   requireValue(stateFingerprint(plan.home)===plan.stateSha,'state changed since preview');
   requireValue(JSON.stringify(identities(plan.home))===JSON.stringify(plan.sessionIds),'session binding changed');
   idle(plan.database,plan.sessionIds);
-  for(const item of plan.files){requireValue(sha(path.join(here,'bin',item.name))===item.source,'source changed since preview');requireValue(sha(path.join(plan.home,'bin',item.name))===item.runtime,'runtime changed since preview');}
+  for(const item of plan.files){requireValue(sha(path.resolve(path.join(here,'bin'),item.name))===item.source,'source changed since preview');requireValue(sha(path.resolve(path.join(plan.home,'bin'),item.name))===item.runtime,'runtime changed since preview');}
  };
  check();
  // Never steal a live or unknown lease. Let the watcher recover stale leases.
  fs.writeFileSync(lease,owner,{flag:'wx',mode:0o600});
  const installed=[];
+ let outsideBackups=[];
  try{
   check();requireValue(!fs.existsSync(record),'release id already exists');
   fs.mkdirSync(path.join(record,'before'),{recursive:true,mode:0o700});
   if(fs.existsSync(state))fs.copyFileSync(state,path.join(record,'before/state.json'));
   fs.writeFileSync(path.join(record,'manifest.json'),JSON.stringify(plan,null,2),{mode:0o600});
   for(const item of plan.files){
-   if(item.runtime===item.source)continue;
+   if(isOutsideBin(item.name)||item.runtime===item.source)continue;
    const target=path.join(plan.home,'bin',item.name),tmp=target+`.install-${process.pid}`;
    requireValue(sha(target)===item.runtime&&sha(path.join(here,'bin',item.name))===item.source,'artifact changed during install');
    if(item.runtime)fs.copyFileSync(target,path.join(record,'before',item.name));
    fs.copyFileSync(path.join(here,'bin',item.name),tmp);fs.chmodSync(tmp,0o755);fs.renameSync(tmp,target);installed.push(item);
   }
+  outsideBackups=backupOutsideModules(plan.home,record);
   installOutsideModules(plan.home);
   requireValue(stateFingerprint(plan.home)===plan.stateSha,'state changed during install');idle(plan.database,plan.sessionIds);
   requireValue(verify(plan.home).every(v=>v.source===v.runtime),'installed hash mismatch');
   // The watcher compares bin/ with this once a day (mivo-deploy-drift.mjs); a partial copy no longer looks healthy.
-  writeDeployManifest({home:plan.home,release:plan.id,...sourceIdentity(),files:plan.files.map(item=>({name:item.name,sha256:item.source}))});
+  writeDeployManifest({home:plan.home,release:plan.id,...sourceIdentity(),files:plan.files.filter(item=>FILES.includes(item.name)).map(item=>({name:item.name,sha256:item.source}))});
   const receipt={status:'installed',at:new Date().toISOString(),files:plan.files,stateChanged:false,sessionIds:plan.sessionIds,schedulerChanged:false,databaseChanged:false};
   fs.writeFileSync(path.join(record,'receipt.json'),JSON.stringify(receipt,null,2),{mode:0o600});return receipt;
  }catch(error){
   for(const item of installed.reverse()){
    const target=path.join(plan.home,'bin',item.name),tmp=target+`.rollback-${process.pid}`;
    if(item.runtime){fs.copyFileSync(path.join(record,'before',item.name),tmp);fs.chmodSync(tmp,0o755);fs.renameSync(tmp,target);}else fs.unlinkSync(target);
-  }throw error;
+  }
+  rollbackOutsideModules(plan.home,record,outsideBackups);throw error;
  }finally{if(fs.existsSync(lease)&&fs.readFileSync(lease,'utf8')===owner)fs.unlinkSync(lease);}
 }
 if(process.argv[1]&&fs.realpathSync(process.argv[1])===fileURLToPath(import.meta.url)){
