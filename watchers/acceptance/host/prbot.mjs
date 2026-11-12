@@ -17,6 +17,7 @@ import { redact } from '../bin/redact.mjs';
 import { isTrustedAuthor } from '../bin/trusted-author.mjs';
 import { appendAlert, hostPaths, isAlive, readAlerts, readLockPayload, releaseLock, tryAcquireLock } from './paths.mjs';
 import { appendPrbotEvent } from './prbot-events.mjs';
+import { createHoldChecker } from './prbot-hold.mjs';
 import { localEnv } from '../bin/localgit.mjs';
 import { run as procRun } from './proc.mjs';
 import { MEMORY_GATE_BYTES, acquireSerialLocks, acquireSlot, readHostConfig, readMemAvailable, releaseSerialLocks, serialLockFiles } from './round.mjs';
@@ -340,6 +341,8 @@ export async function discoverCorrections({ github, profile, now = () => Date.no
   if (paths && fs.existsSync(path.join(paths.prbotDir, 'PAUSED'))) return out;
   const tasks = Array.isArray(pulledTasks) ? pulledTasks : await collectTasks(github, profile);
   const nowMs = now();
+  // 按 issue 挂起（hold.json）：没有文件时 hold 为空操作，不读 GitHub、不写文件。
+  const hold = paths ? createHoldChecker({ paths, github, now, profile }) : null;
   for (const task of tasks) {
     if (task.tier !== 'auto') continue;
     const latest = latestRound(task.rounds);
@@ -362,6 +365,8 @@ export async function discoverCorrections({ github, profile, now = () => Date.no
       const correctionRepo = parseRef(correction.ref).repo;
       const scope = repoTier(correctionRepo, profile);
       if (!scope || scope.tier !== 'auto') continue;
+      // 挂起中：不认领、不做开跑前检查（省下它的只读），日志只记一次。
+      if (hold && (await hold.isHeld(correction.ref))) continue;
       // 已经收尾、或者要报的「需人工处理」已经报过的修正：不再每拍起一个进程（它会先占槽再发现没事做）。
       if (hostConfig !== undefined) {
         let pre;
@@ -1537,6 +1542,8 @@ export async function runPrbotCorrection({
 
   // 0. 开跑前的只读检查：不占槽、不拿锁。没事做 / 要报的需人工处理已报过，就不挤掉验收轮的槽。
   if (fs.existsSync(pausedFile)) return 3;
+  // 手工起的修正轮也认挂起：挂着就什么都不写，安静退出。
+  if (await createHoldChecker({ paths, github: gateGithub, now, profile: acceptanceProfile }).isHeld(issue)) return 3;
   let pre;
   try {
     pre = await correctionPrecheck({ github: gateGithub, profile: acceptanceProfile, issue, hostConfig: settings });
