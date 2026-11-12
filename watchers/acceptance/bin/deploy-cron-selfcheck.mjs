@@ -92,7 +92,10 @@ function plausible(lines, expectScript) {
   if (!base) return false;
   return lines.some((line) => {
     const body = line.trim().replace(/^#+\s*/, '');
-    if (!body || body.includes(expectScript)) return false;
+    if (!body) return false;
+    // The script path is on the line but candidatesFrom found no entry: quoted with spaces, glued to other characters
+    // and the like. That is a form this check cannot read, not a missing entry (#373).
+    if (body.includes(expectScript)) return true;
     return tokenize(body).some((token) => path.basename(token.replace(/["']/g, '')) === base);
   });
 }
