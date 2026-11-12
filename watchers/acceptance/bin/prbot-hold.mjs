@@ -20,6 +20,8 @@ const USAGE = [
   '  add <owner/repo#n> --reason <原因> (--until-time <ISO 时间> | --until-merged <分支> [--into <base>] [--repo <owner/repo>] | --manual)',
   '  remove <owner/repo#n>',
   '  list',
+  '  --help',
+  'merged 条件只认 PR 合并；不经 PR 直推 main 要人工 remove。',
 ].join('\n');
 
 function optionValue(args, name) {
@@ -67,9 +69,13 @@ export function runHoldCli(argv, { home, now = () => Date.now(), stdout = proces
     stderr.write(`${message}\n`);
     return 1;
   };
+  const [command, ...args] = argv;
+  if (!command || command === '--help' || command === '-h' || command === 'help') {
+    stdout.write(`${USAGE}\n`);
+    return 0;
+  }
   if (typeof home !== 'string' || !path.isAbsolute(home)) return fail('需要绝对路径的 ACCEPTANCE_WATCHER_HOME');
   const paths = hostPaths(home);
-  const [command, ...args] = argv;
   if (command === 'list') {
     const { rows, problems } = describeHolds(paths, { now });
     for (const problem of problems) stdout.write(`! ${problem}\n`);

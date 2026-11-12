@@ -6,6 +6,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { decideTick, readRateState } from '../bin/rate-budget.mjs';
 import { appendAlert } from './paths.mjs';
 
 export const HOLD_FILE_VERSION = 1;
@@ -174,8 +175,28 @@ function appendHoldLog(paths, line) {
 }
 
 /**
+ * merged 查询能不能发：复用主循环那道剩余闸。只拦 remaining-below-800；
+ * 没有状态文件、头未知、判定出错都放行（不把闸本身的故障变成误挂）。不写回额度状态。
+ */
+function allowMergedQuery(paths, nowMs) {
+  try {
+    if (!paths?.rateState) return true;
+    const decided = decideTick({
+      component: 'loop',
+      purpose: 'non-essential',
+      state: readRateState(paths.rateState),
+      now: nowMs,
+    });
+    return decided.reason !== 'remaining-below-800';
+  } catch {
+    return true;
+  }
+}
+
+/**
  * 一拍用一个：读一次 hold.json；isHeld(issue) 判断这个修正子 issue 现在是否挂起。
  * merged 条件同一拍内同一条件只查一次，跨拍至少隔 HOLD_MERGE_CHECK_MIN_MS；查询失败照旧挂着。
+ * 剩余低于 800（decideTick 的 remaining-below-800，与主循环非必要读同一道闸）时不发查询，继续挂着，也不记成已查过。
  * 没有 hold.json（或为空）时不碰 GitHub、不写任何文件。
  */
 export function createHoldChecker({ paths, github, now = () => Date.now(), profile } = {}) {
@@ -207,7 +228,13 @@ export function createHoldChecker({ paths, github, now = () => Date.now(), profi
     const nowMs = now();
     const last = Date.parse(state.checks[condKey] || '');
     let result = false;
-    if (!(Number.isFinite(last) && last <= nowMs && nowMs - last < HOLD_MERGE_CHECK_MIN_MS) && github?.graphql) {
+    const due = !(Number.isFinite(last) && last <= nowMs && nowMs - last < HOLD_MERGE_CHECK_MIN_MS) && github?.graphql;
+    // 低于 800 全面暂停非必要读：这条查询不发、不记成已查过，下一次额度够了再查。判定自身出错则放行，和主循环 rateGate 一致。
+    if (due && !allowMergedQuery(paths, nowMs)) {
+      mergeCache.set(condKey, false);
+      return false;
+    }
+    if (due) {
       state.checks[condKey] = new Date(nowMs).toISOString();
       dirty = true;
       try {

@@ -231,7 +231,8 @@ build / typecheck / test 的结果看本 PR 的检查，正文不写没发生的
 - `merged` 用一条宿主只读查询 `MERGED_PR_QUERY`（`host/prbot-hold.mjs`，不经写闸、不是登记给沙箱的查询），
   和发现阶段其余只读同一个客户端、计入 loop 的本小时用量。同一条件同一拍只查一次，跨拍至少隔 15 分钟（查询失败也算查过）：
   每个不同的 `repo/branch/base` 每小时最多 4 点。挂起的 issue 跳过了开跑前检查（每拍至少 1 次读评论），所以挂着时每拍总点数只减不增。
-  只认 PR 合并；不走 PR 直接推进 base 的，用 `remove` 人工解除。查询失败、返回结构不对：继续挂着，不误解除。
+  只认 PR 合并；不经 PR 直推 main 要人工 remove。查询失败、返回结构不对或触发限流：继续挂着，不误解除。
+  剩余低于 800（与主循环非必要读同一道闸，`decideTick` 的 `remaining-below-800`；恰好 800 仍查）时不发这条查询，也不记成已查过。
 - 日志：`state/prbot/hold.log`（JSON 行），同一条挂起只记一次 `held`（带原因和到期条件），解除记一次 `released`；
   去重记录在 `state/prbot/hold-seen.json`。挂起不发提醒、不进 `events.jsonl`（不进 Slack）。
 - 文件不存在或只有空白：和没有这个功能完全一样，不查 GitHub、不写任何文件。

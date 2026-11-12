@@ -4,9 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { RateLimitError } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { correctionBody } from './bin/correct.mjs';
 import { runHoldCli } from './bin/prbot-hold.mjs';
+import { emptyRateState, recordHeader, writeRateState } from './bin/rate-budget.mjs';
 import { hostPaths, readAlerts } from './host/paths.mjs';
 import { discoverCorrections, runPrbotCorrection } from './host/prbot.mjs';
 import { HOLD_MERGE_CHECK_MIN_MS, MERGED_PR_QUERY, holdFilePath, holdLogPath } from './host/prbot-hold.mjs';
@@ -164,14 +166,18 @@ test('SC2/SC3 挂起的 issue 不认领、写操作 0 次；同仓未挂起的�
   assert.equal(fs.existsSync(path.join(paths.prbotRoundsDir, 'example-owner__example-repo__9.json')), false, '不建修正轮状态');
 });
 
-test('SC4 按时间到期：到期前 1ms 仍挂着，刚好到期时解除', async () => {
+test('SC4 按时间到期：到期前 1ms 仍挂着，刚好等于 now 和到期后 1ms 都解除', async () => {
   const { paths, time, discover } = setup();
   const at = '2026-10-24T06:00:00.000Z';
+  const atMs = Date.parse(at);
   writeHolds(paths, [{ issue: HELD, reason: '等到点', until: { type: 'time', at } }]);
-  time.set(Date.parse(at) - 1);
-  assert.deepEqual(await discover(), [FREE]);
-  time.set(Date.parse(at));
-  assert.deepEqual(await discover(), [HELD, FREE]);
+  // now < at 继续挂着；now >= at（刚好到期、到期后 1ms）解除。
+  time.set(atMs - 1);
+  assert.deepEqual(await discover(), [FREE], '到期前 1ms 仍挂着');
+  time.set(atMs);
+  assert.deepEqual(await discover(), [HELD, FREE], '刚好等于 now 时解除');
+  time.set(atMs + 1);
+  assert.deepEqual(await discover(), [HELD, FREE], '到期后 1ms 仍解除');
   assert.deepEqual(holdLog(paths).map((line) => line.event), ['held', 'released']);
 });
 
@@ -286,5 +292,121 @@ test('SC8 CLI：add / remove / list，非法引用和缺条件被拒', async () 
 
 test('文档：docs/acceptance-prbot.md 有挂起一节', () => {
   const doc = fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'docs', 'acceptance-prbot.md'), 'utf8');
-  for (const word of ['hold.json', 'prbot-hold.mjs', 'until-merged', 'prbot-hold-invalid', 'MERGED_PR_QUERY']) assert.ok(doc.includes(word), `文档没写「${word}」`);
+  for (const word of ['hold.json', 'prbot-hold.mjs', 'until-merged', 'prbot-hold-invalid', 'MERGED_PR_QUERY', '不经 PR 直推 main 要人工 remove', 'remaining-below-800']) {
+    assert.ok(doc.includes(word), `文档没写「${word}」`);
+  }
+});
+
+function setRemaining(paths, remaining, nowMs) {
+  const reset = String(Math.floor(nowMs / 1000) + 3600);
+  writeRateState(paths.rateState, recordHeader(emptyRateState(), {
+    identity: 'user',
+    remaining,
+    reset,
+    at: nowMs,
+  }));
+}
+
+test('SC6 整份是合法 JSON 但不是预期对象：按全部不挂起处理，同一份内容只报一次 prbot-hold-invalid', async () => {
+  const cases = [
+    ['数组', '[]'],
+    ['空对象', '{}'],
+    ['数字', '1'],
+    ['字符串', '"holds"'],
+    ['null', 'null'],
+  ];
+  for (const [label, body] of cases) {
+    const { paths, discover } = setup();
+    fs.mkdirSync(paths.prbotDir, { recursive: true });
+    fs.writeFileSync(holdFilePath(paths), body);
+    assert.deepEqual(await discover(), [HELD, FREE], `${label} 应按不挂起处理`);
+    assert.deepEqual(await discover(), [HELD, FREE]);
+    assert.deepEqual(await discover(), [HELD, FREE]);
+    const alerts = readAlerts(paths).filter((alert) => alert.kind === 'prbot-hold-invalid');
+    assert.equal(alerts.length, 1, `${label} 应只报一次，实际 ${alerts.length}`);
+    assert.match(alerts[0].detail, /应为 \{ "version": 1, "holds": \[\.\.\.\] \}/);
+  }
+});
+
+test('空名单：发现结果与没有功能时一样，不发提醒、不查合入、不多写文件', async () => {
+  const { paths, merged, discover } = setup();
+  writeHolds(paths, []);
+  const before = prbotFiles(paths);
+  assert.deepEqual(await discover(), [HELD, FREE]);
+  assert.deepEqual(prbotFiles(paths), before);
+  assert.equal(merged.calls.length, 0);
+  assert.deepEqual(readAlerts(paths), []);
+});
+
+test('SC6 单条 until 类型未知或缺字段：这一条继续挂着，未坏的条目照常判定', async () => {
+  const { paths, discover } = setup();
+  writeHolds(paths, [
+    { issue: HELD, reason: '类型未知', until: { type: 'someday' } },
+    { issue: FREE, reason: '缺 at', until: { type: 'time' } },
+  ]);
+  assert.deepEqual(await discover(), []);
+  writeHolds(paths, [
+    { issue: HELD, reason: '缺 branch', until: { type: 'merged', base: 'main' } },
+    { issue: FREE, reason: '没写 until' },
+  ]);
+  assert.deepEqual(await discover(), []);
+  const alerts = readAlerts(paths).filter((alert) => alert.kind === 'prbot-hold-invalid');
+  assert.equal(alerts.length, 2, '两份不同内容各报一次');
+});
+
+test('同一 issue 重复条目：任意一条仍挂着则不认领，全部到期才解除', async () => {
+  const { paths, time, discover } = setup();
+  const at = '2026-10-24T06:00:00.000Z';
+  writeHolds(paths, [
+    { issue: HELD, reason: '已到期', until: { type: 'time', at }, addedAt: '2026-10-24T04:00:00.000Z' },
+    { issue: HELD, reason: '还要挂', until: { type: 'manual' }, addedAt: '2026-10-24T04:01:00.000Z' },
+  ]);
+  time.set(Date.parse(at) + 1);
+  assert.deepEqual(await discover(), [FREE], '有一条还挂着就不认领');
+  writeHolds(paths, [
+    { issue: HELD, reason: '到期甲', until: { type: 'time', at }, addedAt: '2026-10-24T04:00:00.000Z' },
+    { issue: HELD, reason: '到期乙', until: { type: 'time', at }, addedAt: '2026-10-24T04:01:00.000Z' },
+  ]);
+  assert.deepEqual(await discover(), [HELD, FREE], '全部到期才解除');
+});
+
+test('issue 引用大小写不同视为同一条', async () => {
+  const { paths, discover } = setup();
+  writeHolds(paths, [{ issue: 'Example-Owner/Example-Repo#9', reason: '大小写', until: { type: 'manual' } }]);
+  assert.deepEqual(await discover(), [FREE], 'example-owner/example-repo#9 应被 Example-Owner/Example-Repo#9 挂起');
+});
+
+test('SC5 查询抛出 RateLimitError 时保持挂起、不解除', async () => {
+  const { paths, time, merged, discover } = setup();
+  writeHolds(paths, [{ issue: HELD, reason: '等集成分支', until: { type: 'merged', branch: 'integration/demo', base: 'main' } }]);
+  merged.answer = () => {
+    throw new RateLimitError('API rate limit already exceeded', { remaining: '0', reset: String(Math.floor(Date.parse(T0) / 1000) + 3600) });
+  };
+  assert.deepEqual(await discover(), [FREE]);
+  assert.equal(merged.calls.length, 1);
+  time.set(Date.parse(T0) + HOLD_MERGE_CHECK_MIN_MS - 1);
+  assert.deepEqual(await discover(), [FREE], '限流后 15 分钟内不再查，仍挂着');
+  assert.equal(merged.calls.length, 1);
+});
+
+test('SC5 剩余低于 800 不发 MERGED_PR_QUERY；恰好 800 才查', async () => {
+  const { paths, time, merged, discover } = setup();
+  writeHolds(paths, [{ issue: HELD, reason: '等集成分支', until: { type: 'merged', branch: 'integration/demo', base: 'main' } }]);
+  merged.answer = () => ({ repository: { pullRequests: { nodes: [{ number: 5, mergedAt: '2026-10-24T05:00:00Z' }] } } });
+  setRemaining(paths, 799, Date.parse(T0));
+  assert.deepEqual(await discover(), [FREE], '剩余 799：不查、不解除');
+  assert.equal(merged.calls.length, 0);
+  time.set(Date.parse(T0) + 1000);
+  setRemaining(paths, 800, time.now());
+  assert.deepEqual(await discover(), [HELD, FREE], '剩余恰好 800：放行查询，合入则解除');
+  assert.equal(merged.calls.length, 1);
+});
+
+test('CLI --help 写明「不经 PR 直推 main 要人工 remove」', () => {
+  const out = { text: '', write(chunk) { this.text += chunk; } };
+  const err = { text: '', write(chunk) { this.text += chunk; } };
+  const code = runHoldCli(['--help'], { stdout: out, stderr: err });
+  assert.equal(code, 0);
+  assert.equal(err.text, '');
+  assert.match(out.text, /不经 PR 直推 main 要人工 remove/);
 });
