@@ -910,6 +910,7 @@ touch <state-dir>/disabled
 | `<state-dir>/authorized-repos.json` | `--write` 的授权清单。没有这个文件，或者仓名不在里面，该仓只做 dry-run |
 | `<state-dir>/disabled` | 停写开关 |
 | `<state-dir>/alerts.jsonl` | 告警。也可用 `--alerts-file` 换路径。不推到别处 |
+| `--alert-dedupe-hours N` | 同一条告警（同 kind、同文案）多少小时内不重复写，默认 24。只看窗口内的旧行，过了窗口再发生会重新写一条；缺时间或时间不合法的旧行不算。0、负数、小数、非数字在读令牌之前报错，信息里有期望和实际值 |
 | `<state-dir>/fail-streak` | 连续多少拍遇到找不到或 5xx。满 3 拍自动停写 |
 | `<state-dir>/repo-class.json` | 仓分类，沿用 prio-sync。本入口不改这张表 |
 

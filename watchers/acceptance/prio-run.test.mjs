@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { REPO, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 import { DOWNGRADE_MIN_GAP_MS } from './bin/prio-score.mjs';
 import { ONLY_FIELD_NAMES, PRIO_HOURLY_MAX, PRIO_HOURLY_WINDOW_MS } from './bin/prio-sync.mjs';
-import { alertTextFor, hostFilesFromEnv, main, parseMaxPerTick, parsePrioRunArgs } from './bin/prio-run.mjs';
+import { ALERT_DEDUPE_HOURS_DEFAULT, alertTextFor, hostFilesFromEnv, main, parseAlertDedupeHours, parseMaxPerTick, parsePrioRunArgs } from './bin/prio-run.mjs';
 import { hostPaths, tryAcquireLock } from './host/paths.mjs';
 
 const T0 = Date.parse('2026-10-31T12:00:00.000Z');
@@ -1798,4 +1798,82 @@ test('#236 停写之后下一拍不补写，也不回滚已写的那条', async 
   const next = await run(dir, ['--write', '--only-field', '关联 PR'], options);
   assert.equal(next.writes.length, 0, '停写开关在，下一拍一条都不写（也没有回滚写入）');
   assert.equal(disabled(dir), true);
+});
+
+// #235：告警去重只看最近一个窗口（默认 24 小时，左开右闭），不再被几天前的同一条告警吞掉。
+const READBACK_TEXT = alertTextFor('readback');
+function seedAlert(dir, row) {
+  fs.appendFileSync(path.join(dir, 'alerts.jsonl'), `${typeof row === 'string' ? row : JSON.stringify(row)}\n`);
+}
+async function readbackMismatchTick(dir, args = []) {
+  allow(dir, [REPO]);
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  try { fs.unlinkSync(path.join(dir, 'disabled')); } catch { /* 第一次没有 */ }
+  return run(dir, ['--write', '--only-field', '关联 PR', ...args], {
+    items: [item(1, { id: 'PVTI_1' })],
+    prs: [closingPr(9, 1)],
+    readBack: phasedReadBack(() => '#9(open)'),
+  });
+}
+const iso = (ms) => new Date(ms).toISOString();
+
+test('#235 SC1 窗口内（1 小时前）已有同一条：不追加', async () => {
+  const dir = tmpDir();
+  seedAlert(dir, { ts: iso(T0 - HOUR), kind: 'prio-readback', text: READBACK_TEXT });
+  const { result } = await readbackMismatchTick(dir);
+  assert.equal(result.stop, 'readback');
+  assert.equal(readAlerts(dir).length, 1);
+});
+
+test('#235 SC2 窗口外（25 小时前）的同一条：追加一行', async () => {
+  const dir = tmpDir();
+  seedAlert(dir, { ts: iso(T0 - 25 * HOUR), kind: 'prio-readback', text: READBACK_TEXT });
+  await readbackMismatchTick(dir);
+  const rows = readAlerts(dir);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].ts, iso(T0));
+});
+
+test('#235 SC3 旧行恰好在窗口左边界（now − 24h）上：算窗口外，追加', async () => {
+  const dir = tmpDir();
+  seedAlert(dir, { ts: iso(T0 - 24 * HOUR), kind: 'prio-readback', text: READBACK_TEXT });
+  await readbackMismatchTick(dir);
+  assert.equal(readAlerts(dir).length, 2);
+});
+
+test('#235 SC4 文件不存在、空文件、坏行、缺 ts、ts 不合法：都不抛错，后三种按窗口外处理', async () => {
+  const missing = tmpDir();
+  assert.equal((await readbackMismatchTick(missing)).result.stop, 'readback');
+  assert.equal(readAlerts(missing).length, 1);
+  const empty = tmpDir();
+  fs.writeFileSync(path.join(empty, 'alerts.jsonl'), '');
+  await readbackMismatchTick(empty);
+  assert.equal(readAlerts(empty).length, 1);
+  for (const bad of ['{不是 JSON', { kind: 'prio-readback', text: READBACK_TEXT }, { ts: 'yesterday', kind: 'prio-readback', text: READBACK_TEXT }]) {
+    const dir = tmpDir();
+    seedAlert(dir, bad);
+    const { result } = await readbackMismatchTick(dir);
+    assert.equal(result.stop, 'readback');
+    const written = fs.readFileSync(path.join(dir, 'alerts.jsonl'), 'utf8').split('\n')
+      .filter((line) => line.includes(`"ts":"${iso(T0)}"`));
+    assert.equal(written.length, 1, JSON.stringify(bad));
+  }
+});
+
+test('#235 SC5 窗口参数：不传用 24；0、负数、小数、非数字在读令牌之前报错，带期望与实际值', async () => {
+  assert.equal(ALERT_DEDUPE_HOURS_DEFAULT, 24);
+  assert.equal(parseAlertDedupeHours('48'), 48);
+  for (const raw of ['0', '-3', '1.5', 'abc']) {
+    const dir = tmpDir();
+    const { result, seen } = await run(dir, ['--write', '--alert-dedupe-hours', raw], { items: fills(1) });
+    assert.equal(result.exitCode, 1, raw);
+    assert.match(result.error.message, /期望正整数小时/);
+    assert.match(result.error.message, new RegExp(`实际：${raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.equal(seen.token, 0, raw);
+    assert.equal(seen.network, 0, raw);
+  }
+  const dir = tmpDir();
+  seedAlert(dir, { ts: iso(T0 - 3 * HOUR), kind: 'prio-readback', text: READBACK_TEXT });
+  await readbackMismatchTick(dir, ['--alert-dedupe-hours', '2']);
+  assert.equal(readAlerts(dir).length, 2, '窗口改成 2 小时后，3 小时前那条在窗口外');
 });
