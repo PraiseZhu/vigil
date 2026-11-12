@@ -1310,7 +1310,7 @@ function bodyCell(text) {
 }
 
 /**
- * 修正 PR 正文（task-pr/v1，和修正子 issue 逐段对应）：首行链任务 issue；第二行「Closes <修正子 issue>」
+ * 修正 PR 正文（task-pr/v1，和修正子 issue 逐段对应）：首行链任务 issue；第二行「Closes <修正子 issue>」；第三行「任务 issue：<修正子 issue>」
  * （合并后 GitHub 关掉修正子 issue，trigger 才会再验）；最后一行修正标记原样照抄修正子 issue 的（轮次是验收轮，不是修正轮）。
  * 这三行写闸都认，不能动。正文只在 pr.create 时写一次（写闸没有改 PR 正文的动作），所以状态只写开 PR 时已有的证据。
  */
@@ -1318,6 +1318,9 @@ export function correctionPrBody(state, marker) {
   const prRepo = state.prRepo || parseRef(state.issue || state.root).repo;
   const head = [`任务 issue：${state.root}`];
   if (state.issue) head.push(closesLine(state.issue, prRepo));
+  // 第三行指向修正子 issue（#170）：本机 PR 正文检查认「任务 issue：<修正子 issue>」。前两行和末尾的修正标记行不动，
+  // 写闸认首行；pr-link 反查本来就从 Closes 行认到修正子 issue，多这一行不改变关联结果。
+  if (state.issue) head.push(`任务 issue：${state.issue}`);
   const facts = state.correctionFacts || {};
   const correctionBody = state.correctionBody || state.correctionIssueBody;
   const details =

@@ -922,3 +922,38 @@ test('#60 修正 pr.ready：fork 仓名大小写不同也认；workflow 还在�
   assert.equal(ready.code, 0, JSON.stringify(ready));
   assert.deepEqual(written.map((action) => action.type), ['pr.ready']);
 });
+
+test('#170 修正 PR 正文第三行指向修正子 issue；原三行逐字不变，修正标记解析不变，过本机 open 档正文检查的规则', async () => {
+  const { parseMarker } = await import('./bin/collect.mjs');
+  const state = {
+    issue: `${REPO}#9`, prRepo: REPO, root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 2,
+    correctionFacts: { scText: 'SC1 导出按钮在空列表时禁用。验证：unit', why: '空列表时仍可点击' },
+    changedFiles: ['src/export.js'], preflight: { ok: true, commands: ['npm test'] },
+  };
+  const marker = { root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1 };
+  const lines = correctionPrBody(state, marker).split('\n');
+  assert.equal(lines[0], `任务 issue：${REPO}#1`, '首行不变（写闸认它）');
+  assert.equal(lines[1], 'Closes #9', 'Closes 行不变');
+  assert.equal(lines[2], `任务 issue：${REPO}#9`, '新加的一行：修正子 issue 的全名');
+  const withoutNew = lines.filter((_, index) => index !== 2);
+  assert.equal(lines.at(-1), withoutNew.at(-1), '末尾的修正标记行不变');
+  assert.deepEqual(parseMarker(lines.join('\n')), parseMarker(withoutNew.join('\n')));
+  assert.ok(parseMarker(lines.join('\n')), '修正标记照样解析得出');
+  // 与 check-pr-body.sh --stage open 同等的规则：有「任务 issue：<修正子 issue>」整行；六段齐全且非空；
+  // 验收对照的每行状态只能是 待验证 / 通过 / 未通过 / 人工手测，SC 编号对上修正子 issue（SC1）。
+  const text = lines.join('\n').replace(/<!--[\s\S]*?-->/g, '');
+  assert.ok(text.split('\n').map((line) => line.trim()).includes(`任务 issue：${REPO}#9`));
+  const sections = Object.fromEntries(text.split(/^## /m).slice(1).map((chunk) => {
+    const [title, ...rest] = chunk.split('\n');
+    return [title.trim(), rest.join('\n').trim()];
+  }));
+  for (const name of ['改了什么', '范围对照', '验收对照', '定下的决定', '未执行的验证', '风险与回滚']) {
+    assert.ok(sections[name], `缺「## ${name}」段或段是空的`);
+  }
+  const rows = sections['验收对照'].split('\n').filter((line) => /^\|\s*SC\d+/.test(line.trim()));
+  assert.deepEqual(rows.map((line) => /^\|\s*SC(\d+)/.exec(line.trim())[1]), ['1']);
+  for (const row of rows) {
+    const status = row.split(/(?<!\\)\|/).slice(1, -1).map((cell) => cell.trim())[1];
+    assert.ok(['待验证', '通过', '未通过', '人工手测'].includes(status), status);
+  }
+});
