@@ -14,29 +14,41 @@ const STATUSES = new Set(['待验证', '通过', '未通过', '人工手测']);
 const MAX_BODY = 65536;
 const FORBIDDEN_KEYS = ['title', 'head', 'base', 'branch', 'draft', 'state'];
 // 关单词 + 引用（#号、GH-号、owner/repo#号、issue / PR 链接）。宽一点比漏一点安全：分隔可以跨行、可以有冒号（半角全角）、
-// 尖括号、圆括号；链接可以不带 https、可以带 www；关键字两边可以有 _ 强调。比对前先把正文「抹平」（plain）：
+// 尖括号、圆括号；链接可以不带 https、可以带 www；关键字两边可以有 _ 强调。比对前先把正文「抹平」（见 views）：
 // - Markdown 的 * ` ~ 全删；下划线一个都不删（仓名里可以有下划线，删了两个不同的仓会被当成同一个），改由正则容忍；
-// - 所有 HTML 标签和注释去掉（`<https://...>` 这种尖括号链接不是标签，保留）、Markdown 链接 [文字](地址) 拆成「文字 地址」；
+// - HTML 标签和注释：去掉和不去掉的都看一遍（见 views）；`<https://...>` 这种尖括号链接不是标签；Markdown 链接 [文字](地址) 拆成「文字 地址」；
 // - HTML 数字实体解码、NFKC 归一（全角 ＃ 和数字）、各种连字符统一成 -、格式类不可见字符（零宽、方向控制、变体选择符等）去掉。
 // 比对只比「引用了哪个 issue」（第 1 个捕获组），不比关键字怎么写：同一个引用换个关键字不算新增。
 const CLOSING = /(?<![A-Za-z0-9])_*(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)_*(?![A-Za-z0-9])[\s:：<(\[_]*((?:[\w.-]+\/[\w.-]+)?#\d+|gh-\d+|(?:https?:\/\/)?(?:www\.)?github\.com\/[^\s)>\]]+\/(?:issues|pull)\/\d+)/gi;
 const MARKER = /\[验收机\]\s*修正/g;
 const TASK_LINE = /任务\s*issue\s*[:：]/gi;
-const INVISIBLE = /[\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u3164\ufe00-\ufe0f\uffa0]/gu;
+const INVISIBLE = /[\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u3164\ufe00-\ufe0f\uffa0\u{e0100}-\u{e01ef}]/gu;
 const decodeEntities = (text) => text
   .replace(/&#(\d+);/g, (all, code) => (Number(code) <= 0x10ffff ? String.fromCodePoint(Number(code)) : all))
   .replace(/&#x([0-9a-f]+);/gi, (all, code) => (parseInt(code, 16) <= 0x10ffff ? String.fromCodePoint(parseInt(code, 16)) : all))
   .replace(/&num;/gi, '#');
-const plain = (text) => decodeEntities(String(text ?? '').replace(INVISIBLE, ''))
+const stripTags = (text) => text
+  .replace(/<!--[\s\S]*?(?:-->|$)/g, '')
+  .replace(/<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?\/?>/g, '');
+const tidy = (text) => text
   .replace(INVISIBLE, '')
   .normalize('NFKC')
   .replace(/[\u2010-\u2015\u2212\ufe58\ufe63\uff0d]/g, '-')
-  .replace(/<!--[\s\S]*?(?:-->|$)/g, '')
-  .replace(/<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?\/?>/g, '')
   .replace(/\[([^\]]*)\]\(([^)]*)\)/g, '$1 $2')
   .replace(/[*`~]/g, '');
-const closingRefs = (text) => new Set([...plain(text).matchAll(CLOSING)].map((match) => match[1].toLowerCase()));
-const countOf = (text, pattern) => [...plain(text).replace(/\s+/g, ' ').matchAll(pattern)].length;
+// 同一段正文按三种顺序各抹平一次，任一份里出现的引用都算（第四轮复审 P1：只看删完标签的那份，
+// 藏在注释、标签名、属性里的关单词会跟着被删掉而放行，可原始正文里它还在）：
+// 不删标签的一份、先删标签再解码实体的一份（实体被注释或标签拆开）、先解码实体再删标签的一份。
+const views = (text) => {
+  const base = String(text ?? '').replace(INVISIBLE, '');
+  return [
+    tidy(decodeEntities(base)),
+    tidy(decodeEntities(stripTags(base))),
+    tidy(stripTags(decodeEntities(base))),
+  ];
+};
+const closingRefs = (text) => new Set(views(text).flatMap((view) => [...view.matchAll(CLOSING)].map((match) => match[1].toLowerCase())));
+const countOf = (text, pattern) => Math.max(...views(text).map((view) => [...view.replace(/\s+/g, ' ').matchAll(pattern)].length));
 
 export function check(action, { tier } = {}) {
   if (!tiers.includes(tier)) return { ok: false, reason: 'tier-not-allowed' };

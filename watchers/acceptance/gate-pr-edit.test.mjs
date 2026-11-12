@@ -162,3 +162,19 @@ test('#171 任意 HTML 标签、注释、其它实体、更多不可见字符、
     assert.deepEqual(checkBodyEdit(OLD, withRow('通过', fine)), { ok: true }, fine);
   }
 });
+
+// 第四轮复审 P1：藏在注释、标签名、属性里的关单词不能因为「去标签」被一起删掉；实体被注释或标签拆开也认得出。
+test('#171 注释、标签名、属性里的关单词也拒（原始正文里它还在）', () => {
+  const variants = ['<!-- Closes #19 -->', '<!-- Closes #19', '<Closes #19>', '<Fixes #19>', '<Closes https://github.com/ExampleOrg/repo-a/issues/19>',
+    '<div Closes #19>', '<img alt="Closes #19">', '<span title="Closes #19">x</span>', '&#60;Closes #19>', '<Closes #19&#62;', '&#60;Closes #19&#62;',
+    '<!-- &#67;loses #19 -->', 'Closes &#x2<!--x-->3;19', 'Closes &#x2<b></b>3;19', `Closes\u{E0100}#19`];
+  for (const text of variants) {
+    assert.equal(checkBodyEdit(OLD, withRow('通过', text)).reason, 'closing-keyword', JSON.stringify(text));
+  }
+});
+
+test('#171 修正标记、任务 issue 行被标签拆开或藏进注释也拒', () => {
+  assert.equal(checkBodyEdit(OLD, withRow('通过', '[验收机]<b></b>修正')).reason, 'correction-marker');
+  assert.equal(checkBodyEdit(OLD, withRow('通过', '<!-- [验收机]修正 -->')).reason, 'correction-marker');
+  assert.equal(checkBodyEdit(OLD, withRow('通过', '任务<i></i> issue：x')).reason, 'task-issue-line');
+});
