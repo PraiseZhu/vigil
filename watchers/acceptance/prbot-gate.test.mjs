@@ -976,12 +976,12 @@ test('#171 SC1 SC3 修正轮经写闸 pr.edit：只改验收对照和未执行�
   const claim = await makeGate({ home, profile, github: correctionGithub(world), binding: { kind: 'correction', issue, round: 1, commentId: null } })
     .handle({ type: 'comment.create', repo: REPO, issue: 9, body: '[修正机] 第 1 轮：修正中', dedupeKey: 'claim' });
   const written = [];
-  const gateWith = ({ isDraft = true, prHead } = {}) => {
+  const gateWith = ({ isDraft = true, prState = 'OPEN', prHead } = {}) => {
     const base = correctionGithub(world, { prHead, onWrite: (action) => { written.push(action); return { ok: true }; } });
     return makeGate({
       home, profile,
       github: { ...base, async graphql(query, variables) {
-        if (query === PR_BODY_QUERY) return { repository: { pullRequest: { number: variables.number, isDraft, body: oldBody } } };
+        if (query === PR_BODY_QUERY) return { repository: { pullRequest: { number: variables.number, state: prState, isDraft, body: oldBody } } };
         return base.graphql(query, variables);
       } },
       binding: { kind: 'correction', issue, round: 1, commentId: claim.body.commentId },
@@ -1001,6 +1001,8 @@ test('#171 SC1 SC3 修正轮经写闸 pr.edit：只改验收对照和未执行�
   assert.deepEqual([titled.code, titled.body.reason], [4, 'field-not-editable']);
   const ready = await gateWith({ isDraft: false }).handle(edit(newBody, {}, 'edit-ready'));
   assert.deepEqual([ready.code, ready.body.reason], [4, 'not-allowed']);
+  const closedPr = await gateWith({ prState: 'CLOSED' }).handle(edit(newBody, {}, 'edit-closed'));
+  assert.deepEqual([closedPr.code, closedPr.body.reason], [4, 'not-allowed']);
   const otherBranch = await gateWith({ prHead: { headRefName: 'acceptance/1-2-sc4' } }).handle(edit(newBody, {}, 'edit-other-branch'));
   assert.deepEqual([otherBranch.code, otherBranch.body.reason], [4, 'not-allowed']);
   assert.equal(written.length, 1, '被拒的都没有写');

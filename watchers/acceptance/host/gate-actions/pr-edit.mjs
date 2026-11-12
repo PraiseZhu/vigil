@@ -13,10 +13,14 @@ export const EDITABLE_SECTIONS = Object.freeze(['验收对照', '未执行的验
 const STATUSES = new Set(['待验证', '通过', '未通过', '人工手测']);
 const MAX_BODY = 65536;
 const FORBIDDEN_KEYS = ['title', 'head', 'base', 'branch', 'draft', 'state'];
-const CLOSING_REF = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*(?:[\w.-]+\/[\w.-]+)?#\d+/i;
-const CLOSING_URL = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*https?:\/\/github\.com\/[^\s)]+\/(?:issues|pull)\/\d+/i;
-const MARKER = /\[验收机\]\s*修正/;
-const TASK_LINE = /任务\s*issue\s*[:：]/i;
+// 关单词 + 引用（#号、owner/repo#号、issue / PR 链接）。宽一点比漏一点安全：分隔可以跨行、可以有冒号（半角全角）、
+// 尖括号、圆括号；链接可以不带 https、可以带 www。比对前先去掉 Markdown 的 * _ ` ~，包住关键字也认得出。
+const CLOSING = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b[\s:：<(\[]*((?:[\w.-]+\/[\w.-]+)?#\d+|(?:https?:\/\/)?(?:www\.)?github\.com\/[^\s)>\]]+\/(?:issues|pull)\/\d+)/gi;
+const MARKER = /\[验收机\]\s*修正/g;
+const TASK_LINE = /任务\s*issue\s*[:：]/gi;
+const plain = (text) => String(text ?? '').replace(/[*_`~]/g, '').replace(/\u200b|\u200c|\u200d|\ufeff/g, '');
+const closingRefs = (text) => new Set([...plain(text).matchAll(CLOSING)].map((match) => match[0].toLowerCase().replace(/\s+/g, ' ')));
+const countOf = (text, pattern) => [...plain(text).replace(/\s+/g, ' ').matchAll(pattern)].length;
 
 export function check(action, { tier } = {}) {
   if (!tiers.includes(tier)) return { ok: false, reason: 'tier-not-allowed' };
@@ -51,10 +55,13 @@ function sectionsOf(text) {
 const cellsOf = (line) => line.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map((cell) => cell.trim());
 const isDataRow = (line) => /^\s*\|/.test(line) && !/^\s*\|\s*:?-{2,}/.test(line) && !/^\s*\|\s*验收项\s*\|/.test(line);
 
-function introducedProblem(text) {
-  if (CLOSING_REF.test(text) || CLOSING_URL.test(text)) return 'closing-keyword';
-  if (MARKER.test(text)) return 'correction-marker';
-  if (TASK_LINE.test(text)) return 'task-issue-line';
+// 整篇对比，不只看这一次新增的行（审查 P2：两次 pr.edit 可以把「Closes」和下一行的「#999」拼起来）：
+// 新正文里出现了旧正文没有的关单词引用、修正标记或「任务 issue」行，就拒绝。改不了的地方逐字相同，多出来的只能来自可改的两处。
+function introducedProblem(oldBody, newBody) {
+  const before = closingRefs(oldBody);
+  if ([...closingRefs(newBody)].some((ref) => !before.has(ref))) return 'closing-keyword';
+  if (countOf(newBody, MARKER) > countOf(oldBody, MARKER)) return 'correction-marker';
+  if (countOf(newBody, TASK_LINE) > countOf(oldBody, TASK_LINE)) return 'task-issue-line';
   return null;
 }
 
@@ -82,12 +89,7 @@ export function checkBodyEdit(oldBody, newBody) {
       if (!sameLines(was, now)) return { ok: false, reason: 'outside-editable', detail: `「${title}」段不能改` };
       continue;
     }
-    if (title === '未执行的验证') {
-      const added = now.filter((line) => !was.includes(line)).join('\n');
-      const problem = introducedProblem(added);
-      if (problem) return { ok: false, reason: problem, detail: '「未执行的验证」段新写的内容里不能有这类文字' };
-      continue;
-    }
+    if (title === '未执行的验证') continue;
     // 验收对照：行数不变；非数据行（说明、表头、分隔行）原样；数据行只许改第 2、3 列。
     if (was.length !== now.length) return { ok: false, reason: 'table-shape', detail: '「验收对照」的行数不能变' };
     for (let row = 0; row < was.length; row += 1) {
@@ -104,11 +106,9 @@ export function checkBodyEdit(oldBody, newBody) {
         return { ok: false, reason: 'table-shape', detail: '状态、证据以外的列不能改' };
       }
       if (!STATUSES.has(newCells[1])) return { ok: false, reason: 'bad-status', detail: `状态只能是 待验证 / 通过 / 未通过 / 人工手测，实际：${newCells[1]}` };
-      if (newCells[2] !== oldCells[2]) {
-        const problem = introducedProblem(newCells[2]);
-        if (problem) return { ok: false, reason: problem, detail: '证据里不能写这类文字' };
-      }
     }
   }
+  const problem = introducedProblem(oldBody, newBody);
+  if (problem) return { ok: false, reason: problem, detail: '改动里不能新写关单词引用、修正标记或「任务 issue」行（按整篇正文比）' };
   return { ok: true };
 }

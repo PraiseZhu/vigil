@@ -47,6 +47,7 @@ export const PR_BODY_QUERY = `query ($owner: String!, $name: String!, $number: I
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       number
+      state
       isDraft
       body
     }
@@ -389,6 +390,7 @@ export function createCorrectionCheck({ github, profile, binding, scopeOf, readI
           // 只在转 Ready 前改；新旧正文由写闸自己读当前正文对比，只放行验收对照的状态/证据和未执行的验证。
           const current = (await github.graphql(PR_BODY_QUERY, { owner, name, number: Number(action.pr) }))?.repository?.pullRequest;
           if (!current) return reject('not-allowed', '找不到 PR');
+          if (current.state !== 'OPEN') return reject('not-allowed', `PR 不是开着的（${current.state || '未知'}）：不再改正文`);
           if (current.isDraft !== true) return reject('not-allowed', 'PR 已经不是 Draft：转 Ready 之后不再改正文');
           const edit = module.checkBodyEdit(current.body || '', action.body);
           if (!edit.ok) return reject(edit.reason, edit.detail);

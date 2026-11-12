@@ -73,3 +73,32 @@ test('#171 SC2 参数：带标题、head、base 等字段一律拒绝；只给 a
   assert.equal(check({ ...ok, pr: 0 }, { tier: 'auto' }).reason, 'bad-action');
   assert.deepEqual(toWrite({ ...ok, dedupeKey: 'k' }), { type: 'pr.edit', repo: REPO, pr: 12, body: OLD });
 });
+
+// 审查 P2：按整篇正文比，两次 pr.edit 拼不出一次会被拒的内容；Markdown 包住、链接变体也认得出。
+test('#171 两次改拼出跨行关单词：第二次被拒（按整篇最终正文比）', () => {
+  const step1 = replaceSection(OLD, '未执行的验证', '- Closes');
+  assert.deepEqual(checkBodyEdit(OLD, step1), { ok: true }, '只有关键字、没有引用，本身不关任何 issue');
+  const step2 = replaceSection(OLD, '未执行的验证', '- Closes\n#999');
+  assert.equal(checkBodyEdit(step1, step2).reason, 'closing-keyword');
+  assert.equal(checkBodyEdit(OLD, step2).reason, 'closing-keyword', '一次写也拒');
+});
+
+test('#171 关单词的各种写法都拒：Markdown 包住、www、不带 https、尖括号、圆括号、全角冒号', () => {
+  const variants = ['**Closes** #19', '`Closes` #19', '_Closes_ #19', 'Closes **#19**', '__Fixes__ example-owner/example-repo#19',
+    'Fixes https://www.github.com/example-owner/example-repo/issues/19', 'Fixes github.com/example-owner/example-repo/issues/19',
+    'Closes <https://github.com/example-owner/example-repo/issues/19>', 'Closes (https://github.com/example-owner/example-repo/pull/19)',
+    'Closes：#19', 'Clo​ses #19'.replace('​', ''), 'resolved #12'];
+  // 正文第二行本来就有「Closes #9」（关修正子 issue 自己），所以这里用别的号。
+  for (const text of variants) {
+    assert.equal(checkBodyEdit(OLD, withRow('通过', text)).reason, 'closing-keyword', text);
+  }
+  assert.deepEqual(checkBodyEdit(OLD, withRow('通过', 'fixtures 目录的测试通过；修复见 fix/export 分支')), { ok: true }, '没有引用的「fix」不算');
+});
+
+test('#171 修正标记和任务 issue 行拆成两行、两次写也拒', () => {
+  const split = replaceSection(OLD, '未执行的验证', `[验收机]\n修正 · 总 ${REPO}#5 · 项 ${REPO}#6 SC1 · 第 1 轮`);
+  assert.equal(checkBodyEdit(OLD, split).reason, 'correction-marker');
+  const half = replaceSection(OLD, '未执行的验证', '- 任务');
+  assert.deepEqual(checkBodyEdit(OLD, half), { ok: true });
+  assert.equal(checkBodyEdit(half, replaceSection(OLD, '未执行的验证', `- 任务\nissue：${REPO}#5`)).reason, 'task-issue-line');
+});
