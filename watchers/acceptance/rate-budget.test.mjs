@@ -14,9 +14,12 @@ import {
   TICK_SECONDS,
   boardSnapshotFile,
   budgetConfigFile,
+  POLL_COMPONENT,
   chargeBudget,
   decideTick,
   emptyRateState,
+  pollUsage,
+  pollUsageLogLine,
   identityRecord,
   parseRemaining,
   parseReset,
@@ -509,3 +512,155 @@ test('#247 P3-1 同一拍里 essential 放行不清非必要读的连跳（skips
   assert.equal(other.skipStreak, 1, '别的组件第一次跳过是 1，不接着 loop 的连跳');
   assert.equal(other.state.skips.byKey['loop:non-essential'].count, 3, '动别人不清 loop 的连跳');
 });
+
+const BUDGETS = { loop: 500, 'prio-run': 300, 'board-live': 140 };
+
+// #P1 poll 单独记账：先写这些边界再改实现（Inspector 定）。
+test('poll 用量不再计入 loop 后，非必要读不再因 poll 用量被跳', () => {
+  let state = stateWith(4000);
+  state = chargeBudget(state, { component: POLL_COMPONENT, cost: 600, now: NOW });
+  assert.equal(state.components.poll.used, 600);
+  assert.equal(state.components.loop, undefined, 'poll 点数不出现在 loop.used');
+  const decided = decideTick({
+    component: 'loop',
+    purpose: 'non-essential',
+    state,
+    now: NOW,
+    budgets: BUDGETS,
+    reserve: 6,
+  });
+  assert.equal(decided.allowed, true, '只有 poll 用量时非必要读仍放行');
+  assert.notEqual(decided.reason, 'over-budget');
+  // 对照：同样 600 点如果记在 loop 上，现有判定会跳过。
+  const oldStyle = chargeBudget(stateWith(4000), { component: 'loop', cost: 600, now: NOW });
+  const skipped = decideTick({
+    component: 'loop',
+    purpose: 'non-essential',
+    state: oldStyle,
+    now: NOW,
+    budgets: BUDGETS,
+    reserve: 6,
+  });
+  assert.equal(skipped.allowed, false);
+  assert.equal(skipped.reason, 'over-budget');
+});
+
+test('非 poll 读刚好 500 不跳，再多就跳（used + cost + reserve > 500 才 over-budget）', () => {
+  let atCap = chargeBudget(stateWith(4000), { component: 'loop', cost: 500, now: NOW });
+  const exact = decideTick({
+    component: 'loop',
+    purpose: 'non-essential',
+    state: atCap,
+    now: NOW,
+    budgets: BUDGETS,
+    cost: 0,
+    reserve: 0,
+  });
+  assert.equal(exact.allowed, true, 'loop.used 刚好 500 且本拍不再加点时不跳');
+  const next = decideTick({
+    component: 'loop',
+    purpose: 'non-essential',
+    state: atCap,
+    now: NOW,
+    budgets: BUDGETS,
+    reserve: 6,
+  });
+  assert.equal(next.allowed, false, '已经 500，再预留一次非必要读（6 点）就跳');
+  assert.equal(next.reason, 'over-budget');
+  assert.match(next.log, /action=over-budget budget=500 used=500 cost=6/);
+  // 494 + reserve 6 = 500：等于预算，不跳。
+  const under = decideTick({
+    component: 'loop',
+    purpose: 'non-essential',
+    state: chargeBudget(stateWith(4000), { component: 'loop', cost: 494, now: NOW }),
+    now: NOW,
+    budgets: BUDGETS,
+    reserve: 6,
+  });
+  assert.equal(under.allowed, true, '494 + 6 = 500，按现有 > 才跳的口径放行');
+});
+
+test('账号余量暂停线行为不变：恰好 800/1500 不触发，低于才触发；poll 用量不影响这两档', () => {
+  assert.equal(PAUSE_REMAINING, 800);
+  assert.equal(BOARD_SKIP_REMAINING, 1500);
+  const withPoll = (remaining) => chargeBudget(stateWith(remaining), { component: POLL_COMPONENT, cost: 600, now: NOW });
+  const at800 = decideTick({ component: 'loop', purpose: 'non-essential', state: withPoll(800), now: NOW, budgets: BUDGETS, reserve: 6 });
+  assert.equal(at800.allowed, true);
+  assert.notEqual(at800.reason, 'remaining-below-800');
+  const below800 = decideTick({ component: 'loop', purpose: 'non-essential', state: withPoll(799), now: NOW, budgets: BUDGETS, reserve: 6 });
+  assert.equal(below800.allowed, false);
+  assert.equal(below800.reason, 'remaining-below-800');
+  const at1500 = decideTick({ component: 'prio-run', purpose: 'board', state: withPoll(1500), now: NOW, budgets: BUDGETS });
+  assert.equal(at1500.allowed, true);
+  assert.notEqual(at1500.reason, 'remaining-below-1500');
+  const below1500 = decideTick({ component: 'prio-run', purpose: 'board', state: withPoll(1499), now: NOW, budgets: BUDGETS });
+  assert.equal(below1500.allowed, false);
+  assert.equal(below1500.reason, 'remaining-below-1500');
+});
+
+test('只有 poll 在读时 poll 项有数值；doctor 用的 pollUsage 能读出；并写出 component=poll 的日志行', () => {
+  let state = chargeBudget(stateWith(4000), { component: POLL_COMPONENT, cost: 42, now: NOW });
+  const usage = pollUsage(state, NOW);
+  assert.equal(usage.present, true);
+  assert.equal(usage.used, 42);
+  assert.equal(usage.log, null);
+  const line = pollUsageLogLine({ now: NOW, used: usage.used, cost: 42, hourKey: usage.hourKey });
+  assert.match(line, /rate-poll component=poll used=42 cost=42/);
+  assert.equal(state.components.loop, undefined);
+  const decided = decideTick({ component: 'loop', purpose: 'non-essential', state, now: NOW, budgets: BUDGETS, reserve: 6 });
+  assert.equal(decided.allowed, true);
+});
+
+test('老格式状态文件没有 poll 项：按 0 处理并记一行日志，不清空既有计数', () => {
+  let state = chargeBudget(stateWith(4000), { component: 'loop', cost: 120, now: NOW });
+  state = chargeBudget(state, { component: 'prio-run', cost: 8, now: NOW });
+  assert.equal(state.components.poll, undefined);
+  const file = rateStateFile(tmpDir());
+  writeRateState(file, state);
+  const back = readRateState(file);
+  assert.equal(back.components.loop.used, 120, '既有 loop 计数还在');
+  assert.equal(back.components['prio-run'].used, 8, '既有 prio-run 计数还在');
+  const usage = pollUsage(back, NOW);
+  assert.equal(usage.present, false);
+  assert.equal(usage.used, 0);
+  assert.match(usage.log, /rate-poll component=poll used=0/);
+  assert.match(usage.log, /没有 poll 项，按 0 处理/);
+});
+
+test('prio-run / event-run 计费仍记 prio-run，不进 poll，也不改 loop', () => {
+  let state = chargeBudget(stateWith(4000), { component: 'prio-run', cost: 8, now: NOW });
+  assert.equal(state.components['prio-run'].used, 8);
+  assert.equal(state.components.poll, undefined);
+  assert.equal(state.components.loop, undefined);
+  const decided = decideTick({
+    component: 'prio-run',
+    purpose: 'board',
+    state,
+    now: NOW,
+    budgets: BUDGETS,
+    reserve: 8,
+  });
+  assert.equal(decided.allowed, true, 'prio-run 预算 300，记 8 点后仍放行');
+  // poll 用量不影响 prio-run 预算闸
+  state = chargeBudget(state, { component: POLL_COMPONENT, cost: 600, now: NOW });
+  const afterPoll = decideTick({
+    component: 'prio-run',
+    purpose: 'board',
+    state,
+    now: NOW,
+    budgets: BUDGETS,
+    reserve: 8,
+  });
+  assert.equal(afterPoll.allowed, true);
+  assert.equal(afterPoll.state.components['prio-run'].used, 8);
+});
+
+test('文档 §14 写清 poll 单独记、不计入 loop 预算、在 doctor 和日志里看', () => {
+  const docs = fs.readFileSync(new URL('../../docs/acceptance-operations.md', import.meta.url), 'utf8');
+  const section = docs.slice(docs.indexOf('## 14.'), docs.indexOf('## 15.'));
+  assert.match(section, /components\.poll/);
+  assert.match(section, /不计入 loop/);
+  assert.match(section, /doctor/);
+  assert.match(section, /component=poll/);
+});
+

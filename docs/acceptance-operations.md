@@ -1005,15 +1005,15 @@ github-live 的手测（真的看板上跑 24 小时、以及合并后确认没�
 }
 ```
 
-单位是这一小时的额度点数。`loop` 按「poll 的响应头个数 × 6 点」记，`prio-run` 一次整板读按 8 点记，`board-live` 按 REST 请求数记（它主要走 App 安装令牌的独立额度）。三个值都是保守值，按 #247「待定」项取：主循环改后实测约 500 点/小时、prio-run 沿用 300、仓外看板组件落在用户令牌上约 140 请求/小时。超预算只有该组件自己跳过，同一小时里别的组件照常跑。注意「跳过」的粒度不是一拍：`used` 只增不减、UTC 整点才切窗，所以某个组件一旦在这一小时里超了预算，这一小时**剩余所有拍**它都不再做那一读（不是只丢刚才那一拍）；跨过 5 拍时写一条 `rate-skip-escalate` 提醒（同一段连跳只写一条：越过阈值后继续跳过不再重复提醒，恢复放行或切窗清零后重新计），见本节末尾。
+单位是这一小时的额度点数。`loop` 只记非必要读（修正轮发现、卡住检查等，一次请求 6 点），`prio-run` 一次整板读按 8 点记，`board-live` 按 REST 请求数记（它主要走 App 安装令牌的独立额度）。主循环每拍盘点（`purpose: 'essential'` 的 poll）按「响应头个数 × 6 点」记进 `components.poll`，**不计入** `loop` 的 500 点预算，也不占用另外两个组件的预算。三个值都是保守值，按 #247「待定」项取：主循环改后实测约 500 点/小时、prio-run 沿用 300、仓外看板组件落在用户令牌上约 140 请求/小时。超预算只有该组件自己跳过，同一小时里别的组件照常跑。注意「跳过」的粒度不是一拍：`used` 只增不减、UTC 整点才切窗，所以某个组件一旦在这一小时里超了预算，这一小时**剩余所有拍**它都不再做那一读（不是只丢刚才那一拍）；跨过 5 拍时写一条 `rate-skip-escalate` 提醒（同一段连跳只写一条：越过阈值后继续跳过不再重复提醒，恢复放行或切窗清零后重新计），见本节末尾。
 
-**预算闸只约束非必要读**：`purpose: 'essential'`（只有主循环 poll）直接放行，越预算照跑——拦它会把这一小时剩下的 poll 连同心跳之外的 abort / 派发一起停掉，而心跳仍是 `ok: true`（复审报的 P1）。用量照记，所以 `components.<组件>.used` 超过预算值是正常现象，超预算的后果只落在该组件的非必要读上（修正轮发现、卡住检查、看板整板读等）。响应头闸的 `< 800` 一档同样只暂停非必要读，`essential` 不拦，两处口径一致。
+**预算闸只约束非必要读**：`purpose: 'essential'`（只有主循环 poll）直接放行，越预算照跑——拦它会把这一小时剩下的 poll 连同心跳之外的 abort / 派发一起停掉，而心跳仍是 `ok: true`（复审报的 P1）。poll 的点数记在 `components.poll`，不进 `loop.used`，所以盘点本身不会把 `loop` 的 500 点顶满。`loop` 超预算的判定口径是本小时 `loop.used + 本拍 cost + reserve > 500` 才跳过非必要读，刚好等于 500 不跳。响应头闸的 `< 800` 一档同样只暂停非必要读，`essential` 不拦，两处口径一致。`prio-run` / `event-run` 仍记 `prio-run` 这一格，计费口径不变。
 
 配置缺了或值不对时：`prio-run` 打一行「额度预算配置无法使用：…」并只走响应头闸；主循环把原因写进心跳的 `lastTick.rateBudgetError`，同样不猜默认值。
 
 ### 状态文件（按令牌分开）
 
-`<home>/state/host/rate-budget.json`。`identities` 下每个令牌一格（`user` 账号令牌、`app` App 安装令牌），各记 `remaining` / `remainingRaw` / `reset` / `at` / `source`，互相不覆盖；某一枚没有记录时按缺头处理（`rate-unknown`）。`components` 下是各组件本小时（UTC 整点切窗）的 `used`，`recovery` 是当前恢复期的轮转位置，`skips` 是连续「因额度跳过」的拍数：`skips.byKey` 按「组件:用途」分开数（判定连跳用这个），每一项记 `count`（连跳的**拍**数）、`lastAt`、`lastTick`（这一拍已经计过数，同一拍再判只算一拍）、`escalated`（这一段连跳已经提醒过，不再重复）、`reason`；`skips.count` 是**最近一次判定那个 key** 的连跳数，随判定顺序变化，外部要读连跳请看 `byKey`。
+`<home>/state/host/rate-budget.json`。`identities` 下每个令牌一格（`user` 账号令牌、`app` App 安装令牌），各记 `remaining` / `remainingRaw` / `reset` / `at` / `source`，互相不覆盖；某一枚没有记录时按缺头处理（`rate-unknown`）。`components` 下是各组件本小时（UTC 整点切窗）的 `used`，另有可选的 `components.poll`（主循环盘点用量；老格式文件没有这一项时按 0 读，不清空既有计数），`recovery` 是当前恢复期的轮转位置，`skips` 是连续「因额度跳过」的拍数：`skips.byKey` 按「组件:用途」分开数（判定连跳用这个），每一项记 `count`（连跳的**拍**数）、`lastAt`、`lastTick`（这一拍已经计过数，同一拍再判只算一拍）、`escalated`（这一段连跳已经提醒过，不再重复）、`reason`；`skips.count` 是**最近一次判定那个 key** 的连跳数，随判定顺序变化，外部要读连跳请看 `byKey`。
 
 ### 看板快照（每拍只整板读一次）
 
@@ -1030,7 +1030,10 @@ github-live 的手测（真的看板上跑 24 小时、以及合并后确认没�
 <UTC 时间> rate-skip component=loop identity=user remaining=unknown action=over-budget budget=500 used=498 cost=6 因额度跳过
 <UTC 时间> rate-unknown component=loop identity=app remaining=unknown raw=（缺失） reason=no-record 响应头缺失或不合法，本拍不跳过
 <UTC 时间> rate-recovery component=loop identity=user remaining=438 resetAt=2026-11-03T19:07:00.000Z 重置后限速恢复：每拍最多 1 次非必要读
+<UTC 时间> rate-poll component=poll used=42 cost=6 hourKey=15700 本小时 poll 用量（不计入 loop 预算）
 ```
+
+`rate-poll` 是主循环每拍盘点记账后写的一行，只报告 `components.poll`，不表示跳过。doctor 的「poll 小时用量」一项读同一格，缺项或老格式按 0 计，这项本身不是红灯。
 
 连续「因额度跳过」超过 5 拍（N=5）时行尾再带 `streak=<拍数>`，仍然只跳过、不抛错；连跳节数按「组件 + 用途」分开数（`skips.byKey`），同一拍里 `essential` 放行不会把非必要读的连跳清零，同一拍里同一个 key 判两次（`loop` 的修正轮发现 + 卡住检查）也只算一拍。跨过 5 拍时写一条 `rate-skip-escalate` 提醒（带 `count`、`component`），只写这一条：越过阈值后继续跳过不再重复写，恢复放行或切窗清零后重新计；心跳 `ok` 一直是 true，光看心跳发现不了「整小时没在推进」。
 
