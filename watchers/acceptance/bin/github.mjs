@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { checkSecretFile, ProfileError } from './profile.mjs';
+import { classifyNetError } from './net-errors.mjs';
 
 /** 只在这里读 GitHub 令牌：先过 600 检查，再读文件；从不读环境变量。 */
 function readGithubToken(profile) {
@@ -324,6 +325,9 @@ function signJwt(pem, payload) {
 
 /** 读请求遇 GitHub 瞬时故障时，当次重试前等多久（只重试一次）。 */
 export const READ_RETRY_DELAY_MS = 4000;
+/** 一个 github 客户端（= 一拍里的一个进程）最多替只读请求重试几次（#238，Issue Inspector 2026-11-03 定）。 */
+export const MAX_READ_RETRIES_PER_TICK = 3;
+export const READ_RETRIED_NOTE = '（已重试一次）';
 
 /**
  * 限流被识别出来时抛这个（#247 SC7）：调用方据此跳过这一拍，不再当普通失败抛到整拍。
@@ -382,6 +386,24 @@ export function searchOwnerOf(text) {
  * `gh api --include` 的输出拆成响应头与正文。只有真以 HTTP 状态行开头时才拆，
  * 不然原样返回（老版本 gh、或测试替身只给正文）。
  */
+/**
+ * 只读 GraphQL 的正文能不能解析：能解析返回 null。解析失败的位置落在正文末尾（或报「意外结尾」）就是被截断，
+ * 统一写成 `unexpected end of JSON input` 交给分类表；中间就坏掉的照原文返回（不是网络问题，不重试）。
+ * 不同 Node 版本对截断的报错文字不一样（「Unexpected end of JSON input」/「Unterminated string … at position N」）。
+ */
+function graphqlBodyProblem(result) {
+  const body = splitGhHeaders(result?.stdout).body;
+  try {
+    JSON.parse(body);
+    return null;
+  } catch (error) {
+    const message = String(error?.message || error);
+    const at = Number(/at position (\d+)/.exec(message)?.[1]);
+    const truncated = /unexpected end of JSON input/i.test(message) || (Number.isFinite(at) && at >= body.trimEnd().length - 1);
+    return truncated ? `unexpected end of JSON input（响应被截断：${message}）` : message;
+  }
+}
+
 export function splitGhHeaders(stdout) {
   const text = String(stdout ?? '');
   if (!/^HTTP\/\d/.test(text)) return { headers: {}, body: text };
@@ -425,16 +447,11 @@ export function isRateLimitFailure(result) {
 }
 
 /**
- * gh 失败输出是不是 GitHub / 网络的瞬时故障：502/503/504、HTTP/2 流被对方断开、连接被重置、超时。
- * 404、401、权限、GraphQL 业务错误等都不算，不重试。
+ * gh 失败输出是不是 GitHub / 网络的瞬时故障。判定表只在 net-errors.mjs 一处（#238）：
+ * 502/503/504、EOF、截断的 JSON、乱码、超时、连接被断、DNS；404、401、权限、写闸拒绝、GraphQL 业务错误都不算。
  */
 export function isTransientGithubFailure(result) {
-  const text = `${result?.stderr || ''}\n${result?.stdout || ''}`;
-  return (
-    /\bHTTP 50[234]\b/.test(text) ||
-    /\bstream error\b/i.test(text) ||
-    /connection reset|ECONNRESET|ETIMEDOUT|i\/o timeout|TLS handshake timeout|unexpected EOF/i.test(text)
-  );
+  return classifyNetError(result).transient;
 }
 
 /**
@@ -1050,11 +1067,22 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
    * 跑一条只读的 gh 命令：遇到瞬时故障（见 isTransientGithubFailure）等几秒、当次重试一次，
    * 还失败就把第二次的结果原样交回去，由调用方照旧报错。写请求绝不经过这里。
    */
-  async function runRead(args, opts) {
+  let readRetriesLeft = MAX_READ_RETRIES_PER_TICK;
+  async function runRead(args, opts, bodyProblem = null) {
     const first = await runCmd('gh', args, opts);
-    if (first.code === 0 || !isTransientGithubFailure(first)) return first;
+    // 退出码 0 但正文截断或乱码（2026-11-02 两次实测）也按瞬时故障算。
+    const problem = first.code === 0 && bodyProblem ? bodyProblem(first) : null;
+    const failed = problem ? { ...first, code: 1, stderr: problem } : first;
+    if (failed.code === 0 || !isTransientGithubFailure(failed)) return first;
+    // 外层（tick 的 withReadTimeout）已经替这条读重试过一次：单个请求最多重试一次。总数也有上限。
+    if (first.retried || readRetriesLeft <= 0) return first;
+    readRetriesLeft -= 1;
     await sleepFn(READ_RETRY_DELAY_MS);
-    return runCmd('gh', args, opts);
+    const second = await runCmd('gh', args, opts);
+    const secondProblem = second.code === 0 && bodyProblem ? bodyProblem(second) : null;
+    if (second.code === 0 && !secondProblem) return second;
+    return { ...second, code: second.code === 0 ? 1 : second.code, retried: true,
+      stderr: `${String(secondProblem || second.stderr || '').trim()}${READ_RETRIED_NOTE}` };
   }
 
   async function sendGraphql(token, query, variables) {
@@ -1063,7 +1091,7 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
     // 写（mutation）不加 --include，也不重试。
     const readArgs = ['api', 'graphql', '--include', '--input', '-'];
     const writeArgs = ['api', 'graphql', '--input', '-'];
-    return isReadOnlyGraphql(query) ? runRead(readArgs, opts) : runCmd('gh', writeArgs, opts);
+    return isReadOnlyGraphql(query) ? runRead(readArgs, opts, graphqlBodyProblem) : runCmd('gh', writeArgs, opts);
   }
 
   function finishGraphql(result, token, identity) {
