@@ -177,6 +177,11 @@ export function formatNoticeText(events = []) {
       const what = event.reason ? `部署清单读不出来（${event.reason}）` : `这些文件和部署时不一样：${files}`;
       return `盯梢的运行目录和最近一次部署（${event.release ?? '未知版本'}）对不上：${what}。可能是只拷了一部分文件，或有人在运行目录直接改了文件。请用 deploy.mjs 重新部署；如果是有意保留的本机改动，用 \`deploy.mjs register-patch --home <运行目录> --file <文件名>\` 登记，登记后不再报。`;
     }
+    if (event.kind === 'acceptance-gap') {
+      const what = event.summary ? `（${event.summary}）` : '';
+      const failed = event.manualResult === 'fail' ? '你在 PR 上记的手测结论是不通过。' : '';
+      return `PR #${number}${url} 审查机提了一条要人来做的验收${what}。修复会话没有真机、付费账号，也不能代替人手测，盯梢不会为它派会话。${failed}请二选一：1. 补手测，把结论写到 PR 上（测试包、head、每条 SC 的结果），评论里带一行 \`<!-- manual-test-result:v1 issue=<任务 issue 号> pr=${number} head=<完整提交号> result=pass -->\`，盯梢会让修复会话把结论写进验收文档；2. 明确豁免，交独立 QA。`;
+    }
     if (event.kind === 'blocked-escalate') {
       return `PR #${number}${url} 同一原因再次卡住（${event.cause ?? event.blockedKind ?? 'blocked'}），盯梢不再原样重投。请查看原因并处理。`;
     }

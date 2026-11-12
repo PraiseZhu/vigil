@@ -73,6 +73,18 @@ function visibleLines(body) {
 const result = (action, severities, reason) => ({ policyVersion: FEEDBACK_POLICY_VERSION, action,
   canChangeCode: ['code-fix', 'required-ci-fix', 'conflict-fix'].includes(action), severities, reason });
 
+// Findings only a person can close: acceptance on a real device, with a paid account, or by a manual test. A repair
+// session cannot run them, and one asked to "fix" them either idles into blocked or marks the owner's manual results as
+// not run (#386). Without an owner result they go to the owner as a notice (action human-acceptance, no session).
+const HUMAN_ACCEPTANCE_CLASSES = new Set(['acceptance-gap']);
+export function humanAcceptanceClass(item) {
+  const match = /<!--\s*mivo-finding\b[^>]*?\bclass=([^\s>]+)/.exec(String(item?.body ?? ''));
+  if (!match) return null;
+  let cls = match[1];
+  try { cls = decodeURIComponent(cls); } catch { /* keep the raw class */ }
+  return HUMAN_ACCEPTANCE_CLASSES.has(cls) ? cls : null;
+}
+
 // Greptile's overview restates findings that arrive as their own graded inline threads. Unless it carries an
 // explicit P0/P1 finding of its own, it only opened a session with no authority (2026-10-15 #989, #993).
 function summaryHasOwnHighFinding(severities) {
@@ -80,6 +92,15 @@ function summaryHasOwnHighFinding(severities) {
 }
 export function feedbackRepairPolicy(item = {}, options = {}) {
   const policy = itemRepairPolicy(item, options);
+  // A graded P0/P1/P2 (or ungraded) acceptance gap from the trusted reviewer. P3 stays reply-only, a stale or
+  // infrastructure item stays what it was. The owner's manual result on the PR (attached by the watcher as
+  // manualTestResult, result=pass) is written back into the acceptance docs by the session; otherwise a person runs it.
+  if (trustedReviewer(item) && humanAcceptanceClass(item)
+    && (policy.action === 'code-fix' || (policy.action === 'needs-triage' && policy.reason === 'severity-unconfirmed'))) {
+    return item.manualTestResult?.result === 'pass'
+      ? result('code-fix', policy.severities, 'acceptance-gap-manual-result')
+      : result('human-acceptance', policy.severities, 'acceptance-gap');
+  }
   if (trustedReviewer(item) && isGreptileSummary(String(item.body ?? ''))) {
     if (!['code-fix', 'ignore-infra'].includes(policy.action) || (policy.action === 'code-fix' && !summaryHasOwnHighFinding(policy.severities))) {
       return result('ignore-infra', policy.severities, 'greptile-summary-inline-threads');
@@ -149,6 +170,8 @@ function itemRepairPolicy(item = {}, { headSha } = {}) {
     // infer CI authority from a comment mentioning checks or from unverified optional checks.
     return result('required-ci-fix', [], proof ? 'verified-required-ci-failure' : 'legacy-required-ci-failure');
   }
+  // The owner's manual acceptance record (#386) is evidence for an acceptance gap, not feedback to grade.
+  if (/<!--\s*manual-test-result:v1\b/.test(String(item.body ?? ''))) return result('ignore-infra', [], 'manual-test-result-record');
   // pr-hygiene workflow 的机器人通知（如「冲突已解决」）：冲突本身由 conflict 来源处理，通知被编辑一次就派一轮只会空转。
   if (isBotAuthor(item) && /<!--\s*pr-hygiene:/.test(String(item.body ?? ''))) return result('ignore-infra', [], 'pr-hygiene-notice');
   // 审查机的维护者确认门通知（命中确认门、受保护路径转人工、已开通知 issue）：等的是维护者表态，修复会话不能也不该改代码，
