@@ -14,10 +14,10 @@
 | 2 评估 | 从最新裁决取「要修」的 SC；人工手测层不修；pi 认为某条不成立就标「有争议」并写明理由（裁决本身仍归 #46 SC8，本 issue 不另起裁决流程） | 同一修正子 issue 最多 2 个修正轮，第 3 轮写「需人工处理」 |
 | 3 修复 | 沙箱外从 **PR 所在仓**（fork 模式是上游）的 main 建工作树；远端修正分支已经在、而且从我们推的仓开着 PR（同一 PR 上再修、`pr.update-branch` 之后、第 2 轮沿用 PR）就接着远端 head 建，复用工作树时远端被挪过就先在沙箱里快进（分叉了就停，`worktree-failed`，不覆盖）；分支还在但 PR 已合并 / 已关就从最新 main 重建（带 `.acc-owned.json`，写进 `.git/info/exclude`，不会被提交；提交身份写在工作树自己的配置里），pi 只在 bwrap 里跑一个入口：先写会变红的复现测试，再最小修复，`git commit -s`；最多 4 次 pi。pi 一个文件都没改 →「需人工处理」`no-change`（全部有争议则 `all-disputed`）；读不出改动 → `diff-failed` | bwrap 不可用 → 不跑模型，这一轮「中断」+ 提醒 `sandbox-unavailable`；没有任何环境变量 / 配置能关掉沙箱 |
 | 4 本地预检 | 在**新的** bwrap 里跑目标仓自己的推送前检查（`prbot.repos[repo].preflight`，默认没有就跳过；每项一条命令：字符串或 argv 数组，写错了 `preflight-config-invalid` 需人工处理，进程不崩）；环境白名单只有 PATH、HOME、LANG、TZ、TERM、TMPDIR、NODE_OPTIONS（bwrap 自己会加一个 PWD），凭证全遮 | 红了返工最多 2 次，仍红 →「需人工处理」；bwrap 不可用 → 不跑预检，这一轮「中断」 |
-| 5 提交和建 Draft | 沙箱里打 git bundle（宿主只读复制出来的副本），先过改动 / 禁改路径检查，再经写闸 `branch.push`（带租约 `--force-with-lease=<本轮分支>:<上次已知的远端 head>`，远端还没有这条分支就是空租约），再 `pr.create`（一定 `draft: true`，正文带 `Closes <修正子 issue>`）；都带 `dedupeKey`；同一标记 / 分支已有 PR 就复用。PR 开出后经写闸把修正子 issue 和总 issue 的看板「验收」写成「修正中」（写不上只记一步，不拦修正轮） | GitHub 报错按 1、2、4、8、16 分钟退避，5 次后「中断」+ `interrupted-exhausted`（`write-failed`）；写闸 75 按 #44 SC15 重试，用完也是「中断」+ `interrupted-exhausted`（`gate-busy`） |
+| 5 提交和建 Draft | 沙箱里打 git bundle（宿主只读复制出来的副本），先过改动 / 禁改路径检查，再经写闸 `branch.push`（带租约 `--force-with-lease=<本轮分支>:<上次已知的远端 head>`，远端还没有这条分支就是空租约），再 `pr.create`（一定 `draft: true`，正文带 `Closes <修正子 issue>`；开之前先过「开 PR / 转 Ready 前的检查」的 open 档，不过就不开）；都带 `dedupeKey`；同一标记 / 分支已有 PR 就复用。PR 开出后经写闸把修正子 issue 和总 issue 的看板「验收」写成「修正中」（写不上只记一步，不拦修正轮） | GitHub 报错按 1、2、4、8、16 分钟退避，5 次后「中断」+ `interrupted-exhausted`（`write-failed`）；写闸 75 按 #44 SC15 重试，用完也是「中断」+ `interrupted-exhausted`（`gate-busy`） |
 | 6 盯 Draft CI | 每 2 分钟经写闸读 head 检查。还在排队 / 跑的检查只等，不算失败；**全部**跑完且有失败才进入重跑 / 再修（有一条失败、别的还在跑也先等）。Actions 的 workflow 已经排上、job 还没出来（check suite 有 `workflowRun`、一条 check run 都没有）也算还在跑；没有 `workflowRun` 的 suite（别的 App 自动建、可能永远不出 run）不算。落后 main 发 `pr.update-branch`；和 main 冲突（DIRTY）交给 pi 先取回最新 main 再 `git merge origin/main` 解决，同一 head 只叫一次 pi；两者共用 3 次额度。同一个 head 上第一次看到失败先 `ci.rerun` 一次（写闸自己查 run id 是否属于这个 PR 当前 head）；单个 head 最多等 60 分钟 | 超时 / 冲突额度用完 →「需人工处理」 |
 | 7 自动再修 | 每个 PR 最多 2 次再修；只有 head 变了或出现新的失败指纹才再修；main 上同名检查也红就不改代码，附检查名 / main SHA / 链接写「需人工处理」 | 同一 head + 同一失败再看到只计一次再修额度、不再叫 pi；超过上限 → 停下写「需人工处理」，不空转。再修 / 解决冲突后的重推沿用同一个 PR，不再发 `draft-opened` |
-| 8 转 Ready | 写闸执行 `pr.ready` 前复核：仍是 Draft、head 和动作里的 SHA 一致、head 上至少 1 条检查且全部完成、全绿（排队中、还没有 run 的 workflow suite 也算没完成）；交接方式没显式配置就不转（`handoff-unconfigured`） | 任意一条不满足 → 4 `reason=ready-precondition`，保持 Draft 继续盯 |
+| 8 转 Ready | prbot 先读 PR 正文，验收对照里「待验证」经写闸 `pr.edit` 改成「通过 + 本次 head 的 CI 证据」，再过「开 PR / 转 Ready 前的检查」的 ready 档，不过就不转（`template-check`）；写闸执行 `pr.ready` 前复核：仍是 Draft、head 和动作里的 SHA 一致、head 上至少 1 条检查且全部完成、全绿（排队中、还没有 run 的 workflow suite 也算没完成）；交接方式没显式配置就不转（`handoff-unconfigured`） | 任意一条不满足 → 4 `reason=ready-precondition`，保持 Draft 继续盯 |
 | 9 Ready 之后 | 按 `handoff` 交接；写一条 `ready` 事件；转 Ready 后不再推送、不回 PR 评论、不调 `mivo-handoff.mjs` | watcher 档满 24 小时没人接 → 一条 `ready-stalled` 事件。「有人接」只算转 Ready 之后、不是机器人（`Bot` / `…[bot]`）的 review 和评论，以及名字匹配 `reviewCheckPattern` 的 check run；有过活动或 PR 已合并 / 已关就记下来，之后不再每拍重查 |
 | 10 合并 | **永远不做**。没有 `pr.merge`、不 Approve；合并由我在 GitHub 里点 | — |
 | 11 清理 | 只回收 `profile.worktreeDir/prbot/*` 里带 prbot 的 `.acc-owned.json`、且那一轮已经收尾（状态文件是终态或已进入下一轮）、没有活着的进程拿着锁的工作树；连同它在 `<home>/state/prbot/mirrors/` 下的宿主镜像一起删 | 没有标记 / 还在跑 / 还没收尾的一概不动 |
@@ -179,14 +179,34 @@ pi 写过的工作树不可信：它的 `.git/config`、钩子、`origin/main` �
 （只有一行 SC1，原文照抄修正子 issue 的 SC1；预检通过写「通过」和预检命令，没配预检写「待验证」）、定下的决定
 （有争议没修的条目，行头是「争议未修：」，不用验收机解析的「- 有争议：」）、未执行的验证（开 PR 时 CI 还没跑完，
 build / typecheck / test 的结果看本 PR 的检查，正文不写没发生的 CI 结果；SC1 由验收机在本 PR 合并后再验）、
-风险与回滚。写闸没有改 PR 正文的动作，正文只在 `pr.create` 时写一次，所以状态只写开 PR 时已有的证据，CI 结果看
-PR 的检查。
+风险与回滚。开 PR 时状态只写已有的证据；转 Ready 前 prbot 经写闸 `pr.edit`（#171）把「待验证」改成「通过」，证据写
+「pi 写了复现测试和最小修复 → CI 全绿（head <短 SHA>）→ <PR>/checks」（#172）。
 
 修正轮写动作的 `dedupeKey` 都带修正子 issue、轮次号和认领评论 id（认领本身带这次的开始时间，改评论再带正文摘要）：
 同一轮次号重放、本地状态丢了从头数，都不会从写闸账本里拿回旧结果。
 
 轮次评论里的争议条目是单行：`- 有争议：<owner/repo#n> SC<k> · 验收方：<裁决里的原因> · 修正方：<pi 的理由>`，
 和 `docs/acceptance-session.md` 的格式一样，`collect` 和 `round.mjs status` 按这一行认条目。轮次评论、状态文件里的时间都是北京时间 `+08:00`。
+
+## 开 PR / 转 Ready 前的检查（#172）
+
+规则和本机 `check-pr-issue.sh`、`check-pr-body.sh`（task-pr/v1，2026-10-26 版）一样，纯 JS 复刻在
+`watchers/acceptance/host/prbot-template-check.mjs`：
+
+- **开 PR 前**：修正子 issue 开着，有「目标 / 范围 / 不做 / 依赖 / 验收标准」五段，验收标准有 `SC<n>` 项；要开的
+  PR 正文过 open 档（有「任务 issue：<修正子 issue>」一行，六段齐且不空，验收对照的 SC 和 issue 一一对上，状态是
+  待验证 / 通过 / 未通过 / 人工手测之一）。
+- **转 Ready 前**：先读 GitHub 上的 PR 正文，验收对照里「待验证」的行（和上一个 head 写的 CI 证据）经写闸 `pr.edit`
+  改成「通过 + 本次 head 的 CI 证据」，再过 ready 档：不能还有「待验证 / 未通过」，「通过」要有证据，「人工手测」要在
+  「未执行的验证」里提到，没有模板占位。
+- **不过**：不开 PR / 不转 Ready，这一轮「需人工处理」（`template-check`），轮次评论的步骤里逐条写明没过的原因（期望和实际）。
+- 词边界按 Unicode 算，和脚本的 Python `re`、GNU grep 一样：「SC1导出」不算 SC 项。
+- 没复刻的一条：「合并顺序：」行。本机规则只对一个写死的仓生效，本仓公开、不写死仓名，修正 PR 正文也不写这一行。
+
+为什么纯 JS 复刻、不调脚本（2026-11-12 评估，问过 Jev 选 JS，置信度 0.84）：脚本用 `gh` 读 GitHub，`gh` 会用机器上配置的
+个人令牌（带写权限），而检查全程不许碰写令牌；脚本在本机工具目录，验收机宿主上不保证有同版本的脚本、`python3` 和 `gh`；
+本仓公开，不能写死本机路径。复刻的模块只处理文字、不导入任何模块，issue 和 PR 正文由 prbot 用只读客户端读（不经写闸）。
+代价是规则会漂移：脚本改了，要同步改这个模块和 `prbot-template-check.test.mjs`。
 
 ## 写闸（#60、#171 新增）
 

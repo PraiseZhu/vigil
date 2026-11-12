@@ -20,7 +20,8 @@ import { appendPrbotEvent } from './prbot-events.mjs';
 import { localEnv } from '../bin/localgit.mjs';
 import { run as procRun } from './proc.mjs';
 import { MEMORY_GATE_BYTES, acquireSerialLocks, acquireSlot, readHostConfig, readMemAvailable, releaseSerialLocks, serialLockFiles } from './round.mjs';
-import { CORRECTION_BOARD_VALUE, closesLine } from './prbot-gate-check.mjs';
+import { CORRECTION_BOARD_VALUE, PR_BODY_QUERY, closesLine } from './prbot-gate-check.mjs';
+import { checkPrBody, checkTaskIssue } from './prbot-template-check.mjs';
 import { HANDOFF_VALUES, handoffFor, preflightCommands, repoConfig } from './prbot-config.mjs';
 import {
   createGate,
@@ -1309,10 +1310,78 @@ function bodyCell(text) {
   return String(text || '').replace(/\s+/g, ' ').replace(/\|/g, '\\|').trim();
 }
 
+// 开 PR / 转 Ready 前的正文检查（#172）：和本机 check-pr-issue.sh、check-pr-body.sh 同样的规则（prbot-template-check.mjs）。
+// issue 和 PR 正文都用只读客户端读（不经写闸、不带写令牌）；不过就不开 PR / 不转 Ready，原因写进轮次评论的步骤里。
+
+async function readIssueForCheck(github, ref) {
+  const { repo, number } = parseRef(ref);
+  const [owner, name] = repo.split('/');
+  const data = await github.graphql(ISSUE_BODY_QUERY, { owner, name, number: Number(number) });
+  return data?.repository?.issue || null;
+}
+
+async function readPrForCheck(github, repo, number) {
+  const [owner, name] = String(repo).split('/');
+  const data = await github.graphql(PR_BODY_QUERY, { owner, name, number: Number(number) });
+  return data?.repository?.pullRequest || null;
+}
+
+async function templateProblems(github, state, body, stage) {
+  const issue = await readIssueForCheck(github, state.issue);
+  if (!issue) return [`读不到 issue ${state.issue}（不存在或无权限）`];
+  return [
+    ...(stage === 'open' ? checkTaskIssue(state.issue, issue) : []),
+    ...checkPrBody(body, { issueRef: state.issue, issueBody: issue.body, stage }),
+  ];
+}
+
+function stopForTemplate(state, when, problems) {
+  state.templateProblems = problems;
+  state.stopNote = `${when}的正文检查没过：${problems.join('；')}`;
+  state.failureReason = 'template-check';
+  state.steps.push(state.stopNote);
+  state.stage = 'stop';
+}
+
+export const CI_EVIDENCE_PREFIX = 'pi 写了复现测试和最小修复 → CI 全绿';
+
+/** 转 Ready 时写进验收对照的证据：本次 head 的 CI 全绿（纯文本，写闸 pr.edit 只收纯文本）。 */
+export function ciEvidence(state) {
+  return `${CI_EVIDENCE_PREFIX}（head ${String(state.pr.headSha).slice(0, 7)}）→ ${state.pr.url}/checks`;
+}
+
+/**
+ * 转 Ready 前的正文：「## 验收对照」里还是「待验证」的行，和上一个 head 写的 CI 证据，改成「通过 + 本次 CI 证据」。
+ * 只动状态和证据两格，别的一个字不改（写闸 pr.edit 只放行这两格）。没有要改的就原样返回。
+ */
+export function readyPrBody(body, evidence) {
+  let inTable = false;
+  return String(body ?? '')
+    .split('\n')
+    .map((line) => {
+      const heading = /^## (.+?)\s*$/.exec(line);
+      if (heading) {
+        inTable = heading[1] === '验收对照';
+        return line;
+      }
+      if (!inTable || !/^\|\s*(?:\*\*)?SC\d+/.test(line.trim())) return line;
+      const parts = line.split(/(?<!\\)\|/);
+      if (parts.length < 5) return line;
+      const status = parts[2].trim();
+      const current = parts[3].trim();
+      const stale = status === '通过' && current.startsWith(CI_EVIDENCE_PREFIX) && current !== evidence;
+      if (status !== '待验证' && !stale) return line;
+      parts[2] = ' 通过 ';
+      parts[3] = ` ${evidence} `;
+      return parts.join('|');
+    })
+    .join('\n');
+}
+
 /**
  * 修正 PR 正文（task-pr/v1，和修正子 issue 逐段对应）：首行链任务 issue；第二行「Closes <修正子 issue>」；第三行「任务 issue：<修正子 issue>」
  * （合并后 GitHub 关掉修正子 issue，trigger 才会再验）；最后一行修正标记原样照抄修正子 issue 的（轮次是验收轮，不是修正轮）。
- * 这三行写闸都认，不能动。正文只在 pr.create 时写一次（写闸没有改 PR 正文的动作），所以状态只写开 PR 时已有的证据。
+ * 这三行写闸都认，不能动。开 PR 时状态只写已有的证据；转 Ready 前由 readyPrBody 经写闸 pr.edit 补上 CI 证据（#171、#172）。
  */
 export function correctionPrBody(state, marker) {
   const prRepo = state.prRepo || parseRef(state.issue || state.root).repo;
@@ -1961,6 +2030,12 @@ export async function runPrbotCorrection({
             );
           }
           if (!pr) {
+            const prBody = correctionPrBody(state, marker);
+            const openProblems = await templateProblems(gateGithub, state, prBody, 'open');
+            if (openProblems.length) {
+              stopForTemplate(state, '开 PR 前', openProblems);
+              continue;
+            }
             const head = state.pushRepo === state.prRepo ? state.branch : `${repoOwner(state.pushRepo)}:${state.branch}`;
             const created = await gateWrite(
               gate,
@@ -1972,7 +2047,7 @@ export async function runPrbotCorrection({
                 base: 'main',
                 draft: true,
                 title: `修正：${state.item} SC${state.sc}`,
-                body: correctionPrBody(state, marker),
+                body: prBody,
               },
               { state, sleep, now },
             );
@@ -2273,6 +2348,38 @@ export async function runPrbotCorrection({
         if (!state.handoff) {
           state.failureReason = 'handoff-unconfigured';
           state.stage = 'stop';
+          continue;
+        }
+        const prNow = await readPrForCheck(gateGithub, state.prRepo, state.pr.number);
+        if (!prNow) {
+          stopForTemplate(state, '转 Ready 前', [`读不到 ${state.prRepo}#${state.pr.number} 的正文`]);
+          continue;
+        }
+        let prBody = prNow.body || '';
+        const filled = readyPrBody(prBody, ciEvidence(state));
+        if (filled !== prBody) {
+          const edited = await gateWrite(
+            gate,
+            {
+              type: 'pr.edit',
+              dedupeKey: roundKey(state, `edit:${state.pr.headSha}:${crypto.createHash('sha256').update(filled).digest('hex').slice(0, 16)}`),
+              repo: state.prRepo,
+              pr: state.pr.number,
+              body: filled,
+            },
+            { state, sleep, now },
+          );
+          if (edited.code !== 0) {
+            markWriteFailure(state, edited);
+            state.stage = 'stop';
+            continue;
+          }
+          state.steps.push(`转 Ready 前：验收对照按 CI 结果写成「通过」（head ${String(state.pr.headSha).slice(0, 7)}）`);
+          prBody = filled;
+        }
+        const readyProblems = await templateProblems(gateGithub, state, prBody, 'ready');
+        if (readyProblems.length) {
+          stopForTemplate(state, '转 Ready 前', readyProblems);
           continue;
         }
         const ready = await gateWrite(
