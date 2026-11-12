@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { bodyVersion } from './bin/rounds.mjs';
 import { OWNER, OTHER_REPO, REPO, roundComment } from './fake-gh.fixture.mjs';
+import { PR_BODY_QUERY } from './host/prbot-gate-check.mjs';
 
 export { OWNER, OTHER_REPO, REPO };
 export const FORK_REPO = 'makecindy/cindy';
@@ -254,9 +255,22 @@ export function createWorld({ now = () => Date.parse(CLOCK) } = {}) {
     return { updateProjectV2ItemFieldValue: { projectV2Item: { id: variables.itemId } } };
   }
 
+  // 修正 PR（#172）：prbot 开 PR 前 / 转 Ready 前读 PR 正文做模板检查。键是 owner/repo#号。
+  const pulls = new Map();
+  function setPull({ repo, number, body = '', isDraft = true, state = 'OPEN' }) {
+    const ref = refOf(repo, Number(number));
+    const pull = { number: Number(number), body, isDraft, state };
+    pulls.set(ref, pull);
+    return pull;
+  }
+
   function graphql(payload = {}) {
     const query = String(payload.query || '');
     const variables = payload.variables || {};
+    if (query === PR_BODY_QUERY) {
+      const pull = pulls.get(refOf(`${variables.owner}/${variables.name}`, Number(variables.number)));
+      return { repository: { pullRequest: pull ? clone(pull) : null } };
+    }
     if (query.includes('search(')) return searchData(variables);
     if (query.includes('subIssues(')) return rootData(variables);
     if (query.includes('fieldValueByName(')) return boardValueData(variables);
@@ -353,6 +367,8 @@ export function createWorld({ now = () => Date.parse(CLOCK) } = {}) {
     graphql,
     write,
     refOf,
+    pulls,
+    setPull,
   };
 }
 

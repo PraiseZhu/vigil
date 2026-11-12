@@ -169,7 +169,7 @@ App 装在多个 owner 上、读和写又是两个 App 时，用 `apps` 配。�
 |---|---|
 | 落在 `apps.read.owners` 名下**单个仓**上的只读查询（议题正文、轮次评论、PR 检查等按 `owner/name` 定位的读） | ①读 App |
 | 评论 / issue / sub-issue 写：`comment.create/update`、`issue.create/edit/close/reopen`、`subissue.add` | ②写 App |
-| 推分支 / PR / workflow：`branch.push`、`pr.create`、`pr.ready`、`pr.update-branch`、`ci.rerun` | ②写 App |
+| 推分支 / PR / workflow：`branch.push`、`pr.create`、`pr.ready`、`pr.update-branch`、`ci.rerun`、`pr.edit` | ②写 App |
 | 跨仓盘点、搜索、`viewer`、看板读、别人组织的仓 | 账号令牌 |
 | 看板写（`project.field.set`） | 账号令牌（App 看不到个人账号下的 Projects v2） |
 | 合并（`pr.merge`）与其它没列出的写类型 | 账号令牌（不在表里就按账号令牌，不猜） |
@@ -799,6 +799,7 @@ node watchers/acceptance/deploy-ff.mjs \
 | `up-to-date` | 0 | 已经在目标提交 |
 | `waiting` | 30 | 等待空档（轮次目录、锁目录、验收进程或演练锁） |
 | `ci-pending` | 30 | 等待检查跑完 |
+| `draining` | 30 | 落后超限、等不到空档：正在排空（占住空出来的轮次槽位，见下面「部署排空」） |
 | `locked` | 20 | 另一个实例拿着本脚本的锁 |
 | `blocked-dirty` | 10 | 工作区不干净，不动 |
 | `blocked-diverged` | 11 | 分叉或本地超前，只接受快进 |
@@ -825,6 +826,21 @@ node watchers/acceptance/deploy-ff.mjs \
 - 待拉提交的新增行（删除行不算；改名用 `--no-renames` 拆开算，挪走旧路径也算命中）按「旧规则减去白名单」判（#426）：出现 `token`、`process.env`（不分大小写）就算敏感，只有每一处都落在白名单写法里才放过；白名单只有三种：按字面量名字读写普通环境变量（`process.env.X`、`process.env?.X`、`process.env['X']`，名字里不能有 `TOKEN`、`SECRET`、`PASSW`、`KEY`、`APP`、`AUTH`、`CRED`）、函数默认参数 `(env = process.env)`、模块文件名里的一段 token（`mivo-app-token.mjs` 这种 `.mjs/.js/.ts/.py/.sh/.md` 文件名；`token.json` 这类数据文件不算）。另外，不管怎么读到的，出现全大写的密钥类名字就算（`GITHUB_TOKEN`、`X_API_KEY`、`APIKEY`、`DB_PASSWORD`、`DEPLOY_KEY`、`MIVO_APP_ID`；`KEY` 要是最后一段，`APP` 要跟着 `ID` / `INSTALLATION`，所以 `FORBIDDEN_KEYS`、`WATCHED_BOT_APP` 不算），没有字面量名字的读环境变量写法也算（`process['env']`、`globalThis…process`、`require('process')`、Python 的 `os.environ` / `getenv`、shell 的 `printenv`）；`secrets/` 路径、`*.key` / `*.pem` 等密钥文件、`token.json` / `.token` / `…/token` / `path.join(home, 'token')` / `` `${dir}/token` `` 这类令牌文件、`appOnly`、`listen(8080)` 或 `port: 3000` 这种端口配置照旧单独认。读法列不完（别名、解构、拼接、别的语言），所以默认拦、按白名单放。任何目录下的 `*.test.mjs`、`*.test.py`、`*.fixture.mjs`，以及仓根 `docs/` 下一层的 `*.md`，新增行不做内容扫描（上面的路径规则仍然照查）；`docs/` 的子目录和别处的 `docs/` 目录照常扫。
 
 落后：本地比目标多超过 5 个提交，或最早一个未部署提交距今超过 2 小时，人话里带 `lagging`，并给 lead 一句。同一次落后（以当前本地 HEAD 为键）只在第一次把 `reportLag` 设为 true。快进成功后这份记忆清掉。
+
+### 部署排空（#425）
+
+验收轮一个接一个时，主循环在槽位空出的下一拍就起新轮次，本脚本可能一直等不到空档。排空借用主循环已有的槽位锁 `<host-state>/slots/slot-0`、`slot-1`。主循环起轮前会数活着的槽，单轮拿不到槽就这一拍不认领。所以占住空出来的槽，就能挡住新轮次，主循环一行不用改。
+
+- **什么时候排空**：等不到空档（`rounds`、`locks` 不空或有验收进程），且同时满足两条。一是按上面的规则已算落后，超过 5 个提交或超过 2 小时。二是 `HEAD..origin/main` 没有敏感改动，或者已经点名批准了目标完整 sha。需要批准时不排空。算落后之前先 `git fetch origin`：只更新远端引用，不动工作区和 HEAD，所以一直等不到空档时落后数也是新的。fetch 失败时结局是 `fetch-failed`，已占的槽当场放掉。冷却期内、或下面说的「没有在跑的证据」时不 fetch。
+- **只认活着的登记**：`rounds/`、`locks/` 里每个文件都要判活。内容里有正整数 `pid` 的，用 `kill(pid, 0)` 判活（EPERM 也算活）。读不出 `pid` 的（半截、空对象、不是 JSON），看文件修改时间：超过 10 分钟算残留，10 分钟内按正在写、算在跑。排空的条件是至少有一个活的登记，或者列进程看到了在跑的验收进程。两个目录读不了、或者列不出进程时，不排空。
+- **有残留就不排空**：只要有一个残留文件（写的进程已经不在，比如轮次被 SIGKILL、OOM 或重启打断），就不排空、不占槽，已在排空的当场放槽。哪怕同时还有活的登记也一样，因为活的那轮结束后，残留仍会挡住空档判定。这时排空只会占满 120 分钟、冷却 30 分钟、再占满，验收大部分时间起不了轮次。另写一条 `deploy-drain-stale-locks` 提醒（人话，列出残留文件的相对路径），同一个 HEAD 和目标只写一次。本脚本不删这些文件，要人确认对应轮次已经结束后再删。宿主下一次拿同名锁时，也会自己清掉 pid 已死的锁。空档判定本身不变：目录不空就不部署，残留文件照样挡住部署。
+- **怎么占**：起一个脱离 cron 的持有进程（命令行带 `deploy-ff-drain-holder` 标记），用它的 pid 按宿主锁的同一格式（O_EXCL 建文件，内容 `{pid, startedAt}`）去占空槽。写着活 pid 的槽是在跑的轮次，不抢；pid 已死的陈旧锁删掉重占；读不出内容的按占用处理。不中止、不暂停任何轮次。持有进程活着时每秒自己看一次槽位，有空出来的（在跑的轮次结束删了槽文件，或留下写着死 pid 的槽）就立刻按同样规则占上：主循环每 3 分钟起一次轮次，本脚本 5 分钟才跑一拍，只靠本脚本补占，空出来的槽会被主循环先拿走，排空永远等不到空档（#425 复审）。
+- **状态**：标准输出状态是 `draining`，退出码 30，人话说明占了几个槽、在等什么、截止时间。`deploy-ff.json` 多一个 `drain` 字段：`status`、`holderPid`、`target`、`startedAt`、`deadline`、`slots`。下一拍发现自己在排空时，沿用同一个持有进程和截止时间，补占新空出来的槽，重复跑结果不变。持有进程意外没了，就重起一个接着占，截止时间不变。开始排空时写一条 `deploy-draining` 提醒（人话），同一个 HEAD 和目标只写一次。
+- **什么时候部署**：槽位被占后不会再起新轮；在跑的轮次结束、`rounds`、`locks` 都空、没有验收进程时，空档判定（不变）通过，照原流程 fetch、读检查、敏感批准、快进和 `doctor`。
+- **什么时候放槽**：结局是 `deployed`、`up-to-date`，或者要人看（`needs-approval`、`doctor-failed`、`pull-failed`、`blocked-dirty`、`blocked-diverged`、`ci-red`、`ci-unknown`），或者暂时等不到结果（`fetch-failed`、`ci-pending`）时，当场让持有进程退出并删掉写着它 pid 的槽。后两种放槽后验收照常起轮次，下一拍还落后会再排空，截止时间重新算。`locked` 不放：那时另一个实例拿着本脚本的锁，排空归它管，它可能正在快进或跑 `doctor`。
+- **最长持续时间**：从开始排空算 120 分钟，截止前 1 毫秒仍在排空，到截止时刻（含）的那一拍放槽，写一条 `deploy-drain-timeout` 提醒，状态回到 `waiting`。持有进程自己也在截止时间删槽退出，所以本脚本不再运行也不会一直占着。超时后冷却 30 分钟（`drainCooldownUntil`）才会再排空，保证等不到空档时验收照常起轮次。
+- **和写闸无关**：排空不读、不写写闸总开关，也不改 `MAX_ROUNDS`、限流预算、账号余量暂停线、敏感判定和批准流程。
+- **手动查看**：`jq .drain <home>/state/host/deploy-ff.json`；`cat <home>/state/host/slots/slot-*`（`holder` 为 `deploy-ff` 的是排空占的）；`ps -o pid,etime,args -p <holderPid>`。要提前放开，对 `holderPid` 发 SIGTERM，它会删掉自己的槽后退出。
 
 提醒写到调用方传入的 `alerts.jsonl`，本脚本自己追加，不引用宿主目录里的模块。一行一个 JSON：`ts`、`kind`、`reason`、`detail`，另带 `head`、`target`。`kind` 以 `deploy-` 开头，例如 `deploy-needs-approval`、`deploy-blocked-dirty`、`deploy-doctor-failed`、`deploy-pull-failed`、`deploy-blocked-diverged`、`deploy-ci-red`、`deploy-ci-unknown`，首次落后另写 `deploy-lagging`。同一个本地 HEAD、目标 sha 和 kind 只写一行。`waiting`、`ci-pending`、`up-to-date`、`deployed` 不写；`locked` 和 `fetch-failed` 只出现在标准输出，不写提醒。状态文件用临时文件加 rename 写入，记下落后是否报过、以及已经写过的提醒键。
 
@@ -1005,15 +1021,15 @@ github-live 的手测（真的看板上跑 24 小时、以及合并后确认没�
 }
 ```
 
-单位是这一小时的额度点数。`loop` 按「poll 的响应头个数 × 6 点」记，`prio-run` 一次整板读按 8 点记，`board-live` 按 REST 请求数记（它主要走 App 安装令牌的独立额度）。三个值都是保守值，按 #247「待定」项取：主循环改后实测约 500 点/小时、prio-run 沿用 300、仓外看板组件落在用户令牌上约 140 请求/小时。超预算只有该组件自己跳过，同一小时里别的组件照常跑。注意「跳过」的粒度不是一拍：`used` 只增不减、UTC 整点才切窗，所以某个组件一旦在这一小时里超了预算，这一小时**剩余所有拍**它都不再做那一读（不是只丢刚才那一拍）；跨过 5 拍时写一条 `rate-skip-escalate` 提醒（同一段连跳只写一条：越过阈值后继续跳过不再重复提醒，恢复放行或切窗清零后重新计），见本节末尾。
+单位是这一小时的额度点数。`loop` 只记非必要读（修正轮发现、卡住检查等，一次请求 6 点），`prio-run` 一次整板读按 8 点记，`board-live` 按 REST 请求数记（它主要走 App 安装令牌的独立额度）。主循环每拍盘点（`purpose: 'essential'` 的 poll）按「响应头个数 × 6 点」记进 `components.poll`，**不计入** `loop` 的 500 点预算，也不占用另外两个组件的预算。三个值都是保守值，按 #247「待定」项取：主循环改后实测约 500 点/小时、prio-run 沿用 300、仓外看板组件落在用户令牌上约 140 请求/小时。超预算只有该组件自己跳过，同一小时里别的组件照常跑。注意「跳过」的粒度不是一拍：`used` 只增不减、UTC 整点才切窗，所以某个组件一旦在这一小时里超了预算，这一小时**剩余所有拍**它都不再做那一读（不是只丢刚才那一拍）；跨过 5 拍时写一条 `rate-skip-escalate` 提醒（同一段连跳只写一条：越过阈值后继续跳过不再重复提醒，恢复放行或切窗清零后重新计），见本节末尾。
 
-**预算闸只约束非必要读**：`purpose: 'essential'`（只有主循环 poll）直接放行，越预算照跑——拦它会把这一小时剩下的 poll 连同心跳之外的 abort / 派发一起停掉，而心跳仍是 `ok: true`（复审报的 P1）。用量照记，所以 `components.<组件>.used` 超过预算值是正常现象，超预算的后果只落在该组件的非必要读上（修正轮发现、卡住检查、看板整板读等）。响应头闸的 `< 800` 一档同样只暂停非必要读，`essential` 不拦，两处口径一致。
+**预算闸只约束非必要读**：`purpose: 'essential'`（只有主循环 poll）直接放行，越预算照跑——拦它会把这一小时剩下的 poll 连同心跳之外的 abort / 派发一起停掉，而心跳仍是 `ok: true`（复审报的 P1）。poll 的点数记在 `components.poll`，不进 `loop.used`，所以盘点本身不会把 `loop` 的 500 点顶满。`loop` 超预算的判定口径是本小时 `loop.used + 本拍 cost + reserve > 500` 才跳过非必要读，刚好等于 500 不跳。响应头闸的 `< 800` 一档同样只暂停非必要读，`essential` 不拦，两处口径一致。`prio-run` / `event-run` 仍记 `prio-run` 这一格，计费口径不变。
 
 配置缺了或值不对时：`prio-run` 打一行「额度预算配置无法使用：…」并只走响应头闸；主循环把原因写进心跳的 `lastTick.rateBudgetError`，同样不猜默认值。
 
 ### 状态文件（按令牌分开）
 
-`<home>/state/host/rate-budget.json`。`identities` 下每个令牌一格（`user` 账号令牌、`app` App 安装令牌），各记 `remaining` / `remainingRaw` / `reset` / `at` / `source`，互相不覆盖；某一枚没有记录时按缺头处理（`rate-unknown`）。`components` 下是各组件本小时（UTC 整点切窗）的 `used`，`recovery` 是当前恢复期的轮转位置，`skips` 是连续「因额度跳过」的拍数：`skips.byKey` 按「组件:用途」分开数（判定连跳用这个），每一项记 `count`（连跳的**拍**数）、`lastAt`、`lastTick`（这一拍已经计过数，同一拍再判只算一拍）、`escalated`（这一段连跳已经提醒过，不再重复）、`reason`；`skips.count` 是**最近一次判定那个 key** 的连跳数，随判定顺序变化，外部要读连跳请看 `byKey`。
+`<home>/state/host/rate-budget.json`。`identities` 下每个令牌一格（`user` 账号令牌、`app` App 安装令牌），各记 `remaining` / `remainingRaw` / `reset` / `at` / `source`，互相不覆盖；某一枚没有记录时按缺头处理（`rate-unknown`）。`components` 下是各组件本小时（UTC 整点切窗）的 `used`，另有可选的 `components.poll`（主循环盘点用量；老格式文件没有这一项时按 0 读，不清空既有计数），`recovery` 是当前恢复期的轮转位置，`skips` 是连续「因额度跳过」的拍数：`skips.byKey` 按「组件:用途」分开数（判定连跳用这个），每一项记 `count`（连跳的**拍**数）、`lastAt`、`lastTick`（这一拍已经计过数，同一拍再判只算一拍）、`escalated`（这一段连跳已经提醒过，不再重复）、`reason`；`skips.count` 是**最近一次判定那个 key** 的连跳数，随判定顺序变化，外部要读连跳请看 `byKey`。
 
 ### 看板快照（每拍只整板读一次）
 
@@ -1030,7 +1046,10 @@ github-live 的手测（真的看板上跑 24 小时、以及合并后确认没�
 <UTC 时间> rate-skip component=loop identity=user remaining=unknown action=over-budget budget=500 used=498 cost=6 因额度跳过
 <UTC 时间> rate-unknown component=loop identity=app remaining=unknown raw=（缺失） reason=no-record 响应头缺失或不合法，本拍不跳过
 <UTC 时间> rate-recovery component=loop identity=user remaining=438 resetAt=2026-11-03T19:07:00.000Z 重置后限速恢复：每拍最多 1 次非必要读
+<UTC 时间> rate-poll component=poll used=42 cost=6 hourKey=15700 本小时 poll 用量（不计入 loop 预算）
 ```
+
+`rate-poll` 是主循环每拍盘点记账后写的一行，只报告 `components.poll`，不表示跳过。doctor 的「poll 小时用量」一项读同一格，缺项或老格式按 0 计，这项本身不是红灯。
 
 连续「因额度跳过」超过 5 拍（N=5）时行尾再带 `streak=<拍数>`，仍然只跳过、不抛错；连跳节数按「组件 + 用途」分开数（`skips.byKey`），同一拍里 `essential` 放行不会把非必要读的连跳清零，同一拍里同一个 key 判两次（`loop` 的修正轮发现 + 卡住检查）也只算一拍。跨过 5 拍时写一条 `rate-skip-escalate` 提醒（带 `count`、`component`），只写这一条：越过阈值后继续跳过不再重复写，恢复放行或切窗清零后重新计；心跳 `ok` 一直是 true，光看心跳发现不了「整小时没在推进」。
 

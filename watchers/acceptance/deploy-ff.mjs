@@ -14,10 +14,20 @@ export const LAG_BEHIND_OVER = 5;
 /** 最早一个未部署提交距今超过这么久算落后（正好等于不算）。 */
 export const LAG_AGE_MS = 2 * 60 * 60 * 1000;
 
+/** 排空（#425）最长这么久：从开始占槽算，到点放槽，持有进程也到点自己退出。 */
+export const DRAIN_MAX_MS = 120 * 60 * 1000;
+/** 排空超时之后至少隔这么久才再排空，免得等不到空档时验收被一直挡着。 */
+export const DRAIN_COOLDOWN_MS = 30 * 60 * 1000;
+/** 主循环和单轮共用的两个槽位锁文件名（<host-state>/slots/ 下）。 */
+export const SLOT_NAMES = Object.freeze(['slot-0', 'slot-1']);
+/** rounds/、locks/ 里读不出 pid 的文件：修改时间超过这么久算残留（正好等于不算），更新的按「正在写」当在跑。 */
+export const STALE_UNREADABLE_MS = 10 * 60 * 1000;
+
 export const EXIT = Object.freeze({
   deployed: 0,
   'up-to-date': 0,
   waiting: 30,
+  draining: 30,
   'ci-pending': 30,
   locked: 20,
   'blocked-dirty': 10,
@@ -46,6 +56,7 @@ const ALERT_STATUSES = new Set([
 const HUMAN = Object.freeze({
   locked: '另一个实例正在跑，这次直接退出。',
   waiting: '还没到轮次空档，先等着。',
+  draining: '部署落后太多，正在排空：占住空出来的轮次槽位，不再起新轮次，在跑的轮次不动，等它们结束就部署。',
   'blocked-dirty': '工作区不干净，不动。',
   'fetch-failed': '拉取远端失败，不动。',
   'up-to-date': '已经在目标提交上，不用拉。',
@@ -60,6 +71,61 @@ const HUMAN = Object.freeze({
 });
 
 const LAG_LEAD = '本地落后目标超过限度，请 lead 看一下要不要处理。';
+
+/** 这些结局说明这次部署已经有了结果或要人看，排空占的槽当场放掉。 */
+const DRAIN_RELEASE_STATUSES = new Set([
+  'deployed',
+  'up-to-date',
+  'blocked-dirty',
+  'blocked-diverged',
+  'needs-approval',
+  'pull-failed',
+  'doctor-failed',
+  'ci-red',
+  'ci-unknown',
+  // 等不到结果的两种（#425 返工）：拉不到远端、检查还在跑。先放槽让验收照常起轮次，下一拍还落后再排空。
+  'fetch-failed',
+  'ci-pending',
+]);
+const DRAIN_HOLDER_MARK = 'deploy-ff-drain-holder';
+const DRAIN_ALERT = '部署落后太多，开始排空：占住空出来的轮次槽位，不再起新轮次（在跑的轮次不动），等它们结束就部署，最长 120 分钟。';
+const DRAIN_TIMEOUT_REASON = '排空 120 分钟仍没等到轮次空档，已放开槽位，验收照常起轮次；30 分钟后还落后会再排空。';
+// 持有进程：活到截止时间；到点或收到 SIGTERM 时删掉写着自己 pid 的槽位文件后退出。
+// 活着的时候每秒看一次槽位，有空出来的就立刻占上（#425 复审 P2）：主循环每 3 分钟起一次轮次，部署脚本 5 分钟才跑一拍，
+// 只靠部署脚本补占，在跑的轮次一结束，空出来的槽几乎总被主循环先拿走，排空永远等不到空档。
+// 占法和宿主 tryAcquireLock 一样：O_EXCL 建文件写 {pid, startedAt}；写着活 pid 的不抢，读不出内容的按占用处理，pid 已死的删掉重来。
+export const DRAIN_HOLDER_POLL_MS = 1000;
+const DRAIN_HOLDER_CODE = [
+  "const fs = require('fs');",
+  'const args = process.argv.slice(1);',
+  'const files = args.slice(2);',
+  'const alive = (pid) => {',
+  '  if (!Number.isInteger(pid) || pid <= 0) return false;',
+  "  try { process.kill(pid, 0); return true; } catch (error) { return Boolean(error) && error.code === 'EPERM'; }",
+  '};',
+  'const claim = (file) => {',
+  "  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), holder: 'deploy-ff' });",
+  '  for (let attempt = 0; attempt < 2; attempt += 1) {',
+  "    try { const fd = fs.openSync(file, 'wx', 0o600); try { fs.writeFileSync(fd, payload); } finally { fs.closeSync(fd); } return; } catch (error) {",
+  "      if (!error || error.code !== 'EEXIST') return;",
+  '      let lock = null;',
+  "      try { lock = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return; }",
+  "      if (!lock || typeof lock !== 'object' || lock.pid === process.pid || alive(Number(lock.pid))) return;",
+  '      try { fs.unlinkSync(file); } catch { return; }',
+  '    }',
+  '  }',
+  '};',
+  'const done = () => {',
+  '  for (const file of files) {',
+  "    try { const lock = JSON.parse(fs.readFileSync(file, 'utf8')); if (lock && lock.pid === process.pid) fs.unlinkSync(file); } catch {}",
+  '  }',
+  '  process.exit(0);',
+  '};',
+  "process.on('SIGTERM', done);",
+  "process.on('SIGINT', done);",
+  `setInterval(() => { for (const file of files) claim(file); }, ${DRAIN_HOLDER_POLL_MS});`,
+  'setTimeout(done, Math.max(0, Number(args[1]) || 0));',
+].join('\n');
 
 const GREEN = new Set(['success', 'neutral', 'skipped']);
 const RED = new Set(['failure', 'cancelled', 'timed_out', 'action_required', 'stale', 'startup_failure', 'error']);
@@ -367,7 +433,7 @@ export function humanLine(payload) {
     if (rows) text += ` 行 ${rows}。`;
     if (payload.target) text += ` 目标 ${payload.target}。`;
   }
-  if (payload.reason && payload.status === 'doctor-failed') text += ` ${payload.reason}`;
+  if (payload.reason && (payload.status === 'doctor-failed' || payload.status === 'draining')) text += ` ${payload.reason}`;
   if (payload.lagging) text += ` ${LAG_LEAD}`;
   return oneLine(text);
 }
@@ -423,6 +489,8 @@ function dirEmpty(dir) {
   }
 }
 
+const BUSY_PROCESS_REASON = '有验收进程在跑';
+
 async function idleBlock(opts) {
   const rounds = path.join(opts.hostStateDir, 'rounds');
   const locks = path.join(opts.hostStateDir, 'locks');
@@ -435,7 +503,7 @@ async function idleBlock(opts) {
     return '列不出进程';
   }
   if (!Array.isArray(processes)) return '列不出进程';
-  if (processes.some((line) => BUSY_PROCESS_RE.test(String(line)))) return '有验收进程在跑';
+  if (processes.some((line) => BUSY_PROCESS_RE.test(String(line)))) return BUSY_PROCESS_REASON;
   return null;
 }
 
@@ -445,10 +513,261 @@ function readState(file) {
     return {
       lagReportedFor: typeof data?.lagReportedFor === 'string' ? data.lagReportedFor : null,
       alerted: Array.isArray(data?.alerted) ? data.alerted.filter((item) => typeof item === 'string') : [],
+      drain: validDrain(data?.drain),
+      drainCooldownUntil: typeof data?.drainCooldownUntil === 'string' ? data.drainCooldownUntil : null,
     };
   } catch {
-    return { lagReportedFor: null, alerted: [] };
+    return { lagReportedFor: null, alerted: [], drain: null, drainCooldownUntil: null };
   }
+}
+
+function validDrain(drain) {
+  if (!drain || typeof drain !== 'object' || Array.isArray(drain)) return null;
+  if (!Number.isInteger(drain.holderPid) || drain.holderPid <= 0) return null;
+  if (!Number.isFinite(Date.parse(drain.deadline)) || !Number.isFinite(Date.parse(drain.startedAt))) return null;
+  return {
+    status: 'draining',
+    holderPid: drain.holderPid,
+    target: typeof drain.target === 'string' ? drain.target : null,
+    startedAt: drain.startedAt,
+    deadline: drain.deadline,
+    slots: Array.isArray(drain.slots) ? drain.slots.filter((name) => SLOT_NAMES.includes(name)) : [],
+  };
+}
+
+/** 状态文件只写有内容的排空字段：没排空过的机器上 deploy-ff.json 形状不变。 */
+function stateRecord({ lagReportedFor, alerted, drain, drainCooldownUntil }) {
+  const out = { lagReportedFor, alerted };
+  if (drain) out.drain = drain;
+  if (drainCooldownUntil) out.drainCooldownUntil = drainCooldownUntil;
+  return out;
+}
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+/**
+ * 起一个脱离本进程的持有进程（#425）：槽位锁里写它的 pid，部署脚本退出后它还活着，主循环数槽时就算占用。
+ * 到 ttlMs 自己删掉写着自己 pid 的槽位文件后退出。返回 pid；起不来返回 null。
+ */
+export function spawnDrainHolder({ ttlMs, files }) {
+  try {
+    const child = spawn(process.execPath, ['-e', DRAIN_HOLDER_CODE, DRAIN_HOLDER_MARK, String(Math.max(0, ttlMs)), ...files], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    return Number.isInteger(child.pid) ? child.pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 持有进程还在、而且命令行带标记（防 pid 被别的进程复用）才算活着。读不了 /proc 时只看 pid。 */
+export function drainHolderAlive(pid) {
+  if (!pidAlive(pid)) return false;
+  try {
+    return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes(DRAIN_HOLDER_MARK);
+  } catch (error) {
+    return error?.code !== 'ENOENT';
+  }
+}
+
+/** 只对确认是自己起的持有进程发 SIGTERM；它收到后自己删槽退出。 */
+function stopDrainHolder(holderPid) {
+  if (!drainHolderAlive(holderPid)) return;
+  try { process.kill(holderPid, 'SIGTERM'); } catch { /* 已经退出 */ }
+}
+
+function slotPath(hostStateDir, name) {
+  return path.join(hostStateDir, 'slots', name);
+}
+
+function readSlot(file) {
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return data && typeof data === 'object' ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 占一个空槽，锁格式和宿主的 tryAcquireLock 一样（O_EXCL 建文件，内容 {pid, startedAt}），pid 写持有进程的。
+ * 已经写着持有进程 pid 的算自己的；写着活 pid 的是在跑的轮次，不抢；读不出内容的按占用处理；pid 已死的陈旧锁删掉重来。
+ */
+function claimSlot(file, holderPid, nowMs) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const payload = JSON.stringify({ pid: holderPid, startedAt: new Date(nowMs).toISOString(), holder: 'deploy-ff' });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = fs.openSync(file, 'wx', 0o600);
+      try {
+        fs.writeFileSync(fd, payload);
+      } finally {
+        fs.closeSync(fd);
+      }
+      return true;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') return false;
+      const current = readSlot(file);
+      if (!current) return false;
+      if (current.pid === holderPid) return true;
+      if (pidAlive(Number(current.pid))) return false;
+      try { fs.unlinkSync(file); } catch { return false; }
+    }
+  }
+  return false;
+}
+
+/** 放槽：先让持有进程退出，再删写着它 pid 的槽位文件（它已经删了就是空操作）。别人的槽不动。 */
+function releaseDrain(opts, drain) {
+  if (!drain) return;
+  try { opts.stopHolder(drain.holderPid); } catch { /* 收不掉也照样删槽 */ }
+  for (const name of SLOT_NAMES) {
+    const file = slotPath(opts.hostStateDir, name);
+    const current = readSlot(file);
+    if (current && current.pid === drain.holderPid) {
+      try { fs.unlinkSync(file); } catch { /* 已经不在 */ }
+    }
+  }
+}
+
+/** 本地 HEAD..origin/main 有没有没批准的敏感改动；算不出来按需要批准处理（不排空）。 */
+function needsApprovalLocally(opts, target) {
+  const base = ['--no-renames', '--no-ext-diff', '--no-textconv', 'HEAD', target];
+  const names = opts.runGit(opts.deployDir, ['diff', '--name-only', ...base]);
+  const diff = opts.runGit(opts.deployDir, ['diff', ...base]);
+  if (!names.ok || !diff.ok) return true;
+  const files = names.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+  const hits = sensitiveHits(files, parseAddedLines(diff.stdout));
+  if (!hits.files.length) return false;
+  return !approvalMatches(target, opts.approve, readApproval(opts.approvalFile, opts.deployDir)).ok;
+}
+
+/**
+ * 排空前看 rounds/、locks/ 里每个登记是不是还活着（#425 返工）。只读，不删任何文件。
+ * 内容里有正整数 pid 的按 pid 判活（EPERM 也算活）；读不出 pid 的看修改时间，超过 STALE_UNREADABLE_MS 算残留。
+ * 返回 { live, stale, unreadable }，live/stale 是 `rounds/<文件名>` 这样的相对名；目录本身读不了时 unreadable 为 true。
+ */
+function selectBusyEntries(hostStateDir, nowMs) {
+  const out = { live: [], stale: [], unreadable: false };
+  for (const sub of ['rounds', 'locks']) {
+    let names;
+    try {
+      names = fs.readdirSync(path.join(hostStateDir, sub)).sort();
+    } catch {
+      out.unreadable = true;
+      continue;
+    }
+    for (const name of names) {
+      const rel = `${sub}/${name}`;
+      const file = path.join(hostStateDir, sub, name);
+      let pid = null;
+      try {
+        pid = Number(JSON.parse(fs.readFileSync(file, 'utf8'))?.pid);
+      } catch {
+        pid = null;
+      }
+      if (Number.isInteger(pid) && pid > 0) {
+        (pidAlive(pid) ? out.live : out.stale).push(rel);
+        continue;
+      }
+      let mtimeMs;
+      try {
+        mtimeMs = fs.lstatSync(file).mtimeMs;
+      } catch {
+        continue; // 刚被删掉
+      }
+      (nowMs - mtimeMs > STALE_UNREADABLE_MS ? out.stale : out.live).push(rel);
+    }
+  }
+  return out;
+}
+
+function staleAlert(busy) {
+  const others = busy.live.length ? `另有 ${busy.live.length} 个还在跑，但它们结束后这些残留仍会挡着部署，` : '';
+  return {
+    kind: 'deploy-drain-stale-locks',
+    reason: `部署落后，但轮次登记或锁里有残留文件（写的进程已经不在）：${busy.stale.join('、')}。${others}`
+      + '排空等不到空档，所以不排空、不占槽，验收照常起轮次；这些文件不清掉部署会一直等，需要人确认对应轮次已结束后删掉。',
+  };
+}
+
+/**
+ * 等不到空档时的排空（#425）。先 `git fetch origin`（只更新远端引用，不动工作区和 HEAD）再算落后。
+ * 只有 rounds/、locks/ 里有活着的登记（或列出了在跑的验收进程）才排空；有残留文件时不排空，写残留提醒。
+ * 返回 { decision, drain, drainCooldownUntil, alert }；不排空时 decision 为 null（调用方照旧写 waiting）。
+ */
+function drainStep(opts, state, blockedReason) {
+  const nowMs = opts.now();
+  const nowIso = new Date(nowMs).toISOString();
+  let drain = state.drain;
+  const stop = (extra = {}) => {
+    if (drain) releaseDrain(opts, drain);
+    return { decision: null, drain: null, drainCooldownUntil: state.drainCooldownUntil, ...extra };
+  };
+  if (drain && nowMs >= Date.parse(drain.deadline)) {
+    releaseDrain(opts, drain);
+    return {
+      decision: pack('waiting', `${blockedReason}；${DRAIN_TIMEOUT_REASON}`, {}),
+      drain: null,
+      drainCooldownUntil: new Date(nowMs + DRAIN_COOLDOWN_MS).toISOString(),
+      alert: { kind: 'deploy-drain-timeout', reason: DRAIN_TIMEOUT_REASON },
+    };
+  }
+  // 没有在跑的证据（目录读不了、列不出进程）就不排空，也不 fetch。
+  const busy = selectBusyEntries(opts.hostStateDir, nowMs);
+  if (busy.unreadable) return stop();
+  if (!busy.live.length && !busy.stale.length && blockedReason !== BUSY_PROCESS_REASON) return stop();
+  const cooling = !drain && state.drainCooldownUntil && nowMs < Date.parse(state.drainCooldownUntil);
+  if (cooling) return stop();
+  const fetched = opts.runGit(opts.deployDir, ['fetch', 'origin']);
+  if (!fetched.ok) {
+    if (drain) releaseDrain(opts, drain);
+    return {
+      decision: pack('fetch-failed', `${blockedReason}；排空前拉取远端失败：${oneLine(fetched.stderr) || '无输出'}`, {}),
+      drain: null,
+      drainCooldownUntil: state.drainCooldownUntil,
+    };
+  }
+  const pointers = readPointers(opts.runGit, opts.deployDir);
+  const lag = lagState({ behind: pointers.behind, oldestIso: pointers.oldest, nowMs, head: pointers.head, reportedFor: null });
+  const eligible = lag.lagging && pointers.head && FULL_SHA.test(String(pointers.target || ''))
+    && !needsApprovalLocally(opts, pointers.target);
+  if (!eligible) return stop();
+  // 有残留时排空没用：在跑的结束后残留仍挡着空档判定，只会占满 120 分钟再冷却，反复挡住验收。
+  if (busy.stale.length) return stop({ alert: staleAlert(busy) });
+  const deadline = drain ? drain.deadline : new Date(nowMs + DRAIN_MAX_MS).toISOString();
+  const files = SLOT_NAMES.map((name) => slotPath(opts.hostStateDir, name));
+  let holderPid = drain && opts.holderAlive(drain.holderPid) ? drain.holderPid : null;
+  if (!holderPid) holderPid = opts.spawnHolder({ ttlMs: Date.parse(deadline) - nowMs, files });
+  if (!Number.isInteger(holderPid)) {
+    return { decision: null, drain: null, drainCooldownUntil: state.drainCooldownUntil };
+  }
+  const slots = SLOT_NAMES.filter((name) => claimSlot(slotPath(opts.hostStateDir, name), holderPid, nowMs));
+  const next = {
+    status: 'draining',
+    holderPid,
+    target: pointers.target,
+    startedAt: drain ? drain.startedAt : nowIso,
+    deadline,
+    slots,
+  };
+  const reason = `已占 ${slots.length}/${SLOT_NAMES.length} 个槽位，${blockedReason}，截止 ${deadline}`;
+  return {
+    decision: pack('draining', reason, {}),
+    drain: next,
+    drainCooldownUntil: null,
+    alert: drain ? null : { kind: 'deploy-draining', reason: DRAIN_ALERT },
+  };
 }
 
 function writeState(file, data) {
@@ -630,8 +949,16 @@ async function complete(opts, decision, extra = {}) {
     ? { head: null, target: null, behind: null, oldest: null }
     : readPointers(opts.runGit, opts.deployDir);
   const state = decision.status === 'locked'
-    ? { lagReportedFor: null, alerted: [] }
+    ? { lagReportedFor: null, alerted: [], drain: null, drainCooldownUntil: null }
     : readState(opts.stateFile);
+  // 排空状态（#425）：drainStep 给了新值就用新值；部署有了结果或要人看时当场放槽。
+  let drainNext = extra.drain !== undefined ? extra.drain : state.drain;
+  let cooldownNext = extra.drainCooldownUntil !== undefined ? extra.drainCooldownUntil : state.drainCooldownUntil;
+  if (drainNext && DRAIN_RELEASE_STATUSES.has(decision.status)) {
+    releaseDrain(opts, drainNext);
+    drainNext = null;
+  }
+  if (decision.status === 'deployed') cooldownNext = null;
   const lag = decision.status === 'locked' || decision.status === 'deployed'
     ? { lagging: false, reportLag: false }
     : lagState({
@@ -658,6 +985,7 @@ async function complete(opts, decision, extra = {}) {
     const kinds = [];
     if (ALERT_STATUSES.has(decision.status)) kinds.push(`deploy-${decision.status}`);
     if (lag.reportLag) kinds.push('deploy-lagging');
+    if (extra.alert) kinds.push(extra.alert.kind);
     for (const kind of kinds) {
       const key = `${pointers.head}|${pointers.target}|${kind}`;
       if (alerted.has(key)) continue;
@@ -665,22 +993,26 @@ async function complete(opts, decision, extra = {}) {
       appendAlert(opts.alertsFile, {
         ts,
         kind,
-        reason: kind === 'deploy-lagging' ? LAG_LEAD : payload.reason,
+        reason: kind === 'deploy-lagging' ? LAG_LEAD : (extra.alert?.kind === kind ? extra.alert.reason : payload.reason),
         detail: kind === 'deploy-lagging' ? `behind=${pointers.behind ?? ''}` : payload.reason,
         head: pointers.head,
         target: pointers.target,
       });
     }
     const next = decision.status === 'deployed'
-      ? { lagReportedFor: null, alerted: [] }
+      ? { lagReportedFor: null, alerted: [], drain: null, drainCooldownUntil: null }
       : {
         lagReportedFor: lag.reportLag && pointers.head ? pointers.head : state.lagReportedFor,
         alerted: [...alerted],
+        drain: drainNext,
+        drainCooldownUntil: cooldownNext,
       };
     const changed = decision.status === 'deployed'
       || kinds.length > 0
-      || next.lagReportedFor !== state.lagReportedFor;
-    if (changed) writeState(opts.stateFile, next);
+      || next.lagReportedFor !== state.lagReportedFor
+      || JSON.stringify(next.drain ?? null) !== JSON.stringify(state.drain ?? null)
+      || (next.drainCooldownUntil ?? null) !== (state.drainCooldownUntil ?? null);
+    if (changed) writeState(opts.stateFile, stateRecord(next));
   }
   const text = formatResult(payload);
   // 重读读到结果时，在原来两行之后多一行说明；JSON 行和人话行都不动。
@@ -729,6 +1061,9 @@ export async function runDeploy(options) {
     runGit: options.runGit || defaultRunGit,
     runDoctor: options.runDoctor || defaultRunDoctor,
     runCheck: options.runCheck || defaultRunCheck,
+    spawnHolder: options.spawnHolder || spawnDrainHolder,
+    holderAlive: options.holderAlive || drainHolderAlive,
+    stopHolder: options.stopHolder || stopDrainHolder,
   };
   // 首读未知、重读读到结果时，这一拍的收尾多带一行说明。
   let ciNote = null;
@@ -746,7 +1081,27 @@ export async function runDeploy(options) {
       if (!prioHandle.ok) return await conclude(decide({ selfLock: true, prioLock: false }));
     }
     const blocked = await idleBlock(opts);
-    if (blocked) return await conclude(decide({ idle: false, reason: blocked }));
+    if (blocked) {
+      // 等不到空档：落后超限且不需要批准时排空（#425），占住空出来的槽位，不再起新轮次。
+      let drained = null;
+      try {
+        drained = drainStep(opts, readState(opts.stateFile), blocked);
+      } catch {
+        drained = null;
+      }
+      if (drained?.decision) {
+        return await conclude(drained.decision, {
+          drain: drained.drain,
+          drainCooldownUntil: drained.drainCooldownUntil,
+          alert: drained.alert,
+        });
+      }
+      return await conclude(decide({ idle: false, reason: blocked }), drained ? {
+        drain: drained.drain,
+        drainCooldownUntil: drained.drainCooldownUntil,
+        alert: drained.alert,
+      } : {});
+    }
     const status = opts.runGit(opts.deployDir, ['status', '--porcelain']);
     if (!status.ok || status.stdout.trim()) {
       return await conclude(decide({

@@ -7,6 +7,7 @@
 // - CI that stays unknown after every check has finished. Nothing changes on GitHub any more, so nothing wakes the
 //   watcher; ciStall turns that into a diagnosis task with a bounded number of rounds.
 import { AGGREGATES, GATES, latestByName } from './mivo-ci-triage.mjs';
+import { networkErrorPattern } from '../../acceptance/bin/net-errors.mjs';
 
 export const SELFHEAL_INFRA_PATTERNS = [
   /\b(?:HTTP(?: status)?(?: code)?|status(?: code)?|response)\s*:?\s*5\d\d\b/i,
@@ -14,7 +15,7 @@ export const SELFHEAL_INFRA_PATTERNS = [
   /The hosted runner(?:: [^\n]*)? lost communication with the server/i,
   /The runner has received a shutdown signal/i,
   /The job was not acquired by Runner/i,
-  /\b(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND)\b/,
+  networkErrorPattern(['connReset', 'timedOut', 'dnsAgain', 'notFound'], { flags: '', wordBoundary: true }),
 ];
 // GitHub refuses a fourth attempt of a run in practice long before its own limit matters here: three attempts of one
 // run on one head is where a re-run stops being a cheap guess.

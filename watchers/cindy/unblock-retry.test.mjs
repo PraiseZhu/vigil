@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { TRANSIENT_RETRY_BACKOFF_MS, isValidateClassBlock, reopenInfraBlocked } from './bin/cindy-watcher.mjs';
+import { TRANSIENT_BLOCK_REASON, TRANSIENT_RETRY_BACKOFF_MS, isValidateClassBlock, reopenInfraBlocked } from './bin/cindy-watcher.mjs';
 import { ensureCommitIdentity, privateIdentityCommits } from './bin/cindy-repair.mjs';
 
 const BLOCKED_AT = '2026-11-03T06:40:00.000Z';
@@ -70,6 +70,38 @@ test('only external blocks are retried as transient, and a failed validation rec
   assert.equal(reopenInfraBlocked({ previous: kinds.previous, paths: kinds.paths, now: after(TRANSIENT_RETRY_BACKOFF_MS) }), kinds.previous);
   const receipt = setup(t, { reason: `local preflight failed: ${RATE_LIMIT}`, active: { validationBlock: { remoteHead: 'a'.repeat(40) } } });
   assert.equal(isValidateClassBlock(receipt.previous.activeTask), true);
+});
+
+test('#238 SC7 TRANSIENT_BLOCK_REASON 网络/限流/5xx 匹配与无关文本', () => {
+  const samples = [
+    ['read ECONNRESET', true],
+    ['connect ETIMEDOUT 10.0.0.1:443', true],
+    ['getaddrinfo EAI_AGAIN api.github.com', true],
+    ['socket hang up', true],
+    ['dial tcp: i/o timeout', true],
+    ['API rate limit exceeded', true],
+    ['GitHub GraphQL API 速率限制已耗尽', true],
+    ['触发限流，本轮跳过', true],
+    ['abuse detection mechanism', true],
+    ['HTTP 500', true],
+    ['HTTP 502', true],
+    ['HTTP 503', true],
+    ['HTTP 504', true],
+    ['502 Bad Gateway', true],
+    ['503 Service Unavailable', true],
+    ['504 Gateway Timeout', true],
+    ['504 Gateway Time-out', true],
+    ['unexpected EOF', false],
+    ['invalid UTF-8', false],
+    ['ENOTFOUND api.github.com', false],
+    ['connect ECONNREFUSED', false],
+    ['expected 1 to be 2', false],
+    ['缺少目标仓写权限', false],
+    ['', false],
+  ];
+  for (const [text, want] of samples) {
+    assert.equal(TRANSIENT_BLOCK_REASON.test(text), want, text);
+  }
 });
 
 // identity

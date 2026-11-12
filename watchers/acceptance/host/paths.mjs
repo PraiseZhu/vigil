@@ -48,6 +48,8 @@ export function hostPaths(home) {
     // 每拍一份看板快照（#247 SC2）：dry-run、写入、仓外读者共用这一份。
     boardSnapshot: path.join(hostDir, 'board-snapshot.json'),
     loopLog: path.join(hostDir, 'loop.log'),
+    // 修正轮等待账：每个被发现但还没起的修正 issue 的首次等待时间。
+    prbotWaitFile: path.join(hostDir, 'prbot-wait.json'),
     roundRunDir: path.join(home, 'run'),
   };
 }

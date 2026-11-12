@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { MAX_READ_RETRIES_PER_TICK, createGithub } from './bin/github.mjs';
-import { classifyNetError } from './bin/net-errors.mjs';
+import { classifyNetError, isNetworkErrorText, networkErrorPattern } from './bin/net-errors.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { readAlerts, hostPaths } from './host/paths.mjs';
 import { MAX_TICK_READ_RETRIES, pollRetryable, readRetryBudget, runTick, withReadTimeout } from './host/tick.mjs';
@@ -198,9 +199,53 @@ test('#238 外层重试过的读，里层 runRead 不再重试（单个请求最
   assert.equal(n, 2, '外层重试一次，里层不再加一次');
 });
 
+// SC7 的静态检查不依赖 .git：打包副本、导出目录里也要能跑。
+const NETWORK_KEYWORDS = [
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND',
+  'unexpected EOF', 'invalid UTF-8', 'unexpected end of JSON input',
+  'TLS handshake timeout', 'i/o timeout', 'connection reset', 'reset by peer',
+  'stream error', 'Could not resolve host', 'AbortError', 'operation was aborted',
+  'Bad credentials', 'Resource not accessible', 'HTTP 50',
+];
+const SOURCE_EXTENSIONS = new Set(['.mjs', '.js', '.cjs', '.sh', '.py']);
+
+function productionSources(dir) {
+  const out = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === 'node_modules' || entry.name === '.git') continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...productionSources(full));
+    else if (entry.isFile() && SOURCE_EXTENSIONS.has(path.extname(entry.name)) && !/\.test\.mjs$/.test(entry.name)) out.push(full);
+  }
+  return out;
+}
+
 test('#238 SC7 网络类关键词只定义在 net-errors.mjs', () => {
   const root = fileURLToPath(new URL('../..', import.meta.url));
-  const r = spawnSync('git', ['grep', '-l', '-E', 'ECONNRESET|unexpected EOF|invalid UTF-8', '--', 'watchers/acceptance', ':!*.test.mjs'], { cwd: root, encoding: 'utf8' });
-  if (r.status !== 0 && r.status !== 1) return; // 没有 .git 的检出（打包副本）跳过静态检查。
-  assert.deepEqual(r.stdout.trim().split('\n').filter(Boolean).map((file) => path.basename(file)), ['net-errors.mjs']);
+  const scanRoot = path.join(root, 'watchers', 'acceptance');
+  const allowed = path.join(scanRoot, 'bin', 'net-errors.mjs');
+  const hits = [];
+  for (const file of productionSources(scanRoot)) {
+    if (file === allowed) continue;
+    const lines = fs.readFileSync(file, 'utf8').split('\n');
+    for (const [index, line] of lines.entries()) {
+      const lower = line.toLowerCase();
+      for (const keyword of NETWORK_KEYWORDS) {
+        if (lower.includes(keyword.toLowerCase())) hits.push(`${path.relative(root, file)}:${index + 1} ${keyword}`);
+      }
+    }
+  }
+  assert.deepEqual(hits, [], `网络类关键词只能在 bin/net-errors.mjs 定义，其他文件请改为 import 或调用分类表`);
+});
+
+test('#238 SC7 导出的纯网络关键词可供看守拼正则，不含限流/5xx', () => {
+  assert.equal(isNetworkErrorText('read ECONNRESET'), true);
+  assert.equal(isNetworkErrorText('unexpected EOF'), true);
+  assert.equal(isNetworkErrorText('invalid UTF-8'), true);
+  assert.equal(isNetworkErrorText('API rate limit exceeded'), false);
+  assert.equal(isNetworkErrorText('HTTP 502'), false);
+  const re = networkErrorPattern(['connReset', 'timedOut']);
+  assert.equal(re.test('ECONNRESET'), true);
+  assert.equal(re.test('ETIMEDOUT'), true);
+  assert.equal(re.test('ENOTFOUND'), false);
 });

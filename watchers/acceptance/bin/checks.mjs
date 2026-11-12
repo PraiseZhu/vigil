@@ -8,6 +8,7 @@
 // 每项只能是 ran（跑了）/ not-applicable（这个仓本来就没有这项，比如没有 build 脚本）/ env-skipped（因环境没跑）。
 // 也可以写成 { "status": "env-skipped", "note": "依赖装不上" }。缺项、写错一律拒绝（退出码 1），什么都不写。
 import fs from 'node:fs';
+import { hasNetworkSignal } from './net-errors.mjs';
 import { ENV_PROBLEM_PREFIX } from './trigger.mjs';
 
 export const REQUIRED_CHECKS = Object.freeze(['build', 'typecheck', 'test']);
@@ -54,7 +55,7 @@ export function envSkippedChecks(checks) {
 
 // 「通过」条目的证据里同一句同时出现「没跑」类说法和环境类原因，也按环境没跑处理（防止 checks 写了 ran、证据却写没跑）。
 const NOT_RUN = /(没(有)?跑|没法跑|跑不了|未(能)?(运行|执行|跑)|无法(运行|执行|跑)|not\s+(been\s+)?(run|executed)|could\s*n[o']t\s+(run|execute)|cannot\s+(run|execute)|unable\s+to\s+(run|execute))/i;
-const ENV_CAUSE = /(环境|依赖|node_modules|npm|pnpm|yarn|registry|网络|出网|断网|离线|offline|沙箱|sandbox|EAI_AGAIN|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|装不上|没装|未安装)/i;
+const ENV_CAUSE = /(环境|依赖|node_modules|npm|pnpm|yarn|registry|网络|出网|断网|离线|offline|沙箱|sandbox|装不上|没装|未安装)/i;
 
 // 引用不算：证据里常会引用场景原文或别人的话（vigil#105 SC3 就是引用了「都没跑（依赖没装上）」被误判），
 // 「」、“”、""、反引号里的内容先去掉再看。「」可以嵌套，从最里层一层层去掉。
@@ -75,7 +76,7 @@ function stripQuoted(text) {
 export function saysEnvNotRun(text) {
   return stripQuoted(text)
     .split(SENTENCE_BREAK)
-    .some((sentence) => NOT_RUN.test(sentence) && ENV_CAUSE.test(sentence));
+    .some((sentence) => NOT_RUN.test(sentence) && (ENV_CAUSE.test(sentence) || hasNetworkSignal(sentence)));
 }
 
 /** 「通过」条目里证据写着「因环境没跑」的：返回 `owner/repo#n SC<k>` 列表。 */

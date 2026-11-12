@@ -1209,9 +1209,49 @@ test('#247 SC1 一拍只盘点一次：poll 的清单交给修正轮发现，不
   assert.deepEqual(heartbeat.lastTick.prbotStarted, []);
 
   // 读数是 poll 交出来的真实请求次数（生产端契约见 poll.test.mjs 的「pollInventory 交出这一拍真的发了几次只读请求」）；
-  // 这里只验消费端：reads × 6 点记进 loop 组件的本小时用量。
+  // 这里只验消费端：reads × 6 点记进 poll 项，不进 loop。
   const rateState = JSON.parse(fs.readFileSync(hostPaths(home).rateState, 'utf8'));
-  assert.equal(rateState.components.loop.used, 3 * 6);
+  assert.equal(rateState.components.poll.used, 3 * 6);
+  assert.equal(rateState.components.loop, undefined);
+});
+
+test('poll 用量不把非必要读顶出预算：本小时只有 poll 读了 600 点时修正轮发现仍放行，点数记在 poll', async () => {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  hostWithPrbot(home);
+  const paths = hostPaths(home);
+  const nowMs = Date.parse('2026-10-24T02:00:00.000Z');
+  writeBudgetConfig(home, { loop: 500, 'prio-run': 300, 'board-live': 140 });
+  writeRateStateFile(paths, { remaining: 4000, resetInMs: 55 * 60 * 1000, used: null, nowMs });
+  const discovered = [];
+  const heartbeat = await runTick({
+    home,
+    env: { ...process.env },
+    now: () => nowMs,
+    run: async () => ({
+      code: 0,
+      stdout: JSON.stringify({ entries: [], tasks: [], reads: 100 }),
+      stderr: '',
+    }),
+    spawnRound: () => 1,
+    spawnPrbot: () => 1,
+    runRound: async () => ({ code: 0, stdout: '', stderr: '' }),
+    discoverPrbot: async () => {
+      discovered.push('discover');
+      return [];
+    },
+    checkPrbotStalled: async () => [],
+    cleanupPrbot: () => [],
+    gateAudit: async () => ({ checkedLines: 0, newViolations: [], sinceBaseline: null, newUncertain: [] }),
+    notify: async () => ({ ok: false, reason: 'not-configured' }),
+  });
+  assert.equal(heartbeat.lastTick.ok, true);
+  assert.deepEqual(discovered, ['discover'], 'poll 记了 600 点也不该把修正轮发现跳过');
+  assert.equal(heartbeat.lastTick.rateSkipped, undefined);
+  const rateState = JSON.parse(fs.readFileSync(paths.rateState, 'utf8'));
+  assert.equal(rateState.components.poll.used, 100 * 6);
+  assert.equal(rateState.components.loop, undefined);
+  const log = fs.readFileSync(paths.loopLog, 'utf8');
+  assert.match(log, /rate-poll component=poll used=600/);
 });
 
 test('#247 SC1 poll 还是老形状（数组）时，修正轮仍自己拉，不被当成「有清单」', async () => {
@@ -1498,10 +1538,11 @@ test('#247 P2-2 poll 没给 reads 时按 1 记；给了 0（这一拍没发请�
     return paths;
   };
   const legacy = await runOnce(JSON.stringify({ entries: [], tasks: [] }));
-  assert.equal(JSON.parse(fs.readFileSync(legacy.rateState, 'utf8')).components.loop.used, 6, '老形状没 reads：按一次请求算');
+  assert.equal(JSON.parse(fs.readFileSync(legacy.rateState, 'utf8')).components.poll.used, 6, '老形状没 reads：按一次请求算');
   const zero = await runOnce(JSON.stringify({ entries: [], tasks: [], reads: 0 }));
   const state = JSON.parse(fs.readFileSync(zero.rateState, 'utf8'));
-  assert.equal(state.components.loop, undefined, 'reads=0 表示这一拍没发请求，不记用量');
+  assert.equal(state.components.poll, undefined, 'reads=0 表示这一拍没发请求，不记用量');
+  assert.equal(state.components.loop, undefined, 'reads=0 也不记到 loop');
 });
 
 test('#247 P1 预算越线时 essential 照跑（poll/abort/派发），只有非必要读被跳过', async () => {
@@ -1511,8 +1552,9 @@ test('#247 P1 预算越线时 essential 照跑（poll/abort/派发），只有�
   const paths = hostPaths(home);
   const nowMs = Date.parse('2026-10-24T02:00:00.000Z');
   writeBudgetConfig(home, { loop: 500, 'prio-run': 300, 'board-live': 140 });
-  // 本小时已经用满（used 500）：非必要读全部跳过，但 essential 不受预算闸约束（复审 rev-258 的 P1）。
-  writeRateStateFile(paths, { remaining: 4000, resetInMs: 3000 * 1000, used: 500, nowMs });
+  // 本小时非 poll 的 loop 用量已超过预算（used 501）：discover（reserve 6）和卡住检查（cost/reserve 0）都会跳过。
+  // 不再依赖 poll 记账把 500 再加 6 点顶过线——poll 已改记 components.poll。
+  writeRateStateFile(paths, { remaining: 4000, resetInMs: 3000 * 1000, used: 501, nowMs });
   const polled = [];
   const aborted = [];
   const started = [];
@@ -1568,7 +1610,7 @@ test('#247 P1 预算越线时 essential 照跑（poll/abort/派发），只有�
   assert.deepEqual(stalled, [], '非必要读（卡住检查）被预算闸跳过');
   assert.equal(heartbeat.lastTick.rateSkipped, 'over-budget', '跳过原因写进心跳（外部只认这一个字段）');
   const log = fs.readFileSync(paths.loopLog, 'utf8');
-  assert.match(log, /rate-skip component=loop identity=user remaining=4000 action=over-budget budget=500 used=506 cost=6 因额度跳过/);
+  assert.match(log, /rate-skip component=loop identity=user remaining=4000 action=over-budget budget=500 used=501 cost=6 因额度跳过/);
   const alerts = readAlerts(paths).filter((entry) => entry.kind === 'rate-skip-escalate');
   assert.equal(alerts.length, 0, '只跳过 1 拍（两个非必要闸算一拍）不该提醒');
 });
@@ -1580,7 +1622,7 @@ test('#247 P2-b 预算越线连跑 2N+3 拍：提醒恰好 1 条，连跳按「�
   const nowMs = Date.parse('2026-10-24T02:00:00.000Z');
   writeBudgetConfig(home, { loop: 500, 'prio-run': 300, 'board-live': 140 });
   // 窗口重置在 55 分钟后：这一段都算同一个窗口，不会切进恢复期（那样连跳会被清零）。
-  writeRateStateFile(paths, { remaining: 4000, resetInMs: 55 * 60 * 1000, used: 500, nowMs });
+  writeRateStateFile(paths, { remaining: 4000, resetInMs: 55 * 60 * 1000, used: 501, nowMs });
   const ticks = 2 * MAX_CONSECUTIVE_SKIPS + 3;
   const polled = [];
   const discovered = [];
@@ -1622,7 +1664,7 @@ test('#247 P2-b 预算越线连跑 2N+3 拍：提醒恰好 1 条，连跳按「�
   const state = JSON.parse(fs.readFileSync(paths.rateState, 'utf8'));
   assert.equal(state.skips.byKey['loop:non-essential'].count, ticks, '连跳按拍数（同一拍两个非必要闸只算一拍）');
   const log = fs.readFileSync(paths.loopLog, 'utf8');
-  assert.match(log, /rate-skip component=loop identity=user remaining=4000 action=over-budget budget=500 used=506 cost=6 因额度跳过/);
+  assert.match(log, /rate-skip component=loop identity=user remaining=4000 action=over-budget budget=500 used=501 cost=6 因额度跳过/);
 });
 
 

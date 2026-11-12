@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// 网络类瞬时错误的唯一分类表（#238）。验收机代码（bin/github.mjs、host/tick.mjs）和仓外的看守、体检脚本都按它判断，
-// 不再各写一套关键词。只做分类：不重试、不 sleep。仓外脚本调用命令行入口，不 import 部署目录里的文件：
+// 网络类错误文本的唯一分类表（#238）：瞬时故障、限流、App 回退、可重试判定都用这里的规则；
+// 验收机代码（bin/github.mjs、host/tick.mjs、bin/checks.mjs、host/slack-notify.mjs 等）和仓外的看守、
+// 体检脚本都按它判断，不再各写一套关键词。只做分类：不重试、不 sleep。仓外脚本调用命令行入口：
 //   printf '%s' "<错误文本>" | node watchers/acceptance/bin/net-errors.mjs --classify
 //   → {"transient":true,"category":"truncated-json"}
 import fs from 'node:fs';
@@ -21,6 +22,46 @@ const RULES = [
   ['dns', /EAI_AGAIN|ENOTFOUND|Could not resolve host/i],
   ['exit-124', /退出码 124|\bexit(?: code)? 124\b/i],
 ];
+
+// 只读 GraphQL 响应被截断时统一用这句话交给分类表；github.mjs 不再自己留一份。
+const TRUNCATED_JSON = 'unexpected end of JSON input';
+const TRUNCATED_JSON_PATTERN = new RegExp(TRUNCATED_JSON, 'i');
+
+// 判断环境问题时也要认这些网络原因；连接被拒不重试，但确实不是代码失败。
+const EXTRA_NETWORK_SIGNAL = /ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|socket hang up/i;
+
+// 纯网络类关键词（连接/超时/DNS/截断/UTF-8），不含限流、5xx。看守拼自己的瞬时正则时从这里取。
+export const NETWORK_ERROR_PATTERNS = Object.freeze({
+  connReset: /ECONNRESET/,
+  timedOut: /ETIMEDOUT/,
+  dnsAgain: /EAI_AGAIN/,
+  notFound: /ENOTFOUND/,
+  connRefused: /ECONNREFUSED/,
+  socketHangUp: /socket hang up/i,
+  ioTimeout: /i\/o timeout/i,
+  unexpectedEof: /unexpected EOF/i,
+  invalidUtf8: /invalid UTF-8/i,
+});
+
+/** 按 key 拼一段纯网络正则；wordBoundary 时加上 \b，给 self-heal 这类要整词匹配的调用方。 */
+export function networkErrorPattern(keys, { flags = 'i', wordBoundary = false } = {}) {
+  const sources = keys.map((key) => {
+    const re = NETWORK_ERROR_PATTERNS[key];
+    if (!re) throw new Error(`unknown network pattern: ${key}`);
+    return re.source;
+  });
+  const joined = sources.join('|');
+  return new RegExp(wordBoundary ? `\\b(?:${joined})\\b` : joined, flags);
+}
+
+// App 令牌读失败时的回退类别：鉴权 / 权限 / 仓不可见。具体文案只在这里维护。
+const APP_FALLBACK_RULES = [
+  ['auth-401', /\bHTTP 401\b|Bad credentials|Authentication failed|could not read Username|returned error: 401\b/i],
+  ['auth-403', /\bHTTP 403\b|Resource not accessible by integration|\bFORBIDDEN\b|returned error: 403\b|Permission to [^\n]* denied/i],
+  ['not-found', /\bHTTP 404\b|Could not resolve to a (Repository|node)|\bNOT_FOUND\b|returned error: 404\b|Repository not found/i],
+];
+
+const TIMEOUT_ERROR_NAME = /^(?:TimeoutError|AbortError)$/i;
 
 const MAX_TEXT = 256 * 1024;
 
@@ -50,6 +91,61 @@ export function classifyNetError(input) {
     if (pattern.test(text)) return { transient: true, category };
   }
   return { transient: false, category: null };
+}
+
+/** 只读响应正文是否在末尾被截断（不同 Node 版本的报错文字不同）。 */
+export function isTruncatedJsonError(message, body = '') {
+  const text = String(message ?? '');
+  const at = Number(/at position (\d+)/.exec(text)?.[1]);
+  return TRUNCATED_JSON_PATTERN.test(text) || (Number.isFinite(at) && at >= String(body ?? '').trimEnd().length - 1);
+}
+
+/** 截断正文统一写成分类表认得的固定说法。 */
+export function truncatedJsonMessage(message) {
+  return `${TRUNCATED_JSON}（响应被截断：${message}）`;
+}
+
+/** 这段文字是不是网络/连接故障（含不重试的连接被拒），给环境原因判断用。 */
+export function hasNetworkSignal(input) {
+  const text = clip(textOf(input));
+  if (EXTRA_NETWORK_SIGNAL.test(text)) return true;
+  return RULES.some(([, pattern]) => pattern.test(text));
+}
+
+/** 这段文字是否命中纯网络关键词（不含限流、5xx）。 */
+export function isNetworkErrorText(input) {
+  const text = clip(textOf(input));
+  return Object.values(NETWORK_ERROR_PATTERNS).some((re) => re.test(text));
+}
+
+/** Slack 等 fetch 路径的 AbortSignal.timeout 错误名；只在这里认这两个名字。 */
+export function isTimeoutErrorName(name) {
+  return TIMEOUT_ERROR_NAME.test(String(name ?? ''));
+}
+
+/** GitHub 限流文案 / GraphQL RATE_LIMITED 错误码。 */
+export function isRateLimitText(input) {
+  const text = clip(textOf(input));
+  if (/\bRATE_LIMITED\b/.test(text)) return true;
+  if (/\b429\b/.test(text) && /rate limit|too many requests/i.test(text)) return true;
+  if (/\b403\b/.test(text) && /rate limit/i.test(text)) return true;
+  if (/API rate limit already exceeded|rate limit exceeded|secondary rate limit/i.test(text)) return true;
+  return false;
+}
+
+/** App 令牌回退类别；返回 auth-401 / auth-403 / not-found 或 null。 */
+export function classifyAppFallback(input) {
+  const text = clip(textOf(input));
+  for (const [kind, pattern] of APP_FALLBACK_RULES) {
+    if (pattern.test(text)) return kind;
+  }
+  return null;
+}
+
+/** prio-run 这一类“同一拍可以再试”的 GitHub 文本：业务 NOT_FOUND 或任何 5xx。 */
+export function isRetriableGithubErrorText(input) {
+  const text = clip(textOf(input));
+  return /\bNOT_FOUND\b/.test(text) || /\bHTTP\s+5\d\d\b/.test(text);
 }
 
 function usage() {

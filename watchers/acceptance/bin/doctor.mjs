@@ -11,9 +11,11 @@ import { appBotLogin, createGithub } from './github.mjs';
 import { hostPaths, isAlive } from '../host/paths.mjs';
 import { createProbes } from '../host/probes.mjs';
 import { handoffFor, preflightCommands, repoConfig } from '../host/prbot-config.mjs';
+import { describeHolds } from '../host/prbot-hold.mjs';
 import { checkSlackAccess } from '../host/slack-notify.mjs';
 import { describeViolation, runGateAudit } from '../host/gate-audit.mjs';
 import { POLL_STALL_S, heartbeatMaxAgeMs, heartbeatPhase, heartbeatTickSeconds, phaseLabel, pollingElapsedS } from '../host/poll-beat.mjs';
+import { pollUsage, readRateState } from './rate-budget.mjs';
 
 /** 令牌账号 == ownerLogin 用这条。 */
 export const VIEWER_QUERY = `query {
@@ -400,6 +402,19 @@ export async function runDoctor({
     add('常驻循环', false, '没有心跳文件（循环没跑）');
   }
 
+  // poll 本小时用量是报表项，不是体检红灯：读得出或按 0 计都算通过。不计入 loop 预算。
+  {
+    const usage = pollUsage(readRateState(paths.rateState), now());
+    add(
+      'poll 小时用量',
+      true,
+      usage.present
+        ? `本小时 poll 用了 ${usage.used} 点（不计入 loop 预算）`
+        : `本小时 poll 用了 0 点（状态文件没有 poll 项，按 0 计，不计入 loop 预算）`,
+    );
+  }
+
+
   // 写闸账本审计（只读）：旁路核对写闸账本里已执行的写入，看有没有越规的。只读本地账本 + 只读查轮次评论。
   // 只有明确违规才让这一项变红；「拿不准」只记日志（detail 里报出来），GitHub 没查成也照旧写进 detail 但不改变红绿。
   // skipGateAudit：调用方这一轮已经单独跑过审计，这里不再查一遍。项名不变，算通过。
@@ -507,7 +522,17 @@ export async function runDoctor({
     add('bwrap 遮罩', false, [...maskProblems, firstLine(error?.message)].filter(Boolean).join('；'));
   }
 
-  return { ok: checks.every((check) => check.ok), checks };
+  // 修正轮挂起名单（hold.json）：只显示，不算体检项、不报红；没有条目时什么都不加。
+  const info = [];
+  try {
+    const { rows, problems } = describeHolds(paths, { now });
+    for (const row of rows) info.push(`修正轮挂起：${row.issue}（${row.status}；${row.untilText}；${row.reason}）`);
+    for (const problem of problems) info.push(`修正轮挂起名单有问题：${problem}`);
+  } catch {
+    // 只是显示，读不出不影响体检结果。
+  }
+
+  return { ok: checks.every((check) => check.ok), checks, ...(info.length > 0 ? { info } : {}) };
 }
 
 /** 命令行显式跳过写闸账本审计。不传则照旧跑。 */
@@ -542,6 +567,7 @@ async function main() {
     if (check.ok) process.stdout.write(`✓ ${check.name}\n`);
     else process.stdout.write(`✗ ${check.name}：${check.detail}\n`);
   }
+  for (const line of result.info || []) process.stdout.write(`· ${line}\n`);
   process.exitCode = result.ok ? 0 : 1;
 }
 
