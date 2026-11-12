@@ -172,8 +172,9 @@ const TOKEN_WORD_RE = /token/gi;
 const PROCESS_ENV_RE = /process\.env/gi;
 // 白名单 1：按字面量名字读写一个不敏感的环境变量（process.env.HOME、process.env?.X、process.env['X']，含赋值和 delete）。
 // 名字只认环境变量的写法（大写字母、数字、下划线）：valueOf、toString、constructor 这类对象方法名拿到的是整张表或别的东西，
-// (process.env.valueOf)() 这种括号包住的调用也一样，所以小写名字一律不放过；名字后面紧跟括号的也不放过。
-const ENV_NAMED_RE = /process\.env\s*(?:\?\.\s*|\.\s*)([A-Z_][A-Z0-9_]*)(?![A-Za-z0-9_$]|\s*(?:\?\.\s*)?\()|process\.env\s*(?:\?\.)?\s*\[\s*(['"])([A-Z_][A-Z0-9_]*)\2\s*\](?!\s*(?:\?\.\s*)?\()/g;
+// (process.env.valueOf)() 这种括号包住的调用也一样，所以小写名字一律不放过。
+// 读到名字就得结束：后面再接 .、?.、[ 或调用（process.env.HOME.constructor.constructor(...)['env'] 能拿到整张表）的不放过。
+const ENV_NAMED_RE = /process\.env\s*(?:\?\.\s*|\.\s*)([A-Z_][A-Z0-9_]*)(?![A-Za-z0-9_$]|\s*(?:\?\.|\.|\[|\())|process\.env\s*(?:\?\.)?\s*\[\s*(['"])([A-Z_][A-Z0-9_]*)\2\s*\](?!\s*(?:\?\.|\.|\[|\())/g;
 // 白名单 2：函数默认参数 `(env = process.env)` / `, env = process.env)`（issue #426 SC2 点名的写法）。
 const ENV_DEFAULT_PARAM_RE = /[(,]\s*env\s*=\s*process\.env\s*[),]/g;
 // 白名单 3：文件名里的一段 token（mivo-app-token.mjs 这种模块、脚本、文档名；token.json 这类数据文件不算）。
@@ -181,11 +182,12 @@ const TOKEN_IN_MODULE_NAME_RE = /[\w.-]*token[\w.-]*\.(?:mjs|cjs|js|ts|py|sh|md)
 // 全大写的名字（GITHUB_TOKEN、API_KEY）：按 _ 分段有密钥类的一段就算敏感，不管怎么读到的。
 const UPPER_NAME_RE = /(?<![A-Za-z0-9_])[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*(?![A-Za-z0-9_])/g;
 // 全大写名字算不算密钥类：TOKEN、SECRET、PASSW（PASSWORD、PASSWD）、CREDENTIAL 出现在哪都算（GITHUBTOKEN 这种连写也算）；
-// KEY 只认密钥常见的叫法（API_KEY、PRIVATE_KEY、ACCESS_KEY、DEPLOY_KEY、SIGNING_KEY……）；CREDS、AUTH 和授权头的全称
+// KEY 只认密钥常见的叫法（API_KEY、PRIVATE_KEY、ACCESS_KEY、DEPLOY_KEY、SIGNING_KEY、SESSION_KEY、ACCOUNT_KEY、HMAC_KEY……，
+// 单独一个 KEY 也算）；CREDS、AUTH 和授权头的全称
 // 要单独成一段（GH_CREDS、BASIC_AUTH）；APP 要跟着 ID / INSTALLATION（MIVO_APP_ID）。
 // 免得 CONFLICT_FEEDBACK_KEY、SWITCH_KEY、FORBIDDEN_KEYS、WATCHED_BOT_APP、AUTHOR_LOGIN 这类普通常量也算。
 // （授权头的全称不写出来：本脚本的静态约束不许源码里出现这个词，见 deploy-ff.test.mjs 的 #215 SC10。）
-const SENSITIVE_ENV_RE = /TOKEN|SECRET|PASSW|CREDENTIAL|(?:API|PRIVATE|ACCESS|DEPLOY|SIGNING|ENCRYPTION|SSH|MASTER|LICENSE|CLIENT)_?KEY|(?:^|_)(?:CREDS?|AUTH(?:ORI[ZS]ATION)?)(?:_|$)|APP_?(?:ID|INSTALLATION)/i;
+const SENSITIVE_ENV_RE = /TOKEN|SECRET|PASSW|CREDENTIAL|(?:API|PRIVATE|ACCESS|DEPLOY|SIGN(?:ING)?|ENCRYPT(?:ION)?|SSH|MASTER|LICENSE|CLIENT|SESSION|ACCOUNT|STORAGE|HMAC|AES|RSA|GPG|PGP|SECRET)_?KEYS?|^KEYS?$|(?:^|_)(?:CREDS?|AUTH(?:ORI[ZS]ATION)?)(?:_|$)|APP_?(?:ID|INSTALLATION)/i;
 // process.env 按名字读写要放过，名字里就一个可疑的词都不能有（比上面严：KEY、APP、AUTH、CRED 出现在哪都不放过）。
 const ENV_NAME_UNSAFE_RE = /TOKEN|SECRET|PASSW|KEY|APP|AUTH|CRED/i;
 // 白名单盖不住、也没有字面量名字的读环境变量写法：一律算敏感（process['env']、globalThis…process、

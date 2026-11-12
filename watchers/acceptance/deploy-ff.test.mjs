@@ -410,7 +410,9 @@ test('#426 复审 全大写常量：HAPPY、FORBIDDEN_KEYS、WATCHED_BOT_APP 不
     assert.equal(sensitiveLineReason(file, `const v = process.env.${name};`), 'env', name);
   }
   // 凭证类名字不管从哪读都算（#426 第 2 轮复审：AUTH / CRED 类别名读取原来漏了）。
-  for (const name of ['AUTHORIZATION', 'GH_CREDS', 'GOOGLE_APPLICATION_CREDENTIALS', 'AWS_CREDENTIALS', 'BASIC_AUTH', 'DEPLOY_KEY', 'SIGNING_KEY', 'CLIENT_KEY']) {
+  for (const name of ['AUTHORIZATION', 'GH_CREDS', 'GOOGLE_APPLICATION_CREDENTIALS', 'AWS_CREDENTIALS', 'BASIC_AUTH', 'DEPLOY_KEY', 'SIGNING_KEY', 'CLIENT_KEY',
+    // 第 3 轮复审：KEY 收窄后漏掉的常见密钥叫法。
+    'SESSION_KEY', 'AZURE_STORAGE_ACCOUNT_KEY', 'SERVICE_ACCOUNT_KEY', 'HMAC_KEY', 'AES_KEY', 'RSA_KEY', 'STORAGE_KEY', 'ENCRYPT_KEY', 'SIGN_KEY', 'KEY']) {
     assert.equal(sensitiveLineReason(file, `return env.${name};`), 'env', name);
   }
   for (const name of ['MIVO_APP_ID', 'APP_PRIVATE_KEY', 'X_API_KEY', 'ACCESS_TOKENS', 'GITHUB_TOKEN', 'DB_PASSWORD', 'CLIENT_SECRET', 'TOKEN', 'app_key']) {
@@ -510,8 +512,18 @@ test('#426 复审 新规则放过的每一处 token / process.env 都属于白�
     "const all = (process.env['valueOf'])();",
     'const all = (process.env.valueOf)?.();',
     'const t = process.env.token.mjs;',
+    // 第 3 轮复审：读到名字后面还接着取（.、?.、[、调用）也不放过，constructor 链能拿到整张表。
+    "const all = process.env.HOME.constructor.constructor('return process')()['env'];",
+    "const all = process.env.HOME['constructor']['constructor']('return process')()['env'];",
+    'const all = process.env.HOME?.constructor;',
+    "const all = process.env['HOME'].constructor;",
+    'const repos = process.env.MIVO_REPOS.split(",");',
   ]) {
     assert.notEqual(sensitiveLineReason(file, text), null, text);
+  }
+  // 读完名字就结束的照常放过（比较、默认值、外面再包一层）。
+  for (const text of ['const h = process.env.HOME;', 'const v = process.env.MIVO_X ?? "d";', 'const v = (process.env.MIVO_X || "").split(",");']) {
+    assert.equal(sensitiveLineReason(file, text), null, text);
   }
 });
 
