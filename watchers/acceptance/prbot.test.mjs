@@ -9,6 +9,7 @@ import { collectTasks } from './bin/tasks.mjs';
 import { hostPaths, readAlerts } from './host/paths.mjs';
 import { appendPrbotEvent, readPrbotEvents } from './host/prbot-events.mjs';
 import {
+  CI_EVIDENCE_PREFIX,
   MAX_REFIX,
   READY_STALL_MS,
   REACCEPT_TREE_MIN_MS,
@@ -33,6 +34,11 @@ import {
 import { PR_BY_BRANCH_QUERY, PR_STATUS_QUERY, createGate } from './host/write-gate.mjs';
 import { runTick } from './host/tick.mjs';
 import { createFakeGithub, createWorld, defaultTree } from './session.fixture.mjs';
+import { correctionBody } from './bin/correct.mjs';
+import { ISSUE_BODY_QUERY } from './bin/collect.mjs';
+import { checkBodyEdit } from './host/gate-actions/pr-edit.mjs';
+import { PR_BODY_QUERY } from './host/prbot-gate-check.mjs';
+import { checkPrBody } from './host/prbot-template-check.mjs';
 import { clock, OWNER, REPO, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import { spawnRun } from './bin/localgit.mjs';
 
@@ -44,10 +50,39 @@ function addCorrection(world) {
     repo: REPO,
     number: 9,
     title: '修正：子任务 SC3',
-    body: ['> 修正子 issue', '', CORRECTION_MARKER].join('\n'),
+    // 真实的修正子 issue 正文（task-issue/v1 五段 + SC1），prbot 开 PR 前按本机脚本同样的规则检查它（#172）。
+    body: correctionBody({
+      root: `${REPO}#1`,
+      item: `${REPO}#2`,
+      sc: 3,
+      round: 1,
+      text: 'SC3 把结果写进轮次评论 验证：unit（测试点：假 gh）',
+      why: '轮次评论没写结果',
+    }),
   });
+  assert.ok(correction.body.endsWith(CORRECTION_MARKER), '修正标记和夹具一致');
   world.addChild(`${REPO}#1`, correction.ref);
   return correction;
+}
+
+/** 某仓修正子 issue 的真实正文（task-issue/v1 五段 + SC1 + 修正标记），开 PR 前的模板检查要过（#172）。 */
+const correctionIssueBody = (repo) =>
+  correctionBody({ root: `${repo}#1`, item: `${repo}#2`, sc: 3, round: 1, text: 'SC3 把结果写进轮次评论 验证：unit（测试点：假 gh）', why: '轮次评论没写结果' });
+
+// #172：prbot 开 PR 前 / 转 Ready 前读 PR 正文做模板检查。假写闸开 PR、改正文成功时，同步记进假 GitHub。
+function trackPulls(gate, world) {
+  return {
+    ...gate,
+    async handle(action) {
+      const outcome = await gate.handle(action);
+      if (outcome?.code === 0 && action.type === 'pr.create') world.setPull({ repo: action.repo, number: outcome.body.pr, body: action.body });
+      if (outcome?.code === 0 && action.type === 'pr.edit') {
+        const current = world.pulls.get(`${action.repo}#${action.pr}`) || {};
+        world.setPull({ ...current, repo: action.repo, number: action.pr, body: action.body });
+      }
+      return outcome;
+    },
+  };
 }
 
 // 收录盘任务树：把假 world 里的 issue 变成 INVENTORY_QUERY 需要的节点。
@@ -517,7 +552,7 @@ test('SC1/SC2/SC5/SC11 一次完整跑通：认领 → 评估 → 修复 → Dra
     now: now.now,
     meminfoPath: meminfo,
     sleep: async () => {},
-    makeGate: () => fakeGate,
+    makeGate: () => trackPulls(fakeGate, world),
     prepareWorktree: () => ({ worktree, mirror: path.join(tmpDir(), 'mirror') }),
     piRunner: async () => ({ ok: true, stdout: '', code: 0 }),
     bundleFactory: async () => ({ bundlePath: '/tmp/fake.bundle', headSha: 'c'.repeat(40), cleanup() {} }),
@@ -698,7 +733,7 @@ async function runOnce({
     now: clock('2026-10-24T04:00:00.000Z').now,
     meminfoPath: meminfo,
     sleep: async () => {},
-    makeGate: () => gate,
+    makeGate: () => trackPulls(gate, world),
     prepareWorktree: (options) => {
       piCalls.push({ refresh: options.refresh });
       return { worktree, mirror: path.join(tmpDir(), 'mirror') };
@@ -846,7 +881,11 @@ test('SC5 找已有 PR 只认从我们推的仓来的：别人 fork 里同名分
   assert.equal(result.actions.find((action) => action.type === 'pr.ready').pr, 12);
 
   const ours = { ...stranger, number: 13, headRepository: { nameWithOwner: REPO } };
-  const reuse = await runOnce({ world: (() => { const w = defaultTree({ roundStatus: '要修' }); addCorrection(w); return w; })(), byBranch: [stranger, ours], statuses: [prStatus('c'.repeat(40), [greenRun()])] });
+  const reuseWorld = defaultTree({ roundStatus: '要修' });
+  addCorrection(reuseWorld);
+  // 沿用的 #13 是我们之前开的：正文就是当时 pr.create 写的那份（转 Ready 前要读它做模板检查）。
+  reuseWorld.setPull({ repo: REPO, number: 13, body: result.actions.find((action) => action.type === 'pr.create').body });
+  const reuse = await runOnce({ world: reuseWorld, byBranch: [stranger, ours], statuses: [prStatus('c'.repeat(40), [greenRun()])] });
   assert.equal(reuse.actions.some((action) => action.type === 'pr.create'), false);
   assert.equal(reuse.actions.find((action) => action.type === 'pr.ready').pr, 13);
 });
@@ -1355,7 +1394,7 @@ test('#60 修正 4：推送带租约 —— 第一次是远端已知 head，再�
 test('#60 修正 5：Mivo 仓的修正轮整轮持测试锁（不看 host.json 的 testLock）；锁被验收轮占着就不认领', async () => {
   const MIVO = 'example-owner/mivo-app';
   const world = defaultTree({ roundStatus: '要修', rootRepo: MIVO });
-  const correction = world.addIssue({ repo: MIVO, number: 9, title: '修正', body: `[验收机] 修正 · 总 ${MIVO}#1 · 项 ${MIVO}#2 SC3 · 第 1 轮` });
+  const correction = world.addIssue({ repo: MIVO, number: 9, title: '修正', body: correctionIssueBody(MIVO) });
   world.addChild(`${MIVO}#1`, correction.ref);
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state'), autoRepos: [`${OWNER}/*`, REPO, MIVO] } });
   const paths = hostPaths(home);
@@ -1387,7 +1426,7 @@ test('#60 修正 5：Mivo 仓的修正轮整轮持测试锁（不看 host.json �
 
   // 验收轮（活着的进程）占着测试锁：修正轮这一拍不认领，返回 3。
   const other = defaultTree({ roundStatus: '要修', rootRepo: MIVO });
-  const otherCorrection = other.addIssue({ repo: MIVO, number: 9, title: '修正', body: `[验收机] 修正 · 总 ${MIVO}#1 · 项 ${MIVO}#2 SC3 · 第 1 轮` });
+  const otherCorrection = other.addIssue({ repo: MIVO, number: 9, title: '修正', body: correctionIssueBody(MIVO) });
   other.addChild(`${MIVO}#1`, otherCorrection.ref);
   fs.mkdirSync(path.dirname(paths.testLock), { recursive: true });
   fs.writeFileSync(paths.testLock, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
@@ -1407,7 +1446,7 @@ test('#60 修正 5：Mivo 仓的修正轮整轮持测试锁（不看 host.json �
 test('serialRepos：名单里的重仓修正轮整轮持本仓的同仓锁（和验收轮共用一把）；锁被占就不认领；mivo-test.lock 不碰', async () => {
   const HEAVY = 'example-owner/heavy-app';
   const world = defaultTree({ roundStatus: '要修', rootRepo: HEAVY });
-  const correction = world.addIssue({ repo: HEAVY, number: 9, title: '修正', body: `[验收机] 修正 · 总 ${HEAVY}#1 · 项 ${HEAVY}#2 SC3 · 第 1 轮` });
+  const correction = world.addIssue({ repo: HEAVY, number: 9, title: '修正', body: correctionIssueBody(HEAVY) });
   world.addChild(`${HEAVY}#1`, correction.ref);
   const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state'), autoRepos: [`${OWNER}/*`, REPO, HEAVY] } });
   const paths = hostPaths(home);
@@ -1440,7 +1479,7 @@ test('serialRepos：名单里的重仓修正轮整轮持本仓的同仓锁（和
 
   // 验收轮（活着的进程）占着这把锁：修正轮这一拍不认领，返回 3，什么都不写。
   const other = defaultTree({ roundStatus: '要修', rootRepo: HEAVY });
-  const otherCorrection = other.addIssue({ repo: HEAVY, number: 9, title: '修正', body: `[验收机] 修正 · 总 ${HEAVY}#1 · 项 ${HEAVY}#2 SC3 · 第 1 轮` });
+  const otherCorrection = other.addIssue({ repo: HEAVY, number: 9, title: '修正', body: correctionIssueBody(HEAVY) });
   other.addChild(`${HEAVY}#1`, otherCorrection.ref);
   fs.mkdirSync(path.dirname(lockFile), { recursive: true });
   fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
@@ -2067,4 +2106,98 @@ test('#363 SC12 已关闭 kind=child、未挂载的 open 修正子仍能被发�
   assert.deepEqual(first.map((entry) => entry.issue), [correction.ref]);
   const second = await discoverCorrections({ github, profile, tasks, home, now: () => t0 + 60_000 });
   assert.deepEqual(second.map((entry) => entry.issue), [correction.ref], 'kind=child 不受重验限频');
+});
+
+// #172：prbot 开 PR 前、转 Ready 前跑和本机 check-pr-issue.sh、check-pr-body.sh 同样的检查；不过就不开 / 不转，原因写进轮次评论。
+const lastComment = (world, ref) => world.issues.get(ref).comments.at(-1)?.body || '';
+const readState = (result) => JSON.parse(fs.readFileSync(prbotStatePath(result.paths, CORRECTION_REF), 'utf8'));
+
+test('#172 SC2 修正子 issue 不合模板（缺五段、没有 SC 项）：不开 PR，轮次评论写明缺什么', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  const correction = world.addIssue({ repo: REPO, number: 9, title: '修正', body: CORRECTION_MARKER });
+  world.addChild(`${REPO}#1`, correction.ref);
+  const result = await runOnce({ world, statuses: [prStatus('c'.repeat(40), [greenRun()])] });
+  assert.equal(result.code, 1, '需人工处理');
+  assert.equal(result.actions.some((action) => action.type === 'pr.create'), false, '不开 PR');
+  const state = readState(result);
+  assert.equal(state.failureReason, 'template-check');
+  assert.match(state.stopNote, /^开 PR 前的正文检查没过：/);
+  assert.match(state.stopNote, /缺「## 目标」段/);
+  assert.match(state.stopNote, /验收标准没有 SC<n> 编号项/);
+  assert.match(lastComment(world, CORRECTION_REF), /开 PR 前的正文检查没过：.*缺「## 目标」段/);
+});
+
+test('#172 SC2 PR 正文不过开 PR 档（issue 多一条 SC2，正文只有 SC1）：不开 PR，写明缺哪条', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  const body = correctionIssueBody(REPO).replace(/^(- \[ \] SC1 .*)$/m, '$1\n- [ ] SC2 后来手工加的一条。验证：unit（测试点：x）');
+  assert.notEqual(body, correctionIssueBody(REPO));
+  const correction = world.addIssue({ repo: REPO, number: 9, title: '修正', body });
+  world.addChild(`${REPO}#1`, correction.ref);
+  const result = await runOnce({ world, statuses: [prStatus('c'.repeat(40), [greenRun()])] });
+  assert.equal(result.actions.some((action) => action.type === 'pr.create'), false);
+  const state = readState(result);
+  assert.equal(state.failureReason, 'template-check');
+  assert.match(state.stopNote, /验收对照缺 issue 里的 SC2/);
+});
+
+test('#172 SC3 转 Ready 前：「待验证」经写闸 pr.edit 改成「通过 + 本次 CI 证据」，写闸认这次改动，过了 ready 档才转 Ready', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const result = await runOnce({ world, statuses: [prStatus('c'.repeat(40), [greenRun()])] });
+  assert.equal(result.code, 0, JSON.stringify(result.actions.map((action) => action.type)));
+  const types = result.actions.map((action) => action.type);
+  const created = result.actions.find((action) => action.type === 'pr.create');
+  const edit = result.actions.find((action) => action.type === 'pr.edit');
+  assert.ok(edit, '转 Ready 前改了正文');
+  assert.ok(types.indexOf('pr.edit') < types.indexOf('pr.ready'), '先改正文再转 Ready');
+  assert.deepEqual({ repo: edit.repo, pr: edit.pr }, { repo: REPO, pr: 12 });
+  assert.ok(created.body.includes('| 待验证 | — |'), '开 PR 时没预检证据：待验证');
+  assert.ok(edit.body.includes(`| 通过 | ${CI_EVIDENCE_PREFIX}（head ccccccc）→ https://example.invalid/${REPO}/pull/12/checks |`));
+  assert.deepEqual(checkBodyEdit(created.body, edit.body), { ok: true }, '写闸 pr.edit 认这次改动（只动状态和证据两格）');
+  const issueBody = world.issues.get(CORRECTION_REF).body;
+  assert.ok(checkPrBody(created.body, { issueRef: CORRECTION_REF, issueBody, stage: 'ready' }).length > 0, '改之前过不了 ready 档');
+  assert.deepEqual(checkPrBody(edit.body, { issueRef: CORRECTION_REF, issueBody, stage: 'ready' }), [], '改之后过 ready 档');
+});
+
+test('#172 SC3 转 Ready 前 GitHub 上的正文不过 ready 档（段落标题被改）：不转 Ready，写明原因', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const head = 'c'.repeat(40);
+  const result = await runOnce({
+    world,
+    overrides: {
+      statusProvider: async () => {
+        const pull = world.pulls.get(`${REPO}#12`);
+        if (pull) world.setPull({ ...pull, repo: REPO, number: 12, body: pull.body.replace('## 风险与回滚', '## 风险') });
+        return prStatus(head, [greenRun()]);
+      },
+    },
+  });
+  assert.equal(result.actions.some((action) => action.type === 'pr.ready'), false, '不转 Ready');
+  const state = readState(result);
+  assert.equal(state.failureReason, 'template-check');
+  assert.match(state.stopNote, /^转 Ready 前的正文检查没过：.*缺「## 风险与回滚」段/);
+});
+
+test('#172 SC4 检查读 issue 和 PR 正文走只读客户端，不经写闸、不带令牌', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const reads = [];
+  const readOnly = {
+    async graphql(query, variables) {
+      reads.push({ query, variables });
+      return world.graphql({ query, variables });
+    },
+    async write() {
+      throw new Error('只读客户端不该被拿来写');
+    },
+  };
+  const result = await runOnce({ world, statuses: [prStatus('c'.repeat(40), [greenRun()])], overrides: { github: readOnly } });
+  assert.equal(result.code, 0);
+  assert.ok(reads.some((read) => read.query === ISSUE_BODY_QUERY && read.variables.number === 9), '读修正子 issue');
+  assert.ok(reads.some((read) => read.query === PR_BODY_QUERY && read.variables.number === 12), '读 PR 正文');
+  for (const read of reads) assert.deepEqual(Object.keys(read.variables).sort(), Object.keys(read.variables).filter((key) => !/token|auth/i.test(key)).sort());
+  // 等 CI 那一步原本就经写闸读修正子 issue 的开关状态（不是本检查）；PR 正文只由检查读，不该出现在写闸里。
+  assert.equal(result.actions.some((action) => action.type === 'read.graphql' && action.query === PR_BODY_QUERY), false, '检查读 PR 正文不经写闸');
+  assert.equal(result.actions.some((action) => Object.keys(action).some((key) => /token|auth/i.test(key))), false, '写闸动作里没有令牌字段');
 });
