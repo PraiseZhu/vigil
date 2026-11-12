@@ -14,22 +14,28 @@ const STATUSES = new Set(['待验证', '通过', '未通过', '人工手测']);
 const MAX_BODY = 65536;
 const FORBIDDEN_KEYS = ['title', 'head', 'base', 'branch', 'draft', 'state'];
 // 关单词 + 引用（#号、GH-号、owner/repo#号、issue / PR 链接）。宽一点比漏一点安全：分隔可以跨行、可以有冒号（半角全角）、
-// 尖括号、圆括号；链接可以不带 https、可以带 www。比对前先把正文「抹平」（plain）：
-// - Markdown 的 * ` ~ 全删；_ 只在词的两头删（`_Closes_` 要剥掉，`my_org/my_repo` 要保留，不然两个不同的仓会被当成同一个）；
-// - 常见行内 HTML 标签去掉、Markdown 链接 [文字](地址) 拆成「文字 地址」；
-// - #、数字的全角写法和 HTML 实体（&#35; &#x23; &num;）还原成 #；零宽、不可见分隔字符去掉。
-const CLOSING = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b[\s:：<(\[]*((?:[\w.-]+\/[\w.-]+)?#\d+|gh-\d+|(?:https?:\/\/)?(?:www\.)?github\.com\/[^\s)>\]]+\/(?:issues|pull)\/\d+)/gi;
+// 尖括号、圆括号；链接可以不带 https、可以带 www；关键字两边可以有 _ 强调。比对前先把正文「抹平」（plain）：
+// - Markdown 的 * ` ~ 全删；下划线一个都不删（仓名里可以有下划线，删了两个不同的仓会被当成同一个），改由正则容忍；
+// - 所有 HTML 标签和注释去掉（`<https://...>` 这种尖括号链接不是标签，保留）、Markdown 链接 [文字](地址) 拆成「文字 地址」；
+// - HTML 数字实体解码、NFKC 归一（全角 ＃ 和数字）、各种连字符统一成 -、格式类不可见字符（零宽、方向控制、变体选择符等）去掉。
+// 比对只比「引用了哪个 issue」（第 1 个捕获组），不比关键字怎么写：同一个引用换个关键字不算新增。
+const CLOSING = /(?<![A-Za-z0-9])_*(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)_*(?![A-Za-z0-9])[\s:：<(\[_]*((?:[\w.-]+\/[\w.-]+)?#\d+|gh-\d+|(?:https?:\/\/)?(?:www\.)?github\.com\/[^\s)>\]]+\/(?:issues|pull)\/\d+)/gi;
 const MARKER = /\[验收机\]\s*修正/g;
 const TASK_LINE = /任务\s*issue\s*[:：]/gi;
-const INLINE_TAG = /<\/?(?:a|b|i|u|s|em|strong|code|span|sub|sup|kbd|del|ins|mark|small|big|tt)\b[^>]*>/gi;
-const plain = (text) => String(text ?? '')
+const INVISIBLE = /[\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u3164\ufe00-\ufe0f\uffa0]/gu;
+const decodeEntities = (text) => text
+  .replace(/&#(\d+);/g, (all, code) => (Number(code) <= 0x10ffff ? String.fromCodePoint(Number(code)) : all))
+  .replace(/&#x([0-9a-f]+);/gi, (all, code) => (parseInt(code, 16) <= 0x10ffff ? String.fromCodePoint(parseInt(code, 16)) : all))
+  .replace(/&num;/gi, '#');
+const plain = (text) => decodeEntities(String(text ?? '').replace(INVISIBLE, ''))
+  .replace(INVISIBLE, '')
   .normalize('NFKC')
-  .replace(/&#0*35;|&#x0*23;|&num;/gi, '#')
-  .replace(/[\u00ad\u180e\u200b-\u200f\u2060-\u2064\ufeff]/g, '')
-  .replace(INLINE_TAG, '')
+  .replace(/[\u2010-\u2015\u2212\ufe58\ufe63\uff0d]/g, '-')
+  .replace(/<!--[\s\S]*?(?:-->|$)/g, '')
+  .replace(/<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?\/?>/g, '')
   .replace(/\[([^\]]*)\]\(([^)]*)\)/g, '$1 $2')
-  .replace(/[*`~]|(?<![A-Za-z0-9])_|_(?![A-Za-z0-9])/g, '');
-const closingRefs = (text) => new Set([...plain(text).matchAll(CLOSING)].map((match) => match[0].toLowerCase().replace(/\s+/g, ' ')));
+  .replace(/[*`~]/g, '');
+const closingRefs = (text) => new Set([...plain(text).matchAll(CLOSING)].map((match) => match[1].toLowerCase()));
 const countOf = (text, pattern) => [...plain(text).replace(/\s+/g, ' ').matchAll(pattern)].length;
 
 export function check(action, { tier } = {}) {

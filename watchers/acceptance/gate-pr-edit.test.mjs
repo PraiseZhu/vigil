@@ -133,3 +133,32 @@ test('#171 实体、全角、HTML 标签、链接文字、不可见字符包装�
   }
   assert.deepEqual(checkBodyEdit(OLD, withRow('通过', 'CI 见 <https://github.com/example-owner/example-repo/actions/runs/1>')), { ok: true });
 });
+
+// 第三轮复审：仓名首尾、连续下划线也不能被抹平；未列出的标签、注释、别的实体、别的不可见字符、非 ASCII 连字符也认得出。
+test('#171 仓名首尾和连续下划线的跨仓 Closes 行不会被冒充', () => {
+  for (const [real, fake] of [['ExampleOrg/_repo#9', 'ExampleOrg/repo#9'], ['ExampleOrg/repo_#9', 'ExampleOrg/repo#9'], ['ExampleOrg/my__repo#9', 'ExampleOrg/myrepo#9']]) {
+    const crossOld = OLD.replace('Closes #9', `Closes ${real}`);
+    const forged = crossOld.split('\n').map((line) => {
+      if (!/^\|\s*SC1\b/.test(line)) return line;
+      const cells = line.split('|');
+      cells[2] = ' 通过 ';
+      cells[3] = ` Closes ${fake} `;
+      return cells.join('|');
+    }).join('\n');
+    assert.equal(checkBodyEdit(crossOld, forged).reason, 'closing-keyword', `${real} -> ${fake}`);
+  }
+  assert.equal(checkBodyEdit(OLD, withRow('通过', '__Fixes__ #19')).reason, 'closing-keyword', '强调下划线仍认得出');
+  assert.equal(checkBodyEdit(OLD, withRow('通过', '_Closes_ _#19_')).reason, 'closing-keyword');
+});
+
+test('#171 任意 HTML 标签、注释、其它实体、更多不可见字符、非 ASCII 连字符包装都拒', () => {
+  const variants = ['Closes<div></div>#19', '<font>Closes</font> #19', '<p>Closes</p> #19', '<details>Closes</details> #19',
+    'Closes<!--x-->#19', 'Clo<!--x-->ses #19', 'GH&#x2D;19 Closes GH-19', 'Fixes &#71;&#72;-19', '&#67;loses #19', 'Closes &#x2​3;19',
+    'Closes️#19', 'Closes‪#19', 'Closes⁦#19', 'Closes͏#19', 'Closes؜#19', 'Closes GH‑19'];
+  for (const text of variants) {
+    assert.equal(checkBodyEdit(OLD, withRow('通过', text)).reason, 'closing-keyword', JSON.stringify(text));
+  }
+  for (const fine of ['<font>CI 通过</font>', '_repo 目录测试通过', '见 my_org/my_repo', '[CI](https://github.com/example-owner/example-repo/actions/runs/1)']) {
+    assert.deepEqual(checkBodyEdit(OLD, withRow('通过', fine)), { ok: true }, fine);
+  }
+});
