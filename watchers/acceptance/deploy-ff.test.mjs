@@ -326,6 +326,83 @@ test('内容规则收窄后，路径规则仍然照旧', () => {
   assert.equal(isSensitivePath('watchers/acceptance/host/anything.mjs'), true);
 });
 
+// ---- 复审返工：内容规则的漏网写法、误中写法和 docs 跳过范围 ----
+
+test('返工 环境变量读取：解构、可选链、动态下标、整表枚举都命中，普通写法不命中', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const file = 'watchers/mivo/bin/app.mjs';
+  const hit = [
+    'const { GITHUB_TOKEN } = process.env;',
+    'const { HOME, GITHUB_TOKEN: token } = process.env;',
+    "const { DB_PASSWORD = '' } = process.env;",
+    'const token = process.env?.GITHUB_TOKEN;',
+    "const key = process.env?.['X_API_KEY'];",
+    'const value = process.env[name];',
+    'const value = process.env?.[name];',
+    'for (const [k, v] of Object.entries(process.env)) send(k, v);',
+    'const names = Object.keys(process.env);',
+    'log(JSON.stringify(process.env));',
+  ];
+  for (const text of hit) assert.equal(sensitiveLineReason(file, text), 'env', text);
+  const quiet = [
+    'const { HOME, PATH } = process.env;',
+    'const debug = process.env?.MIVO_DEBUG;',
+    "const home = process.env['HOME'];",
+    'export function preflightSelfReviewEnabled(env = process.env) {',
+    'const child = spawn(cmd, args, { env: { ...process.env, LANG: "C" } });',
+    'const entries = Object.entries(config);',
+    'const { GITHUB_TOKEN } = options;',
+  ];
+  for (const text of quiet) assert.equal(sensitiveLineReason(file, text), null, text);
+});
+
+test('返工 令牌文件：path.join 的独立 token 段和模板字符串的 /token 都命中，tokenize、tokens.md 之类不命中', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const file = 'watchers/mivo/bin/app.mjs';
+  const hit = [
+    "const file = path.join(home,'token');",
+    'const file = path.join(home, "token");',
+    "const file = path.resolve(dir, 'state', 'tokens');",
+    'const file = `${dir}/token`;',
+    'const file = `${home}/state/token`;',
+    "const file = path.join(home, 'token.json');",
+    "const file = path.join(os.homedir(), '.config', 'token');",
+  ];
+  for (const text of hit) assert.equal(sensitiveLineReason(file, text), 'token-file', text);
+  const quiet = [
+    'const parts = tokenize(line);',
+    "const doc = path.join(root, 'docs', 'tokens.md');",
+    "const doc = path.join(root, 'token-notes.txt');",
+    'const file = `${dir}/tokenizer.mjs`;',
+    "if (kind === 'token') count += 1;",
+    "const label = 'token';",
+  ];
+  for (const text of quiet) assert.equal(sensitiveLineReason(file, text), null, text);
+});
+
+test('返工 敏感环境变量名按词边界：HAPPY、MONKEY、KEYBOARD 不命中，APP_ID、API_KEY、ACCESS_TOKENS 命中', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const file = 'watchers/mivo/bin/app.mjs';
+  for (const name of ['HAPPY', 'HAPPY_HOUR', 'MONKEY_MODE', 'KEYBOARD_LAYOUT', 'WEBAPP_URL', 'TOKENIZER_MODEL', 'SECRETARY_NAME']) {
+    assert.equal(sensitiveLineReason(file, `const v = process.env.${name};`), null, name);
+  }
+  for (const name of ['MIVO_APP_ID', 'APP_PRIVATE_KEY', 'X_API_KEY', 'ACCESS_TOKENS', 'GITHUB_TOKEN', 'DB_PASSWORD', 'CLIENT_SECRET', 'TOKEN', 'app_key']) {
+    assert.equal(sensitiveLineReason(file, `const v = process.env.${name};`), 'env', name);
+  }
+});
+
+test('返工 只跳过仓根 docs/ 下一层的 .md（issue 写的 docs/*.md），更深或别处的 docs 目录照常扫', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const text = 'const token = process.env.GITHUB_TOKEN;';
+  assert.equal(sensitiveLineReason('docs/acceptance-operations.md', text), null);
+  for (const file of ['docs/sub/notes.md', 'watchers/acceptance/docs/notes.md', 'docs/notes.mdx', 'docs.md', 'docs/notes.mjs']) {
+    assert.equal(sensitiveLineReason(file, text), 'env', file);
+  }
+  // 测试文件按 issue 仍然任何目录都跳过。
+  assert.equal(sensitiveLineReason('watchers/mivo/deep/x.test.mjs', text), null);
+  assert.equal(sensitiveLineReason('watchers/mivo/x.test.py', text), null);
+});
+
 test('#215 SC4 落后阈值：超过 5 个或超过 2 小时，同一 HEAD 只报一次', () => {
   const head = 'a'.repeat(40);
   const recent = '2026-11-02T11:00:00.000Z';

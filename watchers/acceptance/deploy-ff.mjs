@@ -82,14 +82,32 @@ const HOST_PREFIX = 'watchers/acceptance/host/';
  * 是常事，拦下来只会逼人写完整 sha 批准。真敏感的那几类由下面的正则分别负责，
  * 不再用一条宽泛的 /token/i 命中所有单词。
  */
-const CONTENT_SKIP_RE = /(?:^|\/)(?:[^/]+\.test\.(?:mjs|py)|docs\/[^/]+\.md)$/;
+// docs 只跳过仓根 docs/ 下一层的 .md（issue #426 写的 docs/*.md）；测试文件任何目录都跳过。
+const CONTENT_SKIP_RE = /^(?:docs\/[^/]+\.md|(?:.*\/)?[^/]+\.test\.(?:mjs|py))$/;
 const SECRETS_PATH_RE = /secrets\//i;
 // 密钥/证书文件：带目录的路径（keys/server.key）或被引号包住的文件名（'server.key'）。
 // 有意不匹配 `item.key` 这种对象属性。
 const KEY_FILE_RE = /(?:^|[\s"'`(=:,\/])[~\w.@-]*\/[~\w.@-]*\.(?:key|pem|p12|pfx)(?=$|[\s"'`),;:])|['"`][~\w.@-]+\.(?:key|pem|p12|pfx)['"`]/i;
-const TOKEN_FILE_RE = /(?:^|[\s"'`(=:,\/])\.tokens?\b|(?:^|[\s"'`(=:,\/])tokens?\.(?:json|txt|dat|key|pem|env|db)\b|(?:^|[\s"'`(=:,\/])(?:[~\w.@-]+\/)+tokens?(?=$|[\s"'`),;])/i;
-const ENV_READ_RE = /process\.env(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*['"`]([^'"`]+)['"`]\s*\])/g;
-const SENSITIVE_ENV_RE = /TOKEN|KEY|SECRET|PASSWORD|APP/i;
+const TOKEN_EXT = '(?:\\.(?:json|txt|dat|key|pem|env|db))?';
+const TOKEN_FILE_RE = new RegExp([
+  /(?:^|[\s"'`(=:,\/])\.tokens?\b/.source,
+  /(?:^|[\s"'`(=:,\/])tokens?\.(?:json|txt|dat|key|pem|env|db)\b/.source,
+  /(?:^|[\s"'`(=:,\/])(?:[~\w.@-]+\/)+tokens?(?=$|[\s"'`),;])/.source,
+  // path.join(home, 'token')、path.resolve(dir, "tokens")：单独一段就是令牌文件名。
+  `path\\.(?:join|resolve)\\s*\\([^;]*?['"\`]\\.?tokens?${TOKEN_EXT}['"\`]`,
+  // 模板字符串 `${dir}/token`、`${home}/state/token.json`。
+  `\\$\\{[^}]*\\}\\/(?:[~\\w.@-]+\\/)*\\.?tokens?${TOKEN_EXT}(?=$|[\\s"'\`),;])`,
+].join('|'), 'i');
+// 按名字读：process.env.X、process.env?.X、process.env['X']、process.env?.['X']。
+const ENV_READ_RE = /process\.env\s*(?:\?\.|\.)\s*([A-Za-z_][A-Za-z0-9_]*)|process\.env\s*(?:\?\.)?\s*\[\s*['"`]([^'"`]+)['"`]\s*\]/g;
+// 名字不定的读法：process.env[name]（下标不是纯字符串字面量）。
+const ENV_DYNAMIC_RE = /process\.env\s*(?:\?\.)?\s*\[(?!\s*(['"])[^'"`]*\1\s*\])/;
+// 整张表拿出去：Object.entries(process.env)、Object.keys/values、JSON.stringify(process.env)。
+const ENV_DUMP_RE = /\b(?:Object\.(?:entries|keys|values|getOwnPropertyNames)|JSON\.stringify)\s*\(\s*process\.env\s*[,)]/;
+// 解构：const { GITHUB_TOKEN, HOME: home = '' } = process.env。
+const ENV_DESTRUCTURE_RE = /\{([^{}]*)\}\s*=\s*process\.env\b(?!\s*(?:\?\.|\.|\[))/g;
+// 名字按 _ 分段、整段比对（允许复数 S），HAPPY、MONKEY、KEYBOARD 不算。
+const SENSITIVE_ENV_RE = /(?:^|_)(?:TOKEN|KEY|SECRET|PASSWORD|APP)S?(?:_|$)/i;
 const APP_ONLY_RE = /appOnly/i;
 const PORT_RE = /\.listen\s*\(|\bport\b\s*[:=]\s*['"]?\d{2,5}\b/i;
 const FULL_SHA = /^[0-9a-f]{40}$/;
@@ -163,12 +181,28 @@ export function sensitiveLineReason(file, text) {
   if (SECRETS_PATH_RE.test(line)) return 'secrets-path';
   if (KEY_FILE_RE.test(line)) return 'key-file';
   if (TOKEN_FILE_RE.test(line)) return 'token-file';
-  for (const match of line.matchAll(ENV_READ_RE)) {
-    if (SENSITIVE_ENV_RE.test(match[1] || match[2] || '')) return 'env';
-  }
+  if (envReadSensitive(line)) return 'env';
   if (APP_ONLY_RE.test(line)) return 'appOnly';
   if (PORT_RE.test(line)) return 'port';
   return null;
+}
+
+/** 这一行有没有读名字敏感的环境变量，或者读法让名字看不出来（动态下标、整表枚举、解构剩余）。 */
+function envReadSensitive(line) {
+  for (const match of line.matchAll(ENV_READ_RE)) {
+    const name = match[1] || match[2] || '';
+    if (name.includes('${') || SENSITIVE_ENV_RE.test(name)) return true;
+  }
+  if (ENV_DYNAMIC_RE.test(line) || ENV_DUMP_RE.test(line)) return true;
+  for (const match of line.matchAll(ENV_DESTRUCTURE_RE)) {
+    for (const part of match[1].split(',')) {
+      const item = part.trim();
+      if (item.startsWith('...')) return true;
+      const name = item.split(/[:=]/)[0].trim().replace(/^['"`]|['"`]$/g, '');
+      if (name && SENSITIVE_ENV_RE.test(name)) return true;
+    }
+  }
+  return false;
 }
 
 export function sensitiveHits(files, addedLines) {
