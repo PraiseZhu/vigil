@@ -9,7 +9,7 @@ import path from 'node:path';
 import { evaluateMivoCi } from './bin/mivo-pr-policy.mjs';
 import { applyCiTriage, triageText } from './bin/mivo-ci-triage.mjs';
 import {
-  resolveSkippedRequired, isInfraFailure, redRunsOnHead, superviseCiSelfHeal, heldBySelfHeal, ciSelfHealCheckDue, ciStall,
+  resolveSkippedRequired, isInfraFailure, redRunsOnHead, superviseCiSelfHeal, heldBySelfHeal, ciSelfHealCheckDue, ciStall, SELFHEAL_INFRA_PATTERNS,
   CI_STALL_MS, CI_STALL_ROUND_MS, CI_STALL_ROUNDS, CI_STALL_NOTICE_MS, SELFHEAL_HOLD_MS,
 } from './bin/mivo-ci-selfheal.mjs';
 import { feedbackItems, ciStallCheckDue, CI_STALL_RECHECK_MS, collectPr, scanOnce, watcherPaths, REPO } from './bin/mivo-watcher.mjs';
@@ -197,6 +197,35 @@ test('annotations: only failure-level lines count, and all of them must be infra
   assert.equal(isInfraFailure([{ annotation_level: 'failure', message: 'expected 1 to be 2' }, { annotation_level: 'failure', message: 'HTTP 503' }]), false);
   assert.equal(isInfraFailure([{ annotation_level: 'warning', message: 'HTTP 503' }]), false);
   assert.equal(isInfraFailure([]), false);
+});
+
+test('#238 SC7 SELFHEAL_INFRA_PATTERNS / isInfraFailure 网络与 5xx 匹配与无关文本', () => {
+  const samples = [
+    ['read ECONNRESET', true],
+    ['connect ETIMEDOUT 140.82.112.5:443', true],
+    ['getaddrinfo EAI_AGAIN api.github.com', true],
+    ['getaddrinfo ENOTFOUND api.github.com', true],
+    ['HTTP status code: 502', true],
+    ['HTTP 500', true],
+    ['502 Bad Gateway', true],
+    ['503 Service Unavailable', true],
+    ['504 Gateway Timeout', true],
+    ['The hosted runner lost communication with the server', true],
+    ['The runner has received a shutdown signal', true],
+    ['The job was not acquired by Runner', true],
+    ['unexpected EOF', false],
+    ['invalid UTF-8', false],
+    ['socket hang up', false],
+    ['dial tcp: i/o timeout', false],
+    ['API rate limit exceeded', false],
+    ['expected 1 to be 2', false],
+    ['', false],
+  ];
+  const matchesInfra = (text) => SELFHEAL_INFRA_PATTERNS.some((re) => re.test(text));
+  for (const [text, want] of samples) {
+    assert.equal(matchesInfra(text), want, `pattern ${text}`);
+    assert.equal(isInfraFailure([{ annotation_level: 'failure', message: text }]), want, `isInfraFailure ${text}`);
+  }
 });
 
 // --- holding the failure back while the re-run is out ---

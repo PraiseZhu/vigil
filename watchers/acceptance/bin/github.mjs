@@ -16,7 +16,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { checkSecretFile, ProfileError } from './profile.mjs';
-import { classifyNetError } from './net-errors.mjs';
+import {
+  classifyAppFallback,
+  classifyNetError,
+  isRateLimitText,
+  isTruncatedJsonError,
+  truncatedJsonMessage,
+} from './net-errors.mjs';
 
 /** 只在这里读 GitHub 令牌：先过 600 检查，再读文件；从不读环境变量。 */
 function readGithubToken(profile) {
@@ -388,8 +394,8 @@ export function searchOwnerOf(text) {
  */
 /**
  * 只读 GraphQL 的正文能不能解析：能解析返回 null。解析失败的位置落在正文末尾（或报「意外结尾」）就是被截断，
- * 统一写成 `unexpected end of JSON input` 交给分类表；中间就坏掉的照原文返回（不是网络问题，不重试）。
- * 不同 Node 版本对截断的报错文字不一样（「Unexpected end of JSON input」/「Unterminated string … at position N」）。
+ * 交给 net-errors.mjs 统一归类；中间就坏掉的照原文返回（不是网络问题，不重试）。
+ * 不同 Node 版本对截断的报错文字不一样（例如「Unterminated string … at position N」），所以按位置兜底。
  */
 function graphqlBodyProblem(result) {
   const body = splitGhHeaders(result?.stdout).body;
@@ -398,9 +404,7 @@ function graphqlBodyProblem(result) {
     return null;
   } catch (error) {
     const message = String(error?.message || error);
-    const at = Number(/at position (\d+)/.exec(message)?.[1]);
-    const truncated = /unexpected end of JSON input/i.test(message) || (Number.isFinite(at) && at >= body.trimEnd().length - 1);
-    return truncated ? `unexpected end of JSON input（响应被截断：${message}）` : message;
+    return isTruncatedJsonError(message, body) ? truncatedJsonMessage(message) : message;
   }
 }
 
@@ -434,21 +438,15 @@ export function rateHeadersOf(headers) {
 }
 
 /**
- * 是不是限流错误（#247 SC7）：403 带 rate limit 文案、429、GraphQL 的 `RATE_LIMITED` 错误码。
- * 只在失败结果上判，不把响应头里的字面量当依据。
+ * 是不是限流错误（#247 SC7）：具体文案判定在 net-errors.mjs，这里只看失败结果，不把响应头里的字面量当依据。
  */
 export function isRateLimitFailure(result) {
-  const text = `${result?.stderr || ''}\n${result?.stdout || ''}`;
-  if (/\bRATE_LIMITED\b/.test(text)) return true;
-  if (/\b429\b/.test(text) && /rate limit|too many requests/i.test(text)) return true;
-  if (/\b403\b/.test(text) && /rate limit/i.test(text)) return true;
-  if (/API rate limit already exceeded|rate limit exceeded|secondary rate limit/i.test(text)) return true;
-  return false;
+  return isRateLimitText(`${result?.stderr || ''}\n${result?.stdout || ''}`);
 }
 
 /**
- * gh 失败输出是不是 GitHub / 网络的瞬时故障。判定表只在 net-errors.mjs 一处（#238）：
- * 502/503/504、EOF、截断的 JSON、乱码、超时、连接被断、DNS；404、401、权限、写闸拒绝、GraphQL 业务错误都不算。
+ * gh 失败输出是不是 GitHub / 网络的瞬时故障。判定表只在 net-errors.mjs 一处（#238）；
+ * 权限、找不到、写闸拒绝、GraphQL 业务错误都不算。
  */
 export function isTransientGithubFailure(result) {
   return classifyNetError(result).transient;
@@ -681,7 +679,7 @@ export const WRITE_APP_ROLE = Object.freeze({
 
 /**
  * App 令牌读失败时，要不要回退账号令牌：401 / 凭证坏 → auth-401；403 / 无权限 → auth-403；
- * 404 / 找不到仓（App 没覆盖这个仓）→ not-found。超时、5xx 等不回退（照旧走只读重试规则）。
+ * 404 / 找不到仓（App 没覆盖这个仓）→ not-found。超时、服务端错误等不回退（照旧走只读重试规则）。
  * `branch.push` / `pr.ready` 跑的是 git / gh 子命令，文案不是 HTTP 状态那一套：
  * git 说的是 `fatal: Authentication failed`、`The requested URL returned error: 403`、
  * `remote: Permission to <repo> denied`、`Repository not found`；这些也要认，否则写被拒时不会回退账号令牌。
@@ -699,10 +697,7 @@ export function appFallbackKind(result) {
   } else {
     text += String(result?.stdout || '');
   }
-  if (/\bHTTP 401\b|Bad credentials|Authentication failed|could not read Username|returned error: 401\b/i.test(text)) return 'auth-401';
-  if (/\bHTTP 403\b|Resource not accessible by integration|\bFORBIDDEN\b|returned error: 403\b|Permission to [^\n]* denied/i.test(text)) return 'auth-403';
-  if (/\bHTTP 404\b|Could not resolve to a (Repository|node)|\bNOT_FOUND\b|returned error: 404\b|Repository not found/i.test(text)) return 'not-found';
-  return null;
+  return classifyAppFallback(text);
 }
 
 const FALLBACK_TEXT = {

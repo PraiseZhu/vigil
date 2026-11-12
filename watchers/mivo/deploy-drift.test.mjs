@@ -19,10 +19,11 @@ const DAY1_LATER = '2026-11-12T09:00:00.000Z';
 const DAY2 = '2026-11-13T01:00:00.000Z';
 
 function deployed(t) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-deploy-drift-'));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  fs.mkdirSync(path.join(home, 'bin'));
-  fs.mkdirSync(path.join(home, 'state'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mivo-deploy-drift-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  fs.mkdirSync(path.join(home, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(home, 'state'), { recursive: true });
   fs.writeFileSync(path.join(home, 'state/state.json'), JSON.stringify({ prs: {} }));
   for (const name of FILES) fs.writeFileSync(path.join(home, 'bin', name), 'old bytes');
   const state = fs.readFileSync(path.join(home, 'state/state.json'));

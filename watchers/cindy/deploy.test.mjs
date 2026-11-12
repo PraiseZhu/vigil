@@ -5,11 +5,26 @@ import os from 'node:os';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {spawnSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath,pathToFileURL} from 'node:url';
 import {FILES,verify,validatePlan,apply,stateFingerprint,bootstrap} from './deploy.mjs';
+function importDeployed(file){
+ return spawnSync(process.execPath,['--input-type=module','-e',`await import(${JSON.stringify(pathToFileURL(file).href)})`],{encoding:'utf8',timeout:20000,env:process.env});
+}
+function outsideNetErrors(home){
+ return path.resolve(path.join(home,'bin'),'..','..','acceptance','bin','net-errors.mjs');
+}
+function failAfterCompanion(){
+ const write=fs.writeFileSync;
+ fs.writeFileSync=(file,...args)=>{
+  if(String(file).endsWith('receipt.json'))throw Error('injected after companion');
+  return write(file,...args);
+ };
+ return ()=>{fs.writeFileSync=write;};
+}
 function fixture(t){
- const home=fs.mkdtempSync(path.join(os.tmpdir(),'watcher-deploy-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
- fs.mkdirSync(path.join(home,'bin'));fs.mkdirSync(path.join(home,'state'));
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'watcher-deploy-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const home=path.join(root,'home');
+ fs.mkdirSync(path.join(home,'bin'),{recursive:true});fs.mkdirSync(path.join(home,'state'),{recursive:true});
  fs.writeFileSync(path.join(home,'state/state.json'),JSON.stringify({prs:{}}));
  for(const name of FILES)fs.writeFileSync(path.join(home,'bin',name),'old bytes');
  const state=fs.readFileSync(path.join(home,'state/state.json'));
@@ -17,7 +32,7 @@ function fixture(t){
  return {home,plan,state};
 }
 test('full source deploy preserves state and verifies all artifact hashes',t=>{
- const f=fixture(t),r=apply(f.plan);assert.equal(r.status,'installed');assert.equal(r.stateChanged,false);assert.deepEqual(r.orphanGuards,[]);assert.equal(verify(f.home).filter(v=>v.source===v.runtime).length,FILES.length);assert.deepEqual(fs.readFileSync(path.join(f.home,'state/state.json')),f.state);
+ const f=fixture(t),r=apply(f.plan);assert.equal(r.status,'installed');assert.equal(r.stateChanged,false);assert.deepEqual(r.orphanGuards,[]);assert.ok(verify(f.home).every(v=>v.source===v.runtime));assert.equal(verify(f.home).filter(v=>FILES.includes(v.name)).length,FILES.length);assert.deepEqual(fs.readFileSync(path.join(f.home,'state/state.json')),f.state);
  assert.ok(FILES.includes('cindy-feedback-policy.mjs'));
  assert.ok(FILES.includes('cindy-state.mjs'));
  assert.ok(FILES.includes('cindy-ownership.mjs'));
@@ -83,9 +98,63 @@ test('validatePlan (used by apply) also enforces manifest completeness, not just
  assert.doesNotThrow(() => validatePlan(f.plan));
  assert.throws(() => validatePlan(f.plan, source), /not-in-manifest-either\.mjs/);
 });
+test('#238 SC7 中途失败回滚：已有的仓外 net-errors.mjs 恢复成部署前内容', t => {
+ const f=fixture(t),outside=outsideNetErrors(f.home);
+ fs.mkdirSync(path.dirname(outside),{recursive:true});
+ fs.writeFileSync(outside,'previous companion\n');
+ f.plan.files=verify(f.home);
+ const restore=failAfterCompanion();
+ try{assert.throws(()=>apply(f.plan),/injected after companion/);}finally{restore();}
+ assert.equal(fs.readFileSync(outside,'utf8'),'previous companion\n');
+ assert.equal(fs.existsSync(path.join(f.home,'state/lease')),false);
+});
+test('#238 SC7 中途失败回滚：原先没有仓外 net-errors.mjs 则删掉', t => {
+ const f=fixture(t),outside=outsideNetErrors(f.home);
+ assert.equal(fs.existsSync(outside),false);
+ const restore=failAfterCompanion();
+ try{assert.throws(()=>apply(f.plan),/injected after companion/);}finally{restore();}
+ assert.equal(fs.existsSync(outside),false);
+ assert.equal(fs.existsSync(path.join(f.home,'state/lease')),false);
+});
+test('#238 SC7 成功部署后改仓外 net-errors.mjs，verify 报不一致', t => {
+ const f=fixture(t);apply(f.plan);
+ const extra=verify(f.home).find(v=>String(v.name).includes('net-errors.mjs'));
+ assert.ok(extra,'verify 输出含 net-errors.mjs 的哈希');
+ assert.equal(extra.source,extra.runtime);
+ fs.writeFileSync(outsideNetErrors(f.home),'tampered companion\n');
+ const after=verify(f.home).find(v=>String(v.name).includes('net-errors.mjs'));
+ assert.notEqual(after.runtime,after.source);
+});
+test('#238 SC7 deploy 把 net-errors 装到运行时相对路径，cindy-watcher 能 import', t => {
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'cindy-deploy-net-'));
+ t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const home=path.join(root,'home');
+ const boot=bootstrap(home);
+ const plan={version:1,home,database:path.join(home,'metadata.db'),id:'net-errors-release',files:verify(home),stateSha:boot.stateSha,sessionIds:[]};
+ apply(plan);
+ const result=importDeployed(path.join(home,'bin','cindy-watcher.mjs'));
+ assert.doesNotMatch(`${result.stderr}\n${result.stdout}`,/ERR_MODULE_NOT_FOUND/,result.stderr);
+ assert.equal(result.status,0,result.stderr);
+});
+test('#238 SC7 源树没有 net-errors.mjs 时 cindy deploy 拒绝', t => {
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'cindy-deploy-no-net-'));
+ t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const watcher=path.join(root,'watchers','cindy');
+ fs.cpSync(fileURLToPath(new URL('./',import.meta.url)),watcher,{recursive:true});
+ const source=path.join(watcher,'bin');
+ const home=path.join(root,'home');
+ fs.mkdirSync(path.join(home,'bin'),{recursive:true});
+ assert.throws(()=>verify(home,source),/net-errors/);
+ const f=fixture(t);
+ assert.throws(()=>validatePlan(f.plan,source),/net-errors/);
+ const cli=spawnSync(process.execPath,[path.join(watcher,'deploy.mjs'),'verify'],{encoding:'utf8',timeout:10000});
+ assert.notEqual(cli.status,0);
+ assert.match(`${cli.stderr}\n${cli.stdout}`,/net-errors/);
+});
 test('bootstrap then apply works when runtime has no old files', t => {
- const home=fs.mkdtempSync(path.join(os.tmpdir(),'watcher-empty-'));
- t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'watcher-empty-'));
+ t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const home=path.join(root,'home');
  const boot=bootstrap(home);
  assert.equal(fs.existsSync(path.join(home,'config/optout.json')),true);
  assert.match(boot.stateSha,/^[a-f0-9]{64}$/);

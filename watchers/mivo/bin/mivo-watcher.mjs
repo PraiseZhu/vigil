@@ -29,6 +29,7 @@ import { collectMivoCiSteps } from './mivo-ci.mjs';
 import { superviseCodeqlInfra, codeqlInfraCheckDue } from './mivo-codeql-infra.mjs';
 import { superviseCiSelfHeal, heldBySelfHeal, ciSelfHealCheckDue, ciStall, CI_STALL_MS, CI_STALL_NOTICE_MS } from './mivo-ci-selfheal.mjs';
 import { configuredLogin, isViewerOrWatchedBot, WATCHED_BOT_APP } from './mivo-identity.mjs';
+import { networkErrorPattern } from '../../acceptance/bin/net-errors.mjs';
 
 // 目标仓库在 import 时从 profile/env 求值；缺失时 fail-closed（不回退到任何个人默认值）。
 export const REPO = requireConfig('targetRepo', {
@@ -1981,7 +1982,8 @@ export const INFRA_REOPEN_LIMIT = 3;
 // the infra reopens, so a GitHub that stays down is retried a few times per admission epoch and then left alone.
 // Sessions also describe the same waits as an exhausted quota or a busy shared pre-push lock (#1621/#1741 on
 // 2026-11-04 sat blocked for hours with their fixes committed locally); those pass on their own as well.
-export const TRANSIENT_BLOCK_REASON = /rate.?limit|速率限制|限流|配额|quota|互斥锁|pre-push\.flock|pre-push (?:锁|lock)|abuse detection|HTTP 50[0234]|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|Gateway Time-?out|ETIMEDOUT|ECONNRESET|EAI_AGAIN|socket hang up|i\/o timeout/i;
+const TRANSIENT_LOCAL = /rate.?limit|速率限制|限流|配额|quota|互斥锁|pre-push\.flock|pre-push (?:锁|lock)|abuse detection|HTTP 50[0234]|50[234] (?:Bad Gateway|Service Unavailable|Gateway Time-?out)|Gateway Time-?out/i;
+export const TRANSIENT_BLOCK_REASON = new RegExp(`(?:${TRANSIENT_LOCAL.source})|(?:${networkErrorPattern(['timedOut', 'connReset', 'dnsAgain', 'socketHangUp', 'ioTimeout']).source})`, 'i');
 export const TRANSIENT_RETRY_BACKOFF_MS = 30 * 60 * 1000;
 export const KEEL_LEDGER_HELD = 'keel-ledger-unavailable';
 // A round that stopped because the PR moved under it (mivo-repair.mjs MOVED_BLOCK_KINDS) is handed back without a
