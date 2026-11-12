@@ -283,7 +283,7 @@ test('#233 SC3 窗口滑出 1 小时后恢复计数', async () => {
   assert.equal(disabled(still), true);
 });
 
-test('#233 SC4 计划含降级或改空则本拍 0 写入，自动停写并告警', async () => {
+test('#233 SC4（#248 起）计划含降级或改空：只拦那一条并告警，不停写；同拍空 → P2 照写', async () => {
   const dir = tmpDir();
   allow(dir, [EXTERNAL]);
   seedChange(dir, 2, 'P1', { repo: EXTERNAL });
@@ -294,13 +294,16 @@ test('#233 SC4 计划含降级或改空则本拍 0 写入，自动停写并告�
       item(2, { repo: EXTERNAL, priority: 'P1' }),
     ],
   });
-  assert.equal(writes.length, 0);
-  assert.equal(result.stop, 'downgrade');
-  assert.equal(disabled(dir), true);
+  assert.deepEqual(writes.map((action) => action.ref), [`${EXTERNAL}#1`], '只写空的那条，降级那条不写');
+  assert.deepEqual(Object.keys(writes[0].fields), ['优先级']);
+  assert.equal(result.stop, '');
+  assert.equal(disabled(dir), false);
+  assert.equal(readAlerts(dir).length, 1);
   const [alert] = readAlerts(dir);
+  assert.equal(alert.kind, 'prio-downgrade');
   assert.equal(
     alert.text,
-    '看板优先级自动写入已暂停：有 1 条要把 P1 改成 P2（降级），按规则不自动写。看板没有被改动。需要人看一下这条是否该改，确认后删除停写开关即可恢复。',
+    '看板优先级：#2 要把 P1 改成 P2（降级），按规则这一条不自动写，没有写。同拍其他条目照常写，没有停写。需要人看一下这条是否该改，该改就手动改。',
   );
   assert.equal(alert.text.includes(EXTERNAL), false);
   assert.equal(alert.text.includes(SECRET), false);
@@ -315,10 +318,11 @@ test('#233 SC4 计划含降级或改空则本拍 0 写入，自动停写并告�
     items: [item(1, { priority: 'P1', issueState: 'closed' })],
   });
   assert.equal(cleared.writes.length, 0);
-  assert.equal(cleared.result.stop, 'downgrade');
-  assert.equal(disabled(clearDir), true);
+  assert.equal(cleared.result.stop, '');
+  assert.equal(disabled(clearDir), false);
+  assert.equal(readAlerts(clearDir).length, 1);
   assert.match(readAlerts(clearDir)[0].text, /改空/);
-  assert.match(readAlerts(clearDir)[0].text, /看板没有被改动/);
+  assert.match(readAlerts(clearDir)[0].text, /没有写/);
   assert.match(readAlerts(clearDir)[0].text, /需要人/);
 });
 
@@ -1085,15 +1089,17 @@ function mixedPlan(extra = {}) {
 
 const EXCLUDE_LINE = /按 --only-empty-to-p2 排除 12 条（降级\/清空 7、升 P1 2、空→P1 2、关联 PR 1）/;
 
-test('#285 开关关 + 计划有降级：仍整拍停写并建开关（回归）', async () => {
+test('#285 开关关 + 计划有降级（#248 起）：降级只拦那几条，空 → P1/P2 照写，升级照旧告警，不建开关', async () => {
   const dir = tmpDir();
   allow(dir, [REPO]);
   const { writes, result, io } = await run(dir, ['--write'], { sync: planSync(mixedPlan()) });
-  assert.equal(writes.length, 0);
-  assert.equal(result.stop, 'downgrade');
-  assert.equal(disabled(dir), true);
-  assert.equal(readAlerts(dir).length, 1);
-  assert.equal(readAlerts(dir)[0].kind, 'prio-downgrade');
+  assert.deepEqual(writes.map((action) => action.ref).sort(), [8, 9, 13, 14, 15, 16].map((n) => `${REPO}#${n}`).sort());
+  assert.equal(result.stop, 'nonempty', '两条升级照旧进 prio-nonempty');
+  assert.equal(disabled(dir), false);
+  const kinds = readAlerts(dir).map((alert) => alert.kind);
+  assert.equal(kinds.filter((kind) => kind === 'prio-downgrade').length, 7, '7 条降级/改空各一行');
+  assert.equal(kinds.filter((kind) => kind === 'prio-nonempty').length, 1);
+  assert.equal(kinds.length, 8);
   assert.equal(EXCLUDE_LINE.test(io.text()), false, '没带开关就不打排除计数');
 });
 
@@ -1559,7 +1565,7 @@ test('SC8 关联 PR 段遇到优先级降级时不整拍停写', async () => {
   assert.match(io.text(), /按 --only-field "关联 PR" 排除优先级侧降级\/清空 1 条/);
 });
 
-test('SC8 不带 --only-field 时降级仍整拍停写', async () => {
+test('SC8 不带 --only-field 时降级（#248 起）只拦那一条：不停写，告警一行', async () => {
   const dir = tmpDir();
   allow(dir, [REPO]);
   fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
@@ -1569,9 +1575,10 @@ test('SC8 不带 --only-field 时降级仍整拍停写', async () => {
     items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2', priority: 'P1' })],
     prs: [closingPr(9, 1)],
   });
-  assert.equal(writes.length, 0);
-  assert.equal(result.stop, 'downgrade');
-  assert.equal(disabled(dir), true);
+  assert.deepEqual(writes.map((action) => action.ref), [`${REPO}#1`]);
+  assert.deepEqual(Object.keys(writes[0].fields), ['优先级'], '不带 --only-field 时关联 PR 不写');
+  assert.equal(result.stop, '');
+  assert.equal(disabled(dir), false);
   assert.deepEqual(readAlerts(dir).map((alert) => alert.kind), ['prio-downgrade']);
 });
 
@@ -1876,4 +1883,103 @@ test('#235 SC5 窗口参数：不传用 24；0、负数、小数、非数字在�
   seedAlert(dir, { ts: iso(T0 - 3 * HOUR), kind: 'prio-readback', text: READBACK_TEXT });
   await readbackMismatchTick(dir, ['--alert-dedupe-hours', '2']);
   assert.equal(readAlerts(dir).length, 2, '窗口改成 2 小时后，3 小时前那条在窗口外');
+});
+
+// #248：降级、改空只拦那一条，同拍其他条目、其他仓照常写；每条一行 prio-downgrade 告警，不建停写开关。
+const ch = (number, oldValue, newValue, repo = REPO) => ({ item: `${repo}#${number}`, repo, issue: number, field: '优先级', old: oldValue, new: newValue });
+const writtenRefs = (writes) => writes.map((action) => action.ref);
+const downgradeAlerts = (dir) => readAlerts(dir).filter((alert) => alert.kind === 'prio-downgrade');
+
+test('#248 SC1 单条降档只拦该条：同仓两条空 → P2 照写，不建停写开关，退出码 0', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const { writes, result } = await run(dir, ['--write'], { sync: planSync([ch(1, 'P1', 'P2'), ch(2, null, 'P2'), ch(3, null, 'P2')]) });
+  assert.deepEqual(writtenRefs(writes), [`${REPO}#2`, `${REPO}#3`]);
+  assert.equal(result.exitCode, 0);
+  assert.equal(disabled(dir), false);
+  const alerts = downgradeAlerts(dir);
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0].text, '看板优先级：#1 要把 P1 改成 P2（降级），按规则这一条不自动写，没有写。同拍其他条目照常写，没有停写。需要人看一下这条是否该改，该改就手动改。');
+  assert.equal(alerts[0].text.includes(REPO), false);
+});
+
+test('#248 SC2 降档在 A 仓，B 仓照常写', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO, OTHER]);
+  const { writes } = await run(dir, ['--write'], { sync: planSync([ch(1, 'P1', 'P2'), ch(5, null, 'P2', OTHER), ch(6, null, 'P2', OTHER)]) });
+  assert.deepEqual(writtenRefs(writes), [`${OTHER}#5`, `${OTHER}#6`]);
+  assert.equal(disabled(dir), false);
+});
+
+test('#248 SC3 被拦那条有一行告警，同一拍重跑、下一拍还被拦都不重复追加', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const plan = [ch(1, 'P1', 'P2'), ch(2, null, 'P2')];
+  await run(dir, ['--write'], { sync: planSync(plan) });
+  await run(dir, ['--write'], { sync: planSync(plan) });
+  await run(dir, ['--write'], { sync: planSync(plan), now: T0 + 5 * 60 * 1000 });
+  const alerts = downgradeAlerts(dir);
+  assert.equal(alerts.length, 1);
+  for (const leak of [REPO, SECRET, HOST, COMPANY]) assert.equal(alerts[0].text.includes(leak), false, leak);
+});
+
+test('#248 SC4 三条降档 + 两条填充：三行告警、两条照写；每拍上限只按会写的条数计；同号同变更合并成一行', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO, OTHER]);
+  const plan = [ch(1, 'P1', 'P2'), ch(2, 'P0', 'P1'), ch(3, 'P2', 'P3'), ch(4, null, 'P2'), ch(5, null, 'P2'), ch(1, 'P1', 'P2', OTHER)];
+  const { writes } = await run(dir, ['--write', '--max-per-tick', '2'], { sync: planSync(plan) });
+  assert.deepEqual(writtenRefs(writes), [`${REPO}#4`, `${REPO}#5`], '降档不占每拍上限');
+  assert.deepEqual(downgradeAlerts(dir).map((alert) => /#(\d+) 要把/.exec(alert.text)[1]), ['1', '2', '3']);
+  assert.equal(disabled(dir), false);
+});
+
+test('#248 SC5 A 仓整仓都是降档，B 仓三条照写', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO, OTHER]);
+  const plan = [1, 2, 3, 4, 5].map((n) => ch(n, 'P1', 'P2')).concat([7, 8, 9].map((n) => ch(n, null, 'P2', OTHER)));
+  const { writes, result } = await run(dir, ['--write'], { sync: planSync(plan) });
+  assert.deepEqual(writtenRefs(writes), [`${OTHER}#7`, `${OTHER}#8`, `${OTHER}#9`]);
+  assert.equal(result.exitCode, 0);
+  assert.equal(disabled(dir), false);
+  assert.equal(downgradeAlerts(dir).length, 5);
+});
+
+test('#248 SC6 降档与升档混合：降档进 prio-downgrade，升档照旧进 prio-nonempty，都不写，不整拍停', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const { writes, result } = await run(dir, ['--write'], { sync: planSync([ch(1, 'P1', 'P2'), ch(2, 'P3', 'P1')]) });
+  assert.equal(writes.length, 0);
+  assert.equal(result.stop, 'nonempty');
+  assert.equal(disabled(dir), false);
+  assert.deepEqual(readAlerts(dir).map((alert) => alert.kind).sort(), ['prio-downgrade', 'prio-nonempty']);
+  assert.match(readAlerts(dir).find((alert) => alert.kind === 'prio-nonempty').text, /有 1 条/);
+});
+
+test('#248 SC8 改空与降档同路：只拦那一条，文案写「改空」，同仓其他条目照写', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  const { writes } = await run(dir, ['--write'], { sync: planSync([ch(1, 'P1', null), ch(2, null, 'P2')]) });
+  assert.deepEqual(writtenRefs(writes), [`${REPO}#2`]);
+  assert.match(downgradeAlerts(dir)[0].text, /#1 要把 P1 改成 .*（改空）/);
+  assert.equal(disabled(dir), false);
+});
+
+test('#248 SC9 被拦条目的防抖状态连续两拍都不推进、也不清零', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  seedChange(dir, 2, 'P1');
+  seedDebounce(dir, 2, confirmedDowngrade('P2'));
+  const items = [item(1), item(2, { priority: 'P1' })];
+  const pick = () => {
+    const entry = JSON.parse(fs.readFileSync(path.join(dir, 'debounce.json'), 'utf8')).items[`${REPO}#2`];
+    return { pending: entry.pending, pendingHeld: entry.pendingHeld, consecutive: entry.consecutive, lastRecalcAt: entry.lastRecalcAt };
+  };
+  const seeded = pick();
+  const first = await run(dir, ['--write'], { items });
+  assert.equal(first.writes.some((action) => action.ref === `${REPO}#2`), false, '降档那条没写');
+  const afterFirst = pick();
+  await run(dir, ['--write'], { items, now: T0 + 5 * 60 * 1000 });
+  assert.deepEqual(pick(), afterFirst, '两拍相同');
+  assert.deepEqual(afterFirst, seeded, '没有推进也没有清零');
+  assert.equal(disabled(dir), false);
 });

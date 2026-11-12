@@ -305,12 +305,15 @@ export function assessContinuousPlan(plan, {
   const blocking = onlyField === '关联 PR'
     ? downgrades.filter((row) => row.change?.field === onlyField)
     : downgrades;
-  if (outOfScope.length > 0 || blocking.length > 0) {
+  // 范围外变更仍整拍停。降级、改空只拦那一条（#248）：不 abort、不停写，同拍其他条目、其他仓照常写，
+  // 被拦的每条由调用方各发一条 prio-downgrade 告警（返回值里的 blocked）。
+  if (outOfScope.length > 0) {
     return {
       abort: true,
-      reason: outOfScope.length > 0 ? 'out-of-scope' : 'downgrade',
+      reason: 'out-of-scope',
       outOfScope,
       downgrades: blocking,
+      blocked: [],
       nonAuto,
       hourlyStop: false,
       allow() { return 'skip'; },
@@ -333,6 +336,7 @@ export function assessContinuousPlan(plan, {
     reason: '',
     outOfScope,
     downgrades,
+    blocked: blocking,
     nonAuto,
     hourlyStop,
     // 被 `--only-field "关联 PR"` 排除的优先级侧降级/改空条数，只给调用方写 run 日志用。
@@ -343,6 +347,8 @@ export function assessContinuousPlan(plan, {
       // 本拍不可写字段（`--only-field` 以外的字段）静默排除：不写、不进 nonAuto，因此不发 prio-nonempty。
       if (onlyField != null && change?.field !== onlyField) return 'skip';
       const kind = classifyPrioChange(change, { table }).kind;
+      // 降级、改空：只拦这一条，不写；它有自己的 prio-downgrade 告警，不算进 prio-nonempty。
+      if (kind === 'downgrade' || kind === 'clear') return 'skip';
       if (kind === 'link') {
         if (!linkWritable) return 'skip';
       } else if (kind !== 'fill') {
@@ -361,6 +367,15 @@ function showCount(rows, one) {
 }
 
 export function alertTextFor(reason, { downgrades = [], nonAuto = [], written = 0, paused = false, streak = 0, readback = null, remaining = 0 } = {}) {
+  if (reason === 'downgrade-item') {
+    // 一条一句（#248）：写 #号，不写仓全名；同号同变更的两条合并成一行告警。
+    const row = downgrades[0] || {};
+    const label = row.kind === 'clear' ? '改空' : '降级';
+    const from = priorityWord(row.change?.old);
+    const to = priorityWord(row.change?.new);
+    const ref = row.change?.issue != null ? `#${row.change.issue}` : '有一条';
+    return `看板优先级：${ref} 要把 ${from} 改成 ${to}（${label}），按规则这一条不自动写，没有写。同拍其他条目照常写，没有停写。需要人看一下这条是否该改，该改就手动改。`;
+  }
   if (reason === 'downgrade') {
     const single = showCount(downgrades, (row) => {
       const label = row.kind === 'clear' ? '改空' : '降级';
@@ -406,6 +421,7 @@ const ALERT_KIND = {
   downgrade: 'prio-downgrade',
   'out-of-scope': 'prio-out-of-scope',
   readback: 'prio-readback',
+  'downgrade-item': 'prio-downgrade',
   'readback-error': 'prio-readback-error',
   hourly: 'prio-hourly',
   nonempty: 'prio-nonempty',
@@ -764,10 +780,9 @@ export async function runContinuous(argv = [], deps = {}) {
       emitAlert(stdout, alertsFile, now, alertWindowMs, 'out-of-scope', {});
       return { ...base, disabled: true, stop: 'out-of-scope' };
     }
-    if (assessment?.reason === 'downgrade') {
-      writeDisabled(dir, '降级或改空，持续写入已暂停');
-      emitAlert(stdout, alertsFile, now, alertWindowMs, 'downgrade', { downgrades: assessment.downgrades });
-      return { ...base, disabled: true, stop: 'downgrade' };
+    // 降级、改空（#248）：只拦那一条，各发一条告警（按 kind + 文案在去重窗口内去重），不写停写开关，接着往下判。
+    for (const row of assessment?.blocked || []) {
+      emitAlert(stdout, alertsFile, now, alertWindowMs, 'downgrade-item', { downgrades: [row] });
     }
     if (assessment?.hourlyStop) {
       writeDisabled(dir, '每小时写入上限，持续写入已暂停');
