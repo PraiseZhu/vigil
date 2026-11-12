@@ -265,6 +265,14 @@ function gateReasonText(reason) {
 
 /** 每种提醒的人话文案。title / what / impact / auto / action 都是固定句子；动态句在 noticeCopy 里补。 */
 export const NOTICE_COPY = Object.freeze({
+  'base-not-default': {
+    title: '任务合进了非默认分支，3 天多还没合回默认分支',
+    what: '关联 PR 合进的是集成分支之类的非默认分支；验收机只按默认分支验，这个任务一直没验。',
+    impact: '只有这一个任务一直没验收，其它任务照常。',
+    auto: '验收机继续每拍检查，合入默认分支后会自动开始验收。',
+    action: '需要：把工作合回默认分支、关掉 issue，或人工点名验一次。',
+    needsHuman: false,
+  },
   'needs-human': {
     title: '修正轮卡住了，需要你处理',
     what: '自动修正这件事走不下去了（比如修正次数用完或有冲突），验收机不会再自己往下推。',
@@ -674,10 +682,24 @@ export function alertBlocks(notice, profile) {
 /** 原因已经写进标题和「发生了什么」的，不再贴「原始记录：」。 */
 function knownReason(type, event) {
   const reason = str(event.reason);
+  if (type === 'base-not-default') return true;
   if (type === 'loop-restarted') return ['heartbeat-stale', 'loop-not-running'].includes(reason);
   if (type === 'loop-deploy-restarted') return reason === 'planned-stop';
   if (type === 'heartbeat-delayed') return /^delay-\d+s$/.test(reason);
   return false;
+}
+
+// #380 的摘要行：issue 和 PR 的完整链接、分支名、人话原因。链接只放 https://github.com/ 下的地址。
+function basePendingDetail(data) {
+  const issueUrl = httpUrl(data.url);
+  const issueBit = issueUrl ? `<${issueUrl}|${esc(str(data.issue) || 'issue')}>` : esc(str(data.issue));
+  const prs = (Array.isArray(data.prs) ? data.prs : []).map((pr) => {
+    const url = httpUrl(pr?.url);
+    return url ? `<${url}|${esc(str(pr.ref))}>` : esc(str(pr?.ref));
+  }).filter(Boolean);
+  const branch = `${esc(str(data.base) || '非默认分支')} → 默认分支 ${esc(str(data.defaultBranch) || 'main')}`;
+  const reason = clip(str(data.reason), 200);
+  return `（${[`任务 ${issueBit}`, prs.length ? `PR ${prs.join('、')}` : '', `分支 ${branch}`, esc(reason)].filter(Boolean).join('；')}）`;
 }
 
 function digestLine(data) {
@@ -689,6 +711,8 @@ function digestLine(data) {
   if (type === 'gate-rejected') {
     const reason = str(data.reason);
     if (reason) extra = `（原始记录：${esc(gateReasonText(reason))}）`;
+  } else if (type === 'base-not-default') {
+    extra = basePendingDetail(data);
   } else if (!knownReason(type, data)) {
     const reason = clip(str(data.reason), 140);
     if (reason) extra = `（原始记录：${esc(reason)}）`;

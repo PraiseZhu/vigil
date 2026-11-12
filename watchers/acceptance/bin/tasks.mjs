@@ -131,7 +131,7 @@ function childPrBase(childRef, byKey) {
     defaultBranch: defaultBranchOf(node),
     mergedPrs: linkedPrsOf(node, repo)
       .filter((pr) => pr.mergedAt)
-      .map((pr) => ({ ref: pr.ref, base: pr.base })),
+      .map((pr) => ({ ref: pr.ref, base: pr.base, mergedAt: pr.mergedAt })),
   };
 }
 

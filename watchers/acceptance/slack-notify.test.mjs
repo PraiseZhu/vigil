@@ -28,6 +28,7 @@ import {
 } from './host/slack-notify.mjs';
 import { NOTICE_COPY } from './host/slack-blocks.mjs';
 import { runTick } from './host/tick.mjs';
+import { reportBasePending } from './host/base-pending.mjs';
 import { REPO, START_AT, tmpDir, writeProfile, writeSecret } from './fake-gh.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -1658,3 +1659,30 @@ test('心跳延迟和部署重启只进摘要，不立即 ping', () => {
   assert.equal(classify('alerts', { kind: 'loop-deploy-restarted', reason: 'planned-stop' }), 'digest');
   assert.equal(classify('alerts', { kind: 'loop-restarted', reason: 'heartbeat-stale' }), 'blocked');
 });
+
+test('#380 SC3 合入非默认分支超期只进每日汇总：首拍不发、攒进摘要；摘要行带完整链接、分支名和人话原因', async () => {
+  assert.equal(classify('alerts', { kind: 'base-not-default' }), 'digest');
+  const { home, profile } = setup();
+  const t0 = Date.parse(START_AT) + 10 * 24 * 60 * 60 * 1000;
+  reportBasePending({ paths: hostPaths(home), now: () => t0, baseSkipped: [{
+    issue: `${REPO}#21`, kind: 'standalone', state: 'open', url: `https://github.com/${REPO}/issues/21`,
+    mergedAt: new Date(t0 - 5 * 24 * 60 * 60 * 1000).toISOString(), reason: 'base-not-default',
+    base: 'integration/sample-feature', defaultBranch: 'main', prs: [{ ref: `${REPO}#210`, base: 'integration/sample-feature' }],
+    child: null, message: '',
+  }] });
+  await withSlack(undefined, async (fake) => {
+    const first = await notifySlack({ home, profile, now: () => t0, fetch: fake.fetch, apiBase: fake.apiBase });
+    assert.equal(fake.posts().length, 0, '不发实时');
+    assert.equal(first.digested, 1);
+    const later = await notifySlack({ home, profile, now: () => t0 + 61 * 60000, fetch: fake.fetch, apiBase: fake.apiBase });
+    assert.equal(later.sent, 1, '到点随摘要发出');
+    const body = fake.posts()[0].body;
+    assert.match(body, new RegExp(`https://github.com/${REPO}/issues/21`));
+    assert.match(body, new RegExp(`https://github.com/${REPO}/pull/210`));
+    assert.match(body, /integration\/sample-feature/);
+    assert.match(body, /已经 5 天没合入默认分支 main/);
+    assert.doesNotMatch(body, /base-not-default/, '不拿内部代码当文案');
+    assert.doesNotMatch(body, /<@/, '摘要不 @');
+  });
+});
+
