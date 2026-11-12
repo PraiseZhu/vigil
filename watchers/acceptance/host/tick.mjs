@@ -19,6 +19,7 @@ import { runGateAudit } from './gate-audit.mjs';
 import { reportBasePending } from './base-pending.mjs';
 import { HEARTBEAT_TICK_MAX_S, POLL_BEAT_MS, startTickBeat } from './poll-beat.mjs';
 import { isReadOnlyGraphql } from '../bin/github.mjs';
+import { classifyNetError } from '../bin/net-errors.mjs';
 import {
   GRAPHQL_COST_PER_REQUEST,
   appendRateLog,
@@ -122,7 +123,31 @@ function isGhRead(cmd, args, opts) {
  * 再用新进程（新连接）重试一次；重试也超时才按读失败收尾，文字注明已重试一次。读是幂等的，重试不会多写任何东西。
  * 再兜一层计时：run 自己不认超时时也按 124 收尾。onRead 在每次读（含重试）开始时调用（刷新心跳阶段）。
  */
-export function withReadTimeout(run, timeoutMs = TICK_READ_TIMEOUT_MS, { onRead, onRetryOk } = {}) {
+/** 一拍里 tick 自己替只读请求（含 poll）重试的总次数上限（#238，Issue Inspector 2026-11-03 定）。 */
+export const MAX_TICK_READ_RETRIES = 3;
+export function readRetryBudget(left = MAX_TICK_READ_RETRIES) {
+  return { left };
+}
+
+/**
+ * poll 这次失败值不值得用新进程再拉一次（#238）：超时（124）、网络类瞬时错误（限流 75 除外，它跳过这一拍），
+ * 以及退出码 0 但输出截断、乱码解析不了的。业务错误不重试。
+ */
+export function pollRetryable(poll) {
+  if (!poll) return false;
+  if (poll.code === 0) {
+    try {
+      JSON.parse(poll.stdout || '[]');
+      return false;
+    } catch {
+      return true;
+    }
+  }
+  if (poll.code === POLL_RATE_LIMITED_CODE) return false;
+  return poll.code === 124 || classifyNetError(poll).transient;
+}
+
+export function withReadTimeout(run, timeoutMs = TICK_READ_TIMEOUT_MS, { onRead, onRetryOk, budget } = {}) {
   const message = () => `读 GitHub 超过 ${Math.round(timeoutMs / 1000)} 秒没返回，已掐掉（exit 124）`;
   const once = async (cmd, args, opts) => {
     try {
@@ -147,15 +172,21 @@ export function withReadTimeout(run, timeoutMs = TICK_READ_TIMEOUT_MS, { onRead,
     if (!isGhRead(cmd, args, opts) || Number(opts?.timeoutMs) > 0) return run(cmd, args, opts);
     const startedAt = Date.now();
     const first = await once(cmd, args, opts);
-    if (!first || first.code !== 124) return first;
+    // 超时（124）和网络类瞬时错误（分类表见 bin/net-errors.mjs，#238）都用新进程重试一次；业务错误不重试。
+    if (!first || first.code === 0 || !(first.code === 124 || classifyNetError(first).transient)) return first;
+    if (budget) {
+      if (budget.left <= 0) return first;
+      budget.left -= 1;
+    }
     const second = await once(cmd, args, opts);
-    if (second && second.code === 124) return { ...second, stderr: `${String(second.stderr || '').trim()}${RETRIED}` };
+    // retried：里层已经重试过，github.mjs 的 runRead 不再重试（单个请求最多重试一次）。
+    if (second && second.code !== 0) return { ...second, retried: true, stderr: `${String(second.stderr || '').trim()}${RETRIED}` };
     try {
       onRetryOk?.({ totalMs: Date.now() - startedAt });
     } catch {
       // 留日志失败不影响读。
     }
-    return second;
+    return second && { ...second, retried: true };
   };
 }
 
@@ -405,6 +436,7 @@ export async function runTick({
   const startPrbot = spawnPrbot || defaultSpawnPrbot({ home, env, root: repoRoot });
   const startAdjudicate = spawnAdjudicate || defaultSpawnAdjudicate({ home, env, root: repoRoot });
 
+  const readRetries = readRetryBudget();
   const heartbeat = {
     at: new Date(now()).toISOString(),
     pid: loopPid(env),
@@ -595,7 +627,8 @@ export async function runTick({
     const pollStartedAt = Date.now();
     let poll = await pollOnce();
     let pollRetried = false;
-    if (poll && poll.code === 124) {
+    if (pollRetryable(poll) && readRetries.left > 0) {
+      readRetries.left -= 1;
       pollRetried = true;
       poll = await pollOnce();
       if (poll && poll.code === 0) logReadRetryOk(paths, 'poll', Date.now() - pollStartedAt, now);
@@ -735,6 +768,7 @@ export async function runTick({
         // T20：这一段读 GitHub 原先没有超时，对端不回包时整拍挂住（2026-10-30 卡了约 14 分钟）。只给读加超时，
         // 每次读开始重新记阶段时长（T23：一次读最多约 50 秒，连同重试最多约 100 秒，远小于 180 秒上限）。
         const prbotRun = withReadTimeout(run, prbotReadTimeoutMs, {
+          budget: readRetries,
           onRead: () => tickBeat.setPhase('prbot'),
           onRetryOk: ({ totalMs }) => logReadRetryOk(paths, 'prbot-read', totalMs, now),
         });
