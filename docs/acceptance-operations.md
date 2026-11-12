@@ -799,6 +799,7 @@ node watchers/acceptance/deploy-ff.mjs \
 | `up-to-date` | 0 | 已经在目标提交 |
 | `waiting` | 30 | 等待空档（轮次目录、锁目录、验收进程或演练锁） |
 | `ci-pending` | 30 | 等待检查跑完 |
+| `draining` | 30 | 落后超限、等不到空档：正在排空（占住空出来的轮次槽位，见下面「部署排空」） |
 | `locked` | 20 | 另一个实例拿着本脚本的锁 |
 | `blocked-dirty` | 10 | 工作区不干净，不动 |
 | `blocked-diverged` | 11 | 分叉或本地超前，只接受快进 |
@@ -825,6 +826,19 @@ node watchers/acceptance/deploy-ff.mjs \
 - 待拉提交新增的行里出现 `process.env`、`secrets/` 或 `token`（不分大小写）。删掉的行不算。改名用 `--no-renames` 拆开算，挪走旧路径也算命中。
 
 落后：本地比目标多超过 5 个提交，或最早一个未部署提交距今超过 2 小时，人话里带 `lagging`，并给 lead 一句。同一次落后（以当前本地 HEAD 为键）只在第一次把 `reportLag` 设为 true。快进成功后这份记忆清掉。
+
+### 部署排空（#425）
+
+验收轮一个接一个时，主循环在槽位空出的下一拍就起新轮次，本脚本可能一直等不到空档。排空借用主循环已有的槽位锁 `<host-state>/slots/slot-0`、`slot-1`。主循环起轮前会数活着的槽，单轮拿不到槽就这一拍不认领。所以占住空出来的槽，就能挡住新轮次，主循环一行不用改。
+
+- **什么时候排空**：等不到空档（`rounds`、`locks` 不空或有验收进程），且同时满足两条。一是按上面的规则已算落后，超过 5 个提交或超过 2 小时。二是本地 `HEAD..origin/main` 没有敏感改动，或者已经点名批准了目标完整 sha。需要批准时不排空。这一步只看本地已有的引用，不 fetch，也不动部署目录。
+- **怎么占**：起一个脱离 cron 的持有进程（命令行带 `deploy-ff-drain-holder` 标记），用它的 pid 按宿主锁的同一格式（O_EXCL 建文件，内容 `{pid, startedAt}`）去占空槽。写着活 pid 的槽是在跑的轮次，不抢；pid 已死的陈旧锁删掉重占；读不出内容的按占用处理。不中止、不暂停任何轮次。
+- **状态**：标准输出状态是 `draining`，退出码 30，人话说明占了几个槽、在等什么、截止时间。`deploy-ff.json` 多一个 `drain` 字段：`status`、`holderPid`、`target`、`startedAt`、`deadline`、`slots`。下一拍发现自己在排空时，沿用同一个持有进程和截止时间，补占新空出来的槽，重复跑结果不变。持有进程意外没了，就重起一个接着占，截止时间不变。开始排空时写一条 `deploy-draining` 提醒（人话），同一个 HEAD 和目标只写一次。
+- **什么时候部署**：槽位被占后不会再起新轮；在跑的轮次结束、`rounds`、`locks` 都空、没有验收进程时，空档判定（不变）通过，照原流程 fetch、读检查、敏感批准、快进和 `doctor`。
+- **什么时候放槽**：结局是 `deployed`、`up-to-date`，或者要人看（`needs-approval`、`doctor-failed`、`pull-failed`、`blocked-dirty`、`blocked-diverged`、`ci-red`、`ci-unknown`）时，当场让持有进程退出并删掉写着它 pid 的槽。`ci-pending`、`fetch-failed` 时保持排空，靠超时兜底。
+- **最长持续时间**：从开始排空算 120 分钟，到点下一拍放槽，写一条 `deploy-drain-timeout` 提醒，状态回到 `waiting`。持有进程自己也在截止时间删槽退出，所以本脚本不再运行也不会一直占着。超时后冷却 30 分钟（`drainCooldownUntil`）才会再排空，保证等不到空档时验收照常起轮次。
+- **和写闸无关**：排空不读、不写写闸总开关，也不改 `MAX_ROUNDS`、限流预算、账号余量暂停线、敏感判定和批准流程。
+- **手动查看**：`jq .drain <home>/state/host/deploy-ff.json`；`cat <home>/state/host/slots/slot-*`（`holder` 为 `deploy-ff` 的是排空占的）；`ps -o pid,etime,args -p <holderPid>`。要提前放开，对 `holderPid` 发 SIGTERM，它会删掉自己的槽后退出。
 
 提醒写到调用方传入的 `alerts.jsonl`，本脚本自己追加，不引用宿主目录里的模块。一行一个 JSON：`ts`、`kind`、`reason`、`detail`，另带 `head`、`target`。`kind` 以 `deploy-` 开头，例如 `deploy-needs-approval`、`deploy-blocked-dirty`、`deploy-doctor-failed`、`deploy-pull-failed`、`deploy-blocked-diverged`、`deploy-ci-red`、`deploy-ci-unknown`，首次落后另写 `deploy-lagging`。同一个本地 HEAD、目标 sha 和 kind 只写一行。`waiting`、`ci-pending`、`up-to-date`、`deployed` 不写；`locked` 和 `fetch-failed` 只出现在标准输出，不写提醒。状态文件用临时文件加 rename 写入，记下落后是否报过、以及已经写过的提醒键。
 

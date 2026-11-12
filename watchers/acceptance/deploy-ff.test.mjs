@@ -16,7 +16,12 @@ import {
   parseAddedLines,
   repoFromOrigin,
   runDeploy,
+  DRAIN_COOLDOWN_MS,
+  DRAIN_MAX_MS,
+  spawnDrainHolder,
 } from './deploy-ff.mjs';
+import { tryAcquireLock } from './host/paths.mjs';
+import { acquireSlot } from './host/round.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..', '..');
@@ -1302,4 +1307,277 @@ test('#347 SC8 文档写清重读条件、次数、不重试的状态和说明�
   assert.match(doc, /ci-red[\s\S]{0,40}不重读/);
   assert.match(doc, /最多.{0,10}两个 GET|两个 GET/);
   assert.match(doc, /多一行/);
+});
+
+// ---- #425 部署排空：落后超限时占住空出来的轮次槽，不再起新轮，等在跑的轮次结束后部署 ----
+function lagBehind(world, count, { date = '2026-11-02T11:30:00Z', prefix = 'drain', entries } = {}) {
+  let sha = '';
+  for (let i = 0; i < count; i += 1) {
+    const files = entries && i === 0 ? entries : [{ path: `docs/${prefix}-${i}.md`, content: `${prefix}${i}\n` }];
+    sha = commitAndPush(world, files, `${prefix} ${i}`, date);
+  }
+  // 轮次在跑时部署脚本不 fetch：这里模拟之前某一拍已经 fetch 过，origin/main 是新的、HEAD 没动。
+  git(world.deploy, ['fetch', 'origin']);
+  return sha;
+}
+
+const slotsOf = (world) => path.join(world.host, 'slots');
+const slotFile = (world, name) => path.join(slotsOf(world), name);
+const slotPayload = (world, name) => {
+  try { return JSON.parse(fs.readFileSync(slotFile(world, name), 'utf8')); } catch { return null; }
+};
+const stateOf = (world) => (fs.existsSync(world.stateFile) ? JSON.parse(fs.readFileSync(world.stateFile, 'utf8')) : {});
+const alive = (pid) => {
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+};
+const busyRounds = (world) => fs.writeFileSync(path.join(world.host, 'rounds', 'active.json'), '{}\n');
+const freeRounds = (world) => fs.rmSync(path.join(world.host, 'rounds', 'active.json'), { force: true });
+
+async function waitDead(pid, ms = 3000) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    if (!alive(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return !alive(pid);
+}
+
+/** 测试结束时把真实的持有进程收掉（正常路径里部署脚本自己会收）。 */
+function cleanupHolder(world) {
+  const pid = stateOf(world).drain?.holderPid;
+  if (Number.isInteger(pid)) {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* 已经退出 */ }
+  }
+}
+
+/** 一个真实存在、活着的「在跑轮次」进程，用来占槽。 */
+function fakeRoundProcess() {
+  const child = spawn('sleep', ['300'], { stdio: 'ignore', detached: true });
+  return { pid: child.pid, stop: () => { try { process.kill(child.pid, 'SIGKILL'); } catch { /* 已经退出 */ } } };
+}
+
+test('#425 落后超限、轮次在跑、两个槽都空：进入 draining，两个槽都被活着的持有进程占住，主循环拿不到槽', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  try {
+    const sha = lagBehind(world, 6);
+    busyRounds(world);
+    const result = await deploy(world, { now: () => NOW });
+    const json = assertRun(result, 'draining');
+    assert.equal(result.code, 30);
+    assert.equal(json.lagging, true);
+    assert.equal(result.after, result.before, '排空不动部署目录');
+    assert.equal(mutations(result.calls).length, 0, '排空这一拍不 fetch、不 merge');
+    assert.match(result.stdout.split('\n')[1], /排空/);
+    const state = stateOf(world);
+    assert.equal(state.drain.status, 'draining');
+    assert.equal(state.drain.target, sha);
+    assert.deepEqual(state.drain.slots, ['slot-0', 'slot-1']);
+    assert.equal(state.drain.deadline, new Date(NOW + DRAIN_MAX_MS).toISOString());
+    const holder = state.drain.holderPid;
+    assert.equal(alive(holder), true);
+    for (const name of ['slot-0', 'slot-1']) assert.equal(slotPayload(world, name).pid, holder);
+    // 主循环和 round 用的就是这一套锁：槽被活着的 pid 占着，拿不到。
+    assert.equal(acquireSlot({ slotsDir: slotsOf(world) }), null);
+    assert.equal(tryAcquireLock(slotFile(world, 'slot-0')), false);
+    const drains = readAlerts(world.alertsFile).filter((row) => row.kind === 'deploy-draining');
+    assert.equal(drains.length, 1);
+    assert.match(drains[0].reason, /排空/);
+    assert.equal(fs.readdirSync(path.join(world.host, 'rounds')).length, 1, '不碰 rounds/');
+  } finally {
+    cleanupHolder(world);
+  }
+});
+
+test('#425 不落后或落后未超限：不占槽，轮次照常拿槽', { skip: FLOCK_SKIP }, async () => {
+  for (const count of [0, 5]) {
+    const world = makeWorld();
+    if (count) lagBehind(world, count);
+    busyRounds(world);
+    const json = assertRun(await deploy(world, { now: () => NOW }), 'waiting');
+    assert.equal(json.lagging, false);
+    assert.equal(fs.existsSync(slotsOf(world)) ? fs.readdirSync(slotsOf(world)).length : 0, 0);
+    assert.equal(stateOf(world).drain ?? null, null);
+    const slot = acquireSlot({ slotsDir: slotsOf(world) });
+    assert.equal(slot?.name, 'slot-0', '主循环照常拿槽');
+    assert.equal(readAlerts(world.alertsFile).some((row) => row.kind === 'deploy-draining'), false);
+  }
+});
+
+test('#425 已有轮次占着槽：只占空出来的那个、不抢；轮次放槽后下一拍接着占，同一个持有进程，重复跑结果不变', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  const round = fakeRoundProcess();
+  try {
+    lagBehind(world, 6);
+    busyRounds(world);
+    fs.mkdirSync(slotsOf(world), { recursive: true });
+    const roundLock = JSON.stringify({ pid: round.pid, startedAt: '2026-11-02T11:00:00.000Z' });
+    fs.writeFileSync(slotFile(world, 'slot-0'), roundLock);
+    assertRun(await deploy(world, { now: () => NOW }), 'draining');
+    const first = stateOf(world).drain;
+    assert.deepEqual(first.slots, ['slot-1']);
+    assert.equal(fs.readFileSync(slotFile(world, 'slot-0'), 'utf8'), roundLock, '在跑轮次的槽原样不动');
+    assert.equal(alive(round.pid), true, '不杀轮次');
+    assert.equal(slotPayload(world, 'slot-1').pid, first.holderPid);
+    // 轮次结束：放掉自己的槽（rounds/ 里还有别的轮次）。
+    round.stop();
+    await waitDead(round.pid);
+    fs.rmSync(slotFile(world, 'slot-0'));
+    assertRun(await deploy(world, { now: () => NOW + 5 * 60_000 }), 'draining');
+    const second = stateOf(world).drain;
+    assert.equal(second.holderPid, first.holderPid, '下一拍接着用同一个持有进程');
+    assert.equal(second.startedAt, first.startedAt);
+    assert.equal(second.deadline, first.deadline, '不续期');
+    assert.deepEqual(second.slots, ['slot-0', 'slot-1']);
+    assert.equal(slotPayload(world, 'slot-0').pid, first.holderPid);
+    assertRun(await deploy(world, { now: () => NOW + 10 * 60_000 }), 'draining');
+    assert.deepEqual(stateOf(world).drain, second, '幂等：再跑一拍状态不变');
+    assert.equal(readAlerts(world.alertsFile).filter((row) => row.kind === 'deploy-draining').length, 1, '排空提醒只写一次');
+  } finally {
+    round.stop();
+    cleanupHolder(world);
+  }
+});
+
+test('#425 轮次全部排空后照原流程部署，部署成功后放槽、收掉持有进程', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  try {
+    const sha = lagBehind(world, 6);
+    busyRounds(world);
+    assertRun(await deploy(world, { now: () => NOW }), 'draining');
+    const holder = stateOf(world).drain.holderPid;
+    freeRounds(world);
+    const done = await deploy(world, { now: () => NOW + 60_000, fetchImpl: green(sha) });
+    assertRun(done, 'deployed');
+    assert.equal(done.after, sha);
+    assert.equal(fs.existsSync(slotFile(world, 'slot-0')), false);
+    assert.equal(fs.existsSync(slotFile(world, 'slot-1')), false);
+    assert.equal(await waitDead(holder), true);
+    assert.equal(stateOf(world).drain ?? null, null);
+    assert.equal(acquireSlot({ slotsDir: slotsOf(world) })?.name, 'slot-0', '主循环恢复拿槽');
+  } finally {
+    cleanupHolder(world);
+  }
+});
+
+test('#425 排空中部署结果是需要批准或 doctor 失败：同样放槽', { skip: FLOCK_SKIP }, async () => {
+  const approval = makeWorld();
+  try {
+    lagBehind(approval, 6);
+    busyRounds(approval);
+    assertRun(await deploy(approval, { now: () => NOW }), 'draining');
+    const holder = stateOf(approval).drain.holderPid;
+    // 排空期间 main 上又合进一个敏感改动，轮次结束后部署时才发现要批准。
+    const sensitive = commitAndPush(approval, [{ path: 'watchers/acceptance/host/tick.mjs', content: 'x\n' }], 'host', '2026-11-02T11:40:00Z');
+    freeRounds(approval);
+    assertRun(await deploy(approval, { now: () => NOW + 60_000, fetchImpl: green(sensitive) }), 'needs-approval');
+    assert.equal(fs.existsSync(slotFile(approval, 'slot-0')), false);
+    assert.equal(fs.existsSync(slotFile(approval, 'slot-1')), false);
+    assert.equal(await waitDead(holder), true);
+    assert.equal(stateOf(approval).drain ?? null, null);
+  } finally {
+    cleanupHolder(approval);
+  }
+  const doctor = makeWorld();
+  try {
+    const sha = lagBehind(doctor, 6);
+    busyRounds(doctor);
+    assertRun(await deploy(doctor, { now: () => NOW }), 'draining');
+    freeRounds(doctor);
+    const failed = await deploy(doctor, {
+      now: () => NOW + 60_000,
+      fetchImpl: green(sha),
+      runDoctor: () => ({ code: 1, stdout: 'bad', stderr: '' }),
+    });
+    assertRun(failed, 'doctor-failed');
+    assert.equal(fs.existsSync(slotFile(doctor, 'slot-0')), false);
+    assert.equal(stateOf(doctor).drain ?? null, null);
+  } finally {
+    cleanupHolder(doctor);
+  }
+});
+
+test('#425 排空超过 120 分钟：放槽、收持有进程、写一次超时提醒；冷却 30 分钟内不再排空，之后再排空', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  try {
+    lagBehind(world, 6);
+    busyRounds(world);
+    assertRun(await deploy(world, { now: () => NOW }), 'draining');
+    const holder = stateOf(world).drain.holderPid;
+    const timedOut = await deploy(world, { now: () => NOW + DRAIN_MAX_MS });
+    const json = assertRun(timedOut, 'waiting');
+    assert.match(json.reason, /120 分钟/);
+    assert.equal(fs.existsSync(slotFile(world, 'slot-0')), false);
+    assert.equal(fs.existsSync(slotFile(world, 'slot-1')), false);
+    assert.equal(await waitDead(holder), true);
+    assert.equal(stateOf(world).drain ?? null, null);
+    assert.equal(readAlerts(world.alertsFile).filter((row) => row.kind === 'deploy-drain-timeout').length, 1);
+    assert.equal(acquireSlot({ slotsDir: slotsOf(world) })?.name, 'slot-0', '超时后主循环恢复拿槽');
+    fs.rmSync(slotFile(world, 'slot-0'));
+    assertRun(await deploy(world, { now: () => NOW + DRAIN_MAX_MS + DRAIN_COOLDOWN_MS - 1 }), 'waiting');
+    assert.equal(fs.existsSync(slotFile(world, 'slot-0')), false, '冷却期内不排空');
+    assertRun(await deploy(world, { now: () => NOW + DRAIN_MAX_MS + DRAIN_COOLDOWN_MS }), 'draining');
+  } finally {
+    cleanupHolder(world);
+  }
+});
+
+test('#425 需要批准（敏感改动未批准）时不排空；批准了目标完整 sha 才排空', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  try {
+    const sha = lagBehind(world, 6, { entries: [{ path: 'watchers/acceptance/host/tick.mjs', content: 'y\n' }] });
+    busyRounds(world);
+    const json = assertRun(await deploy(world, { now: () => NOW }), 'waiting');
+    assert.equal(json.lagging, true);
+    assert.equal(fs.existsSync(slotsOf(world)) ? fs.readdirSync(slotsOf(world)).length : 0, 0);
+    assert.equal(stateOf(world).drain ?? null, null);
+    const content = assertRun(await deploy(world, { now: () => NOW, approve: 'f'.repeat(40) }), 'waiting');
+    assert.equal(content.status, 'waiting', '批准的不是目标 sha 也不排空');
+    fs.writeFileSync(world.approvalFile, `${sha}\n`);
+    assertRun(await deploy(world, { now: () => NOW, approvalFile: world.approvalFile }), 'draining');
+    assert.equal(fs.existsSync(world.approvalFile), true, '排空不消费批准文件');
+  } finally {
+    cleanupHolder(world);
+  }
+});
+
+test('#425 持有进程意外没了：下一拍重新起一个接着占槽，不重复提醒', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  try {
+    lagBehind(world, 6);
+    busyRounds(world);
+    assertRun(await deploy(world, { now: () => NOW }), 'draining');
+    const first = stateOf(world).drain;
+    process.kill(first.holderPid, 'SIGKILL');
+    await waitDead(first.holderPid);
+    assertRun(await deploy(world, { now: () => NOW + 5 * 60_000 }), 'draining');
+    const second = stateOf(world).drain;
+    assert.notEqual(second.holderPid, first.holderPid);
+    assert.equal(alive(second.holderPid), true);
+    assert.equal(second.deadline, first.deadline, '截止时间不变');
+    for (const name of ['slot-0', 'slot-1']) assert.equal(slotPayload(world, name).pid, second.holderPid);
+    assert.equal(readAlerts(world.alertsFile).filter((row) => row.kind === 'deploy-draining').length, 1);
+  } finally {
+    cleanupHolder(world);
+  }
+});
+
+test('#425 持有进程到时自己放槽退出，只删写着自己 pid 的槽', { skip: FLOCK_SKIP }, async () => {
+  const dir = tmpDir('drain-holder-');
+  const mine = path.join(dir, 'slot-0');
+  const other = path.join(dir, 'slot-1');
+  const pid = spawnDrainHolder({ ttlMs: 300, files: [mine, other] });
+  assert.equal(Number.isInteger(pid), true);
+  fs.writeFileSync(mine, JSON.stringify({ pid, startedAt: new Date().toISOString() }));
+  fs.writeFileSync(other, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+  assert.equal(await waitDead(pid, 5000), true);
+  assert.equal(fs.existsSync(mine), false);
+  assert.equal(fs.existsSync(other), true, '别人的槽不动');
+});
+
+test('#425 部署脚本不碰写闸、不杀轮次', () => {
+  const src = fs.readFileSync(SCRIPT, 'utf8');
+  assert.doesNotMatch(src, /write-gate|enabledFile/);
+  // 只对自己起的持有进程发信号（命令行带标记才认）。
+  const kills = src.split('\n').filter((line) => /process\.kill\(/.test(line));
+  for (const line of kills) assert.match(line, /holder|pid, 0|-child\.pid|child\.pid/, line);
 });
