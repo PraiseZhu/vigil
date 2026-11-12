@@ -301,6 +301,14 @@ test('内容规则不再把文件名、普通环境变量和文档里的词当�
   assert.deepEqual(sensitiveHits([], quiet), { files: [], lines: [] });
 });
 
+test('#426 复审 白名单以外的 token 字样和全大写密钥名照样算（分不清就多要一次批准）', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  assert.equal(sensitiveLineReason('watchers/mivo/bin/mivo-app-token.mjs', 'let token = null;'), 'token-word');
+  // 2026-11-05 误拦过的原文：不在仓根 docs/ 下的文档、配置注释里写着真实的密钥名，照样要批准。
+  assert.equal(sensitiveLineReason('watchers/acceptance/worker/README.md', '- `PULL_TOKEN`：本机拉取端带在 Authorization: Bearer 里的令牌。'), 'env');
+  assert.equal(sensitiveLineReason('watchers/acceptance/worker/wrangler.toml', '#   npx wrangler secret put PULL_TOKEN'), 'env');
+});
+
 test('内容规则仍然命中敏感环境变量、密钥/令牌文件、App 身份和端口', async () => {
   const { sensitiveLineReason } = await import('./deploy-ff.mjs');
   const cases = [
@@ -315,6 +323,7 @@ test('内容规则仍然命中敏感环境变量、密钥/令牌文件、App 身
     ["const blob = readFileSync(path.join(home, 'vigil/token'));", 'token-file'],
     ['if (profile.appOnly) block();', 'appOnly'],
     ['server.listen(8080);', 'port'],
+    ['listen(8080);', 'port'],
     ['const config = { port: 3000 };', 'port'],
   ];
   for (const [text, rule] of cases) {
@@ -365,7 +374,7 @@ test('返工 环境变量读取：解构、可选链、动态下标、整表枚�
   for (const text of quiet) assert.equal(sensitiveLineReason(file, text), null, text);
 });
 
-test('返工 令牌文件：path.join 的独立 token 段和模板字符串的 /token 都命中，tokenize、tokens.md 之类不命中', async () => {
+test('返工 令牌文件：path.join 的独立 token 段和模板字符串的 /token 按令牌文件命中；tokens.md、tokenizer.mjs 这类文件名不命中，tokenize 之类的字样按 token-word 命中', async () => {
   const { sensitiveLineReason } = await import('./deploy-ff.mjs');
   const file = 'watchers/mivo/bin/app.mjs';
   const hit = [
@@ -392,12 +401,17 @@ test('返工 令牌文件：path.join 的独立 token 段和模板字符串的 /
 test('#426 复审 全大写常量：HAPPY、FORBIDDEN_KEYS、WATCHED_BOT_APP 不算；读环境变量时名字里有可疑的词就算', async () => {
   const { sensitiveLineReason } = await import('./deploy-ff.mjs');
   const file = 'watchers/mivo/bin/app.mjs';
-  for (const name of ['HAPPY', 'HAPPY_HOUR', 'MONKEY_MODE', 'KEYBOARD_LAYOUT', 'WEBAPP_URL', 'FORBIDDEN_KEYS', 'WATCHED_BOT_APP', 'APP_FALLBACK_RULES']) {
+  for (const name of ['HAPPY', 'HAPPY_HOUR', 'MONKEY_MODE', 'KEYBOARD_LAYOUT', 'WEBAPP_URL', 'FORBIDDEN_KEYS', 'WATCHED_BOT_APP', 'APP_FALLBACK_RULES',
+    'CONFLICT_FEEDBACK_KEY', 'SWITCH_KEY', 'QUEUE_COUNT_KEY', 'AUTHOR_LOGIN']) {
     assert.equal(sensitiveLineReason(file, `const ${name} = 1;`), null, name);
   }
   // 按名字读环境变量放过的条件更严：名字里有 TOKEN、SECRET、PASSW、KEY、APP、AUTH、CRED 中的任何一段字都不放过。
   for (const name of ['HAPPY', 'MONKEY_MODE', 'KEYBOARD_LAYOUT', 'WEBAPP_URL', 'TOKENIZER_MODEL', 'SECRETARY_NAME', 'SOME_AUTH', 'GH_CREDS']) {
     assert.equal(sensitiveLineReason(file, `const v = process.env.${name};`), 'env', name);
+  }
+  // 凭证类名字不管从哪读都算（#426 第 2 轮复审：AUTH / CRED 类别名读取原来漏了）。
+  for (const name of ['AUTHORIZATION', 'GH_CREDS', 'GOOGLE_APPLICATION_CREDENTIALS', 'AWS_CREDENTIALS', 'BASIC_AUTH', 'DEPLOY_KEY', 'SIGNING_KEY', 'CLIENT_KEY']) {
+    assert.equal(sensitiveLineReason(file, `return env.${name};`), 'env', name);
   }
   for (const name of ['MIVO_APP_ID', 'APP_PRIVATE_KEY', 'X_API_KEY', 'ACCESS_TOKENS', 'GITHUB_TOKEN', 'DB_PASSWORD', 'CLIENT_SECRET', 'TOKEN', 'app_key']) {
     assert.equal(sensitiveLineReason(file, `const v = process.env.${name};`), 'env', name);
@@ -469,7 +483,7 @@ test('#426 复审 P2 令牌文件的拼接、URL、实际命名，Python / shell
   for (const [file, text] of cases) assert.notEqual(sensitiveLineReason(file, text), null, `${file}: ${text}`);
 });
 
-test('#426 复审 旧规则命中、新规则放过的只有白名单三种写法（issue SC1 / SC2 点名的误报）', async () => {
+test('#426 复审 新规则放过的每一处 token / process.env 都属于白名单三种写法（issue SC1 / SC2 点名的误报）', async () => {
   const { sensitiveLineReason } = await import('./deploy-ff.mjs');
   const OLD = /process\.env|secrets\/|token/i;
   const file = 'watchers/mivo/bin/app.mjs';
@@ -491,9 +505,31 @@ test('#426 复审 旧规则命中、新规则放过的只有白名单三种写�
     'if (process.env.MIVO_X) send(process.env);',
     'export function f(env = process.env) { return env.GITHUB_TOKEN; }',
     "import { x } from './mivo-app-token.mjs'; const t = readToken();",
+    // 第 2 轮复审：白名单写法本身的绕法。小写名字（对象方法）拿到的是整张表；模块文件名的范围不能盖住 process.env。
+    'const all = (process.env.valueOf)();',
+    "const all = (process.env['valueOf'])();",
+    'const all = (process.env.valueOf)?.();',
+    'const t = process.env.token.mjs;',
   ]) {
     assert.notEqual(sensitiveLineReason(file, text), null, text);
   }
+});
+
+test('#426 复审 按每一处触发词判断、不按整行：同一行里没有触发词的读凭证写法不靠这条规则', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const OLD = /process\.env|secrets\/|token/i;
+  const file = 'watchers/mivo/bin/app.mjs';
+  // 旧规则拦下这一行只是因为碰巧有 process.env；同一句单独成行，旧规则本来就不拦。新规则对两种写法一视同仁。
+  const mixed = 'if (process.env.CI) creds = fs.readFileSync(credsPath);';
+  const alone = 'creds = fs.readFileSync(credsPath);';
+  assert.equal(OLD.test(mixed), true);
+  assert.equal(OLD.test(alone), false, '旧规则对单独一行也不拦');
+  assert.equal(sensitiveLineReason(file, mixed), null);
+  assert.equal(sensitiveLineReason(file, alone), null);
+  // 读凭证文件靠令牌文件、密钥文件、secrets/ 和全大写密钥名这几条认：写出文件名或变量名的照样拦。
+  assert.notEqual(sensitiveLineReason(file, "if (process.env.CI) creds = fs.readFileSync(path.join(home, 'token.json'));"), null);
+  assert.notEqual(sensitiveLineReason(file, "if (process.env.CI) creds = fs.readFileSync('secrets/ci.json');"), null);
+  assert.notEqual(sensitiveLineReason(file, 'if (process.env.CI) creds = env.GOOGLE_APPLICATION_CREDENTIALS;'), null);
 });
 
 test('#215 SC4 落后阈值：超过 5 个或超过 2 小时，同一 HEAD 只报一次', () => {
