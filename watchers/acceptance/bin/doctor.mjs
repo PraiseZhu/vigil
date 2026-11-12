@@ -11,6 +11,7 @@ import { appBotLogin, createGithub } from './github.mjs';
 import { hostPaths, isAlive } from '../host/paths.mjs';
 import { createProbes } from '../host/probes.mjs';
 import { handoffFor, preflightCommands, repoConfig } from '../host/prbot-config.mjs';
+import { describeHolds } from '../host/prbot-hold.mjs';
 import { checkSlackAccess } from '../host/slack-notify.mjs';
 import { describeViolation, runGateAudit } from '../host/gate-audit.mjs';
 import { POLL_STALL_S, heartbeatMaxAgeMs, heartbeatPhase, heartbeatTickSeconds, phaseLabel, pollingElapsedS } from '../host/poll-beat.mjs';
@@ -521,7 +522,17 @@ export async function runDoctor({
     add('bwrap 遮罩', false, [...maskProblems, firstLine(error?.message)].filter(Boolean).join('；'));
   }
 
-  return { ok: checks.every((check) => check.ok), checks };
+  // 修正轮挂起名单（hold.json）：只显示，不算体检项、不报红；没有条目时什么都不加。
+  const info = [];
+  try {
+    const { rows, problems } = describeHolds(paths, { now });
+    for (const row of rows) info.push(`修正轮挂起：${row.issue}（${row.status}；${row.untilText}；${row.reason}）`);
+    for (const problem of problems) info.push(`修正轮挂起名单有问题：${problem}`);
+  } catch {
+    // 只是显示，读不出不影响体检结果。
+  }
+
+  return { ok: checks.every((check) => check.ok), checks, ...(info.length > 0 ? { info } : {}) };
 }
 
 /** 命令行显式跳过写闸账本审计。不传则照旧跑。 */
@@ -556,6 +567,7 @@ async function main() {
     if (check.ok) process.stdout.write(`✓ ${check.name}\n`);
     else process.stdout.write(`✗ ${check.name}：${check.detail}\n`);
   }
+  for (const line of result.info || []) process.stdout.write(`· ${line}\n`);
   process.exitCode = result.ok ? 0 : 1;
 }
 

@@ -208,6 +208,49 @@ build / typecheck / test 的结果看本 PR 的检查，正文不写没发生的
 本仓公开，不能写死本机路径。复刻的模块只处理文字、不导入任何模块，issue 和 PR 正文由 prbot 用只读客户端读（不经写闸）。
 代价是规则会漂移：脚本改了，要同步改这个模块和 `prbot-template-check.test.mjs`。
 
+## 按 issue 挂起（`hold.json`）
+
+已经定了要等外部条件的修正子 issue，放进 `<home>/state/prbot/hold.json`，prbot 就不认领它、不往 GitHub 写任何东西；
+到期或解除后下一拍照常发现、认领（等于自动重验）。`PAUSED` 停整个 prbot，挂起只停名单里的 issue。
+
+```json
+{
+  "version": 1,
+  "holds": [
+    { "issue": "ExampleUser/demo#12", "reason": "等集成分支", "until": { "type": "merged", "repo": "ExampleUser/demo", "branch": "integration/demo", "base": "main" }, "addedAt": "2026-01-01T00:00:00.000Z" },
+    { "issue": "ExampleUser/demo#13", "reason": "等到明早", "until": { "type": "time", "at": "2026-01-02T09:00:00+08:00" } },
+    { "issue": "ExampleUser/demo#14", "reason": "等上游改需求", "until": { "type": "manual" } }
+  ]
+}
+```
+
+- 到期条件：`time`（`now >= at` 时解除，到点前 1ms 仍挂着）；`merged`（`repo` 默认是 issue 所在仓、`base` 默认 `main`，
+  base 上有从这个分支合进来的 PR 就解除，merge / squash / rebase 都算）；`manual`（一直挂着，人工移除）。
+- 判断位置：发现阶段（`discoverCorrections`）在开跑前检查之前；手工起的 `host/prbot.mjs run` 也先看挂起，挂着就退出 3、什么都不写。
+  已经在跑的修正轮不杀，下一拍不再起；解除后从 GitHub 上的轮次状态接着走。
+- `merged` 用一条宿主只读查询 `MERGED_PR_QUERY`（`host/prbot-hold.mjs`，不经写闸、不是登记给沙箱的查询），
+  和发现阶段其余只读同一个客户端、计入 loop 的本小时用量。同一条件同一拍只查一次，跨拍至少隔 15 分钟（查询失败也算查过）：
+  每个不同的 `repo/branch/base` 每小时最多 4 点。挂起的 issue 跳过了开跑前检查（每拍至少 1 次读评论），所以挂着时每拍总点数只减不增。
+  只认 PR 合并；不经 PR 直推 main 要人工 remove。查询失败、返回结构不对或触发限流：继续挂着，不误解除。
+  剩余低于 800（与主循环非必要读同一道闸，`decideTick` 的 `remaining-below-800`；恰好 800 仍查）时不发这条查询，也不记成已查过。
+- 日志：`state/prbot/hold.log`（JSON 行），同一条挂起只记一次 `held`（带原因和到期条件），解除记一次 `released`；
+  去重记录在 `state/prbot/hold-seen.json`。挂起不发提醒、不进 `events.jsonl`（不进 Slack）。
+- 文件不存在或只有空白：和没有这个功能完全一样，不查 GitHub、不写任何文件。
+- 文件读不出、不是 JSON、`version` / `holds` 不对：整份按「不挂起」处理，报一次 `prbot-hold-invalid` 提醒（同一份内容只报一次）。
+  不按保守全挂：那等于停掉所有修正轮，而验收机要求自动化一直开着；按不挂起最坏是多空跑一轮，和没有这个功能时一样。
+  单条的 issue 引用不合法：忽略这一条；引用合法但 `until` / `reason` 写坏：这一条按 `manual` 保守挂着。两种都报同一个提醒。
+- 运维 CLI（只改本地文件，同一 issue 再 add 会替换；整份坏掉时拒绝写，不覆盖）：
+
+```sh
+ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/bin/prbot-hold.mjs add ExampleUser/demo#12 --reason '等集成分支' --until-merged integration/demo --into main
+ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/bin/prbot-hold.mjs add ExampleUser/demo#13 --reason '等到明早' --until-time 2026-01-02T09:00:00+08:00
+ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/bin/prbot-hold.mjs add ExampleUser/demo#14 --reason '等上游改需求' --manual
+ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/bin/prbot-hold.mjs remove ExampleUser/demo#12
+ACCEPTANCE_WATCHER_HOME=<home> node watchers/acceptance/bin/prbot-hold.mjs list
+```
+
+- doctor：有条目时在体检项后面多打几行 `· 修正轮挂起：…`，不算体检项、不影响退出码。
+
 ## 写闸（#60、#171 新增）
 
 - `pr.update-branch`：`PUT /repos/{o}/{r}/pulls/{n}/update-branch`，带 `expected_head_sha`。
