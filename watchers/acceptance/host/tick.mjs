@@ -16,6 +16,7 @@ import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbo
 import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
 import { defaultSpawnAdjudicate, scheduleAdjudications } from './adjudicate.mjs';
 import { runGateAudit } from './gate-audit.mjs';
+import { reportBasePending } from './base-pending.mjs';
 import { HEARTBEAT_TICK_MAX_S, POLL_BEAT_MS, startTickBeat } from './poll-beat.mjs';
 import { isReadOnlyGraphql } from '../bin/github.mjs';
 import {
@@ -613,6 +614,7 @@ export async function runTick({
     }
     let entries;
     let inventoryTasks = null;
+    let baseSkipped = [];
     let pollReads = 1;
     try {
       const parsedPoll = JSON.parse(poll.stdout || '[]');
@@ -621,6 +623,7 @@ export async function runTick({
       else if (parsedPoll && Array.isArray(parsedPoll.entries)) {
         entries = parsedPoll.entries;
         inventoryTasks = Array.isArray(parsedPoll.tasks) ? parsedPoll.tasks : null;
+        baseSkipped = Array.isArray(parsedPoll.baseSkipped) ? parsedPoll.baseSkipped : [];
         // reads=0 是「这一拍没发只读请求」，照实记 0；缺这个字段才按老形状当 1 次（P2-2）。
         if (Number.isInteger(parsedPoll.reads) && parsedPoll.reads >= 0) pollReads = parsedPoll.reads;
       } else throw new Error('poll 输出不是数组，也不是 {entries, tasks}');
@@ -818,6 +821,14 @@ export async function runTick({
       remindPollNotices(paths, entries, { now });
     } catch (error) {
       heartbeat.lastTick.noticeError = String(error?.message || error);
+    }
+    // 2c. 合入非默认分支、超过 3 天还没合入默认分支的任务（#380）：用这一拍 poll 的 baseSkipped，不发 GitHub 请求；
+    //     按日去重进提醒文件，只进每日汇总。出错只写心跳，不让这一拍失败。
+    try {
+      const pending = reportBasePending({ paths, baseSkipped, now });
+      if (pending.reported.length) heartbeat.lastTick.basePending = pending.reported;
+    } catch (error) {
+      heartbeat.lastTick.basePendingError = String(error?.message || error);
     }
 
     // 3. 该开始的任务：已在跑的不重开，最多占到空槽数；总开关关着就一个都不起。

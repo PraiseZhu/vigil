@@ -68,6 +68,17 @@ export function loopLogOf(profile) {
   };
 }
 
+/**
+ * 这条跳过记录对应的最近一次非默认分支合并时间（#380）：从盘点里已有的 linkedPrs（总单还看子单的 prBase）里找
+ * decision.prs 点到的那几条，取最晚的 mergedAt。不新增请求；一条都对不上就是 null（汇总不报）。
+ */
+export function lastNonDefaultMergeAt(task, decision) {
+  const refs = new Set((decision?.prs || []).map((pr) => pr.ref));
+  const pool = [...(task?.linkedPrs || []), ...(task?.children || []).flatMap((child) => child?.prBase?.mergedPrs || [])];
+  const times = pool.filter((pr) => refs.has(pr.ref)).map((pr) => Date.parse(pr.mergedAt || '')).filter(Number.isFinite);
+  return times.length ? new Date(Math.max(...times)).toISOString() : null;
+}
+
 /** 合并目标分支不对时的日志行：时间和 kind 在前，后面跟可诊断的键值对。 */
 export function baseSkipLine(decision, now = () => Date.now()) {
   const prs = (decision?.prs || []).map((pr) => `${pr.ref}@${pr.base || 'unknown'}`).join(',');
@@ -138,9 +149,13 @@ export async function pollInventory({ github, profile, now = () => Date.now(), h
     const decision = shouldTrigger(task, { now, profile });
     if (decision.reason === 'base-not-default' || decision.reason === 'base-unknown') {
       // 合并目标分支不对（或取不到）：不进验收、不开修正单。只落一行本地日志，不发通知、不写 GitHub。
+      // 字段集合固定（#380 SC5）：tick 的每日汇总只读这些字段。
       const record = {
         issue: task.ref,
         kind: task.kind,
+        state: task.state || null,
+        url: task.url || null,
+        mergedAt: lastNonDefaultMergeAt(task, decision),
         reason: decision.reason,
         base: decision.base ?? null,
         defaultBranch: decision.defaultBranch || task.defaultBranch || 'main',

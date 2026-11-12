@@ -500,9 +500,9 @@ node watchers/acceptance/bin/poll.mjs --json
 
 输出里 `kind` 为 `child` 的条目数，就是这一拍会开轮的子 issue 数。
 
-### 关联 PR 的目标分支（临时防护）
+### 关联 PR 的目标分支（长期口径）
 
-验收轮的代码是宿主按**默认分支**检出的（`host/prefetch.mjs` 固定取 `refs/remotes/origin/main`）。feature PR 先合到集成分支（`integration/…`）、之后才随集成分支合回默认分支时，按默认分支验会把还没进默认分支的改动判成「要修」，再开一张修正子单——整条链都是误报。所以触发判定里加了一道临时防护：**关联 PR 的目标分支不是仓库默认分支就不进验收**。
+验收轮的代码是宿主按**默认分支**检出的（`host/prefetch.mjs` 固定取 `refs/remotes/origin/main`）。feature PR 先合到集成分支（`integration/…`）、之后才随集成分支合回默认分支时，按默认分支验会把还没进默认分支的改动判成「要修」，再开一张修正子单——整条链都是误报。所以触发判定里有一道防护（#379 加，#380 定为长期口径）：**关联 PR 的目标分支不是仓库默认分支就不进验收，等它合入默认分支再验**。为什么不改成按 PR 的目标分支检出代码验，见 [`docs/acceptance-pr-base-branch.md`](acceptance-pr-base-branch.md)。
 
 - 数据从哪来：`bin/tasks.mjs` 的盘点查询自己的 `closedByPullRequestsReferences` 多取一个 `baseRefName`，`issue.repository` 多取一个 `defaultBranchRef { name }`。两者一个是标量、一个是单对象，**不新增 connection**，每拍盘点请求数不变（点数 = 请求数 × `GRAPHQL_COST_PER_REQUEST`，所以点数也不变）。
 - 默认分支：用盘点里的 `defaultBranchRef.name`；取不到才退回 `main`。默认分支不叫 main 的仓按它自己的默认分支判。
@@ -516,9 +516,26 @@ node watchers/acceptance/bin/poll.mjs --json
 2026-11-10T08:50:26.000Z base-unknown issue=example-org/sample-repo#14 default=main base=unknown prs=example-org/sample-repo#15@unknown 验收机只按默认分支验代码，等合入默认分支后再验
 ```
 
-手工排查也可以直接用只读盘点：`node watchers/acceptance/bin/poll.mjs --json --with-inventory` 的 `baseSkipped`（数组，每条带 `issue`、`reason`、`base`、`defaultBranch`、`prs`、`message`），或者 `node watchers/acceptance/bin/round.mjs start --issue <owner/repo#n>` 的 stderr（退出码 3）。
+手工排查也可以直接用只读盘点：`node watchers/acceptance/bin/poll.mjs --json --with-inventory` 的 `baseSkipped`（数组，每条固定带 `issue`、`kind`、`state`、`url`、`mergedAt`、`reason`、`base`、`defaultBranch`、`prs`、`child`、`message`；`mergedAt` 是最近一次非默认分支合并的时间），或者 `node watchers/acceptance/bin/round.mjs start --issue <owner/repo#n>` 的 stderr（退出码 3）。
 
-这是临时防护：它选择「先不验」，不是「换成分支验」。按关联 PR 的目标分支检出并验收（或明确改为等合入默认分支再验的长期方案）由后续任务决定。修正轮（`host/prbot.mjs`）不受影响：修正 PR 的 base 只能是默认分支（写闸拦其它 base），不会出现「修正 PR 合到集成分支」这种组合。
+这是长期口径：选择「等合入默认分支再验」，不是「换成分支验」。合入默认分支之后不用任何开关、不用清状态，下一拍就自动恢复验收。修正轮（`host/prbot.mjs`）不受影响：修正 PR 的 base 只能是默认分支（写闸拦其它 base），不会出现「修正 PR 合到集成分支」这种组合。
+
+#### 等不到默认分支的兜底：超过 3 天进每日汇总（#380）
+
+集成分支被放弃、或者合回默认分支的 PR 正文不引用这些 issue 时，任务永远等不到「合入默认分支的合并」，也就永远不验。tick 每拍用这一拍 poll 已有的 `baseSkipped`（不新增 GitHub 调用）兜底：
+
+- 条件：`reason` 是 `base-not-default`（目标分支已知、确实不是默认分支；`base-unknown` 下一拍再查，不进汇总），issue 还开着，且距最近一次非默认分支合并（`mergedAt`）**严格超过 3×24 小时**；正好 3 天不报，`mergedAt` 解析不出不报。子 issue 在盘点里都是已关闭的，所以不会单独进汇总；被子 issue 拦住、还开着的总 issue 会进。
+- 去重：同一 issue 每个 UTC 日期只写一条，状态在 `<home>/state/host/base-pending.json`（`{ reported: { <issue>: <日期> } }`）；后来合入了默认分支或 issue 关了，下一拍从状态里清掉。
+- 写到哪：`state/host/alerts.jsonl` 一条 `kind=base-not-default`，带 issue 链接、PR 链接、分支名和人话原因。它不在实时类名单里，打开 Slack 时只进每日汇总（不 @）；当前部署没配 Slack 频道时只在 `alerts.jsonl` 里。
+- 出错：这一步出错只写心跳的 `lastTick.basePendingError`，不让这一拍失败；这一拍报了哪些写在 `lastTick.basePending`。
+
+汇总里看到这一条，运维怎么办（三选一）：
+
+1. 把工作合回默认分支：合回的 PR 正文引用这个 issue（`Closes …` 或任务 issue 行），下一拍自动开始验收。
+2. 不做了：关掉 issue，下一拍就不再报。
+3. 要验集成分支上的代码：人工点名验一次（`node watchers/acceptance/bin/round.mjs start --issue <owner/repo#n>` 现在会因为 `base-not-default` 退出 3，需要先把代码合回默认分支，或在 issue 上写明人工验收结论后关单）。
+
+后果要知道：**非默认分支上的后续合并（包括「要修」之后的修复 PR）都不会自动复验**；合回默认分支后才一起验。
 
 ## 5. 提醒与通知的分工
 
