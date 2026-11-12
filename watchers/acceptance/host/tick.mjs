@@ -13,6 +13,7 @@ import { appendAlert, hostPaths, isAlive, readAlerts, readLockPayload } from './
 import { run as procRun, spawnBackground } from './proc.mjs';
 import { MAX_ROUNDS, readHostConfig, serialLockFiles } from './round.mjs';
 import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbot.mjs';
+import { clearStarted, readPrbotWait, rememberFound, starvedIssues, writePrbotWait } from './prbot-wait.mjs';
 import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
 import { defaultSpawnAdjudicate, scheduleAdjudications } from './adjudicate.mjs';
 import { runGateAudit } from './gate-audit.mjs';
@@ -771,6 +772,8 @@ export async function runTick({
     } catch (error) {
       heartbeat.lastTick.prbotError = String(error?.message || error);
     }
+    // 这一拍因「等待超过 1 小时」优先起的修正轮数：验收轮的空槽要让出这么多，避免总数超过 MAX_ROUNDS。
+    let starvedStarted = 0;
     if (prbotSettings) {
       tickBeat.setPhase('prbot');
       heartbeat.lastTick.prbotStarted = [];
@@ -805,11 +808,13 @@ export async function runTick({
           discoverPrbot || ((options) => discoverCorrections({ ...options, github: prbotGithub, profile: prbotProfile, hostConfig: prbotSettings }));
         // 修正轮发现与卡住检查都是非必要读（#247 SC6）：真实剩余低于暂停线时这一拍不拉、不查，只写一行日志。
         let found = [];
+        let discoveredThisTick = false;
         const discoverGate = rateGate({ component: 'loop', purpose: 'non-essential', reserve: GRAPHQL_COST_PER_REQUEST });
         noteRateSkip(discoverGate, { component: 'loop', purpose: 'non-essential' });
         if (discoverGate.allowed) {
           try {
             found = await discover({ now, home, github: prbotGithub, tasks: inventoryTasks });
+            discoveredThisTick = true;
           } catch (error) {
             // 限流（#247 P2-1）：这一拍跳过发现，不写 prbot-tick-failed。
             if (!isRateLimitError(error)) throw error;
@@ -817,23 +822,53 @@ export async function runTick({
             found = [];
           }
         }
-        // 修正轮和验收轮共用 2 个槽：先给这一拍该开始的验收轮留位（同仓锁被占、起不来的 mivo / serialRepos 验收轮不算），剩下的才给修正轮。
+        // 修正轮和验收轮共用 2 个槽：默认先给这一拍该开始的验收轮留位（同仓锁被占、起不来的 mivo / serialRepos 验收轮不算），剩下的才给修正轮。
+        // 某个修正轮等待已经超过 1 小时：下一个空槽优先给它（不预留验收位），不固定留槽；没超过或刚好 1 小时仍走原口径。
         const pendingAcceptance = entries.filter((item) => {
           if (!item || item.stale) return false;
           const record = byIssue.get(item.issue);
           if (record && isAlive(Number(record.pid))) return false;
           return !lockFilesFor(item.issue).some(lockHeld);
         }).length;
-        // 写闸总开关关着：修正轮的写（推分支、开 PR、写评论）同样全被拒，起了只会白跑、白耗重试次数，所以也不起。
-        let prbotFree = gateEnabled ? Math.max(0, MAX_ROUNDS - liveSlotCount(paths) - pendingAcceptance) : 0;
+        const eligible = [];
         for (const entry of found || []) {
           const lockFile = path.join(paths.prbotLocksDir, `${entry.issue.replace(/[^\w.-]+/g, '__')}.lock`);
           const held = readLockPayload(lockFile);
           if (held && isAlive(Number(held.pid))) continue;
-          if (prbotFree <= 0) break;
-          prbotFree -= 1;
+          eligible.push(entry);
+        }
+        // 发现被额度闸或限流跳过时不改等待账，免得把还在等的 issue 清掉。
+        let waitState = discoveredThisTick
+          ? rememberFound(readPrbotWait(paths.prbotWaitFile), eligible.map((entry) => entry.issue), now())
+          : readPrbotWait(paths.prbotWaitFile);
+        const starved = new Set(starvedIssues(waitState, eligible.map((entry) => entry.issue), now()));
+        // 写闸总开关关着：修正轮的写同样全被拒，起了只会白跑，所以也不起（饿住也不例外）。
+        let remaining = gateEnabled ? Math.max(0, MAX_ROUNDS - liveSlotCount(paths)) : 0;
+        const startedIssues = [];
+        const startOne = (entry) => {
+          if (remaining <= 0) return false;
+          remaining -= 1;
           const pid = startPrbot(entry.issue);
           heartbeat.lastTick.prbotStarted.push({ issue: entry.issue, pid: pid ?? null });
+          startedIssues.push(entry.issue);
+          return true;
+        };
+        for (const entry of eligible) {
+          if (!starved.has(entry.issue)) continue;
+          if (!startOne(entry)) break;
+        }
+        starvedStarted = startedIssues.length;
+        for (const entry of eligible) {
+          if (starved.has(entry.issue)) continue;
+          if (remaining - pendingAcceptance <= 0) break;
+          startOne(entry);
+        }
+        if (discoveredThisTick) {
+          try {
+            writePrbotWait(paths.prbotWaitFile, clearStarted(waitState, startedIssues));
+          } catch {
+            // 等待账写不下去不挡这一拍。
+          }
         }
         const checkStalled = checkPrbotStalled || ((options) => checkReadyStalled({ ...options, github: prbotGithub, profile: prbotProfile }));
         // 卡住检查也是非必要读（#247 P2-1）：低额度 / 超预算时同样跳过，不当成「没卡住」。
@@ -880,7 +915,8 @@ export async function runTick({
 
     // 3. 该开始的任务：已在跑的不重开，最多占到空槽数；总开关关着就一个都不起。
     //    同仓最多 1 轮的仓：锁被占着、或这一拍已经给同一把锁起过一轮的，记进 serialWaiting，等锁放了再起（不认领、不写提醒）。
-    let free = gateEnabled ? Math.max(0, MAX_ROUNDS - liveSlotCount(paths)) : 0;
+    // 饿住的修正轮已经优先占了槽：验收轮让出同样数量，总数不超过 MAX_ROUNDS。没有饿住起步时口径与原来一样。
+    let free = gateEnabled ? Math.max(0, MAX_ROUNDS - liveSlotCount(paths) - starvedStarted) : 0;
     const serialWaiting = [];
     const claimedThisTick = new Set();
     let childClaims = 0;
