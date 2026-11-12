@@ -22,6 +22,8 @@ const withRow = (status, evidence) => {
   all[rowIndex()] = cells.join('|');
   return all.join('\n');
 };
+// 带实体、HTML、转义、不可见字符的写法先被「只许纯文本」拦下（encoded-text），其余由关单词比对拦下。
+const REJECTED = new Set(['closing-keyword', 'encoded-text']);
 const replaceSection = (body, title, text) => body.replace(new RegExp(`(## ${title}\\n\\n)[\\s\\S]*?(\\n\\n## )`), `$1${text}$2`);
 
 test('#171 SC1 允许：验收对照的状态和证据列、未执行的验证段', () => {
@@ -129,7 +131,7 @@ test('#171 实体、全角、HTML 标签、链接文字、不可见字符包装�
     '<b>Closes</b> #19', '<strong>Fixes</strong> #19', '[Closes](https://github.com/example-owner/example-repo/issues/19)',
     'Closes⁠#19', 'Closes­ #19', 'Clo​ses #19'];
   for (const text of variants) {
-    assert.equal(checkBodyEdit(OLD, withRow('通过', text)).reason, 'closing-keyword', JSON.stringify(text));
+    assert.ok(REJECTED.has(checkBodyEdit(OLD, withRow('通过', text)).reason), JSON.stringify(text));
   }
   assert.deepEqual(checkBodyEdit(OLD, withRow('通过', 'CI 见 <https://github.com/example-owner/example-repo/actions/runs/1>')), { ok: true });
 });
@@ -156,9 +158,9 @@ test('#171 任意 HTML 标签、注释、其它实体、更多不可见字符、
     'Closes<!--x-->#19', 'Clo<!--x-->ses #19', 'GH&#x2D;19 Closes GH-19', 'Fixes &#71;&#72;-19', '&#67;loses #19', 'Closes &#x2​3;19',
     'Closes️#19', 'Closes‪#19', 'Closes⁦#19', 'Closes͏#19', 'Closes؜#19', 'Closes GH‑19'];
   for (const text of variants) {
-    assert.equal(checkBodyEdit(OLD, withRow('通过', text)).reason, 'closing-keyword', JSON.stringify(text));
+    assert.ok(REJECTED.has(checkBodyEdit(OLD, withRow('通过', text)).reason), JSON.stringify(text));
   }
-  for (const fine of ['<font>CI 通过</font>', '_repo 目录测试通过', '见 my_org/my_repo', '[CI](https://github.com/example-owner/example-repo/actions/runs/1)']) {
+  for (const fine of ['_repo 目录测试通过', '见 my_org/my_repo', '[CI](https://github.com/example-owner/example-repo/actions/runs/1)']) {
     assert.deepEqual(checkBodyEdit(OLD, withRow('通过', fine)), { ok: true }, fine);
   }
 });
@@ -169,14 +171,14 @@ test('#171 注释、标签名、属性里的关单词也拒（原始正文里它
     '<div Closes #19>', '<img alt="Closes #19">', '<span title="Closes #19">x</span>', '&#60;Closes #19>', '<Closes #19&#62;', '&#60;Closes #19&#62;',
     '<!-- &#67;loses #19 -->', 'Closes &#x2<!--x-->3;19', 'Closes &#x2<b></b>3;19', `Closes\u{E0100}#19`];
   for (const text of variants) {
-    assert.equal(checkBodyEdit(OLD, withRow('通过', text)).reason, 'closing-keyword', JSON.stringify(text));
+    assert.ok(REJECTED.has(checkBodyEdit(OLD, withRow('通过', text)).reason), JSON.stringify(text));
   }
 });
 
 test('#171 修正标记、任务 issue 行被标签拆开或藏进注释也拒', () => {
-  assert.equal(checkBodyEdit(OLD, withRow('通过', '[验收机]<b></b>修正')).reason, 'correction-marker');
-  assert.equal(checkBodyEdit(OLD, withRow('通过', '<!-- [验收机]修正 -->')).reason, 'correction-marker');
-  assert.equal(checkBodyEdit(OLD, withRow('通过', '任务<i></i> issue：x')).reason, 'task-issue-line');
+  for (const text of ['[验收机]<b></b>修正', '<!-- [验收机]修正 -->', '任务<i></i> issue：x']) {
+    assert.equal(checkBodyEdit(OLD, withRow('通过', text)).reason, 'encoded-text', text);
+  }
 });
 
 // 第五轮复审：按读法逐份比。新正文在某种读法下认出的引用，旧正文在同一读法下必须已有；
@@ -191,13 +193,14 @@ const rowIn = (body, status, evidence) => body.split('\n').map((line) => {
 
 test('#171 实体拆开的号按原文认是另一个 issue：拒', () => {
   const before = rowIn(OLD, '待验证', 'Closes #19');
-  assert.equal(checkBodyEdit(before, rowIn(OLD, '通过', 'Closes #1&#57;')).reason, 'closing-keyword', '按原文认是 #1');
+  assert.equal(checkBodyEdit(before, rowIn(OLD, '通过', 'Closes #1&#57;')).reason, 'encoded-text', '按原文认是 #1');
 });
 
 test('#171 旧正文只在某种读法下才有的引用，不替新写的真关单词打掩护', () => {
   for (const hidden of ['<!-- Closes #19 -->', '<Closes #19>', '<div title="Closes #19">x</div>', 'Closes &#35;19', 'Closes #1&#57;']) {
     const before = rowIn(OLD, '待验证', hidden);
-    assert.equal(checkBodyEdit(before, rowIn(OLD, '通过', `${hidden} Closes #19`)).reason, 'closing-keyword', JSON.stringify(hidden));
+    // 证据格原样留着旧的隐藏写法，新的真关单词写在「未执行的验证」段：纯文本层放行，靠逐份比拦下。
+    assert.equal(checkBodyEdit(before, replaceSection(before, '未执行的验证', '- Closes #19')).reason, 'closing-keyword', JSON.stringify(hidden));
   }
 });
 
@@ -205,5 +208,29 @@ test('#171 旧正文原样留着的隐藏引用不误拒：只改状态和证据
   const before = replaceSection(OLD, '未执行的验证', '<!-- Closes #19 --> Closes &#35;19 Closes #1&#57; 无');
   assert.deepEqual(checkBodyEdit(before, rowIn(before, '通过', 'CI test 通过')), { ok: true });
   const hiddenInRow = rowIn(OLD, '待验证', '<Closes #19>');
-  assert.deepEqual(checkBodyEdit(hiddenInRow, rowIn(OLD, '通过', '<Closes #19> CI 通过')), { ok: true });
+  assert.deepEqual(checkBodyEdit(hiddenInRow, rowIn(OLD, '通过', '<Closes #19>')), { ok: true }, '只改状态、证据格原样');
+});
+
+// 第六轮复审 P1：命名实体（&Tab; &nbsp; &sol; …）、不带分号的实体、双重实体、反斜杠转义，换一种读法就会变成关单词；
+// 读法补不完，所以改动的证据格和「未执行的验证」段只许写纯文本。
+test('#171 改动的证据格和「未执行的验证」段只许纯文本：实体、HTML、转义、不可见字符一律拒', () => {
+  const encoded = ['Closes&Tab;#19', 'Closes&NewLine;#19', 'Closes&nbsp;#19', 'Closes&nbsp#19', 'Closes&colon;#19', 'Closes&lpar;#19',
+    'Closes ExampleOrg&sol;repo-a&num;19', 'Closes &amp;#35;19', 'Closes \\#19', 'Closes\\:#19', '<font>CI 通过</font>', '<b>加粗</b>',
+    'Closes\u200b#19', '见 https://example.com/x?a=1&b=2'];
+  for (const text of encoded) {
+    assert.equal(checkBodyEdit(OLD, withRow('通过', text)).reason, 'encoded-text', JSON.stringify(text));
+    assert.equal(checkBodyEdit(OLD, replaceSection(OLD, '未执行的验证', `- ${text}`)).reason, 'encoded-text', JSON.stringify(text));
+  }
+  for (const fine of ['CI 见 <https://github.com/example-owner/example-repo/actions/runs/1>', '`npm ci && npm test 2>&1` 通过', 'A & B 都过了',
+    '`a \\| b` 通过', 'x < 3 且 y > 1', '[CI](https://github.com/example-owner/example-repo/actions/runs/1)']) {
+    assert.deepEqual(checkBodyEdit(OLD, withRow('通过', fine)), { ok: true }, fine);
+  }
+});
+
+test('#171 只许纯文本只看改动的地方：旧正文原样留着的写法不拦', () => {
+  const before = replaceSection(OLD, '未执行的验证', '- 旧说明 <!-- x --> &nbsp;');
+  assert.deepEqual(checkBodyEdit(before, rowIn(before, '通过', 'CI 通过')), { ok: true }, '段没改');
+  const oddCell = rowIn(OLD, '待验证', 'a&nbsp;b');
+  assert.deepEqual(checkBodyEdit(oddCell, rowIn(OLD, '通过', 'a&nbsp;b')), { ok: true }, '证据格没改、只改状态');
+  assert.equal(checkBodyEdit(oddCell, rowIn(OLD, '通过', 'a&nbsp;b CI 通过')).reason, 'encoded-text', '证据格改了就整格检查');
 });

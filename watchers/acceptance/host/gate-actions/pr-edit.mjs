@@ -52,6 +52,19 @@ const views = (text) => {
     tidy(stripTags(decodeEntities(base))),
   ];
 };
+// 可改的两处只许写纯文本（第六轮复审）：GitHub 按哪种读法认关单词说不准——原文、解数字实体、解命名实体、去注释和标签、
+// 去反斜杠转义——读法补不完。所以改动后的证据格、「未执行的验证」段里不许有任何「换一种读法就变样」的写法：
+// 字符实体（& 后跟 # 或字母，含不带分号的）、HTML 标签和注释（只放行 <https://...> 自动链接）、
+// 反斜杠转义的标点（表格里转义竖线的 \| 除外，正文模板自己会写）、不可见格式字符。剩下的纯文本在各读法下都一样，
+// 再按整篇正文逐份比关单词（views）。
+const ENCODED = [
+  [/&[#A-Za-z]/, '字符实体（& 后面跟 # 或字母）'],
+  [/<(?!https?:\/\/[^\s<>]*>)[A-Za-z!/?]/, 'HTML 标签或注释（只放行 <https://...> 链接）'],
+  [/\\(?!\|)[\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]/, '反斜杠转义'],
+  [new RegExp(INVISIBLE.source, 'u'), '不可见字符'],
+];
+const encodedIn = (text) => ENCODED.find(([pattern]) => pattern.test(text))?.[1] ?? null;
+
 const refsOf = (view) => new Set([...view.matchAll(CLOSING)].map((match) => match[1].toLowerCase()));
 const countIn = (view, pattern) => [...view.replace(/\s+/g, ' ').matchAll(pattern)].length;
 
@@ -110,7 +123,7 @@ function sameLines(a, b) {
 /**
  * 新正文相对旧正文只改了允许的地方：返回 { ok: true } 或 { ok: false, reason, detail }。
  * reason：outside-editable（改了别的段 / 首几行 / 标题）、table-shape（验收对照的行数、表头、验收项列变了）、
- * bad-status（状态不是四个之一）、closing-keyword / correction-marker / task-issue-line（改动里新写了这些）。
+ * bad-status（状态不是四个之一）、encoded-text（改动的证据格或「未执行的验证」段里有实体、HTML、转义或不可见字符）、closing-keyword / correction-marker / task-issue-line（改动里新写了这些）。
  */
 export function checkBodyEdit(oldBody, newBody) {
   const before = sectionsOf(oldBody);
@@ -127,7 +140,11 @@ export function checkBodyEdit(oldBody, newBody) {
       if (!sameLines(was, now)) return { ok: false, reason: 'outside-editable', detail: `「${title}」段不能改` };
       continue;
     }
-    if (title === '未执行的验证') continue;
+    if (title === '未执行的验证') {
+      const bad = sameLines(was, now) ? null : encodedIn(now.join('\n'));
+      if (bad) return { ok: false, reason: 'encoded-text', detail: `「未执行的验证」段只能写纯文本，不能有${bad}` };
+      continue;
+    }
     // 验收对照：行数不变；非数据行（说明、表头、分隔行）原样；数据行只许改第 2、3 列。
     if (was.length !== now.length) return { ok: false, reason: 'table-shape', detail: '「验收对照」的行数不能变' };
     for (let row = 0; row < was.length; row += 1) {
@@ -144,6 +161,8 @@ export function checkBodyEdit(oldBody, newBody) {
         return { ok: false, reason: 'table-shape', detail: '状态、证据以外的列不能改' };
       }
       if (!STATUSES.has(newCells[1])) return { ok: false, reason: 'bad-status', detail: `状态只能是 待验证 / 通过 / 未通过 / 人工手测，实际：${newCells[1]}` };
+      const bad = newCells[2] === oldCells[2] ? null : encodedIn(newCells[2]);
+      if (bad) return { ok: false, reason: 'encoded-text', detail: `证据列只能写纯文本，不能有${bad}` };
     }
   }
   const problem = introducedProblem(oldBody, newBody);
