@@ -974,6 +974,21 @@ function sameJson(left, right) {
   return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
 }
 
+/**
+ * 写入成功之后回读抛错（5xx、网络、超时、不是 JSON……，#236）：这一条已经写进看板、记进 changes.jsonl，
+ * 但写成的值没核实。带上出错的这一条、这一拍已写的条数和后面还没写的条数，prio-run 据此停写并告警。
+ */
+export class PrioReadbackError extends Error {
+  constructor(change, cause, { written, remaining }) {
+    super(`写入后回读失败：${String(cause?.message ?? cause)}`, { cause });
+    this.name = 'PrioReadbackError';
+    this.code = 'PRIO_READBACK_FAILED';
+    this.readback = { item: change.item, issue: change.issue, field: change.field };
+    this.written = written;
+    this.remaining = remaining;
+  }
+}
+
 function readBackValue(raw) {
   return raw && typeof raw === 'object' && !Array.isArray(raw) && Object.hasOwn(raw, 'value') ? raw.value : raw;
 }
@@ -1245,6 +1260,7 @@ export async function runPrioSync({
   const skippedLockBusy = [];
   const writtenRefs = new Set();
   let readbackMismatch = null;
+  let currentIndex = 0;
   let stoppedByDisabled = false;
   let outOfScopeHit = null;
   const useItemLock = typeof withItemLock === 'function';
@@ -1314,7 +1330,7 @@ export async function runPrioSync({
         written += 1;
         writtenRefs.add(change.item);
         if (useItemLock) mergeDebounceRef(dir, change.item, nextItems[change.item]);
-        throw error;
+        throw new PrioReadbackError(change, error, { written, remaining: writes.length - currentIndex - 1 });
       }
       const row = { item: change.item, field: change.field, expected: change.new, actual };
       readbacks.push(row);
@@ -1330,6 +1346,7 @@ export async function runPrioSync({
     return { kind: 'written' };
   };
   for (let index = 0; index < writes.length; index += 1) {
+    currentIndex = index;
     const change = writes[index];
     const basis = change.basis ? ` 依据：${change.basis}` : '';
     const line = `${change.item} ${change.field} ${show(change.old)} → ${show(change.new)}${basis}`;

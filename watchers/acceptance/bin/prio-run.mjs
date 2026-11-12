@@ -341,7 +341,7 @@ function showCount(rows, one) {
   return rows.length === 1 ? one(rows[0]) : null;
 }
 
-export function alertTextFor(reason, { downgrades = [], nonAuto = [], written = 0, paused = false, streak = 0 } = {}) {
+export function alertTextFor(reason, { downgrades = [], nonAuto = [], written = 0, paused = false, streak = 0, readback = null, remaining = 0 } = {}) {
   if (reason === 'downgrade') {
     const single = showCount(downgrades, (row) => {
       const label = row.kind === 'clear' ? '改空' : '降级';
@@ -356,6 +356,13 @@ export function alertTextFor(reason, { downgrades = [], nonAuto = [], written = 
   }
   if (reason === 'readback') {
     return '看板优先级自动写入已暂停：有一条写入后读回来的值和要写的不一致。已经停下这一拍剩下的写入，没有自动重试。需要人核对看板，确认后删除停写开关即可恢复。';
+  }
+  if (reason === 'readback-error') {
+    const ref = readback?.issue != null ? `#${readback.issue}` : '有一条';
+    const field = readback?.field ? ` 的「${readback.field}」` : '';
+    return `看板优先级自动写入已暂停：${ref}${field}已经写进看板，但写完读回来时出错，没能确认写成的值。`
+      + `这一拍后面还有 ${remaining} 条没有写。看板上只有这一条被改了，其余没改；已写的这一条不回滚，也没有重试。`
+      + '需要人核对这一条在看板上的值，确认后删除停写开关即可恢复。';
   }
   if (reason === 'hourly') {
     if (written > 0) {
@@ -380,6 +387,7 @@ const ALERT_KIND = {
   downgrade: 'prio-downgrade',
   'out-of-scope': 'prio-out-of-scope',
   readback: 'prio-readback',
+  'readback-error': 'prio-readback-error',
   hourly: 'prio-hourly',
   nonempty: 'prio-nonempty',
   github: 'prio-github',
@@ -745,6 +753,13 @@ export async function runContinuous(argv = [], deps = {}) {
     }
     return { ...base, stop: disabledAtStart ? 'disabled' : '' };
   } catch (error) {
+    // 写成之后回读抛错（#236）：和回读不一致一样立刻停写、告警；已写的这一条不回滚、不重试。
+    // 和写入前阶段的 5xx 分开：那边按连续失败计数，满 3 拍才停。
+    if (error?.code === 'PRIO_READBACK_FAILED') {
+      writeDisabled(dir, '写入后回读出错，持续写入已暂停');
+      emitAlert(stdout, alertsFile, now, 'readback-error', { readback: error.readback, remaining: error.remaining });
+      return { written: error.written || 0, exitCode: 1, disabled: true, alertsFile, stop: 'readback-error' };
+    }
     if (!isRetriableGithubError(error)) throw error;
     const streak = readStreak(dir) + 1;
     writeStreak(dir, streak);

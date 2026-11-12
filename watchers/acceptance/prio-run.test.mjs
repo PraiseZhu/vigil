@@ -1742,3 +1742,60 @@ test('SC1-边界10 整盘抢不到，该条本拍跳过，不 abort、不 disabl
   assert.equal(result.result.skippedLockBusy[0].item, `${REPO}#1`);
   assert.equal(result.result.aborted, false);
 });
+
+// #236：写成之后回读抛错，和回读不一致一样立刻停写、告警；已写的这一条不回滚、不重试。
+const READBACK_FAILURES = {
+  '5xx（status 502）': () => Object.assign(new Error('HTTP 502: Bad Gateway'), { status: 502 }),
+  '网络错误': () => new TypeError('fetch failed'),
+  '超时': () => Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }),
+  '不是 JSON': () => new SyntaxError('Unexpected token < in JSON at position 0'),
+  '无 status 的普通错误': () => new Error('something broke'),
+};
+
+for (const [label, makeError] of Object.entries(READBACK_FAILURES)) {
+  test(`#236 回读抛错（${label}）：写停写开关、告警，第一条之后不再写`, async () => {
+    const dir = tmpDir();
+    allow(dir, [REPO]);
+    fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+    const reads = [];
+    const { writes, result } = await run(dir, ['--write', '--only-field', '关联 PR'], {
+      items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2' }), item(3, { id: 'PVTI_3' })],
+      prs: [closingPr(9, 1), closingPr(10, 2), closingPr(11, 3)],
+      readBack: phasedReadBack((change) => {
+        reads.push(change.item);
+        throw makeError();
+      }),
+    });
+    assert.equal(writes.length, 1, '写闸只调了一次，后面两条没写');
+    assert.deepEqual(reads, [`${REPO}#1`], '回读只做了一次，没有重试');
+    assert.equal(result.stop, 'readback-error');
+    assert.equal(result.written, 1);
+    assert.equal(disabled(dir), true);
+    assert.deepEqual(changeRows(dir).map((row) => row.issue), [1], 'changes.jsonl 记了已写的这一条');
+    const alerts = readAlerts(dir);
+    assert.equal(alerts.length, 1);
+    assert.equal(alerts[0].kind, 'prio-readback-error');
+    assert.match(alerts[0].text, /#1 的「关联 PR」已经写进看板/);
+    assert.match(alerts[0].text, /后面还有 2 条没有写/);
+    assert.match(alerts[0].text, /只有这一条被改了，其余没改/);
+    assert.match(alerts[0].text, /核对这一条.*删除停写开关/);
+    assert.equal(alerts[0].text.includes(REPO), false, '不写仓全名');
+  });
+}
+
+test('#236 停写之后下一拍不补写，也不回滚已写的那条', async () => {
+  const dir = tmpDir();
+  allow(dir, [REPO]);
+  fs.writeFileSync(path.join(dir, 'mac-mini-stopped'), '');
+  const options = {
+    items: [item(1, { id: 'PVTI_1' }), item(2, { id: 'PVTI_2' })],
+    prs: [closingPr(9, 1), closingPr(10, 2)],
+  };
+  const first = await run(dir, ['--write', '--only-field', '关联 PR'], {
+    ...options, readBack: phasedReadBack(() => { throw new TypeError('fetch failed'); }),
+  });
+  assert.equal(first.result.stop, 'readback-error');
+  const next = await run(dir, ['--write', '--only-field', '关联 PR'], options);
+  assert.equal(next.writes.length, 0, '停写开关在，下一拍一条都不写（也没有回滚写入）');
+  assert.equal(disabled(dir), true);
+});
