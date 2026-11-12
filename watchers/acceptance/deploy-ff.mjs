@@ -143,7 +143,58 @@ const EXACT_FILES = new Set([
   'watchers/acceptance/bin/prio-sync.mjs',
 ]);
 const HOST_PREFIX = 'watchers/acceptance/host/';
-const CONTENT_RE = /process\.env|secrets\/|token/i;
+/**
+ * 内容规则只看新增行，且跳过测试文件和 docs/*.md：这些地方提到 token 或 process.env
+ * 是常事，拦下来只会逼人写完整 sha 批准。
+ * 其余文件按「旧规则减去白名单」判（#426 复审，2026-11-12）：新增行里出现 token、process.env（不分大小写），
+ * 或者全大写的密钥类名字（GITHUB_TOKEN、X_API_KEY、MIVO_APP_ID……），就算敏感；只有每一处都落在
+ * 少数已知无害的写法里才放过。读环境变量、读令牌文件的写法列不完（别名、解构、Python、shell、拼接），
+ * 所以默认拦、按白名单放；另外几类真敏感（secrets/、密钥文件、令牌文件、appOnly、端口）照旧单独认。
+ */
+// docs 只跳过仓根 docs/ 下一层的 .md（issue #426 写的 docs/*.md）；测试文件和测试夹具（*.fixture.mjs，只给测试用的数据）任何目录都跳过。
+const CONTENT_SKIP_RE = /^(?:docs\/[^/]+\.md|(?:.*\/)?[^/]+\.(?:test\.(?:mjs|py)|fixture\.mjs))$/;
+const SECRETS_PATH_RE = /secrets\//i;
+// 密钥/证书文件：带目录的路径（keys/server.key）或被引号包住的文件名（'server.key'）。
+// 有意不匹配 `item.key` 这种对象属性。
+const KEY_FILE_RE = /(?:^|[\s"'`(=:,\/])[~\w.@-]*\/[~\w.@-]*\.(?:key|pem|p12|pfx)(?=$|[\s"'`),;:])|['"`][~\w.@-]+\.(?:key|pem|p12|pfx)['"`]/i;
+const TOKEN_EXT = '(?:\\.(?:json|txt|dat|key|pem|env|db))?';
+const TOKEN_FILE_RE = new RegExp([
+  /(?:^|[\s"'`(=:,\/])\.tokens?\b/.source,
+  /(?:^|[\s"'`(=:,\/])tokens?\.(?:json|txt|dat|key|pem|env|db)\b/.source,
+  /(?:^|[\s"'`(=:,\/])(?:[~\w.@-]+\/)+tokens?(?=$|[\s"'`),;])/.source,
+  // path.join(home, 'token')、path.resolve(dir, "tokens")：单独一段就是令牌文件名。
+  `path\\.(?:join|resolve)\\s*\\([^;]*?['"\`]\\.?tokens?${TOKEN_EXT}['"\`]`,
+  // 模板字符串 `${dir}/token`、`${home}/state/token.json`。
+  `\\$\\{[^}]*\\}\\/(?:[~\\w.@-]+\\/)*\\.?tokens?${TOKEN_EXT}(?=$|[\\s"'\`),;])`,
+].join('|'), 'i');
+// 旧规则的两个触发词：新增行里出现就算敏感，除非这一处落在下面的白名单写法里。
+const TOKEN_WORD_RE = /token/gi;
+const PROCESS_ENV_RE = /process\.env/gi;
+// 白名单 1：按字面量名字读写一个不敏感的环境变量（process.env.HOME、process.env?.X、process.env['X']，含赋值和 delete）。
+// 名字只认环境变量的写法（大写字母、数字、下划线）：valueOf、toString、constructor 这类对象方法名拿到的是整张表或别的东西，
+// (process.env.valueOf)() 这种括号包住的调用也一样，所以小写名字一律不放过。
+// 读到名字就得结束：后面再接 .、?.、[ 或调用（process.env.HOME.constructor.constructor(...)['env'] 能拿到整张表）的不放过。
+const ENV_NAMED_RE = /process\.env\s*(?:\?\.\s*|\.\s*)([A-Z_][A-Z0-9_]*)(?![A-Za-z0-9_$]|\s*(?:\?\.|\.|\[|\())|process\.env\s*(?:\?\.)?\s*\[\s*(['"])([A-Z_][A-Z0-9_]*)\2\s*\](?!\s*(?:\?\.|\.|\[|\())/g;
+// 白名单 2：函数默认参数 `(env = process.env)` / `, env = process.env)`（issue #426 SC2 点名的写法）。
+const ENV_DEFAULT_PARAM_RE = /[(,]\s*env\s*=\s*process\.env\s*[),]/g;
+// 白名单 3：文件名里的一段 token（mivo-app-token.mjs 这种模块、脚本、文档名；token.json 这类数据文件不算）。
+const TOKEN_IN_MODULE_NAME_RE = /[\w.-]*token[\w.-]*\.(?:mjs|cjs|js|ts|py|sh|md)(?![\w.])/gi;
+// 全大写的名字（GITHUB_TOKEN、API_KEY）：按 _ 分段有密钥类的一段就算敏感，不管怎么读到的。
+const UPPER_NAME_RE = /(?<![A-Za-z0-9_])[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*(?![A-Za-z0-9_])/g;
+// 全大写名字算不算密钥类：TOKEN、SECRET、PASSW（PASSWORD、PASSWD）、CREDENTIAL 出现在哪都算（GITHUBTOKEN 这种连写也算）；
+// KEY 只认密钥常见的叫法（API_KEY、PRIVATE_KEY、ACCESS_KEY、DEPLOY_KEY、SIGNING_KEY、SESSION_KEY、ACCOUNT_KEY、HMAC_KEY……，
+// 单独一个 KEY 也算）；CREDS、AUTH 和授权头的全称
+// 要单独成一段（GH_CREDS、BASIC_AUTH）；APP 要跟着 ID / INSTALLATION（MIVO_APP_ID）。
+// 免得 CONFLICT_FEEDBACK_KEY、SWITCH_KEY、FORBIDDEN_KEYS、WATCHED_BOT_APP、AUTHOR_LOGIN 这类普通常量也算。
+// （授权头的全称不写出来：本脚本的静态约束不许源码里出现这个词，见 deploy-ff.test.mjs 的 #215 SC10。）
+const SENSITIVE_ENV_RE = /TOKEN|SECRET|PASSW|CREDENTIAL|(?:API|PRIVATE|ACCESS|DEPLOY|SIGN(?:ING)?|ENCRYPT(?:ION)?|SSH|MASTER|LICENSE|CLIENT|SESSION|ACCOUNT|STORAGE|HMAC|AES|RSA|GPG|PGP|SECRET)_?KEYS?|^KEYS?$|(?:^|_)(?:CREDS?|AUTH(?:ORI[ZS]ATION)?)(?:_|$)|APP_?(?:ID|INSTALLATION)/i;
+// process.env 按名字读写要放过，名字里就一个可疑的词都不能有（比上面严：KEY、APP、AUTH、CRED 出现在哪都不放过）。
+const ENV_NAME_UNSAFE_RE = /TOKEN|SECRET|PASSW|KEY|APP|AUTH|CRED/i;
+// 白名单盖不住、也没有字面量名字的读环境变量写法：一律算敏感（process['env']、globalThis…process、
+// require('process') / from 'process'、Python 的 os.environ / getenv、shell 的 printenv）。
+const ENV_OTHER_READ_RE = /\bprocess\s*(?:\?\.)?\s*\[|\bglobalThis\b.*\bprocess\b|\brequire\s*\(\s*['"`](?:node:)?process['"`]|\bfrom\s+['"](?:node:)?process['"]|\bos\.environ\b|\bgetenv\b|\bprintenv\b/;
+const APP_ONLY_RE = /appOnly/i;
+const PORT_RE = /(?<![\w$])listen\s*\(|\bport\b\s*[:=]\s*['"]?\d{2,5}\b/i;
 const FULL_SHA = /^[0-9a-f]{40}$/;
 
 /** 命令行里出现轮次、修正或裁决脚本就不算空档。相对路径 `node round.mjs` 也算。 */
@@ -204,6 +255,64 @@ export function parseAddedLines(diffText) {
   return lines;
 }
 
+/**
+ * 一条新增行按内容规则算不算敏感。返回命中的规则名，不命中返回 null。
+ * 测试文件和 docs/*.md 不扫内容（路径规则仍然照查）。
+ */
+export function sensitiveLineReason(file, text) {
+  const norm = String(file || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+  if (CONTENT_SKIP_RE.test(norm)) return null;
+  const line = String(text ?? '');
+  if (SECRETS_PATH_RE.test(line)) return 'secrets-path';
+  if (KEY_FILE_RE.test(line)) return 'key-file';
+  if (TOKEN_FILE_RE.test(line)) return 'token-file';
+  const unlisted = unlistedTriggerIn(line);
+  if (unlisted) return unlisted;
+  if (APP_ONLY_RE.test(line)) return 'appOnly';
+  if (PORT_RE.test(line)) return 'port';
+  return null;
+}
+
+/** 一处触发词的范围 [起, 止) 落在某个白名单范围里吗。 */
+function coveredBy(ranges, start, end) {
+  return ranges.some(([from, to]) => from <= start && end <= to);
+}
+
+function rangesOf(line, pattern, accept = () => true) {
+  const ranges = [];
+  for (const match of line.matchAll(pattern)) {
+    if (accept(match)) ranges.push([match.index, match.index + match[0].length]);
+  }
+  return ranges;
+}
+
+/**
+ * 这一行有没有白名单盖不住的触发，返回规则名（不命中返回 null）：
+ * 全大写的密钥类名字、没有字面量名字的读环境变量写法一律算（env）；process.env 每一处都要落在白名单里才放过（env）；
+ * token 这个词每一处都要落在白名单里才放过（token-word）。
+ * 按每一处触发词判断，不按整行：同一行里没有触发词的代码（比如 readFileSync(credsPath)）不靠这条规则拦，旧规则也只是碰巧
+ * 因为同一行有 process.env 才拦到；读凭证文件靠路径规则和上面单独认的令牌文件、密钥文件、secrets/。
+ */
+function unlistedTriggerIn(line) {
+  if (ENV_OTHER_READ_RE.test(line)) return 'env';
+  for (const match of line.matchAll(UPPER_NAME_RE)) {
+    if (SENSITIVE_ENV_RE.test(match[0])) return 'env';
+  }
+  // 两类触发词各认各的白名单：process.env 只能被「按名字读写」「默认参数」盖住，token 只能被「模块文件名」盖住
+  // （不然 process.env.token.mjs 这种写法会被当成模块文件名放过）。
+  const envAllowed = [
+    ...rangesOf(line, ENV_NAMED_RE, (match) => !ENV_NAME_UNSAFE_RE.test(match[1] || match[3] || '')),
+    ...rangesOf(line, ENV_DEFAULT_PARAM_RE),
+  ];
+  const tokenAllowed = rangesOf(line, TOKEN_IN_MODULE_NAME_RE, (match) => !/process\.env/i.test(match[0]));
+  for (const [pattern, allowed, rule] of [[PROCESS_ENV_RE, envAllowed, 'env'], [TOKEN_WORD_RE, tokenAllowed, 'token-word']]) {
+    for (const match of line.matchAll(pattern)) {
+      if (!coveredBy(allowed, match.index, match.index + match[0].length)) return rule;
+    }
+  }
+  return null;
+}
+
 export function sensitiveHits(files, addedLines) {
   const fileHits = [];
   for (const file of files || []) {
@@ -211,7 +320,7 @@ export function sensitiveHits(files, addedLines) {
   }
   const lineHits = [];
   for (const row of addedLines || []) {
-    if (row && CONTENT_RE.test(String(row.text ?? ''))) {
+    if (row && sensitiveLineReason(row.file, row.text)) {
       lineHits.push({ file: row.file, line: row.line, text: String(row.text ?? '') });
     }
   }
