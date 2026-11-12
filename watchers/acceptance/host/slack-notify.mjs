@@ -17,6 +17,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { isTimeoutErrorName } from '../bin/net-errors.mjs';
 import { loadAcceptanceProfile } from '../bin/profile.mjs';
 import { appendAlert, hostPaths } from './paths.mjs';
 import { alertBlocks, capBlocks, digestBlocks, readyBlocks, stalledBlocks } from './slack-blocks.mjs';
@@ -398,11 +399,11 @@ async function requestJson({ base, token, fetch, method, httpMethod = 'POST', qu
     try {
       parsed = await response.json();
     } catch (error) {
-      if (error?.name === 'TimeoutError' || error?.name === 'AbortError') throw error;
+      if (isTimeoutErrorName(error?.name)) throw error;
       parsed = null;
     }
   } catch (error) {
-    return { ok: false, error: error?.name === 'TimeoutError' || error?.name === 'AbortError' ? 'timeout' : 'network-error' };
+    return { ok: false, error: isTimeoutErrorName(error?.name) ? 'timeout' : 'network-error' };
   }
   if (status === 429) return { ok: false, error: 'rate-limited' };
   if (!(status >= 200 && status < 300)) return { ok: false, error: `http-${status || 'unknown'}` };

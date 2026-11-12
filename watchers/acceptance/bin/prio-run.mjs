@@ -13,6 +13,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isRetriableGithubErrorText } from './net-errors.mjs';
 import { redact } from './redact.mjs';
 import { explicitWatcherHome, loadAcceptanceProfile } from './profile.mjs';
 import { hostPaths } from '../host/paths.mjs';
@@ -64,8 +65,7 @@ export class PrioRunError extends Error {
 
 export function isRetriableGithubError(error) {
   const text = error instanceof Error ? String(error.message || '') : String(error ?? '');
-  if (/\bNOT_FOUND\b/.test(text)) return true;
-  if (/\bHTTP\s+5\d\d\b/.test(text)) return true;
+  if (isRetriableGithubErrorText(text)) return true;
   const status = Number(error?.status);
   return Number.isInteger(status) && status >= 500 && status <= 599;
 }
