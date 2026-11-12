@@ -12,7 +12,7 @@ import { collectMivoCiSync } from './mivo-ci.mjs';
 import { collectPrOwnershipSync } from './mivo-pr-snapshot.mjs';
 import { isCurrentHandoff } from './mivo-handoff.mjs';
 import { createPushHooks } from './mivo-pre-push.mjs';
-import { taskRepairPolicy, TRIAGE_REASONS } from './mivo-feedback-policy.mjs';
+import { taskFeedbackDigest, taskRepairPolicy, TRIAGE_REASONS } from './mivo-feedback-policy.mjs';
 import { acquireLock, AUTHOR_RECLAIMED, readPr, writePr } from './mivo-state.mjs';
 import { optionalConfig, requireConfig } from './profile.mjs';
 import { acquireValidationSlot, runStreaming, validationConfig } from './mivo-validation-runtime.mjs';
@@ -384,7 +384,30 @@ function taskFrom(home, taskPath) {
   if (task.repo !== REPO) fail(`task.repo must be ${REPO}`);
   if (!isSha(task.headRefOid)) fail('task.headRefOid must be a 40-character SHA');
   if (typeof task.headRefName !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(task.headRefName) || task.headRefName.includes('..')) fail('task.headRefName is invalid');
+  assertTaskFeedback(paths, task);
   return { paths, file, task };
+}
+
+// The task file is writable by the repair session, and every code permission (allowed keys, SC coverage, the
+// pre-push exception) is recomputed from its feedback. The watcher recorded a fingerprint of that feedback in its
+// own PR state when it dispatched the task; an edited task file no longer matches it. Dispatches recorded before
+// the fingerprint existed carry none and are left as they were. This stops accidental edits and simple tampering,
+// not a session that also rewrites the watcher's state (same machine, same account).
+function assertTaskFeedback(paths, task) {
+  let entry = null;
+  try {
+    entry = readPr(paths.home, task.nodeId);
+    if (!entry && fs.existsSync(paths.state)) entry = readJson(paths.state, 'scanner state')?.prs?.[task.nodeId] ?? null;
+  } catch {
+    return; // boundSession reports an unreadable state with its own error.
+  }
+  const record = [entry?.activeTask, entry?.pendingDispatch]
+    .find((item) => item?.dispatchId === task.dispatchId && typeof item.feedbackDigest === 'string');
+  if (!record) return;
+  const actual = taskFeedbackDigest(task.feedback);
+  if (actual !== record.feedbackDigest) {
+    fail(`task feedback was changed after dispatch: expected digest ${record.feedbackDigest.slice(0, 16)}, actual ${actual.slice(0, 16)}`);
+  }
 }
 
 function boundSession(paths, task) {
