@@ -12,8 +12,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-/** 消费方（预算、恢复期错开顺序都按这个名字排）。 */
+/** 消费方（预算、恢复期错开顺序都按这个名字排）。poll 不是消费方，不在这里。 */
 export const COMPONENTS = Object.freeze(['loop', 'prio-run', 'board-live']);
+
+/** 主循环每拍盘点的用量单独记在这一项，不计入 loop 的 500 点小时预算。 */
+export const POLL_COMPONENT = 'poll';
+
+/** 允许写入用量的名字：三个消费方，加上只记账、不参与预算判定的 poll。 */
+const CHARGE_COMPONENTS = new Set([...COMPONENTS, POLL_COMPONENT]);
 
 /** 一拍里的读用途：essential 只有主循环 poll；board 是看板整板读；non-essential 是其余只读。 */
 export const PURPOSES = Object.freeze(['essential', 'board', 'non-essential']);
@@ -254,7 +260,7 @@ function componentUsage(state, component, hourKey) {
 
 /** 把一次读的实际花费记进这个组件的本小时用量（按 UTC 整点切窗）。判定前没有实际花费时用 0。 */
 export function chargeBudget(state, { component, cost, now } = {}) {
-  if (!COMPONENTS.includes(component)) throw new Error(`未知的消费方：${showActual(component)}`);
+  if (!CHARGE_COMPONENTS.has(component)) throw new Error(`未知的消费方：${showActual(component)}`);
   const at = finiteMs(now);
   if (at === null) throw new Error('chargeBudget 需要合法的时间');
   const amount = Number.isFinite(cost) && cost > 0 ? Number(cost) : 0;
@@ -266,6 +272,30 @@ export function chargeBudget(state, { component, cost, now } = {}) {
     version: STATE_VERSION,
     components: { ...(state?.components || {}), [component]: { hourKey: hours, used: usage.used + amount, updatedAt: isoAt(at) } },
   };
+}
+
+/**
+ * 读本小时 poll 用量。状态里没有 `components.poll`、或 hourKey 对不上这一小时，都按 0，
+ * 并给出一行日志（老格式兼容：不清空既有计数）。
+ */
+export function pollUsage(state, now) {
+  const at = finiteMs(now);
+  if (at === null) throw new Error('pollUsage 需要合法的时间');
+  const hourKey = Math.floor(at / HOUR_MS);
+  const raw = state?.components?.[POLL_COMPONENT];
+  const present = Boolean(raw && typeof raw === 'object' && Number(raw.hourKey) === hourKey);
+  const used = present ? componentUsage(state, POLL_COMPONENT, hourKey).used : 0;
+  const log = present
+    ? null
+    : `${isoAt(at)} rate-poll component=poll used=0 reason=missing 老格式状态没有 poll 项，按 0 处理`;
+  return { hourKey, used, present, log };
+}
+
+/** 记一笔 poll 用量的运维日志行（不进 loop 预算）。 */
+export function pollUsageLogLine({ now, used, cost, hourKey } = {}) {
+  const at = finiteMs(now) ?? Date.now();
+  const hours = hourKey == null ? Math.floor(at / HOUR_MS) : hourKey;
+  return `${isoAt(at)} rate-poll component=poll used=${Number(used) || 0} cost=${Number(cost) || 0} hourKey=${hours} 本小时 poll 用量（不计入 loop 预算）`;
 }
 
 /**

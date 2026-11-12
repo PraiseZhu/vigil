@@ -14,6 +14,7 @@ import { handoffFor, preflightCommands, repoConfig } from '../host/prbot-config.
 import { checkSlackAccess } from '../host/slack-notify.mjs';
 import { describeViolation, runGateAudit } from '../host/gate-audit.mjs';
 import { POLL_STALL_S, heartbeatMaxAgeMs, heartbeatPhase, heartbeatTickSeconds, phaseLabel, pollingElapsedS } from '../host/poll-beat.mjs';
+import { pollUsage, readRateState } from './rate-budget.mjs';
 
 /** 令牌账号 == ownerLogin 用这条。 */
 export const VIEWER_QUERY = `query {
@@ -399,6 +400,19 @@ export async function runDoctor({
   } catch {
     add('常驻循环', false, '没有心跳文件（循环没跑）');
   }
+
+  // poll 本小时用量是报表项，不是体检红灯：读得出或按 0 计都算通过。不计入 loop 预算。
+  {
+    const usage = pollUsage(readRateState(paths.rateState), now());
+    add(
+      'poll 小时用量',
+      true,
+      usage.present
+        ? `本小时 poll 用了 ${usage.used} 点（不计入 loop 预算）`
+        : `本小时 poll 用了 0 点（状态文件没有 poll 项，按 0 计，不计入 loop 预算）`,
+    );
+  }
+
 
   // 写闸账本审计（只读）：旁路核对写闸账本里已执行的写入，看有没有越规的。只读本地账本 + 只读查轮次评论。
   // 只有明确违规才让这一项变红；「拿不准」只记日志（detail 里报出来），GitHub 没查成也照旧写进 detail 但不改变红绿。

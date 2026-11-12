@@ -22,11 +22,14 @@ import { isReadOnlyGraphql } from '../bin/github.mjs';
 import { classifyNetError } from '../bin/net-errors.mjs';
 import {
   GRAPHQL_COST_PER_REQUEST,
+  POLL_COMPONENT,
   appendRateLog,
   chargeBudget,
   decideTick,
   defaultIdentity,
   identityRecord,
+  pollUsage,
+  pollUsageLogLine,
   rateLogLine,
   readBudgetFile,
   readRateState,
@@ -665,14 +668,24 @@ export async function runTick({
     }
     if (!Array.isArray(entries)) throw new Error('poll 输出不是数组');
 
-    // 这一拍的实际花费记进 loop 组件的本小时用量（#247 SC5）：按响应头个数 × 单次点数。
+    // 这一拍 poll 的实际花费记进 poll 项（不计入 loop 的 500 点预算）：按响应头个数 × 单次点数。
     try {
+      const cost = pollReads * GRAPHQL_COST_PER_REQUEST;
       const charged = chargeBudget(readRateState(paths.rateState), {
-        component: 'loop',
-        cost: pollReads * GRAPHQL_COST_PER_REQUEST,
+        component: POLL_COMPONENT,
+        cost,
         now: now(),
       });
       writeRateState(paths.rateState, charged);
+      if (cost > 0) {
+        const usage = pollUsage(charged, now());
+        appendRateLog(paths.loopLog, pollUsageLogLine({
+          now: now(),
+          used: usage.used,
+          cost,
+          hourKey: usage.hourKey,
+        }));
+      }
     } catch (error) {
       heartbeat.lastTick.rateError = String(error?.message || error);
     }
