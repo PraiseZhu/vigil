@@ -188,11 +188,12 @@ PR 的检查。
 轮次评论里的争议条目是单行：`- 有争议：<owner/repo#n> SC<k> · 验收方：<裁决里的原因> · 修正方：<pi 的理由>`，
 和 `docs/acceptance-session.md` 的格式一样，`collect` 和 `round.mjs status` 按这一行认条目。轮次评论、状态文件里的时间都是北京时间 `+08:00`。
 
-## 写闸（#60 新增）
+## 写闸（#60、#171 新增）
 
 - `pr.update-branch`：`PUT /repos/{o}/{r}/pulls/{n}/update-branch`，带 `expected_head_sha`。
 - `ci.rerun`：`POST /repos/{o}/{r}/actions/runs/{id}/rerun-failed-jobs`；写闸先查这个 PR 当前 head 的检查，run id 不在里面就拒（`not-allowed`）。
-- 两者只给 auto / fork 档；watch 档返回 4 `tier-not-allowed`。仍然要有修正轮绑定、账本、执行锁。
+- `pr.edit`（#171）：`PATCH /repos/{o}/{r}/pulls/{n}`，只带 `body`。只在 PR 还是 Draft 时、只对本轮修正分支的 PR；写闸自己读当前正文和新正文对比，只放行「验收对照」表的状态列和证据列、「未执行的验证」段，首行「任务 issue：」、Closes 行、修正标记行、其它段和标题一个字都不许变；改动过的证据格和「未执行的验证」段只许写纯文本：字符实体（`&` 后跟 `#` 或字母）、HTML 标签和注释（`<https://...>` 链接除外）、反斜杠转义（表格里的 `\|` 除外）、行尾反斜杠（Markdown 硬换行）、不可见字符一律拒（`encoded-text`），因为 GitHub 按哪种读法认关单词说不准；剩下的纯文本按整篇正文比，新写关单词（`Closes/Fixes/Resolves #号`）、修正标记、「任务 issue」行一律拒绝。带 `title` / `head` / `base` 等字段直接拒（`field-not-editable`）。验收轮绑定不认这个动作。
+- 三者只给 auto / fork 档；watch 档返回 4 `tier-not-allowed`。仍然要有修正轮绑定、账本、执行锁。
 - 更新分支 / 重跑 / 转 Ready 都先查 PR 头：head 分支名必须是本轮分支、base 必须是 `main`；更新分支 / 重跑还要求
   head 所在仓是同一个仓（fork 模式是 `<ownerLogin>/<仓名>`），别人 fork 里的同名分支一律 `not-allowed`（转 Ready 的 head 仓由 `pr.ready` 复核）。
 - `pr.create` 的 `base` 只能是 `main`（不写就是 main），修正轮和验收轮都一样；修正轮的 `pr.create` 正文还必须有一行
