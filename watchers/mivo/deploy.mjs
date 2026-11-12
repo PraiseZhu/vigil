@@ -25,10 +25,13 @@ function sourceIdentity(){
   return {sourceCommit:/^[a-f0-9]{40}$/.test(commit)?commit:null,sourceDirty:dirty};
  }catch{return {sourceCommit:null,sourceDirty:null};}
 }
-function relativeImportNames(file){
+function relativeImportSpecs(file){
  if(!fs.existsSync(file))return [];
  const src=fs.readFileSync(file,'utf8');
- return [...src.matchAll(/from\s+['"]\.\/([^'"]+)['"]/g)].map(m=>m[1]);
+ return [...src.matchAll(/from\s+['"](\.\.?\/[^'"]+)['"]/g)].map(m=>m[1]);
+}
+function isOutsideBin(name){
+ return name.split(/[/\\]/).includes('..');
 }
 function importClosure(sourceDir,entry){
  const seen=new Set(),stack=[entry];
@@ -36,15 +39,36 @@ function importClosure(sourceDir,entry){
   const name=stack.pop();
   if(seen.has(name))continue;
   seen.add(name);
-  for(const dep of relativeImportNames(path.join(sourceDir,name)))stack.push(dep);
+  const file=path.join(sourceDir,name);
+  for(const spec of relativeImportSpecs(file))stack.push(path.relative(sourceDir,path.resolve(path.dirname(file),spec)));
  }
  return seen;
+}
+function outsideModules(sourceDir){
+ const out=new Set();
+ for(const entry of ENTRY_POINTS){
+  if(!FILES.includes(entry))continue;
+  for(const name of importClosure(sourceDir,entry))if(isOutsideBin(name))out.add(name);
+ }
+ return out;
+}
+function installOutsideModules(runtime,sourceDir=path.join(here,'bin')){
+ for(const rel of outsideModules(sourceDir)){
+  const src=path.resolve(sourceDir,rel),dest=path.resolve(path.join(runtime,'bin'),rel);
+  requireValue(fs.existsSync(src),`deploy missing companion module: ${rel}`);
+  fs.mkdirSync(path.dirname(dest),{recursive:true,mode:0o700});
+  const tmp=dest+`.install-${process.pid}`;
+  fs.copyFileSync(src,tmp);fs.chmodSync(tmp,0o755);fs.renameSync(tmp,dest);
+ }
 }
 export function checkManifestCompleteness(sourceDir=path.join(here,'bin')){
  const missing=new Set();
  for(const entry of ENTRY_POINTS){
   if(!FILES.includes(entry))continue;
-  for(const name of importClosure(sourceDir,entry))if(!FILES.includes(name))missing.add(name);
+  for(const name of importClosure(sourceDir,entry)){
+   if(isOutsideBin(name)){if(!fs.existsSync(path.join(sourceDir,name)))missing.add(name);}
+   else if(!FILES.includes(name))missing.add(name);
+  }
  }
  requireValue(missing.size===0,`deploy manifest missing modules imported by entry points: ${[...missing].join(', ')}`);
 }
@@ -121,6 +145,7 @@ export function apply(plan){
    if(item.runtime)fs.copyFileSync(target,path.join(record,'before',item.name));
    fs.copyFileSync(path.join(here,'bin',item.name),tmp);fs.chmodSync(tmp,0o755);fs.renameSync(tmp,target);installed.push(item);
   }
+  installOutsideModules(plan.home);
   requireValue(stateFingerprint(plan.home)===plan.stateSha,'state changed during install');idle(plan.database,plan.sessionIds);
   requireValue(verify(plan.home).every(v=>v.source===v.runtime),'installed hash mismatch');
   // The watcher compares bin/ with this once a day (mivo-deploy-drift.mjs); a partial copy no longer looks healthy.

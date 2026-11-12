@@ -5,11 +5,15 @@ import os from 'node:os';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {spawnSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath,pathToFileURL} from 'node:url';
 import {FILES,verify,validatePlan,apply,stateFingerprint,bootstrap} from './deploy.mjs';
+function importDeployed(file){
+ return spawnSync(process.execPath,['--input-type=module','-e',`await import(${JSON.stringify(pathToFileURL(file).href)})`],{encoding:'utf8',timeout:20000,env:process.env});
+}
 function fixture(t){
- const home=fs.mkdtempSync(path.join(os.tmpdir(),'watcher-deploy-'));t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
- fs.mkdirSync(path.join(home,'bin'));fs.mkdirSync(path.join(home,'state'));
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'watcher-deploy-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const home=path.join(root,'home');
+ fs.mkdirSync(path.join(home,'bin'),{recursive:true});fs.mkdirSync(path.join(home,'state'),{recursive:true});
  fs.writeFileSync(path.join(home,'state/state.json'),JSON.stringify({prs:{}}));
  for(const name of FILES)fs.writeFileSync(path.join(home,'bin',name),'old bytes');
  const state=fs.readFileSync(path.join(home,'state/state.json'));
@@ -83,9 +87,36 @@ test('validatePlan (used by apply) also enforces manifest completeness, not just
  assert.doesNotThrow(() => validatePlan(f.plan));
  assert.throws(() => validatePlan(f.plan, source), /not-in-manifest-either\.mjs/);
 });
+test('#238 SC7 deploy 把 net-errors 装到运行时相对路径，cindy-watcher 能 import', t => {
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'cindy-deploy-net-'));
+ t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const home=path.join(root,'home');
+ const boot=bootstrap(home);
+ const plan={version:1,home,database:path.join(home,'metadata.db'),id:'net-errors-release',files:verify(home),stateSha:boot.stateSha,sessionIds:[]};
+ apply(plan);
+ const result=importDeployed(path.join(home,'bin','cindy-watcher.mjs'));
+ assert.doesNotMatch(`${result.stderr}\n${result.stdout}`,/ERR_MODULE_NOT_FOUND/,result.stderr);
+ assert.equal(result.status,0,result.stderr);
+});
+test('#238 SC7 源树没有 net-errors.mjs 时 cindy deploy 拒绝', t => {
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'cindy-deploy-no-net-'));
+ t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const watcher=path.join(root,'watchers','cindy');
+ fs.cpSync(fileURLToPath(new URL('./',import.meta.url)),watcher,{recursive:true});
+ const source=path.join(watcher,'bin');
+ const home=path.join(root,'home');
+ fs.mkdirSync(path.join(home,'bin'),{recursive:true});
+ assert.throws(()=>verify(home,source),/net-errors/);
+ const f=fixture(t);
+ assert.throws(()=>validatePlan(f.plan,source),/net-errors/);
+ const cli=spawnSync(process.execPath,[path.join(watcher,'deploy.mjs'),'verify'],{encoding:'utf8',timeout:10000});
+ assert.notEqual(cli.status,0);
+ assert.match(`${cli.stderr}\n${cli.stdout}`,/net-errors/);
+});
 test('bootstrap then apply works when runtime has no old files', t => {
- const home=fs.mkdtempSync(path.join(os.tmpdir(),'watcher-empty-'));
- t.after(()=>fs.rmSync(home,{recursive:true,force:true}));
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'watcher-empty-'));
+ t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+ const home=path.join(root,'home');
  const boot=bootstrap(home);
  assert.equal(fs.existsSync(path.join(home,'config/optout.json')),true);
  assert.match(boot.stateSha,/^[a-f0-9]{64}$/);
