@@ -79,6 +79,16 @@ export function parseMaxPerTick(raw) {
   return parsed;
 }
 
+/** 同一条告警多久内不重复写（#235，默认 24 小时）。只认正整数小时；0、负数、小数、非数字都在读令牌之前报错。 */
+export const ALERT_DEDUPE_HOURS_DEFAULT = 24;
+export function parseAlertDedupeHours(raw) {
+  const actual = raw == null || raw === '' ? '（空）' : String(raw);
+  if (!/^\d+$/.test(String(raw ?? '')) || Number(raw) < 1) {
+    throw new PrioRunError(`--alert-dedupe-hours 期望正整数小时（例如 24），实际：${actual}`, 'config');
+  }
+  return Number(raw);
+}
+
 export function parsePrioRunArgs(argv) {
   const out = { write: false, dryRun: false, onlyEmptyToP2: false, stateDir: null, maxPerTick: null, alertsFile: null };
   for (let i = 0; i < argv.length; i += 1) {
@@ -109,6 +119,15 @@ export function parsePrioRunArgs(argv) {
         );
       }
       out.onlyField = value;
+      i += 1;
+      continue;
+    }
+    if (arg === '--alert-dedupe-hours') {
+      const value = argv[i + 1];
+      if (typeof value !== 'string' || value.startsWith('--')) {
+        throw new PrioRunError('缺少 --alert-dedupe-hours 的取值', 'config');
+      }
+      out.alertDedupeHours = parseAlertDedupeHours(value);
       i += 1;
       continue;
     }
@@ -407,10 +426,17 @@ function readAlerts(file) {
   return rows;
 }
 
-function appendAlert(file, { ts, reason, text }) {
+// 去重只看最近一个窗口（#235）：窗口是左开右闭 (ts − window, ts]，恰好在左边界上的旧行算窗口外；
+// 缺 ts 或 ts 不是合法时间的行不参与去重。同一类事件过了窗口再发生会重新写一条。
+function appendAlert(file, { ts, reason, text }, windowMs = ALERT_DEDUPE_HOURS_DEFAULT * 60 * 60 * 1000) {
   const safe = redact(text);
   const kind = ALERT_KIND[reason] || 'prio-unknown';
-  if (readAlerts(file).some((row) => row.kind === kind && row.text === safe)) {
+  const nowMs = Date.parse(ts);
+  const inWindow = (row) => {
+    const at = Date.parse(row?.ts ?? '');
+    return Number.isFinite(at) && at > nowMs - windowMs && at <= nowMs;
+  };
+  if (readAlerts(file).some((row) => inWindow(row) && row.kind === kind && row.text === safe)) {
     return { ts, kind, text: safe, duplicated: true };
   }
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -454,9 +480,9 @@ function teeStdout(stdout, file) {
   };
 }
 
-function emitAlert(stdout, file, nowMs, reason, extra) {
+function emitAlert(stdout, file, nowMs, windowMs, reason, extra) {
   const text = alertTextFor(reason, extra);
-  const saved = appendAlert(file, { ts: new Date(nowMs).toISOString(), reason, text });
+  const saved = appendAlert(file, { ts: new Date(nowMs).toISOString(), reason, text }, windowMs);
   if (!saved.duplicated) stdout.write(`${saved.text}\n`);
   return saved;
 }
@@ -540,6 +566,7 @@ export async function runContinuous(argv = [], deps = {}) {
   const rawStdout = deps.stdout || process.stdout;
   const stdout = teeStdout(rawStdout, path.join(dir, `run-${new Date(now).toISOString().slice(0, 10)}.log`));
   const alertsFile = args.alertsFile || path.join(dir, 'alerts.jsonl');
+  const alertWindowMs = (args.alertDedupeHours ?? ALERT_DEDUPE_HOURS_DEFAULT) * 60 * 60 * 1000;
   const disabledAtStart = fs.existsSync(path.join(dir, 'disabled'));
   const wantWrite = args.write === true && !disabledAtStart;
   if (args.write && disabledAtStart) stdout.write('已停写\n');
@@ -726,7 +753,7 @@ export async function runContinuous(argv = [], deps = {}) {
     };
     if (result.readbackMismatch) {
       writeDisabled(dir, '回读不一致，持续写入已暂停');
-      emitAlert(stdout, alertsFile, now, 'readback', {});
+      emitAlert(stdout, alertsFile, now, alertWindowMs, 'readback', {});
       return { ...base, disabled: true, stop: 'readback' };
     }
     if (result.stoppedByDisabled) return { ...base, stop: 'disabled' };
@@ -734,21 +761,21 @@ export async function runContinuous(argv = [], deps = {}) {
     if (!wantWrite) return { ...base, stop: disabledAtStart ? 'disabled' : '' };
     if (result.outOfScopeHit || assessment?.reason === 'out-of-scope') {
       writeDisabled(dir, '范围外变更，持续写入已暂停');
-      emitAlert(stdout, alertsFile, now, 'out-of-scope', {});
+      emitAlert(stdout, alertsFile, now, alertWindowMs, 'out-of-scope', {});
       return { ...base, disabled: true, stop: 'out-of-scope' };
     }
     if (assessment?.reason === 'downgrade') {
       writeDisabled(dir, '降级或改空，持续写入已暂停');
-      emitAlert(stdout, alertsFile, now, 'downgrade', { downgrades: assessment.downgrades });
+      emitAlert(stdout, alertsFile, now, alertWindowMs, 'downgrade', { downgrades: assessment.downgrades });
       return { ...base, disabled: true, stop: 'downgrade' };
     }
     if (assessment?.hourlyStop) {
       writeDisabled(dir, '每小时写入上限，持续写入已暂停');
-      emitAlert(stdout, alertsFile, now, 'hourly', { written: result.written || 0 });
+      emitAlert(stdout, alertsFile, now, alertWindowMs, 'hourly', { written: result.written || 0 });
       return { ...base, disabled: true, stop: 'hourly' };
     }
     if (assessment?.nonAuto?.length) {
-      emitAlert(stdout, alertsFile, now, 'nonempty', { nonAuto: assessment.nonAuto });
+      emitAlert(stdout, alertsFile, now, alertWindowMs, 'nonempty', { nonAuto: assessment.nonAuto });
       return { ...base, stop: 'nonempty' };
     }
     return { ...base, stop: disabledAtStart ? 'disabled' : '' };
@@ -757,7 +784,7 @@ export async function runContinuous(argv = [], deps = {}) {
     // 和写入前阶段的 5xx 分开：那边按连续失败计数，满 3 拍才停。
     if (error?.code === 'PRIO_READBACK_FAILED') {
       writeDisabled(dir, '写入后回读出错，持续写入已暂停');
-      emitAlert(stdout, alertsFile, now, 'readback-error', { readback: error.readback, remaining: error.remaining });
+      emitAlert(stdout, alertsFile, now, alertWindowMs, 'readback-error', { readback: error.readback, remaining: error.remaining });
       return { written: error.written || 0, exitCode: 1, disabled: true, alertsFile, stop: 'readback-error' };
     }
     if (!isRetriableGithubError(error)) throw error;
@@ -765,7 +792,7 @@ export async function runContinuous(argv = [], deps = {}) {
     writeStreak(dir, streak);
     const paused = streak >= FAIL_STREAK_LIMIT;
     if (paused) writeDisabled(dir, '连续失败，持续写入已暂停');
-    emitAlert(stdout, alertsFile, now, 'github', { paused, streak });
+    emitAlert(stdout, alertsFile, now, alertWindowMs, 'github', { paused, streak });
     return {
       written: 0,
       exitCode: 1,
