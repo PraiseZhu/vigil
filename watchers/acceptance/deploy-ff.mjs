@@ -20,6 +20,8 @@ export const DRAIN_MAX_MS = 120 * 60 * 1000;
 export const DRAIN_COOLDOWN_MS = 30 * 60 * 1000;
 /** 主循环和单轮共用的两个槽位锁文件名（<host-state>/slots/ 下）。 */
 export const SLOT_NAMES = Object.freeze(['slot-0', 'slot-1']);
+/** rounds/、locks/ 里读不出 pid 的文件：修改时间超过这么久算残留（正好等于不算），更新的按「正在写」当在跑。 */
+export const STALE_UNREADABLE_MS = 10 * 60 * 1000;
 
 export const EXIT = Object.freeze({
   deployed: 0,
@@ -81,6 +83,9 @@ const DRAIN_RELEASE_STATUSES = new Set([
   'doctor-failed',
   'ci-red',
   'ci-unknown',
+  // 等不到结果的两种（#425 返工）：拉不到远端、检查还在跑。先放槽让验收照常起轮次，下一拍还落后再排空。
+  'fetch-failed',
+  'ci-pending',
 ]);
 const DRAIN_HOLDER_MARK = 'deploy-ff-drain-holder';
 const DRAIN_ALERT = '部署落后太多，开始排空：占住空出来的轮次槽位，不再起新轮次（在跑的轮次不动），等它们结束就部署，最长 120 分钟。';
@@ -363,6 +368,8 @@ function dirEmpty(dir) {
   }
 }
 
+const BUSY_PROCESS_REASON = '有验收进程在跑';
+
 async function idleBlock(opts) {
   const rounds = path.join(opts.hostStateDir, 'rounds');
   const locks = path.join(opts.hostStateDir, 'locks');
@@ -375,7 +382,7 @@ async function idleBlock(opts) {
     return '列不出进程';
   }
   if (!Array.isArray(processes)) return '列不出进程';
-  if (processes.some((line) => BUSY_PROCESS_RE.test(String(line)))) return '有验收进程在跑';
+  if (processes.some((line) => BUSY_PROCESS_RE.test(String(line)))) return BUSY_PROCESS_REASON;
   return null;
 }
 
@@ -525,13 +532,67 @@ function needsApprovalLocally(opts, target) {
 }
 
 /**
- * 等不到空档时的排空（#425）。只看本地已有的引用，不 fetch、不动部署目录。
+ * 排空前看 rounds/、locks/ 里每个登记是不是还活着（#425 返工）。只读，不删任何文件。
+ * 内容里有正整数 pid 的按 pid 判活（EPERM 也算活）；读不出 pid 的看修改时间，超过 STALE_UNREADABLE_MS 算残留。
+ * 返回 { live, stale, unreadable }，live/stale 是 `rounds/<文件名>` 这样的相对名；目录本身读不了时 unreadable 为 true。
+ */
+function selectBusyEntries(hostStateDir, nowMs) {
+  const out = { live: [], stale: [], unreadable: false };
+  for (const sub of ['rounds', 'locks']) {
+    let names;
+    try {
+      names = fs.readdirSync(path.join(hostStateDir, sub)).sort();
+    } catch {
+      out.unreadable = true;
+      continue;
+    }
+    for (const name of names) {
+      const rel = `${sub}/${name}`;
+      const file = path.join(hostStateDir, sub, name);
+      let pid = null;
+      try {
+        pid = Number(JSON.parse(fs.readFileSync(file, 'utf8'))?.pid);
+      } catch {
+        pid = null;
+      }
+      if (Number.isInteger(pid) && pid > 0) {
+        (pidAlive(pid) ? out.live : out.stale).push(rel);
+        continue;
+      }
+      let mtimeMs;
+      try {
+        mtimeMs = fs.lstatSync(file).mtimeMs;
+      } catch {
+        continue; // 刚被删掉
+      }
+      (nowMs - mtimeMs > STALE_UNREADABLE_MS ? out.stale : out.live).push(rel);
+    }
+  }
+  return out;
+}
+
+function staleAlert(busy) {
+  const others = busy.live.length ? `另有 ${busy.live.length} 个还在跑，但它们结束后这些残留仍会挡着部署，` : '';
+  return {
+    kind: 'deploy-drain-stale-locks',
+    reason: `部署落后，但轮次登记或锁里有残留文件（写的进程已经不在）：${busy.stale.join('、')}。${others}`
+      + '排空等不到空档，所以不排空、不占槽，验收照常起轮次；这些文件不清掉部署会一直等，需要人确认对应轮次已结束后删掉。',
+  };
+}
+
+/**
+ * 等不到空档时的排空（#425）。先 `git fetch origin`（只更新远端引用，不动工作区和 HEAD）再算落后。
+ * 只有 rounds/、locks/ 里有活着的登记（或列出了在跑的验收进程）才排空；有残留文件时不排空，写残留提醒。
  * 返回 { decision, drain, drainCooldownUntil, alert }；不排空时 decision 为 null（调用方照旧写 waiting）。
  */
 function drainStep(opts, state, blockedReason) {
   const nowMs = opts.now();
   const nowIso = new Date(nowMs).toISOString();
   let drain = state.drain;
+  const stop = (extra = {}) => {
+    if (drain) releaseDrain(opts, drain);
+    return { decision: null, drain: null, drainCooldownUntil: state.drainCooldownUntil, ...extra };
+  };
   if (drain && nowMs >= Date.parse(drain.deadline)) {
     releaseDrain(opts, drain);
     return {
@@ -541,15 +602,28 @@ function drainStep(opts, state, blockedReason) {
       alert: { kind: 'deploy-drain-timeout', reason: DRAIN_TIMEOUT_REASON },
     };
   }
+  // 没有在跑的证据（目录读不了、列不出进程）就不排空，也不 fetch。
+  const busy = selectBusyEntries(opts.hostStateDir, nowMs);
+  if (busy.unreadable) return stop();
+  if (!busy.live.length && !busy.stale.length && blockedReason !== BUSY_PROCESS_REASON) return stop();
+  const cooling = !drain && state.drainCooldownUntil && nowMs < Date.parse(state.drainCooldownUntil);
+  if (cooling) return stop();
+  const fetched = opts.runGit(opts.deployDir, ['fetch', 'origin']);
+  if (!fetched.ok) {
+    if (drain) releaseDrain(opts, drain);
+    return {
+      decision: pack('fetch-failed', `${blockedReason}；排空前拉取远端失败：${oneLine(fetched.stderr) || '无输出'}`, {}),
+      drain: null,
+      drainCooldownUntil: state.drainCooldownUntil,
+    };
+  }
   const pointers = readPointers(opts.runGit, opts.deployDir);
   const lag = lagState({ behind: pointers.behind, oldestIso: pointers.oldest, nowMs, head: pointers.head, reportedFor: null });
-  const cooling = !drain && state.drainCooldownUntil && nowMs < Date.parse(state.drainCooldownUntil);
-  const eligible = lag.lagging && !cooling && pointers.head && FULL_SHA.test(String(pointers.target || ''))
+  const eligible = lag.lagging && pointers.head && FULL_SHA.test(String(pointers.target || ''))
     && !needsApprovalLocally(opts, pointers.target);
-  if (!eligible) {
-    if (drain) releaseDrain(opts, drain);
-    return { decision: null, drain: null, drainCooldownUntil: state.drainCooldownUntil };
-  }
+  if (!eligible) return stop();
+  // 有残留时排空没用：在跑的结束后残留仍挡着空档判定，只会占满 120 分钟再冷却，反复挡住验收。
+  if (busy.stale.length) return stop({ alert: staleAlert(busy) });
   const deadline = drain ? drain.deadline : new Date(nowMs + DRAIN_MAX_MS).toISOString();
   const files = SLOT_NAMES.map((name) => slotPath(opts.hostStateDir, name));
   let holderPid = drain && opts.holderAlive(drain.holderPid) ? drain.holderPid : null;
