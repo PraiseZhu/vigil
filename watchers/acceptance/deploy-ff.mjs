@@ -90,11 +90,31 @@ const DRAIN_RELEASE_STATUSES = new Set([
 const DRAIN_HOLDER_MARK = 'deploy-ff-drain-holder';
 const DRAIN_ALERT = '部署落后太多，开始排空：占住空出来的轮次槽位，不再起新轮次（在跑的轮次不动），等它们结束就部署，最长 120 分钟。';
 const DRAIN_TIMEOUT_REASON = '排空 120 分钟仍没等到轮次空档，已放开槽位，验收照常起轮次；30 分钟后还落后会再排空。';
-// 持有进程：只做一件事，活到截止时间；到点或收到 SIGTERM 时删掉写着自己 pid 的槽位文件后退出。
+// 持有进程：活到截止时间；到点或收到 SIGTERM 时删掉写着自己 pid 的槽位文件后退出。
+// 活着的时候每秒看一次槽位，有空出来的就立刻占上（#425 复审 P2）：主循环每 3 分钟起一次轮次，部署脚本 5 分钟才跑一拍，
+// 只靠部署脚本补占，在跑的轮次一结束，空出来的槽几乎总被主循环先拿走，排空永远等不到空档。
+// 占法和宿主 tryAcquireLock 一样：O_EXCL 建文件写 {pid, startedAt}；写着活 pid 的不抢，读不出内容的按占用处理，pid 已死的删掉重来。
+export const DRAIN_HOLDER_POLL_MS = 1000;
 const DRAIN_HOLDER_CODE = [
   "const fs = require('fs');",
   'const args = process.argv.slice(1);',
   'const files = args.slice(2);',
+  'const alive = (pid) => {',
+  '  if (!Number.isInteger(pid) || pid <= 0) return false;',
+  "  try { process.kill(pid, 0); return true; } catch (error) { return Boolean(error) && error.code === 'EPERM'; }",
+  '};',
+  'const claim = (file) => {',
+  "  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), holder: 'deploy-ff' });",
+  '  for (let attempt = 0; attempt < 2; attempt += 1) {',
+  "    try { const fd = fs.openSync(file, 'wx', 0o600); try { fs.writeFileSync(fd, payload); } finally { fs.closeSync(fd); } return; } catch (error) {",
+  "      if (!error || error.code !== 'EEXIST') return;",
+  '      let lock = null;',
+  "      try { lock = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return; }",
+  "      if (!lock || typeof lock !== 'object' || lock.pid === process.pid || alive(Number(lock.pid))) return;",
+  '      try { fs.unlinkSync(file); } catch { return; }',
+  '    }',
+  '  }',
+  '};',
   'const done = () => {',
   '  for (const file of files) {',
   "    try { const lock = JSON.parse(fs.readFileSync(file, 'utf8')); if (lock && lock.pid === process.pid) fs.unlinkSync(file); } catch {}",
@@ -103,6 +123,7 @@ const DRAIN_HOLDER_CODE = [
   '};',
   "process.on('SIGTERM', done);",
   "process.on('SIGINT', done);",
+  `setInterval(() => { for (const file of files) claim(file); }, ${DRAIN_HOLDER_POLL_MS});`,
   'setTimeout(done, Math.max(0, Number(args[1]) || 0));',
 ].join('\n');
 

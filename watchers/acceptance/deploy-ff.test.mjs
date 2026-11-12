@@ -1579,6 +1579,57 @@ test('#425 持有进程到时自己放槽退出，只删写着自己 pid 的槽'
   assert.equal(fs.existsSync(other), true, '别人的槽不动');
 });
 
+// #425 复审 P2：主循环每 3 分钟起轮次、部署脚本 5 分钟一拍，只靠部署脚本补占，空出来的槽会被主循环先拿走。
+// 持有进程自己每秒补占：在跑的轮次一结束（留下死 pid 的槽，或正常收尾删掉槽文件），主循环下一拍就拿不到槽。
+const slotPid = (file) => {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8')).pid;
+  } catch {
+    return null;
+  }
+};
+async function waitUntil(check, ms = 5000) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    if (check()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return check();
+}
+
+test('#425 复审 持有进程每秒自己补占空出来的槽：在跑的轮次一结束，主循环就拿不到槽', async () => {
+  const dir = tmpDir('drain-holder-poll-');
+  const slots = ['slot-0', 'slot-1'].map((name) => path.join(dir, name));
+  const round = fakeRoundProcess();
+  let holder = null;
+  try {
+    fs.writeFileSync(slots[0], JSON.stringify({ pid: round.pid, startedAt: new Date().toISOString() }));
+    holder = spawnDrainHolder({ ttlMs: 30_000, files: slots });
+    assert.equal(Number.isInteger(holder), true);
+    assert.equal(await waitUntil(() => slotPid(slots[1]) === holder), true, '空槽自己占上');
+    assert.equal(slotPid(slots[0]), round.pid, '在跑的轮次的槽不抢');
+    assert.equal(acquireSlot({ slotsDir: dir }), null, '两个槽都占着');
+
+    // 轮次被打断：槽文件还在，写着已经死掉的 pid。
+    round.stop();
+    assert.equal(await waitDead(round.pid, 5000), true);
+    assert.equal(await waitUntil(() => slotPid(slots[0]) === holder), true, '死 pid 的槽自己补占');
+    assert.equal(acquireSlot({ slotsDir: dir }), null, '主循环下一拍拿不到槽');
+
+    // 正常收尾：轮次删掉自己的槽文件。
+    fs.unlinkSync(slots[0]);
+    assert.equal(await waitUntil(() => slotPid(slots[0]) === holder), true, '删掉的槽自己补占');
+    assert.equal(acquireSlot({ slotsDir: dir }), null);
+  } finally {
+    round.stop();
+    if (holder) {
+      try { process.kill(holder, 'SIGTERM'); } catch { /* 已经退出 */ }
+      await waitDead(holder, 5000);
+    }
+  }
+  assert.equal(fs.existsSync(slots[0]) || fs.existsSync(slots[1]), false, '收到 SIGTERM 删掉自己占的槽');
+});
+
 test('#425 部署脚本不碰写闸、不杀轮次', () => {
   const src = fs.readFileSync(SCRIPT, 'utf8');
   assert.doesNotMatch(src, /write-gate|enabledFile/);
