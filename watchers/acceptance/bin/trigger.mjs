@@ -246,6 +246,11 @@ export function shouldTrigger(task, { now, profile }) {
   // 重验任务（#363）带的是父 issue 的轮次：父还在验，子不能另开一轮。parent / standalone 都拦。
   if (task.parentLatestStatus === '验收中') return { trigger: false, reason: 'parent-in-progress' };
 
+  // 没挂到任务下的修正子 issue（#402）：和挂着的子 issue 一样，开着就等，验收结论之后关闭就开下一轮。
+  const unmounted = task.unmountedCorrections || [];
+  const closedAfterVerdict = (child) => child.closedAt && f?.finishedAt && Date.parse(child.closedAt) > Date.parse(f.finishedAt);
+  if (unmounted.some(childOpen)) return { trigger: false, reason: 'children-open' };
+
   if (isParent) {
     if ((task.children || []).some(childOpen)) return { trigger: false, reason: 'children-open' };
     const ownMerged = (task.linkedPrs || []).filter((pr) => pr.mergedAt);
@@ -261,7 +266,7 @@ export function shouldTrigger(task, { now, profile }) {
     if (!f) return { trigger: true, reason: 'no-verdict' };
     if (dispute) return { trigger: true, reason: 'adjudicated' };
     if (f.bodyVersion !== task.bodyVersion) return { trigger: true, reason: 'body-changed' };
-    if ((task.children || []).some((child) => child.closedAt && f.finishedAt && Date.parse(child.closedAt) > Date.parse(f.finishedAt))) {
+    if ([...(task.children || []), ...unmounted].some(closedAfterVerdict)) {
       return { trigger: true, reason: 'children-closed-after-verdict' };
     }
     return passedButOpenRetry(task, f, profile) || { trigger: false, reason: 'up-to-date' };
@@ -279,6 +284,7 @@ export function shouldTrigger(task, { now, profile }) {
   const mergedVersusVerdict = prMergedVersusVerdict(merged, f.createdAt);
   if (mergedVersusVerdict === 'after') return { trigger: true, reason: 'pr-merged-after-verdict' };
   if (f.bodyVersion !== task.bodyVersion) return { trigger: true, reason: 'body-changed' };
+  if (unmounted.some(closedAfterVerdict)) return { trigger: true, reason: 'children-closed-after-verdict' };
   const openRetry = passedButOpenRetry(task, f, profile);
   if (openRetry) return openRetry;
   if (mergedVersusVerdict === 'unknown') return { trigger: false, reason: 'merged-after-verdict-unknown' };

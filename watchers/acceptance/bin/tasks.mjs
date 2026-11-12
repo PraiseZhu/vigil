@@ -400,5 +400,35 @@ export async function collectTasks(github, profile) {
     const task = toTask(issue, profile, seen);
     if (task) tasks.push(task);
   }
+  attachUnmountedCorrections(tasks, seen, profile);
   return tasks;
+}
+
+/**
+ * #402：正文修正标记指向某个任务、却没挂到它下面的修正子 issue。fork 档本来就不 subissue.add；非 fork 档
+ * 在 issue.create 之后、subissue.add 之前中断会留下孤儿。盘点清单里本来就有它们（带标记的 issue 不成任务，
+ * 原来直接丢掉），这里按标记的「项」挂回那个任务的 unmountedCorrections，触发层把它们和挂着的子 issue 同样对待：
+ * 开着就等，验收结论之后关闭就开下一轮。不进 children（那是这一轮要验的树），不新增请求，只认可信作者发的。
+ */
+function attachUnmountedCorrections(tasks, seen, profile) {
+  const byRef = new Map(tasks.filter((task) => task.kind !== 'child').map((task) => [task.ref, task]));
+  for (const issue of seen.values()) {
+    if (!isTrustedAuthor(issue.author, profile)) continue;
+    const marker = parseMarker(issue.body);
+    if (!marker) continue;
+    const task = byRef.get(marker.item);
+    if (!task) continue;
+    const repo = issue.repository?.nameWithOwner;
+    if (!repo) continue;
+    const ref = issueRef(repo, issue.number);
+    if ((task.children || []).some((child) => child.ref === ref)) continue;
+    task.unmountedCorrections = task.unmountedCorrections || [];
+    if (task.unmountedCorrections.some((item) => item.ref === ref)) continue;
+    task.unmountedCorrections.push({
+      ref,
+      state: issue.state === 'CLOSED' ? 'closed' : 'open',
+      closedAt: issue.closedAt || null,
+      url: issue.url,
+    });
+  }
 }
