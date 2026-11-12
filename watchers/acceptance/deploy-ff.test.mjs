@@ -285,10 +285,8 @@ test('内容规则不再把文件名、普通环境变量和文档里的词当�
     // 对象属性、普通 import 路径、只提到 token 这个词的代码行。
     { file: 'watchers/mivo/bin/mivo-watcher.mjs', line: 782, text: 'if (Object.hasOwn(currentCursor, item.key)) nextCursor[item.key] = currentCursor[item.key];' },
     { file: 'watchers/mivo/bin/mivo-app-token.mjs', line: 98, text: "import { resolveThreadsWithApp } from './mivo-app-token.mjs';" },
-    { file: 'watchers/mivo/bin/mivo-app-token.mjs', line: 82, text: 'let token = null;' },
-    // 2026-11-05 那次误拦的原文：文档里提到 PULL_TOKEN，不在 docs/ 下。
-    { file: 'watchers/acceptance/worker/README.md', line: 43, text: '- `PULL_TOKEN`：本机拉取端带在 Authorization: Bearer 里的令牌。' },
-    { file: 'watchers/acceptance/worker/wrangler.toml', line: 4, text: '#   npx wrangler secret put PULL_TOKEN' },
+    // 测试夹具（只给测试用的数据）和测试文件一样不扫内容。
+    { file: 'watchers/acceptance/pr-link.fixture.mjs', line: 701, text: '"body": "新增可选 `appTokenCommand`"' },
   ];
   assert.deepEqual(sensitiveHits([], quiet), { files: [], lines: [] });
 });
@@ -342,16 +340,17 @@ test('返工 环境变量读取：解构、可选链、动态下标、整表枚�
     'for (const [k, v] of Object.entries(process.env)) send(k, v);',
     'const names = Object.keys(process.env);',
     'log(JSON.stringify(process.env));',
+    // #426 复审：白名单以外的 process.env 一律算（整表解构、整表交给子进程、整表打日志）；全大写密钥名不管从哪读都算。
+    'const { HOME, PATH } = process.env;',
+    'const child = spawn(cmd, args, { env: { ...process.env, LANG: "C" } });',
+    'const { GITHUB_TOKEN } = options;',
   ];
   for (const text of hit) assert.equal(sensitiveLineReason(file, text), 'env', text);
   const quiet = [
-    'const { HOME, PATH } = process.env;',
     'const debug = process.env?.MIVO_DEBUG;',
     "const home = process.env['HOME'];",
     'export function preflightSelfReviewEnabled(env = process.env) {',
-    'const child = spawn(cmd, args, { env: { ...process.env, LANG: "C" } });',
     'const entries = Object.entries(config);',
-    'const { GITHUB_TOKEN } = options;',
   ];
   for (const text of quiet) assert.equal(sensitiveLineReason(file, text), null, text);
 });
@@ -369,22 +368,26 @@ test('返工 令牌文件：path.join 的独立 token 段和模板字符串的 /
     "const file = path.join(os.homedir(), '.config', 'token');",
   ];
   for (const text of hit) assert.equal(sensitiveLineReason(file, text), 'token-file', text);
+  // 模块、文档文件名里的一段 token 放过；别处的 token 这个词一律算（分不清词法单元和令牌，宁可多要一次批准）。
   const quiet = [
-    'const parts = tokenize(line);',
     "const doc = path.join(root, 'docs', 'tokens.md');",
-    "const doc = path.join(root, 'token-notes.txt');",
     'const file = `${dir}/tokenizer.mjs`;',
-    "if (kind === 'token') count += 1;",
-    "const label = 'token';",
   ];
   for (const text of quiet) assert.equal(sensitiveLineReason(file, text), null, text);
+  for (const text of ['const parts = tokenize(line);', "const doc = path.join(root, 'token-notes.txt');", "if (kind === 'token') count += 1;", "const label = 'token';"]) {
+    assert.equal(sensitiveLineReason(file, text), 'token-word', text);
+  }
 });
 
-test('返工 敏感环境变量名按词边界：HAPPY、MONKEY、KEYBOARD 不命中，APP_ID、API_KEY、ACCESS_TOKENS 命中', async () => {
+test('#426 复审 全大写常量：HAPPY、FORBIDDEN_KEYS、WATCHED_BOT_APP 不算；读环境变量时名字里有可疑的词就算', async () => {
   const { sensitiveLineReason } = await import('./deploy-ff.mjs');
   const file = 'watchers/mivo/bin/app.mjs';
-  for (const name of ['HAPPY', 'HAPPY_HOUR', 'MONKEY_MODE', 'KEYBOARD_LAYOUT', 'WEBAPP_URL', 'TOKENIZER_MODEL', 'SECRETARY_NAME']) {
-    assert.equal(sensitiveLineReason(file, `const v = process.env.${name};`), null, name);
+  for (const name of ['HAPPY', 'HAPPY_HOUR', 'MONKEY_MODE', 'KEYBOARD_LAYOUT', 'WEBAPP_URL', 'FORBIDDEN_KEYS', 'WATCHED_BOT_APP', 'APP_FALLBACK_RULES']) {
+    assert.equal(sensitiveLineReason(file, `const ${name} = 1;`), null, name);
+  }
+  // 按名字读环境变量放过的条件更严：名字里有 TOKEN、SECRET、PASSW、KEY、APP、AUTH、CRED 中的任何一段字都不放过。
+  for (const name of ['HAPPY', 'MONKEY_MODE', 'KEYBOARD_LAYOUT', 'WEBAPP_URL', 'TOKENIZER_MODEL', 'SECRETARY_NAME', 'SOME_AUTH', 'GH_CREDS']) {
+    assert.equal(sensitiveLineReason(file, `const v = process.env.${name};`), 'env', name);
   }
   for (const name of ['MIVO_APP_ID', 'APP_PRIVATE_KEY', 'X_API_KEY', 'ACCESS_TOKENS', 'GITHUB_TOKEN', 'DB_PASSWORD', 'CLIENT_SECRET', 'TOKEN', 'app_key']) {
     assert.equal(sensitiveLineReason(file, `const v = process.env.${name};`), 'env', name);
@@ -401,6 +404,86 @@ test('返工 只跳过仓根 docs/ 下一层的 .md（issue 写的 docs/*.md）�
   // 测试文件按 issue 仍然任何目录都跳过。
   assert.equal(sensitiveLineReason('watchers/mivo/deep/x.test.mjs', text), null);
   assert.equal(sensitiveLineReason('watchers/mivo/x.test.py', text), null);
+  assert.equal(sensitiveLineReason('watchers/acceptance/pr-link.fixture.mjs', text), null, '测试夹具同测试文件');
+  assert.equal(sensitiveLineReason('watchers/acceptance/fixture.mjs', text), 'env', '只认 *.fixture.mjs');
+});
+
+// ---- #426 复审：旧规则减去白名单。读法列不完，默认拦、按白名单放 ----
+
+test('#426 复审 P1 别名、间接、多行、计算属性、无下划线连写读敏感环境变量都拦', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const file = 'watchers/mivo/bin/app.mjs';
+  for (const text of [
+    'const env = process.env;',
+    'return env.GITHUB_TOKEN;',
+    'const { GITHUB_TOKEN } = env;',
+    "const { GITHUB_TOKEN } = process['env'];",
+    "const t = process['env'].GITHUB_TOKEN;",
+    "const t = globalThis['process'].env.GITHUB_TOKEN;",
+    "const t = require('node:process').env.GITHUB_TOKEN;",
+    "import { env } from 'node:process';",
+    "const t = Reflect.get(process.env, 'GITHUB_TOKEN');",
+    '  GITHUB_TOKEN,',
+    "const { ['GITHUB_TOKEN']: t } = process.env;",
+    'const { [name]: t } = process.env;',
+    "const token = optionalConfigStrict('githubToken', { envVar: 'GITHUB_TOKEN', env });",
+    'const t = process.env.APIKEY;',
+    'const t = process.env.GITHUBTOKEN;',
+    'const t = process.env.CLIENTSECRET;',
+  ]) {
+    assert.notEqual(sensitiveLineReason(file, text), null, text);
+  }
+});
+
+test('#426 复审 P2 令牌文件的拼接、URL、实际命名，Python / shell 读环境变量，整表打日志或枚举都拦', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const cases = [
+    ['watchers/mivo/bin/app.mjs', "const raw = fs.readFileSync(dir + '/token');"],
+    ['watchers/mivo/bin/app.mjs', "const url = new URL('token', base);"],
+    ['watchers/acceptance/bin/event-run.mjs', "const file = path.join(secretsDir, 'event-pull-token');"],
+    ['watchers/mivo/bin/app.mjs', "const file = path.join(home, 'state', 'github.token');"],
+    ['watchers/cindy/bin/x.py', "token = os.environ['GITHUB_TOKEN']"],
+    ['watchers/cindy/bin/x.py', "token = os.getenv('GITHUB_TOKEN')"],
+    ['watchers/cindy/bin/x.py', "home = os.environ.get('HOME')"],
+    ['watchers/acceptance/bin/x.sh', 'curl -H "Authorization: Bearer $GITHUB_TOKEN" "$URL"'],
+    ['watchers/acceptance/bin/x.sh', 'printenv HOME'],
+    ['watchers/acceptance/bin/x.sh', 'echo "$CLIENT_SECRET"'],
+    ['watchers/mivo/bin/app.mjs', 'console.log(process.env);'],
+    ['watchers/mivo/bin/app.mjs', 'const copy = Object.assign({}, process.env);'],
+    ['watchers/mivo/bin/app.mjs', 'for (const k in process.env) send(k);'],
+    ['watchers/mivo/bin/app.mjs', 'const all = Object.entries(process.env ?? {});'],
+    ['watchers/mivo/bin/app.mjs', 'spawn(cmd, args, { env: process.env });'],
+    ['watchers/mivo/bin/app.mjs', 'console.log(process.env.valueOf());'],
+    ['watchers/mivo/bin/app.mjs', "log(process.env['toJSON']());"],
+  ];
+  for (const [file, text] of cases) assert.notEqual(sensitiveLineReason(file, text), null, `${file}: ${text}`);
+});
+
+test('#426 复审 旧规则命中、新规则放过的只有白名单三种写法（issue SC1 / SC2 点名的误报）', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const OLD = /process\.env|secrets\/|token/i;
+  const file = 'watchers/mivo/bin/app.mjs';
+  const released = [
+    "export const FILES=['mivo-pre-push.mjs','mivo-app-token.mjs'];",
+    "import { resolveThreadsWithApp } from './mivo-app-token.mjs';",
+    'export function preflightSelfReviewEnabled(env = process.env) {',
+    'if (process.env.MIVO_PREFLIGHT_SELF_REVIEW === "1") run();',
+    'delete process.env.MIVO_PREFLIGHT_SELF_REVIEW;',
+    "const home = process.env['HOME'];",
+  ];
+  for (const text of released) {
+    assert.equal(OLD.test(text), true, `旧规则命中：${text}`);
+    assert.equal(sensitiveLineReason(file, text), null, `新规则放过：${text}`);
+  }
+  // 白名单写法旁边再多一处触发，整行仍然算。
+  for (const text of [
+    "export const FILES=['mivo-app-token.mjs', 'token.json'];",
+    'if (process.env.MIVO_X) send(process.env);',
+    'export function f(env = process.env) { return env.GITHUB_TOKEN; }',
+    "import { x } from './mivo-app-token.mjs'; const t = readToken();",
+  ]) {
+    assert.notEqual(sensitiveLineReason(file, text), null, text);
+  }
 });
 
 test('#215 SC4 落后阈值：超过 5 个或超过 2 小时，同一 HEAD 只报一次', () => {
