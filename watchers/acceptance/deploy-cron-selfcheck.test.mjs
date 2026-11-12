@@ -110,6 +110,30 @@ test('#367 未知语法：变量拼接的写法 → unknown-form，不当缺失'
   assert.equal(verdict.kind, 'unknown-form');
 });
 
+// #373: the script path is on the line, but not as its own token. A form this check cannot read, not a missing entry.
+const SPACED_SCRIPT = '/srv/my deploy/deploy-ff.mjs';
+const spacedExpect = { script: SPACED_SCRIPT, args: FULL };
+const fullArgs = Object.entries(FULL).flat().join(' ');
+
+test('#373 SC1 引号包住含空格的路径 → unknown-form，不当缺失', () => {
+  const line = `2-59/5 * * * * ${INTERPRETER} "${SPACED_SCRIPT}" ${fullArgs}`;
+  const verdict = classifyCrontab({ text: `${line}\n`, exitCode: 0, expect: spacedExpect, statics: alwaysOk });
+  assert.equal(verdict.kind, 'unknown-form');
+});
+
+test('#373 SC2 路径与其它字符粘连 → unknown-form，不当缺失', () => {
+  const line = `2-59/5 * * * * ${INTERPRETER} ${SPACED_SCRIPT}:ro ${fullArgs}`;
+  const verdict = classifyCrontab({ text: `${line}\n`, exitCode: 0, expect: spacedExpect, statics: alwaysOk });
+  assert.equal(verdict.kind, 'unknown-form');
+});
+
+test('#373 SC3 真没有目标条目仍是缺失，没被放宽', () => {
+  const verdict = classifyCrontab({ text: MISSING_TWO_LINES, exitCode: 0, expect: spacedExpect, statics: alwaysOk });
+  assert.deepEqual([verdict.kind, verdict.detail], ['missing', 'absent']);
+  const near = classifyCrontab({ text: '2-59/5 * * * * node /srv/my deploy/other.mjs\n', exitCode: 0, expect: spacedExpect, statics: alwaysOk });
+  assert.equal(near.kind, 'missing', 'the same directory with another script is not the entry');
+});
+
 test('#367 未知语法：节拍写法认不出 → unknown-form', () => {
   const verdict = classifyCrontab({ text: `${entry(FULL, SCRIPT, '*/5/5')}\n`, exitCode: 0, expect, statics: alwaysOk });
   assert.equal(verdict.kind, 'unknown-form');
@@ -206,6 +230,20 @@ test('#367 SC2 读取输入文件失败不当缺失', () => {
   const missing = path.join(home, 'no-such-crontab.txt');
   const r = spawnSync(process.execPath, [BIN, ...baseArgs(home), '--crontab-file', missing, '--exit-code', '0', '--stderr-text', ''], { encoding: 'utf8' });
   assert.equal(r.status, 0, r.err);
+  assert.equal(stateOf(r).state, 'unreadable');
+  assert.equal(stateOf(r).detail, 'read-failed');
+  assert.doesNotMatch(alertsOf(home)[0].reason, /找不到部署定时条目/);
+});
+
+test('#373 SC5 crontab 文件没有读权限、又传 --exit-code 0 → 读取失败，不当缺失', (t) => {
+  if (process.getuid?.() === 0) { t.skip('root reads any file regardless of mode'); return; }
+  const home = makeHome();
+  const locked = path.join(home, 'locked-crontab.txt');
+  fs.writeFileSync(locked, `${entry()}\n`);
+  fs.chmodSync(locked, 0o000);
+  t.after(() => fs.chmodSync(locked, 0o600));
+  const r = spawnSync(process.execPath, [BIN, ...baseArgs(home), '--crontab-file', locked, '--exit-code', '0', '--stderr-text', ''], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
   assert.equal(stateOf(r).state, 'unreadable');
   assert.equal(stateOf(r).detail, 'read-failed');
   assert.doesNotMatch(alertsOf(home)[0].reason, /找不到部署定时条目/);
