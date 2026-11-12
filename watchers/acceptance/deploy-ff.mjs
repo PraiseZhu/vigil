@@ -88,6 +88,82 @@ const DRAIN_RELEASE_STATUSES = new Set([
   'ci-pending',
 ]);
 const DRAIN_HOLDER_MARK = 'deploy-ff-drain-holder';
+export const LOCK_RESTORE_FAILED_KIND = 'deploy-drain-lock-restore-failed';
+
+export function lockPidOf(content) {
+  try {
+    const data = JSON.parse(Buffer.isBuffer(content) ? content.toString('utf8') : String(content ?? ''));
+    const pid = Number(data?.pid);
+    return Number.isInteger(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+export function lockRestoreFailedReason({ tmp, movedPid, currentPid }) {
+  return `排空占槽要把一份已经判定过期的锁放回原位时，槽位上已经被别的进程写了新的活锁。被挪走的那份还在 ${tmp}（进程号 ${movedPid ?? '未知'}），新的活锁仍在原槽位（进程号 ${currentPid ?? '未知'}），两份文件都还在，没有删除。在跑的轮次不受影响，这一拍没有占用这个槽。请人核对这两份锁各自属于谁，确认后删掉那份临时文件。`;
+}
+
+export function appendLockRestoreAlert(alertsFile, { tmp, moved, current }) {
+  if (!alertsFile) return null;
+  const movedPid = lockPidOf(moved);
+  const currentPid = lockPidOf(current);
+  const entry = {
+    ts: new Date().toISOString(),
+    kind: LOCK_RESTORE_FAILED_KIND,
+    reason: lockRestoreFailedReason({ tmp, movedPid, currentPid }),
+    detail: `tmp=${tmp}; movedPid=${movedPid ?? ''}; currentPid=${currentPid ?? ''}`,
+  };
+  try {
+    appendAlert(alertsFile, entry);
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 删掉一份已确认是陈旧（pid 已死）的锁。不依赖模块作用域：fs / path / crypto 由调用方传入，
+ * 宿主和排空持有进程共用这一份实现。hooks.afterRename 只给单测注入「rename 后、link 前」；
+ * 持有进程不传 hooks。放回因 EEXIST 失败时通过 onRestoreFailed 告警，不删任何文件。
+ */
+export function removeLockIfUnchanged(file, expected, { fs, path, crypto, onRestoreFailed, hooks } = {}) {
+  const expectedBytes = Buffer.isBuffer(expected) ? expected : Buffer.from(String(expected ?? ''), 'utf8');
+  const tmp = path.join(
+    path.dirname(file),
+    `.${path.basename(file)}.stale-${process.pid}-${crypto.randomBytes(8).toString('hex')}`,
+  );
+  try {
+    fs.renameSync(file, tmp);
+  } catch (error) {
+    return false;
+  }
+  try { hooks?.afterRename?.(file, tmp); } catch { /* 测试钩子失败也不删已经挪走的文件 */ }
+  let actual;
+  try {
+    actual = fs.readFileSync(tmp);
+  } catch {
+    return false;
+  }
+  if (Buffer.compare(actual, expectedBytes) === 0) {
+    try { fs.unlinkSync(tmp); } catch { /* 已经不在 */ }
+    return true;
+  }
+  try {
+    fs.linkSync(tmp, file);
+    try { fs.unlinkSync(tmp); } catch { /* 原路径已有硬链接 */ }
+  } catch (error) {
+    if (error && error.code === 'EEXIST') {
+      let current = Buffer.alloc(0);
+      try { current = fs.readFileSync(file); } catch { /* 读不出也要告警 */ }
+      try { onRestoreFailed?.({ file, tmp, moved: actual, current }); } catch { /* 告警失败也不删文件 */ }
+    } else {
+      try { fs.renameSync(tmp, file); } catch { /* 放不回去就留下临时文件，避免丢掉活锁内容 */ }
+    }
+  }
+  return false;
+}
+
 const DRAIN_ALERT = '部署落后太多，开始排空：占住空出来的轮次槽位，不再起新轮次（在跑的轮次不动），等它们结束就部署，最长 120 分钟。';
 const DRAIN_TIMEOUT_REASON = '排空 120 分钟仍没等到轮次空档，已放开槽位，验收照常起轮次；30 分钟后还落后会再排空。';
 // 持有进程：活到截止时间；到点或收到 SIGTERM 时删掉写着自己 pid 的槽位文件后退出。
@@ -95,28 +171,23 @@ const DRAIN_TIMEOUT_REASON = '排空 120 分钟仍没等到轮次空档，已放
 // 只靠部署脚本补占，在跑的轮次一结束，空出来的槽几乎总被主循环先拿走，排空永远等不到空档。
 // 占法和宿主 tryAcquireLock 一样：O_EXCL 建文件写 {pid, startedAt}；写着活 pid 的不抢，读不出内容的按占用处理。
 // pid 已死的陈旧锁：先 rename 到唯一临时名再比对内容，还是观察过的那一份才删；不是同一份就 link 放回，不覆盖活锁。
+// 放回时若原槽位已有新锁（link 得到 EEXIST），临时文件和新锁都留下、不删，并往提醒文件写一条 deploy-drain-lock-restore-failed。
 export const DRAIN_HOLDER_POLL_MS = 1000;
-const DRAIN_HOLDER_CODE = [
+export const DRAIN_HOLDER_CODE = [
   "const fs = require('fs');",
   "const path = require('path');",
   "const crypto = require('crypto');",
   'const args = process.argv.slice(1);',
-  'const files = args.slice(2);',
+  'const alertsFile = args[2] || "";',
+  'const files = args.slice(3);',
+  `const LOCK_RESTORE_FAILED_KIND = ${JSON.stringify(LOCK_RESTORE_FAILED_KIND)};`,
+  `const lockPidOf = ${lockPidOf.toString()};`,
+  `const lockRestoreFailedReason = ${lockRestoreFailedReason.toString()};`,
   'const alive = (pid) => {',
   '  if (!Number.isInteger(pid) || pid <= 0) return false;',
   "  try { process.kill(pid, 0); return true; } catch (error) { return Boolean(error) && error.code === 'EPERM'; }",
   '};',
-  'const removeIfUnchanged = (file, expected) => {',
-  "  const tmp = path.join(path.dirname(file), '.' + path.basename(file) + '.stale-' + process.pid + '-' + crypto.randomBytes(8).toString('hex'));",
-  '  try { fs.renameSync(file, tmp); } catch { return false; }',
-  '  let actual;',
-  "  try { actual = fs.readFileSync(tmp); } catch { return false; }",
-  '  if (Buffer.compare(actual, expected) === 0) { try { fs.unlinkSync(tmp); } catch {} return true; }',
-  '  try { fs.linkSync(tmp, file); try { fs.unlinkSync(tmp); } catch {} } catch (error) {',
-  "    if (!error || error.code !== 'EEXIST') { try { fs.renameSync(tmp, file); } catch {} }",
-  '  }',
-  '  return false;',
-  '};',
+  `const removeLockIfUnchanged = ${removeLockIfUnchanged.toString()}`,
   'const claim = (file) => {',
   "  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), holder: 'deploy-ff' });",
   '  for (let attempt = 0; attempt < 2; attempt += 1) {',
@@ -127,7 +198,14 @@ const DRAIN_HOLDER_CODE = [
   '      let lock = null;',
   "      try { lock = JSON.parse(raw.toString('utf8')); } catch { return; }",
   "      if (!lock || typeof lock !== 'object' || lock.pid === process.pid || alive(Number(lock.pid))) return;",
-  '      if (!removeIfUnchanged(file, raw)) return;',
+  '      const onRestoreFailed = ({ tmp, moved, current }) => {',
+  '        if (!alertsFile) return;',
+  '        const movedPid = lockPidOf(moved);',
+  '        const currentPid = lockPidOf(current);',
+  "        const entry = { ts: new Date().toISOString(), kind: LOCK_RESTORE_FAILED_KIND, reason: lockRestoreFailedReason({ tmp: tmp, movedPid: movedPid, currentPid: currentPid }), detail: 'tmp=' + tmp + '; movedPid=' + (movedPid == null ? '' : movedPid) + '; currentPid=' + (currentPid == null ? '' : currentPid) };",
+  "        try { fs.mkdirSync(path.dirname(alertsFile), { recursive: true, mode: 0o700 }); fs.appendFileSync(alertsFile, JSON.stringify(entry) + '\\n', { mode: 0o600 }); } catch {}",
+  '      };',
+  '      if (!removeLockIfUnchanged(file, raw, { fs: fs, path: path, crypto: crypto, onRestoreFailed: onRestoreFailed })) return;',
   '    }',
   '  }',
   '};',
@@ -590,9 +668,9 @@ function pidAlive(pid) {
  * 起一个脱离本进程的持有进程（#425）：槽位锁里写它的 pid，部署脚本退出后它还活着，主循环数槽时就算占用。
  * 到 ttlMs 自己删掉写着自己 pid 的槽位文件后退出。返回 pid；起不来返回 null。
  */
-export function spawnDrainHolder({ ttlMs, files }) {
+export function spawnDrainHolder({ ttlMs, files, alertsFile }) {
   try {
-    const child = spawn(process.execPath, ['-e', DRAIN_HOLDER_CODE, DRAIN_HOLDER_MARK, String(Math.max(0, ttlMs)), ...files], {
+    const child = spawn(process.execPath, ['-e', DRAIN_HOLDER_CODE, DRAIN_HOLDER_MARK, String(Math.max(0, ttlMs)), alertsFile ? String(alertsFile) : '', ...files], {
       detached: true,
       stdio: 'ignore',
     });
@@ -633,43 +711,6 @@ function readSlot(file) {
 }
 
 /**
- * 删掉一份已确认是陈旧（pid 已死）的锁。先把当前路径上的文件 rename 到唯一临时名（拿走当时那份 inode），
- * 再比对内容：还是观察过的那一份才删；不是同一份（判死后、删前已被新轮次写成活锁）就 link 放回，
- * 不覆盖已经出现在原路径上的新锁。返回是否删除了观察过的那一份。
- */
-export function removeLockIfUnchanged(file, expectedContent) {
-  const expected = Buffer.isBuffer(expectedContent) ? expectedContent : Buffer.from(String(expectedContent ?? ''), 'utf8');
-  const tmp = path.join(
-    path.dirname(file),
-    `.${path.basename(file)}.stale-${process.pid}-${crypto.randomBytes(8).toString('hex')}`,
-  );
-  try {
-    fs.renameSync(file, tmp);
-  } catch (error) {
-    return false;
-  }
-  let actual;
-  try {
-    actual = fs.readFileSync(tmp);
-  } catch {
-    return false;
-  }
-  if (Buffer.compare(actual, expected) === 0) {
-    try { fs.unlinkSync(tmp); } catch { /* 已经不在 */ }
-    return true;
-  }
-  try {
-    fs.linkSync(tmp, file);
-    try { fs.unlinkSync(tmp); } catch { /* 原路径已有硬链接 */ }
-  } catch (error) {
-    if (error?.code !== 'EEXIST') {
-      try { fs.renameSync(tmp, file); } catch { /* 放不回去就留下临时文件，避免丢掉活锁内容 */ }
-    }
-  }
-  return false;
-}
-
-/**
  * 占一个空槽，锁格式和宿主的 tryAcquireLock 一样（O_EXCL 建文件，内容 {pid, startedAt}），pid 写持有进程的。
  * 已经写着持有进程 pid 的算自己的；写着活 pid 的是在跑的轮次，不抢；读不出内容的按占用处理；
  * pid 已死的陈旧锁要再核一次还是同一份才删（见 removeLockIfUnchanged）。
@@ -705,7 +746,13 @@ export function claimSlot(file, holderPid, nowMs, hooks = {}) {
       if (current.pid === holderPid) return true;
       if (pidAlive(Number(current.pid))) return false;
       hooks.afterDeadPid?.(file, raw);
-      if (!removeLockIfUnchanged(file, raw)) return false;
+      if (!removeLockIfUnchanged(file, raw, {
+        fs,
+        path,
+        crypto,
+        hooks,
+        onRestoreFailed: ({ tmp, moved, current }) => appendLockRestoreAlert(hooks.alertsFile, { tmp, moved, current }),
+      })) return false;
     }
   }
   return false;
@@ -832,11 +879,11 @@ function drainStep(opts, state, blockedReason) {
   const deadline = drain ? drain.deadline : new Date(nowMs + DRAIN_MAX_MS).toISOString();
   const files = SLOT_NAMES.map((name) => slotPath(opts.hostStateDir, name));
   let holderPid = drain && opts.holderAlive(drain.holderPid) ? drain.holderPid : null;
-  if (!holderPid) holderPid = opts.spawnHolder({ ttlMs: Date.parse(deadline) - nowMs, files });
+  if (!holderPid) holderPid = opts.spawnHolder({ ttlMs: Date.parse(deadline) - nowMs, files, alertsFile: opts.alertsFile });
   if (!Number.isInteger(holderPid)) {
     return { decision: null, drain: null, drainCooldownUntil: state.drainCooldownUntil };
   }
-  const slots = SLOT_NAMES.filter((name) => claimSlot(slotPath(opts.hostStateDir, name), holderPid, nowMs));
+  const slots = SLOT_NAMES.filter((name) => claimSlot(slotPath(opts.hostStateDir, name), holderPid, nowMs, { alertsFile: opts.alertsFile }));
   const next = {
     status: 'draining',
     holderPid,

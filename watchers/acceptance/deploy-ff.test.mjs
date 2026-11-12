@@ -1,6 +1,7 @@
 // 等无轮次空档再快进部署。临时仓不走网络：origin 配成公开地址，再用 insteadOf 指回本地 bare。
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -17,6 +18,9 @@ import {
   lagState,
   parseAddedLines,
   removeLockIfUnchanged,
+  appendLockRestoreAlert,
+  DRAIN_HOLDER_CODE,
+  LOCK_RESTORE_FAILED_KIND,
   repoFromOrigin,
   runDeploy,
   sensitiveHits,
@@ -2014,12 +2018,12 @@ test('SC4 判死后、删前被新轮次写入的活锁必须保留', () => {
 
   // 直接调用：路径上已经是活锁，但删除时拿的是先前观察到的死锁内容。
   fs.writeFileSync(file, live);
-  assert.equal(removeLockIfUnchanged(file, stale), false);
+  assert.equal(removeLockIfUnchanged(file, stale, { fs, path, crypto }), false);
   assert.equal(fs.readFileSync(file, 'utf8'), live, '内容对不上时活锁保留');
 
   // 同一份死锁才删。
   fs.writeFileSync(file, stale);
-  assert.equal(removeLockIfUnchanged(file, stale), true);
+  assert.equal(removeLockIfUnchanged(file, stale, { fs, path, crypto }), true);
   assert.equal(fs.existsSync(file), false, '确认是同一份陈旧锁才删');
 
   // claimSlot：判死后、删前插入新轮次写入的活锁，不得占槽、不得删活锁。
@@ -2043,8 +2047,93 @@ test('SC4 判死后、删前被新轮次写入的活锁必须保留', () => {
   assert.equal(fs.readFileSync(file, 'utf8'), live);
 
   const src = fs.readFileSync(SCRIPT, 'utf8');
-  assert.match(src, /removeIfUnchanged/);
+  assert.match(src, /removeLockIfUnchanged/);
   assert.match(src, /linkSync/);
+});
+
+const staleTemps = (dir, base) => fs.readdirSync(dir)
+  .filter((name) => name.startsWith(`.${base}.stale-`))
+  .map((name) => path.join(dir, name));
+
+const writeLock = (file, payload) => {
+  try { fs.unlinkSync(file); } catch { /* 还没有 */ }
+  const fd = fs.openSync(file, 'wx', 0o600);
+  try { fs.writeFileSync(fd, typeof payload === 'string' ? payload : JSON.stringify(payload)); }
+  finally { fs.closeSync(fd); }
+};
+
+test('SC4 放回因 EEXIST 失败时保留临时文件和新锁并告警', () => {
+  const dir = tmpDir('lock-eexist-');
+  const file = path.join(dir, 'slot-0');
+  const alertsFile = path.join(dir, 'alerts.jsonl');
+  const dead = deadPid();
+  const stale = JSON.stringify({ pid: dead, startedAt: '2026-11-12T12:00:00.000Z' });
+  const moved = JSON.stringify({ pid: 424242, startedAt: '2026-11-13T01:00:00.000Z' });
+  const newer = JSON.stringify({ pid: process.pid, startedAt: '2026-11-13T01:01:00.000Z' });
+  fs.writeFileSync(file, moved);
+  assert.equal(removeLockIfUnchanged(file, stale, {
+    fs,
+    path,
+    crypto,
+    hooks: { afterRename() { writeLock(file, newer); } },
+    onRestoreFailed: ({ tmp, moved, current }) => appendLockRestoreAlert(alertsFile, { tmp, moved, current }),
+  }), false);
+  assert.equal(fs.readFileSync(file, 'utf8'), newer, '新锁保留');
+  const temps = staleTemps(dir, 'slot-0');
+  assert.equal(temps.length, 1, '临时文件保留');
+  assert.equal(fs.readFileSync(temps[0], 'utf8'), moved);
+  const rows = readAlerts(alertsFile);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, LOCK_RESTORE_FAILED_KIND);
+  assert.match(rows[0].reason, new RegExp(temps[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(rows[0].reason, /424242/);
+  assert.match(rows[0].reason, new RegExp(String(process.pid)));
+  assert.match(rows[0].reason, /没有删除/);
+  assert.match(rows[0].reason, /请人核对/);
+  assert.match(rows[0].detail, new RegExp(temps[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(rows[0].detail, /movedPid=424242/);
+  assert.match(rows[0].detail, new RegExp(`currentPid=${process.pid}`));
+});
+
+test('SC4 持有进程与宿主共用同一份 removeLockIfUnchanged 源码', () => {
+  const shared = removeLockIfUnchanged.toString();
+  assert.equal(DRAIN_HOLDER_CODE.includes(shared), true, '持有进程注入的是同一函数源码');
+  assert.equal(DRAIN_HOLDER_CODE.includes('applyTestHook'), false);
+  assert.equal(DRAIN_HOLDER_CODE.includes('DEPLOY_FF_TEST_LOCK_HOOK'), false);
+  assert.match(DRAIN_HOLDER_CODE, /onRestoreFailed/);
+  assert.match(DRAIN_HOLDER_CODE, /alertsFile/);
+
+  // 同一实现、持有进程那种告警回调：rename 后、link 前出现新锁时，新锁和临时文件都保留并写出提醒。
+  const dir = tmpDir('lock-shared-');
+  const file = path.join(dir, 'slot-0');
+  const alertsFile = path.join(dir, 'alerts.jsonl');
+  const stale = JSON.stringify({ pid: deadPid(), startedAt: '2026-11-12T12:00:00.000Z' });
+  const moved = JSON.stringify({ pid: 424242, startedAt: '2026-11-13T01:00:00.000Z' });
+  const newer = JSON.stringify({ pid: process.pid, startedAt: '2026-11-13T01:01:00.000Z' });
+  fs.writeFileSync(file, moved);
+  const onRestoreFailed = ({ tmp, moved: movedBuf, current }) => appendLockRestoreAlert(alertsFile, { tmp, moved: movedBuf, current });
+  assert.equal(removeLockIfUnchanged(file, stale, {
+    fs,
+    path,
+    crypto,
+    onRestoreFailed,
+    hooks: { afterRename() { writeLock(file, newer); } },
+  }), false);
+  assert.equal(fs.readFileSync(file, 'utf8'), newer, '新锁保留');
+  const temps = staleTemps(dir, 'slot-0');
+  assert.equal(temps.length, 1, '临时文件保留');
+  assert.equal(fs.readFileSync(temps[0], 'utf8'), moved);
+  const rows = readAlerts(alertsFile);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, LOCK_RESTORE_FAILED_KIND);
+  assert.match(rows[0].reason, new RegExp(temps[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(rows[0].reason, /424242/);
+  assert.match(rows[0].reason, new RegExp(String(process.pid)));
+  assert.match(rows[0].reason, /没有删除/);
+  assert.match(rows[0].reason, /请人核对/);
+  assert.match(rows[0].detail, new RegExp(temps[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(rows[0].detail, /movedPid=424242/);
+  assert.match(rows[0].detail, new RegExp(`currentPid=${process.pid}`));
 });
 
 test('#425 部署脚本不碰写闸、不杀轮次', () => {
