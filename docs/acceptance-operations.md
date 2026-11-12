@@ -169,7 +169,7 @@ App 装在多个 owner 上、读和写又是两个 App 时，用 `apps` 配。�
 |---|---|
 | 落在 `apps.read.owners` 名下**单个仓**上的只读查询（议题正文、轮次评论、PR 检查等按 `owner/name` 定位的读） | ①读 App |
 | 评论 / issue / sub-issue 写：`comment.create/update`、`issue.create/edit/close/reopen`、`subissue.add` | ②写 App |
-| 推分支 / PR / workflow：`branch.push`、`pr.create`、`pr.ready`、`pr.update-branch`、`ci.rerun` | ②写 App |
+| 推分支 / PR / workflow：`branch.push`、`pr.create`、`pr.ready`、`pr.update-branch`、`ci.rerun`、`pr.edit` | ②写 App |
 | 跨仓盘点、搜索、`viewer`、看板读、别人组织的仓 | 账号令牌 |
 | 看板写（`project.field.set`） | 账号令牌（App 看不到个人账号下的 Projects v2） |
 | 合并（`pr.merge`）与其它没列出的写类型 | 账号令牌（不在表里就按账号令牌，不猜） |

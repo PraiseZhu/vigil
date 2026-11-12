@@ -42,6 +42,17 @@ export const PR_HEAD_QUERY = `query ($owner: String!, $name: String!, $number: I
   }
 }`;
 
+/** pr.edit（#171）核对新旧正文用：写闸自己读当前正文，不信调用方交来的旧正文。只在宿主写闸里用，沙箱读不到。 */
+export const PR_BODY_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number
+      isDraft
+      body
+    }
+  }
+}`;
+
 /** 修正轮盯 CI 用的固定查询：head、Draft、落后状态、检查名 / 结论 / workflow run id。 */
 export const PR_STATUS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -341,7 +352,8 @@ export function createCorrectionCheck({ github, profile, binding, scopeOf, readI
       }
       case 'pr.ready':
       case 'pr.update-branch':
-      case 'ci.rerun': {
+      case 'ci.rerun':
+      case 'pr.edit': {
         if (!allowedRepos.has(action.repo)) return reject('not-allowed', `${action.repo} 不是这个修正轮的仓`);
         const [owner, name] = String(action.repo || '').split('/');
         const data = await github.graphql(PR_HEAD_QUERY, { owner, name, number: Number(action.pr) });
@@ -372,6 +384,14 @@ export function createCorrectionCheck({ github, profile, binding, scopeOf, readI
         const expected = action.expectedHeadSha || action.headSha;
         if (expected && String(expected) !== String(pr.headRefOid || '')) {
           return reject('head-moved', `动作里的 head ${expected} 和 PR 上的 ${pr.headRefOid || '(空)'} 不一致`);
+        }
+        if (action.type === 'pr.edit') {
+          // 只在转 Ready 前改；新旧正文由写闸自己读当前正文对比，只放行验收对照的状态/证据和未执行的验证。
+          const current = (await github.graphql(PR_BODY_QUERY, { owner, name, number: Number(action.pr) }))?.repository?.pullRequest;
+          if (!current) return reject('not-allowed', '找不到 PR');
+          if (current.isDraft !== true) return reject('not-allowed', 'PR 已经不是 Draft：转 Ready 之后不再改正文');
+          const edit = module.checkBodyEdit(current.body || '', action.body);
+          if (!edit.ok) return reject(edit.reason, edit.detail);
         }
         if (action.type === 'ci.rerun') {
           // 只重跑这个 PR 当前 head 上的 workflow run：runId 由写闸自己查，不信调用方。

@@ -41,8 +41,8 @@ export const WRITE_TYPES = Object.freeze([
   'pr.ready',
 ]);
 
-/** #60 的两个写闸动作：不放进 #44 的 11 类里，但同样经 write() 执行。 */
-export const GATE_ACTION_WRITE_TYPES = Object.freeze(['pr.update-branch', 'ci.rerun']);
+/** 写闸动作（#60 两个、#171 一个）：不放进 #44 的 11 类里，但同样经 write() 执行。 */
+export const GATE_ACTION_WRITE_TYPES = Object.freeze(['pr.update-branch', 'ci.rerun', 'pr.edit']);
 
 const WRITE_TYPE_SET = new Set([...WRITE_TYPES, ...GATE_ACTION_WRITE_TYPES]);
 const BOARD_FIELDS = new Set(['验收', '裁决']);
@@ -676,6 +676,7 @@ export const WRITE_APP_ROLE = Object.freeze({
   'pr.ready': 'write',
   'pr.update-branch': 'write',
   'ci.rerun': 'write',
+  'pr.edit': 'write',
 });
 
 /**
@@ -1650,6 +1651,11 @@ export function createGithub({ profile, run, fetchImpl, sleep, now, fallbackLog,
       case 'ci.rerun': {
         await ghApi('POST', `repos/${action.repo}/actions/runs/${action.runId}/rerun-failed-jobs`, undefined, writerToken);
         return { pr: action.pr, repo: action.repo, runId: action.runId };
+      }
+      case 'pr.edit': {
+        // 只改正文（#171）：写闸已核对过只动了验收对照的状态/证据和未执行的验证；标题、head、base 不在请求里。
+        await ghApi('PATCH', `repos/${action.repo}/pulls/${action.pr}`, { body: action.body }, writerToken);
+        return { pr: action.pr, repo: action.repo };
       }
       default:
         throw new Error(`未知写操作类型：${action.type}`);

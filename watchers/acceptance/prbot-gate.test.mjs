@@ -957,3 +957,51 @@ test('#170 修正 PR 正文第三行指向修正子 issue；原三行逐字不�
     assert.ok(['待验证', '通过', '未通过', '人工手测'].includes(status), status);
   }
 });
+
+test('#171 SC1 SC3 修正轮经写闸 pr.edit：只改验收对照和未执行的验证才放行；非 Draft、别的分支、改别处一律 4', async () => {
+  const { PR_BODY_QUERY } = await import('./host/prbot-gate-check.mjs');
+  const { home, profile, world } = setup();
+  const issue = `${REPO}#9`;
+  const state = { issue, prRepo: REPO, root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1,
+    correctionFacts: { scText: 'SC1 导出按钮在空列表时禁用。验证：unit', why: '空列表时仍可点击' } };
+  const oldBody = correctionPrBody(state, { root: `${REPO}#1`, item: `${REPO}#2`, sc: 3, round: 1 });
+  const row = oldBody.split('\n').findIndex((line) => /^\|\s*SC1\b/.test(line));
+  const newBody = oldBody.split('\n').map((line, at) => {
+    if (at !== row) return line;
+    const cells = line.split('|');
+    cells[2] = ' 通过 ';
+    cells[3] = ' CI test 通过 ';
+    return cells.join('|');
+  }).join('\n');
+  const claim = await makeGate({ home, profile, github: correctionGithub(world), binding: { kind: 'correction', issue, round: 1, commentId: null } })
+    .handle({ type: 'comment.create', repo: REPO, issue: 9, body: '[修正机] 第 1 轮：修正中', dedupeKey: 'claim' });
+  const written = [];
+  const gateWith = ({ isDraft = true, prHead } = {}) => {
+    const base = correctionGithub(world, { prHead, onWrite: (action) => { written.push(action); return { ok: true }; } });
+    return makeGate({
+      home, profile,
+      github: { ...base, async graphql(query, variables) {
+        if (query === PR_BODY_QUERY) return { repository: { pullRequest: { number: variables.number, isDraft, body: oldBody } } };
+        return base.graphql(query, variables);
+      } },
+      binding: { kind: 'correction', issue, round: 1, commentId: claim.body.commentId },
+    });
+  };
+  const edit = (body, extra = {}, key = 'edit') => ({ type: 'pr.edit', repo: REPO, pr: 12, body, dedupeKey: key, ...extra });
+
+  const ok = await gateWith().handle(edit(newBody));
+  assert.equal(ok.code, 0, JSON.stringify(ok));
+  assert.deepEqual(written.map((action) => [action.type, action.pr, action.body === newBody]), [['pr.edit', 12, true]]);
+
+  const firstLine = await gateWith().handle(edit(newBody.replace(`任务 issue：${REPO}#1`, `任务 issue：${REPO}#5`), {}, 'edit-first-line'));
+  assert.deepEqual([firstLine.code, firstLine.body.reason], [4, 'outside-editable']);
+  const sneaky = await gateWith().handle(edit(newBody.replace('CI test 通过', 'Closes #1'), {}, 'edit-closes'));
+  assert.deepEqual([sneaky.code, sneaky.body.reason], [4, 'closing-keyword']);
+  const titled = await gateWith().handle(edit(newBody, { title: '换个标题' }, 'edit-title'));
+  assert.deepEqual([titled.code, titled.body.reason], [4, 'field-not-editable']);
+  const ready = await gateWith({ isDraft: false }).handle(edit(newBody, {}, 'edit-ready'));
+  assert.deepEqual([ready.code, ready.body.reason], [4, 'not-allowed']);
+  const otherBranch = await gateWith({ prHead: { headRefName: 'acceptance/1-2-sc4' } }).handle(edit(newBody, {}, 'edit-other-branch'));
+  assert.deepEqual([otherBranch.code, otherBranch.body.reason], [4, 'not-allowed']);
+  assert.equal(written.length, 1, '被拒的都没有写');
+});

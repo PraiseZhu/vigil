@@ -28,6 +28,7 @@ import { acquireLock, appendAlert, hostPaths, releaseLock } from './paths.mjs';
 import { run as procRun } from './proc.mjs';
 import * as prUpdateBranchAction from './gate-actions/pr-update-branch.mjs';
 import * as ciRerunAction from './gate-actions/ci-rerun.mjs';
+import * as prEditAction from './gate-actions/pr-edit.mjs';
 import {
   createCorrectionCheck,
   MAIN_CHECKS_QUERY,
@@ -45,6 +46,7 @@ export const GATE_LOCK_WAIT_MS = 30000;
 const GATE_ACTIONS = new Map([
   [prUpdateBranchAction.type, prUpdateBranchAction],
   [ciRerunAction.type, ciRerunAction],
+  [prEditAction.type, prEditAction],
 ]);
 const GATE_ACTION_TYPES = [...GATE_ACTIONS.keys()];
 const ALLOWED_TYPES = new Set([...WRITE_TYPES, ...GATE_ACTION_TYPES, 'read.graphql', 'probe']);
