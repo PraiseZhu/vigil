@@ -830,6 +830,34 @@ test('SC12 pi 一个文件都没改：不推、不开 PR，需人工处理（no-
   assert.equal(human.reason, 'no-change');
 });
 
+test('修正轮把 issue 正文写入沙箱上下文，提示里写明路径且禁止 gh/curl', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  const correction = addCorrection(world);
+  const piCalls = [];
+  const result = await runOnce({
+    world,
+    piCalls,
+    diff: '',
+    overrides: {
+      piRunner: async ({ prompt, roundDir }) => {
+        if (!piCalls.length) piCalls.push({});
+        const last = piCalls.at(-1);
+        last.prompt = prompt;
+        last.roundDir = roundDir;
+        const file = path.join(roundDir, 'context', 'issue.md');
+        last.context = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+        return { ok: true, stdout: '', code: 0 };
+      },
+    },
+  });
+  assert.equal(result.code, 1);
+  assert.equal(piCalls.length, 1);
+  assert.equal(piCalls[0].context, correction.body);
+  assert.ok(piCalls[0].prompt.includes(`修正子 issue 的正文（含验收项原文）在沙箱可读文件：${path.join(piCalls[0].roundDir, 'context', 'issue.md')}`));
+  assert.match(piCalls[0].prompt, /不要直接调用 gh 或 curl/);
+  assert.equal(piCalls[0].context.includes('SC3 把结果写进轮次评论'), true);
+});
+
 test('SC1 本地状态丢了：接手 GitHub 上进行中的同一条修正轮评论，不再认领新一轮', async () => {
   const world = defaultTree({ roundStatus: '要修' });
   const correction = addCorrection(world);

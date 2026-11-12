@@ -243,6 +243,7 @@ function notifyOnce(paths, event, { round, now = () => Date.now(), profile } = {
 export async function correctionPrecheck({ github, profile, issue, hostConfig }) {
   const correction = await readComments(github, issue);
   if (!correction) return { action: 'idle', reason: 'missing' };
+  if (isBlankIssueBody(correction.body)) return { action: 'missing-body', reason: 'missing-issue-body', correction };
   const marker = parseMarker(correction.body);
   if (!marker || marker.root == null) return { action: 'idle', reason: 'no-marker' };
   const correctionRounds = parseCorrectionRounds(correction.comments?.nodes || [], profile);
@@ -376,7 +377,7 @@ export async function discoverCorrections({ github, profile, now = () => Date.no
           continue;
         }
         if (pre.action === 'idle') continue;
-        if ((pre.action === 'limit' || pre.action === 'unconfigured') && paths && alreadyNotified(paths, correction.ref, notifyKey('needs-human', pre.round, pre.reason))) continue;
+        if ((pre.action === 'limit' || pre.action === 'unconfigured' || pre.action === 'missing-body') && paths && alreadyNotified(paths, correction.ref, notifyKey('needs-human', pre.round, pre.reason))) continue;
       }
       out.push({
         issue: correction.ref,
@@ -720,7 +721,42 @@ function readNotes(roundDir, stdout) {
   return notes;
 }
 
-function buildPrompt(state) {
+export function isBlankIssueBody(body) {
+  return String(body ?? '').trim() === '';
+}
+
+/** 沙箱可读的修正子 issue 正文：写在轮次目录下，不进工作树，避免被提交。 */
+export const SANDBOX_ISSUE_CONTEXT_REL = path.join('context', 'issue.md');
+
+export function sandboxIssueContextPath(roundDir) {
+  if (typeof roundDir !== 'string' || !path.isAbsolute(roundDir)) {
+    throw new Error('sandboxIssueContextPath 需要绝对路径的 roundDir');
+  }
+  return path.join(roundDir, SANDBOX_ISSUE_CONTEXT_REL);
+}
+
+/**
+ * 把修正子 issue 正文写进沙箱可读的上下文文件。正文缺失或只有空白就抛错，不写文件、不跑模型。
+ */
+export function writeSandboxIssueContext(roundDir, body) {
+  if (typeof roundDir !== 'string' || !path.isAbsolute(roundDir)) {
+    throw new Error('writeSandboxIssueContext 需要绝对路径的 roundDir');
+  }
+  if (isBlankIssueBody(body)) {
+    const error = new Error('修正子 issue 正文缺失，无法写入沙箱上下文，不跑模型');
+    error.code = 'missing-issue-body';
+    throw error;
+  }
+  const file = sandboxIssueContextPath(roundDir);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, String(body), { mode: 0o600 });
+  return file;
+}
+
+export function buildPrompt(state, { issueContextPath } = {}) {
+  if (typeof issueContextPath !== 'string' || !path.isAbsolute(issueContextPath)) {
+    throw new Error('buildPrompt 需要沙箱可读的 issue 正文绝对路径');
+  }
   const must = (state.mustFix || []).map((item) => `- ${item.ref} SC${item.sc}`).join('\n') || '-（没有列出的条目）';
   const conflict = state.mergeMain
     ? ['', '这一次是解决冲突：PR 和最新 main 冲突了。先 git merge origin/main，解决冲突后提交，再确认测试照样通过。']
@@ -732,6 +768,10 @@ function buildPrompt(state) {
     `验收项：${state.item} SC${state.sc}`,
     '必修：',
     must,
+    '',
+    `修正子 issue 的正文（含验收项原文）在沙箱可读文件：${issueContextPath}`,
+    '先读这个文件，再判断验收项是否成立、要不要改代码。',
+    '不要直接调用 gh 或 curl 去拉取 issue、评论或其它网络资源。',
     '',
     '要求：',
     '1. 先写一个会变红的复现测试，再写最小修复。',
@@ -1553,29 +1593,41 @@ export async function runPrbotCorrection({
     return 1;
   }
   if (pre.action === 'idle') return pre.reason === 'finished' ? 0 : 1;
-  const { marker, correctionRounds } = pre;
-  const latestCorrection = pre.latest;
-  if (pre.action === 'limit' || pre.action === 'unconfigured') {
+  if (pre.action === 'missing-body' || pre.action === 'limit' || pre.action === 'unconfigured') {
     // 不认领：GitHub 上什么都不写（修正轮绑定只认第 1、2 轮的认领）。需人工处理同一原因只报一次。
+    if (pre.action === 'missing-body') {
+      appendAlert(paths, {
+        kind: 'prbot-missing-issue-body',
+        issue,
+        reason: '修正子 issue 正文缺失，不跑修正轮',
+        now,
+        profile: acceptanceProfile,
+      });
+    }
+    const marker = pre.marker;
     notifyOnce(
       paths,
       {
         type: 'needs-human',
         issue,
-        root: marker.root,
-        item: marker.item,
-        sc: [marker.sc],
+        root: marker?.root,
+        item: marker?.item,
+        sc: marker?.sc != null ? [marker.sc] : [],
         repo: parseRef(issue).repo,
         reason: pre.reason,
         detail:
-          pre.action === 'limit'
-            ? `同一修正子 issue 最多 ${MAX_CORRECTION_ROUNDS} 个修正轮，已用完`
-            : `host.json 的 prbot.repos["${parseRef(issue).repo}"].handoff 没有显式配置（owner / watcher）`,
+          pre.action === 'missing-body'
+            ? '修正子 issue 正文缺失，无法把验收项原文交给沙箱，不认领、不跑模型'
+            : pre.action === 'limit'
+              ? `同一修正子 issue 最多 ${MAX_CORRECTION_ROUNDS} 个修正轮，已用完`
+              : `host.json 的 prbot.repos["${parseRef(issue).repo}"].handoff 没有显式配置（owner / watcher）`,
       },
       { round: pre.round, ...eventOptions },
     );
     return 1;
   }
+  const { marker, correctionRounds } = pre;
+  const latestCorrection = pre.latest;
 
   // 和验收轮共用的内存门与 2 个槽（SC1）。
   const available = readMemAvailable(meminfoPath);
@@ -1696,6 +1748,7 @@ export async function runPrbotCorrection({
     state.rootRepo = parseRef(marker.root).repo;
     state.prRepo = state.prRepo || state.rootRepo;
     state.branch = correctionBranch(marker);
+    if (!isBlankIssueBody(pre.correction?.body)) state.correctionBody = pre.correction.body;
     state.correctionFacts = correctionIssueFacts(pre.correction?.body);
     state.correctionDetails = correctionIssueDetails(pre.correction?.body);
     state.handoff = handoffFor(settings, state.repo);
@@ -1881,6 +1934,22 @@ export async function runPrbotCorrection({
           }
         }
         const roundDir = path.join(paths.roundRunDir, 'prbot', `${stateKey(issue)}-r${state.round}`);
+        let issueContextPath;
+        try {
+          issueContextPath = writeSandboxIssueContext(roundDir, state.correctionBody || pre.correction?.body);
+        } catch (error) {
+          appendAlert(paths, {
+            kind: 'prbot-missing-issue-body',
+            issue,
+            round: state.round,
+            reason: String(error?.message || error),
+            now,
+            profile: acceptanceProfile,
+          });
+          state.failureReason = 'missing-issue-body';
+          state.stage = 'stop';
+          continue;
+        }
         state.piIterations = (state.piIterations || 0) + 1;
         const result = await pi({
           home,
@@ -1889,7 +1958,7 @@ export async function runPrbotCorrection({
           roundDir,
           worktree: state.worktree,
           piCommand: piCommandFor(settings),
-          prompt: buildPrompt(state),
+          prompt: buildPrompt(state, { issueContextPath }),
           env,
           run,
           issue,
