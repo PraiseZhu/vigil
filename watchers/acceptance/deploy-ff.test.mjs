@@ -12,10 +12,12 @@ import {
   classifyChecks,
   defaultRunGit,
   formatResult,
+  isSensitivePath,
   lagState,
   parseAddedLines,
   repoFromOrigin,
   runDeploy,
+  sensitiveHits,
 } from './deploy-ff.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -263,12 +265,66 @@ test('#215 新增行解析忽略文件头和删除行', () => {
   ].join('\n');
   const lines = parseAddedLines(diff);
   assert.deepEqual(lines.map((row) => row.text), ['plain']);
-  assert.equal(CONTENT_HITS(lines), false);
+  assert.deepEqual(sensitiveHits([], lines), { files: [], lines: [] });
 });
 
-function CONTENT_HITS(lines) {
-  return lines.some((row) => /process\.env|secrets\/|token/i.test(row.text));
-}
+// ---- 内容规则只认真敏感，文件名和普通环境变量不算 ----
+
+test('内容规则不再把文件名、普通环境变量和文档里的词当成敏感改动', () => {
+  // ea4e104 的 deploy.mjs:10：token 只是文件名里的一段。
+  const filesLine = "export const FILES=['mivo-pre-push.mjs','mivo-app-token.mjs','mivo-ci.mjs'];";
+  const quiet = [
+    { file: 'watchers/mivo/deploy.mjs', line: 10, text: filesLine },
+    // e04162a：自审开关的环境变量读取，名字里没有令牌/密钥。
+    { file: 'watchers/mivo/bin/profile.mjs', line: 94, text: 'export function preflightSelfReviewEnabled(env = process.env) {' },
+    { file: 'watchers/mivo/self-review.test.mjs', line: 15, text: 'const before = process.env.MIVO_PREFLIGHT_SELF_REVIEW;' },
+    // 测试文件和 docs/*.md 不扫内容，哪怕它真的写了敏感词。
+    { file: 'watchers/mivo/app-token.test.mjs', line: 26, text: "const TOKEN = 'fake-installation-token-for-test';" },
+    { file: 'docs/acceptance-operations.md', line: 219, text: '回退账号令牌重试一次，记 app-token-fallback，抛 AppOnlyError' },
+    { file: 'docs/acceptance-operations.md', line: 227, text: 'process.env.GITHUB_TOKEN=xxx' },
+    // 对象属性、普通 import 路径、只提到 token 这个词的代码行。
+    { file: 'watchers/mivo/bin/mivo-watcher.mjs', line: 782, text: 'if (Object.hasOwn(currentCursor, item.key)) nextCursor[item.key] = currentCursor[item.key];' },
+    { file: 'watchers/mivo/bin/mivo-app-token.mjs', line: 98, text: "import { resolveThreadsWithApp } from './mivo-app-token.mjs';" },
+    { file: 'watchers/mivo/bin/mivo-app-token.mjs', line: 82, text: 'let token = null;' },
+    // 2026-11-05 那次误拦的原文：文档里提到 PULL_TOKEN，不在 docs/ 下。
+    { file: 'watchers/acceptance/worker/README.md', line: 43, text: '- `PULL_TOKEN`：本机拉取端带在 Authorization: Bearer 里的令牌。' },
+    { file: 'watchers/acceptance/worker/wrangler.toml', line: 4, text: '#   npx wrangler secret put PULL_TOKEN' },
+  ];
+  assert.deepEqual(sensitiveHits([], quiet), { files: [], lines: [] });
+});
+
+test('内容规则仍然命中敏感环境变量、密钥/令牌文件、App 身份和端口', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const cases = [
+    ['const token = process.env.GITHUB_TOKEN;', 'env'],
+    ["const key = process.env['X_API_KEY'];", 'env'],
+    ['const secret = process.env.DB_PASSWORD;', 'env'],
+    ['const app = process.env.MIVO_APP_ID;', 'env'],
+    ["const conf = readFileSync(path.join(home, 'secrets/demo.json'));", 'secrets-path'],
+    ["const key = readFileSync(path.join(home, 'certs/server.key'));", 'key-file'],
+    ["const blob = readFileSync(path.join(home, 'token.json'));", 'token-file'],
+    ["const blob = readFileSync(path.join(home, '.token'));", 'token-file'],
+    ["const blob = readFileSync(path.join(home, 'vigil/token'));", 'token-file'],
+    ['if (profile.appOnly) block();', 'appOnly'],
+    ['server.listen(8080);', 'port'],
+    ['const config = { port: 3000 };', 'port'],
+  ];
+  for (const [text, rule] of cases) {
+    assert.equal(sensitiveLineReason('watchers/mivo/bin/app.mjs', text), rule, text);
+    const hits = sensitiveHits([], [{ file: 'watchers/mivo/bin/app.mjs', line: 7, text }]);
+    assert.deepEqual(hits.lines, [{ file: 'watchers/mivo/bin/app.mjs', line: 7, text }], text);
+  }
+});
+
+test('内容规则收窄后，路径规则仍然照旧', () => {
+  // 6b55d8f 命中 trigger.mjs 和 host/prbot.mjs 是路径规则，按设计保留。
+  const hits = sensitiveHits(['watchers/acceptance/bin/trigger.mjs', 'watchers/acceptance/host/prbot.mjs', 'package-lock.json'], []);
+  assert.deepEqual(hits, {
+    files: ['watchers/acceptance/bin/trigger.mjs', 'watchers/acceptance/host/prbot.mjs', 'package-lock.json'],
+    lines: [],
+  });
+  assert.equal(isSensitivePath('watchers/acceptance/host/anything.mjs'), true);
+});
 
 test('#215 SC4 落后阈值：超过 5 个或超过 2 小时，同一 HEAD 只报一次', () => {
   const head = 'a'.repeat(40);
@@ -842,39 +898,39 @@ test('#215 SC14 waiting、up-to-date、deployed 不写提醒', { skip: FLOCK_SKI
   assert.equal(readAlerts(shipped.alertsFile).length, 0);
 });
 
-test('#215 SC16 新增行含 process.env 需要批准并列出行', { skip: FLOCK_SKIP }, async () => {
+test('#215 SC16 新增行读敏感环境变量需要批准并列出行', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
-  const sha = commitAndPush(world, [{ path: 'docs/note.md', content: 'const x = process.env.PATH\n' }], 'env');
+  const sha = commitAndPush(world, [{ path: 'watchers/mivo/bin/note.mjs', content: 'const x = process.env.GITHUB_TOKEN\n' }], 'env');
   const result = await deploy(world, { fetchImpl: green(sha) });
   const json = assertRun(result, 'needs-approval');
-  assert.ok(json.files.includes('docs/note.md'));
-  assert.ok(json.lines.some((row) => row.file === 'docs/note.md' && row.text.includes('process.env')));
+  assert.ok(json.files.includes('watchers/mivo/bin/note.mjs'));
+  assert.ok(json.lines.some((row) => row.file === 'watchers/mivo/bin/note.mjs' && row.text.includes('GITHUB_TOKEN')));
   assert.equal(result.after, result.before);
 });
 
 test('#215 SC16 新增行含 secrets/ 需要批准', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
-  const sha = commitAndPush(world, [{ path: 'docs/note.md', content: 'see secrets/demo\n' }], 'path');
+  const sha = commitAndPush(world, [{ path: 'watchers/mivo/bin/note.mjs', content: 'see secrets/demo\n' }], 'path');
   const result = await deploy(world, { fetchImpl: green(sha) });
   const json = assertRun(result, 'needs-approval');
   assert.ok(json.lines.some((row) => row.text.includes('secrets/')));
   assert.equal(result.after, result.before);
 });
 
-test('#215 SC16 新增行含 TOKEN 需要批准', { skip: FLOCK_SKIP }, async () => {
+test('#215 SC16 新增行读令牌文件需要批准', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
-  const sha = commitAndPush(world, [{ path: 'docs/note.md', content: 'const NAME = "TOKEN"\n' }], 'word');
+  const sha = commitAndPush(world, [{ path: 'watchers/mivo/bin/note.mjs', content: "const blob = readFileSync(path.join(home, 'token.json'))\n" }], 'word');
   const result = await deploy(world, { fetchImpl: green(sha) });
   const json = assertRun(result, 'needs-approval');
-  assert.ok(json.lines.some((row) => row.text.includes('TOKEN')));
+  assert.ok(json.lines.some((row) => row.text.includes('token.json')));
   assert.equal(result.after, result.before);
 });
 
 test('#215 SC16 这些词只出现在删除行时照常部署', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
-  commitAndPush(world, [{ path: 'docs/note.md', content: 'process.env\nsecrets/\nTOKEN\n' }], 'add words');
+  commitAndPush(world, [{ path: 'watchers/mivo/bin/note.mjs', content: 'process.env.GITHUB_TOKEN\nsecrets/\n' }], 'add words');
   fastForward(world);
-  const sha = commitAndPush(world, [{ path: 'docs/note.md', content: 'plain\n' }], 'drop words');
+  const sha = commitAndPush(world, [{ path: 'watchers/mivo/bin/note.mjs', content: 'plain\n' }], 'drop words');
   const result = await deploy(world, { fetchImpl: green(sha) });
   assertRun(result, 'deployed');
   assert.equal(result.after, sha);
@@ -1097,20 +1153,20 @@ test('#215 L2 列不出进程就等待', { skip: FLOCK_SKIP }, async () => {
 
 test('#215 L3 新增行内容以两个加号开头仍要批准', { skip: FLOCK_SKIP }, async () => {
   const diff = [
-    'diff --git a/docs/plus.md b/docs/plus.md',
+    'diff --git a/watchers/mivo/plus.mjs b/watchers/mivo/plus.mjs',
     '--- /dev/null',
-    '+++ b/docs/plus.md',
+    '+++ b/watchers/mivo/plus.mjs',
     '@@ -0,0 +1 @@',
-    '+++ process.env.X',
+    '+++ process.env.GITHUB_TOKEN',
   ].join('\n');
   const parsed = parseAddedLines(diff);
-  assert.ok(parsed.some((row) => row.text === '++ process.env.X'), JSON.stringify(parsed));
+  assert.ok(parsed.some((row) => row.text === '++ process.env.GITHUB_TOKEN'), JSON.stringify(parsed));
   const world = makeWorld();
-  const sha = commitAndPush(world, [{ path: 'docs/plus.md', content: '++ process.env.X\n' }], 'plus');
+  const sha = commitAndPush(world, [{ path: 'watchers/mivo/plus.mjs', content: '++ process.env.GITHUB_TOKEN\n' }], 'plus');
   const result = await deploy(world, { fetchImpl: green(sha) });
   const json = assertRun(result, 'needs-approval');
   assert.equal(result.after, result.before);
-  assert.ok(json.lines.some((row) => row.file === 'docs/plus.md' && row.text.includes('process.env')));
+  assert.ok(json.lines.some((row) => row.file === 'watchers/mivo/plus.mjs' && row.text.includes('process.env')));
   const src = fs.readFileSync(SCRIPT, 'utf8');
   assert.match(src, /--no-ext-diff/);
   assert.match(src, /--no-textconv/);

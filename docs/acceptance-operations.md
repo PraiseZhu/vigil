@@ -822,7 +822,7 @@ node watchers/acceptance/deploy-ff.mjs \
 - 仓根 `package.json`、仓根 `run-ensure.sh`
 - 任意目录下的 `package-lock.json`、`npm-shrinkwrap.json`、`yarn.lock`、`pnpm-lock.yaml`
 - 本脚本自己 `watchers/acceptance/deploy-ff.mjs`
-- 待拉提交新增的行里出现 `process.env`、`secrets/` 或 `token`（不分大小写）。删掉的行不算。改名用 `--no-renames` 拆开算，挪走旧路径也算命中。
+- 待拉提交的新增行里出现下面任一类（删除行不算；改名用 `--no-renames` 拆开算，挪走旧路径也算命中）：读名字含 `TOKEN`、`KEY`、`SECRET`、`PASSWORD` 或 `APP` 的环境变量；`secrets/` 路径；`*.key` / `*.pem` 等密钥文件；`token.json`、`.token`、`…/token` 这类令牌文件；`appOnly`；`listen(8080)` 或 `port: 3000` 这种端口配置。`*.test.mjs`、`*.test.py`、`docs/*.md` 的新增行不做内容扫描（上面的路径规则仍然照查）。单独出现 `token` 这个词，或读取名字不含这些词的普通环境变量，不再算敏感。
 
 落后：本地比目标多超过 5 个提交，或最早一个未部署提交距今超过 2 小时，人话里带 `lagging`，并给 lead 一句。同一次落后（以当前本地 HEAD 为键）只在第一次把 `reportLag` 设为 true。快进成功后这份记忆清掉。
 

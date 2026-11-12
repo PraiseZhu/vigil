@@ -77,7 +77,21 @@ const EXACT_FILES = new Set([
   'watchers/acceptance/bin/prio-sync.mjs',
 ]);
 const HOST_PREFIX = 'watchers/acceptance/host/';
-const CONTENT_RE = /process\.env|secrets\/|token/i;
+/**
+ * 内容规则只看新增行，且跳过测试文件和 docs/*.md：这些地方提到 token 或 process.env
+ * 是常事，拦下来只会逼人写完整 sha 批准。真敏感的那几类由下面的正则分别负责，
+ * 不再用一条宽泛的 /token/i 命中所有单词。
+ */
+const CONTENT_SKIP_RE = /(?:^|\/)(?:[^/]+\.test\.(?:mjs|py)|docs\/[^/]+\.md)$/;
+const SECRETS_PATH_RE = /secrets\//i;
+// 密钥/证书文件：带目录的路径（keys/server.key）或被引号包住的文件名（'server.key'）。
+// 有意不匹配 `item.key` 这种对象属性。
+const KEY_FILE_RE = /(?:^|[\s"'`(=:,\/])[~\w.@-]*\/[~\w.@-]*\.(?:key|pem|p12|pfx)(?=$|[\s"'`),;:])|['"`][~\w.@-]+\.(?:key|pem|p12|pfx)['"`]/i;
+const TOKEN_FILE_RE = /(?:^|[\s"'`(=:,\/])\.tokens?\b|(?:^|[\s"'`(=:,\/])tokens?\.(?:json|txt|dat|key|pem|env|db)\b|(?:^|[\s"'`(=:,\/])(?:[~\w.@-]+\/)+tokens?(?=$|[\s"'`),;])/i;
+const ENV_READ_RE = /process\.env(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*['"`]([^'"`]+)['"`]\s*\])/g;
+const SENSITIVE_ENV_RE = /TOKEN|KEY|SECRET|PASSWORD|APP/i;
+const APP_ONLY_RE = /appOnly/i;
+const PORT_RE = /\.listen\s*\(|\bport\b\s*[:=]\s*['"]?\d{2,5}\b/i;
 const FULL_SHA = /^[0-9a-f]{40}$/;
 
 /** 命令行里出现轮次、修正或裁决脚本就不算空档。相对路径 `node round.mjs` 也算。 */
@@ -138,6 +152,25 @@ export function parseAddedLines(diffText) {
   return lines;
 }
 
+/**
+ * 一条新增行按内容规则算不算敏感。返回命中的规则名，不命中返回 null。
+ * 测试文件和 docs/*.md 不扫内容（路径规则仍然照查）。
+ */
+export function sensitiveLineReason(file, text) {
+  const norm = String(file || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+  if (CONTENT_SKIP_RE.test(norm)) return null;
+  const line = String(text ?? '');
+  if (SECRETS_PATH_RE.test(line)) return 'secrets-path';
+  if (KEY_FILE_RE.test(line)) return 'key-file';
+  if (TOKEN_FILE_RE.test(line)) return 'token-file';
+  for (const match of line.matchAll(ENV_READ_RE)) {
+    if (SENSITIVE_ENV_RE.test(match[1] || match[2] || '')) return 'env';
+  }
+  if (APP_ONLY_RE.test(line)) return 'appOnly';
+  if (PORT_RE.test(line)) return 'port';
+  return null;
+}
+
 export function sensitiveHits(files, addedLines) {
   const fileHits = [];
   for (const file of files || []) {
@@ -145,7 +178,7 @@ export function sensitiveHits(files, addedLines) {
   }
   const lineHits = [];
   for (const row of addedLines || []) {
-    if (row && CONTENT_RE.test(String(row.text ?? ''))) {
+    if (row && sensitiveLineReason(row.file, row.text)) {
       lineHits.push({ file: row.file, line: row.line, text: String(row.text ?? '') });
     }
   }
