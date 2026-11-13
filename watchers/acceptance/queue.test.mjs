@@ -163,7 +163,7 @@ test('#62 SC2 看板值认不出：按 P2 排并记一行带 ref 的日志', () 
 test('#62 SC3 一拍盘点：认领条目按优先级排，且不新增 GraphQL 读', async () => {
   const { home } = writeProfile(tmpDir());
   const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
-  const mergedPr = (number) => [{ number: 90 + number, url: `https://github.com/${REPO}/pull/${90 + number}`, mergedAt: '2026-10-20T00:00:00.000Z', repository: { nameWithOwner: REPO } }];
+  const mergedPr = (number) => [{ number: 90 + number, url: `https://github.com/${REPO}/pull/${90 + number}`, mergedAt: '2026-10-20T00:00:00.000Z', baseRefName: 'main', repository: { nameWithOwner: REPO } }];
   const nodes = [
     issueNode({ number: 1, createdAt: '2026-10-03T00:00:00.000Z', prs: mergedPr(1) }),
     issueNode({ number: 2, createdAt: '2026-10-02T00:00:00.000Z', prs: mergedPr(2) }),
@@ -207,6 +207,7 @@ test('#62 SC5 多页盘点：只读请求数仍等于盘点页数（点数 = 页
               number: 5000 + number,
               url: `https://github.com/${REPO}/pull/${5000 + number}`,
               mergedAt: '2026-10-20T00:00:00.000Z',
+              baseRefName: 'main',
               repository: { nameWithOwner: REPO },
             },
           ],
@@ -269,12 +270,12 @@ test('#62 SC3 poll 只用本地快照：快照新鲜时按优先级出条目', a
           issueNode({
             number: 1,
             createdAt: '2026-10-01T00:00:00.000Z',
-            prs: [{ number: 91, url: `https://github.com/${REPO}/pull/91`, mergedAt: '2026-10-20T00:00:00.000Z', repository: { nameWithOwner: REPO } }],
+            prs: [{ number: 91, url: `https://github.com/${REPO}/pull/91`, mergedAt: '2026-10-20T00:00:00.000Z', baseRefName: 'main', repository: { nameWithOwner: REPO } }],
           }),
           issueNode({
             number: 2,
             createdAt: '2026-10-02T00:00:00.000Z',
-            prs: [{ number: 92, url: `https://github.com/${REPO}/pull/92`, mergedAt: '2026-10-20T00:00:00.000Z', repository: { nameWithOwner: REPO } }],
+            prs: [{ number: 92, url: `https://github.com/${REPO}/pull/92`, mergedAt: '2026-10-20T00:00:00.000Z', baseRefName: 'main', repository: { nameWithOwner: REPO } }],
           }),
         ],
       }),
