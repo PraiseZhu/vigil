@@ -30,6 +30,8 @@ import {
 import {
   ITEM_FIELD_QUERY,
   ONLY_FIELD_NAMES,
+  appOnlyRepoTable,
+  appOnlySkipLine,
   PRIO_HOURLY_MAX,
   PRIO_HOURLY_WINDOW_MS,
   PRIO_LIMIT_MAX,
@@ -517,6 +519,7 @@ async function loadBoard(deps, profile, table) {
     items: board.items,
     prs,
     excludedCount: board.excludedCount,
+    appOnlySkipped: board.appOnlySkipped || [],
     nullContent: board.skipped?.nullContent || 0,
     reader,
     source: 'fetched',
@@ -550,6 +553,7 @@ async function resolveBoard(deps, profile, table, { snapshot, snapshotFile, now,
       items: snapshot.items,
       prs: prs || [],
       excludedCount: snapshot.excludedCount || 0,
+      appOnlySkipped: snapshot.appOnlySkipped || [],
       nullContent: snapshot.nullContent || 0,
       reader,
       source: 'snapshot',
@@ -563,6 +567,7 @@ async function resolveBoard(deps, profile, table, { snapshot, snapshotFile, now,
         at: now,
         items: board.items,
         excludedCount: board.excludedCount,
+        appOnlySkipped: board.appOnlySkipped,
         nullContent: board.nullContent,
       });
     } catch (error) {
@@ -596,7 +601,7 @@ export async function runContinuous(argv = [], deps = {}) {
 
   try {
     const profile = deps.loadProfile ? deps.loadProfile() : loadAcceptanceProfile();
-    const table = deps.table || readRepoClassTable(path.join(dir, 'repo-class.json'));
+    const table = appOnlyRepoTable(deps.table || readRepoClassTable(path.join(dir, 'repo-class.json')), profile);
     const allowRepos = wantWrite || args.onlyEmptyToP2
       ? readAuthorizedRepos(path.join(dir, 'authorized-repos.json'))
       : [];
@@ -680,6 +685,8 @@ export async function runContinuous(argv = [], deps = {}) {
         );
       },
     });
+    const skipLine = appOnlySkipLine(board.appOnlySkipped, now, 'prio-run');
+    if (skipLine) stdout.write(skipLine);
     let writeFn = deps.write || null;
     if (wantWrite && !writeFn) {
       const writer = createPriorityGithub({ profile, token, run: deps.run, fetchImpl: deps.fetchImpl });
