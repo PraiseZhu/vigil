@@ -21,6 +21,17 @@ import { prefetchCode } from './prefetch.mjs';
 import { appendDepsInfo, prepareDeps } from './predeps.mjs';
 import { appendBuildCiInfo, buildCiPolicyFor, collectBuildCiFacts } from './build-ci.mjs';
 import { ENV_PROBLEM_PREFIX } from '../bin/trigger.mjs';
+import {
+  CATEGORY_MISSING_LLM_PROXY_API_KEY,
+  CATEGORY_UNKNOWN,
+  classifyPiFailure,
+  formatAuthDiagnostic,
+  inspectLlmProxyReady,
+  loadModelsFromPiCommand,
+  markAuthEnvBackoff,
+  readAuthEnvBackoff,
+  selectModelId,
+} from './llm-proxy-preflight.mjs';
 import { redact } from '../bin/redact.mjs';
 import { activityChange, probeSandboxActivity } from './activity.mjs';
 
@@ -466,6 +477,29 @@ function appendRoundsLog(paths, line) {
  * 3 什么都不做（内存不够 / 槽满 / 测试锁被占 / 写闸总开关关着 / start 返回 3）；4 写闸拒绝（已写提醒）。
  * start 的其它非 0 退出码照抄，并写 claim-failed。
  */
+
+function classifyHostPiFailure({ result, logFile, models, modelId }) {
+  let stdout = result?.stdout || '';
+  let stderr = result?.stderr || '';
+  if (!stdout && !stderr && logFile) {
+    try {
+      stderr = fs.readFileSync(logFile, 'utf8');
+    } catch {
+      // 没有日志就只按退出码分类。
+    }
+  }
+  return classifyPiFailure({ code: result?.code, stdout, stderr, models, modelId });
+}
+
+function piExitAbortReason({ result, logFile, models, modelId }) {
+  const exitCode = Number.isInteger(result?.code) ? result.code : 1;
+  const classified = classifyHostPiFailure({ result, logFile, models, modelId });
+  if (classified.category === CATEGORY_MISSING_LLM_PROXY_API_KEY) {
+    return `${ENV_PROBLEM_PREFIX}${formatAuthDiagnostic(classified)}`;
+  }
+  return `pi 退出（code=${exitCode}${result?.signal ? `，${result.signal}` : ''}）但没写裁决`;
+}
+
 export async function runHostRound({
   home,
   issue,
@@ -500,6 +534,23 @@ export async function runHostRound({
   const { repo } = parseRef(issue);
   // 同仓最多 1 轮的锁（mivo 测试锁 + serialRepos）：在占槽之前算好，名单写错就在这里报错、什么都不占。
   const serialFiles = serialLockFiles(paths, [repo], settings);
+
+  const models = loadModelsFromPiCommand(piCommand);
+  const modelId = selectModelId(piCommand);
+  const authReady = inspectLlmProxyReady({
+    models,
+    modelId,
+    piCommand,
+    env,
+    dir: paths.hostDir,
+    nowMs: now(),
+  });
+  if (!authReady.ready) {
+    log(
+      `${new Date(now()).toISOString()} llm-proxy-preflight-defer issue=${issue} category=${authReady.preflight?.category || 'missing-llm-proxy-api-key'} 认证预检未通过或仍在环境退避窗口，这一拍不认领`,
+    );
+    return 3;
+  }
 
   // 1. 内存门：放在认领之前，不够就什么都不写。
   const available = readMemAvailable(meminfoPath);
@@ -783,6 +834,19 @@ export async function runHostRound({
       egressServer = await startEgress({ home, hostConfig: settings, roundDir, issue, round: claim.round, profile, now });
 
       // 10. 起 pi（一定在 bwrap 里，先起出网桥再起 pi），派发消息从标准输入喂进去。
+      const sandboxPreflight = inspectLlmProxyReady({
+        models,
+        modelId,
+        piCommand,
+        env: sandboxEnvironment,
+        dir: paths.hostDir,
+        nowMs: now(),
+      });
+      if (!sandboxPreflight.ready) {
+        const reason = `${ENV_PROBLEM_PREFIX}${formatAuthDiagnostic({ code: null, category: sandboxPreflight.preflight?.category })}`;
+        await abortWithAlert('round-failed', reason);
+        return 1;
+      }
       sandboxReady = true;
       const piLog = path.join(roundDir, 'pi.log');
       pi = spawnPi({
@@ -882,7 +946,18 @@ export async function runHostRound({
         noteEnvUnverified(status);
         return exitCode === 0 ? 0 : 1;
       }
-      const reason = `pi 退出（code=${exitCode}${result?.signal ? `，${result.signal}` : ''}）但没写裁决`;
+      const reason = piExitAbortReason({ result, logFile: piLog, models, modelId });
+      const classified = classifyHostPiFailure({ result, logFile: piLog, models, modelId });
+      if (reason.startsWith(ENV_PROBLEM_PREFIX) || classified.category === CATEGORY_UNKNOWN) {
+        const prev = readAuthEnvBackoff(paths.hostDir);
+        markAuthEnvBackoff({
+          dir: paths.hostDir,
+          nowMs: now(),
+          failures: (prev?.failures || 0) + 1,
+          code: classified.code,
+          category: classified.category,
+        });
+      }
       const aborted = await callRound(['abort', '--issue', issue, '--round', String(claim.round), '--reason', reason]);
       // 3 = 已不是第 n 轮「验收中」（回读之后刚好写完裁决）：不算失败。
       if (aborted?.code === 3) return exitCode === 0 ? 0 : 1;
