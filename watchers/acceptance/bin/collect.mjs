@@ -174,8 +174,13 @@ function searchQueries(rootRef, profile) {
   const phrase = `"[验收机] 修正 · 总 ${rootRef}" in:body is:issue`;
   const queries = [phrase];
   for (const forkRepo of profile.forkRepos || []) queries.push(`${phrase} repo:${forkRepo}`);
+  // App-only 路由必须能从查询本身确定 owner。全局搜索没有 owner，
+  // 会被 github.mjs 以 no-app-route 拦截；逐仓搜索仍可按 repo: owner 分流。
+  if (profile.appOnly === true) return queries.filter((query) => /(?:^|\s)repo:[^\s]+/.test(query));
   return queries;
 }
+
+export { searchQueries };
 
 /**
  * 收集整棵任务树。`--issue` 永远是总 issue（独立 issue 就是它自己）。
