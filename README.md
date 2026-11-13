@@ -105,12 +105,12 @@ ID=vigil-<sha7>-<YYYYMMDD>-r1                                  # 每次部署一
 
 node watchers/mivo/deploy.mjs verify --home "$HOME_DIR"        # 看哪些文件会变（match:false 表示有更新）
 node watchers/mivo/deploy.mjs preview --home "$HOME_DIR" --database "$DB" --id "$ID" \
-  --plan "$HOME_DIR/deployments/$ID.plan.json"                 # 生成部署计划
-node watchers/mivo/deploy.mjs apply --plan "$HOME_DIR/deployments/$ID.plan.json"
+  --plan "$HOME_DIR/deployments/$ID.plan.json" && \
+node watchers/mivo/deploy.mjs apply --plan "$HOME_DIR/deployments/$ID.plan.json" # 预览后立即安装
 node watchers/mivo/deploy.mjs verify --home "$HOME_DIR"        # 部署后应为 match:true
 ```
 
-- `--database` 只用来确认修复会话都空闲（需要 `sqlite3` 命令）。有会话正在跑时 `preview` / `apply` 报 `Host session active or missing`，等它跑完再试即可；`apply` 期间状态或文件被改动也会拒绝并回滚。
+- `--database` 只用来确认修复会话都空闲（需要 `sqlite3` 命令）。有会话正在跑时 `preview` / `apply` 报 `Host session active or missing`，等它跑完再试即可；`apply` 期间状态或文件被改动也会拒绝并回滚。预览输出还会列出当前已安装提交到本次提交之间的提交标题；如果状态在两步之间变化，重新生成 plan，并把 `preview && apply` 连着执行。
 - `--plan` 必须是绝对路径，文件不能已存在；`--id` 只能用小写字母、数字和 `-`。
 - `apply` 成功后在 `<watcher home>/deployments/<id>/` 留下 `before/`（被替换的旧文件）、`manifest.json` 和 `receipt.json`（`status: installed`）。要退回上一版，把 `before/` 里的文件拷回 `bin/`，或者检出旧提交用新的 id 再部署一次。
 - 部署只换代码，不碰 `state/`、`config/` 和调度；正在跑的一轮不受影响，下一轮起用新代码。部署完删掉临时检出即可。
