@@ -2302,7 +2302,98 @@ test('#458 SC6 修正：缺变量后短间隔再跑仍不认领，退避未到�
   assert.equal(Date.parse(stamp.until) - t0, 30 * 60 * 1000);
 });
 
-test('#458 SC5/SC6/SC9 修正：调用前白名单缺密钥不计次，不升人工终态，状态不含原文或假凭证', async () => {
+
+test('#458 SC5 修正：已进入 fix 后调用前变量未设或为空则不调 pi、不耗次数，非空对照会再调', async () => {
+  const present = 'sk-fake-credential-for-test-do-not-store';
+  const t0 = Date.parse('2026-11-13T12:00:00.000Z');
+
+  async function runAfterEnteringFix(afterFirstPi) {
+    const world = defaultTree({ roundStatus: '要修' });
+    addCorrection(world);
+    const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+    const hostConfig = proxyHostConfig(home);
+    const env = { PATH: process.env.PATH, LLM_PROXY_API_KEY: present };
+    let nowMs = t0;
+    let piRuns = 0;
+    const first = await runOnce({
+      world,
+      home,
+      hostConfig,
+      overrides: {
+        env,
+        now: () => nowMs,
+        piRunner: async () => {
+          piRuns += 1;
+          afterFirstPi(env);
+          return { ok: false, code: 1, stderr: 'assertion failed in unit test' };
+        },
+      },
+    });
+    assert.equal(first.code, 1);
+    assert.equal(piRuns, 1, '调用前预检失败后不得再调 pi');
+    const state = readCorrectionState(home);
+    assert.equal(state.stage, 'fix');
+    assert.equal(state.piIterations, 1);
+    assert.notEqual(state.status, '需人工处理');
+    assert.notEqual(state.failureReason, 'limit-pi-iterations');
+    assert.equal(state.authDiagnostic?.category, 'missing-llm-proxy-api-key');
+    assert.equal(state.authDiagnostic?.code, null);
+    assert.equal(Object.keys(state.authDiagnostic).sort().join(','), 'category,code');
+    assert.equal(JSON.stringify(state).includes(present), false);
+    const stamp = JSON.parse(fs.readFileSync(path.join(hostPaths(home).hostDir, 'llm-proxy-preflight.json'), 'utf8'));
+    assert.equal(Date.parse(stamp.until) - t0, 30 * 60 * 1000);
+    assert.equal(stamp.category, 'missing-llm-proxy-api-key');
+
+    nowMs = t0 + 1000;
+    const again = await runOnce({
+      world,
+      home,
+      hostConfig,
+      overrides: {
+        env,
+        now: () => nowMs,
+        piRunner: async () => {
+          piRuns += 1;
+          return { ok: false, code: 1, stderr: 'assertion failed in unit test' };
+        },
+      },
+    });
+    assert.equal(again.code, 3);
+    assert.equal(piRuns, 1, '退避未到期不得再调 pi');
+    assert.equal(readCorrectionState(home).piIterations, 1);
+  }
+
+  await runAfterEnteringFix((env) => {
+    delete env.LLM_PROXY_API_KEY;
+  });
+  await runAfterEnteringFix((env) => {
+    env.LLM_PROXY_API_KEY = '';
+  });
+
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const env = { PATH: process.env.PATH, LLM_PROXY_API_KEY: present };
+  let piRuns = 0;
+  const result = await runOnce({
+    world,
+    home,
+    hostConfig: proxyHostConfig(home),
+    overrides: {
+      env,
+      now: () => t0,
+      piRunner: async () => {
+        piRuns += 1;
+        if (piRuns === 1) return { ok: false, code: 1, stderr: 'assertion failed in unit test' };
+        return { ok: true, stdout: '', code: 0 };
+      },
+    },
+  });
+  assert.equal(piRuns, 2, '变量非空时同一 fix 路径会再次调用 pi');
+  assert.ok(result.code === 0 || result.code === 1);
+});
+
+test('#458 SC6/SC9 修正：调用后白名单缺密钥分类不计次，不升人工终态，状态不含原文或假凭证', async () => {
   const world = defaultTree({ roundStatus: '要修' });
   addCorrection(world);
   const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
