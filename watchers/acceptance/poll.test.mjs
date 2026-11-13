@@ -711,3 +711,71 @@ test('#247 P2-2 pollInventory 交出这一拍真的发了几次只读请求（�
   assert.equal(graphqlCalls, 2, '两页就该发两次请求');
   assert.equal(result.reads, graphqlCalls, 'reads 必须是这一拍真的发了几个请求，不能恒为 1');
 });
+
+function staleParent({ state = 'OPEN', closedAt = null, status = '验收中', number = 6, createdAt = '2026-10-24T01:00:00.000Z' } = {}) {
+  return issueNode({
+    number,
+    state,
+    closedAt,
+    body: 'stale check',
+    comments: [roundComment({ round: 1, status, createdAt, databaseId: 1001 })],
+  });
+}
+
+function appendLedger(home, entries) {
+  const file = hostPaths(home).ledgerFile;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  for (const entry of entries) {
+    fs.appendFileSync(file, `${JSON.stringify(entry)}\n`);
+  }
+}
+
+test('判卡死前看本地结论：已关单、结论已写、结论已写但单还开着都不标 stale；无结论仍标；不增 GitHub 请求', async () => {
+  const createdAt = '2026-10-24T01:00:00.000Z';
+  const now = () => Date.parse('2026-10-24T01:40:00.000Z');
+
+  async function runPoll({ homeSetup, issue }) {
+    const { home } = writeProfile(tmpDir());
+    const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+    if (homeSetup) homeSetup(home, profile);
+    const run = createFakeRun({ onGraphql: () => inventoryData({ open: issue.state === 'OPEN' ? [issue] : [], closed: issue.state === 'CLOSED' ? [issue] : [] }) });
+    const github = createGithub({ profile, run });
+    const result = await pollInventory({ github, profile, now });
+    return { result, reads: result.reads, home, profile };
+  }
+
+  const baseline = await runPoll({ issue: staleParent() });
+  assert.ok(baseline.result.entries.find((e) => e.stale && e.issue === `${REPO}#6`), '无本地结论时仍报卡死');
+  assert.ok(baseline.reads >= 1);
+
+  const closed = await runPoll({
+    issue: staleParent({ state: 'CLOSED', closedAt: '2026-10-24T01:35:00.000Z' }),
+  });
+  assert.equal(closed.result.entries.find((e) => e.stale), undefined, '盘点快照已关单不报卡死');
+  assert.equal(closed.reads, baseline.reads, '关单判断复用本拍快照，不另发请求');
+
+  const ledgerPassed = await runPoll({
+    issue: staleParent(),
+    homeSetup: (home) => {
+      appendLedger(home, [
+        {
+          dedupeKey: `round-finish:${REPO}#6:1:1001:通过`,
+          type: 'comment.update',
+          at: '2026-10-24T01:35:00.000Z',
+        },
+      ]);
+    },
+  });
+  assert.equal(ledgerPassed.result.entries.find((e) => e.stale), undefined, '账本已有通过结论，即使评论快照仍是验收中也不报');
+  assert.equal(ledgerPassed.reads, baseline.reads, '读账本不增加 GitHub 请求');
+
+  const passedButOpenIssue = staleParent({ status: '通过' });
+  const openWithVerdict = await runPoll({ issue: passedButOpenIssue });
+  assert.equal(openWithVerdict.result.entries.find((e) => e.stale), undefined, '结论已写但单还开着不报卡死');
+  assert.ok(
+    openWithVerdict.result.entries.find((e) => e.passedButOpen && e.issue === `${REPO}#6`)
+      || openWithVerdict.result.entries.some((e) => e.issue === `${REPO}#6` && !e.stale),
+    '结论已写且单仍开时走原有 passedButOpen 或其他非 stale 路径',
+  );
+  void createdAt;
+});

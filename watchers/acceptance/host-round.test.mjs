@@ -5,6 +5,7 @@ import net from 'node:net';
 import path from 'node:path';
 import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
+import { cachePath } from './bin/rounds.mjs';
 import { hostPaths, progressFileFor, readAlerts } from './host/paths.mjs';
 import { roundDirFor, roundKey, runHostRound, startGateRelay } from './host/round.mjs';
 import { runTick } from './host/tick.mjs';
@@ -1330,4 +1331,141 @@ test('#458 修复回归：验收入口未知失败窗口递增，到期不抹历
   const fresh = readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN });
   assert.equal(fresh.failures, 1);
   assert.equal(Date.parse(fresh.until) - nowMs, 5 * 60 * 1000);
+});
+
+function enableGate(home) {
+  const paths = hostPaths(home);
+  fs.mkdirSync(paths.gateDir, { recursive: true });
+  fs.writeFileSync(paths.enabledFile, '1');
+}
+
+function writeRegistry(home, { issue = ROOT_REF, round = 1, pid = 999999999, piPid = 999999999, startedAt = '2026-10-24T01:00:00.000Z' } = {}) {
+  const paths = hostPaths(home);
+  fs.mkdirSync(paths.roundsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(paths.roundsDir, `${roundKey(issue, round)}.json`),
+    JSON.stringify({ issue, round, pid, piPid, startedAt }),
+  );
+}
+
+function appendLedger(home, entries) {
+  const file = hostPaths(home).ledgerFile;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  for (const entry of entries) {
+    fs.appendFileSync(file, `${JSON.stringify(entry)}\n`);
+  }
+}
+
+async function tickStale({ homeSetup, uptimeS = 86400, nowIso = '2026-10-24T02:00:00.000Z', abortStderr = '', abortCode = 0 } = {}) {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  writeHostJson(home);
+  enableGate(home);
+  if (homeSetup) {
+    const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+    homeSetup(home, profile);
+  }
+  const aborted = [];
+  const nowMs = Date.parse(nowIso);
+  const heartbeat = await runTick({
+    home,
+    env: { ...process.env },
+    now: () => nowMs,
+    uptime: () => uptimeS,
+    run: async () => ({
+      code: 0,
+      stdout: JSON.stringify({
+        entries: [{ issue: ROOT_REF, round: 1, stale: true, lastProgressAt: '2026-10-24T01:00:00.000Z', commentId: 1001 }],
+        tasks: [],
+        reads: 1,
+      }),
+      stderr: '',
+    }),
+    spawnRound: () => 1,
+    runRound: async (argv) => {
+      aborted.push(argv);
+      return { code: abortCode, stdout: '', stderr: abortStderr };
+    },
+    discoverPrbot: async () => [],
+    checkPrbotStalled: async () => [],
+    cleanupPrbot: () => [],
+    gateAudit: async () => ({ checkedLines: 0, newViolations: [], sinceBaseline: null, newUncertain: [] }),
+    notify: async () => ({ ok: true }),
+  });
+  return { home, heartbeat, aborted, alerts: readAlerts(hostPaths(home)) };
+}
+
+test('判卡死：已关单、结论已写（进程已退）、结论已写但单还开着 → 不 abort、不写 round-stale', async () => {
+  const closed = await tickStale({
+    homeSetup: (home) => {
+      writeRegistry(home);
+      appendLedger(home, [{ dedupeKey: `close:${ROOT_REF}:1`, type: 'issue.close', at: '2026-10-24T01:50:00.000Z' }]);
+    },
+  });
+  assert.deepEqual(closed.aborted, []);
+  assert.equal(closed.alerts.some((entry) => entry.kind === 'round-stale'), false);
+  assert.equal(closed.heartbeat.lastTick.staleSkipped[0]?.source, 'ledger');
+  assert.equal(closed.heartbeat.lastTick.staleSkipped[0]?.closed, true);
+
+  const finishedDead = await tickStale({
+    homeSetup: (home, profile) => {
+      writeRegistry(home);
+      fs.mkdirSync(path.dirname(cachePath(profile, ROOT_REF)), { recursive: true });
+      fs.writeFileSync(
+        cachePath(profile, ROOT_REF),
+        JSON.stringify({ round: { round: 1, commentId: 1001, finishedAt: '2026-10-24T01:50:00.000Z' }, lastVerdict: '通过' }),
+      );
+    },
+  });
+  assert.deepEqual(finishedDead.aborted, []);
+  assert.equal(finishedDead.alerts.some((entry) => entry.kind === 'round-stale'), false);
+  assert.equal(finishedDead.heartbeat.lastTick.staleSkipped[0]?.source, 'cache');
+  assert.equal(finishedDead.heartbeat.lastTick.staleSkipped[0]?.status, '通过');
+
+  const passedOpen = await tickStale({
+    homeSetup: (home) => {
+      writeRegistry(home);
+      appendLedger(home, [
+        { dedupeKey: `round-finish:${ROOT_REF}:1:1001:通过`, type: 'comment.update', at: '2026-10-24T01:50:00.000Z' },
+      ]);
+    },
+  });
+  assert.deepEqual(passedOpen.aborted, []);
+  assert.equal(passedOpen.alerts.some((entry) => entry.kind === 'round-stale'), false);
+  assert.equal(passedOpen.heartbeat.lastTick.staleSkipped[0]?.status, '通过');
+  assert.equal(passedOpen.heartbeat.lastTick.staleSkipped[0]?.closed, false);
+});
+
+test('判卡死：进程被杀且无结论时，重启中断与普通卡死文案不同；普通卡死仍报警', async () => {
+  const restarted = await tickStale({
+    uptimeS: 600,
+    homeSetup: (home) => writeRegistry(home, { startedAt: '2026-10-24T01:00:00.000Z' }),
+  });
+  assert.equal(restarted.aborted.length, 1);
+  assert.equal(restarted.aborted[0].includes('重启中断：进程不在'), true, `abort 原因应区分重启：${restarted.aborted[0]}`);
+  assert.equal(restarted.alerts.length, 1);
+  assert.equal(restarted.alerts[0].kind, 'round-stale');
+  assert.equal(restarted.alerts[0].reason, '重启中断：进程不在');
+  assert.equal(restarted.heartbeat.lastTick.stale[0]?.reason, '重启中断：进程不在');
+
+  const stuck = await tickStale({
+    uptimeS: 86400,
+    homeSetup: (home) => writeRegistry(home, { startedAt: '2026-10-24T01:00:00.000Z' }),
+  });
+  assert.equal(stuck.aborted.length, 1);
+  assert.equal(stuck.aborted[0].includes('卡死：进程不在'), true);
+  assert.equal(stuck.aborted[0].includes('重启中断'), false);
+  assert.equal(stuck.alerts[0].kind, 'round-stale');
+  assert.equal(stuck.alerts[0].reason, '卡死：进程不在');
+});
+
+test('判卡死：本地没看到结论，但 abort 认领检查已是通过 → 不写 round-stale', async () => {
+  const raced = await tickStale({
+    homeSetup: (home) => writeRegistry(home),
+    abortCode: 3,
+    abortStderr: '认领检查失败：期望第 1 轮（验收中），实际第 1 轮（通过）。',
+  });
+  assert.equal(raced.aborted.length, 1, '本地没有结论时仍会走 abort');
+  assert.equal(raced.alerts.some((entry) => entry.kind === 'round-stale'), false, 'GitHub 上已是通过则不再报警');
+  assert.equal(raced.heartbeat.lastTick.staleSkipped[0]?.source, 'abort-check');
+  assert.equal(raced.heartbeat.lastTick.staleSkipped[0]?.status, '通过');
 });

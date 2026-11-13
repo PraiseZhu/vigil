@@ -9,6 +9,7 @@ import { RateLimitError, createGithub } from './github.mjs';
 import { collectTasks } from './tasks.mjs';
 import { createRounds, latestRound } from './rounds.mjs';
 import { lastFinal, shouldTrigger, stalledRounds } from './trigger.mjs';
+import { loadLedgerEntries, localRoundVerdict } from './stale-verdict.mjs';
 import { hostPaths, readRoundProgress } from '../host/paths.mjs';
 import { readRateState, recordHeader, writeRateState, appendRateLog } from './rate-budget.mjs';
 import { PRIORITY_FALLBACK, readQueuePriorities, sortTaskQueue, unrecognizedPriorities } from './queue.mjs';
@@ -172,6 +173,14 @@ export async function pollInventory({ github, profile, now = () => Date.now(), h
   const roundsApi = createRounds({ github: counted, profile, now });
   const hostProgressAt = hostProgress || defaultHostProgress(profile);
   const log = loopLog === false ? () => {} : loopLog || loopLogOf(profile);
+  // 本地结论只读一次账本：判卡死不再为每条轮次另打 GitHub。
+  let hostState = null;
+  try {
+    hostState = hostPaths(homeOf(profile));
+  } catch {
+    hostState = null;
+  }
+  const ledgerEntries = loadLedgerEntries(hostState);
   const collected = await collectTasks(counted, profile);
   // 认领槽位前的排序（#62）：优先级高的先，同档旧的先。账目/倾向都不改，只改遍历顺序。
   const tasks = orderForClaim(collected, {
@@ -191,7 +200,15 @@ export async function pollInventory({ github, profile, now = () => Date.now(), h
       lastProgressAt: progressAt,
       hostProgressAt: latest ? hostProgressAt(task.ref, latest.round) : null,
     });
-    if (stale) out.push(stale);
+    if (stale && !localRoundVerdict(stale.issue, stale.round, {
+      paths: hostState,
+      profile,
+      task,
+      ledgerEntries,
+      commentId: stale.commentId,
+    })) {
+      out.push(stale);
+    }
     const decision = shouldTrigger(task, { now, profile });
     if (decision.reason === 'base-not-default' || decision.reason === 'base-unknown') {
       // 合并目标分支不对（或取不到）：不进验收、不开修正单。只落一行本地日志，不发通知、不写 GitHub。
