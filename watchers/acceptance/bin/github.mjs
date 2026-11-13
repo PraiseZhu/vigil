@@ -210,7 +210,7 @@ export function assertMirrorIntact(dir) {
 }
 
 /** 目录占多少字节（不跟符号链接）。 */
-function dirSize(dir) {
+export function dirSize(dir) {
   let total = 0;
   const stack = [dir];
   while (stack.length) {
@@ -218,7 +218,13 @@ function dirSize(dir) {
     for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
       const full = path.join(current, entry.name);
       if (entry.isDirectory()) stack.push(full);
-      else if (entry.isFile()) total += fs.lstatSync(full).size;
+      else if (entry.isFile()) {
+        try {
+          total += fs.lstatSync(full).size;
+        } catch (error) {
+          if (error?.code !== 'ENOENT') throw error;
+        }
+      }
     }
   }
   return total;
