@@ -5,7 +5,7 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {deploymentDrift,registerLocalPatch,writeDeployManifest} from './bin/mivo-deploy-drift.mjs';
+import {deploymentDrift,registerLocalPatch,writeDeployManifest,readDeployManifest} from './bin/mivo-deploy-drift.mjs';
 const here=path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_RUNTIME='/path/to/your/runtime/mivo-watcher';
 export const FILES=['mivo-pre-push.mjs','mivo-handoff.mjs','mivo-identity.mjs','mivo-lifeline-source.mjs','mivo-feedback-policy.mjs','mivo-ci.mjs','mivo-ci-triage.mjs','mivo-codeql-infra.mjs','mivo-ci-selfheal.mjs','mivo-deploy-drift.mjs','mivo-pr-policy.mjs','mivo-pr-snapshot.mjs','mivo-pr-actions.mjs','mivo-code-scanning.mjs','mivo-repair.mjs','mivo-validation-runtime.mjs','mivo-validation-evidence.mjs','mivo-validation-baseline.mjs','mivo-review-resolve.mjs','mivo-app-token.mjs','mivo-state.mjs','mivo-ownership.mjs','mivo-watcher.mjs','notify.mjs','public-review.mjs','session-title.mjs','profile.mjs','mivo-watch-script.py','protocol.py','session-title-maintenance.py'];
@@ -18,12 +18,25 @@ const ENTRY_POINTS=['mivo-watcher.mjs','mivo-repair.mjs','mivo-handoff.mjs','miv
 const sha=file=>fs.existsSync(file)?createHash('sha256').update(fs.readFileSync(file)).digest('hex'):null;
 const requireValue=(v,m)=>{if(!v)throw Error(m);};
 // Which source commit the installed files came from, for the drift manifest. Best effort: a copy outside git has none.
-function sourceIdentity(){
+function sourceIdentity(sourceDir=here){
  try{
-  const commit=execFileSync('git',['-C',here,'rev-parse','HEAD'],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();
-  const dirty=execFileSync('git',['-C',here,'status','--porcelain','--','bin'],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim()!=='';
+  const commit=execFileSync('git',['-C',sourceDir,'rev-parse','HEAD'],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();
+  const dirty=execFileSync('git',['-C',sourceDir,'status','--porcelain','--','bin'],{encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim()!=='';
   return {sourceCommit:/^[a-f0-9]{40}$/.test(commit)?commit:null,sourceDirty:dirty};
  }catch{return {sourceCommit:null,sourceDirty:null};}
+}
+export function sourceChanges(home, sourceDir=here){
+ let previous=null,manifestError=null;
+ try{previous=readDeployManifest(home)?.sourceCommit??null;}
+ catch{manifestError='deployment manifest unavailable';}
+ const current=sourceIdentity(sourceDir).sourceCommit;
+ if(manifestError)return {from:null,to:current,commits:[],error:manifestError};
+ if(!previous||!current||previous===current)return {from:previous,to:current,commits:[]};
+ try{
+  const output=execFileSync('git',['-C',sourceDir,'log','--format=%H%x09%s',`${previous}..${current}`],{encoding:'utf8',stdio:['ignore','pipe','ignore']});
+  const commits=output.trim()?output.trim().split('\n').map(line=>{const [sha,...title]=line.split('\t');return {sha,title:title.join('\t')};}):[];
+  return {from:previous,to:current,commits};
+ }catch{return {from:previous,to:current,commits:null,error:'source history unavailable'};}
 }
 function relativeImportSpecs(file){
  if(!fs.existsSync(file))return [];
@@ -160,7 +173,7 @@ export function apply(plan){
  const state=path.join(plan.home,'state/state.json'),lease=path.join(plan.home,'state/lease');
  const record=path.join(plan.home,'deployments',plan.id),owner=`${process.pid} ${plan.id}\n`;
  const check=()=>{
-  requireValue(stateFingerprint(plan.home)===plan.stateSha,'state changed since preview');
+  requireValue(stateFingerprint(plan.home)===plan.stateSha,'state changed since preview; run preview and apply consecutively');
   requireValue(JSON.stringify(identities(plan.home))===JSON.stringify(plan.sessionIds),'session binding changed');
   idle(plan.database,plan.sessionIds);
   for(const item of plan.files){requireValue(sha(path.resolve(path.join(here,'bin'),item.name))===item.source,'source changed since preview');requireValue(sha(path.resolve(path.join(plan.home,'bin'),item.name))===item.runtime,'runtime changed since preview');}
@@ -208,7 +221,7 @@ if(process.argv[1]&&fs.realpathSync(process.argv[1])===fileURLToPath(import.meta
   const home=get('--home'),database=get('--database'),id=get('--id'),file=get('--plan');
   requireValue(['--home','--database','--id','--plan'].every(k=>args.includes(k))&&path.isAbsolute(file),'explicit home/database/id/absolute plan required');
   const plan={version:1,home,database,id,files:verify(home),stateSha:stateFingerprint(home),sessionIds:identities(home)};
-  validatePlan(plan);idle(database,plan.sessionIds);fs.writeFileSync(file,JSON.stringify(plan,null,2),{flag:'wx',mode:0o600});console.log(JSON.stringify({mode:'preview',plan:file,files:plan.files.length}));
+  validatePlan(plan);idle(database,plan.sessionIds);fs.writeFileSync(file,JSON.stringify(plan,null,2),{flag:'wx',mode:0o600});console.log(JSON.stringify({mode:'preview',plan:file,files:plan.files.length,source:sourceChanges(home)}));
  }else if(mode==='drift'){
   const home=get('--home');requireValue(args.includes('--home')&&path.isAbsolute(home),'--home required');
   const result=deploymentDrift({home});console.log(JSON.stringify(result));

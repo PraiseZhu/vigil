@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
-import {spawnSync} from 'node:child_process';
+import {execFileSync,spawnSync} from 'node:child_process';
 import {fileURLToPath,pathToFileURL} from 'node:url';
-import {FILES,verify,validatePlan,apply,stateFingerprint} from './deploy.mjs';
+import {FILES,verify,validatePlan,apply,stateFingerprint,sourceChanges} from './deploy.mjs';
 function importDeployed(file){
  return spawnSync(process.execPath,['--input-type=module','-e',`await import(${JSON.stringify(pathToFileURL(file).href)})`],{encoding:'utf8',timeout:20000,env:process.env});
 }
@@ -80,6 +80,26 @@ test('state fingerprint includes PR file content hashes',t=>{
  const first=stateFingerprint(home);
  fs.writeFileSync(path.join(home,'state/prs/PR_1.json'),'{"sessionId":"b"}\n');
  assert.notEqual(stateFingerprint(home),first);
+});
+test('preview reports source commits since the installed release',t=>{
+ const f=fixture(t),source=path.join(path.dirname(f.home),'source');
+ fs.mkdirSync(path.join(source,'bin'),{recursive:true});
+ const git=(...args)=>execFileSync('git',['-C',source,...args],{encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
+ git('init','-q');git('config','user.email','test@example.invalid');git('config','user.name','Example User');
+ fs.writeFileSync(path.join(source,'bin','version.txt'),'one\n');git('add','bin/version.txt');git('commit','-q','-m','old release');
+ const previous=git('rev-parse','HEAD');
+ fs.writeFileSync(path.join(source,'bin','version.txt'),'two\n');git('commit','-q','-am','new release');
+ const current=git('rev-parse','HEAD');
+ fs.mkdirSync(path.join(f.home,'deployments'),{recursive:true});
+ const withoutManifest=sourceChanges(f.home,source);
+ assert.deepEqual(withoutManifest.commits,[]);
+ fs.writeFileSync(path.join(f.home,'deployments/current.json'),JSON.stringify({version:1,release:'old',sourceCommit:previous,sourceDirty:false,at:new Date().toISOString(),files:FILES.map(name=>({name,sha256:'a'.repeat(64)})),localPatches:{}}));
+ const changes=sourceChanges(f.home,source);
+ assert.equal(changes.from,previous);assert.equal(changes.to,current);assert.ok(Array.isArray(changes.commits));
+ assert.ok(changes.commits.some(commit=>commit.sha===current));
+ assert.equal(changes.commits.find(commit=>commit.sha===current).title,'new release');
+ fs.writeFileSync(path.join(f.home,'deployments/current.json'),'not json\n');
+ assert.deepEqual(sourceChanges(f.home,source).commits,[]);
 });
 test('#238 SC7 中途失败回滚：已有的仓外 net-errors.mjs 恢复成部署前内容', t => {
  const f=fixture(t),outside=outsideNetErrors(f.home);

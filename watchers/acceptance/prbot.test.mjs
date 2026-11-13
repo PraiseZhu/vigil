@@ -41,6 +41,7 @@ import { PR_BODY_QUERY } from './host/prbot-gate-check.mjs';
 import { checkPrBody } from './host/prbot-template-check.mjs';
 import { clock, OWNER, REPO, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import { spawnRun } from './bin/localgit.mjs';
+import { authEnvBackoffPath, modelAuthScope, readAuthEnvBackoff, CATEGORY_UNKNOWN } from './host/llm-proxy-preflight.mjs';
 
 const CORRECTION_REF = `${REPO}#9`;
 const CORRECTION_MARKER = `[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#2 SC3 · 第 1 轮`;
@@ -2228,4 +2229,377 @@ test('#172 SC4 检查读 issue 和 PR 正文走只读客户端，不经写闸、
   // 等 CI 那一步原本就经写闸读修正子 issue 的开关状态（不是本检查）；PR 正文只由检查读，不该出现在写闸里。
   assert.equal(result.actions.some((action) => action.type === 'read.graphql' && action.query === PR_BODY_QUERY), false, '检查读 PR 正文不经写闸');
   assert.equal(result.actions.some((action) => Object.keys(action).some((key) => /token|auth/i.test(key))), false, '写闸动作里没有令牌字段');
+});
+
+function proxyModelsJson({ modelId = 'proxy/flash', provider = 'proxy', apiKey = '$LLM_PROXY_API_KEY' } = {}) {
+  return {
+    providers: {
+      proxy: { apiKey, baseUrl: 'https://example.invalid' },
+      other: { apiKey: '$OTHER_API_KEY', baseUrl: 'https://other.example.invalid' },
+    },
+    models: { [modelId]: { provider }, 'other/flash': { provider: 'other' } },
+  };
+}
+
+function proxyHostConfig(home, { modelId = 'proxy/flash', models } = {}) {
+  const modelsFile = path.join(home, 'config', 'models.json');
+  fs.mkdirSync(path.dirname(modelsFile), { recursive: true });
+  fs.writeFileSync(modelsFile, `${JSON.stringify(models || proxyModelsJson({ modelId }))}\n`);
+  return {
+    prbot: {
+      piCommand: ['sh', '-c', `cp ${modelsFile} "$HOME/.pi/agent/models.json" && exec pi "$@"`, 'pi', '--model', modelId],
+      repos: { [REPO]: { handoff: 'owner' } },
+    },
+  };
+}
+
+function readCorrectionState(home, issue = CORRECTION_REF) {
+  const file = prbotStatePath(hostPaths(home), issue);
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+test('#458 SC4 修正入口：缺变量时不认领，piIterations 为 0', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const result = await runOnce({
+    world,
+    home,
+    hostConfig: proxyHostConfig(home),
+    overrides: { env: { PATH: process.env.PATH } },
+  });
+  assert.equal(result.code, 3);
+  assert.equal(result.actions.some((action) => action.type === 'comment.create'), false);
+  const state = readCorrectionState(result.home);
+  assert.equal(state, null);
+});
+
+test('#458 SC6 修正：缺变量后短间隔再跑仍不认领，退避未到期', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const t0 = Date.parse('2026-11-13T12:00:00.000Z');
+  const hostConfig = proxyHostConfig(home);
+  const first = await runOnce({
+    world,
+    home,
+    hostConfig,
+    overrides: { env: { PATH: process.env.PATH }, now: () => t0 },
+  });
+  const second = await runOnce({
+    world,
+    home,
+    hostConfig,
+    overrides: { env: { PATH: process.env.PATH }, now: () => t0 + 1000 },
+  });
+  assert.equal(first.code, 3);
+  assert.equal(second.code, 3);
+  assert.equal(first.actions.concat(second.actions).some((action) => action.type === 'comment.create'), false);
+  const stamp = JSON.parse(fs.readFileSync(authEnvBackoffPath(hostPaths(home).hostDir, { scope: modelAuthScope(proxyModelsJson(), 'proxy/flash') }), 'utf8'));
+  assert.equal(Date.parse(stamp.until) - t0, 30 * 60 * 1000);
+});
+
+
+test('#458 SC5 修正：已进入 fix 后调用前变量未设或为空则不调 pi、不耗次数，非空对照会再调', async () => {
+  const present = 'sk-fake-credential-for-test-do-not-store';
+  const t0 = Date.parse('2026-11-13T12:00:00.000Z');
+
+  async function runAfterEnteringFix(afterFirstPi) {
+    const world = defaultTree({ roundStatus: '要修' });
+    addCorrection(world);
+    const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+    const hostConfig = proxyHostConfig(home);
+    const env = { PATH: process.env.PATH, LLM_PROXY_API_KEY: present };
+    let nowMs = t0;
+    let piRuns = 0;
+    const first = await runOnce({
+      world,
+      home,
+      hostConfig,
+      overrides: {
+        env,
+        now: () => nowMs,
+        piRunner: async () => {
+          piRuns += 1;
+          afterFirstPi(env);
+          return { ok: false, code: 1, stderr: 'assertion failed in unit test' };
+        },
+      },
+    });
+    assert.equal(first.code, 1);
+    assert.equal(piRuns, 1, '调用前预检失败后不得再调 pi');
+    const state = readCorrectionState(home);
+    assert.equal(state.stage, 'fix');
+    assert.equal(state.piIterations, 1);
+    assert.notEqual(state.status, '需人工处理');
+    assert.notEqual(state.failureReason, 'limit-pi-iterations');
+    assert.equal(state.authDiagnostic?.category, 'missing-llm-proxy-api-key');
+    assert.equal(state.authDiagnostic?.code, null);
+    assert.equal(Object.keys(state.authDiagnostic).sort().join(','), 'category,code');
+    assert.equal(JSON.stringify(state).includes(present), false);
+    const stamp = JSON.parse(fs.readFileSync(authEnvBackoffPath(hostPaths(home).hostDir, { scope: modelAuthScope(proxyModelsJson(), 'proxy/flash') }), 'utf8'));
+    assert.equal(Date.parse(stamp.until) - t0, 30 * 60 * 1000);
+    assert.equal(stamp.category, 'missing-llm-proxy-api-key');
+
+    nowMs = t0 + 1000;
+    const again = await runOnce({
+      world,
+      home,
+      hostConfig,
+      overrides: {
+        env,
+        now: () => nowMs,
+        piRunner: async () => {
+          piRuns += 1;
+          return { ok: false, code: 1, stderr: 'assertion failed in unit test' };
+        },
+      },
+    });
+    assert.equal(again.code, 3);
+    assert.equal(piRuns, 1, '退避未到期不得再调 pi');
+    assert.equal(readCorrectionState(home).piIterations, 1);
+  }
+
+  await runAfterEnteringFix((env) => {
+    delete env.LLM_PROXY_API_KEY;
+  });
+  await runAfterEnteringFix((env) => {
+    env.LLM_PROXY_API_KEY = '';
+  });
+
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const env = { PATH: process.env.PATH, LLM_PROXY_API_KEY: present };
+  let piRuns = 0;
+  const result = await runOnce({
+    world,
+    home,
+    hostConfig: proxyHostConfig(home),
+    overrides: {
+      env,
+      now: () => t0,
+      piRunner: async () => {
+        piRuns += 1;
+        if (piRuns === 1) return { ok: false, code: 1, stderr: 'assertion failed in unit test' };
+        return { ok: true, stdout: '', code: 0 };
+      },
+    },
+  });
+  assert.equal(piRuns, 2, '变量非空时同一 fix 路径会再次调用 pi');
+  assert.ok(result.code === 0 || result.code === 1);
+});
+
+test('#458 SC6/SC9 修正：调用后白名单缺密钥分类不计次，不升人工终态，状态不含原文或假凭证', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const fake = 'sk-fake-credential-for-test-do-not-store';
+  const piCalls = [];
+  const t0 = Date.parse('2026-11-13T12:00:00.000Z');
+  const result = await runOnce({
+    world,
+    home,
+    hostConfig: proxyHostConfig(home),
+    piCalls,
+    overrides: {
+      env: { PATH: process.env.PATH, LLM_PROXY_API_KEY: 'present-but-not-asserted' },
+      now: () => t0,
+      piRunner: async () => ({ ok: false, code: 1, stderr: `No API key found for proxy.\nBearer ${fake}` }),
+    },
+  });
+  assert.equal(result.code, 1);
+  assert.equal(piCalls.length, 1, '同一拍不连跑');
+  const state = readCorrectionState(result.home);
+  assert.equal(state.piIterations, 0);
+  assert.notEqual(state.status, '需人工处理');
+  assert.notEqual(state.failureReason, 'limit-pi-iterations');
+  const blob = JSON.stringify(state);
+  assert.equal(blob.includes(fake), false);
+  assert.equal(blob.includes('No API key found'), false);
+  assert.equal(state.authDiagnostic?.category, 'missing-llm-proxy-api-key');
+  assert.equal(state.authDiagnostic?.code, 1);
+
+  const again = await runOnce({
+    world,
+    home,
+    hostConfig: proxyHostConfig(home),
+    piCalls,
+    overrides: {
+      env: { PATH: process.env.PATH, LLM_PROXY_API_KEY: 'present-but-not-asserted' },
+      now: () => t0 + 1000,
+      piRunner: async () => {
+        piCalls.push({ late: true });
+        return { ok: false, code: 1, stderr: 'No API key found for proxy.' };
+      },
+    },
+  });
+  assert.equal(again.code, 3);
+  assert.equal(piCalls.filter((item) => item.late).length, 0, '退避未到期不得再调 pi');
+  assert.equal(readCorrectionState(result.home).piIterations, 0);
+});
+
+test('#458 SC7 真修复失败仍 4 次后 limit-pi-iterations', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const piCalls = [];
+  let piFails = 0;
+  const result = await runOnce({
+    world,
+    home,
+    hostConfig: proxyHostConfig(home),
+    piCalls,
+    overrides: {
+      env: { PATH: process.env.PATH, LLM_PROXY_API_KEY: 'present-but-not-asserted' },
+      piRunner: async () => {
+        piFails += 1;
+        return { ok: false, code: 1, stderr: 'assertion failed in unit test' };
+      },
+    },
+  });
+  assert.equal(result.code, 1);
+  assert.equal(piFails, 4);
+  const state = readCorrectionState(result.home);
+  assert.equal(state.piIterations, 4);
+  assert.equal(state.failureReason, 'limit-pi-iterations');
+});
+
+test('#458 SC8 修正：未知网络计入现有 4 次但每拍只一次，短间隔不再调用，跨拍达界后停止', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const hostConfig = proxyHostConfig(home);
+  const piCalls = [];
+  let netFails = 0;
+  let nowMs = Date.parse('2026-11-13T12:00:00.000Z');
+  const env = { PATH: process.env.PATH, LLM_PROXY_API_KEY: 'present-but-not-asserted' };
+  const runTick = () =>
+    runOnce({
+      world,
+      home,
+      hostConfig,
+      piCalls,
+      overrides: {
+        env,
+        now: () => nowMs,
+        piRunner: async () => {
+          netFails += 1;
+          return { ok: false, code: 1, stderr: 'ECONNRESET connecting to example.invalid' };
+        },
+      },
+    });
+
+  const first = await runTick();
+  assert.equal(first.code, 1);
+  assert.equal(netFails, 1);
+  let state = readCorrectionState(home);
+  assert.equal(state.piIterations, 1);
+  assert.equal(state.authDiagnostic?.category, 'unknown');
+  assert.notEqual(state.failureReason, 'limit-pi-iterations');
+  assert.equal(JSON.stringify(state).includes('ECONNRESET'), false);
+
+  nowMs += 1000;
+  const again = await runTick();
+  assert.equal(again.code, 3);
+  assert.equal(netFails, 1, '退避未到期不得再调 pi');
+  assert.equal(readCorrectionState(home).piIterations, 1);
+
+  // 按未知独立窗口 5/15/60 分钟刚好过期，总跨度远小于一轮 3 小时上限。
+  const waitsMin = [5, 15, 60];
+  for (let n = 2; n <= 4; n += 1) {
+    nowMs += waitsMin[n - 2] * 60 * 1000;
+    const tick = await runTick();
+    assert.equal(tick.code, 1);
+    assert.equal(netFails, n);
+    state = readCorrectionState(home);
+    assert.equal(state.piIterations, n);
+  }
+  assert.equal(state.failureReason, 'limit-pi-iterations');
+
+  nowMs += 60 * 60 * 1000;
+  const afterCap = await runTick();
+  assert.equal(netFails, 4, '达界后不能再试');
+  assert.equal(readCorrectionState(home).failureReason, 'limit-pi-iterations');
+  assert.ok(afterCap.code === 0 || afterCap.code === 1 || afterCap.code === 3);
+});
+
+
+test('#458 修复回归：其他认证不会继承同 home 的代理缺密钥退避', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const t0 = Date.parse('2026-11-13T12:00:00.000Z');
+  const missing = await runOnce({ world, home, hostConfig: proxyHostConfig(home), overrides: { env: { PATH: process.env.PATH }, now: () => t0 } });
+  assert.equal(missing.code, 3);
+  let calls = 0;
+  const other = await runOnce({
+    world, home,
+    hostConfig: proxyHostConfig(home, { modelId: 'other/flash', models: proxyModelsJson({ modelId: 'other/flash', provider: 'other', apiKey: '$OTHER_API_KEY' }) }),
+    overrides: {
+      env: { PATH: process.env.PATH }, now: () => t0 + 1000,
+      piRunner: async () => { calls += 1; return { ok: true, code: 0, stdout: '' }; },
+    },
+  });
+  assert.equal(calls, 1, '不依赖代理变量的模型必须照常调用');
+  assert.notEqual(other.code, 3);
+});
+
+test('#458 修复回归：未知失败严格按 5/15/60 分钟窗口递增，四次停止', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const hostConfig = proxyHostConfig(home);
+  let nowMs = Date.parse('2026-11-13T12:00:00.000Z');
+  let calls = 0;
+  const tick = () => runOnce({ world, home, hostConfig, overrides: {
+    env: { PATH: process.env.PATH, LLM_PROXY_API_KEY: 'fake-for-test' }, now: () => nowMs,
+    piRunner: async () => { calls += 1; return { ok: false, code: 1, stderr: 'ECONNRESET connecting to example.invalid' }; },
+  } });
+  assert.equal((await tick()).code, 1);
+  for (const [index, minutes] of [5, 15, 60].entries()) {
+    nowMs += minutes * 60 * 1000 - 1;
+    assert.equal((await tick()).code, 3, `第 ${index + 1} 个窗口到期前不能调用`);
+    assert.equal(calls, index + 1);
+    nowMs += 1;
+    assert.equal((await tick()).code, 1);
+    assert.equal(calls, index + 2);
+  }
+  assert.equal(readCorrectionState(home).piIterations, 4);
+  assert.equal(readCorrectionState(home).failureReason, 'limit-pi-iterations');
+  nowMs += 60 * 60 * 1000;
+  await tick();
+  assert.equal(calls, 4);
+});
+
+
+
+test('#458 修复回归：真实修正成功才清除本作用域退避', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const hostConfig = proxyHostConfig(home);
+  const scope = modelAuthScope(proxyModelsJson(), 'proxy/flash');
+  const dir = hostPaths(home).hostDir;
+  let nowMs = Date.parse('2026-11-13T12:00:00.000Z');
+  let success = false;
+  let calls = 0;
+  const tick = () => runOnce({ world, home, hostConfig, overrides: {
+    env: { PATH: process.env.PATH, LLM_PROXY_API_KEY: 'fake-for-test' }, now: () => nowMs,
+    piRunner: async () => { calls += 1; return success ? { ok: true, code: 0, stdout: '' } : { ok: false, code: 1, stderr: 'ECONNRESET connecting to example.invalid' }; },
+  } });
+  await tick();
+  nowMs += 5 * 60 * 1000;
+  await tick();
+  assert.equal(readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN }).failures, 2);
+  nowMs += 15 * 60 * 1000;
+  success = true;
+  await tick();
+  assert.equal(calls, 3);
+  assert.equal(readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN }), null);
+
 });

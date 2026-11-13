@@ -294,11 +294,12 @@ node bin/notify.mjs emit --home "$MIVO_WATCHER_HOME"
 
 ```sh
 node deploy.mjs verify  --home <watcher home>                    # 比对源码与运行目录，match:true 表示一致
-node deploy.mjs preview --home <watcher home> --database <Cindy 的 .db 文件> --id <新 id> --plan <绝对路径>
+node deploy.mjs preview --home <watcher home> --database <Cindy 的 .db 文件> --id <新 id> --plan <绝对路径> && \
 node deploy.mjs apply   --plan <同一个 plan 文件>
 ```
 
 `--database` 用来确认修复会话都空闲（需要 `sqlite3`），不是可选项。完整步骤（从哪份检出部署、第一次安装要先建 `bin/` 和 `state/prs/`、部署记录与回退、调度命令必须带 `MIVO_WATCHER_LIVE=1`）见根目录 [`README.md`](../../README.md#安装与部署)。
+预览结果会带上当前已安装提交到本次提交之间的提交标题；若两步之间状态发生变化，重新生成 plan，并把 `preview && apply` 连着执行。
 
 ## 测试
 

@@ -46,7 +46,7 @@ import { writeLockHeld } from './bin/prio-lock.mjs';
 import { renderPrioBoardSection } from './bin/prio-board-section.mjs';
 import { viewPrio } from './bin/prio-view.mjs';
 import { defaultStateDir, stateFiles } from './bin/prio-sync.mjs';
-import { tmpDir, writeProfile } from './fake-gh.fixture.mjs';
+import { PROCFS_SKIP, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SECRET = 'webhook-secret-test';
@@ -1568,7 +1568,7 @@ test('W4c SC4 写锁实现只有 bin/prio-lock.mjs 一份：event-run 不再自�
   assert.doesNotMatch(src, /procLocksFile|proc-locks/, '不再留第二份 /proc/locks 解析');
 });
 
-test('W4c SC4 写锁探测改由 bin/prio-lock.mjs 负责：锁文件残留不算被占，/proc/locks 列了算忙、读不到说探测不了', () => {
+test('W4c SC4 写锁探测改由 bin/prio-lock.mjs 负责：锁文件残留不算被占，/proc/locks 列了算忙、读不到说探测不了', { skip: PROCFS_SKIP }, () => {
   const fixture = eventRunFixture();
   const lockFile = path.join(fixture.home, 'prio-write.lock');
   fs.writeFileSync(lockFile, '');
