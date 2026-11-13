@@ -189,7 +189,7 @@ test('#140 反例（review-pr141）：交接早于最后一条登记（之后又
 });
 
 const ROOT_TASK_KEYS = [
-  'ref', 'repo', 'number', 'kind', 'tier', 'fork', 'state', 'closedAt', 'url', 'nodeId',
+  'ref', 'repo', 'number', 'kind', 'tier', 'fork', 'state', 'closedAt', 'createdAt', 'url', 'nodeId',
   'body', 'bodyVersion', 'defaultBranch', 'children', 'linkedPrs', 'rounds', 'outOfScope', 'leadHandoff', 'dispute',
 ];
 

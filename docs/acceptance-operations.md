@@ -540,6 +540,26 @@ node watchers/acceptance/bin/poll.mjs --json
 
 后果要知道：**非默认分支上的后续合并（包括「要修」之后的修复 PR）都不会自动复验**；合回默认分支后才一起验。
 
+### 认领顺序（#62）
+
+槽位只有 `MAX_ROUNDS`（2）个，先认谁不再只看盘点回来的 `UPDATED_AT` 倒序。`bin/poll.mjs` 在认领之前用 `bin/queue.mjs` 的纯函数
+`sortTaskQueue()` 排一遍，键依次是：
+
+1. 看板「优先级」：`P0` → `P1` → `P2` → `P3`；
+2. 同档按 issue `createdAt` 旧的先（解析不出的排在同档最后）；
+3. 仍相同按 `owner/repo#号` 升序，保证同一份输入每次排出来的顺序一样。
+
+看板「优先级」为空、issue 不在看板上，都按 `P2` 算。优先级只读 `prio-run` 每拍写的看板快照
+（`state/host/board-snapshot.json`，见 14 节）：**不新增 GraphQL 读**，一颗点数都不多花。快照缺失、过期、坏掉，
+或看板值认不出（不是 `P0`..`P3`）时，这些任务按 `P2` 排，并在 `state/host/loop.log` 写一行：
+
+```
+<UTC 时间> queue-priority-fallback reason=missing tasks=3 看板优先级快照用不了，这些任务按 P2 排序
+<UTC 时间> queue-priority-fallback reason=unrecognized tasks=1 看板值认不出，按 P2 排序：owner/repo#12=P9
+```
+
+读不到不让这一拍失败：顺序退回「`createdAt` 旧的先 + 号升序」。看板只读，这条路径不写看板。
+
 ## 5. 提醒与通知的分工
 
 本 issue 的提醒只**发现**：调度循环停摆、轮次卡住或卡死、写闸拒绝、扫到密钥、沙箱起不来，
@@ -1039,7 +1059,7 @@ github-live 的手测（真的看板上跑 24 小时、以及合并后确认没�
 
 `<home>/state/host/board-snapshot.json`，由 `prio-run` 每拍开头写一次，字段固定为 `version`（状态格式版本，当前是 1）、`at`（抓取时间，ISO）、`items`、`excludedCount`、`nullContent`。同一拍里 dry-run、`--write` 和仓外看板读者共用这一份，不再各自发整板查询；PR 搜索不属于快照，照旧每次都拉。
 
-读者只有两条路：`at` 距今不超过一个拍间隔（默认 180 秒）就直接用；过了就**重拉一次并覆盖**（`prio-run` 走这条），或者报「快照过期」不用（仓外读者走这条）。读接口是 `rate-budget.mjs` 的 `readBoardSnapshot`，返回 `{ok, reason, at, ageMs, items, excludedCount, nullContent}`，`reason` 是 `missing` / `stale` / `corrupt` / `clock-skew`。不许静默用旧数据。`ageMs` 为负（墙钟往回跳）按 `clock-skew` 处理：旧快照不能用，等下一拍重拉。快照里的 `items` 是抓取那一刻按 `repo-class.json` 分档过滤后的结果；拍内改分类表不影响这一份快照（下一拍重拉时生效）。用到快照的那一拍不按整板读记点数（真发请求时才记 8 点）。
+读者只有两条路：`at` 距今不超过一个拍间隔（默认 180 秒）就直接用；过了就**重拉一次并覆盖**（`prio-run` 走这条），或者报「快照过期」不用（仓外读者走这条）。读接口是 `rate-budget.mjs` 的 `readBoardSnapshot`，返回 `{ok, reason, at, ageMs, items, excludedCount, nullContent}`，`reason` 是 `missing` / `stale` / `corrupt` / `clock-skew`。不许静默用旧数据。`ageMs` 为负（墙钟往回跳）按 `clock-skew` 处理：旧快照不能用，等下一拍重拉。快照里的 `items` 是抓取那一刻按 `repo-class.json` 分档过滤后的结果；拍内改分类表不影响这一份快照（下一拍重拉时生效）。用到快照的那一拍不按整板读记点数（真发请求时才记 8 点）。主循环的认领排序（4 节「认领顺序」）也是这条路的读者：只用这一份快照的「优先级」，不重拉、不额外发请求；快照不能用时按 `P2` 排并发一行 `queue-priority-fallback`。
 
 ### 日志行
 
