@@ -11,6 +11,7 @@ import { isReadOnlyGraphql } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import {
   appOnlyRepoTable,
+  appOnlySkipLine,
   assertPrioFields,
   BOARD_ITEMS_QUERY,
   classifyRepo,
@@ -4902,30 +4903,51 @@ function appOnlyProfile(extra = {}) {
   };
 }
 
-test('#364 只用 App 模式：读 App 名单外的仓不搜 PR，并记一行 app-only-skip', async () => {
+test('#364 只用 App 模式：读 App 名单外的仓读看板时整仓跳过、记下仓名，也不搜 PR', async () => {
   const table = appOnlyRepoTable(classTable(), appOnlyProfile());
   assert.equal(classifyRepo('example-owner/repo', table).repoClass, 'daily-tool');
   assert.equal(classifyRepo('Other-Org/client', table).repoClass, 'exclude');
+  const node = (repo, number) => ({
+    id: `PVTI_${number}`,
+    isArchived: false,
+    updatedAt: '2026-11-13T00:00:00Z',
+    content: {
+      __typename: 'Issue',
+      number,
+      state: 'OPEN',
+      updatedAt: '2026-11-13T00:00:00Z',
+      repository: { nameWithOwner: repo },
+      labels: { nodes: [] },
+    },
+    fieldValues: { nodes: [] },
+  });
   const searched = [];
   const github = {
     async ownerGraphql(query, variables) {
+      if (String(query).includes('projectV2')) {
+        return {
+          user: {
+            projectV2: {
+              items: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [node('Example-Owner/repo', 1), node('Other-Org/client', 2), node('Other-Org/client', 3)],
+              },
+            },
+          },
+        };
+      }
       searched.push(String(variables.query));
       return { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
     },
   };
-  const lines = [];
-  const original = process.stderr.write;
-  process.stderr.write = (chunk) => {
-    lines.push(String(chunk));
-    return true;
-  };
-  try {
-    await loadPullRequests(github, ['Example-Owner/repo', 'Other-Org/client'], table);
-  } finally {
-    process.stderr.write = original;
-  }
+  const board = await loadBoardItems(github, { ownerLogin: OWNER, projectNumber: PROJECT }, table);
+  assert.deepEqual(board.items.map((entry) => entry.repo), ['Example-Owner/repo']);
+  assert.equal(board.excludedCount, 2);
+  assert.deepEqual(board.appOnlySkipped, ['Other-Org/client']);
+  await loadPullRequests(github, ['Example-Owner/repo', 'Other-Org/client'], table);
   assert.deepEqual(searched, ['is:pr repo:Example-Owner/repo']);
-  assert.equal(lines.filter((line) => line.startsWith('app-only-skip repo=Other-Org/client ')).length, 1);
+  assert.match(appOnlySkipLine(board.appOnlySkipped, T0, 'prio-run'), /^2026-10-31T12:00:00\.000Z app-only-skip component=prio-run repos=Other-Org\/client /);
+  assert.equal(appOnlySkipLine([], T0, 'prio-run'), '');
 });
 
 test('#364 只用 App 模式：名单外仓的条目按 exclude 处理，不写字段、计入排除', async () => {

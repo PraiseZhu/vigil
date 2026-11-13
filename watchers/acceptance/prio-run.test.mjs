@@ -1983,3 +1983,66 @@ test('#248 SC9 被拦条目的防抖状态连续两拍都不推进、也不清�
   assert.deepEqual(afterFirst, seeded, '没有推进也没有清零');
   assert.equal(disabled(dir), false);
 });
+
+test('#364 只用 App 模式：读 App 名单外的仓整仓跳过，run 日志记一行 app-only-skip，不搜 PR、整拍不报错', async () => {
+  const { runContinuous } = await import('./bin/prio-run.mjs');
+  const dir = tmpDir();
+  const tokenFile = path.join(dir, 'token');
+  writeSecret(tokenFile, 'fake-token-not-real\n');
+  const node = (repo, number) => ({
+    id: `PVTI_${number}`,
+    isArchived: false,
+    updatedAt: '2026-11-13T00:00:00Z',
+    content: {
+      __typename: 'Issue',
+      number,
+      state: 'OPEN',
+      updatedAt: '2026-11-13T00:00:00Z',
+      repository: { nameWithOwner: repo },
+      labels: { nodes: [] },
+    },
+    fieldValues: { nodes: [] },
+  });
+  const inputs = [];
+  const run = async (args, opts) => {
+    inputs.push(String(opts?.input || ''));
+    return {
+      code: 0,
+      stdout: JSON.stringify({
+        data: {
+          user: {
+            projectV2: {
+              items: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [node('Other-Org/client', 1), node('Another-Org/tool', 2)],
+              },
+            },
+          },
+        },
+      }),
+    };
+  };
+  const out = { text: '', write(chunk) { this.text += chunk; } };
+  const now = Date.parse('2026-11-13T12:00:00Z');
+  const result = await runContinuous(['--state-dir', dir], {
+    dir,
+    stdout: out,
+    now: () => now,
+    loadProfile: () => ({
+      ownerLogin: 'ExampleUser',
+      projectNumber: 7,
+      githubTokenFile: tokenFile,
+      appOnly: true,
+      apps: { read: { appId: 1, privateKeyFile: '/dev/null', owners: ['ExampleUser'] } },
+    }),
+    run,
+    fetchImpl: async () => {
+      throw new Error('unexpected network');
+    },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(inputs.length, 1);
+  assert.equal(inputs.some((input) => input.includes('is:pr')), false);
+  const log = fs.readFileSync(path.join(dir, 'run-2026-11-13.log'), 'utf8');
+  assert.match(log, /app-only-skip component=prio-run repos=Another-Org\/tool,Other-Org\/client /);
+});

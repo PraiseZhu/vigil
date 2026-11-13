@@ -231,7 +231,8 @@ App 读到 401 / 403 / 404（读是 gh 的 HTTP 状态与 GraphQL 错误；`bran
 - 只在宿主生效：沙箱 profile 副本删掉 `appOnly`（沙箱里没有令牌，读写都经写闸，由写闸按 `appOnly` 发请求）。
 - `doctor` 的「令牌账号」一项在 `appOnly` 下不再用账号令牌查 `viewer`，直接标明开关已开。
 - 看板同步（`prio-run` / `prio-sync`）在 `appOnly` 下只认 ①读 App 名单里的 owner：看板上别的 owner 的仓按 `exclude` 整仓跳过（不搜 PR、不改字段、保留上次状态），
-  每轮在 stderr 记一行 `app-only-skip repo=<owner/name> …`，不会再因为按仓搜 PR 被 `app-only-blocked` 拦下整轮报错（#364）。
+  每拍在看板同步自己的 run 日志（`--state-dir` 下的 `run-<日期>.log`，与 stdout 同一份）记一行
+  `<UTC 时间> app-only-skip component=<prio-run|prio-sync> repos=<owner/name,…> …`，不会再因为按仓搜 PR 被 `app-only-blocked` 拦下整轮报错（#364、#460）。
 - 打开前先确认：`loop.log` 最近 24 小时的 `app-token-fallback` 都已消掉（每一条在 `appOnly` 下都会变成一次失败）；
   ①读 App 有 Contents 读权限（拉代码要用）。回滚：把 `appOnly` 改回 `false`（或删掉这一键），重启 `loop` 与写闸 `serve`。
 

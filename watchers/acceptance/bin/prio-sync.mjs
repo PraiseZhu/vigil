@@ -466,6 +466,12 @@ export function appOnlyRepoTable(table, profile) {
   return { ...table, appReadOwners: owners.map((owner) => String(owner).toLowerCase()) };
 }
 
+/** 只用 App 模式下这一拍整仓跳过的仓，写进 run 日志的一行；没有就返回空串。 */
+export function appOnlySkipLine(repos, nowMs, component) {
+  if (!Array.isArray(repos) || repos.length === 0) return '';
+  return `${new Date(nowMs).toISOString()} app-only-skip component=${component} repos=${repos.join(',')} 只用 App 模式：这些仓的 owner 不在读 App 名单里，看板同步整仓跳过（不搜 PR、不改字段）\n`;
+}
+
 export function readRepoClassTable(file) {
   if (!file || !fs.existsSync(file)) return emptyClassTable();
   let parsed;
@@ -809,6 +815,7 @@ export async function loadBoardItems(github, profile, table = DEFAULT_REPO_CLASS
   const items = [];
   const skipped = { archived: 0, notIssue: 0, nullContent: 0, invalid: 0 };
   let excludedCount = 0;
+  const appOnlySkipped = new Set();
   let after = null;
   do {
     const data = await github.ownerGraphql(BOARD_ITEMS_QUERY, {
@@ -827,13 +834,14 @@ export async function loadBoardItems(github, profile, table = DEFAULT_REPO_CLASS
       const mapped = mapItem(node, table);
       if (itemIsExcluded(mapped, table)) {
         excludedCount += 1;
+        if (mapped?.repo && classifyRepo(mapped.repo, table).appOnly) appOnlySkipped.add(mapped.repo);
         continue;
       }
       items.push(mapped);
     }
     after = conn.pageInfo?.hasNextPage ? conn.pageInfo.endCursor : null;
   } while (after);
-  return { items, skipped, excludedCount };
+  return { items, skipped, excludedCount, appOnlySkipped: [...appOnlySkipped].sort() };
 }
 
 export async function loadPullRequests(github, repos, table = DEFAULT_REPO_CLASS_TABLE) {
@@ -842,11 +850,7 @@ export async function loadPullRequests(github, repos, table = DEFAULT_REPO_CLASS
   for (const repo of repos || []) {
     const name = String(repo || '');
     if (!name.includes('/') || seen.has(name)) continue;
-    const ranked = classifyRepo(name, table || DEFAULT_REPO_CLASS_TABLE);
-    if (ranked.appOnly) {
-      process.stderr.write(`app-only-skip repo=${name} 只用 App 模式：这个 owner 不在读 App 名单里，看板同步整仓跳过（不搜 PR、不改字段）\n`);
-    }
-    if (ranked.repoClass === 'exclude') continue;
+    if (isExcludedRepo(name, table)) continue;
     seen.add(name);
     let after = null;
     do {
@@ -1637,6 +1641,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   let prs = deps.loadPrs ? await deps.loadPrs() : null;
   let skipped = null;
   let boardExcluded = 0;
+  let appOnlySkipped = [];
   const needBoard = items == null;
   const needPrs = !args.restore && prs == null;
   if (needBoard || needPrs) {
@@ -1646,6 +1651,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       items = board.items;
       skipped = board.skipped;
       boardExcluded = board.excludedCount;
+      appOnlySkipped = board.appOnlySkipped || [];
     }
     if (needPrs) {
       prs = await loadPullRequests(reader, [...new Set((items || []).map((entry) => entry.repo))], table);
@@ -1672,6 +1678,8 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     }
   }
   const loggedStdout = teeRunLog(stdout, logFile);
+  const skipLine = appOnlySkipLine(appOnlySkipped, nowMs, 'prio-sync');
+  if (skipLine) loggedStdout.write(skipLine);
   const nullContent = skipped ? skipped.nullContent : 0;
   if (args.restore) {
     return restorePrio({
