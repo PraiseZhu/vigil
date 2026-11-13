@@ -1069,7 +1069,7 @@ github-live 的手测（真的看板上跑 24 小时、以及合并后确认没�
 
 ## 15. 部署定时自检（#367）
 
-部署靠一条规范化 crontab 条目按固定节拍拉起部署脚本。条目本身不在仓里，被删、被注释、被改坏时验收机的其它检查只会说「部署落后 N 个提交」，读起来像在等空档或等批准。这一节的自检只做一件事：**只读核对那条条目，发现问题只告警，不写 cron、不修 cron、不动其它条目。**
+部署靠一条规范化 crontab 条目按固定节拍拉起部署脚本。系统 crontab 不在仓里（仓里只有重启后恢复用的模板 `watchers/acceptance/crontab.template`，见第 16 节），被删、被注释、被改坏时验收机的其它检查只会说「部署落后 N 个提交」，读起来像在等空档或等批准。这一节的自检只做一件事：**只读核对那条条目，发现问题只告警，不写 cron、不修 cron、不动其它条目。**
 
 它核对的边界：
 
@@ -1118,3 +1118,56 @@ node watchers/acceptance/bin/deploy-cron-selfcheck.mjs --home <验收机 home> \
 - 接线回滚：如果已经按上面的步骤挂到 `run-ensure`，删掉那一行调用即可。自检只读、不写 cron，不需要还原任何系统状态。
 
 状态文件在宿主状态目录下的 `deploy-cron-selfcheck.json`，删掉后下一次会按「首次」处理（正常就静默）。
+
+## 16. 重启后恢复 crontab
+
+2026-11-11 17:14（北京）机器重启后验收机的用户 crontab 被清空，deploy-ff 停了约 1 小时，靠人工补装。仓里的 `watchers/acceptance/crontab.template` 是恢复依据，只含**验收机自己**的 5 条生效条目，每条上方有一行中文注释说明它干什么。
+
+模板口径：
+
+- 5 条各是什么：deploy-ff 每 5 分钟一拍（带 `--approval-file`）；prio 看板持续写入 `run.sh` 在 24、54 分；关联 PR 持续写入 `run-field.sh` 在 9、39 分；event-run 拉起脚本的 `@reboot` 一条与每分钟一条。
+- 路径一律写 `$HOME`，不写死本机家目录、主机名、令牌。cron 执行条目时会把 `$HOME` 设成该用户的家目录，所以模板里的 `$HOME` 可以直接用，也用 `$HOME` **保持原样**直接交给 `crontab`，不要用 `sed` 展开成绝对路径——展开了就把本机路径写死，换机或改用户名后模板就错了。
+- 以后新增条目时，命令里的 `%` 必须转义成 `\%`（现有 5 条都不含 `%`）。
+- 别的 bot（pi-cron、ops-lane 等）的条目不属于验收机，仓外另管，不要写进模板。
+
+模板本身先校验一遍（只读：只读模板文件，不读系统 crontab、不写任何文件）：
+
+```sh
+node watchers/acceptance/bin/crontab-template-check.mjs
+```
+
+它查五件事：5 条生效条目都在且每条上方有注释、deploy-ff 带 `--approval-file`、没有写死的用户家目录绝对路径（一律要写 `$HOME`）、没有疑似令牌、没有重复条目。退出码 0 = 通过，非 0 = 不通过并逐条打印原因。
+
+恢复步骤（**人工步骤，不由本仓任何 PR 接线**；本仓不装 cron、不写 cron、不改系统状态）：
+
+1. 先确认是「真的没有 crontab」，不是读失败。退出码与 stderr 分开落文件，不经管道（管道会把 `crontab` 的退出码换掉）：
+
+```sh
+crontab -l >/tmp/crontab.now 2>/tmp/crontab.err; echo "rc=$?"; cat /tmp/crontab.err
+```
+
+只有退出码非 0 且 stderr 是整段 `no crontab for <用户>` 时才按本节装。退出码非 0 但 stderr 另有内容（权限、spool 之类）按读取失败处理，先查原因。
+
+2. 装之前先备份现有内容（当前为空时这条会失败，属正常）：
+
+```sh
+crontab -l >"$HOME/crontab.backup.$(date +%Y%m%dT%H%M%SZ)"
+```
+
+3. **已有非空 crontab 就不覆盖**：把 `crontab -l` 的输出与模板逐行比对，差异先人工确认。模板只写验收机自己的 5 条，直接 `crontab <模板>` 会连带丢掉别的 bot 的条目。
+
+4. 确认是空的、且模板校验通过，再装（在 vigil 仓根执行，`$HOME` 保持原样）：
+
+```sh
+node watchers/acceptance/bin/crontab-template-check.mjs || exit 1
+crontab watchers/acceptance/crontab.template
+crontab -l | diff - watchers/acceptance/crontab.template && echo "装好了，与模板一致"
+```
+
+5. 盯一拍：下一个 5 分钟拍里 deploy-ff 日志有新行；`deploy-cron-selfcheck` 不再告警；event-run 的轮询在 1 分钟内被拉起来。
+
+6. 仓外条目补装：别的 bot 的条目仓外另管，不在本仓的模板里，也不由本仓的 PR 负责。
+
+回滚：装错了用备份盖回去（`crontab <备份文件>`）。装之前本来就是空、也没有备份的，`crontab -r` 回到没有 crontab 的状态。
+
+本节边界：只提供模板和人工操作步骤。模板不被任何脚本读取，也没有任何自动化按它写 cron；本仓的测试只校验模板文本与本节措辞，不接触真实 crontab。
