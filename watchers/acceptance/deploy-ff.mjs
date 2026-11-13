@@ -88,30 +88,124 @@ const DRAIN_RELEASE_STATUSES = new Set([
   'ci-pending',
 ]);
 const DRAIN_HOLDER_MARK = 'deploy-ff-drain-holder';
+export const LOCK_RESTORE_FAILED_KIND = 'deploy-drain-lock-restore-failed';
+
+export function lockPidOf(content) {
+  try {
+    const data = JSON.parse(Buffer.isBuffer(content) ? content.toString('utf8') : String(content ?? ''));
+    const pid = Number(data?.pid);
+    return Number.isInteger(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+export function lockRestoreFailedReason({ tmp, movedPid, currentPid }) {
+  return `排空占槽要把一份已经判定过期的锁放回原位时，槽位上已经被别的进程写了新的活锁。被挪走的那份还在 ${tmp}（进程号 ${movedPid ?? '未知'}），新的活锁仍在原槽位（进程号 ${currentPid ?? '未知'}），两份文件都还在，没有删除。在跑的轮次不受影响，这一拍没有占用这个槽。请人核对这两份锁各自属于谁，确认后删掉那份临时文件。`;
+}
+
+export function appendLockRestoreAlert(alertsFile, { tmp, moved, current }) {
+  if (!alertsFile) return null;
+  const movedPid = lockPidOf(moved);
+  const currentPid = lockPidOf(current);
+  const entry = {
+    ts: new Date().toISOString(),
+    kind: LOCK_RESTORE_FAILED_KIND,
+    reason: lockRestoreFailedReason({ tmp, movedPid, currentPid }),
+    detail: `tmp=${tmp}; movedPid=${movedPid ?? ''}; currentPid=${currentPid ?? ''}`,
+  };
+  try {
+    appendAlert(alertsFile, entry);
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 删掉一份已确认是陈旧（pid 已死）的锁。不依赖模块作用域：fs / path / crypto 由调用方传入，
+ * 宿主和排空持有进程共用这一份实现。hooks.afterRename 只给单测注入「rename 后、link 前」；
+ * 持有进程不传 hooks。放回因 EEXIST 失败时通过 onRestoreFailed 告警，不删任何文件。
+ */
+export function removeLockIfUnchanged(file, expected, { fs, path, crypto, onRestoreFailed, hooks } = {}) {
+  const expectedBytes = Buffer.isBuffer(expected) ? expected : Buffer.from(String(expected ?? ''), 'utf8');
+  const tmp = path.join(
+    path.dirname(file),
+    `.${path.basename(file)}.stale-${process.pid}-${crypto.randomBytes(8).toString('hex')}`,
+  );
+  try {
+    fs.renameSync(file, tmp);
+  } catch (error) {
+    return false;
+  }
+  try { hooks?.afterRename?.(file, tmp); } catch { /* 测试钩子失败也不删已经挪走的文件 */ }
+  let actual;
+  try {
+    actual = fs.readFileSync(tmp);
+  } catch {
+    return false;
+  }
+  if (Buffer.compare(actual, expectedBytes) === 0) {
+    try { fs.unlinkSync(tmp); } catch { /* 已经不在 */ }
+    return true;
+  }
+  try {
+    fs.linkSync(tmp, file);
+    try { fs.unlinkSync(tmp); } catch { /* 原路径已有硬链接 */ }
+  } catch (error) {
+    if (error && error.code === 'EEXIST') {
+      let current = Buffer.alloc(0);
+      try { current = fs.readFileSync(file); } catch { /* 读不出也要告警 */ }
+      try { onRestoreFailed?.({ file, tmp, moved: actual, current }); } catch { /* 告警失败也不删文件 */ }
+    } else {
+      try { fs.renameSync(tmp, file); } catch { /* 放不回去就留下临时文件，避免丢掉活锁内容 */ }
+    }
+  }
+  return false;
+}
+
 const DRAIN_ALERT = '部署落后太多，开始排空：占住空出来的轮次槽位，不再起新轮次（在跑的轮次不动），等它们结束就部署，最长 120 分钟。';
 const DRAIN_TIMEOUT_REASON = '排空 120 分钟仍没等到轮次空档，已放开槽位，验收照常起轮次；30 分钟后还落后会再排空。';
 // 持有进程：活到截止时间；到点或收到 SIGTERM 时删掉写着自己 pid 的槽位文件后退出。
 // 活着的时候每秒看一次槽位，有空出来的就立刻占上（#425 复审 P2）：主循环每 3 分钟起一次轮次，部署脚本 5 分钟才跑一拍，
 // 只靠部署脚本补占，在跑的轮次一结束，空出来的槽几乎总被主循环先拿走，排空永远等不到空档。
-// 占法和宿主 tryAcquireLock 一样：O_EXCL 建文件写 {pid, startedAt}；写着活 pid 的不抢，读不出内容的按占用处理，pid 已死的删掉重来。
+// 占法和宿主 tryAcquireLock 一样：O_EXCL 建文件写 {pid, startedAt}；写着活 pid 的不抢，读不出内容的按占用处理。
+// pid 已死的陈旧锁：先 rename 到唯一临时名再比对内容，还是观察过的那一份才删；不是同一份就 link 放回，不覆盖活锁。
+// 放回时若原槽位已有新锁（link 得到 EEXIST），临时文件和新锁都留下、不删，并往提醒文件写一条 deploy-drain-lock-restore-failed。
 export const DRAIN_HOLDER_POLL_MS = 1000;
-const DRAIN_HOLDER_CODE = [
+export const DRAIN_HOLDER_CODE = [
   "const fs = require('fs');",
+  "const path = require('path');",
+  "const crypto = require('crypto');",
   'const args = process.argv.slice(1);',
-  'const files = args.slice(2);',
+  'const alertsFile = args[2] || "";',
+  'const files = args.slice(3);',
+  `const LOCK_RESTORE_FAILED_KIND = ${JSON.stringify(LOCK_RESTORE_FAILED_KIND)};`,
+  `const lockPidOf = ${lockPidOf.toString()};`,
+  `const lockRestoreFailedReason = ${lockRestoreFailedReason.toString()};`,
   'const alive = (pid) => {',
   '  if (!Number.isInteger(pid) || pid <= 0) return false;',
   "  try { process.kill(pid, 0); return true; } catch (error) { return Boolean(error) && error.code === 'EPERM'; }",
   '};',
+  `const removeLockIfUnchanged = ${removeLockIfUnchanged.toString()}`,
   'const claim = (file) => {',
   "  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), holder: 'deploy-ff' });",
   '  for (let attempt = 0; attempt < 2; attempt += 1) {',
   "    try { const fd = fs.openSync(file, 'wx', 0o600); try { fs.writeFileSync(fd, payload); } finally { fs.closeSync(fd); } return; } catch (error) {",
   "      if (!error || error.code !== 'EEXIST') return;",
+  '      let raw;',
+  "      try { raw = fs.readFileSync(file); } catch { return; }",
   '      let lock = null;',
-  "      try { lock = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return; }",
+  "      try { lock = JSON.parse(raw.toString('utf8')); } catch { return; }",
   "      if (!lock || typeof lock !== 'object' || lock.pid === process.pid || alive(Number(lock.pid))) return;",
-  '      try { fs.unlinkSync(file); } catch { return; }',
+  '      const onRestoreFailed = ({ tmp, moved, current }) => {',
+  '        if (!alertsFile) return;',
+  '        const movedPid = lockPidOf(moved);',
+  '        const currentPid = lockPidOf(current);',
+  "        const entry = { ts: new Date().toISOString(), kind: LOCK_RESTORE_FAILED_KIND, reason: lockRestoreFailedReason({ tmp: tmp, movedPid: movedPid, currentPid: currentPid }), detail: 'tmp=' + tmp + '; movedPid=' + (movedPid == null ? '' : movedPid) + '; currentPid=' + (currentPid == null ? '' : currentPid) };",
+  "        try { fs.mkdirSync(path.dirname(alertsFile), { recursive: true, mode: 0o700 }); fs.appendFileSync(alertsFile, JSON.stringify(entry) + '\\n', { mode: 0o600 }); } catch {}",
+  '      };',
+  '      if (!removeLockIfUnchanged(file, raw, { fs: fs, path: path, crypto: crypto, onRestoreFailed: onRestoreFailed })) return;',
   '    }',
   '  }',
   '};',
@@ -144,12 +238,14 @@ const EXACT_FILES = new Set([
 ]);
 const HOST_PREFIX = 'watchers/acceptance/host/';
 /**
- * 内容规则只看新增行，且跳过测试文件和 docs/*.md：这些地方提到 token 或 process.env
- * 是常事，拦下来只会逼人写完整 sha 批准。
- * 其余文件按「旧规则减去白名单」判（#426 复审，2026-11-12）：新增行里出现 token、process.env（不分大小写），
- * 或者全大写的密钥类名字（GITHUB_TOKEN、X_API_KEY、MIVO_APP_ID……），就算敏感；只有每一处都落在
- * 少数已知无害的写法里才放过。读环境变量、读令牌文件的写法列不完（别名、解构、Python、shell、拼接），
- * 所以默认拦、按白名单放；另外几类真敏感（secrets/、密钥文件、令牌文件、appOnly、端口）照旧单独认。
+ * 内容规则只看新增行。测试文件（*.test.mjs / *.test.py / *.fixture.mjs）和仓根 docs/*.md
+ * 跳过常规内容扫描（普通的 token 字样、按名字读非敏感环境变量），以免无害改动逼人写完整 sha 批准；
+ * 但 appOnly、令牌文件、secrets/、listen()/端口、GITHUB_TOKEN 在这些文件里照样拦。
+ * 其余文件按「旧规则减去白名单」判（#426 复审，2026-11-12；后收紧默认参数和 PRAISEZHU_*）：
+ * 新增行里出现 token、process.env（不分大小写），或者全大写的密钥类名字（GITHUB_TOKEN、
+ * X_API_KEY、MIVO_APP_ID、PRAISEZHU_*……），就算敏感；只有每一处都落在少数已知无害的写法里才放过。
+ * 读环境变量、读令牌文件的写法列不完（别名、解构、Python、shell、拼接），所以默认拦、按白名单放；
+ * 另外几类真敏感（secrets/、密钥文件、令牌文件、appOnly、端口）照旧单独认。
  */
 // docs 只跳过仓根 docs/ 下一层的 .md（issue #426 写的 docs/*.md）；测试文件和测试夹具（*.fixture.mjs，只给测试用的数据）任何目录都跳过。
 const CONTENT_SKIP_RE = /^(?:docs\/[^/]+\.md|(?:.*\/)?[^/]+\.(?:test\.(?:mjs|py)|fixture\.mjs))$/;
@@ -175,9 +271,8 @@ const PROCESS_ENV_RE = /process\.env/gi;
 // (process.env.valueOf)() 这种括号包住的调用也一样，所以小写名字一律不放过。
 // 读到名字就得结束：后面再接 .、?.、[ 或调用（process.env.HOME.constructor.constructor(...)['env'] 能拿到整张表）的不放过。
 const ENV_NAMED_RE = /process\.env\s*(?:\?\.\s*|\.\s*)([A-Z_][A-Z0-9_]*)(?![A-Za-z0-9_$]|\s*(?:\?\.|\.|\[|\())|process\.env\s*(?:\?\.)?\s*\[\s*(['"])([A-Z_][A-Z0-9_]*)\2\s*\](?!\s*(?:\?\.|\.|\[|\())/g;
-// 白名单 2：函数默认参数 `(env = process.env)` / `, env = process.env)`（issue #426 SC2 点名的写法）。
-const ENV_DEFAULT_PARAM_RE = /[(,]\s*env\s*=\s*process\.env\s*[),]/g;
-// 白名单 3：文件名里的一段 token（mivo-app-token.mjs 这种模块、脚本、文档名；token.json 这类数据文件不算）。
+// 白名单 2：文件名里的一段 token（mivo-app-token.mjs 这种模块、脚本、文档名；token.json 这类数据文件不算）。
+// 不再放过函数默认参数 `(env = process.env)`：那会把整张环境表交出去。
 const TOKEN_IN_MODULE_NAME_RE = /[\w.-]*token[\w.-]*\.(?:mjs|cjs|js|ts|py|sh|md)(?![\w.])/gi;
 // 全大写的名字（GITHUB_TOKEN、API_KEY）：按 _ 分段有密钥类的一段就算敏感，不管怎么读到的。
 const UPPER_NAME_RE = /(?<![A-Za-z0-9_])[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*(?![A-Za-z0-9_])/g;
@@ -187,12 +282,14 @@ const UPPER_NAME_RE = /(?<![A-Za-z0-9_])[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*(?![A-Za-z0
 // 要单独成一段（GH_CREDS、BASIC_AUTH）；APP 要跟着 ID / INSTALLATION（MIVO_APP_ID）。
 // 免得 CONFLICT_FEEDBACK_KEY、SWITCH_KEY、FORBIDDEN_KEYS、WATCHED_BOT_APP、AUTHOR_LOGIN 这类普通常量也算。
 // （授权头的全称不写出来：本脚本的静态约束不许源码里出现这个词，见 deploy-ff.test.mjs 的 #215 SC10。）
-const SENSITIVE_ENV_RE = /TOKEN|SECRET|PASSW|CREDENTIAL|(?:API|PRIVATE|ACCESS|DEPLOY|SIGN(?:ING)?|ENCRYPT(?:ION)?|SSH|MASTER|LICENSE|CLIENT|SESSION|ACCOUNT|STORAGE|HMAC|AES|RSA|GPG|PGP|SECRET)_?KEYS?|^KEYS?$|(?:^|_)(?:CREDS?|AUTH(?:ORI[ZS]ATION)?)(?:_|$)|APP_?(?:ID|INSTALLATION)/i;
+const SENSITIVE_ENV_RE = /TOKEN|SECRET|PASSW|CREDENTIAL|(?:API|PRIVATE|ACCESS|DEPLOY|SIGN(?:ING)?|ENCRYPT(?:ION)?|SSH|MASTER|LICENSE|CLIENT|SESSION|ACCOUNT|STORAGE|HMAC|AES|RSA|GPG|PGP|SECRET)_?KEYS?|^KEYS?$|(?:^|_)(?:CREDS?|AUTH(?:ORI[ZS]ATION)?)(?:_|$)|APP_?(?:ID|INSTALLATION)|PRAISEZHU/i;
 // process.env 按名字读写要放过，名字里就一个可疑的词都不能有（比上面严：KEY、APP、AUTH、CRED 出现在哪都不放过）。
-const ENV_NAME_UNSAFE_RE = /TOKEN|SECRET|PASSW|KEY|APP|AUTH|CRED/i;
+const ENV_NAME_UNSAFE_RE = /TOKEN|SECRET|PASSW|KEY|APP|AUTH|CRED|PRAISEZHU/i;
 // 白名单盖不住、也没有字面量名字的读环境变量写法：一律算敏感（process['env']、globalThis…process、
 // require('process') / from 'process'、Python 的 os.environ / getenv、shell 的 printenv）。
-const ENV_OTHER_READ_RE = /\bprocess\s*(?:\?\.)?\s*\[|\bglobalThis\b.*\bprocess\b|\brequire\s*\(\s*['"`](?:node:)?process['"`]|\bfrom\s+['"](?:node:)?process['"]|\bos\.environ\b|\bgetenv\b|\bprintenv\b/;
+const ENV_OTHER_READ_RE = /\bprocess\s*(?:\?\.)?\s*\[|\bglobalThis\b.*\bprocess\b|\brequire\s*\(\s*['"`](?:node:)?process['"`]|\bfrom\s+['"](?:node:)?process['"]|\bos\.environ\b|\bgetenv\b|\bprintenv\b|\{\s*env(?:\s*:\s*[A-Za-z_$][\w$]*)?\s*\}\s*=\s*process\s*(?:[;,)\]}]|$)|(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*process\s*;\s*[A-Za-z_$][\w$]*\s*(?:\?\.|\.)\s*env\b/;
+// 测试/文档跳过常规扫描时，GITHUB_TOKEN 仍要拦（整词，含 process.env.GITHUB_TOKEN 和裸名）。
+const GITHUB_TOKEN_RE = /(?<![A-Za-z0-9_])GITHUB_TOKEN(?![A-Za-z0-9_])/;
 const APP_ONLY_RE = /appOnly/i;
 const PORT_RE = /(?<![\w$])listen\s*\(|\bport\b\s*[:=]\s*['"]?\d{2,5}\b/i;
 const FULL_SHA = /^[0-9a-f]{40}$/;
@@ -216,7 +313,11 @@ export function isSensitivePath(file) {
   if (EXACT_FILES.has(norm)) return true;
   if (norm.startsWith(HOST_PREFIX)) return true;
   const base = norm.slice(norm.lastIndexOf('/') + 1);
-  return LOCK_BASENAMES.has(base);
+  if (LOCK_BASENAMES.has(base)) return true;
+  if (base === 'token.json' || base === '.token') return true;
+  if (/(?:^|\/)secrets\//i.test(norm)) return true;
+  if (/\.key$/i.test(base)) return true;
+  return false;
 }
 
 /**
@@ -257,19 +358,22 @@ export function parseAddedLines(diffText) {
 
 /**
  * 一条新增行按内容规则算不算敏感。返回命中的规则名，不命中返回 null。
- * 测试文件和 docs/*.md 不扫内容（路径规则仍然照查）。
+ * 测试文件和 docs/*.md 跳过常规内容扫描，但真敏感写法（appOnly、令牌文件、secrets/、
+ * 端口、GITHUB_TOKEN，以及密钥文件路径）照样拦。路径规则由 isSensitivePath 另查。
  */
 export function sensitiveLineReason(file, text) {
   const norm = String(file || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
-  if (CONTENT_SKIP_RE.test(norm)) return null;
   const line = String(text ?? '');
+  const skipRegular = CONTENT_SKIP_RE.test(norm);
   if (SECRETS_PATH_RE.test(line)) return 'secrets-path';
   if (KEY_FILE_RE.test(line)) return 'key-file';
   if (TOKEN_FILE_RE.test(line)) return 'token-file';
-  const unlisted = unlistedTriggerIn(line);
-  if (unlisted) return unlisted;
   if (APP_ONLY_RE.test(line)) return 'appOnly';
   if (PORT_RE.test(line)) return 'port';
+  if (GITHUB_TOKEN_RE.test(line)) return 'env';
+  if (skipRegular) return null;
+  const unlisted = unlistedTriggerIn(line);
+  if (unlisted) return unlisted;
   return null;
 }
 
@@ -298,12 +402,10 @@ function unlistedTriggerIn(line) {
   for (const match of line.matchAll(UPPER_NAME_RE)) {
     if (SENSITIVE_ENV_RE.test(match[0])) return 'env';
   }
-  // 两类触发词各认各的白名单：process.env 只能被「按名字读写」「默认参数」盖住，token 只能被「模块文件名」盖住
+  // process.env 只能被「按名字读写」盖住，token 只能被「模块文件名」盖住
   // （不然 process.env.token.mjs 这种写法会被当成模块文件名放过）。
-  const envAllowed = [
-    ...rangesOf(line, ENV_NAMED_RE, (match) => !ENV_NAME_UNSAFE_RE.test(match[1] || match[3] || '')),
-    ...rangesOf(line, ENV_DEFAULT_PARAM_RE),
-  ];
+  // `(env = process.env)` 不再放过：那会把整张表交出去。
+  const envAllowed = rangesOf(line, ENV_NAMED_RE, (match) => !ENV_NAME_UNSAFE_RE.test(match[1] || match[3] || ''));
   const tokenAllowed = rangesOf(line, TOKEN_IN_MODULE_NAME_RE, (match) => !/process\.env/i.test(match[0]));
   for (const [pattern, allowed, rule] of [[PROCESS_ENV_RE, envAllowed, 'env'], [TOKEN_WORD_RE, tokenAllowed, 'token-word']]) {
     for (const match of line.matchAll(pattern)) {
@@ -566,9 +668,9 @@ function pidAlive(pid) {
  * 起一个脱离本进程的持有进程（#425）：槽位锁里写它的 pid，部署脚本退出后它还活着，主循环数槽时就算占用。
  * 到 ttlMs 自己删掉写着自己 pid 的槽位文件后退出。返回 pid；起不来返回 null。
  */
-export function spawnDrainHolder({ ttlMs, files }) {
+export function spawnDrainHolder({ ttlMs, files, alertsFile }) {
   try {
-    const child = spawn(process.execPath, ['-e', DRAIN_HOLDER_CODE, DRAIN_HOLDER_MARK, String(Math.max(0, ttlMs)), ...files], {
+    const child = spawn(process.execPath, ['-e', DRAIN_HOLDER_CODE, DRAIN_HOLDER_MARK, String(Math.max(0, ttlMs)), alertsFile ? String(alertsFile) : '', ...files], {
       detached: true,
       stdio: 'ignore',
     });
@@ -610,9 +712,11 @@ function readSlot(file) {
 
 /**
  * 占一个空槽，锁格式和宿主的 tryAcquireLock 一样（O_EXCL 建文件，内容 {pid, startedAt}），pid 写持有进程的。
- * 已经写着持有进程 pid 的算自己的；写着活 pid 的是在跑的轮次，不抢；读不出内容的按占用处理；pid 已死的陈旧锁删掉重来。
+ * 已经写着持有进程 pid 的算自己的；写着活 pid 的是在跑的轮次，不抢；读不出内容的按占用处理；
+ * pid 已死的陈旧锁要再核一次还是同一份才删（见 removeLockIfUnchanged）。
+ * hooks.afterDeadPid 只给测试用：在判死后、删除前插入「新轮次写入活锁」。
  */
-function claimSlot(file, holderPid, nowMs) {
+export function claimSlot(file, holderPid, nowMs, hooks = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const payload = JSON.stringify({ pid: holderPid, startedAt: new Date(nowMs).toISOString(), holder: 'deploy-ff' });
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -626,11 +730,29 @@ function claimSlot(file, holderPid, nowMs) {
       return true;
     } catch (error) {
       if (error?.code !== 'EEXIST') return false;
-      const current = readSlot(file);
-      if (!current) return false;
+      let raw;
+      try {
+        raw = fs.readFileSync(file);
+      } catch {
+        return false;
+      }
+      let current;
+      try {
+        current = JSON.parse(raw.toString('utf8'));
+      } catch {
+        return false;
+      }
+      if (!current || typeof current !== 'object') return false;
       if (current.pid === holderPid) return true;
       if (pidAlive(Number(current.pid))) return false;
-      try { fs.unlinkSync(file); } catch { return false; }
+      hooks.afterDeadPid?.(file, raw);
+      if (!removeLockIfUnchanged(file, raw, {
+        fs,
+        path,
+        crypto,
+        hooks,
+        onRestoreFailed: ({ tmp, moved, current }) => appendLockRestoreAlert(hooks.alertsFile, { tmp, moved, current }),
+      })) return false;
     }
   }
   return false;
@@ -757,11 +879,11 @@ function drainStep(opts, state, blockedReason) {
   const deadline = drain ? drain.deadline : new Date(nowMs + DRAIN_MAX_MS).toISOString();
   const files = SLOT_NAMES.map((name) => slotPath(opts.hostStateDir, name));
   let holderPid = drain && opts.holderAlive(drain.holderPid) ? drain.holderPid : null;
-  if (!holderPid) holderPid = opts.spawnHolder({ ttlMs: Date.parse(deadline) - nowMs, files });
+  if (!holderPid) holderPid = opts.spawnHolder({ ttlMs: Date.parse(deadline) - nowMs, files, alertsFile: opts.alertsFile });
   if (!Number.isInteger(holderPid)) {
     return { decision: null, drain: null, drainCooldownUntil: state.drainCooldownUntil };
   }
-  const slots = SLOT_NAMES.filter((name) => claimSlot(slotPath(opts.hostStateDir, name), holderPid, nowMs));
+  const slots = SLOT_NAMES.filter((name) => claimSlot(slotPath(opts.hostStateDir, name), holderPid, nowMs, { alertsFile: opts.alertsFile }));
   const next = {
     status: 'draining',
     holderPid,

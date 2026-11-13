@@ -1,6 +1,7 @@
 // 等无轮次空档再快进部署。临时仓不走网络：origin 配成公开地址，再用 insteadOf 指回本地 bare。
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -10,11 +11,16 @@ import {
   BUSY_PROCESS_RE,
   EXIT,
   classifyChecks,
+  claimSlot,
   defaultRunGit,
   formatResult,
   isSensitivePath,
   lagState,
   parseAddedLines,
+  removeLockIfUnchanged,
+  appendLockRestoreAlert,
+  DRAIN_HOLDER_CODE,
+  LOCK_RESTORE_FAILED_KIND,
   repoFromOrigin,
   runDeploy,
   sensitiveHits,
@@ -285,17 +291,14 @@ test('内容规则不再把文件名、普通环境变量和文档里的词当�
   const filesLine = "export const FILES=['mivo-pre-push.mjs','mivo-app-token.mjs','mivo-ci.mjs'];";
   const quiet = [
     { file: 'watchers/mivo/deploy.mjs', line: 10, text: filesLine },
-    // e04162a：自审开关的环境变量读取，名字里没有令牌/密钥。
-    { file: 'watchers/mivo/bin/profile.mjs', line: 94, text: 'export function preflightSelfReviewEnabled(env = process.env) {' },
+    // 测试文件和 docs/*.md 仍跳过常规内容扫描：普通 token 字样、按名字读非敏感环境变量。
     { file: 'watchers/mivo/self-review.test.mjs', line: 15, text: 'const before = process.env.MIVO_PREFLIGHT_SELF_REVIEW;' },
-    // 测试文件和 docs/*.md 不扫内容，哪怕它真的写了敏感词。
     { file: 'watchers/mivo/app-token.test.mjs', line: 26, text: "const TOKEN = 'fake-installation-token-for-test';" },
-    { file: 'docs/acceptance-operations.md', line: 219, text: '回退账号令牌重试一次，记 app-token-fallback，抛 AppOnlyError' },
-    { file: 'docs/acceptance-operations.md', line: 227, text: 'process.env.GITHUB_TOKEN=xxx' },
+    { file: 'docs/acceptance-operations.md', line: 40, text: '回退账号令牌重试一次，记 app-token-fallback。' },
     // 对象属性、普通 import 路径、只提到 token 这个词的代码行。
     { file: 'watchers/mivo/bin/mivo-watcher.mjs', line: 782, text: 'if (Object.hasOwn(currentCursor, item.key)) nextCursor[item.key] = currentCursor[item.key];' },
     { file: 'watchers/mivo/bin/mivo-app-token.mjs', line: 98, text: "import { resolveThreadsWithApp } from './mivo-app-token.mjs';" },
-    // 测试夹具（只给测试用的数据）和测试文件一样不扫内容。
+    // 测试夹具（只给测试用的数据）和测试文件一样跳过常规扫描。
     { file: 'watchers/acceptance/pr-link.fixture.mjs', line: 701, text: '"body": "新增可选 `appTokenCommand`"' },
   ];
   assert.deepEqual(sensitiveHits([], quiet), { files: [], lines: [] });
@@ -368,9 +371,9 @@ test('返工 环境变量读取：解构、可选链、动态下标、整表枚�
   const quiet = [
     'const debug = process.env?.MIVO_DEBUG;',
     "const home = process.env['HOME'];",
-    'export function preflightSelfReviewEnabled(env = process.env) {',
     'const entries = Object.entries(config);',
   ];
+  assert.equal(sensitiveLineReason(file, 'export function preflightSelfReviewEnabled(env = process.env) {'), 'env');
   for (const text of quiet) assert.equal(sensitiveLineReason(file, text), null, text);
 });
 
@@ -422,16 +425,24 @@ test('#426 复审 全大写常量：HAPPY、FORBIDDEN_KEYS、WATCHED_BOT_APP 不
 
 test('返工 只跳过仓根 docs/ 下一层的 .md（issue 写的 docs/*.md），更深或别处的 docs 目录照常扫', async () => {
   const { sensitiveLineReason } = await import('./deploy-ff.mjs');
-  const text = 'const token = process.env.GITHUB_TOKEN;';
-  assert.equal(sensitiveLineReason('docs/acceptance-operations.md', text), null);
+  // 常规内容扫描：普通 token 字样、按名字读非敏感环境变量，在仓根 docs/*.md 和测试文件里仍放过。
+  const regular = 'let token = null; const home = process.env.HOME;';
+  assert.equal(sensitiveLineReason('docs/acceptance-operations.md', regular), null);
+  // GITHUB_TOKEN 即使写在可跳过常规扫描的文件里也要拦。
+  const githubToken = 'const token = process.env.GITHUB_TOKEN;';
+  assert.equal(sensitiveLineReason('docs/acceptance-operations.md', githubToken), 'env');
   for (const file of ['docs/sub/notes.md', 'watchers/acceptance/docs/notes.md', 'docs/notes.mdx', 'docs.md', 'docs/notes.mjs']) {
-    assert.equal(sensitiveLineReason(file, text), 'env', file);
+    assert.equal(sensitiveLineReason(file, githubToken), 'env', file);
+    assert.equal(sensitiveLineReason(file, regular), 'token-word', file);
   }
-  // 测试文件按 issue 仍然任何目录都跳过。
-  assert.equal(sensitiveLineReason('watchers/mivo/deep/x.test.mjs', text), null);
-  assert.equal(sensitiveLineReason('watchers/mivo/x.test.py', text), null);
-  assert.equal(sensitiveLineReason('watchers/acceptance/pr-link.fixture.mjs', text), null, '测试夹具同测试文件');
-  assert.equal(sensitiveLineReason('watchers/acceptance/fixture.mjs', text), 'env', '只认 *.fixture.mjs');
+  // 测试文件任何目录都跳过常规扫描，但 GITHUB_TOKEN 照样拦。
+  assert.equal(sensitiveLineReason('watchers/mivo/deep/x.test.mjs', regular), null);
+  assert.equal(sensitiveLineReason('watchers/mivo/x.test.py', regular), null);
+  assert.equal(sensitiveLineReason('watchers/acceptance/pr-link.fixture.mjs', regular), null, '测试夹具同测试文件');
+  assert.equal(sensitiveLineReason('watchers/mivo/deep/x.test.mjs', githubToken), 'env');
+  assert.equal(sensitiveLineReason('watchers/mivo/x.test.py', githubToken), 'env');
+  assert.equal(sensitiveLineReason('watchers/acceptance/pr-link.fixture.mjs', githubToken), 'env', '测试夹具同测试文件');
+  assert.equal(sensitiveLineReason('watchers/acceptance/fixture.mjs', githubToken), 'env', '只认 *.fixture.mjs');
 });
 
 // ---- #426 复审：旧规则减去白名单。读法列不完，默认拦、按白名单放 ----
@@ -485,17 +496,17 @@ test('#426 复审 P2 令牌文件的拼接、URL、实际命名，Python / shell
   for (const [file, text] of cases) assert.notEqual(sensitiveLineReason(file, text), null, `${file}: ${text}`);
 });
 
-test('#426 复审 新规则放过的每一处 token / process.env 都属于白名单三种写法（issue SC1 / SC2 点名的误报）', async () => {
+test('#426 复审 新规则放过的每一处 token / process.env 都属于白名单两种写法（按名字读普通环境变量、模块文件名）', async () => {
   const { sensitiveLineReason } = await import('./deploy-ff.mjs');
   const OLD = /process\.env|secrets\/|token/i;
   const file = 'watchers/mivo/bin/app.mjs';
   const released = [
     "export const FILES=['mivo-pre-push.mjs','mivo-app-token.mjs'];",
     "import { resolveThreadsWithApp } from './mivo-app-token.mjs';",
-    'export function preflightSelfReviewEnabled(env = process.env) {',
     'if (process.env.MIVO_PREFLIGHT_SELF_REVIEW === "1") run();',
     'delete process.env.MIVO_PREFLIGHT_SELF_REVIEW;',
     "const home = process.env['HOME'];",
+    'const nodeEnv = process.env.NODE_ENV;',
   ];
   for (const text of released) {
     assert.equal(OLD.test(text), true, `旧规则命中：${text}`);
@@ -505,6 +516,7 @@ test('#426 复审 新规则放过的每一处 token / process.env 都属于白�
   for (const text of [
     "export const FILES=['mivo-app-token.mjs', 'token.json'];",
     'if (process.env.MIVO_X) send(process.env);',
+    'export function preflightSelfReviewEnabled(env = process.env) {',
     'export function f(env = process.env) { return env.GITHUB_TOKEN; }',
     "import { x } from './mivo-app-token.mjs'; const t = readToken();",
     // 第 2 轮复审：白名单写法本身的绕法。小写名字（对象方法）拿到的是整张表；模块文件名的范围不能盖住 process.env。
@@ -542,6 +554,109 @@ test('#426 复审 按每一处触发词判断、不按整行：同一行里没�
   assert.notEqual(sensitiveLineReason(file, "if (process.env.CI) creds = fs.readFileSync(path.join(home, 'token.json'));"), null);
   assert.notEqual(sensitiveLineReason(file, "if (process.env.CI) creds = fs.readFileSync('secrets/ci.json');"), null);
   assert.notEqual(sensitiveLineReason(file, 'if (process.env.CI) creds = env.GOOGLE_APPLICATION_CREDENTIALS;'), null);
+});
+
+test('SC1 PRAISEZHU_* 无条件敏感：按名字读和裸名都要拦', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const file = 'watchers/mivo/bin/app.mjs';
+  for (const text of [
+    'const v = process.env.PRAISEZHU_FOO;',
+    "const v = process.env['PRAISEZHU_GH'];",
+    'const v = process.env?.PRAISEZHU_FOO;',
+    'const PRAISEZHU_BOX = 1;',
+    'return PRAISEZHU_LOGIN;',
+  ]) {
+    assert.equal(sensitiveLineReason(file, text), 'env', text);
+  }
+  // 负面：普通非敏感环境变量读取仍放过。
+  for (const text of ['const h = process.env.HOME;', 'const n = process.env.NODE_ENV;']) {
+    assert.equal(sensitiveLineReason(file, text), null, text);
+  }
+});
+
+test('SC2 整表默认参数 (env = process.env) 不再白名单放行', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const file = 'watchers/mivo/bin/profile.mjs';
+  for (const text of [
+    'export function preflightSelfReviewEnabled(env = process.env) {',
+    'function f(env = process.env) {',
+    'const f = (env = process.env) => env;',
+    'function g(opts, env = process.env) {',
+  ]) {
+    assert.equal(sensitiveLineReason(file, text), 'env', text);
+  }
+});
+
+test('SC3 测试和文档仍跳过常规内容扫描，但真敏感写法照样拦', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const skipFiles = [
+    'watchers/mivo/app-token.test.mjs',
+    'watchers/mivo/x.test.py',
+    'watchers/acceptance/pr-link.fixture.mjs',
+    'docs/acceptance-operations.md',
+  ];
+  const hits = [
+    ['if (profile.appOnly) block();', 'appOnly'],
+    ["const blob = readFileSync(path.join(home, 'token.json'));", 'token-file'],
+    ["const conf = readFileSync(path.join(home, 'secrets/demo.json'));", 'secrets-path'],
+    ['server.listen(8080);', 'port'],
+    ['const config = { port: 3000 };', 'port'],
+    ['const token = process.env.GITHUB_TOKEN;', 'env'],
+    ['return GITHUB_TOKEN;', 'env'],
+  ];
+  const quiet = [
+    'let token = null;',
+    "const TOKEN = 'fake-installation-token-for-test';",
+    'const before = process.env.MIVO_PREFLIGHT_SELF_REVIEW;',
+    'const home = process.env.HOME;',
+    'const nodeEnv = process.env.NODE_ENV;',
+    '"body": "新增可选 `appTokenCommand`"',
+  ];
+  for (const file of skipFiles) {
+    for (const [text, rule] of hits) {
+      assert.equal(sensitiveLineReason(file, text), rule, `${file}: ${text}`);
+    }
+    for (const text of quiet) {
+      assert.equal(sensitiveLineReason(file, text), null, `${file}: ${text}`);
+    }
+  }
+});
+
+test('SC5 解构或别名读取 process.env 整表要拦', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const file = 'watchers/mivo/bin/app.mjs';
+  for (const text of [
+    'const { env } = process;',
+    'let { env } = process;',
+    'var { env } = process;',
+    '({ env } = process);',
+    'const { env: e } = process;',
+    'const p = process; p.env',
+    'let p = process; p.env',
+    'const p = process; p?.env',
+  ]) {
+    assert.equal(sensitiveLineReason(file, text), 'env', text);
+  }
+  // 负面：不是整表、只按名字读非敏感变量。
+  for (const text of ['const { HOME } = config;', 'const p = process.argv;', 'const h = process.env.HOME;']) {
+    assert.equal(sensitiveLineReason(file, text), null, text);
+  }
+});
+
+test('SC6 isSensitivePath 认 token.json、.token、secrets/*、*.key', () => {
+  assert.equal(isSensitivePath('token.json'), true);
+  assert.equal(isSensitivePath('state/token.json'), true);
+  assert.equal(isSensitivePath('.token'), true);
+  assert.equal(isSensitivePath('home/.token'), true);
+  assert.equal(isSensitivePath('secrets/demo.json'), true);
+  assert.equal(isSensitivePath('watchers/mivo/secrets/ci.json'), true);
+  assert.equal(isSensitivePath('certs/server.key'), true);
+  assert.equal(isSensitivePath('server.key'), true);
+  // 负面：模块文件名里的 token、普通源码、对象属性式文件名以外的路径。
+  assert.equal(isSensitivePath('watchers/mivo/bin/mivo-app-token.mjs'), false);
+  assert.equal(isSensitivePath('watchers/mivo/bin/app.mjs'), false);
+  assert.equal(isSensitivePath('docs/guide.md'), false);
+  assert.equal(isSensitivePath('watchers/mivo/self-review.test.mjs'), false);
 });
 
 test('#215 SC4 落后阈值：超过 5 个或超过 2 小时，同一 HEAD 只报一次', () => {
@@ -1892,6 +2007,133 @@ test('#425 复审 持有进程每秒自己补占空出来的槽：在跑的轮�
     }
   }
   assert.equal(fs.existsSync(slots[0]) || fs.existsSync(slots[1]), false, '收到 SIGTERM 删掉自己占的槽');
+});
+
+test('SC4 判死后、删前被新轮次写入的活锁必须保留', () => {
+  const dir = tmpDir('lock-race-');
+  const file = path.join(dir, 'slot-0');
+  const dead = deadPid();
+  const stale = JSON.stringify({ pid: dead, startedAt: '2026-11-12T12:00:00.000Z' });
+  const live = JSON.stringify({ pid: process.pid, startedAt: '2026-11-13T01:00:00.000Z' });
+
+  // 直接调用：路径上已经是活锁，但删除时拿的是先前观察到的死锁内容。
+  fs.writeFileSync(file, live);
+  assert.equal(removeLockIfUnchanged(file, stale, { fs, path, crypto }), false);
+  assert.equal(fs.readFileSync(file, 'utf8'), live, '内容对不上时活锁保留');
+
+  // 同一份死锁才删。
+  fs.writeFileSync(file, stale);
+  assert.equal(removeLockIfUnchanged(file, stale, { fs, path, crypto }), true);
+  assert.equal(fs.existsSync(file), false, '确认是同一份陈旧锁才删');
+
+  // claimSlot：判死后、删前插入新轮次写入的活锁，不得占槽、不得删活锁。
+  fs.writeFileSync(file, stale);
+  const claimed = claimSlot(file, 9_999_999, Date.now(), {
+    afterDeadPid() {
+      fs.unlinkSync(file);
+      const fd = fs.openSync(file, 'wx', 0o600);
+      try { fs.writeFileSync(fd, live); } finally { fs.closeSync(fd); }
+    },
+  });
+  assert.equal(claimed, false);
+  assert.equal(fs.readFileSync(file, 'utf8'), live, '新轮次活锁必须保留');
+
+  // 负面：真正的死锁可以被占掉；活着的锁不抢。
+  fs.writeFileSync(file, stale);
+  assert.equal(claimSlot(file, 8_888_888, Date.now()), true);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).pid, 8_888_888);
+  fs.writeFileSync(file, live);
+  assert.equal(claimSlot(file, 7_777_777, Date.now()), false);
+  assert.equal(fs.readFileSync(file, 'utf8'), live);
+
+  const src = fs.readFileSync(SCRIPT, 'utf8');
+  assert.match(src, /removeLockIfUnchanged/);
+  assert.match(src, /linkSync/);
+});
+
+const staleTemps = (dir, base) => fs.readdirSync(dir)
+  .filter((name) => name.startsWith(`.${base}.stale-`))
+  .map((name) => path.join(dir, name));
+
+const writeLock = (file, payload) => {
+  try { fs.unlinkSync(file); } catch { /* 还没有 */ }
+  const fd = fs.openSync(file, 'wx', 0o600);
+  try { fs.writeFileSync(fd, typeof payload === 'string' ? payload : JSON.stringify(payload)); }
+  finally { fs.closeSync(fd); }
+};
+
+test('SC4 放回因 EEXIST 失败时保留临时文件和新锁并告警', () => {
+  const dir = tmpDir('lock-eexist-');
+  const file = path.join(dir, 'slot-0');
+  const alertsFile = path.join(dir, 'alerts.jsonl');
+  const dead = deadPid();
+  const stale = JSON.stringify({ pid: dead, startedAt: '2026-11-12T12:00:00.000Z' });
+  const moved = JSON.stringify({ pid: 424242, startedAt: '2026-11-13T01:00:00.000Z' });
+  const newer = JSON.stringify({ pid: process.pid, startedAt: '2026-11-13T01:01:00.000Z' });
+  fs.writeFileSync(file, moved);
+  assert.equal(removeLockIfUnchanged(file, stale, {
+    fs,
+    path,
+    crypto,
+    hooks: { afterRename() { writeLock(file, newer); } },
+    onRestoreFailed: ({ tmp, moved, current }) => appendLockRestoreAlert(alertsFile, { tmp, moved, current }),
+  }), false);
+  assert.equal(fs.readFileSync(file, 'utf8'), newer, '新锁保留');
+  const temps = staleTemps(dir, 'slot-0');
+  assert.equal(temps.length, 1, '临时文件保留');
+  assert.equal(fs.readFileSync(temps[0], 'utf8'), moved);
+  const rows = readAlerts(alertsFile);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, LOCK_RESTORE_FAILED_KIND);
+  assert.match(rows[0].reason, new RegExp(temps[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(rows[0].reason, /424242/);
+  assert.match(rows[0].reason, new RegExp(String(process.pid)));
+  assert.match(rows[0].reason, /没有删除/);
+  assert.match(rows[0].reason, /请人核对/);
+  assert.match(rows[0].detail, new RegExp(temps[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(rows[0].detail, /movedPid=424242/);
+  assert.match(rows[0].detail, new RegExp(`currentPid=${process.pid}`));
+});
+
+test('SC4 持有进程与宿主共用同一份 removeLockIfUnchanged 源码', () => {
+  const shared = removeLockIfUnchanged.toString();
+  assert.equal(DRAIN_HOLDER_CODE.includes(shared), true, '持有进程注入的是同一函数源码');
+  assert.equal(DRAIN_HOLDER_CODE.includes('applyTestHook'), false);
+  assert.equal(DRAIN_HOLDER_CODE.includes('DEPLOY_FF_TEST_LOCK_HOOK'), false);
+  assert.match(DRAIN_HOLDER_CODE, /onRestoreFailed/);
+  assert.match(DRAIN_HOLDER_CODE, /alertsFile/);
+
+  // 同一实现、持有进程那种告警回调：rename 后、link 前出现新锁时，新锁和临时文件都保留并写出提醒。
+  const dir = tmpDir('lock-shared-');
+  const file = path.join(dir, 'slot-0');
+  const alertsFile = path.join(dir, 'alerts.jsonl');
+  const stale = JSON.stringify({ pid: deadPid(), startedAt: '2026-11-12T12:00:00.000Z' });
+  const moved = JSON.stringify({ pid: 424242, startedAt: '2026-11-13T01:00:00.000Z' });
+  const newer = JSON.stringify({ pid: process.pid, startedAt: '2026-11-13T01:01:00.000Z' });
+  fs.writeFileSync(file, moved);
+  const onRestoreFailed = ({ tmp, moved: movedBuf, current }) => appendLockRestoreAlert(alertsFile, { tmp, moved: movedBuf, current });
+  assert.equal(removeLockIfUnchanged(file, stale, {
+    fs,
+    path,
+    crypto,
+    onRestoreFailed,
+    hooks: { afterRename() { writeLock(file, newer); } },
+  }), false);
+  assert.equal(fs.readFileSync(file, 'utf8'), newer, '新锁保留');
+  const temps = staleTemps(dir, 'slot-0');
+  assert.equal(temps.length, 1, '临时文件保留');
+  assert.equal(fs.readFileSync(temps[0], 'utf8'), moved);
+  const rows = readAlerts(alertsFile);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, LOCK_RESTORE_FAILED_KIND);
+  assert.match(rows[0].reason, new RegExp(temps[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(rows[0].reason, /424242/);
+  assert.match(rows[0].reason, new RegExp(String(process.pid)));
+  assert.match(rows[0].reason, /没有删除/);
+  assert.match(rows[0].reason, /请人核对/);
+  assert.match(rows[0].detail, new RegExp(temps[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(rows[0].detail, /movedPid=424242/);
+  assert.match(rows[0].detail, new RegExp(`currentPid=${process.pid}`));
 });
 
 test('#425 部署脚本不碰写闸、不杀轮次', () => {
