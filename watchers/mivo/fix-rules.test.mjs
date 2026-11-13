@@ -535,6 +535,8 @@ test('P2-only dispatch still forbids GitHub replies while code-fix dispatch leav
   }).message;
   assert.match(codeFix, /每个 SC 的 evidence 第一条写一句人话结论/);
   assert.match(codeFix, /推送前自查 PR 格式：finalize 前先读当前 PR 标题与正文/);
+  assert.match(codeFix, /新增行为或改变范围前，先改任务 issue 的范围与验收项/);
+  assert.match(codeFix, /作业级 permissions 时，它会整份替换 workflow 顶层的权限/);
   assert.match(codeFix, /用 Jev 选仓内能消除已复现触发路径的最强修法/);
   assert.doesNotMatch(codeFix, /获准修复项的 PR 回复末尾加 <!-- mivo-watcher-receipt/);
 });
@@ -650,6 +652,7 @@ test('P3-only dispatch carries explicit no-code policy and does not instruct aut
   assert.doesNotMatch(message,/OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY/);
   assert.doesNotMatch(message,/三句回复后 resolve thread/);
   assert.doesNotMatch(message,/推送前自查 PR 格式/);
+  assert.doesNotMatch(message,/范围同步：/);
   const p=JSON.parse(message.split('\n').find(l=>l.startsWith('repairPolicy=')).slice('repairPolicy='.length));
   assert.equal(p.canChangeCode,false); assert.equal(p.items[0].action,'reply-only');
 });

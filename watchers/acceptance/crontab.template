@@ -1,0 +1,20 @@
+# 验收机自己的 crontab 条目模板（5 条）。重启后 crontab 被清空时，按本文件恢复，流程见 docs/acceptance-operations.md
+# 第 16 节「重启后恢复 crontab」。本文件只是模板：本仓的任何脚本都不读它，也没有任何自动化按它写 cron。
+# 路径一律写 $HOME（cron 执行时会把 $HOME 设成该用户的家目录），不要写死本机绝对路径、主机名或令牌。
+# 以后新增条目时，命令里的 % 要转义成 \%；下面 5 条都不含 %。
+# 别的 bot（pi-cron、ops-lane 等）的条目不属于验收机，仓外另管，不要写进这里。
+
+# deploy-ff：每 5 分钟（整点后 2 分起）拉起一次自动快进部署脚本；--approval-file 指向人工批准文件，没有批准时只报告不部署。
+2-59/5 * * * * mkdir -p $HOME/acceptance/home/state/deploy-ff-log && env -i PATH=$HOME/.node22/bin:/usr/local/bin:/usr/bin:/bin HOME=$HOME LANG=C.UTF-8 TZ=America/Los_Angeles ACCEPTANCE_WATCHER_HOME=$HOME/acceptance/home $HOME/.node22/bin/node $HOME/acceptance/vigil/watchers/acceptance/deploy-ff.mjs --deploy-dir $HOME/acceptance/vigil --host-state $HOME/acceptance/home/state/host --self-lock $HOME/acceptance/home/state/host/deploy-ff.lock --prio-lock /tmp/prio-dryrun.lock --state-file $HOME/acceptance/home/state/host/deploy-ff.json --alerts $HOME/acceptance/home/state/host/alerts.jsonl --approval-file $HOME/acceptance/home/state/host/deploy-ff-approval --doctor-script $HOME/acceptance/vigil/watchers/acceptance/bin/doctor.mjs </dev/null >>$HOME/acceptance/home/state/deploy-ff-log/deploy-ff.log 2>>$HOME/acceptance/home/state/deploy-ff-log/deploy-ff.err
+
+# prio 看板持续写入（run.sh）：每小时 24、54 分各一拍，只把还没有优先级的条目写成最低级（空→P2），已有优先级的条目不动。
+24,54 * * * * $HOME/acceptance/tools/prio-run-write/run.sh
+
+# 关联 PR 持续写入（run-field.sh）：每小时 9、39 分各一拍，按批准的上限每拍最多写 5 条关联 PR。
+9,39 * * * * $HOME/acceptance/tools/prio-run-write/run-field.sh
+
+# event-run 拉起（开机一次）：重启后立刻起一次事件轮询；EVENT_RUN_ARGS=--write 表示允许它把处理结论写回去。
+@reboot EVENT_RUN_ARGS=--write $HOME/acceptance/vigil/watchers/acceptance/bin/event-run-ensure.sh
+
+# event-run 拉起（每分钟一次）：常驻轮询退出后，由这一条在下一分钟内重新拉起，保证事件处理不断档。
+* * * * * EVENT_RUN_ARGS=--write $HOME/acceptance/vigil/watchers/acceptance/bin/event-run-ensure.sh

@@ -230,6 +230,9 @@ App 读到 401 / 403 / 404（读是 gh 的 HTTP 状态与 GraphQL 错误；`bran
 - 必须同时配 `apps`；和 `appConfigPath` 互斥（它不按 owner 分流）。写错加载 profile 就报错。
 - 只在宿主生效：沙箱 profile 副本删掉 `appOnly`（沙箱里没有令牌，读写都经写闸，由写闸按 `appOnly` 发请求）。
 - `doctor` 的「令牌账号」一项在 `appOnly` 下不再用账号令牌查 `viewer`，直接标明开关已开。
+- 看板同步（`prio-run` / `prio-sync`）在 `appOnly` 下只认 ①读 App 名单里的 owner：看板上别的 owner 的仓按 `exclude` 整仓跳过（不搜 PR、不改字段、保留上次状态），
+  每拍在看板同步自己的 run 日志（`--state-dir` 下的 `run-<日期>.log`，与 stdout 同一份）记一行
+  `<UTC 时间> app-only-skip component=<prio-run|prio-sync> repos=<owner/name,…> …`，不会再因为按仓搜 PR 被 `app-only-blocked` 拦下整轮报错（#364、#460）。
 - 打开前先确认：`loop.log` 最近 24 小时的 `app-token-fallback` 都已消掉（每一条在 `appOnly` 下都会变成一次失败）；
   ①读 App 有 Contents 读权限（拉代码要用）。回滚：把 `appOnly` 改回 `false`（或删掉这一键），重启 `loop` 与写闸 `serve`。
 
@@ -537,6 +540,26 @@ node watchers/acceptance/bin/poll.mjs --json
 
 后果要知道：**非默认分支上的后续合并（包括「要修」之后的修复 PR）都不会自动复验**；合回默认分支后才一起验。
 
+### 认领顺序（#62）
+
+槽位只有 `MAX_ROUNDS`（2）个，先认谁不再只看盘点回来的 `UPDATED_AT` 倒序。`bin/poll.mjs` 在认领之前用 `bin/queue.mjs` 的纯函数
+`sortTaskQueue()` 排一遍，键依次是：
+
+1. 看板「优先级」：`P0` → `P1` → `P2` → `P3`；
+2. 同档按 issue `createdAt` 旧的先（解析不出的排在同档最后）；
+3. 仍相同按 `owner/repo#号` 升序，保证同一份输入每次排出来的顺序一样。
+
+看板「优先级」为空、issue 不在看板上，都按 `P2` 算。优先级只读 `prio-run` 每拍写的看板快照
+（`state/host/board-snapshot.json`，见 14 节）：**不新增 GraphQL 读**，一颗点数都不多花。快照缺失、过期、坏掉，
+或看板值认不出（不是 `P0`..`P3`）时，这些任务按 `P2` 排，并在 `state/host/loop.log` 写一行：
+
+```
+<UTC 时间> queue-priority-fallback reason=missing tasks=3 看板优先级快照用不了，这些任务按 P2 排序
+<UTC 时间> queue-priority-fallback reason=unrecognized tasks=1 看板值认不出，按 P2 排序：owner/repo#12=P9
+```
+
+读不到不让这一拍失败：顺序退回「`createdAt` 旧的先 + 号升序」。看板只读，这条路径不写看板。
+
 ## 5. 提醒与通知的分工
 
 本 issue 的提醒只**发现**：调度循环停摆、轮次卡住或卡死、写闸拒绝、扫到密钥、沙箱起不来，
@@ -553,6 +576,22 @@ node watchers/acceptance/bin/poll.mjs --json
 `prefetch-failed`、`deps-failed`、`env-unverified`、`sandbox-down`、`sandbox-unavailable`、`gate-unavailable`、`gate-rejected`、`secret-found`、`write-rejected`、`egress-denied`；裁决运行的
 `adjudicate-failed`、`adjudicate-timeout`、`adjudicate-needs-human`、`adjudicate-not-configured`；
 Slack 自己的 `slack-failed`（重试用完）、`slack-history-failed`（读频道历史失败）。
+
+### 老根单每日汇总（#62）
+
+开着超过 7 天、从来没进过验收（没有任何轮次记录）的根 issue（`kind` 为 `parent` / `standalone`，没有可信父 issue），
+如果这一拍 `shouldTrigger()` 也不触发（最常见是 `no-merged-pr`：没有已合并的 PR），它不会自己动，也不会出现在别处。
+这类单子由 `host/tick.mjs` 每拍算一遍（数据只用盘点已经在手里的任务清单，**不额外读 GitHub、不写看板**），
+按本机日期去重后写一条 `kind: 'stale-root'` 到 `alerts.jsonl`：`issue`、`reason`（人话，例如「没有已合并的 PR，
+验收机不会自动开始验收」）、`url`（完整 issue 链接）、`ageDays`。
+
+- **只进摘要，不发即时通知**：`kind: 'stale-root'` 不在 ping / 中断类名单里，走摘要那条路（最多每 60 分钟一条，摘要永不 @），
+  摘要行带单号、完整链接和原因；不新增实时告警路径。
+- **同一个 issue 每个本机日只报一次**：状态记在 `state/host/stale-root-digest.json`（`{version, days: {ref: 'YYYY-MM-DD'}}`）。
+  不再符合条件的（已有 PR 合并、已关单、已进过验收）从状态里删掉，之后重新符合条件可以当天再报一次。
+- **阀值**：严格超过 7×24 小时（正好 7 天不报）；已关闭、有父的子 issue、已有轮次记录、这一拍就会触发的不报。
+- 心跳里带 `lastTick.staleRoots: {candidates, reported}`；这一步自己出错只写 `lastTick.staleRootsError`，不影响这一拍。
+- 「不触发原因」只落本地：`alerts.jsonl`（`kind: 'stale-root'`，含 `reason` / `url` / `ageDays`）+ 去重状态 `stale-root-digest.json`。这一步**不发任何 GitHub 请求**（读不读得到都不影响），也不写看板。
 
 ## 6. 上线顺序
 
@@ -1038,7 +1077,7 @@ github-live 的手测（真的看板上跑 24 小时、以及合并后确认没�
 
 `<home>/state/host/board-snapshot.json`，由 `prio-run` 每拍开头写一次，字段固定为 `version`（状态格式版本，当前是 1）、`at`（抓取时间，ISO）、`items`、`excludedCount`、`nullContent`。同一拍里 dry-run、`--write` 和仓外看板读者共用这一份，不再各自发整板查询；PR 搜索不属于快照，照旧每次都拉。
 
-读者只有两条路：`at` 距今不超过一个拍间隔（默认 180 秒）就直接用；过了就**重拉一次并覆盖**（`prio-run` 走这条），或者报「快照过期」不用（仓外读者走这条）。读接口是 `rate-budget.mjs` 的 `readBoardSnapshot`，返回 `{ok, reason, at, ageMs, items, excludedCount, nullContent}`，`reason` 是 `missing` / `stale` / `corrupt` / `clock-skew`。不许静默用旧数据。`ageMs` 为负（墙钟往回跳）按 `clock-skew` 处理：旧快照不能用，等下一拍重拉。快照里的 `items` 是抓取那一刻按 `repo-class.json` 分档过滤后的结果；拍内改分类表不影响这一份快照（下一拍重拉时生效）。用到快照的那一拍不按整板读记点数（真发请求时才记 8 点）。
+读者只有两条路：`at` 距今不超过一个拍间隔（默认 180 秒）就直接用；过了就**重拉一次并覆盖**（`prio-run` 走这条），或者报「快照过期」不用（仓外读者走这条）。读接口是 `rate-budget.mjs` 的 `readBoardSnapshot`，返回 `{ok, reason, at, ageMs, items, excludedCount, nullContent}`，`reason` 是 `missing` / `stale` / `corrupt` / `clock-skew`。不许静默用旧数据。`ageMs` 为负（墙钟往回跳）按 `clock-skew` 处理：旧快照不能用，等下一拍重拉。快照里的 `items` 是抓取那一刻按 `repo-class.json` 分档过滤后的结果；拍内改分类表不影响这一份快照（下一拍重拉时生效）。用到快照的那一拍不按整板读记点数（真发请求时才记 8 点）。主循环的认领排序（4 节「认领顺序」）也是这条路的读者：只用这一份快照的「优先级」，不重拉、不额外发请求；快照不能用时按 `P2` 排并发一行 `queue-priority-fallback`。
 
 ### 日志行
 
@@ -1068,7 +1107,7 @@ github-live 的手测（真的看板上跑 24 小时、以及合并后确认没�
 
 ## 15. 部署定时自检（#367）
 
-部署靠一条规范化 crontab 条目按固定节拍拉起部署脚本。条目本身不在仓里，被删、被注释、被改坏时验收机的其它检查只会说「部署落后 N 个提交」，读起来像在等空档或等批准。这一节的自检只做一件事：**只读核对那条条目，发现问题只告警，不写 cron、不修 cron、不动其它条目。**
+部署靠一条规范化 crontab 条目按固定节拍拉起部署脚本。系统 crontab 不在仓里（仓里只有重启后恢复用的模板 `watchers/acceptance/crontab.template`，见第 16 节），被删、被注释、被改坏时验收机的其它检查只会说「部署落后 N 个提交」，读起来像在等空档或等批准。这一节的自检只做一件事：**只读核对那条条目，发现问题只告警，不写 cron、不修 cron、不动其它条目。**
 
 它核对的边界：
 
@@ -1117,3 +1156,56 @@ node watchers/acceptance/bin/deploy-cron-selfcheck.mjs --home <验收机 home> \
 - 接线回滚：如果已经按上面的步骤挂到 `run-ensure`，删掉那一行调用即可。自检只读、不写 cron，不需要还原任何系统状态。
 
 状态文件在宿主状态目录下的 `deploy-cron-selfcheck.json`，删掉后下一次会按「首次」处理（正常就静默）。
+
+## 16. 重启后恢复 crontab
+
+2026-11-11 17:14（北京）机器重启后验收机的用户 crontab 被清空，deploy-ff 停了约 1 小时，靠人工补装。仓里的 `watchers/acceptance/crontab.template` 是恢复依据，只含**验收机自己**的 5 条生效条目，每条上方有一行中文注释说明它干什么。
+
+模板口径：
+
+- 5 条各是什么：deploy-ff 每 5 分钟一拍（带 `--approval-file`）；prio 看板持续写入 `run.sh` 在 24、54 分；关联 PR 持续写入 `run-field.sh` 在 9、39 分；event-run 拉起脚本的 `@reboot` 一条与每分钟一条。
+- 路径一律写 `$HOME`，不写死本机家目录、主机名、令牌。cron 执行条目时会把 `$HOME` 设成该用户的家目录，所以模板里的 `$HOME` 可以直接用，也用 `$HOME` **保持原样**直接交给 `crontab`，不要用 `sed` 展开成绝对路径——展开了就把本机路径写死，换机或改用户名后模板就错了。
+- 以后新增条目时，命令里的 `%` 必须转义成 `\%`（现有 5 条都不含 `%`）。
+- 别的 bot（pi-cron、ops-lane 等）的条目不属于验收机，仓外另管，不要写进模板。
+
+模板本身先校验一遍（只读：只读模板文件，不读系统 crontab、不写任何文件）：
+
+```sh
+node watchers/acceptance/bin/crontab-template-check.mjs
+```
+
+它查五件事：5 条生效条目都在且每条上方有注释、deploy-ff 带 `--approval-file`、没有写死的用户家目录绝对路径（一律要写 `$HOME`）、没有疑似令牌、没有重复条目。退出码 0 = 通过，非 0 = 不通过并逐条打印原因。
+
+恢复步骤（**人工步骤，不由本仓任何 PR 接线**；本仓不装 cron、不写 cron、不改系统状态）：
+
+1. 先确认是「真的没有 crontab」，不是读失败。退出码与 stderr 分开落文件，不经管道（管道会把 `crontab` 的退出码换掉）：
+
+```sh
+crontab -l >/tmp/crontab.now 2>/tmp/crontab.err; echo "rc=$?"; cat /tmp/crontab.err
+```
+
+只有退出码非 0 且 stderr 是整段 `no crontab for <用户>` 时才按本节装。退出码非 0 但 stderr 另有内容（权限、spool 之类）按读取失败处理，先查原因。
+
+2. 装之前先备份现有内容（当前为空时这条会失败，属正常）：
+
+```sh
+crontab -l >"$HOME/crontab.backup.$(date +%Y%m%dT%H%M%SZ)"
+```
+
+3. **已有非空 crontab 就不覆盖**：把 `crontab -l` 的输出与模板逐行比对，差异先人工确认。模板只写验收机自己的 5 条，直接 `crontab <模板>` 会连带丢掉别的 bot 的条目。
+
+4. 确认是空的、且模板校验通过，再装（在 vigil 仓根执行，`$HOME` 保持原样）：
+
+```sh
+node watchers/acceptance/bin/crontab-template-check.mjs || exit 1
+crontab watchers/acceptance/crontab.template
+crontab -l | diff - watchers/acceptance/crontab.template && echo "装好了，与模板一致"
+```
+
+5. 盯一拍：下一个 5 分钟拍里 deploy-ff 日志有新行；`deploy-cron-selfcheck` 不再告警；event-run 的轮询在 1 分钟内被拉起来。
+
+6. 仓外条目补装：别的 bot 的条目仓外另管，不在本仓的模板里，也不由本仓的 PR 负责。
+
+回滚：装错了用备份盖回去（`crontab <备份文件>`）。装之前本来就是空、也没有备份的，`crontab -r` 回到没有 crontab 的状态。
+
+本节边界：只提供模板和人工操作步骤。模板不被任何脚本读取，也没有任何自动化按它写 cron；本仓的测试只校验模板文本与本节措辞，不接触真实 crontab。

@@ -221,6 +221,8 @@ test('SC7 文档写清调用顺序、退出码处理、资源门、卡死与并�
   assert.match(doc, /mivo 最多 1 轮/);
   assert.match(doc, /stale: true/);
   assert.match(doc, /卡死：进程不在/);
+  assert.match(doc, /重启中断：进程不在/);
+  assert.match(doc, /不为卡死检测另发 GitHub 请求/);
   assert.match(doc, /poll\.mjs --json/);
   assert.match(doc, /round\.mjs start/);
   assert.match(doc, /round\.mjs status/);

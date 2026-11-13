@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 一拍调度（#47 SC12 / SC13）：常驻循环每 180 秒调一次（#247 SC3：60 → 180）。
-// 1) poll.mjs 在沙箱外跑（只读盘点，可以读 GitHub 令牌），不进 bwrap；2) 卡住的轮次先杀进程再 abort；
+// 1) poll.mjs 在沙箱外跑（只读盘点，可以读 GitHub 令牌），不进 bwrap；2) 卡住的轮次先核对本轮本地结论，已完成的不 abort、不报警，其余先杀进程再 abort；
 // 3) 按空槽起新的 round；4) 写心跳。任何错误都只落进心跳和 alerts.jsonl，绝不抛出循环。
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,11 +12,20 @@ import { runRound as runRoundCommand } from '../bin/round.mjs';
 import { appendAlert, hostPaths, isAlive, readAlerts, readLockPayload } from './paths.mjs';
 import { run as procRun, spawnBackground } from './proc.mjs';
 import { MAX_ROUNDS, readHostConfig, serialLockFiles } from './round.mjs';
+import {
+  STALE_ROOT_STATE_FILE,
+  digestDay,
+  readStaleRootState,
+  selectDueStaleRoots,
+  staleRootDigest,
+  writeStaleRootState,
+} from '../bin/stale-root.mjs';
 import { checkReadyStalled, cleanupWorktrees, discoverCorrections } from './prbot.mjs';
 import { clearStarted, readPrbotWait, rememberFound, starvedIssues, writePrbotWait } from './prbot-wait.mjs';
 import { NOTIFY_BUDGET_MS, notifySlack } from './slack-notify.mjs';
 import { defaultSpawnAdjudicate, scheduleAdjudications } from './adjudicate.mjs';
 import { runGateAudit } from './gate-audit.mjs';
+import { abortFoundFinalVerdict, killedByRestart, loadLedgerEntries, localRoundVerdict, staleAbortReason } from '../bin/stale-verdict.mjs';
 import { reportBasePending } from './base-pending.mjs';
 import { HEARTBEAT_TICK_MAX_S, POLL_BEAT_MS, startTickBeat } from './poll-beat.mjs';
 import { isReadOnlyGraphql } from '../bin/github.mjs';
@@ -716,14 +725,47 @@ export async function runTick({
       return Boolean(held && isAlive(Number(held.pid)));
     };
 
-    // 2. 卡住的轮次（poll 按宿主侧进度时间判定）：有活进程先杀，等它退出，再 abort。
+    // 2. 卡住的轮次（poll 按宿主侧进度时间判定）：先看本地结论，已经完成的不 abort、不报警。
+    // 其余有活进程先杀，等它退出，再 abort。进程因宿主重启消失且无结论时，文案与普通卡死分开。
     const staleEntries = entries.filter((item) => item?.stale);
+    let tickProfile = null;
+    try {
+      tickProfile = loadAcceptanceProfile({ ...env, ACCEPTANCE_WATCHER_HOME: home });
+    } catch {
+      tickProfile = null;
+    }
+    const ledgerEntries = loadLedgerEntries(paths);
     if (staleEntries.length > 0) tickBeat.setPhase('abort');
     for (const entry of staleEntries) {
       const record = byIssue.get(entry.issue);
+      const already = localRoundVerdict(entry.issue, entry.round, {
+        paths,
+        profile: tickProfile,
+        ledgerEntries,
+        commentId: entry.commentId,
+      });
+      if (already) {
+        heartbeat.lastTick.staleSkipped ??= [];
+        heartbeat.lastTick.staleSkipped.push({
+          issue: entry.issue,
+          round: entry.round,
+          source: already.source,
+          status: already.status,
+          closed: Boolean(already.closed),
+        });
+        continue;
+      }
       const piPid = Number(record?.piPid);
-      let reason = '卡死：进程不在';
-      if (isAlive(piPid)) {
+      const processAlive = isAlive(piPid);
+      let reason = staleAbortReason({
+        processAlive,
+        restartKill: !processAlive && killedByRestart({
+          startedAt: record?.startedAt,
+          nowMs: now(),
+          uptimeS: uptime(),
+        }),
+      });
+      if (processAlive) {
         try {
           process.kill(piPid, 'SIGTERM');
         } catch {
@@ -737,7 +779,7 @@ export async function runTick({
           }
           await waitGone(piPid, 2000, sleep);
         }
-        reason = '卡死：已结束进程';
+        reason = staleAbortReason({ processAlive: true });
       }
       if (!gateEnabled) {
         heartbeat.lastTick.stale.push({ issue: entry.issue, round: entry.round, reason, aborted: false });
@@ -752,6 +794,19 @@ export async function runTick({
         '--reason',
         reason,
       ]);
+      const alreadyOnGithub = abortFoundFinalVerdict(aborted?.stderr);
+      if (alreadyOnGithub) {
+        // abort 自己的认领检查已看到终态：不再写 round-stale（#1696 / #2254 这类误报）。
+        heartbeat.lastTick.staleSkipped ??= [];
+        heartbeat.lastTick.staleSkipped.push({
+          issue: entry.issue,
+          round: entry.round,
+          source: 'abort-check',
+          status: alreadyOnGithub,
+          closed: false,
+        });
+        continue;
+      }
       appendAlert(paths, {
         kind: 'round-stale',
         issue: entry.issue,
@@ -955,6 +1010,40 @@ export async function runTick({
         heartbeat.lastTick.adjudicate = { started: scheduled.started, skipped: scheduled.skipped };
       } catch (error) {
         heartbeat.lastTick.adjudicateError = String(error?.message || error);
+      }
+    }
+
+    // 3c-2. 老根单每日汇总（#62）：开着超过 7 天、从来没进过验收的根 issue 每天报一次，只进摘要。
+    //     数据全用这一拍盘点已经在手里的任务清单，不额外读 GitHub、不写看板、不发实时通知。
+    //     自己 try/catch：报不了只记心跳，不让这一拍失败。
+    if (Array.isArray(inventoryTasks)) {
+      try {
+        const digestProfile = loadAcceptanceProfile({ ...env, ACCEPTANCE_WATCHER_HOME: home });
+        const nowMs = now();
+        const day = digestDay(nowMs);
+        if (!day) throw new Error('这一拍的时间读不出来，没法按日去重');
+        const rows = staleRootDigest(inventoryTasks, { nowMs, profile: digestProfile });
+        const file = path.join(paths.hostDir, STALE_ROOT_STATE_FILE);
+        const state = readStaleRootState(file);
+        const { due, next } = selectDueStaleRoots(rows, state, day);
+        for (const row of due) {
+          appendAlert(paths, {
+            kind: 'stale-root',
+            issue: row.ref,
+            reason: row.text,
+            detail: row.url || undefined,
+            url: row.url || undefined,
+            repo: row.repo || undefined,
+            ageDays: row.ageDays,
+            now,
+          });
+        }
+        if (due.length > 0 || JSON.stringify(next) !== JSON.stringify(state.days)) {
+          writeStaleRootState(file, { days: next });
+        }
+        heartbeat.lastTick.staleRoots = { candidates: rows.length, reported: due.length };
+      } catch (error) {
+        heartbeat.lastTick.staleRootsError = String(error?.message || error);
       }
     }
   } catch (error) {

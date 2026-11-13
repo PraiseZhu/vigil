@@ -334,12 +334,15 @@ test('SC6 poll 把 base-not-default / base-unknown 各记一行 loop.log，且�
   assert.deepEqual(result.baseSkipped.map((entry) => entry.reason).sort(), ['base-not-default', 'base-unknown']);
 
   const log = fs.readFileSync(path.join(home, 'state', 'host', 'loop.log'), 'utf8').trim().split('\n');
-  assert.equal(log.length, 2, `loop.log 应该只有两行：${log.join(' | ')}`);
-  assert.match(log[0], /^\d{4}-\d\d-\d\dT[\d:.]+Z base-not-default issue=example-owner\/example-repo#14 /);
-  assert.match(log[0], /base=integration\/sample-feature/);
-  assert.match(log[0], new RegExp(`prs=${REPO}#140@integration/sample-feature`));
-  assert.match(log[1], /base-unknown issue=example-owner\/example-repo#15 /);
-  assert.match(log[1], /base=unknown/);
+  // 认领排序（#62）在同一份 loop.log 里可能多一行 queue-priority-fallback（本夹具没有看板快照）。
+  // 本用例只断言 base-not-default / base-unknown 各一行，不把「文件里只有这两行」当成约定。
+  const baseLines = log.filter((line) => / base-(?:not-default|unknown) /.test(line));
+  assert.equal(baseLines.length, 2, `loop.log 里 base-not-default / base-unknown 应各一行，实际：${log.join(' | ')}`);
+  assert.match(baseLines[0], /^\d{4}-\d\d-\d\dT[\d:.]+Z base-not-default issue=example-owner\/example-repo#14 /);
+  assert.match(baseLines[0], /base=integration\/sample-feature/);
+  assert.match(baseLines[0], new RegExp(`prs=${REPO}#140@integration/sample-feature`));
+  assert.match(baseLines[1], /base-unknown issue=example-owner\/example-repo#15 /);
+  assert.match(baseLines[1], /base=unknown/);
   // 只读：没有任何写调用（gh api / 非 graphql 的 gh）
   assert.deepEqual(run.calls.filter((call) => call.cmd !== 'gh' || !call.args.includes('graphql')), []);
 });

@@ -75,6 +75,27 @@ function view(notice) {
   return base;
 }
 
+/** issue 链接的形状：只有这个形状的地址才原样发出去。 */
+const ISSUE_URL = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/issues\/(\d+)$/;
+
+/**
+ * issue 链接：只接受 `https://github.com/<owner>/<repo>/issues/<n>`，且 owner/repo/号 和事件的 `issue` 字段一致。
+ * 不一致（伪造的、指向别的仓的）或形状不对，就按 `issue` 字段自己拼；折不出来的返回空串。
+ * 和 prLink 同一个口径：链接只在转义后的区块里出现，外部文字进不来。
+ */
+export function issueLink(event) {
+  const ref = splitRef(event?.issue);
+  const url = str(event?.url).trim();
+  const match = ISSUE_URL.exec(url);
+  if (ref && REPO_NAME.test(ref.repo)) {
+    const built = `https://github.com/${ref.repo}/issues/${ref.number}`;
+    if (!match) return built;
+    return `${match[1]}/${match[2]}` === ref.repo && Number(match[3]) === ref.number ? url : built;
+  }
+  if (match && REPO_NAME.test(`${match[1]}/${match[2]}`)) return url;
+  return '';
+}
+
 /**
  * PR 链接：只接受 `https://github.com/<repo>/pull/<pr>`，且 repo/pr 和事件字段一致。
  * 不一致（伪造的、指向别的仓的）或形状不对，就按事件里的 repo+pr 自己拼。
@@ -529,6 +550,14 @@ export const NOTICE_COPY = Object.freeze({
     action: '不用。',
     needsHuman: false,
   },
+  'stale-root': {
+    title: '这个任务开了一周多还没开始验收',
+    what: 'issue 建了超过 7 天、一直开着，也从来没有进过验收（没有任何轮次记录）。',
+    impact: '它不会自己动：验收机这一拍不触发，也不会写轮次评论。',
+    auto: '只记进每日汇总，不动 issue、不写看板、不发即时提醒。',
+    action: '需要：看一眼原因，把缺的补上（比如合并 PR、关掉子 issue），或者把单子关掉。',
+    needsHuman: true,
+  },
   'expected-gate-rejected': {
     title: '验收机一次读取被安全闸拦下，属正常防护',
     what: '验收机一次读取 / 写操作超出了允许范围，被写闸拦下。',
@@ -707,6 +736,13 @@ function digestLine(data) {
   const copy = noticeCopy(data, type);
   const issue = str(data.issue);
   const issueBit = issue ? `（${esc(issue)}）` : '';
+  // 老根单（#62）：直接给「单号 + 完整 GitHub 链接 + 原因」，不套通用的影响 / 处理套话。
+  if (type === 'stale-root') {
+    const link = issueLink(data);
+    const reason = clip(str(data.reason), 140);
+    const tail = [reason ? esc(reason) : esc(copy.impact), link].filter(Boolean).join('｜');
+    return `· ${esc(copy.title)}${issueBit}：${tail || esc(copy.impact)}`;
+  }
   let extra = '';
   if (type === 'gate-rejected') {
     const reason = str(data.reason);

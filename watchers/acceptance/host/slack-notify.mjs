@@ -340,7 +340,7 @@ function project(notice, kind) {
     headSha: event.headSha,
     reason: event.reason,
     detail: event.detail,
-    // 合入非默认分支超期（#380）的摘要行要的链接和分支名；别的提醒没有这些字段，下面会删掉。
+    // 合入非默认分支超期（#380）的摘要行要链接和分支名；老根单汇总（#62）只要完整 issue 链接。别的提醒没有这些字段，下面会删掉。
     url: event.url,
     base: event.base,
     defaultBranch: event.defaultBranch,
