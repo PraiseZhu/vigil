@@ -12,6 +12,10 @@ import {
   classifyPiFailure,
   formatAuthDiagnostic,
   llmProxyPreflight,
+  modelAuthScope,
+  inspectLlmProxyReady,
+  clearAuthEnvBackoff,
+  authEnvBackoffPath,
   loadModelsFromPiCommand,
   markAuthEnvBackoff,
   nextAuthEnvBackoffUntil,
@@ -254,4 +258,39 @@ test('#458 未知失败按独立真实时间退避，不套用环境 30/120/360 
   assert.equal(Date.parse(stamp.until) - t0, UNKNOWN_BACKOFF_MINUTES[0] * 60 * 1000);
   assert.equal(isAuthEnvBackingOff(stamp, t0 + 1000), true);
   assert.equal(isAuthEnvBackingOff(stamp, t0 + UNKNOWN_BACKOFF_MINUTES[0] * 60 * 1000), false);
+});
+
+
+test('#458 修复回归：作用域和失败类别历史互不覆盖，成功清除不影响其他模型', () => {
+  const models = modelsFixture();
+  const scope = modelAuthScope(models, PROXY_MODEL);
+  const other = modelAuthScope(models, OTHER_MODEL);
+  const dir = tmpDir();
+  const nowMs = Date.parse('2026-11-13T12:00:00.000Z');
+  markAuthEnvBackoff({ dir, scope, nowMs, failures: 2, category: CATEGORY_UNKNOWN });
+  markAuthEnvBackoff({ dir, scope, nowMs, failures: 1, category: CATEGORY_MISSING_LLM_PROXY_API_KEY });
+  markAuthEnvBackoff({ dir, scope: other, nowMs, failures: 3, category: CATEGORY_UNKNOWN });
+  assert.equal(readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN }).failures, 2);
+  assert.equal(readAuthEnvBackoff(dir, { scope }).failures, 1);
+  clearAuthEnvBackoff(dir, { scope });
+  assert.equal(readAuthEnvBackoff(dir, { scope }), null);
+  assert.equal(readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN }), null);
+  assert.equal(readAuthEnvBackoff(dir, { scope: other, category: CATEGORY_UNKNOWN }).failures, 3);
+  const encoded = fs.readFileSync(authEnvBackoffPath(dir, { scope: other, category: CATEGORY_UNKNOWN }), 'utf8');
+  assert.deepEqual(Object.keys(JSON.parse(encoded)).sort(), ['category', 'code', 'failures', 'until']);
+  assert.throws(() => authEnvBackoffPath(dir, { scope: '../outside' }));
+});
+
+test('#458 修复回归：预检到期保留历史；旧无作用域戳不阻塞其他认证', () => {
+  const dir = tmpDir();
+  const models = modelsFixture();
+  const scope = modelAuthScope(models, PROXY_MODEL);
+  const t0 = Date.parse('2026-11-13T12:00:00.000Z');
+  const stamp = markAuthEnvBackoff({ dir, scope, nowMs: t0, failures: 2, category: CATEGORY_UNKNOWN });
+  const nowMs = Date.parse(stamp.until);
+  assert.equal(inspectLlmProxyReady({ models, modelId: PROXY_MODEL, dir, nowMs, env: { LLM_PROXY_API_KEY: 'fake-value' } }).ready, true);
+  assert.equal(readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN }).failures, 2);
+  markAuthEnvBackoff({ dir, nowMs, failures: 1 });
+  assert.equal(inspectLlmProxyReady({ models, modelId: OTHER_MODEL, dir, nowMs, env: {} }).ready, true);
+  assert.equal(readAuthEnvBackoff(dir).failures, 1, '不改写旧格式历史戳');
 });

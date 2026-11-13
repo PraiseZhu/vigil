@@ -37,6 +37,8 @@ import {
   CATEGORY_UNKNOWN,
   classifyPiFailure,
   inspectLlmProxyReady,
+  modelAuthScope,
+  clearAuthEnvBackoff,
   loadModelsFromPiCommand,
   markAuthEnvBackoff,
   readAuthEnvBackoff,
@@ -1641,6 +1643,7 @@ export async function runPrbotCorrection({
   const piCommand = piCommandFor(settings);
   const models = loadModelsFromPiCommand(piCommand);
   const modelId = selectModelId(piCommand);
+  const authScope = modelAuthScope(models, modelId);
   const authReady = inspectLlmProxyReady({
     models,
     modelId,
@@ -2021,9 +2024,10 @@ export async function runPrbotCorrection({
           });
           if (classified.category === CATEGORY_MISSING_LLM_PROXY_API_KEY) {
             state.authDiagnostic = { code: classified.code, category: classified.category };
-            const prev = readAuthEnvBackoff(paths.hostDir);
+            const prev = readAuthEnvBackoff(paths.hostDir, { scope: authScope, category: classified.category });
             markAuthEnvBackoff({
               dir: paths.hostDir,
+              scope: authScope,
               nowMs: now(),
               failures: (prev?.failures || 0) + 1,
               code: classified.code,
@@ -2041,9 +2045,10 @@ export async function runPrbotCorrection({
               state.stage = 'stop';
               continue;
             }
-            const prevUnknown = readAuthEnvBackoff(paths.hostDir);
+            const prevUnknown = readAuthEnvBackoff(paths.hostDir, { scope: authScope, category: classified.category });
             markAuthEnvBackoff({
               dir: paths.hostDir,
+              scope: authScope,
               nowMs: now(),
               failures: (prevUnknown?.failures || 0) + 1,
               code: classified.code,
@@ -2060,6 +2065,7 @@ export async function runPrbotCorrection({
           }
           continue;
         }
+        clearAuthEnvBackoff(paths.hostDir, { scope: authScope });
         state.piIterations = (state.piIterations || 0) + 1;
         const notes = readNotes(roundDir, result.stdout);
         if (notes.disputes.length) {
