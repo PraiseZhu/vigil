@@ -390,6 +390,124 @@ function rangesOf(line, pattern, accept = () => true) {
   return ranges;
 }
 
+/** 从 process 解构出 env 键（可夹在其它键中间，可重命名、带默认值，也可跨行）。 */
+function destructureKeysIncludeEnv(inside) {
+  const keys = [];
+  let depth = 0;
+  let quote = null;
+  let start = 0;
+  const flush = (end) => {
+    const part = inside.slice(start, end).trim();
+    if (part) keys.push(part);
+  };
+  for (let i = 0; i < inside.length; i++) {
+    const ch = inside[i];
+    if (quote) {
+      if (ch === '\\' && i + 1 < inside.length) {
+        i += 1;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+      continue;
+    }
+    if (ch === '{' || ch === '(' || ch === '[') {
+      depth += 1;
+      continue;
+    }
+    if (ch === '}' || ch === ')' || ch === ']') {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (ch === ',' && depth === 0) {
+      flush(i);
+      start = i + 1;
+    }
+  }
+  flush(inside.length);
+  for (const part of keys) {
+    if (part.startsWith('...')) continue;
+    const named = /^([A-Za-z_$][\w$]*)/.exec(part);
+    const quoted = /^(['"`])env\1/.exec(part);
+    if ((named && named[1] === 'env') || quoted) return true;
+  }
+  return false;
+}
+
+/** `} = process` 后只能是语句结束，不能是 process.env / process.argv。 */
+const PROCESS_DESTRUCTURE_END_RE = /\}\s*=\s*process\s*(?:[;,)\]}]|\/\/|$)/g;
+
+function matchingOpenBrace(text, close) {
+  let depth = 0;
+  let quote = null;
+  for (let i = close; i >= 0; i--) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === quote) {
+        let slashes = 0;
+        for (let j = i - 1; j >= 0 && text[j] === '\\'; j--) slashes += 1;
+        if (slashes % 2 === 1) continue;
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+      continue;
+    }
+    if (ch === '}') {
+      depth += 1;
+      continue;
+    }
+    if (ch === '{') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function isProcessEnvDestructure(text) {
+  const line = String(text ?? '');
+  for (const match of line.matchAll(PROCESS_DESTRUCTURE_END_RE)) {
+    const close = match.index;
+    const open = matchingOpenBrace(line, close);
+    if (open < 0) continue;
+    if (destructureKeysIncludeEnv(line.slice(open + 1, close))) return true;
+  }
+  return false;
+}
+
+function consecutiveAddedLineGroups(addedLines) {
+  const byFile = new Map();
+  for (const row of addedLines || []) {
+    if (!row || row.file == null) continue;
+    const file = String(row.file);
+    if (!byFile.has(file)) byFile.set(file, []);
+    byFile.get(file).push(row);
+  }
+  const groups = [];
+  for (const rows of byFile.values()) {
+    rows.sort((a, b) => Number(a.line) - Number(b.line));
+    let group = [];
+    let prev = null;
+    for (const row of rows) {
+      const n = Number(row.line);
+      if (prev != null && n !== prev + 1) {
+        if (group.length) groups.push(group);
+        group = [];
+      }
+      group.push(row);
+      prev = n;
+    }
+    if (group.length) groups.push(group);
+  }
+  return groups;
+}
+
 /**
  * 这一行有没有白名单盖不住的触发，返回规则名（不命中返回 null）：
  * 全大写的密钥类名字、没有字面量名字的读环境变量写法一律算（env）；process.env 每一处都要落在白名单里才放过（env）；
@@ -399,6 +517,7 @@ function rangesOf(line, pattern, accept = () => true) {
  */
 function unlistedTriggerIn(line) {
   if (ENV_OTHER_READ_RE.test(line)) return 'env';
+  if (isProcessEnvDestructure(line)) return 'env';
   for (const match of line.matchAll(UPPER_NAME_RE)) {
     if (SENSITIVE_ENV_RE.test(match[0])) return 'env';
   }
@@ -421,10 +540,25 @@ export function sensitiveHits(files, addedLines) {
     if (isSensitivePath(file)) fileHits.push(file);
   }
   const lineHits = [];
+  const seenLine = new Set();
+  const addLineHit = (row) => {
+    const hit = { file: row.file, line: row.line, text: String(row.text ?? '') };
+    const key = `${hit.file}\0${hit.line}\0${hit.text}`;
+    if (seenLine.has(key)) return;
+    seenLine.add(key);
+    lineHits.push(hit);
+  };
   for (const row of addedLines || []) {
-    if (row && sensitiveLineReason(row.file, row.text)) {
-      lineHits.push({ file: row.file, line: row.line, text: String(row.text ?? '') });
-    }
+    if (row && sensitiveLineReason(row.file, row.text)) addLineHit(row);
+  }
+  // 内容规则按新增行判断；跨行的 `{ argv, env } = process` 把同一文件里行号连续的新增行拼起来再认一次。
+  for (const group of consecutiveAddedLineGroups(addedLines)) {
+    if (group.length < 2) continue;
+    if (group.some((row) => lineHits.some((hit) => hit.file === row.file && hit.line === row.line))) continue;
+    const joined = group.map((row) => String(row.text ?? '')).join('\n');
+    if (!isProcessEnvDestructure(joined)) continue;
+    const envRow = group.find((row) => /(?:^|[,{\s])env\b/.test(String(row.text ?? ''))) || group[0];
+    addLineHit(envRow);
   }
   const names = [];
   const seen = new Set();
