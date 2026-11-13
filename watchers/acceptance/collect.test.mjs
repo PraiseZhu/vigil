@@ -3,7 +3,7 @@ import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion } from './bin/rounds.mjs';
 import { runHelper } from './bin/helper.mjs';
-import { parseItems, parseMarker, parseLayer, parseTestPoint } from './bin/collect.mjs';
+import { parseItems, parseMarker, parseLayer, parseTestPoint, searchQueries } from './bin/collect.mjs';
 import { tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import {
   OWNER,
@@ -41,6 +41,20 @@ async function runCollect(world, profile, ref = `${REPO}#1`) {
 }
 
 const CORRECTION_MARKER = `[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#2 SC3 · 第 1 轮`;
+
+test('App-only 模式跳过无 owner 的全局修正搜索，保留逐仓搜索', () => {
+  const normal = searchQueries(`${REPO}#1`, { forkRepos: ['example-org/fork-repo'] });
+  assert.equal(normal.length, 2);
+  assert.match(normal[0], /in:body is:issue$/);
+
+  const appOnly = searchQueries(`${REPO}#1`, {
+    appOnly: true,
+    forkRepos: ['example-org/fork-repo'],
+  });
+  assert.deepEqual(appOnly, [
+    `"[验收机] 修正 · 总 ${REPO}#1" in:body is:issue repo:example-org/fork-repo`,
+  ]);
+});
 
 test('SC1 collect 输出任务树：总 issue、跨仓子 issue、修正子 issue、验收项、已合并 PR', async () => {
   const profile = loadProfile();

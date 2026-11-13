@@ -97,6 +97,7 @@
 | alerts | `gate-rejected` 且原因是 `query-not-allowed` / `repo-not-allowed` / `edit-not-allowed`、`egress-denied`、写闸探针（`probe`） | **预期拒绝（只记日志，不发）**：不发 Slack、不进摘要、不 @ |
 | alerts | `slack-failed` | **不发**（Slack 自己的发送失败；发不出去还往 Slack 报会绕圈，靠心跳和 `ensure.sh` 报出来，见第 5 节） |
 | alerts | `heartbeat-delayed`（心跳过期但原循环进程还在、锁还占着，没补起）、`loop-deploy-restarted`（`stop.sh` 主动停后保活拉起，部署重启） | **摘要**：预期内或无影响，不立即 ping |
+| alerts | `stale-root`（老根单：开着超过 7 天、从没进过验收的根 issue，#62） | **摘要**（同一 issue 每个本机日只进一次）：行内带 `owner/repo#号`、完整 `https://github.com/<owner>/<repo>/issues/<号>` 链接和人话原因（例如「没有已合并的 PR，验收机不会自动开始验收」）。**不发 ping**，不动 issue、不写看板 |
 | alerts | 其它未知 kind | **摘要**（未知的也进摘要，不丢） |
 | — | 验收结论本身（通过 / 要修 / 中断） | **不发**：只在 GitHub 的轮次评论和看板里 |
 

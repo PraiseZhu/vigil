@@ -694,6 +694,68 @@ test('SC5 解构或别名读取 process.env 整表要拦', async () => {
   }
 });
 
+test('多键解构 process 含 env 要拦：夹杂其它键、重命名、默认值、跨行；不含 env 的不解构整表不拦', async () => {
+  const { sensitiveLineReason, sensitiveHits } = await import('./deploy-ff.mjs');
+  const file = 'watchers/mivo/bin/app.mjs';
+  const hit = [
+    'const { argv, env } = process;',
+    'let { argv, env } = process;',
+    'var { argv, env } = process;',
+    'const { env, argv } = process;',
+    '({ argv, env } = process);',
+    'const { argv, env: e } = process;',
+    'const { argv, env = {} } = process;',
+    'const { argv, env: e = {} } = process;',
+    'const { argv, cwd, env } = process;',
+    'const { argv, env = defaultEnv } = process;',
+    "const { argv, 'env': e } = process;",
+    'const {\n  argv,\n  env\n} = process;',
+    'let {\n  env: e,\n  argv\n} = process;',
+    'var {\n  argv,\n  env = {}\n} = process;',
+  ];
+  for (const text of hit) {
+    assert.equal(sensitiveLineReason(file, text), 'env', text);
+  }
+  const quiet = [
+    'const { argv } = process;',
+    'const { argv, cwd } = process;',
+    'const { HOME } = config;',
+    'const p = process.argv;',
+    'const h = process.env.HOME;',
+    'const { environment } = process;',
+    'const { envName } = process;',
+    'const { env } = config;',
+    'const { env } = process.argv;',
+    'const { argv, env } = other;',
+  ];
+  for (const text of quiet) {
+    assert.equal(sensitiveLineReason(file, text), null, text);
+  }
+
+  const hits = sensitiveHits([], [
+    { file, line: 10, text: 'const {' },
+    { file, line: 11, text: '  argv,' },
+    { file, line: 12, text: '  env' },
+    { file, line: 13, text: '} = process;' },
+  ]);
+  assert.equal(hits.lines.length, 1, JSON.stringify(hits));
+  assert.equal(hits.lines[0].file, file);
+  assert.equal(hits.lines[0].line, 12);
+  assert.equal(hits.lines[0].text, '  env');
+
+  const already = sensitiveHits([], [
+    { file, line: 3, text: 'const { argv, env } = process;' },
+  ]);
+  assert.equal(already.lines.length, 1);
+  assert.equal(already.lines[0].text, 'const { argv, env } = process;');
+
+  const split = sensitiveHits([], [
+    { file, line: 1, text: 'const { env } = config;' },
+    { file, line: 20, text: 'const { argv } = process;' },
+  ]);
+  assert.equal(split.lines.length, 0, JSON.stringify(split));
+});
+
 test('SC6 isSensitivePath 认 token.json、.token、secrets/*、*.key', () => {
   assert.equal(isSensitivePath('token.json'), true);
   assert.equal(isSensitivePath('state/token.json'), true);

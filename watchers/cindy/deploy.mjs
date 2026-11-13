@@ -176,7 +176,7 @@ function applyLocked(plan){
  const state=path.join(plan.home,'state/state.json'),lease=path.join(plan.home,'state/lease');
  const record=path.join(plan.home,'deployments',plan.id),owner=`${process.pid} ${plan.id}\n`;
  const check=()=>{
-  requireValue(stateFingerprint(plan.home)===plan.stateSha,'state changed since preview');
+  requireValue(stateFingerprint(plan.home)===plan.stateSha,'state changed since preview; run preview and apply consecutively');
   requireValue(JSON.stringify(identities(plan.home))===JSON.stringify(plan.sessionIds),'session binding changed');
   idle(plan.database,plan.sessionIds);
   for(const item of plan.files){requireValue(sha(path.resolve(path.join(here,'bin'),item.name))===item.source,'source changed since preview');requireValue(sha(path.resolve(path.join(plan.home,'bin'),item.name))===item.runtime,'runtime changed since preview');}

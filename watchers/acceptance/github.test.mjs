@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { createGithub, defaultRun, isReadOnlyGraphql, WRITE_TYPES, WriteBusyError, WriteRejectedError } from './bin/github.mjs';
+import { createGithub, defaultRun, dirSize, isReadOnlyGraphql, WRITE_TYPES, WriteBusyError, WriteRejectedError } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { setAcceptanceFields } from './bin/board.mjs';
 import { BOARD_ITEMS_QUERY, PR_SEARCH_QUERY } from './bin/prio-sync.mjs';
@@ -843,4 +843,49 @@ test('#204 块字符串里的 mutation、右花括号和井号不算关键字或
   assert.equal(isReadOnlyGraphql('query { f(s: """\nmutation }\n""") { id } }'), true);
   assert.equal(isReadOnlyGraphql('query { f(s: """#""") { id } }'), true);
   assert.equal(isReadOnlyGraphql('query { f(s: """#""") { id } } mutation { y }'), false);
+});
+
+function patchLstat(matchPath, error) {
+  const orig = fs.lstatSync;
+  fs.lstatSync = (target, options) => {
+    if (path.resolve(String(target)) === path.resolve(matchPath)) throw error;
+    return orig.call(fs, target, options);
+  };
+  return orig;
+}
+
+test('dirSize：readdir 之后 maintenance.lock 消失（ENOENT）跳过该文件，其余计入', () => {
+  const root = tmpDir();
+  const objects = path.join(root, '.git', 'objects');
+  fs.mkdirSync(objects, { recursive: true });
+  const keep = path.join(objects, 'pack.idx');
+  const lock = path.join(objects, 'maintenance.lock');
+  fs.writeFileSync(keep, 'idx-bytes');
+  fs.writeFileSync(lock, '');
+  const keepBytes = fs.lstatSync(keep).size;
+  const error = new Error(`ENOENT: no such file or directory, lstat '${lock}'`);
+  error.code = 'ENOENT';
+  const orig = patchLstat(lock, error);
+  try {
+    assert.equal(dirSize(root), keepBytes);
+  } finally {
+    fs.lstatSync = orig;
+  }
+});
+
+test('dirSize：lstat 非 ENOENT（EACCES）仍抛出', () => {
+  const root = tmpDir();
+  const secret = path.join(root, 'secret');
+  fs.writeFileSync(secret, 'x');
+  const error = new Error(`EACCES: permission denied, lstat '${secret}'`);
+  error.code = 'EACCES';
+  const orig = patchLstat(secret, error);
+  try {
+    assert.throws(
+      () => dirSize(root),
+      (thrown) => thrown && thrown.code === 'EACCES',
+    );
+  } finally {
+    fs.lstatSync = orig;
+  }
 });

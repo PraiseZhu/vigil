@@ -32,6 +32,18 @@ import {
   READY_ACTIVITY_QUERY,
 } from './write-gate.mjs';
 import { runPiInSandbox, runPreflightInSandbox } from './prbot-sandbox.mjs';
+import {
+  CATEGORY_MISSING_LLM_PROXY_API_KEY,
+  CATEGORY_UNKNOWN,
+  classifyPiFailure,
+  inspectLlmProxyReady,
+  modelAuthScope,
+  clearAuthEnvBackoff,
+  loadModelsFromPiCommand,
+  markAuthEnvBackoff,
+  readAuthEnvBackoff,
+  selectModelId,
+} from './llm-proxy-preflight.mjs';
 
 export const MAX_CORRECTION_ROUNDS = 2;
 export const MAX_PI_ITERATIONS = 4;
@@ -1628,6 +1640,19 @@ export async function runPrbotCorrection({
   }
   const { marker, correctionRounds } = pre;
   const latestCorrection = pre.latest;
+  const piCommand = piCommandFor(settings);
+  const models = loadModelsFromPiCommand(piCommand);
+  const modelId = selectModelId(piCommand);
+  const authScope = modelAuthScope(models, modelId);
+  const authReady = inspectLlmProxyReady({
+    models,
+    modelId,
+    piCommand,
+    env,
+    dir: paths.hostDir,
+    nowMs: now(),
+  });
+  if (!authReady.ready) return 3;
 
   // 和验收轮共用的内存门与 2 个槽（SC1）。
   const available = readMemAvailable(meminfoPath);
@@ -1950,14 +1975,26 @@ export async function runPrbotCorrection({
           state.stage = 'stop';
           continue;
         }
-        state.piIterations = (state.piIterations || 0) + 1;
+        const callReady = inspectLlmProxyReady({
+          models,
+          modelId,
+          piCommand,
+          env,
+          dir: paths.hostDir,
+          nowMs: now(),
+        });
+        if (!callReady.ready) {
+          state.authDiagnostic = { code: null, category: callReady.preflight?.category || CATEGORY_MISSING_LLM_PROXY_API_KEY };
+          saveState(paths, state);
+          return callReady.backingOff ? 3 : 1;
+        }
         const result = await pi({
           home,
           profile: acceptanceProfile,
           hostConfig: settings,
           roundDir,
           worktree: state.worktree,
-          piCommand: piCommandFor(settings),
+          piCommand,
           prompt: buildPrompt(state, { issueContextPath }),
           env,
           run,
@@ -1978,6 +2015,49 @@ export async function runPrbotCorrection({
           return 1;
         }
         if (!result?.ok) {
+          const classified = classifyPiFailure({
+            code: result?.code,
+            stdout: result?.stdout,
+            stderr: result?.stderr,
+            models,
+            modelId,
+          });
+          if (classified.category === CATEGORY_MISSING_LLM_PROXY_API_KEY) {
+            state.authDiagnostic = { code: classified.code, category: classified.category };
+            const prev = readAuthEnvBackoff(paths.hostDir, { scope: authScope, category: classified.category });
+            markAuthEnvBackoff({
+              dir: paths.hostDir,
+              scope: authScope,
+              nowMs: now(),
+              failures: (prev?.failures || 0) + 1,
+              code: classified.code,
+              category: classified.category,
+            });
+            saveState(paths, state);
+            return 1;
+          }
+          if (classified.category === CATEGORY_UNKNOWN) {
+            state.authDiagnostic = { code: classified.code, category: classified.category };
+            state.piIterations = (state.piIterations || 0) + 1;
+            state.steps.push(`修复：第 ${state.piIterations} 次 pi 没有正常结束`);
+            if ((state.piIterations || 0) >= MAX_PI_ITERATIONS) {
+              state.failureReason = 'limit-pi-iterations';
+              state.stage = 'stop';
+              continue;
+            }
+            const prevUnknown = readAuthEnvBackoff(paths.hostDir, { scope: authScope, category: classified.category });
+            markAuthEnvBackoff({
+              dir: paths.hostDir,
+              scope: authScope,
+              nowMs: now(),
+              failures: (prevUnknown?.failures || 0) + 1,
+              code: classified.code,
+              category: classified.category,
+            });
+            saveState(paths, state);
+            return 1;
+          }
+          state.piIterations = (state.piIterations || 0) + 1;
           state.steps.push(`修复：第 ${state.piIterations} 次 pi 没有正常结束`);
           if ((state.piIterations || 0) >= MAX_PI_ITERATIONS) {
             state.failureReason = 'limit-pi-iterations';
@@ -1985,6 +2065,8 @@ export async function runPrbotCorrection({
           }
           continue;
         }
+        clearAuthEnvBackoff(paths.hostDir, { scope: authScope });
+        state.piIterations = (state.piIterations || 0) + 1;
         const notes = readNotes(roundDir, result.stdout);
         if (notes.disputes.length) {
           // 单行写进轮次评论：带上验收方（裁决里的原因）和修正方（pi 的理由）。

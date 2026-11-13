@@ -555,11 +555,17 @@ export function budgetConfigFile(hostDir) {
   return path.resolve(hostDir, '..', '..', 'config', 'rate-budget.json');
 }
 
+/** 只留字符串项；不是数组时返回空数组（快照里只用来写日志，不参与判断）。 */
+function stringList(value) {
+  return Array.isArray(value) ? value.filter((entry) => typeof entry === 'string') : [];
+}
+
 /**
  * `at` 是这一份快照的抓取时间。同名的 `items` 是已过滤好的看板条目，
- * `excludedCount` / `nullContent` 是这一拍过滤掉的条数（分档排除、content 为 null）。
+ * `excludedCount` / `nullContent` 是这一拍过滤掉的条数（分档排除、content 为 null）；
+ * `appOnlySkipped` 是只用 App 模式下整仓跳过的仓名（只写日志用，空就不写这一键）。
  */
-export function writeBoardSnapshot(file, { at, items = [], excludedCount = 0, nullContent = 0 } = {}) {
+export function writeBoardSnapshot(file, { at, items = [], excludedCount = 0, nullContent = 0, appOnlySkipped = [] } = {}) {
   const when = finiteMs(at);
   if (when === null) throw new Error('writeBoardSnapshot 需要合法的抓取时间');
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -570,6 +576,8 @@ export function writeBoardSnapshot(file, { at, items = [], excludedCount = 0, nu
     excludedCount: Number(excludedCount) || 0,
     nullContent: Number(nullContent) || 0,
   };
+  const skippedRepos = stringList(appOnlySkipped);
+  if (skippedRepos.length > 0) payload.appOnlySkipped = skippedRepos;
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
   fs.renameSync(tmp, file);
@@ -579,7 +587,7 @@ export function writeBoardSnapshot(file, { at, items = [], excludedCount = 0, nu
 /**
  * 读快照。读者只有两条路（SC2）：新鲜的直接用；过期或缺失就自己重拉一次并覆盖，
  * 或者报「快照过期」——不许静默用旧数据。这里只回答「能不能用」，不重拉。
- * 返回 { ok, reason, at, ageMs, items, excludedCount, nullContent }。
+ * 返回 { ok, reason, at, ageMs, items, excludedCount, nullContent, appOnlySkipped }。
  */
 export function readBoardSnapshot(file, { now, tickSeconds = TICK_SECONDS } = {}) {
   const at = finiteMs(now);
@@ -603,6 +611,7 @@ export function readBoardSnapshot(file, { now, tickSeconds = TICK_SECONDS } = {}
     items: parsed.items,
     excludedCount: Number(parsed.excludedCount) || 0,
     nullContent: Number(parsed.nullContent) || 0,
+    appOnlySkipped: stringList(parsed.appOnlySkipped),
   };
   // 负年龄 = 墙钟往回跳（NTP 步进、快照恢复）：不能说它「还新」，否则旧快照会一直用到时钟追上（P2-5）。
   if (ageMs < 0) return { ok: false, reason: 'clock-skew', ...base };

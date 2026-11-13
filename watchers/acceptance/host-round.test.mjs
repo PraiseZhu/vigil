@@ -5,6 +5,7 @@ import net from 'node:net';
 import path from 'node:path';
 import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
+import { cachePath } from './bin/rounds.mjs';
 import { hostPaths, progressFileFor, readAlerts } from './host/paths.mjs';
 import { roundDirFor, roundKey, runHostRound, startGateRelay } from './host/round.mjs';
 import { runTick } from './host/tick.mjs';
@@ -13,7 +14,14 @@ import { runHelper } from './bin/helper.mjs';
 import { runRound as runRoundStatus } from './bin/round.mjs';
 import { CLOCK, createFakeGithub, defaultTree, fullConclusions, writeJsonFile } from './session.fixture.mjs';
 import { OWNER, REPO, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
-import { ENV_PROBLEM_PREFIX } from './bin/trigger.mjs';
+import { ENV_PROBLEM_PREFIX, ENV_BACKOFF_MINUTES, backoffUntil } from './bin/trigger.mjs';
+import {
+  CATEGORY_MISSING_LLM_PROXY_API_KEY,
+  CATEGORY_UNKNOWN,
+  formatAuthDiagnostic,
+  readAuthEnvBackoff,
+  modelAuthScope,
+} from './host/llm-proxy-preflight.mjs';
 import { appendCodePaths } from './bin/message.mjs';
 import { appendDepsInfo } from './host/predeps.mjs';
 import { collectBuildCiFacts } from './host/build-ci.mjs';
@@ -1062,4 +1070,402 @@ test('#149 探针抛异常：不影响这一轮，静止时照常判卡住', { t
   const code = await stallRun(fixture, { spawnPi: pi.spawnPi, probeActivity: () => { throw new Error('boom'); } });
   assert.equal(code, 1);
   assert.ok(readAlerts(hostPaths(fixture.home)).some((entry) => entry.kind === 'round-stalled'));
+});
+
+function proxyModels({ modelId = 'proxy/flash', provider = 'proxy', apiKey = '$LLM_PROXY_API_KEY' } = {}) {
+  return {
+    providers: {
+      proxy: { apiKey, baseUrl: 'https://example.invalid' },
+      other: { apiKey: '$OTHER_API_KEY', baseUrl: 'https://other.example.invalid' },
+    },
+    models: {
+      [modelId]: { provider },
+      'other/flash': { provider: 'other' },
+    },
+  };
+}
+
+function writeProxyHost(home, { modelId = 'proxy/flash', models } = {}) {
+  const modelsFile = path.join(home, 'config', 'models.json');
+  fs.mkdirSync(path.dirname(modelsFile), { recursive: true });
+  fs.writeFileSync(modelsFile, `${JSON.stringify(models || proxyModels({ modelId }))}\n`);
+  const file = path.join(home, 'config', 'host.json');
+  fs.writeFileSync(
+    file,
+    JSON.stringify(
+      {
+        piCommand: ['sh', '-c', `cp ${modelsFile} "$HOME/.pi/agent/models.json" && exec pi "$@"`, 'pi', '--model', modelId, '--thinking', 'max'],
+      },
+      null,
+      2,
+    ),
+  );
+  return modelsFile;
+}
+
+async function runProxyRound(fixture, { env = {}, spawnPi, now, hostModel } = {}) {
+  writeProxyHost(fixture.home, hostModel);
+  return runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    env,
+    run: BWRAP_OK,
+    runRound: fixture.runRoundFake,
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    spawnPi: spawnPi || exitingPi(fixture.calls, 0),
+    meminfoPath: writeMeminfo(),
+    statusIntervalMs: 60000,
+    log: () => {},
+    now,
+  });
+}
+
+test('#458 SC3 验收入口：依赖该变量但未设时在认领前退出 3，不写验收中', async () => {
+  const fixture = roundFixture();
+  const code = await runProxyRound(fixture, { env: {} });
+  assert.equal(code, 3);
+  assert.equal(fixture.calls.round.length, 0, '认领前停手，不能出现 start');
+  const stamp = readAuthEnvBackoff(hostPaths(fixture.home).hostDir, { scope: modelAuthScope(proxyModels(), 'proxy/flash') });
+  assert.ok(stamp?.until, '应记下环境退避截止时间');
+});
+
+test('#458 SC6 验收：缺变量后短间隔再跑仍不认领，退避未到期', async () => {
+  const fixture = roundFixture();
+  const t0 = Date.parse('2026-11-13T12:00:00.000Z');
+  assert.equal(await runProxyRound(fixture, { env: {}, now: () => t0 }), 3);
+  assert.equal(await runProxyRound(fixture, { env: {}, now: () => t0 + 1000 }), 3);
+  assert.equal(fixture.calls.round.length, 0);
+  const stamp = readAuthEnvBackoff(hostPaths(fixture.home).hostDir, { scope: modelAuthScope(proxyModels(), 'proxy/flash') });
+  assert.equal(Date.parse(stamp.until) - t0, ENV_BACKOFF_MINUTES[0] * 60 * 1000);
+});
+
+test('#458 SC2 验收入口：其他认证方式即使未设 LLM_PROXY_API_KEY 也会认领', async () => {
+  const fixture = roundFixture();
+  const code = await runProxyRound(fixture, {
+    env: {},
+    hostModel: { modelId: 'other/flash', models: proxyModels({ modelId: 'other/flash', provider: 'other', apiKey: '$OTHER_API_KEY' }) },
+  });
+  assert.equal(code, 1);
+  assert.equal(fixture.calls.round[0][0], 'start');
+});
+
+test('#458 SC6/SC9 验收：pi 以白名单缺密钥失败时中断原因带环境前缀和 code/category，不含原文或假凭证', async () => {
+  const fixture = roundFixture();
+  const fake = 'sk-fake-credential-for-test-do-not-store';
+  const code = await runProxyRound(fixture, {
+    env: { LLM_PROXY_API_KEY: 'present-but-not-asserted' },
+    spawnPi: (options) => {
+      fixture.calls.pi.push(options);
+      return {
+        pid: 555020,
+        stdin: { write() {}, end() {} },
+        kill() {},
+        exit: Promise.resolve({ code: 1, stderr: `No API key found for proxy.\nBearer ${fake}` }),
+      };
+    },
+  });
+  assert.equal(code, 1);
+  assert.equal(fixture.calls.pi.length, 1);
+  const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
+  const reason = abort[abort.indexOf('--reason') + 1];
+  assert.ok(reason.startsWith(ENV_PROBLEM_PREFIX), reason);
+  assert.match(reason, /code=1/);
+  assert.match(reason, new RegExp(CATEGORY_MISSING_LLM_PROXY_API_KEY));
+  assert.equal(reason.includes(fake), false);
+  assert.equal(reason.includes('No API key found'), false);
+  const alerts = readAlerts(hostPaths(fixture.home));
+  const blob = JSON.stringify(alerts);
+  assert.equal(blob.includes(fake), false);
+  assert.equal(blob.includes('No API key found'), false);
+  const rounds = [{ round: 1, status: '中断', reason, finishedAt: '2026-11-13T12:00:00.000Z', createdAt: '2026-11-13T12:00:00.000Z' }];
+  assert.equal(Date.parse(backoffUntil(rounds)) - Date.parse(rounds[0].finishedAt), ENV_BACKOFF_MINUTES[0] * 60 * 1000);
+  assert.ok(formatAuthDiagnostic({ code: 1, category: CATEGORY_MISSING_LLM_PROXY_API_KEY }));
+});
+
+test('#458 SC8 验收：网络未知失败不挂环境前缀', async () => {
+  const fixture = roundFixture();
+  const code = await runProxyRound(fixture, {
+    env: { LLM_PROXY_API_KEY: 'present-but-not-asserted' },
+    spawnPi: (options) => {
+      fixture.calls.pi.push(options);
+      return {
+        pid: 555021,
+        stdin: { write() {}, end() {} },
+        kill() {},
+        exit: Promise.resolve({ code: 1, stderr: 'ECONNRESET connecting to example.invalid' }),
+      };
+    },
+  });
+  assert.equal(code, 1);
+  const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
+  const reason = abort[abort.indexOf('--reason') + 1];
+  assert.equal(reason.startsWith(ENV_PROBLEM_PREFIX), false, reason);
+  assert.match(reason, /code=1/);
+});
+
+test('#458 生产布局：piCommand 只在 sh -c 里 cp 绝对 models.json，表里只有 providers 时缺变量不认领', async () => {
+  const fixture = roundFixture();
+  const modelsDir = path.join(fixture.home, 'pi-agent');
+  fs.mkdirSync(modelsDir, { recursive: true });
+  const modelsFile = path.join(modelsDir, 'models.json');
+  const settingsFile = path.join(modelsDir, 'settings.json');
+  fs.writeFileSync(
+    modelsFile,
+    `${JSON.stringify({ $schema: 'https://example.invalid/models.json', providers: { proxy: { apiKey: '$LLM_PROXY_API_KEY', baseUrl: 'https://example.invalid' } } })}\n`,
+  );
+  fs.writeFileSync(settingsFile, '{}\n');
+  fs.writeFileSync(
+    path.join(fixture.home, 'config', 'host.json'),
+    JSON.stringify({
+      piCommand: [
+        'sh',
+        '-c',
+        `mkdir -p "$HOME/.pi/agent" && cp ${modelsFile} ${settingsFile} "$HOME/.pi/agent/" && exec pi "$@"`,
+        'pi',
+        '--model',
+        'proxy/flash:discount',
+        '--thinking',
+        'max',
+        '--no-session',
+      ],
+    }),
+  );
+  const code = await runHostRound({
+    home: fixture.home,
+    issue: ROOT_REF,
+    env: {},
+    run: BWRAP_OK,
+    runRound: fixture.runRoundFake,
+    startGate: fixture.startGateFake,
+    prefetch: fixture.prefetchFake,
+    spawnPi: exitingPi(fixture.calls, 0),
+    meminfoPath: writeMeminfo(),
+    statusIntervalMs: 60000,
+    log: () => {},
+  });
+  assert.equal(code, 3);
+  assert.equal(fixture.calls.round.length, 0, '真实依赖入口必须在认领前生效');
+});
+
+test('#458 SC8 验收：未知网络失败不挂环境前缀，短间隔下一拍不认领', async () => {
+  const fixture = roundFixture();
+  const t0 = Date.parse('2026-11-13T12:00:00.000Z');
+  const spawn = (options) => {
+    fixture.calls.pi.push(options);
+    return {
+      pid: 555021,
+      stdin: { write() {}, end() {} },
+      kill() {},
+      exit: Promise.resolve({ code: 1, stderr: 'ECONNRESET connecting to example.invalid' }),
+    };
+  };
+  const first = await runProxyRound(fixture, {
+    env: { LLM_PROXY_API_KEY: 'present-but-not-asserted' },
+    spawnPi: spawn,
+    now: () => t0,
+  });
+  assert.equal(first, 1);
+  const abort = fixture.calls.round.find((argv) => argv[0] === 'abort');
+  const reason = abort[abort.indexOf('--reason') + 1];
+  assert.equal(reason.startsWith(ENV_PROBLEM_PREFIX), false, reason);
+  assert.match(reason, /code=1/);
+  fixture.calls.round.length = 0;
+  const second = await runProxyRound(fixture, {
+    env: { LLM_PROXY_API_KEY: 'present-but-not-asserted' },
+    spawnPi: spawn,
+    now: () => t0 + 1000,
+  });
+  assert.equal(second, 3);
+  assert.equal(fixture.calls.round.length, 0, '未知失败短间隔不得立刻再认领');
+  assert.ok(readAuthEnvBackoff(hostPaths(fixture.home).hostDir, { scope: modelAuthScope(proxyModels(), 'proxy/flash'), category: CATEGORY_UNKNOWN })?.until);
+});
+
+
+test('#458 修复回归：验收入口已有缺密钥退避不阻塞其他认证模型', async () => {
+  const fixture = roundFixture();
+  const t0 = Date.parse('2026-11-13T12:00:00.000Z');
+  assert.equal(await runProxyRound(fixture, { env: {}, now: () => t0 }), 3);
+  await runProxyRound(fixture, {
+    env: {}, now: () => t0 + 1000,
+    hostModel: { modelId: 'other/flash', models: proxyModels({ modelId: 'other/flash', provider: 'other', apiKey: '$OTHER_API_KEY' }) },
+  });
+  assert.equal(fixture.calls.pi.length, 1);
+  assert.equal(fixture.calls.round[0][0], 'start');
+});
+
+
+test('#458 修复回归：验收入口未知失败窗口递增，到期不抹历史，真实成功复位', async () => {
+  const status = { round: 1, status: '验收中', stalled: false };
+  const fixture = roundFixture({ status });
+  const scope = modelAuthScope(proxyModels(), 'proxy/flash');
+  const dir = hostPaths(fixture.home).hostDir;
+  let nowMs = Date.parse('2026-11-13T12:00:00.000Z');
+  let success = false;
+  const tick = () => runProxyRound(fixture, {
+    env: { LLM_PROXY_API_KEY: 'fake-for-test' }, now: () => nowMs,
+    spawnPi: (options) => {
+      fixture.calls.pi.push(options);
+      return { pid: 555022, stdin: { write() {}, end() {} }, kill() {}, exit: Promise.resolve(success ? { code: 0 } : { code: 1, stderr: 'ECONNRESET connecting to example.invalid' }) };
+    },
+  });
+  assert.equal(await tick(), 1);
+  for (const [i, minutes] of [5, 15, 60].entries()) {
+    nowMs += minutes * 60 * 1000 - 1;
+    assert.equal(await tick(), 3);
+    assert.equal(fixture.calls.pi.length, i + 1);
+    nowMs += 1;
+    assert.equal(await tick(), 1);
+    assert.equal(fixture.calls.pi.length, i + 2);
+  }
+  assert.equal(readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN }).failures, 4);
+  nowMs += 60 * 60 * 1000;
+  success = true;
+  status.status = '通过';
+  assert.equal(await tick(), 0);
+  assert.equal(readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN }), null);
+  success = false;
+  status.status = '验收中';
+  nowMs += 1000;
+  assert.equal(await tick(), 1);
+  const fresh = readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN });
+  assert.equal(fresh.failures, 1);
+  assert.equal(Date.parse(fresh.until) - nowMs, 5 * 60 * 1000);
+});
+
+function enableGate(home) {
+  const paths = hostPaths(home);
+  fs.mkdirSync(paths.gateDir, { recursive: true });
+  fs.writeFileSync(paths.enabledFile, '1');
+}
+
+function writeRegistry(home, { issue = ROOT_REF, round = 1, pid = 999999999, piPid = 999999999, startedAt = '2026-10-24T01:00:00.000Z' } = {}) {
+  const paths = hostPaths(home);
+  fs.mkdirSync(paths.roundsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(paths.roundsDir, `${roundKey(issue, round)}.json`),
+    JSON.stringify({ issue, round, pid, piPid, startedAt }),
+  );
+}
+
+function appendLedger(home, entries) {
+  const file = hostPaths(home).ledgerFile;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  for (const entry of entries) {
+    fs.appendFileSync(file, `${JSON.stringify(entry)}\n`);
+  }
+}
+
+async function tickStale({ homeSetup, uptimeS = 86400, nowIso = '2026-10-24T02:00:00.000Z', abortStderr = '', abortCode = 0 } = {}) {
+  const { home } = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } });
+  writeHostJson(home);
+  enableGate(home);
+  if (homeSetup) {
+    const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+    homeSetup(home, profile);
+  }
+  const aborted = [];
+  const nowMs = Date.parse(nowIso);
+  const heartbeat = await runTick({
+    home,
+    env: { ...process.env },
+    now: () => nowMs,
+    uptime: () => uptimeS,
+    run: async () => ({
+      code: 0,
+      stdout: JSON.stringify({
+        entries: [{ issue: ROOT_REF, round: 1, stale: true, lastProgressAt: '2026-10-24T01:00:00.000Z', commentId: 1001 }],
+        tasks: [],
+        reads: 1,
+      }),
+      stderr: '',
+    }),
+    spawnRound: () => 1,
+    runRound: async (argv) => {
+      aborted.push(argv);
+      return { code: abortCode, stdout: '', stderr: abortStderr };
+    },
+    discoverPrbot: async () => [],
+    checkPrbotStalled: async () => [],
+    cleanupPrbot: () => [],
+    gateAudit: async () => ({ checkedLines: 0, newViolations: [], sinceBaseline: null, newUncertain: [] }),
+    notify: async () => ({ ok: true }),
+  });
+  return { home, heartbeat, aborted, alerts: readAlerts(hostPaths(home)) };
+}
+
+test('判卡死：已关单、结论已写（进程已退）、结论已写但单还开着 → 不 abort、不写 round-stale', async () => {
+  const closed = await tickStale({
+    homeSetup: (home) => {
+      writeRegistry(home);
+      appendLedger(home, [{ dedupeKey: `close:${ROOT_REF}:1`, type: 'issue.close', at: '2026-10-24T01:50:00.000Z' }]);
+    },
+  });
+  assert.deepEqual(closed.aborted, []);
+  assert.equal(closed.alerts.some((entry) => entry.kind === 'round-stale'), false);
+  assert.equal(closed.heartbeat.lastTick.staleSkipped[0]?.source, 'ledger');
+  assert.equal(closed.heartbeat.lastTick.staleSkipped[0]?.closed, true);
+
+  const finishedDead = await tickStale({
+    homeSetup: (home, profile) => {
+      writeRegistry(home);
+      fs.mkdirSync(path.dirname(cachePath(profile, ROOT_REF)), { recursive: true });
+      fs.writeFileSync(
+        cachePath(profile, ROOT_REF),
+        JSON.stringify({ round: { round: 1, commentId: 1001, finishedAt: '2026-10-24T01:50:00.000Z' }, lastVerdict: '通过' }),
+      );
+    },
+  });
+  assert.deepEqual(finishedDead.aborted, []);
+  assert.equal(finishedDead.alerts.some((entry) => entry.kind === 'round-stale'), false);
+  assert.equal(finishedDead.heartbeat.lastTick.staleSkipped[0]?.source, 'cache');
+  assert.equal(finishedDead.heartbeat.lastTick.staleSkipped[0]?.status, '通过');
+
+  const passedOpen = await tickStale({
+    homeSetup: (home) => {
+      writeRegistry(home);
+      appendLedger(home, [
+        { dedupeKey: `round-finish:${ROOT_REF}:1:1001:通过`, type: 'comment.update', at: '2026-10-24T01:50:00.000Z' },
+      ]);
+    },
+  });
+  assert.deepEqual(passedOpen.aborted, []);
+  assert.equal(passedOpen.alerts.some((entry) => entry.kind === 'round-stale'), false);
+  assert.equal(passedOpen.heartbeat.lastTick.staleSkipped[0]?.status, '通过');
+  assert.equal(passedOpen.heartbeat.lastTick.staleSkipped[0]?.closed, false);
+});
+
+test('判卡死：进程被杀且无结论时，重启中断与普通卡死文案不同；普通卡死仍报警', async () => {
+  const restarted = await tickStale({
+    uptimeS: 600,
+    homeSetup: (home) => writeRegistry(home, { startedAt: '2026-10-24T01:00:00.000Z' }),
+  });
+  assert.equal(restarted.aborted.length, 1);
+  assert.equal(restarted.aborted[0].includes('重启中断：进程不在'), true, `abort 原因应区分重启：${restarted.aborted[0]}`);
+  assert.equal(restarted.alerts.length, 1);
+  assert.equal(restarted.alerts[0].kind, 'round-stale');
+  assert.equal(restarted.alerts[0].reason, '重启中断：进程不在');
+  assert.equal(restarted.heartbeat.lastTick.stale[0]?.reason, '重启中断：进程不在');
+
+  const stuck = await tickStale({
+    uptimeS: 86400,
+    homeSetup: (home) => writeRegistry(home, { startedAt: '2026-10-24T01:00:00.000Z' }),
+  });
+  assert.equal(stuck.aborted.length, 1);
+  assert.equal(stuck.aborted[0].includes('卡死：进程不在'), true);
+  assert.equal(stuck.aborted[0].includes('重启中断'), false);
+  assert.equal(stuck.alerts[0].kind, 'round-stale');
+  assert.equal(stuck.alerts[0].reason, '卡死：进程不在');
+});
+
+test('判卡死：本地没看到结论，但 abort 认领检查已是通过 → 不写 round-stale', async () => {
+  const raced = await tickStale({
+    homeSetup: (home) => writeRegistry(home),
+    abortCode: 3,
+    abortStderr: '认领检查失败：期望第 1 轮（验收中），实际第 1 轮（通过）。',
+  });
+  assert.equal(raced.aborted.length, 1, '本地没有结论时仍会走 abort');
+  assert.equal(raced.alerts.some((entry) => entry.kind === 'round-stale'), false, 'GitHub 上已是通过则不再报警');
+  assert.equal(raced.heartbeat.lastTick.staleSkipped[0]?.source, 'abort-check');
+  assert.equal(raced.heartbeat.lastTick.staleSkipped[0]?.status, '通过');
 });

@@ -9,8 +9,10 @@ import { RateLimitError, createGithub } from './github.mjs';
 import { collectTasks } from './tasks.mjs';
 import { createRounds, latestRound } from './rounds.mjs';
 import { lastFinal, shouldTrigger, stalledRounds } from './trigger.mjs';
+import { loadLedgerEntries, localRoundVerdict } from './stale-verdict.mjs';
 import { hostPaths, readRoundProgress } from '../host/paths.mjs';
-import { readRateState, recordHeader, writeRateState } from './rate-budget.mjs';
+import { readRateState, recordHeader, writeRateState, appendRateLog } from './rate-budget.mjs';
+import { PRIORITY_FALLBACK, readQueuePriorities, sortTaskQueue, unrecognizedPriorities } from './queue.mjs';
 
 function nextRoundNumber(rounds) {
   const max = (rounds || []).reduce((acc, round) => Math.max(acc, round.round), 0);
@@ -117,9 +119,47 @@ export function countReads(github, counter = { reads: 0 }) {
   return wrapped;
 }
 
-export async function poll({ github, profile, now = () => Date.now(), hostProgress }) {
+/**
+ * 认领顺序（#62）：看板优先级 → issue createdAt 旧的先 → repo+号升序。
+ * 优先级只读本地看板快照（prio-run 每拍写的那份），不新增 GraphQL 读。快照过期 / 缺失 / 坏掉、
+ * 或看板值是认不出的写法时，这些任务按 P2 排，并在 <home>/state/host/loop.log 记一行，不让这一拍失败。
+ * 返回排好序的任务清单；`log` 只给测试注入。
+ */
+export function orderForClaim(tasks, { home, now = () => Date.now(), priorities = null, log = null } = {}) {
+  const write = log || defaultQueueLog(home, now);
+  const source = priorities || readQueuePriorities({ home, now });
+  const byRef = source.byRef instanceof Map ? source.byRef : new Map();
+  const priorityOf = (task) => byRef.get(task?.ref) ?? null;
+  const unrecognized = unrecognizedPriorities(tasks, priorityOf);
+  if (source.reason) {
+    write(`queue-priority-fallback reason=${source.reason} tasks=${(tasks || []).length} 看板优先级快照用不了，这些任务按 ${PRIORITY_FALLBACK} 排序`);
+  } else if (unrecognized.length > 0) {
+    const refs = unrecognized.map((row) => `${row.ref}=${row.value}`).join(',');
+    write(`queue-priority-fallback reason=unrecognized tasks=${unrecognized.length} 看板值认不出，按 ${PRIORITY_FALLBACK} 排序：${refs}`);
+  }
+  return sortTaskQueue(tasks, { priorityOf });
+}
+
+/** 降级日志写进宿主 loop.log（和额度日志同一份）；目录不在、写不了就算了，不影响这一拍。只写日志，不写缓存。 */
+function defaultQueueLog(home, now) {
+  let file = null;
+  try {
+    file = hostPaths(home).loopLog;
+  } catch {
+    return () => {};
+  }
+  return (text) => {
+    try {
+      appendRateLog(file, `${new Date(now()).toISOString()} ${text}`);
+    } catch {
+      // 记不下日志不挡这一拍。
+    }
+  };
+}
+
+export async function poll({ github, profile, now = () => Date.now(), hostProgress, priorities = null, queueLog = null }) {
   // 只读本地缓存里的 lastProgressAt（模型写的，只作参考）和宿主进度文件；不写缓存、不调 write。
-  const { entries } = await pollInventory({ github, profile, now, hostProgress });
+  const { entries } = await pollInventory({ github, profile, now, hostProgress, priorities, queueLog });
   return entries;
 }
 
@@ -128,12 +168,27 @@ export async function poll({ github, profile, now = () => Date.now(), hostProgre
  * 不再让 `discoverCorrections` 自己又拉一遍全量盘点。
  * 返回值里的 `reads` 是这一拍真的发了几次只读请求（#247 P2-2）：用量记它，不写字面量。
  */
-export async function pollInventory({ github, profile, now = () => Date.now(), hostProgress, loopLog } = {}) {
+export async function pollInventory({ github, profile, now = () => Date.now(), hostProgress, loopLog, priorities = null, queueLog = null } = {}) {
   const counted = countReads(github);
   const roundsApi = createRounds({ github: counted, profile, now });
   const hostProgressAt = hostProgress || defaultHostProgress(profile);
   const log = loopLog === false ? () => {} : loopLog || loopLogOf(profile);
-  const tasks = await collectTasks(counted, profile);
+  // 本地结论只读一次账本：判卡死不再为每条轮次另打 GitHub。
+  let hostState = null;
+  try {
+    hostState = hostPaths(homeOf(profile));
+  } catch {
+    hostState = null;
+  }
+  const ledgerEntries = loadLedgerEntries(hostState);
+  const collected = await collectTasks(counted, profile);
+  // 认领槽位前的排序（#62）：优先级高的先，同档旧的先。账目/倾向都不改，只改遍历顺序。
+  const tasks = orderForClaim(collected, {
+    home: homeOf(profile),
+    now,
+    priorities,
+    ...(queueLog ? { log: queueLog } : {}),
+  });
   const out = [];
   const baseSkipped = [];
   for (const task of tasks) {
@@ -145,7 +200,15 @@ export async function pollInventory({ github, profile, now = () => Date.now(), h
       lastProgressAt: progressAt,
       hostProgressAt: latest ? hostProgressAt(task.ref, latest.round) : null,
     });
-    if (stale) out.push(stale);
+    if (stale && !localRoundVerdict(stale.issue, stale.round, {
+      paths: hostState,
+      profile,
+      task,
+      ledgerEntries,
+      commentId: stale.commentId,
+    })) {
+      out.push(stale);
+    }
     const decision = shouldTrigger(task, { now, profile });
     if (decision.reason === 'base-not-default' || decision.reason === 'base-unknown') {
       // 合并目标分支不对（或取不到）：不进验收、不开修正单。只落一行本地日志，不发通知、不写 GitHub。
