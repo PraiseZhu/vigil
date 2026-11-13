@@ -124,11 +124,11 @@ fork 的归属,头仓改从 REST `repos/<repo>/pulls/<n>` 读,读不到(fork 已
 ```sh
 node watchers/<mivo|cindy>/deploy.mjs verify --home <dir>      # mivo 必须带 --home
 node watchers/cindy/deploy.mjs bootstrap --home <dir>          # 只有 cindy 有；mivo 第一次安装先手动建 <dir>/bin/ 和 <dir>/state/prs/
-node watchers/<mivo|cindy>/deploy.mjs preview --home <dir> --database <Cindy 的 .db 文件> --id <id> --plan <绝对路径>
+node watchers/<mivo|cindy>/deploy.mjs preview --home <dir> --database <Cindy 的 .db 文件> --id <id> --plan <绝对路径> && \
 node watchers/<mivo|cindy>/deploy.mjs apply --plan <file>
 ```
 
-`--database` 指向 Cindy 的本地数据库，用来确认修复会话都空闲（`idle()`，需要 `sqlite3`）；有会话在跑时 `preview` / `apply` 会拒绝，等它跑完再试。完整步骤见根目录 [`README.md`](../README.md#安装与部署)。
+`--database` 指向 Cindy 的本地数据库，用来确认修复会话都空闲（`idle()`，需要 `sqlite3`）；有会话在跑时 `preview` / `apply` 会拒绝，等它跑完再试。Mivo 预览输出会列出当前已安装提交到本次提交之间的提交标题。状态可能在预览后变化，因此应把 `preview && apply` 连着执行；若仍报 `state changed since preview`，重新预览并立即应用。完整步骤见根目录 [`README.md`](../README.md#安装与部署)。
 
 ## 5. 停止盯梢某个 PR
 
