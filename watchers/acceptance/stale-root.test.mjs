@@ -78,7 +78,8 @@ test('#62 SC4 进过验收的、有父的子单、已关闭的、这一拍就会
   );
   assert.equal(staleRootOf(rootTask({ state: 'closed', closedAt: '2026-10-05T00:00:00.000Z' }), { nowMs, profile: PROFILE }), null, '已关闭：不报');
   const merged = {
-    linkedPrs: [{ ref: `${REPO}#9`, mergedAt: '2026-10-02T00:00:00.000Z', url: 'https://github.com/example-owner/example-repo/pull/9' }],
+    defaultBranch: 'main',
+    linkedPrs: [{ ref: `${REPO}#9`, mergedAt: '2026-10-02T00:00:00.000Z', url: 'https://github.com/example-owner/example-repo/pull/9', base: 'main' }],
   };
   assert.equal(staleRootOf(rootTask(merged), { nowMs, profile: PROFILE }), null, '这一拍会触发（马上被认领）：不算漏单');
   // createdAt 读不出来：不猜年龄，不报。
