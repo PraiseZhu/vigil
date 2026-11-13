@@ -336,6 +336,57 @@ test('内容规则仍然命中敏感环境变量、密钥/令牌文件、App 身
   }
 });
 
+test('带引号的 port 键、listenPort 这类、YAML port 要拦；普通文本不拦', async () => {
+  const { sensitiveLineReason } = await import('./deploy-ff.mjs');
+  const file = 'watchers/mivo/bin/app.mjs';
+  const hit = [
+    '"port": 8080',
+    "'port': 8080",
+    '`port`: 8080',
+    '"port":8080',
+    '{ "port": 8080 }',
+    "{ 'port': 3000 }",
+    '"listenPort": 8080',
+    "'listenPort': 3000",
+    'listenPort: 8080',
+    'listen_port: 8080',
+    'httpPort: 3000',
+    'http_port: 80',
+    'serverPort: 4430',
+    'portNumber: 8080',
+    'port: 8080',
+    "port: '8080'",
+    'PORT: 8080',
+    'const config = { port: 3000 };',
+    'server.listen(8080);',
+    'listen(8080);',
+  ];
+  for (const text of hit) {
+    assert.equal(sensitiveLineReason(file, text), 'port', text);
+    assert.equal(sensitiveLineReason('docs/acceptance-operations.md', text), 'port', `docs: ${text}`);
+  }
+  const quiet = [
+    'port 字段说明',
+    '说明 port 字段的含义',
+    'the port field in the payload',
+    'export const n = 8080;',
+    'passport: 12345',
+    'report: 8080',
+    'supported: 8080',
+    'important: 8080',
+    'opportunity: 8080',
+    'portable: 8080',
+    'the port number is documented here',
+    'listen for connections',
+    'const listenPort = name;',
+    'const port = "field";',
+  ];
+  for (const text of quiet) {
+    assert.equal(sensitiveLineReason(file, text), null, text);
+    assert.equal(sensitiveLineReason('docs/acceptance-operations.md', text), null, `docs: ${text}`);
+  }
+});
+
 test('内容规则收窄后，路径规则仍然照旧', () => {
   // 6b55d8f 命中 trigger.mjs 和 host/prbot.mjs 是路径规则，按设计保留。
   const hits = sensitiveHits(['watchers/acceptance/bin/trigger.mjs', 'watchers/acceptance/host/prbot.mjs', 'package-lock.json'], []);

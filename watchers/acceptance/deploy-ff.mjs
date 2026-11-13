@@ -291,7 +291,9 @@ const ENV_OTHER_READ_RE = /\bprocess\s*(?:\?\.)?\s*\[|\bglobalThis\b.*\bprocess\
 // 测试/文档跳过常规扫描时，GITHUB_TOKEN 仍要拦（整词，含 process.env.GITHUB_TOKEN 和裸名）。
 const GITHUB_TOKEN_RE = /(?<![A-Za-z0-9_])GITHUB_TOKEN(?![A-Za-z0-9_])/;
 const APP_ONLY_RE = /appOnly/i;
-const PORT_RE = /(?<![\w$])listen\s*\(|\bport\b\s*[:=]\s*['"]?\d{2,5}\b/i;
+// listen() 一律拦。端口键名只认 port、listenPort、http_port 这类（前缀白名单），允许 JSON/YAML 把键名用引号包住。
+// 键名后面必须是 [:=] 和 2–5 位数字，避免「port 字段说明」这种普通文本。
+const PORT_RE = /(?<![\w$])listen\s*\(|['"`]?(?<![A-Za-z0-9_$])(?:listen[_-]?|http[_-]?|https[_-]?|tcp[_-]?|udp[_-]?|server[_-]?|app[_-]?|api[_-]?)?port(?:[_-]?(?:number|num|no))?(?![A-Za-z0-9_$])['"`]?\s*[:=]\s*['"`]?\d{2,5}\b/i;
 const FULL_SHA = /^[0-9a-f]{40}$/;
 
 /** 命令行里出现轮次、修正或裁决脚本就不算空档。相对路径 `node round.mjs` 也算。 */
