@@ -10,6 +10,7 @@ import { DOWNGRADE_MIN_GAP_MS, DOWNGRADE_WINDOW_MS } from './bin/prio-score.mjs'
 import { isReadOnlyGraphql } from './bin/github.mjs';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import {
+  appOnlyRepoTable,
   assertPrioFields,
   BOARD_ITEMS_QUERY,
   classifyRepo,
@@ -4890,4 +4891,67 @@ test('SC1-边界9 两个 syncOneItem 并行共享 marker：written 合计与串�
   assert.equal(state.items[`${REPO}#9`].priority, 'P0', '原有键不能丢');
   assert.deepEqual(Object.keys(state.items).sort(), [`${REPO}#1`, `${REPO}#2`, `${REPO}#9`].sort());
   assert.deepEqual(state.prCi, { [`${REPO}#80`]: { mark: 'pass', pending: 0 } }, '单条改过的 prCi 不能被拍末覆写丢掉');
+});
+
+// #364 只用 App 模式：①读 App 名单外 owner 的仓，看板同步整仓跳过（不搜 PR、不改字段），不让 app-only-blocked 拖垮整轮。
+function appOnlyProfile(extra = {}) {
+  return {
+    appOnly: true,
+    apps: { read: { appId: 1, privateKeyFile: '/dev/null', owners: ['Example-Owner'] } },
+    ...extra,
+  };
+}
+
+test('#364 只用 App 模式：读 App 名单外的仓不搜 PR，并记一行 app-only-skip', async () => {
+  const table = appOnlyRepoTable(classTable(), appOnlyProfile());
+  assert.equal(classifyRepo('example-owner/repo', table).repoClass, 'daily-tool');
+  assert.equal(classifyRepo('Other-Org/client', table).repoClass, 'exclude');
+  const searched = [];
+  const github = {
+    async ownerGraphql(query, variables) {
+      searched.push(String(variables.query));
+      return { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+    },
+  };
+  const lines = [];
+  const original = process.stderr.write;
+  process.stderr.write = (chunk) => {
+    lines.push(String(chunk));
+    return true;
+  };
+  try {
+    await loadPullRequests(github, ['Example-Owner/repo', 'Other-Org/client'], table);
+  } finally {
+    process.stderr.write = original;
+  }
+  assert.deepEqual(searched, ['is:pr repo:Example-Owner/repo']);
+  assert.equal(lines.filter((line) => line.startsWith('app-only-skip repo=Other-Org/client ')).length, 1);
+});
+
+test('#364 只用 App 模式：名单外仓的条目按 exclude 处理，不写字段、计入排除', async () => {
+  const table = appOnlyRepoTable(classTable(), appOnlyProfile({ apps: { read: { appId: 1, privateKeyFile: '/dev/null', owners: [REPO.split('/')[0]] } } }));
+  const out = capture();
+  const gate = recorder();
+  await runPrioSync({
+    dir: tmpDir(),
+    items: [item(4, { repo: 'Other-Org/client', priority: 'P0' }), item(8, { repo: REPO })],
+    prs: [],
+    nowMs: T0,
+    apply: true,
+    ownerLogin: OWNER,
+    projectNumber: PROJECT,
+    write: gate.write,
+    stdout: out.stdout,
+    table,
+  });
+  assert.equal(gate.writes.some((entry) => entry.repo === 'Other-Org/client'), false);
+  assert.match(out.text(), /排除 1 条/);
+});
+
+test('#364 没开只用 App 模式、没配读 App 或走 appConfigPath 时，分类表原样返回', () => {
+  const table = classTable();
+  assert.equal(appOnlyRepoTable(table, { appOnly: false, apps: appOnlyProfile().apps }), table);
+  assert.equal(appOnlyRepoTable(table, { appOnly: true }), table);
+  assert.equal(appOnlyRepoTable(table, appOnlyProfile({ appConfigPath: '/x/app.json' })), table);
+  assert.equal(classifyRepo('Other-Org/client', table).repoClass, 'daily-tool');
 });

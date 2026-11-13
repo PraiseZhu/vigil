@@ -30,6 +30,7 @@ import {
 import {
   ITEM_FIELD_QUERY,
   ONLY_FIELD_NAMES,
+  appOnlyRepoTable,
   PRIO_HOURLY_MAX,
   PRIO_HOURLY_WINDOW_MS,
   PRIO_LIMIT_MAX,
@@ -596,7 +597,7 @@ export async function runContinuous(argv = [], deps = {}) {
 
   try {
     const profile = deps.loadProfile ? deps.loadProfile() : loadAcceptanceProfile();
-    const table = deps.table || readRepoClassTable(path.join(dir, 'repo-class.json'));
+    const table = appOnlyRepoTable(deps.table || readRepoClassTable(path.join(dir, 'repo-class.json')), profile);
     const allowRepos = wantWrite || args.onlyEmptyToP2
       ? readAuthorizedRepos(path.join(dir, 'authorized-repos.json'))
       : [];

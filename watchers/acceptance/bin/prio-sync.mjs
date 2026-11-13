@@ -453,6 +453,19 @@ function excludeNames(value) {
   return value.filter((entry) => typeof entry === 'string');
 }
 
+/**
+ * 只用 App 模式（profile.appOnly）下，看板以外的读（按仓搜 PR）只能走 ①读 App：owner 不在它的名单里，
+ * 请求会被 app-only-blocked 拦下、整轮报错（#364 第二次开 appOnly 时 makecindy/* 就是这样）。
+ * 这里把分类表收窄成「只认 ①读 App 名单里的 owner」，名单外的仓按 exclude 整仓跳过：不搜 PR、不改字段、
+ * 保留上次的状态。没开 appOnly、没配 ①读 App、或走旧 appConfigPath 时原样返回。
+ */
+export function appOnlyRepoTable(table, profile) {
+  if (profile?.appOnly !== true || profile.appConfigPath) return table;
+  const owners = profile.apps?.read?.owners;
+  if (!Array.isArray(owners)) return table;
+  return { ...table, appReadOwners: owners.map((owner) => String(owner).toLowerCase()) };
+}
+
 export function readRepoClassTable(file) {
   if (!file || !fs.existsSync(file)) return emptyClassTable();
   let parsed;
@@ -488,6 +501,9 @@ export function classifyRepo(repo, table = DEFAULT_REPO_CLASS_TABLE) {
   const has = (names) => (names || []).some((entry) => String(entry).toLowerCase() === key);
   const excluded = (table?.exclude || []).some((entry) => typeof entry === 'string' && entry.toLowerCase() === key);
   if (excluded) return { repoClass: 'exclude', unlisted: false };
+  if (Array.isArray(table?.appReadOwners) && !table.appReadOwners.includes(key.split('/')[0])) {
+    return { repoClass: 'exclude', unlisted: false, appOnly: true };
+  }
   if (has(table.mivo)) return { repoClass: 'mivo', unlisted: false };
   if (has(table.idle)) return { repoClass: 'idle', unlisted: false };
   if (has(table['daily-tool'])) return { repoClass: 'daily-tool', unlisted: false };
@@ -826,7 +842,11 @@ export async function loadPullRequests(github, repos, table = DEFAULT_REPO_CLASS
   for (const repo of repos || []) {
     const name = String(repo || '');
     if (!name.includes('/') || seen.has(name)) continue;
-    if (isExcludedRepo(name, table)) continue;
+    const ranked = classifyRepo(name, table || DEFAULT_REPO_CLASS_TABLE);
+    if (ranked.appOnly) {
+      process.stderr.write(`app-only-skip repo=${name} 只用 App 模式：这个 owner 不在读 App 名单里，看板同步整仓跳过（不搜 PR、不改字段）\n`);
+    }
+    if (ranked.repoClass === 'exclude') continue;
     seen.add(name);
     let after = null;
     do {
@@ -1611,7 +1631,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const stdout = deps.stdout || process.stdout;
   const nowMs = deps.now ? deps.now() : Date.now();
   const profile = deps.loadProfile ? deps.loadProfile() : loadAcceptanceProfile();
-  const table = readRepoClassTable(path.join(dir, 'repo-class.json'));
+  const table = appOnlyRepoTable(readRepoClassTable(path.join(dir, 'repo-class.json')), profile);
   let write = deps.write || null;
   let items = deps.loadItems ? await deps.loadItems() : null;
   let prs = deps.loadPrs ? await deps.loadPrs() : null;
