@@ -16,8 +16,10 @@ import { OWNER, REPO, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import { ENV_PROBLEM_PREFIX, ENV_BACKOFF_MINUTES, backoffUntil } from './bin/trigger.mjs';
 import {
   CATEGORY_MISSING_LLM_PROXY_API_KEY,
+  CATEGORY_UNKNOWN,
   formatAuthDiagnostic,
   readAuthEnvBackoff,
+  modelAuthScope,
 } from './host/llm-proxy-preflight.mjs';
 import { appendCodePaths } from './bin/message.mjs';
 import { appendDepsInfo } from './host/predeps.mjs';
@@ -1123,7 +1125,7 @@ test('#458 SC3 验收入口：依赖该变量但未设时在认领前退出 3，
   const code = await runProxyRound(fixture, { env: {} });
   assert.equal(code, 3);
   assert.equal(fixture.calls.round.length, 0, '认领前停手，不能出现 start');
-  const stamp = readAuthEnvBackoff(hostPaths(fixture.home).hostDir);
+  const stamp = readAuthEnvBackoff(hostPaths(fixture.home).hostDir, { scope: modelAuthScope(proxyModels(), 'proxy/flash') });
   assert.ok(stamp?.until, '应记下环境退避截止时间');
 });
 
@@ -1133,7 +1135,7 @@ test('#458 SC6 验收：缺变量后短间隔再跑仍不认领，退避未到�
   assert.equal(await runProxyRound(fixture, { env: {}, now: () => t0 }), 3);
   assert.equal(await runProxyRound(fixture, { env: {}, now: () => t0 + 1000 }), 3);
   assert.equal(fixture.calls.round.length, 0);
-  const stamp = readAuthEnvBackoff(hostPaths(fixture.home).hostDir);
+  const stamp = readAuthEnvBackoff(hostPaths(fixture.home).hostDir, { scope: modelAuthScope(proxyModels(), 'proxy/flash') });
   assert.equal(Date.parse(stamp.until) - t0, ENV_BACKOFF_MINUTES[0] * 60 * 1000);
 });
 
@@ -1275,5 +1277,57 @@ test('#458 SC8 验收：未知网络失败不挂环境前缀，短间隔下一�
   });
   assert.equal(second, 3);
   assert.equal(fixture.calls.round.length, 0, '未知失败短间隔不得立刻再认领');
-  assert.ok(readAuthEnvBackoff(hostPaths(fixture.home).hostDir)?.until);
+  assert.ok(readAuthEnvBackoff(hostPaths(fixture.home).hostDir, { scope: modelAuthScope(proxyModels(), 'proxy/flash'), category: CATEGORY_UNKNOWN })?.until);
+});
+
+
+test('#458 修复回归：验收入口已有缺密钥退避不阻塞其他认证模型', async () => {
+  const fixture = roundFixture();
+  const t0 = Date.parse('2026-11-13T12:00:00.000Z');
+  assert.equal(await runProxyRound(fixture, { env: {}, now: () => t0 }), 3);
+  await runProxyRound(fixture, {
+    env: {}, now: () => t0 + 1000,
+    hostModel: { modelId: 'other/flash', models: proxyModels({ modelId: 'other/flash', provider: 'other', apiKey: '$OTHER_API_KEY' }) },
+  });
+  assert.equal(fixture.calls.pi.length, 1);
+  assert.equal(fixture.calls.round[0][0], 'start');
+});
+
+
+test('#458 修复回归：验收入口未知失败窗口递增，到期不抹历史，真实成功复位', async () => {
+  const status = { round: 1, status: '验收中', stalled: false };
+  const fixture = roundFixture({ status });
+  const scope = modelAuthScope(proxyModels(), 'proxy/flash');
+  const dir = hostPaths(fixture.home).hostDir;
+  let nowMs = Date.parse('2026-11-13T12:00:00.000Z');
+  let success = false;
+  const tick = () => runProxyRound(fixture, {
+    env: { LLM_PROXY_API_KEY: 'fake-for-test' }, now: () => nowMs,
+    spawnPi: (options) => {
+      fixture.calls.pi.push(options);
+      return { pid: 555022, stdin: { write() {}, end() {} }, kill() {}, exit: Promise.resolve(success ? { code: 0 } : { code: 1, stderr: 'ECONNRESET connecting to example.invalid' }) };
+    },
+  });
+  assert.equal(await tick(), 1);
+  for (const [i, minutes] of [5, 15, 60].entries()) {
+    nowMs += minutes * 60 * 1000 - 1;
+    assert.equal(await tick(), 3);
+    assert.equal(fixture.calls.pi.length, i + 1);
+    nowMs += 1;
+    assert.equal(await tick(), 1);
+    assert.equal(fixture.calls.pi.length, i + 2);
+  }
+  assert.equal(readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN }).failures, 4);
+  nowMs += 60 * 60 * 1000;
+  success = true;
+  status.status = '通过';
+  assert.equal(await tick(), 0);
+  assert.equal(readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN }), null);
+  success = false;
+  status.status = '验收中';
+  nowMs += 1000;
+  assert.equal(await tick(), 1);
+  const fresh = readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN });
+  assert.equal(fresh.failures, 1);
+  assert.equal(Date.parse(fresh.until) - nowMs, 5 * 60 * 1000);
 });

@@ -27,6 +27,8 @@ import {
   classifyPiFailure,
   formatAuthDiagnostic,
   inspectLlmProxyReady,
+  modelAuthScope,
+  clearAuthEnvBackoff,
   loadModelsFromPiCommand,
   markAuthEnvBackoff,
   readAuthEnvBackoff,
@@ -537,6 +539,7 @@ export async function runHostRound({
 
   const models = loadModelsFromPiCommand(piCommand);
   const modelId = selectModelId(piCommand);
+  const authScope = modelAuthScope(models, modelId);
   const authReady = inspectLlmProxyReady({
     models,
     modelId,
@@ -943,15 +946,17 @@ export async function runHostRound({
         status = null;
       }
       if (isTerminalFor(status, claim.round)) {
+        if (exitCode === 0) clearAuthEnvBackoff(paths.hostDir, { scope: authScope });
         noteEnvUnverified(status);
         return exitCode === 0 ? 0 : 1;
       }
       const reason = piExitAbortReason({ result, logFile: piLog, models, modelId });
       const classified = classifyHostPiFailure({ result, logFile: piLog, models, modelId });
       if (reason.startsWith(ENV_PROBLEM_PREFIX) || classified.category === CATEGORY_UNKNOWN) {
-        const prev = readAuthEnvBackoff(paths.hostDir);
+        const prev = readAuthEnvBackoff(paths.hostDir, { scope: authScope, category: classified.category });
         markAuthEnvBackoff({
           dir: paths.hostDir,
+          scope: authScope,
           nowMs: now(),
           failures: (prev?.failures || 0) + 1,
           code: classified.code,

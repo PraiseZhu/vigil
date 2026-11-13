@@ -1,6 +1,7 @@
 // #458：判断所选模型的 provider.apiKey 是否为字面量 $LLM_PROXY_API_KEY，并做认领前/调用前预检。
 // 只看调用方传入的模型表和 env 里该变量是否非空；不读 secrets/，返回值不含变量值和 pi 输出原文。
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { ENV_BACKOFF_MINUTES } from '../bin/trigger.mjs';
 import { hasNetworkSignal, isNetworkErrorText } from '../bin/net-errors.mjs';
@@ -130,13 +131,23 @@ export function nextAuthEnvBackoffUntil(failureCount, nowMs, { minutes = ENV_BAC
   return new Date(nowMs + minutes[k - 1] * 60 * 1000).toISOString();
 }
 
-export function authEnvBackoffPath(dir) {
-  return path.join(dir, AUTH_ENV_BACKOFF_FILE);
+/** 只使用模型身份和认证引用，不读取或落盘任何凭据值。 */
+export function modelAuthScope(models, modelId) {
+  const ref = providerApiKeyRef(models, modelId);
+  const auth = typeof ref === 'string' && /^\$[A-Z_][A-Z0-9_]*$/.test(ref) ? ref : 'other-auth';
+  return createHash('sha256').update(JSON.stringify([modelId || '', selectProviderName(models, modelId) || '', auth])).digest('hex');
 }
 
-export function readAuthEnvBackoff(dir, { readFileSync = fs.readFileSync } = {}) {
+export function authEnvBackoffPath(dir, { scope, category = CATEGORY_MISSING_LLM_PROXY_API_KEY } = {}) {
+  if (scope === undefined) return path.join(dir, AUTH_ENV_BACKOFF_FILE);
+  if (!/^[a-f0-9]{64}$/.test(scope)) throw new Error('认证退避作用域应为 64 位散列');
+  if (![CATEGORY_MISSING_LLM_PROXY_API_KEY, CATEGORY_UNKNOWN].includes(category)) throw new Error('认证退避类别不在白名单');
+  return path.join(dir, `llm-proxy-preflight-${scope}-${category}.json`);
+}
+
+export function readAuthEnvBackoff(dir, { scope, category, readFileSync = fs.readFileSync } = {}) {
   try {
-    const parsed = JSON.parse(readFileSync(authEnvBackoffPath(dir), 'utf8'));
+    const parsed = JSON.parse(readFileSync(authEnvBackoffPath(dir, { scope, category }), 'utf8'));
     if (!parsed || typeof parsed !== 'object') return null;
     return {
       until: typeof parsed.until === 'string' ? parsed.until : null,
@@ -151,6 +162,7 @@ export function readAuthEnvBackoff(dir, { readFileSync = fs.readFileSync } = {})
 
 export function markAuthEnvBackoff({
   dir,
+  scope,
   nowMs,
   failures,
   code = null,
@@ -169,18 +181,21 @@ export function markAuthEnvBackoff({
     category,
   };
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const file = authEnvBackoffPath(dir);
+  const file = authEnvBackoffPath(dir, { scope, category });
   const tmp = `${file}.${process.pid}.${nowMs}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(stamp)}\n`, { mode: 0o600 });
   renameSync(tmp, file);
   return stamp;
 }
 
-export function clearAuthEnvBackoff(dir, { unlinkSync = fs.unlinkSync } = {}) {
-  try {
-    unlinkSync(authEnvBackoffPath(dir));
-  } catch {
-    // 没有戳文件就算清掉了。
+export function clearAuthEnvBackoff(dir, { scope, unlinkSync = fs.unlinkSync } = {}) {
+  for (const category of [CATEGORY_MISSING_LLM_PROXY_API_KEY, CATEGORY_UNKNOWN]) {
+    try {
+      unlinkSync(authEnvBackoffPath(dir, { scope, category }));
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    if (scope === undefined) break;
   }
 }
 
@@ -190,33 +205,20 @@ export function isAuthEnvBackingOff(stamp, nowMs) {
   return Number.isFinite(until) && nowMs < until;
 }
 
-/**
- * 只对确实依赖 $LLM_PROXY_API_KEY 的模型看退避戳。
- * 预检通过就清掉戳；失败且还在窗内则本拍停手，不把短间隔重试当成退避到期。
- */
+/** 到期只放行尝试，保留各作用域/类别的连续失败历史；真正成功才清除。 */
 export function inspectLlmProxyReady({ models, modelId, piCommand, env, dir, nowMs }) {
-  const preflight = llmProxyPreflight({ models, modelId, piCommand, env });
-  if (preflight.ok) {
-    const stamp = readAuthEnvBackoff(dir);
-    if (isAuthEnvBackingOff(stamp, nowMs)) {
-      return { ready: false, backingOff: true, preflight, stamp };
-    }
-    if (providerApiKeyRef(models, modelId || selectModelId(piCommand)) === LLM_PROXY_API_KEY_REF) {
-      clearAuthEnvBackoff(dir);
-    }
-    return { ready: true, preflight };
-  }
-  const stamp = readAuthEnvBackoff(dir);
-  if (isAuthEnvBackingOff(stamp, nowMs)) {
-    return { ready: false, backingOff: true, preflight, stamp };
-  }
-  const failures = (stamp?.failures || 0) + 1;
+  const id = modelId || selectModelId(piCommand);
+  const scope = modelAuthScope(models, id);
+  const preflight = llmProxyPreflight({ models, modelId: id, piCommand, env });
+  const stamp = readAuthEnvBackoff(dir, { scope });
+  const unknown = readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN });
+  const active = [stamp, unknown].find((item) => isAuthEnvBackingOff(item, nowMs));
+  if (active) return { ready: false, backingOff: true, preflight, stamp: active };
+  if (preflight.ok) return { ready: true, preflight };
   const next = markAuthEnvBackoff({
-    dir,
-    nowMs,
-    failures,
-    code: null,
-    category: preflight.category,
+    dir, scope, nowMs,
+    failures: (stamp?.failures || 0) + 1,
+    code: null, category: preflight.category,
   });
   return { ready: false, backingOff: false, preflight, stamp: next };
 }

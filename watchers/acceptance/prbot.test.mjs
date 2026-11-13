@@ -41,6 +41,7 @@ import { PR_BODY_QUERY } from './host/prbot-gate-check.mjs';
 import { checkPrBody } from './host/prbot-template-check.mjs';
 import { clock, OWNER, REPO, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import { spawnRun } from './bin/localgit.mjs';
+import { authEnvBackoffPath, modelAuthScope, readAuthEnvBackoff, CATEGORY_UNKNOWN } from './host/llm-proxy-preflight.mjs';
 
 const CORRECTION_REF = `${REPO}#9`;
 const CORRECTION_MARKER = `[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#2 SC3 · 第 1 轮`;
@@ -2298,7 +2299,7 @@ test('#458 SC6 修正：缺变量后短间隔再跑仍不认领，退避未到�
   assert.equal(first.code, 3);
   assert.equal(second.code, 3);
   assert.equal(first.actions.concat(second.actions).some((action) => action.type === 'comment.create'), false);
-  const stamp = JSON.parse(fs.readFileSync(path.join(hostPaths(home).hostDir, 'llm-proxy-preflight.json'), 'utf8'));
+  const stamp = JSON.parse(fs.readFileSync(authEnvBackoffPath(hostPaths(home).hostDir, { scope: modelAuthScope(proxyModelsJson(), 'proxy/flash') }), 'utf8'));
   assert.equal(Date.parse(stamp.until) - t0, 30 * 60 * 1000);
 });
 
@@ -2340,7 +2341,7 @@ test('#458 SC5 修正：已进入 fix 后调用前变量未设或为空则不调
     assert.equal(state.authDiagnostic?.code, null);
     assert.equal(Object.keys(state.authDiagnostic).sort().join(','), 'category,code');
     assert.equal(JSON.stringify(state).includes(present), false);
-    const stamp = JSON.parse(fs.readFileSync(path.join(hostPaths(home).hostDir, 'llm-proxy-preflight.json'), 'utf8'));
+    const stamp = JSON.parse(fs.readFileSync(authEnvBackoffPath(hostPaths(home).hostDir, { scope: modelAuthScope(proxyModelsJson(), 'proxy/flash') }), 'utf8'));
     assert.equal(Date.parse(stamp.until) - t0, 30 * 60 * 1000);
     assert.equal(stamp.category, 'missing-llm-proxy-api-key');
 
@@ -2525,4 +2526,80 @@ test('#458 SC8 修正：未知网络计入现有 4 次但每拍只一次，短�
   assert.equal(netFails, 4, '达界后不能再试');
   assert.equal(readCorrectionState(home).failureReason, 'limit-pi-iterations');
   assert.ok(afterCap.code === 0 || afterCap.code === 1 || afterCap.code === 3);
+});
+
+
+test('#458 修复回归：其他认证不会继承同 home 的代理缺密钥退避', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const t0 = Date.parse('2026-11-13T12:00:00.000Z');
+  const missing = await runOnce({ world, home, hostConfig: proxyHostConfig(home), overrides: { env: { PATH: process.env.PATH }, now: () => t0 } });
+  assert.equal(missing.code, 3);
+  let calls = 0;
+  const other = await runOnce({
+    world, home,
+    hostConfig: proxyHostConfig(home, { modelId: 'other/flash', models: proxyModelsJson({ modelId: 'other/flash', provider: 'other', apiKey: '$OTHER_API_KEY' }) }),
+    overrides: {
+      env: { PATH: process.env.PATH }, now: () => t0 + 1000,
+      piRunner: async () => { calls += 1; return { ok: true, code: 0, stdout: '' }; },
+    },
+  });
+  assert.equal(calls, 1, '不依赖代理变量的模型必须照常调用');
+  assert.notEqual(other.code, 3);
+});
+
+test('#458 修复回归：未知失败严格按 5/15/60 分钟窗口递增，四次停止', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const hostConfig = proxyHostConfig(home);
+  let nowMs = Date.parse('2026-11-13T12:00:00.000Z');
+  let calls = 0;
+  const tick = () => runOnce({ world, home, hostConfig, overrides: {
+    env: { PATH: process.env.PATH, LLM_PROXY_API_KEY: 'fake-for-test' }, now: () => nowMs,
+    piRunner: async () => { calls += 1; return { ok: false, code: 1, stderr: 'ECONNRESET connecting to example.invalid' }; },
+  } });
+  assert.equal((await tick()).code, 1);
+  for (const [index, minutes] of [5, 15, 60].entries()) {
+    nowMs += minutes * 60 * 1000 - 1;
+    assert.equal((await tick()).code, 3, `第 ${index + 1} 个窗口到期前不能调用`);
+    assert.equal(calls, index + 1);
+    nowMs += 1;
+    assert.equal((await tick()).code, 1);
+    assert.equal(calls, index + 2);
+  }
+  assert.equal(readCorrectionState(home).piIterations, 4);
+  assert.equal(readCorrectionState(home).failureReason, 'limit-pi-iterations');
+  nowMs += 60 * 60 * 1000;
+  await tick();
+  assert.equal(calls, 4);
+});
+
+
+
+test('#458 修复回归：真实修正成功才清除本作用域退避', async () => {
+  const world = defaultTree({ roundStatus: '要修' });
+  addCorrection(world);
+  const home = writeProfile(tmpDir(), { profile: { stateDir: path.join(tmpDir(), 'acc-state') } }).home;
+  const hostConfig = proxyHostConfig(home);
+  const scope = modelAuthScope(proxyModelsJson(), 'proxy/flash');
+  const dir = hostPaths(home).hostDir;
+  let nowMs = Date.parse('2026-11-13T12:00:00.000Z');
+  let success = false;
+  let calls = 0;
+  const tick = () => runOnce({ world, home, hostConfig, overrides: {
+    env: { PATH: process.env.PATH, LLM_PROXY_API_KEY: 'fake-for-test' }, now: () => nowMs,
+    piRunner: async () => { calls += 1; return success ? { ok: true, code: 0, stdout: '' } : { ok: false, code: 1, stderr: 'ECONNRESET connecting to example.invalid' }; },
+  } });
+  await tick();
+  nowMs += 5 * 60 * 1000;
+  await tick();
+  assert.equal(readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN }).failures, 2);
+  nowMs += 15 * 60 * 1000;
+  success = true;
+  await tick();
+  assert.equal(calls, 3);
+  assert.equal(readAuthEnvBackoff(dir, { scope, category: CATEGORY_UNKNOWN }), null);
+
 });
