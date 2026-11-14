@@ -24,10 +24,13 @@ import {
   repoFromOrigin,
   runDeploy,
   sensitiveHits,
+  SENSITIVE_RULE_VERSION,
   DRAIN_COOLDOWN_MS,
   DRAIN_MAX_MS,
   spawnDrainHolder,
 } from './deploy-ff.mjs';
+import { readDeployAudit } from './deploy-audit.mjs';
+import { makeGrant } from './deploy-grant.fixture.mjs';
 import { tryAcquireLock } from './host/paths.mjs';
 import { acquireSlot } from './host/round.mjs';
 
@@ -195,6 +198,10 @@ async function deploy(world, extra = {}) {
     alertsFile: world.alertsFile,
     approvalFile: extra.approvalFile ?? null,
     approve: extra.approve ?? null,
+    grant: extra.grant ?? null,
+    grantFile: extra.grantFile ?? null,
+    auditLogFile: extra.auditLogFile ?? null,
+    appendAudit: extra.appendAudit,
     doctorScript: extra.doctorScript || world.doctor,
     doctorArgs: extra.doctorArgs || [],
     now: extra.now || (() => Date.now()),
@@ -206,6 +213,28 @@ async function deploy(world, extra = {}) {
     timeoutMs: extra.timeoutMs ?? 15_000,
   });
   return { ...result, before, after: git(world.deploy, ['rev-parse', 'HEAD']), calls };
+}
+
+function rangeOf(world) {
+  git(world.deploy, ['fetch', 'origin']);
+  const baseSha = git(world.deploy, ['rev-parse', 'HEAD']);
+  const targetSha = git(world.deploy, ['rev-parse', 'origin/main']);
+  const commits = git(world.deploy, ['rev-list', '--reverse', `${baseSha}..${targetSha}`]).split('\n').filter(Boolean);
+  return { baseSha, targetSha, commits };
+}
+
+function grantFor(world, extra = {}) {
+  const range = rangeOf(world);
+  return makeGrant({
+    ...range,
+    ruleVersion: extra.ruleVersion ?? SENSITIVE_RULE_VERSION,
+    nowMs: extra.nowMs ?? Date.now(),
+    overrides: extra.overrides || {},
+  });
+}
+
+function auditOf(world) {
+  return readDeployAudit(path.join(path.dirname(world.stateFile), 'deploy-ff-audit.jsonl'));
 }
 
 function mutations(calls) {
@@ -1071,6 +1100,8 @@ const SENSITIVE_CASES = [
   ['#215 SC5 redact 需要批准', 'watchers/acceptance/bin/redact.mjs', 'export const r = 1;\n'],
   ['#215 SC5 secretscan 需要批准', 'watchers/acceptance/bin/secretscan.mjs', 'export const s = 1;\n'],
   ['#215 SC5 脚本自身需要批准', 'watchers/acceptance/deploy-ff.mjs', 'export const self = 1;\n'],
+  ['#215 SC5 授予模块需要批准', 'watchers/acceptance/deploy-approval.mjs', 'export const n = 1;\n'],
+  ['#215 SC5 审计模块需要批准', 'watchers/acceptance/deploy-audit.mjs', 'export const n = 1;\n'],
   ['#215 SC15 prio-sync 需要批准', 'watchers/acceptance/bin/prio-sync.mjs', 'export const sync = 1;\n'],
   ['#215 SC15 仓根 package.json 需要批准', 'package.json', '{"private":true}\n'],
   ['#215 SC15 子目录 package-lock.json 需要批准', 'deps/package-lock.json', '{"name":"demo"}\n'],
@@ -1127,7 +1158,11 @@ test('#215 SC6 完整且相等的 --approve 才放行，用过的批准文件会
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
   fs.writeFileSync(world.approvalFile, `${sha}\n`);
-  const result = await deploy(world, { fetchImpl: green(sha), approvalFile: world.approvalFile });
+  const result = await deploy(world, {
+    fetchImpl: green(sha),
+    approvalFile: world.approvalFile,
+    grant: grantFor(world),
+  });
   assertRun(result, 'deployed');
   assert.equal(result.after, sha);
   assert.equal(fs.existsSync(world.approvalFile), false);
@@ -1183,6 +1218,7 @@ test('#215 SC6 命令行批准放行时，内容对不上的批准文件留着',
     fetchImpl: green(sha),
     approve: sha,
     approvalFile: world.approvalFile,
+    grant: grantFor(world),
   });
   assertRun(result, 'deployed');
   assert.equal(fs.readFileSync(world.approvalFile, 'utf8').trim(), 'e'.repeat(40));
@@ -1191,16 +1227,27 @@ test('#215 SC6 命令行批准放行时，内容对不上的批准文件留着',
 test('#215 SC6 检查没过时不删除已用的批准文件，也不回退', { skip: FLOCK_SKIP }, async () => {
   const world = makeWorld();
   const sha = commitAndPush(world, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
+  const before = git(world.deploy, ['rev-parse', 'HEAD']);
   fs.writeFileSync(world.approvalFile, `${sha}\n`);
   const result = await deploy(world, {
     fetchImpl: green(sha),
     approvalFile: world.approvalFile,
+    grant: grantFor(world),
     runDoctor: () => ({ code: 1, stdout: '检查没过\n', stderr: '' }),
   });
-  assertRun(result, 'doctor-failed');
+  const json = assertRun(result, 'doctor-failed');
   assert.equal(result.after, sha);
   assert.equal(fs.existsSync(world.approvalFile), true);
   assert.equal(result.calls.some((args) => args[0] === 'reset'), false);
+  assert.match(json.reason, new RegExp(`工作区已从 ${before} 快进到 ${sha}，未自动回滚`));
+  const rows = auditOf(world);
+  assert.ok(rows.some((row) => row.outcome === 'attempt'));
+  const failed = rows.find((row) => row.outcome === 'doctor-failed');
+  assert.equal(failed.workspaceChanged, true);
+  assert.equal(failed.autoRollback, false);
+  assert.equal(failed.previousSha, before);
+  assert.equal(failed.targetSha, sha);
+  assert.equal(failed.attemptId, rows.find((row) => row.outcome === 'attempt').attemptId);
 });
 
 test('#215 SC7 语法检查失败时 doctor-failed 且不回退', { skip: FLOCK_SKIP }, async () => {
@@ -1506,14 +1553,22 @@ test('#215 SC10 SC14 SC17 源码静态约束', () => {
   // 改了判定实现就必须同一个提交带上文档和测试。只比这条规则，不比整份提交列表：
   // 一次提交里可以同时改别的文件（比如随同的测试夹具），那不是这次要比的东西。
   const COMPANIONS = ['docs/acceptance-operations.md', 'watchers/acceptance/deploy-ff.test.mjs'];
-  const missingCompanions = (files) => (files.includes('watchers/acceptance/deploy-ff.mjs')
-    ? COMPANIONS.filter((file) => !files.includes(file)) : []);
+  const DOC_ALTS = ['docs/acceptance-operations.md', 'docs/fleet-deploy-authorization.md'];
+  const missingCompanions = (files) => {
+    if (!files.includes('watchers/acceptance/deploy-ff.mjs')) return [];
+    const missing = [];
+    if (!DOC_ALTS.some((file) => files.includes(file))) missing.push('docs/acceptance-operations.md');
+    if (!files.includes('watchers/acceptance/deploy-ff.test.mjs')) missing.push('watchers/acceptance/deploy-ff.test.mjs');
+    return missing;
+  };
   // 规则本身先自检：浅克隆下拿不到父提交、走不到下面的真实比对，这里保证规则没被改松。
   assert.deepEqual(missingCompanions(['watchers/acceptance/deploy-ff.mjs']), COMPANIONS);
   assert.deepEqual(missingCompanions(['watchers/acceptance/deploy-ff.mjs', 'docs/acceptance-operations.md']),
     ['watchers/acceptance/deploy-ff.test.mjs']);
   assert.deepEqual(missingCompanions(['watchers/acceptance/deploy-ff.mjs', ...COMPANIONS,
     'watchers/acceptance/host/sandbox.mjs']), []);
+  assert.deepEqual(missingCompanions(['watchers/acceptance/deploy-ff.mjs',
+    'docs/fleet-deploy-authorization.md', 'watchers/acceptance/deploy-ff.test.mjs']), []);
   assert.deepEqual(missingCompanions(['watchers/acceptance/loop.test.mjs']), []);
   // 不读 origin/main：CI 的 checkout 往往只有一个提交，没有远端引用。
   // 父提交在本地时，用 HEAD 和它的父提交比；浅克隆没有父提交时，只能查这三份文件都在这次提交里。
@@ -1527,11 +1582,13 @@ test('#215 SC10 SC14 SC17 源码静态约束', () => {
     const files = diff.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
     assert.deepEqual(missingCompanions(files), [], `这次提交只动了 ${files.join(', ')}`);
   } else {
-    for (const file of ['watchers/acceptance/deploy-ff.mjs', ...COMPANIONS]) {
+    for (const file of ['watchers/acceptance/deploy-ff.mjs', 'watchers/acceptance/deploy-ff.test.mjs']) {
       assert.equal(fs.existsSync(path.join(ROOT, file)), true, file);
       const tracked = spawnSync('git', ['cat-file', '-e', `HEAD:${file}`], { cwd: ROOT, encoding: 'utf8' });
       assert.equal(tracked.status, 0, `${file} 不在这次提交里`);
     }
+    const hasDoc = DOC_ALTS.some((file) => spawnSync('git', ['cat-file', '-e', `HEAD:${file}`], { cwd: ROOT, encoding: 'utf8' }).status === 0);
+    assert.equal(hasDoc, true, 'deploy-ff 改动需要同伴文档');
   }
 });
 
@@ -2030,7 +2087,13 @@ test('#425 需要批准（敏感改动未批准）时不排空；批准了目标
     const content = assertRun(await deploy(world, { now: () => NOW, approve: 'f'.repeat(40) }), 'waiting');
     assert.equal(content.status, 'waiting', '批准的不是目标 sha 也不排空');
     fs.writeFileSync(world.approvalFile, `${sha}\n`);
-    assertRun(await deploy(world, { now: () => NOW, approvalFile: world.approvalFile }), 'draining');
+    assertRun(await deploy(world, { now: () => NOW, approvalFile: world.approvalFile }), 'waiting');
+    assert.equal(stateOf(world).drain ?? null, null, '只有 SHA 文件仍不排空');
+    assertRun(await deploy(world, {
+      now: () => NOW,
+      approvalFile: world.approvalFile,
+      grant: grantFor(world, { nowMs: NOW }),
+    }), 'draining');
     assert.equal(fs.existsSync(world.approvalFile), true, '排空不消费批准文件');
   } finally {
     cleanupHolder(world);
@@ -2489,3 +2552,146 @@ test('#425 返工 locked（另一个实例拿着本脚本的锁）不碰那个�
     cleanupHolder(world);
   }
 });
+
+test('B SC3 仅 SHA 文件或仅 --approve 不能放行敏感快进', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  const sha = commitAndPush(world, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
+  fs.writeFileSync(world.approvalFile, `${sha}\n`);
+  const byFile = await deploy(world, { fetchImpl: green(sha), approvalFile: world.approvalFile });
+  assertRun(byFile, 'needs-approval');
+  assert.equal(byFile.after, byFile.before);
+  assert.equal(fs.existsSync(world.approvalFile), true);
+  const byFlag = await deploy(world, { fetchImpl: green(sha), approve: sha });
+  assertRun(byFlag, 'needs-approval');
+  assert.equal(byFlag.after, byFlag.before);
+});
+
+test('B SC3 完整授予记录是明确执行路径；bot 评论和 approved 文本不行', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  const sha = commitAndPush(world, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
+  const grant = grantFor(world);
+  const ok = await deploy(world, { fetchImpl: green(sha), grant });
+  assertRun(ok, 'deployed');
+  assert.equal(ok.after, sha);
+  const bot = makeWorld();
+  const botSha = commitAndPush(bot, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
+  const botRun = await deploy(bot, {
+    fetchImpl: green(botSha),
+    grant: { kind: 'bot-comment', authorType: 'Bot', body: `${botSha}\napproved` },
+  });
+  assertRun(botRun, 'needs-approval');
+  assert.equal(botRun.after, botRun.before);
+  assert.match(botRun.json.reason, /bot 评论/);
+  const text = makeWorld();
+  const textSha = commitAndPush(text, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
+  const textRun = await deploy(text, { fetchImpl: green(textSha), grant: 'approved' });
+  assertRun(textRun, 'needs-approval');
+  assert.equal(textRun.after, textRun.before);
+  const user = makeWorld();
+  const userSha = commitAndPush(user, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
+  const userRun = await deploy(user, {
+    fetchImpl: green(userSha),
+    grant: { login: 'ExampleUser', type: 'User', body: userSha },
+  });
+  assertRun(userRun, 'needs-approval');
+  assert.match(userRun.json.reason, /不能单独证明/);
+});
+
+test('B SC2 旧 SHA、短 SHA、区间不符、过期不改工作区也不排空', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  try {
+    lagBehind(world, 6, { entries: [{ path: 'watchers/acceptance/host/tick.mjs', content: 'y\n' }] });
+    busyRounds(world);
+    const stale = grantFor(world, { nowMs: NOW, overrides: { targetSha: 'd'.repeat(40) } });
+    assertRun(await deploy(world, { now: () => NOW, grant: stale }), 'waiting');
+    assert.equal(stateOf(world).drain ?? null, null);
+    assert.equal(fs.existsSync(slotsOf(world)) ? fs.readdirSync(slotsOf(world)).length : 0, 0);
+  } finally {
+    cleanupHolder(world);
+  }
+  const idle = makeWorld();
+  const idleSha = commitAndPush(idle, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
+  const expired = grantFor(idle, { nowMs: NOW, overrides: { expiresAt: new Date(NOW - 1).toISOString() } });
+  const expiredRun = await deploy(idle, { fetchImpl: green(idleSha), grant: expired, now: () => NOW });
+  assertRun(expiredRun, 'needs-approval');
+  assert.equal(expiredRun.after, expiredRun.before);
+  const short = await deploy(idle, {
+    fetchImpl: green(idleSha),
+    grant: grantFor(idle, { nowMs: NOW }),
+    approve: idleSha.slice(0, 7),
+    now: () => NOW,
+  });
+  assertRun(short, 'needs-approval');
+  assert.equal(short.after, short.before);
+});
+
+test('B SC1 敏感部署追加审计且写失败则快进前失败关闭', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  const sha = commitAndPush(world, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
+  const before = git(world.deploy, ['rev-parse', 'HEAD']);
+  const range = rangeOf(world);
+  const result = await deploy(world, { fetchImpl: green(sha), grant: grantFor(world) });
+  assertRun(result, 'deployed');
+  const rows = auditOf(world);
+  assert.ok(rows.length >= 2);
+  assert.equal(rows[0].outcome, 'attempt');
+  assert.equal(rows[1].outcome, 'deployed');
+  assert.equal(rows[0].previousSha, before);
+  assert.equal(rows[1].targetSha, sha);
+  assert.deepEqual(rows[1].commits, range.commits);
+  assert.equal(rows[1].sensitiveRuleVersion, SENSITIVE_RULE_VERSION);
+  assert.deepEqual(rows[1].grantSource.ids, ['t710u', 't711u']);
+  assert.equal(rows[0].attemptId, rows[1].attemptId);
+  const first = fs.readFileSync(path.join(path.dirname(world.stateFile), 'deploy-ff-audit.jsonl'), 'utf8');
+  const again = await deploy(world, { fetchImpl: green(sha), grant: grantFor(world) });
+  assertRun(again, 'up-to-date');
+  assert.equal(again.after, sha);
+  assert.equal(fs.readFileSync(path.join(path.dirname(world.stateFile), 'deploy-ff-audit.jsonl'), 'utf8'), first);
+
+  const blocked = makeWorld();
+  const blockedSha = commitAndPush(blocked, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
+  const fail = await deploy(blocked, {
+    fetchImpl: green(blockedSha),
+    grant: grantFor(blocked),
+    appendAudit: () => { throw new Error('disk full'); },
+  });
+  assertRun(fail, 'needs-approval');
+  assert.equal(fail.after, fail.before);
+  assert.equal(fail.calls.some((args) => args[0] === 'merge'), false);
+  assert.match(fail.json.reason, /审计日志写失败，未执行/);
+});
+
+test('B SC5 拒绝可重复执行且旧审计行不覆盖', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  const sha = commitAndPush(world, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
+  const first = await deploy(world, { fetchImpl: green(sha) });
+  assertRun(first, 'needs-approval');
+  const second = await deploy(world, { fetchImpl: green(sha) });
+  assertRun(second, 'needs-approval');
+  const rows = auditOf(world).filter((row) => row.outcome === 'rejected');
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].targetSha, sha);
+  assert.equal(rows[1].targetSha, sha);
+  assert.notEqual(rows[0].attemptId, rows[1].attemptId);
+});
+
+test('B SC6 新机制不能自证旧 SHA 文件；本轮不提交生产授予文件', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  const sha = commitAndPush(world, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
+  fs.writeFileSync(world.approvalFile, `${sha}\n`);
+  const result = await deploy(world, {
+    fetchImpl: green(sha),
+    approvalFile: world.approvalFile,
+    grant: { schema: 'vigil-deploy-grant/v1', kind: 'legacy-sha-file', provesLegacy: true, targetSha: sha },
+  });
+  assertRun(result, 'needs-approval');
+  assert.match(result.json.reason, /不能自行证明旧门禁/);
+  const tracked = spawnSync('git', ['ls-files'], { cwd: ROOT, encoding: 'utf8' }).stdout.split('\n');
+  assert.equal(tracked.some((file) => /deploy-ff-grant|production-grant|grant\.json$/.test(file)), false);
+  const doc = fs.readFileSync(path.join(ROOT, 'docs', 'fleet-deploy-authorization.md'), 'utf8');
+  assert.match(doc, /自举/);
+  assert.match(doc, /回滚/);
+  assert.match(doc, /威胁模型/);
+  assert.match(doc, /不声称密码学保证|不是密码学保证/);
+});
+

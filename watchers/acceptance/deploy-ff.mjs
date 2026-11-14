@@ -8,6 +8,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { evaluateGrant } from './deploy-approval.mjs';
+import { appendDeployAudit, defaultAuditLogPath } from './deploy-audit.mjs';
 
 /** 超过这么多个提交算落后（正好等于这个数不算）。 */
 export const LAG_BEHIND_OVER = 5;
@@ -66,7 +68,7 @@ const HUMAN = Object.freeze({
   'ci-unknown': '检查结果读不到或不认得，不拉。',
   'needs-approval': '有敏感改动，需要点名批准目标提交后才拉。',
   'pull-failed': '快进失败，不动。',
-  'doctor-failed': '已经快进，但部署后检查没过，不自动回退。',
+  'doctor-failed': '已经快进到目标提交，部署后检查没过，未自动回滚。',
   deployed: '已快进到目标提交，检查通过。',
 });
 
@@ -229,6 +231,8 @@ const EXACT_FILES = new Set([
   'package.json',
   'run-ensure.sh',
   'watchers/acceptance/deploy-ff.mjs',
+  'watchers/acceptance/deploy-approval.mjs',
+  'watchers/acceptance/deploy-audit.mjs',
   'watchers/acceptance/bin/trigger.mjs',
   'watchers/acceptance/bin/profile.mjs',
   'watchers/acceptance/bin/github.mjs',
@@ -295,6 +299,8 @@ const APP_ONLY_RE = /appOnly/i;
 // 键名后面必须是 [:=] 和 2–5 位数字，避免「port 字段说明」这种普通文本。
 const PORT_RE = /(?<![\w$])listen\s*\(|['"`]?(?<![A-Za-z0-9_$])(?:listen[_-]?|http[_-]?|https[_-]?|tcp[_-]?|udp[_-]?|server[_-]?|app[_-]?|api[_-]?)?port(?:[_-]?(?:number|num|no))?(?![A-Za-z0-9_$])['"`]?\s*[:=]\s*['"`]?\d{2,5}\b/i;
 const FULL_SHA = /^[0-9a-f]{40}$/;
+/** 敏感路径与内容规则的版本。规则集合变了才改这一行；授予记录必须写同一值。 */
+export const SENSITIVE_RULE_VERSION = 'deploy-ff-sensitive/v2';
 
 /** 命令行里出现轮次、修正或裁决脚本就不算空档。相对路径 `node round.mjs` 也算。 */
 export const BUSY_PROCESS_RE = /(?:^|[\s/])(round|prbot|adjudicate)\.mjs/;
@@ -907,6 +913,96 @@ function releaseDrain(opts, drain) {
   }
 }
 
+function parseGrantText(text) {
+  if (!text) return null;
+  const trimmed = String(text).trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try { return JSON.parse(trimmed); } catch { return { schema: 'invalid-json' }; }
+  }
+  return trimmed;
+}
+
+function readOutsideText(file, deployDir) {
+  if (!file) return null;
+  if (!isOutside(deployDir, file)) return null;
+  try {
+    return fs.readFileSync(file, 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function loadGrantInput(opts, deployDir) {
+  if (opts.grant != null) return opts.grant;
+  const fromGrant = parseGrantText(readOutsideText(opts.grantFile, deployDir));
+  if (fromGrant != null) return fromGrant;
+  const parsed = parseGrantText(readOutsideText(opts.approvalFile, deployDir));
+  if (parsed && typeof parsed === 'object') return parsed;
+  return null;
+}
+
+function rangeCommits(runGit, cwd, fromSha, toSha) {
+  if (!FULL_SHA.test(String(fromSha || '')) || !FULL_SHA.test(String(toSha || ''))) return null;
+  const list = runGit(cwd, ['rev-list', '--reverse', `${fromSha}..${toSha}`]);
+  if (!list.ok) return null;
+  const shas = list.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+  if (!shas.length || shas.some((sha) => !FULL_SHA.test(sha))) return null;
+  return shas;
+}
+
+function shaPinMatches(target, opts, deployDir) {
+  const flag = typeof opts.approve === 'string' ? opts.approve.trim() : '';
+  const fileSha = readApproval(opts.approvalFile, deployDir);
+  const fileIsSha = FULL_SHA.test(String(fileSha || ''));
+  if (flag && !FULL_SHA.test(flag)) return { given: true, ok: false, viaFile: false };
+  const pinGiven = FULL_SHA.test(flag) || fileIsSha;
+  if (!pinGiven) return { given: false, ok: true, viaFile: false };
+  const gate = approvalMatches(target, flag, fileIsSha ? fileSha : null);
+  return { given: true, ok: gate.ok, viaFile: gate.viaFile && fileIsSha };
+}
+
+function judgeSensitiveGrant(opts, target, baseSha) {
+  const commits = rangeCommits(opts.runGit, opts.deployDir, baseSha, target);
+  const judged = evaluateGrant(loadGrantInput(opts, opts.deployDir), {
+    targetSha: target,
+    baseSha,
+    commits: commits || [],
+    ruleVersion: SENSITIVE_RULE_VERSION,
+    nowMs: opts.now(),
+  });
+  const pin = shaPinMatches(target, opts, opts.deployDir);
+  return { commits, judged, pin };
+}
+
+function grantAuditFields(judged) {
+  const snap = judged?.snapshot;
+  return {
+    grantSource: snap?.grantSource ?? null,
+    grantScope: snap?.grantSource?.scope ?? null,
+    jasperVerdict: snap?.jasperVerdict ?? null,
+    independentVerification: snap?.independentVerification ?? null,
+  };
+}
+
+function tryAppendAudit(opts, record) {
+  const file = opts.auditLogFile || defaultAuditLogPath(opts.stateFile);
+  const payload = {
+    ts: new Date(opts.now()).toISOString(),
+    autoRollback: false,
+    recoverable: true,
+    sensitiveRuleVersion: SENSITIVE_RULE_VERSION,
+    ...record,
+  };
+  try {
+    const writer = opts.appendAudit || appendDeployAudit;
+    writer(file, payload);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: `审计日志写失败，未执行：${oneLine(error?.message || error)}` };
+  }
+}
+
 /** 本地 HEAD..origin/main 有没有没批准的敏感改动；算不出来按需要批准处理（不排空）。 */
 function needsApprovalLocally(opts, target) {
   const base = ['--no-renames', '--no-ext-diff', '--no-textconv', 'HEAD', target];
@@ -916,7 +1012,11 @@ function needsApprovalLocally(opts, target) {
   const files = names.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
   const hits = sensitiveHits(files, parseAddedLines(diff.stdout));
   if (!hits.files.length) return false;
-  return !approvalMatches(target, opts.approve, readApproval(opts.approvalFile, opts.deployDir)).ok;
+  const head = opts.runGit(opts.deployDir, ['rev-parse', 'HEAD']);
+  if (!head.ok) return true;
+  const judged = judgeSensitiveGrant(opts, target, head.stdout.trim());
+  if (!judged.commits || !judged.judged.ok || !judged.pin.ok) return true;
+  return false;
 }
 
 /**
@@ -1319,6 +1419,10 @@ export async function runDeploy(options) {
     timeoutMs: 15_000,
     approve: null,
     approvalFile: null,
+    grant: null,
+    grantFile: null,
+    auditLogFile: null,
+    appendAudit: null,
     locksHeld: false,
     assumePrioBlocked: false,
     ...options,
@@ -1410,34 +1514,106 @@ export async function runDeploy(options) {
     const files = names.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
     const hits = sensitiveHits(files, parseAddedLines(diff.stdout));
     let usedApprovalFile = false;
+    const baseSha = afterFetch.head;
+    const grantState = judgeSensitiveGrant(opts, afterFetch.target, baseSha);
     if (hits.files.length) {
-      const fileSha = readApproval(opts.approvalFile, opts.deployDir);
-      const gate = approvalMatches(afterFetch.target, opts.approve, fileSha);
-      if (!gate.ok) {
-        const listed = hits.files.join('、');
-        const rows = hits.lines.map((row) => `${row.file}:${row.line}`).join('、');
-        const reason = `敏感改动需要批准 ${afterFetch.target}：${listed}${rows ? `；行 ${rows}` : ''}`;
+      const listed = hits.files.join('、');
+      const rows = hits.lines.map((row) => `${row.file}:${row.line}`).join('、');
+      const prefix = `敏感改动需要批准 ${afterFetch.target}：${listed}${rows ? `；行 ${rows}` : ''}`;
+      let reject = null;
+      if (!grantState.commits) reject = `${prefix}；算不出提交区间`;
+      else if (!grantState.judged.ok) reject = `${prefix}；${grantState.judged.reason}`;
+      else if (!grantState.pin.ok) reject = prefix;
+      if (reject) {
+        tryAppendAudit(opts, {
+          attemptId: crypto.randomBytes(16).toString('hex'),
+          outcome: 'rejected',
+          previousSha: baseSha,
+          targetSha: afterFetch.target,
+          commits: grantState.commits || [],
+          sensitiveFiles: hits.files,
+          workspaceChanged: false,
+          associatedFailure: reject,
+          ...grantAuditFields(grantState.judged),
+        });
         return await conclude(decide({
           needsApproval: true,
           files: hits.files,
           lines: hits.lines,
-          reason,
+          reason: reject,
         }));
       }
-      usedApprovalFile = gate.viaFile;
+      usedApprovalFile = grantState.pin.viaFile;
     }
     const beforeMerge = await idleBlock(opts);
     if (beforeMerge) return await conclude(decide({ idle: false, reason: beforeMerge }));
+    const attemptId = crypto.randomBytes(16).toString('hex');
+    const preLog = tryAppendAudit(opts, {
+      attemptId,
+      outcome: 'attempt',
+      previousSha: baseSha,
+      targetSha: afterFetch.target,
+      commits: grantState.commits || [],
+      sensitiveFiles: hits.files,
+      workspaceChanged: false,
+      ...grantAuditFields(grantState.judged),
+    });
+    if (!preLog.ok) {
+      return await conclude(decide({
+        needsApproval: true,
+        files: hits.files,
+        lines: hits.lines,
+        reason: hits.files.length
+          ? `敏感改动需要批准 ${afterFetch.target}：${hits.files.join('、')}；${preLog.reason}`
+          : preLog.reason,
+      }));
+    }
     const pulled = opts.runGit(opts.deployDir, ['merge', '--ff-only', afterFetch.target]);
     const headNow = opts.runGit(opts.deployDir, ['rev-parse', 'HEAD']);
     if (!pulled.ok || !headNow.ok || headNow.stdout.trim() !== afterFetch.target) {
+      const pullReason = oneLine(pulled.stderr) || '快进后的 HEAD 不是刚才核对过的目标提交';
+      tryAppendAudit(opts, {
+        attemptId,
+        outcome: 'pull-failed',
+        previousSha: baseSha,
+        targetSha: afterFetch.target,
+        commits: grantState.commits || [],
+        sensitiveFiles: hits.files,
+        workspaceChanged: false,
+        associatedFailure: pullReason,
+        ...grantAuditFields(grantState.judged),
+      });
       return await conclude(decide({
         pullOk: false,
-        reason: oneLine(pulled.stderr) || '快进后的 HEAD 不是刚才核对过的目标提交',
+        reason: pullReason,
       }));
     }
     const post = await runPostDeploy(opts, files);
-    if (!post.ok) return await conclude(decide({ postOk: false, reason: post.reason, files: post.files }));
+    if (!post.ok) {
+      const reason = `工作区已从 ${baseSha} 快进到 ${afterFetch.target}，未自动回滚。${post.reason}`;
+      tryAppendAudit(opts, {
+        attemptId,
+        outcome: 'doctor-failed',
+        previousSha: baseSha,
+        targetSha: afterFetch.target,
+        commits: grantState.commits || [],
+        sensitiveFiles: hits.files,
+        workspaceChanged: true,
+        associatedFailure: reason,
+        ...grantAuditFields(grantState.judged),
+      });
+      return await conclude(decide({ postOk: false, reason, files: post.files }));
+    }
+    tryAppendAudit(opts, {
+      attemptId,
+      outcome: 'deployed',
+      previousSha: baseSha,
+      targetSha: afterFetch.target,
+      commits: grantState.commits || [],
+      sensitiveFiles: hits.files,
+      workspaceChanged: true,
+      ...grantAuditFields(grantState.judged),
+    });
     if (usedApprovalFile && opts.approvalFile) {
       try { fs.unlinkSync(opts.approvalFile); } catch { /* 文件已经不在 */ }
     }
@@ -1449,7 +1625,7 @@ export async function runDeploy(options) {
 }
 
 function usage() {
-  return '用法：node watchers/acceptance/deploy-ff.mjs --deploy-dir <dir> --host-state <dir> --self-lock <file> --prio-lock <file> --state-file <file> --alerts <file> --doctor-script <file> [--doctor-arg <arg>] [--approval-file <file>] [--approve <sha>]';
+  return '用法：node watchers/acceptance/deploy-ff.mjs --deploy-dir <dir> --host-state <dir> --self-lock <file> --prio-lock <file> --state-file <file> --alerts <file> --doctor-script <file> [--doctor-arg <arg>] [--approval-file <file>] [--approve <sha>] [--grant-file <file>] [--audit-log <file>]';
 }
 
 function parseArgs(argv) {
@@ -1462,6 +1638,8 @@ function parseArgs(argv) {
     alertsFile: null,
     approvalFile: null,
     approve: null,
+    grantFile: null,
+    auditLogFile: null,
     doctorScript: null,
     doctorArgs: [],
     selfHeld: false,
@@ -1484,6 +1662,8 @@ function parseArgs(argv) {
       case '--alerts': out.alertsFile = take(); break;
       case '--approval-file': out.approvalFile = take(); break;
       case '--approve': out.approve = take(); break;
+      case '--grant-file': out.grantFile = take(); break;
+      case '--audit-log': out.auditLogFile = take(); break;
       case '--doctor-script': out.doctorScript = take(); break;
       case '--doctor-arg': out.doctorArgs.push(take()); break;
       case '--self-held': out.selfHeld = true; break;
@@ -1526,6 +1706,8 @@ export async function main(argv = []) {
     alertsFile: args.alertsFile,
     approvalFile: args.approvalFile,
     approve: args.approve,
+    grantFile: args.grantFile,
+    auditLogFile: args.auditLogFile,
     doctorScript: args.doctorScript,
     doctorArgs: args.doctorArgs,
   };
