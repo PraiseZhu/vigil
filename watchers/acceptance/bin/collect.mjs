@@ -176,7 +176,11 @@ function searchQueries(rootRef, profile) {
   for (const forkRepo of profile.forkRepos || []) queries.push(`${phrase} repo:${forkRepo}`);
   // App-only 路由必须能从查询本身确定 owner。全局搜索没有 owner，
   // 会被 github.mjs 以 no-app-route 拦截；逐仓搜索仍可按 repo: owner 分流。
-  if (profile.appOnly === true) return queries.filter((query) => /(?:^|\s)repo:[^\s]+/.test(query));
+  // 沙箱 profile 副本会删掉 appOnly（只在宿主生效），但沙箱读写都经写闸，
+  // 写闸按宿主的 appOnly 同样会拦，所以配了 writeCommand 时也不发全局搜索。
+  if (profile.appOnly === true || profile.writeCommand) {
+    return queries.filter((query) => /(?:^|\s)repo:[^\s]+/.test(query));
+  }
   return queries;
 }
 
