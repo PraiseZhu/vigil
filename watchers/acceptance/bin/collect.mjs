@@ -5,6 +5,7 @@ import { bodyVersion, parseRef } from './rounds.mjs';
 import { leadHandoffOf, repoTier } from './tasks.mjs';
 import { isTrustedAuthor } from './trusted-author.mjs';
 import { isVerdictOnly } from './profile.mjs';
+import { AppOnlyError } from './github.mjs';
 
 export const MANUAL_LAYERS = Object.freeze(['cindy-mac', 'cindy-windows', 'paid', 'github-live']);
 
@@ -63,7 +64,7 @@ const TEST_POINT = /测试点：([^）)]+)/;
 const MARKER = /\[验收机\]\s*修正\s*·\s*总\s+([^\s·]+#\d+)\s*·\s*项\s+([^\s·]+#\d+)\s*SC(\d+)\s*·\s*第\s*(\d+)\s*轮/;
 const DISPUTE_ITEM = /([\w.-]+\/[\w.-]+#\d+)\s*SC(\d+)/;
 // 验收轮只看最近一条已出裁决（通过 / 要修）的：本轮刚认领的「验收中」评论里还没有争议条目。
-const ACCEPTANCE_FIRST_LINE = /^\[验收机\] 第 \d+ 轮：(通过|要修)/;
+const ACCEPTANCE_FIRST_LINE = /^\[验收机\] 第 \d+ 轮：(通过|要修|待人工)/;
 const CORRECTION_FIRST_LINE = /^\[修正机\] 第/;
 const DISPUTE_MARK = '有争议';
 
@@ -170,17 +171,31 @@ export async function fetchIssueBody(github, ref) {
   return { title: issue.title, body: issue.body || '', state: openState(issue.state), url: issue.url };
 }
 
-function searchQueries(rootRef, profile) {
+function plannedSearchQueries(rootRef, profile) {
   const phrase = `"[验收机] 修正 · 总 ${rootRef}" in:body is:issue`;
   const queries = [phrase];
   for (const forkRepo of profile.forkRepos || []) queries.push(`${phrase} repo:${forkRepo}`);
+  return queries;
+}
+
+function searchQueries(rootRef, profile) {
+  const queries = plannedSearchQueries(rootRef, profile);
   // App-only 路由必须能从查询本身确定 owner。全局搜索没有 owner，
   // 会被 github.mjs 以 no-app-route 拦截；逐仓搜索仍可按 repo: owner 分流。
+  // 过滤逻辑本身不改：丢掉的查询由 skippedSearchQueries 记成未执行，不能据此判原标准通过。
   if (profile.appOnly === true) return queries.filter((query) => /(?:^|\s)repo:[^\s]+/.test(query));
   return queries;
 }
 
-export { searchQueries };
+function skippedSearchQueries(rootRef, profile) {
+  const planned = plannedSearchQueries(rootRef, profile);
+  const executed = new Set(searchQueries(rootRef, profile));
+  return planned
+    .filter((query) => !executed.has(query))
+    .map((query) => ({ query, reason: 'appOnly-global-search' }));
+}
+
+export { plannedSearchQueries, searchQueries, skippedSearchQueries };
 
 /**
  * 收集整棵任务树。`--issue` 永远是总 issue（独立 issue 就是它自己）。
@@ -206,8 +221,18 @@ export async function collectTree({ github, profile, ref }) {
     const marker = parseMarker(node.body);
     if (marker && marker.root === rootRef) correctionsByRef.set(nodeRef, { node, marker });
   }
+  const skippedQueries = skippedSearchQueries(rootRef, profile);
   for (const query of searchQueries(rootRef, profile)) {
-    const found = await github.graphql(SEARCH_QUERY, { q: query });
+    let found;
+    try {
+      found = await github.graphql(SEARCH_QUERY, { q: query });
+    } catch (error) {
+      if (error instanceof AppOnlyError) {
+        skippedQueries.push({ query, reason: error.reason || error.kind || 'appOnly-blocked' });
+        continue;
+      }
+      throw error;
+    }
     for (const node of found?.search?.nodes || []) {
       if (node?.__typename && node.__typename !== 'Issue') continue;
       if (!isTrustedAuthor(node?.author, profile)) continue;
@@ -225,6 +250,7 @@ export async function collectTree({ github, profile, ref }) {
       title: issue.title,
       url: issue.url,
       state: openState(issue.state),
+      body: issue.body || '',
       items: parseItems(issue.body, rootRef),
       prs: prsOf(issue, rootRepo),
     },
@@ -240,6 +266,7 @@ export async function collectTree({ github, profile, ref }) {
       title: node.title,
       url: node.url,
       state: openState(node.state),
+      body: node.body || '',
       items: parseItems(node.body, nodeRef),
       prs: prsOf(node, node.repository?.nameWithOwner || rootRepo),
     });
@@ -287,5 +314,7 @@ export async function collectTree({ github, profile, ref }) {
     corrections,
     disputed,
     manual,
+    skippedQueries,
+    collectionComplete: skippedQueries.length === 0,
   };
 }

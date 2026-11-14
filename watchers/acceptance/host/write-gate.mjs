@@ -37,6 +37,7 @@ import {
   PR_STATUS_QUERY,
   READY_ACTIVITY_QUERY,
 } from './prbot-gate-check.mjs';
+import { illegalPassFromVerdictText, pendingCloseBlocked } from '../bin/authenticity.mjs';
 
 export { MAIN_CHECKS_QUERY, PR_BY_BRANCH_QUERY, PR_HEAD_QUERY, PR_STATUS_QUERY, READY_ACTIVITY_QUERY };
 
@@ -52,7 +53,7 @@ const GATE_ACTION_TYPES = [...GATE_ACTIONS.keys()];
 const ALLOWED_TYPES = new Set([...WRITE_TYPES, ...GATE_ACTION_TYPES, 'read.graphql', 'probe']);
 const WATCH_ALLOWED_TYPES = new Set(['comment.create', 'comment.update', 'project.field.set', 'read.graphql']);
 const ACCEPTANCE_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：验收中$/;
-const VERDICT_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(通过|要修)/;
+const VERDICT_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(通过|要修|待人工)/;
 const ABORT_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：中断/;
 const BRANCH_PATTERN = /^acceptance\/(\d+)-(\d+)-sc(\d+)$/;
 const GREEN_CHECKS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
@@ -520,6 +521,8 @@ export function createGate({
           if (versionLine(action.body) !== bodyVersion(state.issue.body)) {
             return reject('body-version-mismatch', '裁决里的正文版本和当前总 issue 正文不一致');
           }
+          const illegal = illegalPassFromVerdictText(action.body, currentTree);
+          if (illegal.length) return reject('illegal-pass', illegal.join('；'));
         }
         return null;
       }
@@ -551,6 +554,17 @@ export function createGate({
           if (!current) return reject('not-in-tree', `找不到 ${target}`);
           if (!onlyCheckboxToggles(current.issue.body, action.body)) {
             return reject('edit-not-allowed', 'issue.edit 只能勾选或取消验收项、给验收项补「人工手测」，不能改正文其它内容');
+          }
+        }
+        if (action.type === 'issue.close' && target === binding.root) {
+          const blocked = pendingCloseBlocked(currentTree);
+          if (blocked) return reject('pending-human', blocked);
+        }
+        if (action.type === 'project.field.set') {
+          const fields = action.fields && typeof action.fields === 'object' && !Array.isArray(action.fields) ? action.fields : {};
+          if (fields['验收'] === '通过') {
+            const blocked = pendingCloseBlocked(currentTree);
+            if (blocked) return reject('pending-human', blocked);
           }
         }
         return null;

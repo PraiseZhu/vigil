@@ -11,6 +11,7 @@ import { createRounds, latestRound, parseRounds, RoundError } from './rounds.mjs
 import { buildDispatchMessage } from './message.mjs';
 import { readAcceptanceField, setAcceptanceFields } from './board.mjs';
 import { collectTree } from './collect.mjs';
+import { writeClaimSnapshot } from './authenticity.mjs';
 import { appendAlert, hostPaths } from '../host/paths.mjs';
 
 export const EXIT = Object.freeze({ OK: 0, FAIL: 1, NOTHING: 3, REJECTED: 4 });
@@ -192,6 +193,12 @@ async function markClaimed({ github, profile, task, started, now, stderr, alert 
   try {
     const tree = await collectTree({ github, profile, ref: task.ref });
     targets = [tree.root.ref, ...tree.issues.filter((entry) => entry.role !== 'root').map((entry) => entry.ref)];
+    const bodies = {};
+    for (const issue of tree.issues) bodies[issue.ref] = issue.body || '';
+    writeClaimSnapshot(profile, task.ref, started.round, {
+      bodyVersion: tree.root.bodyVersion,
+      bodies,
+    });
   } catch (error) {
     failed.push({ ref: task.ref, error: String(error?.message || error) });
     targets = [];

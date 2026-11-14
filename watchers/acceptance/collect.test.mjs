@@ -3,7 +3,7 @@ import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion } from './bin/rounds.mjs';
 import { runHelper } from './bin/helper.mjs';
-import { parseItems, parseMarker, parseLayer, parseTestPoint, searchQueries } from './bin/collect.mjs';
+import { parseItems, parseMarker, parseLayer, parseTestPoint, searchQueries, skippedSearchQueries } from './bin/collect.mjs';
 import { tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import {
   OWNER,
@@ -53,6 +53,9 @@ test('App-only 模式跳过无 owner 的全局修正搜索，保留逐仓搜索'
   });
   assert.deepEqual(appOnly, [
     `"[验收机] 修正 · 总 ${REPO}#1" in:body is:issue repo:example-org/fork-repo`,
+  ]);
+  assert.deepEqual(skippedSearchQueries(`${REPO}#1`, { appOnly: true, forkRepos: ['example-org/fork-repo'] }), [
+    { query: `"[验收机] 修正 · 总 ${REPO}#1" in:body is:issue`, reason: 'appOnly-global-search' },
   ]);
 });
 
@@ -124,6 +127,8 @@ test('SC1 collect 输出任务树：总 issue、跨仓子 issue、修正子 issu
   // 人工手测项单独列出。
   const manual = tree.manual.map((item) => `${item.source} SC${item.sc}`);
   assert.deepEqual(manual.sort(), [`${REPO}#2 SC5`, `${OTHER_REPO}#7 SC8`].sort());
+  assert.deepEqual(tree.skippedQueries, []);
+  assert.equal(tree.collectionComplete, true);
 });
 
 test('SC1 parseItems 解析 task-issue/v1 的 SC 行（未标层次、测试点、人工手测、已勾）', () => {

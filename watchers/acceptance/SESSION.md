@@ -23,7 +23,7 @@
 node watchers/acceptance/bin/helper.mjs collect --issue <root>
 ```
 
-stdout 是 JSON：`root`（kind / tier / fork / 正文版本 / `verdictOnly` / `approveExec`）、`handoff`（批准执行 lead 的交接，没有就是 `null`）、`issues`（总 issue 在前，每条验收项的出处 issue、原文、验证层次、测试点、关联 PR）、`corrections`（修正子 issue）、`disputed`（有争议的条目）、`manual`（人工手测项）。按它决定这一轮验什么。
+stdout 是 JSON：`root`（kind / tier / fork / 正文版本 / `verdictOnly` / `approveExec`）、`handoff`（批准执行 lead 的交接，没有就是 `null`）、`issues`（总 issue 在前，每条验收项的出处 issue、原文、验证层次、测试点、关联 PR）、`corrections`（修正子 issue）、`disputed`（有争议的条目）、`manual`（人工手测项）、`skippedQueries`（计划了但没执行的查询，例如 appOnly 丢掉的无 `repo:` 全局搜索）、`collectionComplete`（没有跳过的查询才是 true）。按它决定这一轮验什么。收集不完整时不能按原标准判通过。
 
 `root.verdictOnly` 为 `true` 的是**只出裁决**的任务（profile 的 `verdictOnlyIssues`，比如验收机自己的总 issue）：照常验、照常写看板，但**不关、不勾、不开修正、不推送**——这类任务**最后一步只写裁决**（`verdict` 再 `done`），`close` / `correct` / `push` 会以退出码 `1` 拒绝。裁决里会自动加一行「本 issue 由人工复核后关闭。」
 
@@ -40,7 +40,10 @@ node watchers/acceptance/bin/helper.mjs progress --issue <root> --round <n>
 - 代码已由宿主检出：派发消息的「代码」一节列出本轮任务树里每个仓的绝对路径（宿主检出各仓最新 main 的工作树，带 `.git`），**只读**。直接在那里读代码、看 `git log`；需要可写副本（跑会写文件的测试）时复制到 `TMPDIR` 再用（`cp -a <路径> "$TMPDIR/"`），用完清理。沙箱里没有凭证，**不要**自己 `git clone`（私有仓克隆不下来），也不要往 `worktreeDir` 里检出。
 - 依赖已由宿主预装：派发消息的「依赖」一节写明每个 npm 仓的情况。有 lockfile 的仓，`node_modules` 已按 lockfile 装好（`npm ci --ignore-scripts`）并只读挂在检出目录里，直接 `npm run build` / `npx tsc` / `npx vitest run` 即可。沙箱里 npm 一律离线、连不上 registry，**不要**再跑 `npm ci` / `npm install`。写着「没有预装依赖」的仓，或因为安装脚本没跑而缺的产物，要依赖才能跑的检查属**环境限制**：在证据里写明「环境限制：未预装依赖」，不能据此判不通过，也不能把没跑的检查当作已通过——见第 4 节「必需检查」：有一项因环境没跑，这一轮就**不能判通过**。
 - `static`、`unit`、`contract`、`browser-fixture` 逐条跑，每条都留下证据：跑的命令 + 关键输出一行。
-- `cindy-mac`、`cindy-windows`、`paid`、`github-live` 这几种层次**不验**，在裁决里列成「人工手测」；人工手测**不拦关闭**。
+- `cindy-mac`、`cindy-windows`、`paid`、`github-live` 这几种层次**不验**，在裁决里列成「人工手测」或「待验」。人工/未执行项使总评成为「待人工」：不关总单、不写看板通过。已真正验过的机器项仍可勾选推进。
+- 认领时冻结任务树标准正文和起始正文版本；结束评论同时留下起始版本、结束版本、运行代码 SHA（能取到时）和 helper/collect/close/verdict/authenticity 的材料哈希。只允许勾选已验项和行尾「人工手测」后缀；其它标准文字变化则本轮作废（中断，原因含「标准已变」），不改旧记录。
+- 「通过」必须有可复查证据。空证据（含 `—` / `-` / `无`）不能判原标准通过。临时额外测试可以作为明确标注的补充（`evidenceKind` / `testFiles`），但不能替代冻结标准；不要只靠文案里出现「临时副本」一刀切。
+- 不要为了通过而改 appOnly、添加授权或绕过 query gate。被跳过的查询写进 `skippedQueries`，总评不得是原标准「通过」。
 - 勾选框（`- [x]`）只算声称，不算证据：每条都要自己找证据。
 - 正文里**没写验收标准的**：先从正文和关联 PR 里提炼标准，写进裁决时标 `extracted: true`，再按提炼出来的标准验。
 - 目标仓自己的 `AGENTS.md`、PR 模板和合并门禁照常遵守。
@@ -82,7 +85,7 @@ node watchers/acceptance/bin/helper.mjs done    --issue <root> --round <n>
 
 `--verdict` 给的就是随后交给 `verdict` 的同一份 `verdict.json`（先写好它）：`close` 在写任何东西之前先查里面「通过」条目的证据，没给就退出码 `1`、什么都不写。
 
-`close` 自己按 **勾选 → 看板（总 issue 和每个子 issue 写「通过」）→ 关总 issue** 的顺序做：看板写失败就停在关单之前，issue 还开着，不会「关了但看板没写」。
+`close` 在总评「通过」时按 **勾选 → 看板（总 issue 和每个子 issue 写「通过」）→ 关总 issue** 的顺序做：看板写失败就停在关单之前，issue 还开着，不会「关了但看板没写」。总评「待人工」时只勾选已验机器项、给人工项补行尾「人工手测」，**不关总单、不写看板通过**，issue 保持 open。
 
 `verdict` 判「通过」时会回读总 issue：还开着就拒绝（退出码 1），说明 `close` 没做完——不要跳过 `close` 直接写裁决。
 
@@ -120,16 +123,17 @@ node watchers/acceptance/bin/helper.mjs done    --issue <root> --round <n>
     { "ref": "<item>", "sc": 3, "result": "通过", "evidence": "跑的命令 + 关键输出一行" },
     { "ref": "<item>", "sc": 4, "result": "要修", "why": "没过的原因", "evidence": "…" },
     { "ref": "<item>", "sc": 5, "result": "人工手测", "layer": "cindy-mac" },
-    { "ref": "<item>", "sc": 6, "result": "有争议", "sides": { "acceptance": "验收方理由", "correction": "修正方理由" } }
+    { "ref": "<item>", "sc": 6, "result": "待验", "why": "github-live 本轮未执行" },
+    { "ref": "<item>", "sc": 7, "result": "有争议", "sides": { "acceptance": "验收方理由", "correction": "修正方理由" } }
   ]
 }
 ```
 
-- `ref` 是出处 issue `<item>`，`sc` 是那条验收项的编号；`result` 只能是 `通过` / `要修` / `人工手测` / `有争议`。
+- `ref` 是出处 issue `<item>`，`sc` 是那条验收项的编号；`result` 只能是 `通过` / `要修` / `人工手测` / `待验` / `有争议`。
 - **`collect` 收到的任务树里每条 SC 都要有一条结论**：缺了 `verdict` 以退出码 `1` 拒绝，stderr 写清缺哪几条，什么都不写；`items` 为空也拒绝（空的不能判通过）。
 - `extracted: true`：任务本来没写验收标准，`items` 是你提炼出来的标准。
 - `handoffChecks`：只在 `collect` 的 `handoff.focus` 非空时必填，见第 2 节「批准执行的交接」。
-- 结论由 `items` 推出：任一条「要修」或「有争议」、或本轮有「需人工处理」记录 → 要修；否则通过（人工手测不拦）。`--status` 可选，和推出的不一致就退出码 `1`。
+- 结论由 `items` 推出：任一条「要修」或「有争议」、或本轮有「需人工处理」记录 → 要修；有「人工手测」/「待验」、收集不完整或 `extracted: true` → 待人工；否则通过。`--status` 可选，和推出的不一致就退出码 `1`。
 
 ## 5. 要修
 
@@ -169,6 +173,7 @@ node watchers/acceptance/bin/helper.mjs done    --issue <root> --round <n>
 `close` / `correct` / `board` / `push` 都必须在 `verdict` 之前做完：`verdict` 一写，这一轮就结束了，之后所有写命令都会被认领检查拒绝。
 
 - 通过：`close`（内部 勾选 → 看板 → 关单）→ `verdict` → `done`。
+- 待人工：`close`（只勾选已验机器项，不关单、不写看板通过）→ `verdict`（issue 仍开着）→ `done`。
 - 要修：`correct`（每条要修各一次）→ `board --target all --acceptance 要修` → `verdict` → `done`。
 - 只出裁决（`root.verdictOnly`）：（可选 `board`）→ `verdict` → `done`，不跑 `close` / `correct` / `push`。
 - `verdict` 写之前会核对任务树里每条 SC 都有结论，缺了退出码 `1`：补齐 `verdict.json` 再跑同一条命令。

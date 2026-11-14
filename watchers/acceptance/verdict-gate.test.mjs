@@ -32,6 +32,8 @@ import {
   createWorld,
   defaultTree,
   fullConclusions,
+  machineConclusions,
+  machineOnlyTree,
   writeJsonFile,
   ALL_RAN,
   ALL_RAN_CHECKS_FILE,
@@ -251,13 +253,14 @@ test('verdict-only 写闸：绑定到名单里的根，关单 / 勾选 / 开修�
     fields: { 验收: '通过' },
     dedupeKey: 'vo-board',
   });
-  assert.equal(board.code, 0, JSON.stringify(board));
+  assert.equal(board.code, 4, JSON.stringify(board));
+  assert.equal(board.body.reason, 'pending-human');
   const comment = await gate.handle({ type: 'comment.create', repo: REPO, issue: 2, body: '[验收机] 备注', dedupeKey: 'vo-comment' });
   assert.equal(comment.code, 0, JSON.stringify(comment));
 
-  // 别的根不受影响。
+  // 别的根不受影响（全机器层仍可关单）。
   const other = setup();
-  const otherWorld = defaultTree();
+  const otherWorld = machineOnlyTree();
   const normal = openGate({ home: other.home, profile: other.profile, world: otherWorld, binding: bindingFor(otherWorld) });
   await normal.start();
   const closed = await normal.handle({ type: 'issue.close', repo: REPO, issue: 1, reason: 'completed', dedupeKey: 'normal-close' });
@@ -277,13 +280,14 @@ test('端到端 verdict-only：helper → 真写闸，裁决照写并带「本 i
   assert.equal(github.gateCalls.length, 0, 'helper 侧先拒，动作根本没到写闸');
 
   const board = await helper(github, profile, ['board', '--issue', ROOT_REF, '--round', '1', '--target', 'all', '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE]);
-  assert.equal(board.code, 0, board.err);
+  assert.equal(board.code, 1, board.err);
+  assert.match(board.err, /不能写看板通过/);
 
   const file = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items: fullConclusions() });
   const verdict = await helper(github, profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', file]);
   assert.equal(verdict.code, 0, verdict.err);
   const body = rootComment(world).body;
-  assert.match(body.split('\n')[0], /^\[验收机\] 第 1 轮：通过$/);
+  assert.match(body.split('\n')[0], /^\[验收机\] 第 1 轮：待人工$/);
   assert.ok(body.split('\n').includes(VERDICT_ONLY_LINE), body);
   assert.equal(VERDICT_ONLY_LINE, '本 issue 由人工复核后关闭。');
   assert.equal(world.get(ROOT_REF).state, 'open', '只出裁决：不关');
@@ -295,7 +299,7 @@ test('端到端 verdict-only：helper → 真写闸，裁决照写并带「本 i
 
 test('helper：写闸回 4 verdict-only（绕过 helper 的情形）→ 退出码 4，但不标中断', async () => {
   const { profile } = setup();
-  const world = defaultTree();
+  const world = machineOnlyTree();
   const result = await helper(
     createFakeGithub(world, {
       onWrite: (action) => {
@@ -314,7 +318,7 @@ test('helper：写闸回 4 verdict-only（绕过 helper 的情形）→ 退出�
 
 test('close 顺序 勾选 → 看板 → 关单：看板写失败就停在关单之前，issue 还开着', async () => {
   const { profile, home } = setup();
-  const world = defaultTree();
+  const world = machineOnlyTree();
   const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN, items: [{ ref: `${REPO}#2`, sc: 3 }], manual: [] });
   const result = await helper(
     createFakeGithub(world, {
@@ -333,7 +337,7 @@ test('close 顺序 勾选 → 看板 → 关单：看板写失败就停在关单
   assert.ok(world.get(`${REPO}#2`).body.includes('- [x] SC3'), '勾选在看板之前');
 });
 
-test('端到端 close：helper → 真写闸，勾选（含 CRLF 正文）→ 看板 → 关单都放行', async () => {
+test('端到端 close：helper → 真写闸，有人工层时勾选放行、不关单不写看板通过', async () => {
   const { home, profile } = setup();
   const childBody = ['# 子任务', '', '- [ ] SC3 把结果写进轮次评论 验证：unit', '- [ ] SC5 真机 验证：cindy-mac', ''].join('\r\n');
   const world = defaultTree({ childBody });
@@ -347,10 +351,27 @@ test('端到端 close：helper → 真写闸，勾选（含 CRLF 正文）→ �
   const result = await helper(github, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
   assert.equal(result.code, 0, result.err);
   const types = github.gateCalls.map((action) => action.type);
-  assert.deepEqual(types, ['issue.edit', 'project.field.set', 'project.field.set', 'project.field.set', 'issue.close']);
+  assert.deepEqual(types, ['issue.edit']);
   const body = world.get(`${REPO}#2`).body;
   assert.ok(body.includes('- [x] SC3 把结果写进轮次评论 验证：unit\r\n'), JSON.stringify(body));
   assert.ok(body.includes('SC5 真机 验证：cindy-mac 人工手测'), JSON.stringify(body));
+  assert.equal(world.get(ROOT_REF).state, 'open');
+});
+
+test('端到端 close：全机器层 helper → 真写闸，勾选 → 看板 → 关单都放行', async () => {
+  const { home, profile } = setup();
+  const world = machineOnlyTree();
+  const gate = openGate({ home, profile, world, binding: bindingFor(world) });
+  await gate.start();
+  const github = realGithubThroughGate({ profile, world, gate });
+  const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN,
+    items: [{ ref: `${REPO}#2`, sc: 3 }, { ref: `${OTHER_REPO}#7`, sc: 7 }],
+    manual: [],
+  });
+  const result = await helper(github, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
+  assert.equal(result.code, 0, result.err);
+  const types = github.gateCalls.map((action) => action.type);
+  assert.deepEqual(types, ['issue.edit', 'issue.edit', 'project.field.set', 'project.field.set', 'project.field.set', 'issue.close']);
   assert.equal(world.get(ROOT_REF).state, 'closed');
 });
 
@@ -988,7 +1009,7 @@ test('github.mjs：写闸退出码 4 带回 reason 和 files；退出码 1 是�
 
 test('helper：写闸退出码 1 → helper 退出码 1（不是 4），这一轮尽力标中断写明原因', async () => {
   const { profile } = setup();
-  const world = defaultTree();
+  const world = machineOnlyTree();
   const result = await helper(
     createFakeGithub(world, {
       onWrite: (action) => {

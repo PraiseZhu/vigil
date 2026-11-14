@@ -1,0 +1,290 @@
+// 验收真实性（舰队标准 A）：人工/未执行不能收成通过；空证据与不可追溯补充不能冒充原验；
+// 每轮冻结标准正文与执行材料。纯函数 + 本地快照，不发 GitHub 请求、不起子进程。
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const MANUAL_LAYERS = Object.freeze(['cindy-mac', 'cindy-windows', 'paid', 'github-live']);
+
+export const OVERALL_PENDING = '待人工';
+export const ITEM_PENDING = '待验';
+export const STANDARD_CHANGED_REASON = '标准已变，本轮作废';
+export const MATERIAL_FILES = Object.freeze([
+  'helper.mjs',
+  'collect.mjs',
+  'close.mjs',
+  'verdict.mjs',
+  'authenticity.mjs',
+]);
+export const EMPTY_EVIDENCE = Object.freeze(new Set(['', '—', '-', '–', '无']));
+export const PENDING_ITEM_RESULTS = Object.freeze(['人工手测', ITEM_PENDING]);
+export const FINAL_OVERALL = Object.freeze(['通过', '要修', OVERALL_PENDING, '中断']);
+export const VERDICT_OVERALL = Object.freeze(['通过', '要修', OVERALL_PENDING]);
+
+const CHECKBOX_LINE = /^(\s*[-*]\s+\[)[ xX](\][^\n]*)$/;
+const SC_ITEM_LINE = /^\s*[-*]\s*(?:\[\s*[xX ]\s*\])?\s*(?:\*\*)?SC\d+\b/;
+const MANUAL_SUFFIX = ' 人工手测';
+const TEMP_COPY_HINT = /临时副本/;
+
+function sha256Text(text) {
+  return `sha256:${crypto.createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex')}`;
+}
+
+function cacheKey(ref) {
+  return String(ref || '').replace('#', '__').replace(/\//g, '__');
+}
+
+export function evidenceIsEmpty(text) {
+  return EMPTY_EVIDENCE.has(String(text ?? '').trim());
+}
+
+export function materialDir() {
+  return path.dirname(fileURLToPath(import.meta.url));
+}
+
+export function materialVersions(dir = materialDir()) {
+  const out = {};
+  for (const name of MATERIAL_FILES) {
+    const file = path.join(dir, name);
+    out[name] = sha256Text(fs.readFileSync(file, 'utf8'));
+  }
+  return out;
+}
+
+/** 从临时目录启动的副本不能冒充只读检出上的原验入口。 */
+export function assertNotTempModule(moduleUrl, tmpDir = os.tmpdir()) {
+  const file = path.resolve(fileURLToPath(moduleUrl));
+  const tmp = path.resolve(tmpDir);
+  if (file === tmp || file.startsWith(`${tmp}${path.sep}`)) {
+    throw new Error('只能跑只读检出上的 helper/collect/close/verdict，不能从临时目录启动');
+  }
+}
+
+export function snapshotPath(profile, ref, n) {
+  return path.join(profile.stateDir, 'snapshots', `${cacheKey(ref)}-r${n}.json`);
+}
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export function readClaimSnapshot(profile, ref, n) {
+  return readJson(snapshotPath(profile, ref, n));
+}
+
+function atomicWrite(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, file);
+}
+
+export function writeClaimSnapshot(profile, ref, n, patch) {
+  const file = snapshotPath(profile, ref, n);
+  const prev = readJson(file) || {};
+  const next = {
+    ...prev,
+    ...patch,
+    ref,
+    round: n,
+    bodies: { ...(prev.bodies || {}), ...(patch.bodies || {}) },
+    materials: patch.materials || prev.materials || materialVersions(),
+  };
+  atomicWrite(file, next);
+  return next;
+}
+
+export function attachCodeSha(profile, ref, n, codeSha) {
+  if (typeof codeSha !== 'string' || !/^[0-9a-f]{40}$/i.test(codeSha.trim())) return readClaimSnapshot(profile, ref, n);
+  return writeClaimSnapshot(profile, ref, n, { codeSha: codeSha.trim() });
+}
+
+export function snapshotFromTree(tree) {
+  const bodies = {};
+  for (const issue of tree?.issues || []) bodies[issue.ref] = issue.body ?? '';
+  if (tree?.root?.ref && !Object.prototype.hasOwnProperty.call(bodies, tree.root.ref)) {
+    bodies[tree.root.ref] = tree.root.body ?? '';
+  }
+  return {
+    bodyVersion: tree?.root?.bodyVersion || null,
+    bodies,
+  };
+}
+
+export function ensureClaimSnapshot(profile, ref, n, tree) {
+  const existing = readClaimSnapshot(profile, ref, n);
+  if (existing?.bodies && Object.keys(existing.bodies).length) return existing;
+  return writeClaimSnapshot(profile, ref, n, {
+    ...snapshotFromTree(tree),
+    inferred: true,
+    materials: materialVersions(),
+  });
+}
+
+function sameExceptCheckbox(before, after) {
+  if (before === after) return true;
+  const a = CHECKBOX_LINE.exec(before);
+  const b = CHECKBOX_LINE.exec(after);
+  return Boolean(a && b && a[1] === b[1] && a[2] === b[2]);
+}
+
+export function allowedStandardLine(before, after) {
+  if (sameExceptCheckbox(before, after)) return true;
+  if (!SC_ITEM_LINE.test(before) || !after.endsWith(MANUAL_SUFFIX)) return false;
+  const trimmed = before.trimEnd();
+  if (trimmed.endsWith(MANUAL_SUFFIX.trim())) return false;
+  return sameExceptCheckbox(trimmed, after.slice(0, -MANUAL_SUFFIX.length));
+}
+
+/** 除勾选与行尾「 人工手测」外，标准正文有任何其它字的变化。 */
+export function standardShifted(startBody, currentBody) {
+  const oldLines = String(startBody ?? '').split('\n');
+  const newLines = String(currentBody ?? '').split('\n');
+  if (oldLines.length !== newLines.length) return true;
+  for (let i = 0; i < oldLines.length; i += 1) {
+    if (!allowedStandardLine(oldLines[i], newLines[i])) return true;
+  }
+  return false;
+}
+
+export function shiftedIssues(snapshot, tree) {
+  const out = [];
+  const bodies = snapshot?.bodies || {};
+  for (const issue of tree?.issues || []) {
+    if (!Object.prototype.hasOwnProperty.call(bodies, issue.ref)) continue;
+    const current = issue.body != null ? issue.body : '';
+    if (standardShifted(bodies[issue.ref], current)) out.push(issue.ref);
+  }
+  return out;
+}
+
+function conclusionKey(ref, sc) {
+  return `${String(ref).toLowerCase()} SC${Number(sc)}`;
+}
+
+export function treeItemOf(tree, ref, sc) {
+  for (const issue of tree?.issues || []) {
+    for (const item of issue.items || []) {
+      if (conclusionKey(item.source || issue.ref, item.sc) === conclusionKey(ref, sc)) return item;
+    }
+  }
+  return null;
+}
+
+export function originalPassBlocked(item, { checkoutDir, snapshot } = {}) {
+  if (item?.result !== '通过') return null;
+  const ref = `${item.ref} SC${item.sc}`;
+  if (item.evidenceKind === 'supplement') {
+    return `${ref} 的补充证据不能替代冻结标准的通过`;
+  }
+  if (item.extraTest === true && item.evidenceKind !== 'frozen') {
+    return `${ref} 的额外测试没有结构化冻结追溯，不能判原标准通过`;
+  }
+  if (evidenceIsEmpty(item.evidence)) {
+    return `${ref} 的通过证据为空`;
+  }
+  const files = Array.isArray(item.testFiles) ? item.testFiles : [];
+  const root = checkoutDir || snapshot?.checkoutDir || null;
+  if (files.length && root) {
+    for (const rel of files) {
+      if (typeof rel !== 'string' || !rel || path.isAbsolute(rel) || rel.split(/[\\/]/).includes('..')) {
+        return `${ref} 的 testFiles 不是检出内相对路径`;
+      }
+      if (!fs.existsSync(path.join(root, rel))) {
+        return `${ref} 的 testFiles 不在冻结检出里：${rel}`;
+      }
+    }
+  }
+  if (item.codeSha && snapshot?.codeSha && item.codeSha !== snapshot.codeSha) {
+    return `${ref} 的 codeSha 与本轮冻结 SHA 不一致`;
+  }
+  if (TEMP_COPY_HINT.test(String(item.evidence || '')) && !files.length && item.evidenceKind !== 'frozen') {
+    return `${ref} 的通过证据不可追溯到冻结检出（未提供 testFiles 或 evidenceKind=frozen）`;
+  }
+  return null;
+}
+
+export function guardOriginalPass(items = [], extras = {}) {
+  if (extras.moduleUrl) assertNotTempModule(extras.moduleUrl);
+  const snapshot = extras.snapshot;
+  if (snapshot?.materials && extras.compareMaterials !== false) {
+    const now = extras.materials || materialVersions(extras.materialDir || materialDir());
+    const changed = Object.keys(snapshot.materials).filter((name) => now[name] && now[name] !== snapshot.materials[name]);
+    if (changed.length && items.some((item) => item.result === '通过')) {
+      throw new Error(`执行材料已变，不能按原标准判通过：${changed.join('、')}`);
+    }
+  }
+  for (const item of items) {
+    if (item.result !== '通过') continue;
+    const blocked = originalPassBlocked(item, extras);
+    if (blocked) throw new Error(blocked);
+  }
+}
+
+export function deriveStatus(items = [], needsHuman = [], extras = {}) {
+  if (!items.length) throw new Error('裁决没有任何逐条结论，不能判通过：items 至少要有一条');
+  if (needsHuman.length) return '要修';
+  if (items.some((item) => item.result === '要修' || item.result === '有争议')) return '要修';
+  if (extras.extracted) return OVERALL_PENDING;
+  if ((extras.skippedQueries || []).length || extras.collectionComplete === false) return OVERALL_PENDING;
+  if (items.some((item) => PENDING_ITEM_RESULTS.includes(item.result))) return OVERALL_PENDING;
+  const tree = extras.tree;
+  if (tree?.manual?.length) return OVERALL_PENDING;
+  for (const item of items) {
+    if (item.result !== '通过') continue;
+    const sc = treeItemOf(tree, item.ref, item.sc);
+    if (sc?.manual || MANUAL_LAYERS.includes(item.layer)) return OVERALL_PENDING;
+  }
+  return '通过';
+}
+
+export function formatMaterialLine(materials = {}) {
+  return MATERIAL_FILES.map((name) => `${name}=${materials[name] || '未知'}`).join(' ');
+}
+
+export function firstLine(text) {
+  return String(text ?? '').split('\n')[0] || '';
+}
+
+export function lineValue(body, label) {
+  const match = String(body || '')
+    .split('\n')
+    .find((line) => line.startsWith(`${label}：`));
+  return match ? match.slice(label.length + 1).trim() : null;
+}
+
+export function illegalPassFromVerdictText(body, tree) {
+  const match = /^\[验收机\] 第 \d+ 轮：(通过|要修|待人工|中断)/.exec(firstLine(body));
+  if (!match || match[1] !== '通过') return [];
+  const reasons = [];
+  if (tree?.manual?.length) reasons.push('人工层未完成，不能总评通过');
+  if (tree?.collectionComplete === false || (tree?.skippedQueries || []).length) {
+    reasons.push('收集不完整，不能按原标准通过');
+  }
+  if (/未执行的查询|未收集全/.test(body)) reasons.push('裁决写明未收集全');
+  for (const line of String(body || '').split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('- 人工手测：') || trimmed.startsWith('- 待验：')) {
+      reasons.push('有待验项，不能总评通过');
+    }
+    if (trimmed.startsWith('- 通过：')) {
+      const ev = /证据：(.*)$/.exec(trimmed);
+      if (!ev || evidenceIsEmpty(ev[1])) reasons.push('通过项空证据');
+    }
+  }
+  return [...new Set(reasons)];
+}
+
+export function pendingCloseBlocked(tree) {
+  if (tree?.manual?.length) return '人工/未执行项未完成，不能关总单、不能写看板通过';
+  if (tree?.collectionComplete === false || (tree?.skippedQueries || []).length) {
+    return '收集不完整，不能关总单、不能写看板通过';
+  }
+  return null;
+}

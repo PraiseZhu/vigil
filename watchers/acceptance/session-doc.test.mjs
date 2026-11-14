@@ -43,7 +43,9 @@ test('SC2 SESSION.md 写清验法：检出、清理、逐层跑、证据、人�
   assert.match(session, /paid/);
   assert.match(session, /github-live/);
   assert.match(session, /「人工手测」/);
-  assert.match(session, /不拦关闭/);
+  assert.match(session, /待人工/);
+  assert.match(session, /不关总单/);
+  assert.doesNotMatch(session, /不拦关闭/);
   assert.match(session, /只算声称/);
   assert.match(session, /没写验收标准的/);
   assert.match(session, /提炼标准/);
@@ -169,6 +171,7 @@ test('SC12 静态：新文件不含真实用户名、绝对家目录路径；只
     path.join(BIN, 'verdict.mjs'),
     path.join(BIN, 'correct.mjs'),
     path.join(BIN, 'close.mjs'),
+    path.join(BIN, 'authenticity.mjs'),
     path.join(BIN, 'push.mjs'),
     path.join(BIN, 'localgit.mjs'),
     path.join(BIN, 'redact.mjs'),

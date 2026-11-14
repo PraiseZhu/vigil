@@ -109,13 +109,15 @@ test('SC5 rounds.start 发第 n 轮验收中评论并记下正文版本', async 
   const created = store.get().comments.nodes.at(-1);
   assert.match(created.body.split('\n')[0], /\[验收机\] 第 3 轮：验收中/);
   assert.match(created.body, new RegExp(`正文版本：${bodyVersion(body)}`));
+  assert.match(created.body, new RegExp(`起始正文版本：${bodyVersion(body)}`));
+  assert.match(created.body, /材料版本：helper\.mjs=sha256:/);
   assert.equal(writes[0].type, 'comment.create');
   // 去重键带开始时间（北京时间）：同号再认领（旧评论被删后）不会命中旧账本记录。
   assert.equal(writes[0].dedupeKey, `round-start:${REPO}#1:3:2026-10-24T10:00:00+08:00`);
   assert.match(created.body, /^开始：2026-10-24T10:00:00\+08:00$/m);
 });
 
-test('SC5 rounds.finish 把评论就地改成通过、要修或中断', async () => {
+test('SC5 rounds.finish 把评论就地改成通过、要修、待人工或中断', async () => {
   const { profile } = loadHome();
   const body = 'task body';
   const existing = roundComment({ round: 1, status: '验收中', bodyVersion: bodyVersion(body), databaseId: 42 });
@@ -127,6 +129,16 @@ test('SC5 rounds.finish 把评论就地改成通过、要修或中断', async ()
   assert.match(updated.body.split('\n')[0], /\[验收机\] 第 1 轮：通过/);
   assert.match(updated.body, /完成：/);
   assert.match(updated.body, /ok/);
+
+  const pendingStore = issueStore(issueNode({
+    number: 1,
+    body,
+    comments: [roundComment({ round: 1, status: '验收中', bodyVersion: bodyVersion(body), databaseId: 43 })],
+  }));
+  const pendingGithub = githubFor(pendingStore, profile);
+  const pendingRounds = createRounds({ github: pendingGithub, profile, now: () => Date.parse('2026-10-24T03:00:00.000Z') });
+  await pendingRounds.finish(`${REPO}#1`, 1, '待人工');
+  assert.match(pendingStore.get().comments.nodes[0].body.split('\n')[0], /\[验收机\] 第 1 轮：待人工/);
 });
 
 test('SC6 rounds.check 不是第 n 轮或已不是验收中就拒绝，消息写清期望和实际', async () => {

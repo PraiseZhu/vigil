@@ -22,6 +22,8 @@ import {
   createFakeGithub,
   defaultTree,
   fullConclusions,
+  machineConclusions,
+  machineOnlyTree,
   writeJsonFile,
   PASS_VERDICT_FILE,
 } from './session.fixture.mjs';
@@ -115,8 +117,8 @@ test('evidenceEnvHints：「没跑」和环境原因要在同一句才算', () =
 
 test('vigil#105 SC3 原样证据：close 和 verdict 都放行，判「通过」', async () => {
   const { profile, home } = setup();
-  const world = defaultTree();
-  const items = fullConclusions({ [`${REPO}#2 SC3`]: { evidence: SC3_105_EVIDENCE } });
+  const world = machineOnlyTree();
+  const items = machineConclusions({ [`${REPO}#2 SC3`]: { evidence: SC3_105_EVIDENCE } });
   const verdict = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items });
   const verified = writeJsonFile(home, 'verified.json', {
     checks: ALL_RAN,

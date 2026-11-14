@@ -36,6 +36,27 @@ export const DEFAULT_OTHER_BODY = [
   '- [ ] SC8 真仓里跑一次 验证：github-live',
 ].join('\n');
 
+/** 全机器层任务树：没有 cindy-mac / github-live 等人工层，用来锁「通过仍可关单」的正例。 */
+export const MACHINE_ROOT_BODY = [
+  '# 总任务',
+  '',
+  '- [ ] SC1 收齐任务树 验证：contract（测试点：断言 collect 输出）',
+  '- [ ] SC2 写清验法 验证：unit',
+].join('\n');
+
+export const MACHINE_CHILD_BODY = [
+  '# 子任务',
+  '',
+  '- [ ] SC3 把结果写进轮次评论 验证：unit（测试点：假 gh）',
+  '- [x] SC4 看板写验收 验证：contract',
+].join('\n');
+
+export const MACHINE_OTHER_BODY = [
+  '# 跨仓子任务',
+  '',
+  '- [ ] SC7 跨仓也要收 验证：browser-fixture（测试点：夹具跨仓）',
+].join('\n');
+
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
@@ -437,6 +458,27 @@ export const DEFAULT_SCS = Object.freeze([
   [OTHER_REPO, 7, 7],
   [OTHER_REPO, 7, 8],
 ]);
+
+export const MACHINE_SCS = Object.freeze([
+  [REPO, 1, 1],
+  [REPO, 1, 2],
+  [REPO, 2, 3],
+  [REPO, 2, 4],
+  [OTHER_REPO, 7, 7],
+]);
+
+export function machineOnlyTree(options = {}) {
+  return defaultTree({
+    rootBody: MACHINE_ROOT_BODY,
+    childBody: MACHINE_CHILD_BODY,
+    otherBody: MACHINE_OTHER_BODY,
+    ...options,
+  });
+}
+
+export function machineConclusions(overrides = {}, extra = {}) {
+  return fullConclusions(overrides, { scs: MACHINE_SCS, ...extra });
+}
 
 /**
  * 覆盖 defaultTree 全部 SC 的裁决条目：verdict 要求任务树里每条 SC 都有结论。

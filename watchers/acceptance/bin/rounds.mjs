@@ -4,8 +4,9 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { isTrustedAuthor } from './trusted-author.mjs';
+import { OVERALL_PENDING, materialVersions, writeClaimSnapshot } from './authenticity.mjs';
 
-const FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(验收中|通过|要修|中断)/;
+const FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(验收中|通过|要修|待人工|中断)/;
 const LOCK_STALE_MS = 10 * 60 * 1000;
 export const ISSUE_COMMENTS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -156,8 +157,21 @@ export function latestRound(rounds) {
   return eligible.at(-1).item;
 }
 
-function formatStartBody(n, version, startedAt) {
-  return [`[验收机] 第 ${n} 轮：验收中`, `正文版本：${version}`, `开始：${startedAt}`].join('\n');
+function formatStartBody(n, version, startedAt, { materials, codeSha } = {}) {
+  const lines = [
+    `[验收机] 第 ${n} 轮：验收中`,
+    `正文版本：${version}`,
+    `起始正文版本：${version}`,
+    `开始：${startedAt}`,
+  ];
+  if (codeSha) lines.push(`代码 SHA：${codeSha}`);
+  if (materials) {
+    const packed = Object.entries(materials)
+      .map(([name, hash]) => `${name}=${hash}`)
+      .join(' ');
+    if (packed) lines.push(`材料版本：${packed}`);
+  }
+  return lines.join('\n');
 }
 
 function formatFinishBody(existing, n, status, { reason, detail, finishedAt }) {
@@ -259,7 +273,10 @@ function cacheFromGithub(cache, latest) {
       lastProgressAt: same ? cache?.round?.lastProgressAt ?? null : null,
       finishedAt: latest.finishedAt,
     },
-    lastVerdict: latest.status === '通过' || latest.status === '要修' ? latest.status : cache?.lastVerdict ?? null,
+    lastVerdict:
+      latest.status === '通过' || latest.status === '要修' || latest.status === OVERALL_PENDING
+        ? latest.status
+        : cache?.lastVerdict ?? null,
   };
 }
 
@@ -323,13 +340,20 @@ export function createRounds({ github, profile, now = () => Date.now() }) {
       const n = maxRound(rounds) + 1;
       const version = bodyVersion(fresh.body);
       const startedAt = nowIso(now);
+      const materials = materialVersions();
       const created = await github.write({
         type: 'comment.create',
         // 去重键带开始时间：轮次评论被删或挤出读取窗口后同号再认领，账本不会把旧评论当成这一次的结果。
         dedupeKey: `round-start:${ref}:${n}:${startedAt}`,
         repo: task.repo,
         issue: task.number,
-        body: formatStartBody(n, version, startedAt),
+        body: formatStartBody(n, version, startedAt, { materials }),
+      });
+      writeClaimSnapshot(profile, ref, n, {
+        bodyVersion: version,
+        bodies: { [ref]: fresh.body || '' },
+        materials,
+        claimedAt: startedAt,
       });
       writeCache(profile, ref, {
         kind: task.kind,
@@ -377,7 +401,7 @@ export function createRounds({ github, profile, now = () => Date.now() }) {
   }
 
   async function finish(ref, n, status, { reason, detail } = {}) {
-    if (!['通过', '要修', '中断'].includes(status)) {
+    if (!['通过', '要修', OVERALL_PENDING, '中断'].includes(status)) {
       throw new RoundError(`非法结束状态：${status}`, 'BAD_STATUS');
     }
     const current = await check(ref, n);

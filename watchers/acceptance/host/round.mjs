@@ -35,6 +35,7 @@ import {
   selectModelId,
 } from './llm-proxy-preflight.mjs';
 import { redact } from '../bin/redact.mjs';
+import { attachCodeSha } from '../bin/authenticity.mjs';
 import { activityChange, probeSandboxActivity } from './activity.mjs';
 
 /** 内存门：MemAvailable 低于 3 GiB 就不认领、不跑模型。常量，不可配。 */
@@ -403,7 +404,6 @@ function fileSize(file) {
   }
 }
 
-/** status --json 说这一轮已经是终态（通过 / 要修 / 中断）了吗。 */
 /** 本轮被 helper 按裁决防线标成「中断」（环境问题 / 未验证）：必需检查因环境没跑，不能判通过。 */
 function isEnvUnverified(status, round) {
   return (
@@ -414,6 +414,7 @@ function isEnvUnverified(status, round) {
   );
 }
 
+/** status --json 说这一轮已经是终态（通过 / 要修 / 待人工 / 中断）了吗。 */
 function isTerminalFor(status, round) {
   return Boolean(status) && Number(status.round) === round && typeof status.status === 'string' && status.status !== '验收中';
 }
@@ -678,6 +679,15 @@ export async function runHostRound({
       return claimed.code;
     }
     const claim = parseClaim(claimed.stdout);
+    try {
+      const shaRun = await run('git', ['-C', root, 'rev-parse', 'HEAD'], {
+        env: { PATH: env.PATH, HOME: env.HOME, GIT_TERMINAL_PROMPT: '0' },
+        timeoutMs: 5000,
+      });
+      if (shaRun?.code === 0) attachCodeSha(hostProfile, issue, claim.round, String(shaRun.stdout || '').trim());
+    } catch {
+      // 取不到运行 SHA 不挡这一轮；裁决里写「未知」。预取位置不变。
+    }
     const roundStartedMs = now();
     const startedAt = new Date(roundStartedMs).toISOString();
 
