@@ -11,6 +11,7 @@ import { createGate, startGateServer } from './host/write-gate.mjs';
 import { hostPaths } from './host/paths.mjs';
 import {
   buildBwrapArgs,
+  claimSnapshotOverlays,
   defaultHomeAllow,
   maskList,
   prepareSandboxProfile,
@@ -78,11 +79,31 @@ function overlayFixture() {
   };
 }
 
-test('P1 沙箱参数：认领快照只读叠到派生路径，拒绝挂整个 host 状态', () => {
+test('P1/P2 沙箱参数：只叠本轮快照文件并只读重挂视图，拒绝整个 snapshots 目录', () => {
   const fx = overlayFixture();
   assert.ok(endsWithSnapshots(fx.hostSnapshots));
   assert.ok(endsWithSnapshots(fx.dest));
   assert.equal(fx.dest.startsWith(path.join(fx.roundDir, 'home-acc')), true);
+  assert.throws(
+    () =>
+      buildBwrapArgs({
+        home: fx.home,
+        profile: fx.profile,
+        roundDir: fx.roundDir,
+        masks: fx.masks,
+        binds: [fx.stateDir, fx.worktreeDir],
+        hostHome: fx.hostHome,
+        readOnlyOverlays: [{ src: fx.hostSnapshots, dest: fx.dest }],
+      }),
+    /整个 snapshots|本轮快照文件/,
+  );
+
+  const srcFile = snapshotPath(fx.profile, ROOT, 1);
+  fs.writeFileSync(srcFile, '{"ok":true}\n');
+  const overlays = claimSnapshotOverlays({ snapshotView: fx.dest, srcFile });
+  const destFile = path.join(fx.dest, path.basename(srcFile));
+  assert.equal(fs.existsSync(destFile), true);
+  assert.equal(fs.readFileSync(destFile, 'utf8'), '', '挂载点必须是空文件，不能把快照复制进可写目录');
   const args = buildBwrapArgs({
     home: fx.home,
     profile: fx.profile,
@@ -90,18 +111,28 @@ test('P1 沙箱参数：认领快照只读叠到派生路径，拒绝挂整个 h
     masks: fx.masks,
     binds: [fx.stateDir, fx.worktreeDir],
     hostHome: fx.hostHome,
-    readOnlyOverlays: [{ src: fx.hostSnapshots, dest: fx.dest }],
+    readOnlyOverlays: overlays,
   });
   const bindRound = args.findIndex((value, i) => value === '--bind' && args[i + 1] === fx.roundDir);
+  const remountAt = args.findIndex(
+    (value, i) => value === '--ro-bind' && args[i + 1] === fs.realpathSync(fx.dest) && args[i + 2] === fs.realpathSync(fx.dest),
+  );
   const overlayAt = args.findIndex(
-    (value, i) => value === '--ro-bind' && args[i + 1] === fs.realpathSync(fx.hostSnapshots) && args[i + 2] === fs.realpathSync(fx.dest),
+    (value, i) => value === '--ro-bind' && args[i + 1] === fs.realpathSync(srcFile) && args[i + 2] === fs.realpathSync(destFile),
   );
   assert.ok(bindRound >= 0, 'roundDir 必须可写绑定');
-  assert.ok(overlayAt >= 0, '必须把宿主快照只读叠到沙箱派生路径');
-  assert.ok(overlayAt > bindRound, '只读叠挂必须在可写 roundDir 之后');
+  assert.ok(remountAt >= 0, '快照视图目录必须 dest→dest 只读重挂');
+  assert.ok(overlayAt >= 0, '必须把本轮宿主快照文件只读叠到沙箱派生路径');
+  assert.ok(remountAt > bindRound, '只读重挂必须在可写 roundDir 之后');
+  assert.ok(overlayAt > remountAt, '本轮文件叠挂必须在目录只读重挂之后');
   const stateReal = fs.realpathSync(path.join(fx.home, 'state'));
   const maskAt = args.findIndex((value, i) => value === '--tmpfs' && args[i + 1] === stateReal);
   if (maskAt >= 0) assert.ok(overlayAt < maskAt, '先叠快照再遮原宿主状态');
+  assert.equal(
+    args.some((value, i) => value === '--ro-bind' && args[i + 1] === fs.realpathSync(fx.hostSnapshots)),
+    false,
+    '不能把整个宿主 snapshots 目录叠进沙箱',
+  );
 
   assert.throws(
     () =>
@@ -127,7 +158,7 @@ test('P1 沙箱参数：认领快照只读叠到派生路径，拒绝挂整个 h
         hostHome: fx.hostHome,
         readOnlyOverlays: [{ src: fx.hostSnapshots, dest: path.join(fx.roundDir, 'leaked-state') }],
       }),
-    /快照|派生/,
+    /快照|派生|整个 snapshots/,
   );
 });
 
@@ -139,7 +170,7 @@ const skipBwrap = !bwrapAvailable
     : READONLY_SKIP;
 
 test(
-  'P1 真 bwrap：快照可读不可写删，缺证据关单/看板拒绝，完整证据 helper close 放行',
+  'P1/P2 真 bwrap：本轮快照可读、其他轮不可读不可列出，不可写删，缺证据关单/看板拒绝，完整证据 helper close 放行',
   { skip: skipBwrap, timeout: 120000 },
   async () => {
     const outside = fs.mkdtempSync(path.join(HERE, '.sandbox-auth-test-'));
@@ -168,6 +199,9 @@ test(
     const hostSnapshots = snapshotDir(profile);
     assert.ok(readClaimSnapshot(profile, ROOT, 1));
     assert.equal(fs.existsSync(snapshotPath(profile, ROOT, 1)), true);
+    const otherName = 'example-owner__other-repo__9-r4.json';
+    const otherHost = path.join(hostSnapshots, otherName);
+    fs.writeFileSync(otherHost, `${JSON.stringify({ body: 'OTHER-ROUND', ref: 'example-owner/other-repo#9', round: 4 }, null, 2)}\n`);
 
     const socketPath = path.join(roundDir, 'g.sock');
     const prepared = prepareSandboxProfile({ profile, roundDir, repoRoot: REPO_ROOT, socketPath });
@@ -177,6 +211,9 @@ test(
     const masks = maskList({ rawProfile, profile, hostConfig: {}, env: { HOME: hostHome }, home });
     const sandboxBin = path.join(HERE, 'host', 'sandbox-bin');
     const env = sandboxEnv({ base: { ...process.env, HOME: hostHome }, roundDir, socketPath, sandboxBin });
+    const srcFile = snapshotPath(profile, ROOT, 1);
+    const overlays = claimSnapshotOverlays({ snapshotView: dest, srcFile });
+    assert.equal(fs.readFileSync(path.join(dest, path.basename(srcFile)), 'utf8'), '');
     const args = buildBwrapArgs({
       home,
       profile,
@@ -185,7 +222,7 @@ test(
       binds: [stateDir, worktreeDir],
       hostHome,
       homeAllow: defaultHomeAllow({ repoRoot: REPO_ROOT }),
-      readOnlyOverlays: [{ src: hostSnapshots, dest }],
+      readOnlyOverlays: overlays,
     });
 
     const verified = writeJsonFile(roundDir, 'verified.json', {
@@ -221,13 +258,16 @@ test(
         `const hostPath = ${JSON.stringify(snapshotPath(profile, ROOT, 1))};`,
         `const hostDir = ${JSON.stringify(hostSnapshots)};`,
         `const hostState = ${JSON.stringify(path.join(home, 'state'))};`,
+        `const otherName = ${JSON.stringify(otherName)};`,
         'const profile = loadAcceptanceProfile();',
         'const view = snapshotDir(profile);',
         'const snap = readClaimSnapshot(profile, ROOT, 1);',
-        'const out = { view, hasSnap: Boolean(snap && snap.bodyVersion), hostPathReadable: false, hostDirReadable: false, hostStateReadable: false, wrote: false, unlinked: false, mkdir: false, writeClaim: null };',
+        'const out = { view, hasSnap: Boolean(snap && snap.bodyVersion), hostPathReadable: false, hostDirReadable: false, hostStateReadable: false, wrote: false, unlinked: false, mkdir: false, writeClaim: null, otherListed: false, otherReadable: false, listed: [] };',
         'try { fs.readFileSync(hostPath, "utf8"); out.hostPathReadable = true; } catch {}',
         'try { fs.readdirSync(hostDir); out.hostDirReadable = true; } catch {}',
         'try { const names = fs.readdirSync(hostState); out.hostStateReadable = names.length > 0; } catch {}',
+        'try { out.listed = fs.readdirSync(view); out.otherListed = out.listed.includes(otherName); } catch {}',
+        'try { const text = fs.readFileSync(path.join(view, otherName), "utf8"); out.otherReadable = text.includes("OTHER-ROUND"); } catch {}',
         'try { fs.writeFileSync(path.join(view, "forged.json"), "{}"); out.wrote = true; } catch {}',
         'try { fs.unlinkSync(path.join(view, path.basename(hostPath))); out.unlinked = true; } catch {}',
         'try { fs.mkdirSync(path.join(view, "rebuilt")); out.mkdir = true; } catch {}',
@@ -245,6 +285,9 @@ test(
     assert.equal(probed.code, 0, probed.stderr);
     const view = JSON.parse(probed.stdout);
     assert.equal(view.hasSnap, true, `沙箱应读到宿主认领快照：${probed.stdout}`);
+    assert.deepEqual(view.listed, [path.basename(snapshotPath(profile, ROOT, 1))], `快照视图只能看到本轮文件：${JSON.stringify(view.listed)}`);
+    assert.equal(view.otherListed, false, `不能列出其他轮次快照：${JSON.stringify(view.listed)}`);
+    assert.equal(view.otherReadable, false, `不能读其他轮次快照：${probed.stdout}`);
     assert.equal(view.view, dest);
     assert.equal(view.hostPathReadable, false, '原宿主快照路径必须被遮住');
     assert.equal(view.hostDirReadable, false, '原宿主 snapshots 目录必须被遮住');

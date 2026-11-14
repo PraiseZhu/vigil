@@ -13,7 +13,7 @@ import { runRound as runRoundCommand } from '../bin/round.mjs';
 import { parseRef } from '../bin/rounds.mjs';
 import { appendCodePaths } from '../bin/message.mjs';
 import { appendAlert, hostPaths, progressFileFor, releaseLock, tryAcquireLock, writeRoundProgress } from './paths.mjs';
-import { buildBwrapArgs, defaultHomeAllow, maskList, prepareSandboxProfile, probeBwrap, sandboxEnv } from './sandbox.mjs';
+import { buildBwrapArgs, claimSnapshotOverlays, defaultHomeAllow, maskList, prepareSandboxProfile, probeBwrap, sandboxEnv } from './sandbox.mjs';
 import { EGRESS_BRIDGE_PORT, bridgeCommand, startRoundEgress } from './egress-proxy.mjs';
 import { run as procRun, spawnDetached, spawnProcess } from './proc.mjs';
 // prefetch.mjs → prbot.mjs → 本文件成环：两边都只在函数里用对方的导出，模块求值顺序不受影响。
@@ -35,7 +35,7 @@ import {
   selectModelId,
 } from './llm-proxy-preflight.mjs';
 import { redact } from '../bin/redact.mjs';
-import { attachCodeSha, snapshotDir } from '../bin/authenticity.mjs';
+import { attachCodeSha, snapshotDir, snapshotPath } from '../bin/authenticity.mjs';
 import { activityChange, probeSandboxActivity } from './activity.mjs';
 
 /** 内存门：MemAvailable 低于 3 GiB 就不认领、不跑模型。常量，不可配。 */
@@ -842,7 +842,10 @@ export async function runHostRound({
         readOnlyBinds: [...codeDirs, ...(deps?.readOnlyBinds || [])],
         readOnlyMounts: deps?.mounts || [],
         tmpfsDirs: deps?.tmpfs || [],
-        readOnlyOverlays: [{ src: hostSnapshots, dest: prepared.snapshotView }],
+        readOnlyOverlays: claimSnapshotOverlays({
+          snapshotView: prepared.snapshotView,
+          srcFile: snapshotPath(profile, issue, claim.round),
+        }),
         hostHome: env.HOME || process.env.HOME,
         homeAllow: defaultHomeAllow({ repoRoot: root, hostConfig: settings }),
       });

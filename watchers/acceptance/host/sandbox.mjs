@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { TOKEN_FILE_KEY } from '../bin/profile.mjs';
-import { CLAIM_SNAPSHOT_REL, isClaimSnapshotDir } from '../bin/authenticity.mjs';
+import { CLAIM_SNAPSHOT_REL, isClaimSnapshotDir, isClaimSnapshotFile } from '../bin/authenticity.mjs';
 
 /** 传进沙箱的环境变量白名单；别的（含任何令牌）一律不传。 */
 export const ENV_ALLOWLIST = Object.freeze([
@@ -292,10 +292,12 @@ export function buildBwrapArgs(options = {}) {
     mountList.push({ src: srcReal, dest: destReal, destLexical: path.resolve(dest) });
   }
 
-  // 认领快照只读叠挂：源可以在被遮罩的宿主 state/host/snapshots 里，目标必须是 roundDir 里
-  // 沙箱 watcher home 派生出的同一相对路径。整层 host 状态不能挂进来。叠在可写绑定之后、
-  // 遮罩之前，这样读的是权威快照、写会打到只读层。
-  const overlayList = [];
+  // 认领快照只读叠挂：不能把整个 snapshots 目录挂进来（会露出其他轮次）。只许
+  // （1）把沙箱派生的 snapshots 视图目录 dest→dest 只读重挂，避免 roundDir 可写绑定让会话伪造；
+  // （2）把本轮权威快照文件叠到该视图里的同名空挂载点。源文件可以在被遮罩的宿主
+  // state/host/snapshots 里。叠在可写绑定之后、遮罩之前。先目录后文件。
+  const overlayDirs = [];
+  const overlayFiles = [];
   const sandboxHome = path.resolve(roundDir, 'home-acc');
   for (const overlay of readOnlyOverlays || []) {
     const src = overlay?.src;
@@ -304,22 +306,59 @@ export function buildBwrapArgs(options = {}) {
       throw new Error('认领快照只读叠挂必须都是绝对路径');
     }
     const srcReal = realExisting(src);
-    if (!srcReal || !fs.statSync(srcReal).isDirectory()) throw new Error(`认领快照源不存在：${src}`);
+    if (!srcReal) throw new Error(`认领快照源不存在：${src}`);
     const destReal = realExisting(dest);
-    if (!destReal || !fs.statSync(destReal).isDirectory()) throw new Error(`认领快照视图不存在：${dest}`);
-    if (!isClaimSnapshotDir(srcReal) || !isClaimSnapshotDir(destReal)) {
-      throw new Error('只许把认领快照目录叠到沙箱派生的 state/host/snapshots，不能挂整个 host 状态');
-    }
-    if (!isInside(destReal, sandboxHome)) {
-      throw new Error('认领快照视图必须是沙箱 watcher home 下的派生路径');
-    }
-    for (const maskDir of maskDirs) {
-      if (isInside(destReal, maskDir)) {
-        throw new Error(`沙箱拒绝：认领快照视图 ${dest} 落在遮罩目录里`);
+    if (!destReal) throw new Error(`认领快照视图不存在：${dest}`);
+    const srcStat = fs.statSync(srcReal);
+    const destStat = fs.statSync(destReal);
+    if (srcStat.isDirectory() && destStat.isDirectory()) {
+      if (!isClaimSnapshotDir(srcReal) || !isClaimSnapshotDir(destReal)) {
+        throw new Error('只许把认领快照叠到沙箱派生的 state/host/snapshots，不能挂整个 host 状态');
       }
+      if (srcReal !== destReal) {
+        throw new Error('不能把整个 snapshots 目录叠进沙箱，只许本轮快照文件');
+      }
+      if (!isInside(destReal, sandboxHome)) {
+        throw new Error('认领快照视图必须是沙箱 watcher home 下的派生路径');
+      }
+      for (const maskDir of maskDirs) {
+        if (isInside(destReal, maskDir)) {
+          throw new Error(`沙箱拒绝：认领快照视图 ${dest} 落在遮罩目录里`);
+        }
+      }
+      overlayDirs.push({ src: srcReal, dest: destReal });
+      continue;
     }
-    overlayList.push({ src: srcReal, dest: destReal });
+    if (srcStat.isFile() && destStat.isFile()) {
+      if (!isClaimSnapshotFile(srcReal) || !isClaimSnapshotFile(destReal)) {
+        throw new Error('只许叠本轮认领快照文件');
+      }
+      if (path.basename(srcReal) !== path.basename(destReal)) {
+        throw new Error('认领快照视图文件名必须与本轮快照一致');
+      }
+      if (!isClaimSnapshotDir(path.dirname(destReal)) || !isInside(path.dirname(destReal), sandboxHome)) {
+        throw new Error('认领快照视图必须是沙箱 watcher home 下的派生路径');
+      }
+      for (const maskDir of maskDirs) {
+        if (isInside(destReal, maskDir) || isInside(path.dirname(destReal), maskDir)) {
+          throw new Error(`沙箱拒绝：认领快照视图 ${dest} 落在遮罩目录里`);
+        }
+      }
+      overlayFiles.push({ src: srcReal, dest: destReal });
+      continue;
+    }
+    throw new Error('认领快照只读叠挂的源和目标必须都是目录或都是文件');
   }
+  if (overlayFiles.length > 1) {
+    throw new Error('只许叠本轮一份认领快照');
+  }
+  for (const file of overlayFiles) {
+    const parent = path.dirname(file.dest);
+    if (!overlayDirs.some((dir) => dir.src === parent && dir.dest === parent)) {
+      throw new Error('叠本轮快照文件前必须把快照视图目录只读重挂');
+    }
+  }
+  const overlayList = [...overlayDirs, ...overlayFiles];
 
   // 只读挂载里的空 tmpfs（给工具写缓存）：只许落在上面那些只读挂载的目标里；
   // 挂载点在挂载的源里要已经存在（只读挂载里建不出挂载点）。
@@ -467,6 +506,39 @@ export function sandboxEnv({
  * 沙箱里的 watcher home：真 profile 的副本，但写操作只经 gate-client 走 socket，
  * 令牌文件换成一个占位文件（内容不是令牌），所有 …TokenFile / App 私钥配置一律删掉。
  */
+/**
+ * 本轮认领快照的只读叠挂：先把沙箱派生的 snapshots 视图 dest→dest 只读重挂（目录保持不可写，
+ * 会话不能在旁边伪造文件），再把已有的本轮权威快照文件叠到同名空挂载点。不把内容复制进可写目录。
+ */
+export function claimSnapshotOverlays({ snapshotView, srcFile } = {}) {
+  if (typeof snapshotView !== 'string' || !path.isAbsolute(snapshotView)) {
+    throw new Error('认领快照视图必须是绝对路径');
+  }
+  if (!isClaimSnapshotDir(snapshotView)) {
+    throw new Error('认领快照视图必须是沙箱派生的 state/host/snapshots');
+  }
+  fs.mkdirSync(snapshotView, { recursive: true, mode: 0o700 });
+  const overlays = [{ src: snapshotView, dest: snapshotView }];
+  if (srcFile == null || srcFile === '') return overlays;
+  if (typeof srcFile !== 'string' || !path.isAbsolute(srcFile)) {
+    throw new Error('本轮认领快照必须是绝对路径');
+  }
+  if (!isClaimSnapshotFile(srcFile)) {
+    throw new Error('只许叠本轮认领快照文件');
+  }
+  let srcStat = null;
+  try {
+    srcStat = fs.statSync(srcFile);
+  } catch {
+    return overlays;
+  }
+  if (!srcStat.isFile()) return overlays;
+  const destFile = path.join(snapshotView, path.basename(srcFile));
+  fs.closeSync(fs.openSync(destFile, 'w'));
+  overlays.push({ src: srcFile, dest: destFile });
+  return overlays;
+}
+
 export function prepareSandboxProfile({ profile, roundDir, repoRoot, socketPath } = {}) {
   if (!profile?.profilePath) throw new Error('prepareSandboxProfile 需要带 profilePath 的 profile');
   const sandboxHome = path.join(roundDir, 'home-acc');
