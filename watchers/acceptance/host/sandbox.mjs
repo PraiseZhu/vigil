@@ -321,7 +321,10 @@ export function buildBwrapArgs(options = {}) {
   // 认领快照只读视图：可写 roundDir 里派生的目录 dest→dest 重挂不可信（已有内容、
   // 符号链接会跟着进来，open('w') 还会截断权威文件）。改为：lstat 确认视图是真目录后
   // 盖空 tmpfs，再把本轮宿主快照文件叠到 tmpfs 里的同名路径，最后 remount-ro。
-  // 不跟随符号链接，不在未验证路径上 open('w')，不清理/删除已有文件。
+  // snapshots 叶子做成挂载点只能挡住 rename 叶子；host/state/home-acc 仍在可写 bind 上、
+  // 不是挂载点，rename 后换成伪造链接就能让 readClaimSnapshot 读到假正文。因此在
+  // tmpfs 之前把 sandbox watcher home dest→dest 只读重挂成挂载点，整条可信读取路径
+  // 都不可替换。不跟随符号链接，不在未验证路径上 open('w')，不清理/删除已有文件。
   const overlayTmpfs = [];
   const overlayFiles = [];
   const sandboxHome = path.resolve(roundDir, 'home-acc');
@@ -413,6 +416,19 @@ export function buildBwrapArgs(options = {}) {
       throw new Error('叠本轮快照文件前必须把快照视图目录盖成空 tmpfs');
     }
   }
+  const pathLock = [];
+  if (overlayTmpfs.length) {
+    let homeStat = null;
+    try {
+      homeStat = fs.lstatSync(sandboxHome);
+    } catch {
+      homeStat = null;
+    }
+    if (!homeStat || homeStat.isSymbolicLink() || !homeStat.isDirectory()) {
+      throw new Error('沙箱 watcher home 不能是符号链接');
+    }
+    pathLock.push(sandboxHome);
+  }
 
   // 只读挂载里的空 tmpfs（给工具写缓存）：只许落在上面那些只读挂载的目标里；
   // 挂载点在挂载的源里要已经存在（只读挂载里建不出挂载点）。
@@ -463,6 +479,9 @@ export function buildBwrapArgs(options = {}) {
   for (const bind of bindList) args.push('--bind', bind, bind);
   for (const dir of readOnlyList) args.push('--ro-bind', dir, dir);
   for (const mount of mountList) args.push('--ro-bind', mount.src, mount.dest);
+  // 先把 watcher home 收成只读挂载点（父路径不可 rename），再盖空快照视图 tmpfs。
+  // 若先 tmpfs 再 dest→dest 重挂 home-acc，非递归 bind 会吃掉子挂载，本轮文件消失。
+  for (const dir of pathLock) args.push('--ro-bind', dir, dir);
   for (const dir of overlayTmpfs) args.push('--tmpfs', dir);
   for (const overlay of overlayFiles) args.push('--ro-bind', overlay.src, overlay.dest);
   for (const dir of overlayTmpfs) args.push('--remount-ro', dir);

@@ -136,6 +136,13 @@ test('P1/P2 沙箱参数：只叠本轮快照文件并只读重挂视图，拒�
   assert.ok(tmpfsAt > bindRound, '空 tmpfs 必须在可写 roundDir 之后');
   assert.ok(overlayAt > tmpfsAt, '本轮文件叠挂必须在空 tmpfs 之后');
   assert.ok(remountAt > overlayAt, 'remount-ro 必须在文件叠挂之后');
+  const sandboxHome = path.resolve(path.join(fx.roundDir, 'home-acc'));
+  const lockAt = args.findIndex(
+    (value, i) => value === '--ro-bind' && args[i + 1] === sandboxHome && args[i + 2] === sandboxHome,
+  );
+  assert.ok(lockAt >= 0, '可信读取路径的 watcher home 必须是只读挂载点，不能只保护 snapshots 叶子');
+  assert.ok(lockAt > bindRound, '路径锁必须在可写 roundDir 之后');
+  assert.ok(tmpfsAt > lockAt, '空 tmpfs 必须在路径锁之后，以免 dest→dest 重挂吃掉子挂载');
   const stateReal = fs.realpathSync(path.join(fx.home, 'state'));
   const maskAt = args.findIndex((value, i) => value === '--tmpfs' && args[i + 1] === stateReal);
   if (maskAt >= 0) assert.ok(overlayAt < maskAt, '先叠快照再遮原宿主状态');
@@ -236,6 +243,33 @@ test('P2 准备：snapshots 视图是符号链接时拒绝，且不改目标里�
   assert.equal(fs.lstatSync(fx.dest).isSymbolicLink(), true);
 });
 
+test('前提：只把 snapshots 叶子做成挂载点仍可替换 host/state/home-acc 父路径（此前提不成立）', () => {
+  const fx = overlayFixture();
+  const srcFile = snapshotPath(fx.profile, ROOT, 1);
+  writeBody(srcFile, '{"ok":true}\n');
+  const overlays = claimSnapshotOverlays({ snapshotView: fx.dest, srcFile });
+  const args = buildBwrapArgs({
+    home: fx.home,
+    profile: fx.profile,
+    roundDir: fx.roundDir,
+    masks: fx.masks,
+    binds: [fx.stateDir, fx.worktreeDir],
+    hostHome: fx.hostHome,
+    readOnlyOverlays: overlays,
+  });
+  const sandboxHome = path.resolve(path.join(fx.roundDir, 'home-acc'));
+  const destLex = path.resolve(fx.dest);
+  assert.equal(
+    args.some((value, i) => value === '--tmpfs' && args[i + 1] === destLex),
+    true,
+  );
+  assert.equal(
+    args.some((value, i) => value === '--ro-bind' && args[i + 1] === sandboxHome && args[i + 2] === sandboxHome),
+    true,
+    '不能只保护 snapshots 叶子：home-acc 必须是只读挂载点，父路径才不可 rename',
+  );
+});
+
 test('P2 准备：视图链接到沙箱外目录时拒绝，同名金丝雀与权威快照字节不变', () => {
   const fx = overlayFixture();
   const srcFile = snapshotPath(fx.profile, ROOT, 1);
@@ -256,6 +290,129 @@ const skipBwrap = !bwrapAvailable
   : fixtureDirWritable(HERE)
     ? false
     : READONLY_SKIP;
+
+test(
+  'P2 真 bwrap：host/state/home-acc 父路径三层 rename 不能换成伪造快照',
+  { skip: skipBwrap, timeout: 120000 },
+  async () => {
+    const outside = fs.mkdtempSync(path.join(HERE, '.sandbox-auth-test-'));
+    after(() => fs.rmSync(outside, { recursive: true, force: true }));
+    const place = (name) => {
+      const dir = path.join(outside, name);
+      fs.mkdirSync(dir, { recursive: true });
+      return dir;
+    };
+    const hostHome = place('host-home');
+    const home = place('watcher-home');
+    const stateDir = place('acc-state');
+    const worktreeDir = place('acc-worktree');
+    const roundDir = place('round');
+    fs.mkdirSync(path.join(roundDir, 'home'), { recursive: true });
+    fs.mkdirSync(path.join(roundDir, 'tmp'), { recursive: true });
+    writeProfile(home, {
+      profile: { stateDir, worktreeDir, ownerLogin: OWNER, projectNumber: 7, autoRepos: [`${OWNER}/*`, 'example-owner/*'] },
+    });
+    const paths = hostPaths(home);
+    fs.mkdirSync(paths.gateDir, { recursive: true });
+    fs.writeFileSync(paths.enabledFile, '1');
+    const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+    const world = machineOnlyTree();
+    claimWorld(profile, world, ROOT, 1);
+    const srcFile = snapshotPath(profile, ROOT, 1);
+    const auth = { file: srcFile, body: fs.readFileSync(srcFile), hash: sha256File(srcFile) };
+    writeBody(
+      path.join(snapshotDir(profile), 'example-owner__other-repo__9-r4.json'),
+      `${JSON.stringify({ body: 'OTHER-ROUND' }, null, 2)}\n`,
+    );
+
+    const socketPath = path.join(roundDir, 'g.sock');
+    const prepared = prepareSandboxProfile({ profile, roundDir, repoRoot: REPO_ROOT, socketPath });
+    const dest = path.join(prepared.sandboxHome, 'state', 'host', 'snapshots');
+    const rawProfile = JSON.parse(fs.readFileSync(profile.profilePath, 'utf8'));
+    const masks = maskList({ rawProfile, profile, hostConfig: {}, env: { HOME: hostHome }, home });
+    const sandboxBin = path.join(HERE, 'host', 'sandbox-bin');
+    const env = sandboxEnv({ base: { ...process.env, HOME: hostHome }, roundDir, socketPath, sandboxBin });
+    const overlays = claimSnapshotOverlays({ snapshotView: dest, srcFile });
+    const args = buildBwrapArgs({
+      home,
+      profile,
+      roundDir,
+      masks,
+      binds: [stateDir, worktreeDir],
+      hostHome,
+      homeAllow: defaultHomeAllow({ repoRoot: REPO_ROOT }),
+      readOnlyOverlays: overlays,
+    });
+
+    const forgedHost = path.join(roundDir, 'forged-host');
+    const forgedState = path.join(roundDir, 'forged-state');
+    const forgedHome = path.join(roundDir, 'forged-home');
+    const fake = JSON.stringify({ body: 'PARENT-RENAME-FORGED' });
+    writeBody(path.join(forgedHost, 'snapshots', path.basename(srcFile)), fake);
+    writeBody(path.join(forgedState, 'host', 'snapshots', path.basename(srcFile)), fake);
+    writeBody(path.join(forgedHome, 'state', 'host', 'snapshots', path.basename(srcFile)), fake);
+
+    const probe = path.join(roundDir, 'probe-parent-rename.mjs');
+    fs.writeFileSync(
+      probe,
+      [
+        "import fs from 'node:fs';",
+        "import path from 'node:path';",
+        `import { loadAcceptanceProfile } from ${JSON.stringify(path.join(HERE, 'bin', 'profile.mjs'))};`,
+        `import { readClaimSnapshot } from ${JSON.stringify(path.join(HERE, 'bin', 'authenticity.mjs'))};`,
+        `const ROOT = ${JSON.stringify(ROOT)};`,
+        `const forgedHost = ${JSON.stringify(forgedHost)};`,
+        `const forgedState = ${JSON.stringify(forgedState)};`,
+        `const forgedHome = ${JSON.stringify(forgedHome)};`,
+        'const profile = loadAcceptanceProfile();',
+        'const homeAcc = process.env.ACCEPTANCE_WATCHER_HOME;',
+        'const layers = [',
+        '  { name: "host", dir: path.join(homeAcc, "state", "host"), forged: forgedHost },',
+        '  { name: "state", dir: path.join(homeAcc, "state"), forged: forgedState },',
+        '  { name: "home-acc", dir: homeAcc, forged: forgedHome },',
+        '];',
+        'const out = { snapOk: false, layers: {} };',
+        'const snap0 = readClaimSnapshot(profile, ROOT, 1);',
+        'out.snapOk = Boolean(snap0 && snap0.bodyVersion);',
+        'for (const layer of layers) {',
+        '  const rec = { renamed: false, linked: false, forged: false, body: null };',
+        '  try { fs.renameSync(layer.dir, `${layer.dir}.bak`); rec.renamed = true; } catch (error) { rec.renameError = String(error.message || error); }',
+        '  try { fs.symlinkSync(layer.forged, layer.dir); rec.linked = true; } catch (error) { rec.linkError = String(error.message || error); }',
+        '  try {',
+        '    const snap = readClaimSnapshot(profile, ROOT, 1);',
+        '    rec.body = snap && typeof snap.body === "string" ? snap.body : snap ? JSON.stringify(snap) : null;',
+        '    rec.forged = String(rec.body || "").includes("PARENT-RENAME-FORGED");',
+        '  } catch (error) { rec.readError = String(error.message || error); }',
+        '  out.layers[layer.name] = rec;',
+        '}',
+        'out.snapAfter = readClaimSnapshot(profile, ROOT, 1);',
+        'process.stdout.write(JSON.stringify(out));',
+        '',
+      ].join('\n'),
+    );
+
+    const probed = await procRun('bwrap', [...args, '--', process.execPath, probe], {
+      env,
+      cwd: roundDir,
+      timeoutMs: 30000,
+    });
+    assert.equal(probed.code, 0, probed.stderr);
+    const view = JSON.parse(probed.stdout);
+    assert.equal(view.snapOk, true, `本轮快照必须可读：${probed.stdout}`);
+    for (const name of ['host', 'state', 'home-acc']) {
+      const rec = view.layers[name];
+      assert.equal(rec.renamed, false, `${name} 不可 rename：${JSON.stringify(rec)}`);
+      assert.equal(rec.linked, false, `${name} 不可换成符号链接：${JSON.stringify(rec)}`);
+      assert.equal(rec.forged, false, `${name} 替换后不能读到 PARENT-RENAME-FORGED：${JSON.stringify(rec)}`);
+    }
+    assert.ok(view.snapAfter && view.snapAfter.bodyVersion, `替换失败后仍读本轮权威快照：${probed.stdout}`);
+    assert.equal(String(view.snapAfter.body || '').includes('PARENT-RENAME-FORGED'), false);
+    assert.equal(sha256File(auth.file), auth.hash, '宿主权威快照 hash 必须不变');
+    assert.equal(Buffer.compare(fs.readFileSync(auth.file), auth.body), 0);
+    assert.equal(fs.lstatSync(prepared.sandboxHome).isDirectory(), true);
+    assert.equal(fs.lstatSync(prepared.sandboxHome).isSymbolicLink(), false);
+  },
+);
 
 test(
   'P2 真 bwrap：已有内容与符号链接不能穿透，rename 不能换视图，缺证据零写入，合法 close 放行',
