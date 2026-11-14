@@ -11,13 +11,12 @@ import { readNeedsHuman } from './push.mjs';
 import { guardPass } from './checks.mjs';
 import {
   OVERALL_PENDING,
-  STANDARD_CHANGED_REASON,
   deriveStatus as deriveOverall,
-  ensureClaimSnapshot,
   formatMaterialLine,
   guardOriginalPass,
   materialVersions,
-  shiftedIssues,
+  readClaimSnapshot,
+  snapshotUnusableReason,
 } from './authenticity.mjs';
 
 export const RESULTS = Object.freeze(['通过', '要修', '人工手测', '待验', '有争议']);
@@ -226,6 +225,12 @@ export async function runVerdict({ github, profile, ref, n, file, statusFlag, no
   if (missingFocus.length) {
     throw new Error(`交接重点核对缺结论：lead 交接第 ${tree.handoff.n} 次「请重点查」第 ${missingFocus.join('、')} 条没写（verdict.json 的 handoffChecks）`);
   }
+  const snapshot = readClaimSnapshot(profile, ref, n);
+  const unusable = snapshotUnusableReason(snapshot, tree);
+  if (unusable) {
+    await rounds.finish(ref, n, '中断', { reason: unusable });
+    throw new Error(`${unusable}。旧轮次评论未改`);
+  }
   const needsHuman = readNeedsHuman(profile, ref, n);
   const extras = {
     tree,
@@ -241,17 +246,15 @@ export async function runVerdict({ github, profile, ref, n, file, statusFlag, no
     throw new Error(`--status 只能是 通过、要修 或 待人工：${statusFlag}`);
   }
   const status = derived;
-  const snapshot = ensureClaimSnapshot(profile, ref, n, tree);
-  const shifted = shiftedIssues(snapshot, tree);
-  if (shifted.length && status !== '要修') {
-    await rounds.finish(ref, n, '中断', { reason: `${STANDARD_CHANGED_REASON}：${shifted.join('、')}` });
-    throw new Error(`${STANDARD_CHANGED_REASON}：${shifted.join('、')}。旧轮次评论未改`);
-  }
   // 裁决防线：判「通过」或带「通过」条目时要写明必需检查；空证据 / 不可追溯补充在写之前拒绝。
-  // 「要修」不受影响：真的没过就是没过。
+  // 「要修」不受空证据影响：真的没过就是没过。标准变化已在 derive 之前作废。
   if (status !== '要修' && items.some((item) => item.result === '通过')) {
     await guardPass({ rounds, ref, n, checks: payload.checks, items, where: 'verdict.json' });
-    guardOriginalPass(items, { snapshot, moduleUrl: import.meta.url });
+    guardOriginalPass(items, {
+      snapshot,
+      checkoutDir: snapshot.checkoutDir,
+      moduleUrl: import.meta.url,
+    });
   }
 
   // 正文版本按「现在」的正文算：验收机自己改了正文（勾选），就用改后的版本；起始版本留在评论里。

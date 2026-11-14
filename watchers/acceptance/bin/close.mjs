@@ -10,14 +10,14 @@ import { collectTree, fetchIssueBody } from './collect.mjs';
 import { createRounds, parseRef } from './rounds.mjs';
 import { guardPass, readVerdictItems } from './checks.mjs';
 import { assertNotVerdictOnly } from './profile.mjs';
+import { missingConclusions } from './verdict.mjs';
 import {
   OVERALL_PENDING,
-  STANDARD_CHANGED_REASON,
   deriveStatus,
-  ensureClaimSnapshot,
   guardOriginalPass,
   pendingCloseBlocked,
-  shiftedIssues,
+  readClaimSnapshot,
+  snapshotUnusableReason,
 } from './authenticity.mjs';
 
 const SC_LINE = /^\s*[-*]\s*(?:\[\s*([xX ])\s*\])?\s*(?:\*\*)?SC(\d+)\b/;
@@ -46,6 +46,17 @@ export function applyTicks(body, { verified = [], manual = [] } = {}) {
       return out;
     });
   return { body: lines.join('\n'), changed };
+}
+
+function readCloseVerdict(file) {
+  const items = readVerdictItems(file);
+  let extracted = false;
+  try {
+    extracted = Boolean(JSON.parse(fs.readFileSync(file, 'utf8'))?.extracted);
+  } catch {
+    extracted = false;
+  }
+  return { items, extracted };
 }
 
 function readVerified(file) {
@@ -78,7 +89,7 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
   assertNotVerdictOnly(profile, tree.root.ref, 'close');
 
   const verified = readVerified(flags.get('verified'));
-  const verdictItems = readVerdictItems(flags.get('verdict'));
+  const { items: verdictItems, extracted } = readCloseVerdict(flags.get('verdict'));
   const grouped = new Map();
   for (const entry of verified.items) {
     if (!grouped.has(entry.ref)) grouped.set(entry.ref, { verified: [], manual: [] });
@@ -95,15 +106,27 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
     if (!inTree.has(issueRef.toLowerCase())) throw new Error(`${issueRef} 不在本轮任务树里，不能勾选`);
   }
 
-  const snapshot = ensureClaimSnapshot(profile, ref, n, tree);
-  const shifted = shiftedIssues(snapshot, tree);
-  if (shifted.length) {
-    await rounds.finish(ref, n, '中断', { reason: `${STANDARD_CHANGED_REASON}：${shifted.join('、')}` });
-    throw new Error(`${STANDARD_CHANGED_REASON}：${shifted.join('、')}。旧轮次评论未改`);
+  if (verdictItems.some((item) => item.result === '通过')) {
+    await guardPass({ rounds, ref, n, checks: verified.checks, items: verdictItems, where: 'close 的 verified.json' });
+  }
+  if (extracted) {
+    throw new Error('提炼标准（extracted）不能关单或写看板通过，应写待人工裁决');
+  }
+  const missing = missingConclusions(tree, verdictItems);
+  if (missing.length) {
+    throw new Error(`裁决缺结论（通过 / 要修 / 人工手测 / 待验 / 有争议），没写：${missing.join('、')}`);
+  }
+
+  const snapshot = readClaimSnapshot(profile, ref, n);
+  const unusable = snapshotUnusableReason(snapshot, tree);
+  if (unusable) {
+    await rounds.finish(ref, n, '中断', { reason: unusable });
+    throw new Error(`${unusable}。旧轮次评论未改`);
   }
 
   const overall = deriveStatus(verdictItems, [], {
     tree,
+    extracted,
     skippedQueries: tree.skippedQueries || [],
     collectionComplete: tree.collectionComplete,
   });
@@ -111,12 +134,13 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
     throw new Error('close 只处理通过或待人工：本轮有要修/有争议，不要关单');
   }
 
-  // 裁决防线：有「通过」条目时先查必需检查和证据。空证据 / 不可追溯补充在写之前拒绝，什么都不写。
-  if (verdictItems.some((item) => item.result === '通过')) {
-    await guardPass({ rounds, ref, n, checks: verified.checks, items: verdictItems, where: 'close 的 verified.json' });
-    guardOriginalPass(verdictItems, { snapshot, moduleUrl: import.meta.url });
-  } else if (overall === '通过') {
-    await guardPass({ rounds, ref, n, checks: verified.checks, items: verdictItems, where: 'close 的 verified.json' });
+  // 裁决防线：有「通过」条目时先查证据。空证据 / 不可追溯补充在写之前拒绝，什么都不写。
+  if (verdictItems.some((item) => item.result === '通过') || overall === '通过') {
+    guardOriginalPass(verdictItems, {
+      snapshot,
+      checkoutDir: snapshot.checkoutDir,
+      moduleUrl: import.meta.url,
+    });
   }
 
   const canClose = overall === '通过' && !pendingCloseBlocked(tree);

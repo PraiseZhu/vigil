@@ -26,6 +26,7 @@ import {
   machineOnlyTree,
   writeJsonFile,
   PASS_VERDICT_FILE,
+  claimWorld,
 } from './session.fixture.mjs';
 
 const ROOT_REF = `${REPO}#1`;
@@ -118,6 +119,7 @@ test('evidenceEnvHints：「没跑」和环境原因要在同一句才算', () =
 test('vigil#105 SC3 原样证据：close 和 verdict 都放行，判「通过」', async () => {
   const { profile, home } = setup();
   const world = machineOnlyTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   const items = machineConclusions({ [`${REPO}#2 SC3`]: { evidence: SC3_105_EVIDENCE } });
   const verdict = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items });
   const verified = writeJsonFile(home, 'verified.json', {
@@ -167,6 +169,7 @@ test('close：没给 --verdict（证据没法先查）→ 退出码 1、零写�
 test('verdict 判通过但 checks 里有 env-skipped → 退出码 6、这一轮标中断（环境问题）、不写通过', async () => {
   const { profile, home } = setup();
   const world = defaultTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   world.get(ROOT_REF).state = 'closed';
   const file = writeJsonFile(home, 'verdict.json', {
     checks: { build: 'ran', typecheck: 'env-skipped', test: 'env-skipped' },
@@ -184,6 +187,7 @@ test('verdict 判通过但 checks 里有 env-skipped → 退出码 6、这一轮
 test('verdict：checks 都写 ran，但「通过」证据写着因环境没跑 → 同样退出码 6、标中断', async () => {
   const { profile, home } = setup();
   const world = defaultTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   world.get(ROOT_REF).state = 'closed';
   const items = fullConclusions().map((item, i) =>
     i === 0 ? { ...item, evidence: 'build/typecheck/vitest 都没跑（依赖没装上）' } : item,
@@ -197,6 +201,7 @@ test('verdict：checks 都写 ran，但「通过」证据写着因环境没跑 �
 test('verdict：判通过却没写 checks → 退出码 1、零写入；判要修不需要 checks', async () => {
   const { profile, home } = setup();
   const world = defaultTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   world.get(ROOT_REF).state = 'closed';
   const noChecks = writeJsonFile(home, 'no-checks.json', { items: fullConclusions() });
   const refused = await helper(world, profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', noChecks]);
@@ -206,6 +211,7 @@ test('verdict：判通过却没写 checks → 退出码 1、零写入；判要�
   assert.match(rootComment(world).body, /第 1 轮：验收中/);
 
   const fixWorld = defaultTree();
+  claimWorld(profile, fixWorld, ROOT_REF, 1);
   const fix = writeJsonFile(home, 'fix.json', {
     items: fullConclusions({ [`${REPO}#2 SC4`]: { result: '要修', why: '缺测试' } }),
   });
@@ -307,6 +313,7 @@ test('#358 board --acceptance 通过：--checks 的 env-skipped note 已有执�
 test('#358 真没跑（0 passed / 依赖装不上）仍按环境未验证：退出码 6、标「中断」', async () => {
   const { profile, home } = setup();
   const world = defaultTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   world.get(ROOT_REF).state = 'closed';
   const file = writeJsonFile(home, 'verdict-358-notrun.json', {
     checks: { build: 'ran', typecheck: 'ran', test: { status: 'env-skipped', note: '依赖装不上，一个用例都没起来（0 passed）' } },
@@ -322,6 +329,7 @@ test('#358 边界：env-skipped 没写 note（{status} 无 note / 字符串 env-
   // 对象形式但没有 note：护栏只看 note 字符串，没有就交给原路径（环境未验证）。
   const objectCase = setup();
   const objectWorld = defaultTree();
+  claimWorld(objectCase.profile, objectWorld, ROOT_REF, 1);
   objectWorld.get(ROOT_REF).state = 'closed';
   const objectFile = writeJsonFile(objectCase.home, 'verdict-358-no-note.json', {
     checks: { build: 'ran', typecheck: 'ran', test: { status: 'env-skipped' } },
@@ -337,6 +345,7 @@ test('#358 边界：env-skipped 没写 note（{status} 无 note / 字符串 env-
   // 字符串形式 'env-skipped'：没有 note 可看，同样不被拦。
   const stringCase = setup();
   const stringWorld = defaultTree();
+  claimWorld(stringCase.profile, stringWorld, ROOT_REF, 1);
   stringWorld.get(ROOT_REF).state = 'closed';
   const stringFile = writeJsonFile(stringCase.home, 'verdict-358-string.json', {
     checks: { build: 'ran', typecheck: 'ran', test: 'env-skipped' },
@@ -387,6 +396,7 @@ test('#358 边界：checks 是数组 / 缺 checks 时新护栏放行，由 parse
   const { profile, home } = setup();
 
   const arrayWorld = defaultTree();
+  claimWorld(profile, arrayWorld, ROOT_REF, 1);
   arrayWorld.get(ROOT_REF).state = 'closed';
   const arrayFile = writeJsonFile(home, 'verdict-358-array.json', {
     checks: [{ status: 'env-skipped', note: '1200 passed' }],

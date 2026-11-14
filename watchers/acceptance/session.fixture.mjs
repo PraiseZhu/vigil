@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { bodyVersion } from './bin/rounds.mjs';
+import { materialVersions, writeClaimSnapshot } from './bin/authenticity.mjs';
 import { OWNER, OTHER_REPO, REPO, roundComment } from './fake-gh.fixture.mjs';
 import { PR_BODY_QUERY } from './host/prbot-gate-check.mjs';
 
@@ -478,6 +479,24 @@ export function machineOnlyTree(options = {}) {
 
 export function machineConclusions(overrides = {}, extra = {}) {
   return fullConclusions(overrides, { scs: MACHINE_SCS, ...extra });
+}
+
+/** 测试里跳过 rounds.start 时，按当前任务树写一份完整认领快照（沙箱不可写的 host/snapshots）。 */
+export function claimWorld(profile, world, ref, n = 1) {
+  const root = world.get(ref);
+  const bodies = { [ref]: root.body || '' };
+  for (const childRef of root.subIssues || []) {
+    const child = world.get(childRef);
+    if (child) bodies[child.ref] = child.body || '';
+  }
+  return writeClaimSnapshot(profile, ref, n, {
+    bodyVersion: bodyVersion(root.body),
+    bodies,
+    materials: materialVersions(),
+    inferred: false,
+    checkoutDir: profile.worktreeDir,
+    claimedAt: CLOCK,
+  });
 }
 
 /**

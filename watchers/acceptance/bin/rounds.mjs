@@ -11,7 +11,9 @@ const LOCK_STALE_MS = 10 * 60 * 1000;
 export const ISSUE_COMMENTS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
+      number
       body
+      repository { nameWithOwner }
       comments(last: 100) {
         nodes {
           id
@@ -21,6 +23,14 @@ export const ISSUE_COMMENTS_QUERY = `query ($owner: String!, $name: String!, $nu
           updatedAt
           url
           author { login __typename }
+        }
+      }
+      subIssues(first: 50) {
+        nodes {
+          number
+          body
+          author { login __typename }
+          repository { nameWithOwner }
         }
       }
     }
@@ -292,6 +302,19 @@ function commentsOf(issue) {
   return issue.comments?.nodes || [];
 }
 
+/** 认领快照用：总单正文 + 已挂上的可信子单正文。不 import collect，避免和 tasks 循环。 */
+function treeBodiesFromIssue(issue, rootRef, profile) {
+  const bodies = { [rootRef]: issue.body || '' };
+  const parsed = parseRef(rootRef);
+  const rootRepo = issue.repository?.nameWithOwner || parsed.repo;
+  for (const node of issue.subIssues?.nodes || []) {
+    if (!isTrustedAuthor(node?.author, profile)) continue;
+    const nodeRef = `${node.repository?.nameWithOwner || rootRepo}#${node.number}`;
+    bodies[nodeRef] = node.body || '';
+  }
+  return bodies;
+}
+
 function maxRound(rounds) {
   return (rounds || []).reduce((acc, round) => Math.max(acc, round.round), 0);
 }
@@ -349,11 +372,23 @@ export function createRounds({ github, profile, now = () => Date.now() }) {
         issue: task.number,
         body: formatStartBody(n, version, startedAt, { materials }),
       });
+      const bodies = treeBodiesFromIssue(fresh, ref, profile);
+      for (const child of task.children || []) {
+        if (!child?.ref || Object.hasOwn(bodies, child.ref)) continue;
+        try {
+          const childIssue = await readIssue(github, child.ref);
+          bodies[child.ref] = childIssue.body || '';
+        } catch {
+          // 缺子单正文：快照不完整，后续通过/关单会拒。
+        }
+      }
       writeClaimSnapshot(profile, ref, n, {
         bodyVersion: version,
-        bodies: { [ref]: fresh.body || '' },
+        bodies,
         materials,
         claimedAt: startedAt,
+        checkoutDir: profile.worktreeDir,
+        inferred: false,
       });
       writeCache(profile, ref, {
         kind: task.kind,

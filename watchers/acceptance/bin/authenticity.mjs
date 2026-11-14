@@ -36,6 +36,10 @@ function cacheKey(ref) {
   return String(ref || '').replace('#', '__').replace(/\//g, '__');
 }
 
+function conclusionKey(ref, sc) {
+  return `${String(ref).toLowerCase()} SC${Number(sc)}`;
+}
+
 export function evidenceIsEmpty(text) {
   return EMPTY_EVIDENCE.has(String(text ?? '').trim());
 }
@@ -53,17 +57,20 @@ export function materialVersions(dir = materialDir()) {
   return out;
 }
 
-/** 从临时目录启动的副本不能冒充只读检出上的原验入口。 */
-export function assertNotTempModule(moduleUrl, tmpDir = os.tmpdir()) {
-  const file = path.resolve(fileURLToPath(moduleUrl));
-  const tmp = path.resolve(tmpDir);
-  if (file === tmp || file.startsWith(`${tmp}${path.sep}`)) {
-    throw new Error('只能跑只读检出上的 helper/collect/close/verdict，不能从临时目录启动');
+function watcherHomeFromProfile(profile) {
+  if (typeof profile?.profilePath === 'string' && profile.profilePath) {
+    return path.dirname(path.dirname(profile.profilePath));
   }
+  throw new Error('认领快照需要 profile.profilePath，才能写到沙箱不可写的宿主目录');
+}
+
+/** 认领快照目录：`<watcher home>/state/host/snapshots`，沙箱看不见、写不了。 */
+export function snapshotDir(profile) {
+  return path.join(watcherHomeFromProfile(profile), 'state', 'host', 'snapshots');
 }
 
 export function snapshotPath(profile, ref, n) {
-  return path.join(profile.stateDir, 'snapshots', `${cacheKey(ref)}-r${n}.json`);
+  return path.join(snapshotDir(profile), `${cacheKey(ref)}-r${n}.json`);
 }
 
 function readJson(file) {
@@ -117,14 +124,12 @@ export function snapshotFromTree(tree) {
   };
 }
 
-export function ensureClaimSnapshot(profile, ref, n, tree) {
+/** 缺文件、推断、缺子单时抛错：禁止事后按当前正文重建。 */
+export function requireClaimSnapshot(profile, ref, n, tree) {
   const existing = readClaimSnapshot(profile, ref, n);
-  if (existing?.bodies && Object.keys(existing.bodies).length) return existing;
-  return writeClaimSnapshot(profile, ref, n, {
-    ...snapshotFromTree(tree),
-    inferred: true,
-    materials: materialVersions(),
-  });
+  const blocked = snapshotPassBlocked(existing, tree);
+  if (blocked) throw new Error(blocked);
+  return existing;
 }
 
 function sameExceptCheckbox(before, after) {
@@ -135,14 +140,16 @@ function sameExceptCheckbox(before, after) {
 }
 
 export function allowedStandardLine(before, after) {
+  if (before === after) return true;
+  if (!SC_ITEM_LINE.test(before) || !SC_ITEM_LINE.test(after)) return false;
   if (sameExceptCheckbox(before, after)) return true;
-  if (!SC_ITEM_LINE.test(before) || !after.endsWith(MANUAL_SUFFIX)) return false;
+  if (!after.endsWith(MANUAL_SUFFIX)) return false;
   const trimmed = before.trimEnd();
   if (trimmed.endsWith(MANUAL_SUFFIX.trim())) return false;
   return sameExceptCheckbox(trimmed, after.slice(0, -MANUAL_SUFFIX.length));
 }
 
-/** 除勾选与行尾「 人工手测」外，标准正文有任何其它字的变化。 */
+/** 除 SC 行已验勾选和行尾「 人工手测」外，标准正文有任何其它字的变化。 */
 export function standardShifted(startBody, currentBody) {
   const oldLines = String(startBody ?? '').split('\n');
   const newLines = String(currentBody ?? '').split('\n');
@@ -157,15 +164,35 @@ export function shiftedIssues(snapshot, tree) {
   const out = [];
   const bodies = snapshot?.bodies || {};
   for (const issue of tree?.issues || []) {
-    if (!Object.prototype.hasOwnProperty.call(bodies, issue.ref)) continue;
+    if (!Object.prototype.hasOwnProperty.call(bodies, issue.ref)) {
+      out.push(issue.ref);
+      continue;
+    }
     const current = issue.body != null ? issue.body : '';
     if (standardShifted(bodies[issue.ref], current)) out.push(issue.ref);
   }
   return out;
 }
 
-function conclusionKey(ref, sc) {
-  return `${String(ref).toLowerCase()} SC${Number(sc)}`;
+export function snapshotUnusableReason(snapshot, tree) {
+  if (!snapshot) return '缺少认领快照，本轮作废';
+  if (snapshot.inferred) return '认领快照是推断的，本轮作废';
+  if (!snapshot.bodyVersion) return '缺少起始正文版本，本轮作废';
+  const shifted = shiftedIssues(snapshot, tree);
+  if (shifted.length) return `${STANDARD_CHANGED_REASON}：${shifted.join('、')}`;
+  return null;
+}
+
+export function snapshotPassBlocked(snapshot, tree) {
+  const unusable = snapshotUnusableReason(snapshot, tree);
+  if (unusable) return unusable.replace(/，本轮作废$/, '，不能通过/关单/写看板通过');
+  if (!snapshot.materials || typeof snapshot.materials !== 'object' || !Object.keys(snapshot.materials).length) {
+    return '认领快照材料版本为空，不能通过/关单/写看板通过';
+  }
+  const now = materialVersions();
+  const changed = Object.keys(snapshot.materials).filter((name) => now[name] && now[name] !== snapshot.materials[name]);
+  if (changed.length) return `执行材料已变：${changed.join('、')}`;
+  return null;
 }
 
 export function treeItemOf(tree, ref, sc) {
@@ -177,25 +204,28 @@ export function treeItemOf(tree, ref, sc) {
   return null;
 }
 
+function relativeInCheckout(rel) {
+  return typeof rel === 'string' && rel && !path.isAbsolute(rel) && !rel.split(/[\\/]/).includes('..');
+}
+
 export function originalPassBlocked(item, { checkoutDir, snapshot } = {}) {
   if (item?.result !== '通过') return null;
   const ref = `${item.ref} SC${item.sc}`;
   if (item.evidenceKind === 'supplement') {
     return `${ref} 的补充证据不能替代冻结标准的通过`;
   }
-  if (item.extraTest === true && item.evidenceKind !== 'frozen') {
-    return `${ref} 的额外测试没有结构化冻结追溯，不能判原标准通过`;
-  }
   if (evidenceIsEmpty(item.evidence)) {
     return `${ref} 的通过证据为空`;
   }
   const files = Array.isArray(item.testFiles) ? item.testFiles : [];
   const root = checkoutDir || snapshot?.checkoutDir || null;
-  if (files.length && root) {
+  const tempOrExtra = TEMP_COPY_HINT.test(String(item.evidence || '')) || item.extraTest === true;
+  const needsCheckout = tempOrExtra || item.evidenceKind === 'frozen' || files.length > 0;
+  if (needsCheckout) {
+    if (!files.length) return `${ref} 的通过证据不可追溯到冻结检出（未提供 testFiles）`;
+    if (!root) return `${ref} 的 testFiles 没有冻结检出根`;
     for (const rel of files) {
-      if (typeof rel !== 'string' || !rel || path.isAbsolute(rel) || rel.split(/[\\/]/).includes('..')) {
-        return `${ref} 的 testFiles 不是检出内相对路径`;
-      }
+      if (!relativeInCheckout(rel)) return `${ref} 的 testFiles 不是检出内相对路径`;
       if (!fs.existsSync(path.join(root, rel))) {
         return `${ref} 的 testFiles 不在冻结检出里：${rel}`;
       }
@@ -204,20 +234,20 @@ export function originalPassBlocked(item, { checkoutDir, snapshot } = {}) {
   if (item.codeSha && snapshot?.codeSha && item.codeSha !== snapshot.codeSha) {
     return `${ref} 的 codeSha 与本轮冻结 SHA 不一致`;
   }
-  if (TEMP_COPY_HINT.test(String(item.evidence || '')) && !files.length && item.evidenceKind !== 'frozen') {
-    return `${ref} 的通过证据不可追溯到冻结检出（未提供 testFiles 或 evidenceKind=frozen）`;
-  }
   return null;
 }
 
 export function guardOriginalPass(items = [], extras = {}) {
   if (extras.moduleUrl) assertNotTempModule(extras.moduleUrl);
   const snapshot = extras.snapshot;
-  if (snapshot?.materials && extras.compareMaterials !== false) {
-    const now = extras.materials || materialVersions(extras.materialDir || materialDir());
-    const changed = Object.keys(snapshot.materials).filter((name) => now[name] && now[name] !== snapshot.materials[name]);
-    if (changed.length && items.some((item) => item.result === '通过')) {
-      throw new Error(`执行材料已变，不能按原标准判通过：${changed.join('、')}`);
+  if (items.some((item) => item.result === '通过')) {
+    if (!snapshot?.materials || !Object.keys(snapshot.materials).length) {
+      throw new Error('认领快照材料版本为空，不能按原标准判通过');
+    }
+    if (extras.compareMaterials !== false) {
+      const now = extras.materials || materialVersions(extras.materialDir || materialDir());
+      const changed = Object.keys(snapshot.materials).filter((name) => now[name] && now[name] !== snapshot.materials[name]);
+      if (changed.length) throw new Error(`执行材料已变，不能按原标准判通过：${changed.join('、')}`);
     }
   }
   for (const item of items) {
@@ -259,15 +289,30 @@ export function lineValue(body, label) {
   return match ? match.slice(label.length + 1).trim() : null;
 }
 
-export function illegalPassFromVerdictText(body, tree) {
+function passEvidenceLines(body) {
+  const have = new Map();
+  for (const line of String(body || '').split('\n')) {
+    const trimmed = line.trim();
+    const match = /^- 通过：(\S+)\s+SC(\d+)(?:\s|·|$)/.exec(trimmed);
+    if (!match) continue;
+    const ev = /证据：(.*)$/.exec(trimmed);
+    have.set(conclusionKey(match[1], match[2]), ev ? ev[1] : '');
+  }
+  return have;
+}
+
+export function illegalPassFromVerdictText(body, tree, snapshot) {
   const match = /^\[验收机\] 第 \d+ 轮：(通过|要修|待人工|中断)/.exec(firstLine(body));
   if (!match || match[1] !== '通过') return [];
   const reasons = [];
+  const snapBlock = snapshotPassBlocked(snapshot, tree);
+  if (snapBlock) reasons.push(snapBlock);
   if (tree?.manual?.length) reasons.push('人工层未完成，不能总评通过');
   if (tree?.collectionComplete === false || (tree?.skippedQueries || []).length) {
     reasons.push('收集不完整，不能按原标准通过');
   }
   if (/未执行的查询|未收集全/.test(body)) reasons.push('裁决写明未收集全');
+  const have = passEvidenceLines(body);
   for (const line of String(body || '').split('\n')) {
     const trimmed = line.trim();
     if (trimmed.startsWith('- 人工手测：') || trimmed.startsWith('- 待验：')) {
@@ -276,6 +321,17 @@ export function illegalPassFromVerdictText(body, tree) {
     if (trimmed.startsWith('- 通过：')) {
       const ev = /证据：(.*)$/.exec(trimmed);
       if (!ev || evidenceIsEmpty(ev[1])) reasons.push('通过项空证据');
+    }
+  }
+  for (const issue of tree?.issues || []) {
+    for (const item of issue.items || []) {
+      const key = conclusionKey(item.source || issue.ref, item.sc);
+      const evidence = have.get(key);
+      if (evidence === undefined) {
+        reasons.push(`通过评论缺 ${item.source || issue.ref} SC${item.sc} 的证据`);
+      } else if (evidenceIsEmpty(evidence)) {
+        reasons.push(`${item.source || issue.ref} SC${item.sc} 通过项空证据`);
+      }
     }
   }
   return [...new Set(reasons)];
@@ -287,4 +343,25 @@ export function pendingCloseBlocked(tree) {
     return '收集不完整，不能关总单、不能写看板通过';
   }
   return null;
+}
+
+export function tempRoots() {
+  const out = [];
+  for (const dir of [os.tmpdir(), '/tmp', '/var/tmp', process.env.TMPDIR, process.env.TMP, process.env.TEMP]) {
+    if (typeof dir !== 'string' || !dir.trim()) continue;
+    const resolved = path.resolve(dir);
+    if (resolved === path.parse(resolved).root) continue;
+    if (!out.includes(resolved)) out.push(resolved);
+  }
+  return out;
+}
+
+/** 从临时目录启动的副本不能冒充只读检出上的原验入口。 */
+export function assertNotTempModule(moduleUrl) {
+  const file = path.resolve(fileURLToPath(moduleUrl));
+  for (const tmp of tempRoots()) {
+    if (file === tmp || file.startsWith(`${tmp}${path.sep}`)) {
+      throw new Error('只能跑只读检出上的 helper/collect/close/verdict，不能从临时目录启动');
+    }
+  }
 }

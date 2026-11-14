@@ -198,6 +198,8 @@ async function markClaimed({ github, profile, task, started, now, stderr, alert 
     writeClaimSnapshot(profile, task.ref, started.round, {
       bodyVersion: tree.root.bodyVersion,
       bodies,
+      checkoutDir: profile.worktreeDir,
+      inferred: false,
     });
   } catch (error) {
     failed.push({ ref: task.ref, error: String(error?.message || error) });

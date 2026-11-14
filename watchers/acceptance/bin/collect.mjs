@@ -233,6 +233,15 @@ export async function collectTree({ github, profile, ref }) {
       }
       throw error;
     }
+    if (Array.isArray(found?.skippedQueries) && found.skippedQueries.length) {
+      for (const skipped of found.skippedQueries) {
+        skippedQueries.push({
+          query: skipped.query || query,
+          reason: skipped.reason || 'no-app-route',
+        });
+      }
+      continue;
+    }
     for (const node of found?.search?.nodes || []) {
       if (node?.__typename && node.__typename !== 'Issue') continue;
       if (!isTrustedAuthor(node?.author, profile)) continue;

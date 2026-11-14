@@ -14,7 +14,13 @@ import { runCorrect } from './correct.mjs';
 import { runPush, secretFiles, sessionPath, writeNeedsHuman } from './push.mjs';
 import { EnvUnverifiedError, guardPass, readChecksRaw } from './checks.mjs';
 import { runVerdict } from './verdict.mjs';
-import { OVERALL_PENDING, assertNotTempModule, pendingCloseBlocked } from './authenticity.mjs';
+import {
+  OVERALL_PENDING,
+  assertNotTempModule,
+  pendingCloseBlocked,
+  readClaimSnapshot,
+  snapshotPassBlocked,
+} from './authenticity.mjs';
 
 export const EXIT = Object.freeze({ OK: 0, FAIL: 1, CLAIM: 3, REJECTED: 4, SECRET: 5, ENV: 6 });
 
@@ -229,7 +235,8 @@ async function cmdBoard({ github, profile, ref, n, flags, now, stdout }) {
     targets = [one];
   }
   if (acceptance === '通过') {
-    const blocked = pendingCloseBlocked(await loadTree());
+    const loaded = await loadTree();
+    const blocked = pendingCloseBlocked(loaded) || snapshotPassBlocked(readClaimSnapshot(profile, ref, n), loaded);
     if (blocked) throw new Error(blocked);
   }
 

@@ -23,6 +23,7 @@ import {
   ALL_RAN,
   ALL_RAN_CHECKS_FILE,
   PASS_VERDICT_FILE,
+  claimWorld,
 } from './session.fixture.mjs';
 
 function loadProfile(extra = {}) {
@@ -65,6 +66,7 @@ function writesOf(world, type) {
 test('SC3 verdict 就地改轮次评论：逐条结果、正文版本、放锁、只写一次', async () => {
   const { profile, home } = loadProfile();
   const world = defaultTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   world.addComment(`${REPO}#1`, {
     body: [`- 有争议：${REPO}#2 SC9 · 验收方：x · 修正方：y`].join('\n'),
   });
@@ -116,6 +118,7 @@ test('SC3 verdict 就地改轮次评论：逐条结果、正文版本、放锁�
 test('SC3 逐条结果里有「要修」或「有争议」→ 要修；人工手测使总评为待人工', async () => {
   const { profile, home } = loadProfile();
   const world = defaultTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
 
   const disputed = verdictFile(home, {
     items: fullConclusions({
@@ -129,6 +132,7 @@ test('SC3 逐条结果里有「要修」或「有争议」→ 要修；人工手
   assert.ok(body.includes(`- 有争议：${REPO}#2 SC4 · 验收方：没证据 · 修正方：测过了`));
 
   const world2 = defaultTree({ roundNumber: 2, roundStatus: '验收中' });
+  claimWorld(profile, world2, `${REPO}#1`, 2);
   const passFile = verdictFile(home, {
     items: fullConclusions({ [`${REPO}#2 SC5`]: { result: '人工手测', layer: 'paid' } }),
   });
@@ -141,6 +145,7 @@ test('SC3 逐条结果里有「要修」或「有争议」→ 要修；人工手
 test('SC3 --status 与逐条结果不一致 → 退出码 1，不写', async () => {
   const { profile, home } = loadProfile();
   const world = defaultTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   const file = verdictFile(home, { items: fullConclusions({ [`${REPO}#2 SC3`]: { result: '要修', why: 'x' } }) });
   const result = await run(world, profile, [
     'verdict',
@@ -177,6 +182,7 @@ test('SC3 关闭勾选后按改后的正文记版本，trigger 不会因此重�
   const root = world.get(`${REPO}#1`);
   root.subIssues = [];
   root.prs = [{ number: 12, url: `https://github.com/${REPO}/pull/12`, mergedAt: '2026-10-20T00:00:00.000Z', baseRefName: 'main' }];
+  claimWorld(profile, world, `${REPO}#1`, 1);
   const before = bodyVersion(root.body);
 
   const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN,
@@ -220,6 +226,7 @@ test('SC11 裁决正文脱敏：不写状态目录、令牌、运行 id；首行
   const { profile, home } = loadProfile();
   // 子 issue 没有验收项：任务树里只有总 issue 的 SC1 / SC2 要结论，裁决里不会提到跨仓子 issue。
   const world = defaultTree({ childBody: '', otherBody: '' });
+  claimWorld(profile, world, `${REPO}#1`, 1);
   const fakeHome = ['', 'home', 'someone', 'project'].join('/');
   const token = `ghp_${'x'.repeat(36)}`;
   const file = verdictFile(home, {
@@ -286,6 +293,7 @@ test('SC11 redact 单元：绝对路径、令牌、私钥、Bearer、运行 id �
 test('「通过」之前总 issue 必须已关：还开着 → 退出码 1、不写裁决（免得留下通过但没关、以后也不再验）', async () => {
   const { profile, home } = loadProfile();
   const world = machineOnlyTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   const file = verdictFile(home, { items: machineConclusions() });
   const open = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', file]);
   assert.equal(open.code, 1);
@@ -294,6 +302,7 @@ test('「通过」之前总 issue 必须已关：还开着 → 退出码 1、不
 
   // 「要修」不受影响：总 issue 本来就不关。
   const fixWorld = defaultTree();
+  claimWorld(profile, fixWorld, `${REPO}#1`, 1);
   const fix = verdictFile(home, { items: fullConclusions({ [`${REPO}#2 SC4`]: { result: '要修', why: '缺测试' } }) });
   const needsFix = await run(fixWorld, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', fix]);
   assert.equal(needsFix.code, 0, needsFix.err);
@@ -312,6 +321,7 @@ function withHandoff(world) {
 test('#140 SC5 交接有重点项时 handoffChecks 缺一条 → 退出码 1、什么都不写；补齐后裁决多一节「交接重点核对」', async () => {
   const { profile, home } = loadProfile();
   const world = defaultTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   const handoff = withHandoff(world);
   const items = fullConclusions({ [`${REPO}#2 SC4`]: { result: '要修', why: '看板没写', evidence: 'x' } });
   const short = verdictFile(home, { items, handoffChecks: [{ n: 1, result: '查了，没问题' }] });
@@ -332,6 +342,7 @@ test('#140 SC2 批准执行推进、却没有交接：裁决多一行「没有�
   const { profile, home } = loadProfile();
   const items = fullConclusions({ [`${REPO}#2 SC4`]: { result: '要修', why: '看板没写', evidence: 'x' } });
   let world = defaultTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   world.addComment(`${REPO}#1`, { body: `批准执行登记：2026-10-24 ${REPO}#2 → 会话 s1（x）claim c1` });
   let res = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', verdictFile(home, { items })]);
   assert.equal(res.code, 0, res.err);
@@ -339,6 +350,7 @@ test('#140 SC2 批准执行推进、却没有交接：裁决多一行「没有�
   assert.equal(NO_HANDOFF_LINE, '批准执行没有交接评论，等满 24 小时后照常验收。');
 
   world = defaultTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   res = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', verdictFile(home, { items })]);
   assert.equal(res.code, 0, res.err);
   const body = writesOf(world, 'comment.update')[0].body;
@@ -348,6 +360,7 @@ test('#140 SC2 批准执行推进、却没有交接：裁决多一行「没有�
 test('#140 反例（review-pr141）：交接早于最后一条登记时按没有交接写裁决：带「没有交接评论」一行，不要求旧重点项', async () => {
   const { profile, home } = loadProfile();
   const world = defaultTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   withHandoff(world);
   world.addComment(`${REPO}#1`, { body: `批准执行登记：2026-10-24 ${REPO}#3 → 会话 s2（x）claim c2`, createdAt: '2026-10-24T00:30:00.000Z' });
   const items = fullConclusions({ [`${REPO}#2 SC4`]: { result: '要修', why: '看板没写', evidence: 'x' } });

@@ -23,6 +23,7 @@ import {
   ALL_RAN,
   ALL_RAN_CHECKS_FILE,
   PASS_VERDICT_FILE,
+  claimWorld,
 } from './session.fixture.mjs';
 
 function loadProfile() {
@@ -80,6 +81,7 @@ test('helper 未知命令 / 缺参数 → 退出码 1 并打印用法', async ()
 test('SC4 close 有人工层时勾已验项、标人工手测，但不关总单、不写看板通过', async () => {
   const { profile, home } = loadProfile();
   const world = defaultTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN,
     items: [
       { ref: `${REPO}#2`, sc: 3 },
@@ -88,7 +90,17 @@ test('SC4 close 有人工层时勾已验项、标人工手测，但不关总单�
     manual: [{ ref: `${REPO}#2`, sc: 5 }],
   });
 
-  const result = await run(world, profile, ['close', '--issue', `${REPO}#1`, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
+  const result = await run(world, profile, [
+    'close',
+    '--issue',
+    `${REPO}#1`,
+    '--round',
+    '1',
+    '--verified',
+    verified,
+    '--verdict',
+    writeJsonFile(home, 'pending-verdict.json', { checks: ALL_RAN, items: fullConclusions() }),
+  ]);
   assert.equal(result.code, 0, result.err);
   const printed = JSON.parse(result.out);
   assert.equal(printed.closed, null);
@@ -115,6 +127,7 @@ test('SC4 close 有人工层时勾已验项、标人工手测，但不关总单�
 test('SC6 close 全机器层且证据非空：勾选 → 看板通过 → 关总单', async () => {
   const { profile, home } = loadProfile();
   const world = machineOnlyTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN,
     items: [
       { ref: `${REPO}#2`, sc: 3 },
@@ -123,7 +136,17 @@ test('SC6 close 全机器层且证据非空：勾选 → 看板通过 → 关总
     manual: [],
   });
 
-  const result = await run(world, profile, ['close', '--issue', `${REPO}#1`, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
+  const result = await run(world, profile, [
+    'close',
+    '--issue',
+    `${REPO}#1`,
+    '--round',
+    '1',
+    '--verified',
+    verified,
+    '--verdict',
+    writeJsonFile(home, 'machine-pass.json', { checks: ALL_RAN, items: machineConclusions() }),
+  ]);
   assert.equal(result.code, 0, result.err);
   const printed = JSON.parse(result.out);
   assert.equal(printed.closed, `${REPO}#1`);
@@ -229,6 +252,7 @@ test('SC10 progress 写最近进度时间，done 要求先有裁决', async () =
 
   // 写裁决之后才能 done。「通过」之前总 issue 要已关（helper close 做的事），这里直接置为已关。
   const passWorld = machineOnlyTree();
+  claimWorld(profile, passWorld, `${REPO}#1`, 1);
   passWorld.get(`${REPO}#1`).state = 'closed';
   const verdict = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items: machineConclusions() });
   const judged = await run(passWorld, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', verdict]);
@@ -305,6 +329,7 @@ test('SC10 done 只认我自己的轮次评论：别人伪造的「第 n 轮：�
 test('SC9 写闸拒绝（非 secret-found）→ 退出码 4 且这一轮标中断写明原因', async () => {
   const { profile } = loadProfile();
   const world = machineOnlyTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   const result = await run(world, profile, [
     'board',
     '--issue',
@@ -333,6 +358,7 @@ test('SC9 写闸拒绝（非 secret-found）→ 退出码 4 且这一轮标中�
 test('SC9 写闸忙 → 退出码 1 且这一轮标中断写「写闸忙」', async () => {
   const { profile } = loadProfile();
   const world = machineOnlyTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   const result = await run(world, profile, ['board', '--issue', `${REPO}#1`, '--round', '1', '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE], {
     onWrite: (action) => {
       if (action.type === 'project.field.set') throw new WriteBusyError('外发忙');

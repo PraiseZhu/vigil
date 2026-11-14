@@ -38,6 +38,7 @@ import {
   ALL_RAN,
   ALL_RAN_CHECKS_FILE,
   PASS_VERDICT_FILE,
+  claimWorld,
 } from './session.fixture.mjs';
 
 const ROOT_REF = `${REPO}#1`;
@@ -261,6 +262,7 @@ test('verdict-only 写闸：绑定到名单里的根，关单 / 勾选 / 开修�
   // 别的根不受影响（全机器层仍可关单）。
   const other = setup();
   const otherWorld = machineOnlyTree();
+  claimWorld(other.profile, otherWorld, ROOT_REF, 1);
   const normal = openGate({ home: other.home, profile: other.profile, world: otherWorld, binding: bindingFor(otherWorld) });
   await normal.start();
   const closed = await normal.handle({ type: 'issue.close', repo: REPO, issue: 1, reason: 'completed', dedupeKey: 'normal-close' });
@@ -270,6 +272,7 @@ test('verdict-only 写闸：绑定到名单里的根，关单 / 勾选 / 开修�
 test('端到端 verdict-only：helper → 真写闸，裁决照写并带「本 issue 由人工复核后关闭」，issue 不关', async () => {
   const { home, profile } = setup({ profile: { verdictOnlyIssues: [ROOT_REF] } });
   const world = defaultTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   const gate = openGate({ home, profile, world, binding: bindingFor(world) });
   await gate.start();
   const github = realGithubThroughGate({ profile, world, gate });
@@ -300,6 +303,7 @@ test('端到端 verdict-only：helper → 真写闸，裁决照写并带「本 i
 test('helper：写闸回 4 verdict-only（绕过 helper 的情形）→ 退出码 4，但不标中断', async () => {
   const { profile } = setup();
   const world = machineOnlyTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   const result = await helper(
     createFakeGithub(world, {
       onWrite: (action) => {
@@ -319,6 +323,7 @@ test('helper：写闸回 4 verdict-only（绕过 helper 的情形）→ 退出�
 test('close 顺序 勾选 → 看板 → 关单：看板写失败就停在关单之前，issue 还开着', async () => {
   const { profile, home } = setup();
   const world = machineOnlyTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN, items: [{ ref: `${REPO}#2`, sc: 3 }], manual: [] });
   const result = await helper(
     createFakeGithub(world, {
@@ -328,7 +333,7 @@ test('close 顺序 勾选 → 看板 → 关单：看板写失败就停在关单
       },
     }),
     profile,
-    ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE],
+    ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', writeJsonFile(home, 'machine-pass.json', { checks: ALL_RAN, items: machineConclusions() })],
   );
   assert.equal(result.code, 1, result.err);
   assert.match(result.err, /看板写失败/);
@@ -341,6 +346,7 @@ test('端到端 close：helper → 真写闸，有人工层时勾选放行、不
   const { home, profile } = setup();
   const childBody = ['# 子任务', '', '- [ ] SC3 把结果写进轮次评论 验证：unit', '- [ ] SC5 真机 验证：cindy-mac', ''].join('\r\n');
   const world = defaultTree({ childBody });
+  claimWorld(profile, world, ROOT_REF, 1);
   const gate = openGate({ home, profile, world, binding: bindingFor(world) });
   await gate.start();
   const github = realGithubThroughGate({ profile, world, gate });
@@ -348,7 +354,7 @@ test('端到端 close：helper → 真写闸，有人工层时勾选放行、不
     items: [{ ref: `${REPO}#2`, sc: 3 }],
     manual: [{ ref: `${REPO}#2`, sc: 5 }],
   });
-  const result = await helper(github, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
+  const result = await helper(github, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', writeJsonFile(home, 'pending-verdict.json', { checks: ALL_RAN, items: fullConclusions() })]);
   assert.equal(result.code, 0, result.err);
   const types = github.gateCalls.map((action) => action.type);
   assert.deepEqual(types, ['issue.edit']);
@@ -361,6 +367,7 @@ test('端到端 close：helper → 真写闸，有人工层时勾选放行、不
 test('端到端 close：全机器层 helper → 真写闸，勾选 → 看板 → 关单都放行', async () => {
   const { home, profile } = setup();
   const world = machineOnlyTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   const gate = openGate({ home, profile, world, binding: bindingFor(world) });
   await gate.start();
   const github = realGithubThroughGate({ profile, world, gate });
@@ -368,7 +375,7 @@ test('端到端 close：全机器层 helper → 真写闸，勾选 → 看板 �
     items: [{ ref: `${REPO}#2`, sc: 3 }, { ref: `${OTHER_REPO}#7`, sc: 7 }],
     manual: [],
   });
-  const result = await helper(github, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
+  const result = await helper(github, profile, ['close', '--issue', ROOT_REF, '--round', '1', '--verified', verified, '--verdict', writeJsonFile(home, 'machine-pass.json', { checks: ALL_RAN, items: machineConclusions() })]);
   assert.equal(result.code, 0, result.err);
   const types = github.gateCalls.map((action) => action.type);
   assert.deepEqual(types, ['issue.edit', 'issue.edit', 'project.field.set', 'project.field.set', 'project.field.set', 'issue.close']);
@@ -417,6 +424,7 @@ test('verdict 覆盖率：任务树里有 SC 没结论 → 退出码 1、点名�
   const empty = writeJsonFile(home, 'empty.json', { items: [] });
   // 连没有 SC 的任务（items 本该是提炼出来的标准）也不行：空的不能判通过。
   const bare = defaultTree({ rootBody: '# 没写验收标准', childBody: '', otherBody: '' });
+  claimWorld(profile, bare, ROOT_REF, 1);
   const none = await helper(createFakeGithub(bare), profile, ['verdict', '--issue', ROOT_REF, '--round', '1', '--file', empty]);
   assert.equal(none.code, 1);
   assert.match(none.err, /items 是空的/);
@@ -446,6 +454,7 @@ test('missingConclusions：大小写不敏感、同一条只报一次', () => {
 test('端到端 verdict：helper → 真写闸，全覆盖的裁决放行；时间写北京时间', async () => {
   const { home, profile } = setup();
   const world = defaultTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   const gate = openGate({ home, profile, world, binding: bindingFor(world) });
   await gate.start();
   const github = realGithubThroughGate({ profile, world, gate });
@@ -1010,6 +1019,7 @@ test('github.mjs：写闸退出码 4 带回 reason 和 files；退出码 1 是�
 test('helper：写闸退出码 1 → helper 退出码 1（不是 4），这一轮尽力标中断写明原因', async () => {
   const { profile } = setup();
   const world = machineOnlyTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   const result = await helper(
     createFakeGithub(world, {
       onWrite: (action) => {
@@ -1029,6 +1039,7 @@ test('helper：写闸退出码 1 → helper 退出码 1（不是 4），这一�
 test('helper push：写闸扫到密钥时回的文件名记进「需人工处理」，裁决里列出文件名（#46 SC7）', async () => {
   const { profile, home } = setup();
   const world = defaultTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   const files = ['config/leak.txt'];
   const fakeGit = {
     async branchSha() {
