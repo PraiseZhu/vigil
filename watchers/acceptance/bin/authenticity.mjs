@@ -57,7 +57,7 @@ export function materialVersions(dir = materialDir()) {
   return out;
 }
 
-/** 认领快照相对 watcher home 的路径。沙箱只通过只读叠挂看到本轮权威快照文件，看不到其他轮次，也看不到整个 host 状态。 */
+/** 认领快照相对 watcher home 的路径。沙箱只通过空 tmpfs 视图看到本轮权威快照文件，看不到其他轮次/已有内容/符号链接，也看不到整个 host 状态。 */
 export const CLAIM_SNAPSHOT_REL = path.join('state', 'host', 'snapshots');
 
 function watcherHomeFromProfile(profile) {
