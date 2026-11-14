@@ -29,7 +29,7 @@ import {
   DRAIN_MAX_MS,
   spawnDrainHolder,
 } from './deploy-ff.mjs';
-import { readDeployAudit } from './deploy-audit.mjs';
+import { appendDeployAudit, readDeployAudit } from './deploy-audit.mjs';
 import { makeGrant } from './deploy-grant.fixture.mjs';
 import { tryAcquireLock } from './host/paths.mjs';
 import { acquireSlot } from './host/round.mjs';
@@ -2693,5 +2693,38 @@ test('B SC6 新机制不能自证旧 SHA 文件；本轮不提交生产授予文
   assert.match(doc, /回滚/);
   assert.match(doc, /威胁模型/);
   assert.match(doc, /不声称密码学保证|不是密码学保证/);
+  assert.match(doc, /过期判断只看本机时钟/);
+});
+
+test('B P2 doctor-failed 第二笔审计写失败时 reason 写明未写入，仍不回滚', { skip: FLOCK_SKIP }, async () => {
+  const world = makeWorld();
+  const sha = commitAndPush(world, [{ path: 'watchers/acceptance/host/note.mjs', content: 'export const n = 1;\n' }], 'gate');
+  const before = git(world.deploy, ['rev-parse', 'HEAD']);
+  let writes = 0;
+  const result = await deploy(world, {
+    fetchImpl: green(sha),
+    grant: grantFor(world),
+    runDoctor: () => ({ code: 1, stdout: '检查没过\n', stderr: '' }),
+    appendAudit: (file, payload) => {
+      writes += 1;
+      if (writes === 1) {
+        appendDeployAudit(file, payload);
+        return;
+      }
+      throw new Error('disk full');
+    },
+  });
+  const json = assertRun(result, 'doctor-failed');
+  assert.equal(result.code, EXIT['doctor-failed']);
+  assert.equal(result.after, sha);
+  assert.notEqual(result.after, before);
+  assert.equal(result.calls.some((args) => args[0] === 'reset'), false);
+  assert.match(json.reason, new RegExp(`工作区已从 ${before} 快进到 ${sha}，未自动回滚`));
+  assert.match(json.reason, /doctor-failed 审计行未写入/);
+  const rows = auditOf(world);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].outcome, 'attempt');
+  assert.equal(rows[0].workspaceChanged, false);
+  assert.equal(writes, 2);
 });
 

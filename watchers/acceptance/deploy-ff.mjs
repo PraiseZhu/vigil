@@ -1590,8 +1590,8 @@ export async function runDeploy(options) {
     }
     const post = await runPostDeploy(opts, files);
     if (!post.ok) {
-      const reason = `工作区已从 ${baseSha} 快进到 ${afterFetch.target}，未自动回滚。${post.reason}`;
-      tryAppendAudit(opts, {
+      let reason = `工作区已从 ${baseSha} 快进到 ${afterFetch.target}，未自动回滚。${post.reason}`;
+      const failedLog = tryAppendAudit(opts, {
         attemptId,
         outcome: 'doctor-failed',
         previousSha: baseSha,
@@ -1602,6 +1602,7 @@ export async function runDeploy(options) {
         associatedFailure: reason,
         ...grantAuditFields(grantState.judged),
       });
+      if (!failedLog.ok) reason += ' doctor-failed 审计行未写入';
       return await conclude(decide({ postOk: false, reason, files: post.files }));
     }
     tryAppendAudit(opts, {
