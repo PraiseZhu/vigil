@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { assertSocketPath } from './egress-proxy.mjs';
 import { isVerdictOnly, loadAcceptanceProfile, watcherHome } from '../bin/profile.mjs';
 import { recordScope } from './scope-snapshot.mjs';
-import { createGithub, PRIO_BOARD_FIELDS, WRITE_TYPES } from '../bin/github.mjs';
+import { AppOnlyError, createGithub, PRIO_BOARD_FIELDS, WRITE_TYPES } from '../bin/github.mjs';
 import { bodyVersion, latestRound, parseRef, parseRounds } from '../bin/rounds.mjs';
 import {
   ISSUE_BODY_QUERY,
@@ -37,6 +37,12 @@ import {
   PR_STATUS_QUERY,
   READY_ACTIVITY_QUERY,
 } from './prbot-gate-check.mjs';
+import {
+  illegalPassFromVerdictText,
+  passSideEffectBlocked,
+  pendingCloseBlocked,
+  readClaimSnapshot,
+} from '../bin/authenticity.mjs';
 
 export { MAIN_CHECKS_QUERY, PR_BY_BRANCH_QUERY, PR_HEAD_QUERY, PR_STATUS_QUERY, READY_ACTIVITY_QUERY };
 
@@ -52,7 +58,7 @@ const GATE_ACTION_TYPES = [...GATE_ACTIONS.keys()];
 const ALLOWED_TYPES = new Set([...WRITE_TYPES, ...GATE_ACTION_TYPES, 'read.graphql', 'probe']);
 const WATCH_ALLOWED_TYPES = new Set(['comment.create', 'comment.update', 'project.field.set', 'read.graphql']);
 const ACCEPTANCE_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：验收中$/;
-const VERDICT_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(通过|要修)/;
+const VERDICT_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(通过|要修|待人工)/;
 const ABORT_FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：中断/;
 const BRANCH_PATTERN = /^acceptance\/(\d+)-(\d+)-sc(\d+)$/;
 const GREEN_CHECKS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
@@ -191,10 +197,12 @@ function sameExceptCheckbox(before, after) {
   return Boolean(a && b && a[1] === b[1] && a[2] === b[2]);
 }
 
-/** 一行允许的改动：勾选 / 取消；或在验收项行尾补一次「 人工手测」（可同时勾选）。 */
+/** 一行允许的改动：只许 SC 行勾选 / 取消，或在验收项行尾补一次「 人工手测」（可同时勾选）。 */
 function allowedLineEdit(before, after) {
+  if (before === after) return true;
+  if (!SC_ITEM_LINE.test(before)) return false;
   if (sameExceptCheckbox(before, after)) return true;
-  if (!SC_ITEM_LINE.test(before) || !after.endsWith(MANUAL_SUFFIX)) return false;
+  if (!after.endsWith(MANUAL_SUFFIX)) return false;
   const trimmed = before.trimEnd();
   if (trimmed.endsWith(MANUAL_SUFFIX.trim())) return false;
   return sameExceptCheckbox(trimmed, after.slice(0, -MANUAL_SUFFIX.length));
@@ -392,8 +400,28 @@ export function createGate({
     if (query === SEARCH_QUERY && !searchAllowed(variables.q)) {
       return reject('search-not-allowed', '只放行本轮总 issue 的修正搜索');
     }
-    const data = await github.graphql(query, variables);
-    return { code: 0, body: { data: data ?? {} } };
+    try {
+      const data = await github.graphql(query, variables);
+      return { code: 0, body: { data: data ?? {} } };
+    } catch (error) {
+      if (query === SEARCH_QUERY && error instanceof AppOnlyError) {
+        return {
+          code: 0,
+          body: {
+            data: {
+              search: { nodes: [] },
+              skippedQueries: [
+                {
+                  query: variables.q,
+                  reason: error.reason || error.kind || 'no-app-route',
+                },
+              ],
+            },
+          },
+        };
+      }
+      throw error;
+    }
   }
 
   async function checkPrReady(action, { number, root, forkRepos = [] }) {
@@ -520,6 +548,9 @@ export function createGate({
           if (versionLine(action.body) !== bodyVersion(state.issue.body)) {
             return reject('body-version-mismatch', '裁决里的正文版本和当前总 issue 正文不一致');
           }
+          const snapshot = readClaimSnapshot(profile, binding.root, binding.round);
+          const illegal = illegalPassFromVerdictText(action.body, currentTree, snapshot);
+          if (illegal.length) return reject('illegal-pass', illegal.join('；'));
         }
         return null;
       }
@@ -551,6 +582,13 @@ export function createGate({
           if (!current) return reject('not-in-tree', `找不到 ${target}`);
           if (!onlyCheckboxToggles(current.issue.body, action.body)) {
             return reject('edit-not-allowed', 'issue.edit 只能勾选或取消验收项、给验收项补「人工手测」，不能改正文其它内容');
+          }
+        }
+        if (action.type === 'issue.close' || (action.type === 'project.field.set' && action.fields?.['验收'] === '通过')) {
+          const snapshot = readClaimSnapshot(profile, binding.root, binding.round);
+          const blocked = passSideEffectBlocked(currentTree, snapshot, action.items);
+          if (blocked) {
+            return reject(pendingCloseBlocked(currentTree) ? 'pending-human' : 'illegal-pass', blocked);
           }
         }
         return null;

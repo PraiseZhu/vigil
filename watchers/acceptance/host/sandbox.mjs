@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { TOKEN_FILE_KEY } from '../bin/profile.mjs';
+import { CLAIM_SNAPSHOT_REL, isClaimSnapshotDir } from '../bin/authenticity.mjs';
 
 /** 传进沙箱的环境变量白名单；别的（含任何令牌）一律不传。 */
 export const ENV_ALLOWLIST = Object.freeze([
@@ -183,7 +184,7 @@ function resolveHomeAllow(hostHomeReal, homeAllow, maskDirs) {
  * hostHome 必填：没有它就没法默认遮掉 HOME，直接抛错，不退回只遮名单的老做法。
  */
 export function buildBwrapArgs(options = {}) {
-  const { home, profile, roundDir, masks, binds, hostHome, homeAllow, readOnlyBinds, readOnlyMounts, tmpfsDirs } = options;
+  const { home, profile, roundDir, masks, binds, hostHome, homeAllow, readOnlyBinds, readOnlyMounts, tmpfsDirs, readOnlyOverlays } = options;
   // 环境变量不再进 bwrap 的参数（--setenv 的值会出现在 /proc/<pid>/cmdline，ps 看得见 LLM key）：
   // 调用方把 sandboxEnv() 的结果作为 spawn 的 env 交给 bwrap 进程本身，bwrap 不加 --clearenv，子进程原样继承。
   if (Object.prototype.hasOwnProperty.call(options, 'env')) {
@@ -290,6 +291,36 @@ export function buildBwrapArgs(options = {}) {
     }
     mountList.push({ src: srcReal, dest: destReal, destLexical: path.resolve(dest) });
   }
+
+  // 认领快照只读叠挂：源可以在被遮罩的宿主 state/host/snapshots 里，目标必须是 roundDir 里
+  // 沙箱 watcher home 派生出的同一相对路径。整层 host 状态不能挂进来。叠在可写绑定之后、
+  // 遮罩之前，这样读的是权威快照、写会打到只读层。
+  const overlayList = [];
+  const sandboxHome = path.resolve(roundDir, 'home-acc');
+  for (const overlay of readOnlyOverlays || []) {
+    const src = overlay?.src;
+    const dest = overlay?.dest;
+    if (typeof src !== 'string' || !path.isAbsolute(src) || typeof dest !== 'string' || !path.isAbsolute(dest)) {
+      throw new Error('认领快照只读叠挂必须都是绝对路径');
+    }
+    const srcReal = realExisting(src);
+    if (!srcReal || !fs.statSync(srcReal).isDirectory()) throw new Error(`认领快照源不存在：${src}`);
+    const destReal = realExisting(dest);
+    if (!destReal || !fs.statSync(destReal).isDirectory()) throw new Error(`认领快照视图不存在：${dest}`);
+    if (!isClaimSnapshotDir(srcReal) || !isClaimSnapshotDir(destReal)) {
+      throw new Error('只许把认领快照目录叠到沙箱派生的 state/host/snapshots，不能挂整个 host 状态');
+    }
+    if (!isInside(destReal, sandboxHome)) {
+      throw new Error('认领快照视图必须是沙箱 watcher home 下的派生路径');
+    }
+    for (const maskDir of maskDirs) {
+      if (isInside(destReal, maskDir)) {
+        throw new Error(`沙箱拒绝：认领快照视图 ${dest} 落在遮罩目录里`);
+      }
+    }
+    overlayList.push({ src: srcReal, dest: destReal });
+  }
+
   // 只读挂载里的空 tmpfs（给工具写缓存）：只许落在上面那些只读挂载的目标里；
   // 挂载点在挂载的源里要已经存在（只读挂载里建不出挂载点）。
   const tmpfsList = [];
@@ -339,6 +370,7 @@ export function buildBwrapArgs(options = {}) {
   for (const bind of bindList) args.push('--bind', bind, bind);
   for (const dir of readOnlyList) args.push('--ro-bind', dir, dir);
   for (const mount of mountList) args.push('--ro-bind', mount.src, mount.dest);
+  for (const overlay of overlayList) args.push('--ro-bind', overlay.src, overlay.dest);
   for (const dir of tmpfsList) args.push('--tmpfs', dir);
   // HOME 里没挂回来的遮罩目标本来就在空 tmpfs 下面、读不到；再挂一次反而要在 tmpfs 里造挂载点，跳过。
   // /run 下面同理（整个已是空 tmpfs）。
@@ -462,7 +494,9 @@ export function prepareSandboxProfile({ profile, roundDir, repoRoot, socketPath 
   // 占位文件只是为了让沙箱里的 profile 校验（600、非空）能过，内容不是任何令牌。
   fs.writeFileSync(placeholderToken, 'sandbox-placeholder-not-a-token', { mode: 0o600 });
   fs.chmodSync(placeholderToken, 0o600);
-  return { sandboxHome, profileFile, placeholderToken };
+  const snapshotView = path.join(sandboxHome, CLAIM_SNAPSHOT_REL);
+  fs.mkdirSync(snapshotView, { recursive: true, mode: 0o700 });
+  return { sandboxHome, profileFile, placeholderToken, snapshotView };
 }
 
 /** 小写别名，和 #47 的接口名对齐。 */

@@ -12,8 +12,14 @@ import { collectTree } from './collect.mjs';
 import { runClose } from './close.mjs';
 import { runCorrect } from './correct.mjs';
 import { runPush, secretFiles, sessionPath, writeNeedsHuman } from './push.mjs';
-import { EnvUnverifiedError, guardPass, readChecksRaw } from './checks.mjs';
+import { EnvUnverifiedError, guardPass, readChecksRaw, readPassItems } from './checks.mjs';
 import { runVerdict } from './verdict.mjs';
+import {
+  OVERALL_PENDING,
+  assertNotTempModule,
+  passSideEffectBlocked,
+  readClaimSnapshot,
+} from './authenticity.mjs';
 
 export const EXIT = Object.freeze({ OK: 0, FAIL: 1, CLAIM: 3, REJECTED: 4, SECRET: 5, ENV: 6 });
 
@@ -99,7 +105,7 @@ const USAGE = `用法：
 
   collect   --issue <ref>
   progress  --issue <ref> --round <n>
-  verdict   --issue <ref> --round <n> --file <verdict.json> [--status 通过|要修]
+  verdict   --issue <ref> --round <n> --file <verdict.json> [--status 通过|要修|待人工]
   close     --issue <ref> --round <n> --verified <verified.json> --verdict <verdict.json>
   correct   --issue <ref> --round <n> --item "<ref> SC<k>" --why <原因> [--title <标题>]
   push      --issue <ref> --round <n> --repo <owner/repo> --branch acceptance/<总>-<出处>-sc<k> --worktree <目录> [--base origin/main]
@@ -204,23 +210,34 @@ async function cmdBoard({ github, profile, ref, n, flags, now, stdout }) {
   }
   const verdictUrl = flags.get('verdict-url') || current.url;
   const target = flags.get('target');
+  let tree = null;
+  async function loadTree() {
+    if (!tree) tree = await collectTree({ github, profile, ref });
+    return tree;
+  }
   let targets;
   if (target === undefined || target === 'root') {
     targets = [ref];
   } else if (target === 'all') {
-    const tree = await collectTree({ github, profile, ref });
-    targets = [tree.root.ref, ...tree.issues.filter((entry) => entry.role !== 'root').map((entry) => entry.ref)];
+    const loaded = await loadTree();
+    targets = [loaded.root.ref, ...loaded.issues.filter((entry) => entry.role !== 'root').map((entry) => entry.ref)];
   } else {
     const { repo, number } = parseRef(target);
     const one = `${repo}#${number}`;
     // 和 close 一样：只写本轮任务树里的 issue（总 issue、子 issue、修正子 issue），树外的整条拒绝、什么都不写。
-    const tree = await collectTree({ github, profile, ref });
+    const loaded = await loadTree();
     const inTree = new Set([
-      ...tree.issues.map((entry) => entry.ref.toLowerCase()),
-      ...tree.corrections.map((entry) => entry.ref.toLowerCase()),
+      ...loaded.issues.map((entry) => entry.ref.toLowerCase()),
+      ...loaded.corrections.map((entry) => entry.ref.toLowerCase()),
     ]);
     if (!inTree.has(one.toLowerCase())) throw new Error(`${one} 不在本轮任务树里，不能写看板`);
     targets = [one];
+  }
+  const passItems = acceptance === '通过' ? readPassItems(flags.get('checks')) : undefined;
+  if (acceptance === '通过') {
+    const loaded = await loadTree();
+    const blocked = passSideEffectBlocked(loaded, readClaimSnapshot(profile, ref, n), passItems);
+    if (blocked) throw new Error(blocked);
   }
 
   for (const one of targets) {
@@ -232,6 +249,7 @@ async function cmdBoard({ github, profile, ref, n, flags, now, stdout }) {
       verdictUrl,
       round: n,
       ref: one,
+      ...(passItems ? { items: passItems } : {}),
     });
   }
   stdout.write(`${JSON.stringify({ target: target || 'root', acceptance, verdictUrl, issues: targets })}\n`);
@@ -244,10 +262,10 @@ async function cmdDone({ github, profile, ref, n, now, stdout, stderr }) {
   const comments = data?.repository?.issue?.comments?.nodes || [];
   const rounds = parseRounds(comments, profile);
   const latest = latestRound(rounds);
-  if (!latest || latest.round !== n || !['通过', '要修'].includes(latest.status)) {
+  if (!latest || latest.round !== n || !['通过', '要修', OVERALL_PENDING].includes(latest.status)) {
     const actual = latest ? `第 ${latest.round} 轮（${latest.status}）` : '还没有轮次';
     const prefix = latest && latest.round === n ? `第 ${n} 轮还没写裁决` : '认领检查失败';
-    stderr.write(`${prefix}：期望第 ${n} 轮（通过或要修），实际${actual}\n`);
+    stderr.write(`${prefix}：期望第 ${n} 轮（通过、要修或待人工），实际${actual}\n`);
     return EXIT.CLAIM;
   }
   const file = sessionPath(profile, ref);
@@ -304,6 +322,7 @@ export async function runHelper(argv, options = {}) {
 
   const context = { github, profile, ref, n, flags, now, stdout, stderr, git };
   try {
+    assertNotTempModule(import.meta.url);
     // #358：先拦自相矛盾的 checks，再动任何写操作（退出码 1、零写入、不标中断）。
     rejectContradictoryChecks(command, flags);
     switch (command) {

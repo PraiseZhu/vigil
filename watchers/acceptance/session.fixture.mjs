@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { bodyVersion } from './bin/rounds.mjs';
+import { materialVersions, writeClaimSnapshot } from './bin/authenticity.mjs';
 import { OWNER, OTHER_REPO, REPO, roundComment } from './fake-gh.fixture.mjs';
 import { PR_BODY_QUERY } from './host/prbot-gate-check.mjs';
 
@@ -34,6 +35,27 @@ export const DEFAULT_OTHER_BODY = [
   '',
   '- [ ] SC7 跨仓也要收 验证：browser-fixture（测试点：夹具跨仓）',
   '- [ ] SC8 真仓里跑一次 验证：github-live',
+].join('\n');
+
+/** 全机器层任务树：没有 cindy-mac / github-live 等人工层，用来锁「通过仍可关单」的正例。 */
+export const MACHINE_ROOT_BODY = [
+  '# 总任务',
+  '',
+  '- [ ] SC1 收齐任务树 验证：contract（测试点：断言 collect 输出）',
+  '- [ ] SC2 写清验法 验证：unit',
+].join('\n');
+
+export const MACHINE_CHILD_BODY = [
+  '# 子任务',
+  '',
+  '- [ ] SC3 把结果写进轮次评论 验证：unit（测试点：假 gh）',
+  '- [x] SC4 看板写验收 验证：contract',
+].join('\n');
+
+export const MACHINE_OTHER_BODY = [
+  '# 跨仓子任务',
+  '',
+  '- [ ] SC7 跨仓也要收 验证：browser-fixture（测试点：夹具跨仓）',
 ].join('\n');
 
 function clone(value) {
@@ -438,6 +460,45 @@ export const DEFAULT_SCS = Object.freeze([
   [OTHER_REPO, 7, 8],
 ]);
 
+export const MACHINE_SCS = Object.freeze([
+  [REPO, 1, 1],
+  [REPO, 1, 2],
+  [REPO, 2, 3],
+  [REPO, 2, 4],
+  [OTHER_REPO, 7, 7],
+]);
+
+export function machineOnlyTree(options = {}) {
+  return defaultTree({
+    rootBody: MACHINE_ROOT_BODY,
+    childBody: MACHINE_CHILD_BODY,
+    otherBody: MACHINE_OTHER_BODY,
+    ...options,
+  });
+}
+
+export function machineConclusions(overrides = {}, extra = {}) {
+  return fullConclusions(overrides, { scs: MACHINE_SCS, ...extra });
+}
+
+/** 测试里跳过 rounds.start 时，按当前任务树写一份完整认领快照（沙箱不可写的 host/snapshots）。 */
+export function claimWorld(profile, world, ref, n = 1) {
+  const root = world.get(ref);
+  const bodies = { [ref]: root.body || '' };
+  for (const childRef of root.subIssues || []) {
+    const child = world.get(childRef);
+    if (child) bodies[child.ref] = child.body || '';
+  }
+  return writeClaimSnapshot(profile, ref, n, {
+    bodyVersion: bodyVersion(root.body),
+    bodies,
+    materials: materialVersions(),
+    inferred: false,
+    checkoutDir: profile.worktreeDir,
+    claimedAt: CLOCK,
+  });
+}
+
 /**
  * 覆盖 defaultTree 全部 SC 的裁决条目：verdict 要求任务树里每条 SC 都有结论。
  * `overrides` 按 `owner/repo#n SC<k>` 换掉某几条（比如某条要修）；没列的默认「通过」。
@@ -457,6 +518,11 @@ export const ALL_RAN = Object.freeze({ build: 'ran', typecheck: 'ran', test: 'ra
 export const ALL_RAN_CHECKS_FILE = (() => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-checks-'));
   return writeJsonFile(dir, 'checks.json', { checks: ALL_RAN });
+})();
+/** 全机器树看板通过：必需检查 + 覆盖 MACHINE_SCS 的非空逐条证据。 */
+export const MACHINE_PASS_CHECKS_FILE = (() => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-checks-'));
+  return writeJsonFile(dir, 'machine-pass-checks.json', { checks: ALL_RAN, items: machineConclusions() });
 })();
 /** close 的 --verdict（close 先查「通过」条目的证据再写）：一条证据正常的「通过」。 */
 export const PASS_VERDICT_FILE = (() => {

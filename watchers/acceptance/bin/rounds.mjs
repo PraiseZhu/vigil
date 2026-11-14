@@ -4,13 +4,16 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { isTrustedAuthor } from './trusted-author.mjs';
+import { OVERALL_PENDING, materialVersions, writeClaimSnapshot } from './authenticity.mjs';
 
-const FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(验收中|通过|要修|中断)/;
+const FIRST_LINE = /^\[验收机\] 第 (\d+) 轮：(验收中|通过|要修|待人工|中断)/;
 const LOCK_STALE_MS = 10 * 60 * 1000;
 export const ISSUE_COMMENTS_QUERY = `query ($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
+      number
       body
+      repository { nameWithOwner }
       comments(last: 100) {
         nodes {
           id
@@ -20,6 +23,14 @@ export const ISSUE_COMMENTS_QUERY = `query ($owner: String!, $name: String!, $nu
           updatedAt
           url
           author { login __typename }
+        }
+      }
+      subIssues(first: 50) {
+        nodes {
+          number
+          body
+          author { login __typename }
+          repository { nameWithOwner }
         }
       }
     }
@@ -156,8 +167,21 @@ export function latestRound(rounds) {
   return eligible.at(-1).item;
 }
 
-function formatStartBody(n, version, startedAt) {
-  return [`[验收机] 第 ${n} 轮：验收中`, `正文版本：${version}`, `开始：${startedAt}`].join('\n');
+function formatStartBody(n, version, startedAt, { materials, codeSha } = {}) {
+  const lines = [
+    `[验收机] 第 ${n} 轮：验收中`,
+    `正文版本：${version}`,
+    `起始正文版本：${version}`,
+    `开始：${startedAt}`,
+  ];
+  if (codeSha) lines.push(`代码 SHA：${codeSha}`);
+  if (materials) {
+    const packed = Object.entries(materials)
+      .map(([name, hash]) => `${name}=${hash}`)
+      .join(' ');
+    if (packed) lines.push(`材料版本：${packed}`);
+  }
+  return lines.join('\n');
 }
 
 function formatFinishBody(existing, n, status, { reason, detail, finishedAt }) {
@@ -259,7 +283,10 @@ function cacheFromGithub(cache, latest) {
       lastProgressAt: same ? cache?.round?.lastProgressAt ?? null : null,
       finishedAt: latest.finishedAt,
     },
-    lastVerdict: latest.status === '通过' || latest.status === '要修' ? latest.status : cache?.lastVerdict ?? null,
+    lastVerdict:
+      latest.status === '通过' || latest.status === '要修' || latest.status === OVERALL_PENDING
+        ? latest.status
+        : cache?.lastVerdict ?? null,
   };
 }
 
@@ -273,6 +300,19 @@ async function readIssue(github, ref) {
 
 function commentsOf(issue) {
   return issue.comments?.nodes || [];
+}
+
+/** 认领快照用：总单正文 + 已挂上的可信子单正文。不 import collect，避免和 tasks 循环。 */
+function treeBodiesFromIssue(issue, rootRef, profile) {
+  const bodies = { [rootRef]: issue.body || '' };
+  const parsed = parseRef(rootRef);
+  const rootRepo = issue.repository?.nameWithOwner || parsed.repo;
+  for (const node of issue.subIssues?.nodes || []) {
+    if (!isTrustedAuthor(node?.author, profile)) continue;
+    const nodeRef = `${node.repository?.nameWithOwner || rootRepo}#${node.number}`;
+    bodies[nodeRef] = node.body || '';
+  }
+  return bodies;
 }
 
 function maxRound(rounds) {
@@ -323,13 +363,32 @@ export function createRounds({ github, profile, now = () => Date.now() }) {
       const n = maxRound(rounds) + 1;
       const version = bodyVersion(fresh.body);
       const startedAt = nowIso(now);
+      const materials = materialVersions();
       const created = await github.write({
         type: 'comment.create',
         // 去重键带开始时间：轮次评论被删或挤出读取窗口后同号再认领，账本不会把旧评论当成这一次的结果。
         dedupeKey: `round-start:${ref}:${n}:${startedAt}`,
         repo: task.repo,
         issue: task.number,
-        body: formatStartBody(n, version, startedAt),
+        body: formatStartBody(n, version, startedAt, { materials }),
+      });
+      const bodies = treeBodiesFromIssue(fresh, ref, profile);
+      for (const child of task.children || []) {
+        if (!child?.ref || Object.hasOwn(bodies, child.ref)) continue;
+        try {
+          const childIssue = await readIssue(github, child.ref);
+          bodies[child.ref] = childIssue.body || '';
+        } catch {
+          // 缺子单正文：快照不完整，后续通过/关单会拒。
+        }
+      }
+      writeClaimSnapshot(profile, ref, n, {
+        bodyVersion: version,
+        bodies,
+        materials,
+        claimedAt: startedAt,
+        checkoutDir: profile.worktreeDir,
+        inferred: false,
       });
       writeCache(profile, ref, {
         kind: task.kind,
@@ -377,7 +436,7 @@ export function createRounds({ github, profile, now = () => Date.now() }) {
   }
 
   async function finish(ref, n, status, { reason, detail } = {}) {
-    if (!['通过', '要修', '中断'].includes(status)) {
+    if (!['通过', '要修', OVERALL_PENDING, '中断'].includes(status)) {
       throw new RoundError(`非法结束状态：${status}`, 'BAD_STATUS');
     }
     const current = await check(ref, n);
