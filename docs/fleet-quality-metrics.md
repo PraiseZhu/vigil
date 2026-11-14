@@ -29,7 +29,7 @@ node watchers/acceptance/bin/fleet-quality-stats.mjs \
   --labeled-sample
 ```
 
-`--snapshot` 可以是一份 JSON，也可以是目录（读其中的 `comments.json`、`issues.json`、`events.json`、`alerts.jsonl`、`deploy-log.jsonl`、`deploy-ff.json`、`heartbeat.json`，缺哪个就标 unknown）。
+`--snapshot` 可以是一份 JSON，也可以是目录（读其中的 `comments.json`、`issues.json`、`events.json`、`alerts.jsonl`、`deploy-log.jsonl`、`deploy-ff.json`、`heartbeat.json`、`timeline.json`、`pull-requests.json`；目录里缺哪个就标 unknown）。显式传入的路径如果根本不存在，退出码非 0，并写出期望路径与实际「不存在」，与「未传参 → unknown」不是一回事。JSONL 坏行会报告行号，受影响指标为 unknown，CLI 退出非 0；不会用剩下的好行假装已经测完。
 
 默认窗口：`--timezone`（默认 `America/Los_Angeles`）下、`--now` 所在「今天」之前的 **7 个完整本地日**。输出写明时区与 UTC 起止。这不是不加说明的 UTC 日。
 
@@ -38,7 +38,7 @@ node watchers/acceptance/bin/fleet-quality-stats.mjs \
 | 来源 | 真实形状 | 本工具怎么认 |
 |---|---|---|
 | 轮次评论 | REST `GET /issues/{n}/comments`：`id`、`html_url`、`user.login`/`type`、`body`、`created_at`。GraphQL `issue.comments.nodes`：`databaseId`、`url`、`author { login __typename }`、`createdAt`。首行 `[验收机] 第 N 轮：验收中\|通过\|要修\|中断`，字段 `正文版本` / `开始` / `完成` / `原因`，结束评论可有 `## 逐条结果` | 两种都收。默认只计 `type=Bot`（GraphQL 的 bot login 会补 `[bot]`）。别人冒充首行的 User 评论不计 |
-| 关单 | REST issue events：`event=closed\|reopened`、`id`、`created_at`、`actor`。issue 对象上的 `closed_at` / `closed_by` 可作补充 | 用于人工未验关单、返工（重开） |
+| 关单 | REST issue events：`event=closed\|reopened`、`id`、`created_at`、`actor`。单 issue `GET /issues/{n}/events` 的事件 `url` 是 `/issues/events/{id}`，**没有 issue 号**；仓库级 `/issues/events` 带嵌套 `issue.number` / `issue.html_url`。issue 对象上的 `closed_at` / `closed_by` 可作补充 | 读嵌套 `issue`；单 issue 导出用 `--events file:owner/repo#n`（可重复）或 `eventsByIssue` / `{ issueRef, events }` 按文件绑定，不能只靠一个全局 `--issue-ref`。无法挂到 issue 的 closed/reopened 让相关指标 **unknown** 并列 event id，不填 0 |
 | 告警 | `alerts.jsonl` 一行一条 JSON：`ts`、`kind`，可选 `issue`、`head`/`target`、`reason` | 显式 `--alerts`。没有文件 → 重复告警 unknown，不是 0 |
 | 心跳 | `heartbeat.json`：`at`、`tickIntervalS`、`lastTick` | 保活：年龄 ≤ 拍间隔 + 60 秒（`tickIntervalS` 只认 1..3600 的整数）。**不进入质量通过率** |
 | 部署 | 今天的 `deploy-ff.json` 是覆盖式状态 `{lagReportedFor, alerted, drain}` | **legacy 授权一律 unknown** |
@@ -57,12 +57,12 @@ node watchers/acceptance/bin/fleet-quality-stats.mjs \
 | 键 | 分子 | 分母 | 去重 | 缺数据 |
 |---|---|---|---|---|
 | `firstPassOriginal` 原条件一次通过率 | 第一次终局是「通过」，且逐条都是带证据的通过（无人工手测、无空证据、无待核实的临时补测试） | 窗口内第一次终局可判定的单 | 一单一条 | 没有评论 → unknown |
-| `rework` 返工 | 终局之后又出现要修，或通过之后被重开 | 有终局的单 | 一单最多一次 | 同左 |
+| `rework` 返工 | **窗口内发生的**终局之后要修，或通过之后被重开 | 到窗口结束为止已有终局的单（**首次终局可以在窗口外**；一次通过率仍只看窗口内的第一次终局） | 一单最多一次 | 无法挂接的 reopened → unknown，不是 0 |
 | `emptyEvidencePass` 无证据通过 | 通过终局里存在空证据的通过项 | 可判定终局单 | 一单一条 | 没有评论 → unknown |
-| `humanUnverifiedClose` 人工未验关单 | bot 关闭且该通过评论含人工手测 | 窗口内 bot 关闭的通过单 | 一单一条 | 没有 closed 事件 → unknown |
+| `humanUnverifiedClose` 人工未验关单 | bot 关单且**某次**通过评论含人工手测（不限第一次终局；第一次终局是要修、后来通过并被 bot 关掉也算） | 窗口内 bot 关闭的通过单 | 一单一条 | 没有 closed 事件，或 closed 事件无法挂到 issue → unknown，不是 0 |
 | `tempCopyUnverified` 临时副本补测试 | 证据匹配「临时副本补」测试/用例 | 可判定终局单 | 按项列出 | **待核实，不自动记作弊**。「可写副本」跑已入库测试不算 |
-| `deployAuth` 授权不可核实的部署 | 已部署且敏感、授权不是 User 评论里的目标完整 SHA | 窗口内可判定的敏感部署次数 | 一次快进一条 | legacy 状态或无日志 → **unknown**，不是 0 |
-| `deliveryLatency` 交付时延 | 分布（分钟） | 有 readyAt 与第一次终局的单 | 一单一次 | 缺 PR `mergedAt` → 该单 unknown。环境等待另列 `envWaitSeparate` |
+| `deployAuth` 授权不可核实的部署 | 已部署且敏感、授权不是 User 评论里的目标完整 SHA | **窗口内已部署次数**（含非敏感；不是只留「敏感且带 authorization」的行） | 一次快进一条 | legacy 状态或无日志 → **unknown**，不是 0 |
+| `deliveryLatency` 交付时延 | 分布（分钟） | 有 readyAt 与第一次终局的单 | 一单一次 | 认作者 `readyAt` / `closedByPullRequestsReferences` / **timeline CrossReferencedEvent** / `--pull-requests` 的 `mergedAt`。#62 真实 GraphQL `closedByPullRequestsReferences` 为空时，要用 timeline（如 PR mergedAt `2026-11-13T18:02:01Z`）才能算。缺这些数据 → 该单 unknown，不是 0。环境等待另列 `envWaitSeparate` |
 | `repeatClaimSameBody` 重复唤醒（评论能看到的） | 同一 issue+正文版本的再次认领 | 窗口内认领次数 | 连续同一签名逐次计 | 没有评论 → unknown |
 | `repeatWakeFullSignature` | 同上且带 main SHA | 认领次数 | 同左 | 评论无 main SHA → **unknown** |
 | `repeatAlerts` 重复告警 | 同一 `kind + issue + 部署 SHA` 在 60 分钟内的第二条及以后 | 窗口内非心跳告警行数 | 按这个键 | 没有 `alerts.jsonl` → unknown |

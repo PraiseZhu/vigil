@@ -30,6 +30,8 @@ const TEMP_COPY_EXTRA = /临时副本\s*补|在临时副本补|临时副本.{0,2
 const WRITABLE_COPY = /可写副本/;
 const ISSUE_URL = /github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)/;
 const ISSUE_API = /repos\/([^/]+\/[^/]+)\/issues\/(\d+)/;
+const PULL_URL = /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/;
+const ISSUE_REF_TOKEN = /^([^/]+\/[^#\s]+)#(\d+)$/;
 const SHA_FULL = /^[0-9a-f]{40}$/i;
 
 function pad2(n) {
@@ -191,6 +193,145 @@ export function issueRefFromUrls(...urls) {
   return null;
 }
 
+export function parseIssueRefToken(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  const token = ISSUE_REF_TOKEN.exec(raw);
+  if (token) return `${token[1]}#${token[2]}`;
+  return issueRefFromUrls(raw);
+}
+
+export function parsePathWithIssueRef(value) {
+  const text = String(value ?? '');
+  const idx = text.lastIndexOf(':');
+  if (idx > 1) {
+    const filePath = text.slice(0, idx);
+    const ref = parseIssueRefToken(text.slice(idx + 1));
+    if (ref && filePath) return { path: filePath, issueRef: ref };
+  }
+  return { path: text, issueRef: null };
+}
+
+export function issueRefFromNestedIssue(issue) {
+  if (!isObject(issue)) return null;
+  const fromUrls = issueRefFromUrls(issue.html_url, issue.url, issue.issue_url);
+  if (fromUrls) return fromUrls;
+  const repo =
+    issue.repository?.nameWithOwner ||
+    issue.repository?.full_name ||
+    (issue.repository?.owner?.login && issue.repository?.name
+      ? `${issue.repository.owner.login}/${issue.repository.name}`
+      : null);
+  const number = issue.number;
+  if (repo && number != null && Number.isFinite(Number(number))) return `${repo}#${Number(number)}`;
+  return null;
+}
+
+export function extractTimelineItems(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  if (!isObject(raw)) return [];
+  if (
+    raw.__typename === 'CrossReferencedEvent' ||
+    raw.event === 'cross-referenced' ||
+    raw.source?.__typename === 'PullRequest'
+  ) {
+    return [raw];
+  }
+  if (Array.isArray(raw.nodes)) return raw.nodes;
+  if (raw.timelineItems) return extractTimelineItems(raw.timelineItems);
+  if (raw.timeline) return extractTimelineItems(raw.timeline);
+  if (raw.issue?.timelineItems || raw.issue?.timeline) {
+    return extractTimelineItems(raw.issue.timelineItems || raw.issue.timeline);
+  }
+  if (raw.repository) return extractTimelineItems(raw.repository);
+  if (raw.data) return extractTimelineItems(raw.data);
+  return [];
+}
+
+export function normalizePullRequest(pr) {
+  if (!isObject(pr)) return null;
+  const merged = parseInstant(pr.mergedAt || pr.merged_at);
+  const url = pr.url || pr.html_url || null;
+  const number = pr.number ?? null;
+  let repo = pr.repository?.nameWithOwner || pr.repository?.full_name || null;
+  if (!repo && url) {
+    const pull = PULL_URL.exec(url);
+    if (pull) repo = pull[1];
+  }
+  if (!Number.isFinite(merged?.utcMs) && number == null && !url) return null;
+  return {
+    ref: pr.ref || (repo && number != null ? `${repo}#${number}` : url),
+    number,
+    url,
+    mergedAt: merged?.original || null,
+    mergedAtMs: merged?.utcMs ?? null,
+  };
+}
+
+export function pullRequestsFromTimeline(raw) {
+  const items = extractTimelineItems(raw);
+  const prs = [];
+  for (const item of items) {
+    if (!isObject(item)) continue;
+    const source = item.source || {};
+    if (source.__typename === 'PullRequest' || (source.number && (source.mergedAt || source.merged_at))) {
+      const rec = normalizePullRequest(source);
+      if (rec) prs.push(rec);
+      continue;
+    }
+    if (item.event === 'cross-referenced' || item.__typename === 'CrossReferencedEvent') {
+      const issue = source.issue || source;
+      const prBody = issue.pull_request || issue.pullRequest;
+      if (prBody || /\/pull\//.test(String(issue.html_url || issue.url || ''))) {
+        const rec = normalizePullRequest({
+          number: issue.number,
+          url: issue.html_url || issue.url,
+          mergedAt: prBody?.merged_at || prBody?.mergedAt || issue.mergedAt || issue.merged_at,
+          repository: issue.repository,
+        });
+        if (rec) prs.push(rec);
+      }
+      continue;
+    }
+    if (item.mergedAt || item.merged_at || item.number) {
+      const rec = normalizePullRequest(item);
+      if (rec) prs.push(rec);
+    }
+  }
+  return prs;
+}
+
+function graphqlIssueRef(raw) {
+  const issue = raw?.data?.repository?.issue || raw?.repository?.issue;
+  if (!issue) return null;
+  const repo =
+    issue.repository?.nameWithOwner ||
+    raw?.data?.repository?.nameWithOwner ||
+    raw?.repository?.nameWithOwner;
+  if (repo && issue.number != null) return `${repo}#${issue.number}`;
+  return issueRefFromUrls(issue.url, issue.html_url);
+}
+
+function mergePullRequests(target, incoming) {
+  if (!target.pullRequests) target.pullRequests = [];
+  const have = new Set(
+    target.pullRequests.map((pr) => `${pr.number ?? ''}|${pr.mergedAtMs ?? ''}|${pr.url ?? ''}`),
+  );
+  for (const pr of incoming) {
+    const rec = Number.isFinite(pr?.mergedAtMs) || pr?.mergedAt || pr?.number != null ? (pr.mergedAtMs != null || pr.ref ? pr : normalizePullRequest(pr)) : normalizePullRequest(pr);
+    if (!rec) continue;
+    const key = `${rec.number ?? ''}|${rec.mergedAtMs ?? ''}|${rec.url ?? ''}`;
+    if (have.has(key)) continue;
+    have.add(key);
+    target.pullRequests.push(rec);
+  }
+  const mergedMs = target.pullRequests.map((pr) => pr.mergedAtMs).filter(Number.isFinite);
+  if (!Number.isFinite(target.readyAtMs) && mergedMs.length) {
+    target.readyAtMs = Math.max(...mergedMs);
+  }
+}
+
 export function classifyEvidence(evidence) {
   const text = evidence == null ? '' : String(evidence).trim();
   if (!text) return { kind: 'empty', cheat: false, unverified: false };
@@ -300,6 +441,7 @@ export function normalizeEvent(raw, { issueRef = null } = {}) {
   if (name !== 'closed' && name !== 'reopened') return null;
   const at = parseInstant(raw.created_at || raw.createdAt);
   const actor = normalizeAuthor({ user: raw.actor || raw.user || raw.author });
+  const nested = issueRefFromNestedIssue(raw.issue);
   return {
     event: name,
     eventId: raw.id ?? raw.databaseId ?? null,
@@ -307,7 +449,8 @@ export function normalizeEvent(raw, { issueRef = null } = {}) {
     atMs: at?.utcMs ?? null,
     zoneHint: at?.zoneHint || null,
     actor,
-    issueRef: issueRef || raw.issueRef || issueRefFromUrls(raw.url, raw.html_url, raw.issue_url, raw.commit_url),
+    url: raw.url || raw.html_url || null,
+    issueRef: issueRef || raw.issueRef || nested || issueRefFromUrls(raw.url, raw.html_url, raw.issue_url, raw.commit_url),
   };
 }
 
@@ -321,18 +464,21 @@ export function normalizeIssue(raw) {
   const closedBy = raw.closed_by ? normalizeAuthor({ user: raw.closed_by }) : null;
   const closedAt = parseInstant(raw.closed_at || raw.closedAt);
   const prs = [];
-  const nodes = raw.closedByPullRequestsReferences?.nodes || raw.pullRequests || raw.linkedPullRequests || [];
-  for (const pr of nodes) {
-    const merged = parseInstant(pr.mergedAt || pr.merged_at);
-    const prRef = pr.ref || (pr.repository?.nameWithOwner && pr.number ? `${pr.repository.nameWithOwner}#${pr.number}` : null);
-    prs.push({
-      ref: prRef,
-      url: pr.url || pr.html_url || null,
-      mergedAt: merged?.original || null,
-      mergedAtMs: merged?.utcMs ?? null,
-    });
-  }
+  const seen = new Set();
+  const addPr = (pr) => {
+    const rec = normalizePullRequest(pr);
+    if (!rec) return;
+    const key = `${rec.number ?? ''}|${rec.mergedAtMs ?? ''}|${rec.url ?? ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    prs.push(rec);
+  };
+  for (const pr of unwrapList(raw.closedByPullRequestsReferences, ['nodes'])) addPr(pr);
+  for (const pr of unwrapList(raw.pullRequests)) addPr(pr);
+  for (const pr of unwrapList(raw.linkedPullRequests)) addPr(pr);
+  for (const pr of pullRequestsFromTimeline(raw.timelineItems || raw.timeline)) addPr(pr);
   const ready = parseInstant(raw.readyAt);
+  const mergedMs = prs.map((pr) => pr.mergedAtMs).filter(Number.isFinite);
   return {
     ref,
     body: raw.body || '',
@@ -342,7 +488,7 @@ export function normalizeIssue(raw) {
     closedBy,
     pullRequests: prs,
     readyAt: ready?.original || null,
-    readyAtMs: ready?.utcMs ?? (prs.length ? Math.max(...prs.map((pr) => pr.mergedAtMs).filter(Number.isFinite)) : null),
+    readyAtMs: ready?.utcMs ?? (mergedMs.length ? Math.max(...mergedMs) : null),
     htmlUrl: raw.html_url || raw.url || null,
     labeledSample: Boolean(raw.labeledSample),
   };
@@ -613,78 +759,113 @@ export function computeMetrics(snapshot, window, opts = {}) {
     }
 
     const final = firstFinal(rounds);
-    if (!final || !inWindow(final.finishedAtMs ?? final.startedAtMs, window)) continue;
-    const finalAt = final.finishedAtMs ?? final.startedAtMs;
-    const day = localDateOf(finalAt, window.timeZone);
-    if (daily[day]) daily[day].firstFinals += 1;
+    const finalAt = final ? final.finishedAtMs ?? final.startedAtMs : null;
+    const firstFinalInWindow = Boolean(final && inWindow(finalAt, window));
 
-    const judged = originalCondition(final);
-    if (judged.unknown) firstPassUnknown.push({ ...sourceOfRound(final), why: judged.why });
-    else {
-      firstPassDenom.push(sourceOfRound(final));
-      if (judged.ok) firstPassSources.push(sourceOfRound(final));
-    }
-    for (const item of final.items.filter((entry) => entry.evidenceClass.kind === 'temp-copy-extra-tests')) {
-      tempCopy.push({ ...sourceOfRound(final), sc: `${item.ref} SC${item.sc}`, label: '待核实' });
-    }
-    for (const item of final.items.filter((entry) => entry.result === '通过' && entry.evidenceClass.kind === 'empty')) {
-      emptyEvidence.push({ ...sourceOfRound(final), sc: `${item.ref} SC${item.sc}` });
+    if (firstFinalInWindow) {
+      const day = localDateOf(finalAt, window.timeZone);
+      if (daily[day]) daily[day].firstFinals += 1;
+
+      const judged = originalCondition(final);
+      if (judged.unknown) firstPassUnknown.push({ ...sourceOfRound(final), why: judged.why });
+      else {
+        firstPassDenom.push(sourceOfRound(final));
+        if (judged.ok) firstPassSources.push(sourceOfRound(final));
+      }
+      for (const item of final.items.filter((entry) => entry.evidenceClass.kind === 'temp-copy-extra-tests')) {
+        tempCopy.push({ ...sourceOfRound(final), sc: `${item.ref} SC${item.sc}`, label: '待核实' });
+      }
+      for (const item of final.items.filter((entry) => entry.result === '通过' && entry.evidenceClass.kind === 'empty')) {
+        emptyEvidence.push({ ...sourceOfRound(final), sc: `${item.ref} SC${item.sc}` });
+      }
+
+      const readyMs = readyMsOf(issue);
+      const envBefore = ordered.filter((round) => round.envWait && (round.finishedAtMs || 0) <= (finalAt || 0));
+      const envMinutes = envBefore.reduce((sum, round) => {
+        if (!Number.isFinite(round.finishedAtMs) || !Number.isFinite(round.startedAtMs)) return sum;
+        return sum + (round.finishedAtMs - round.startedAtMs) / 60000;
+      }, 0);
+      delivery.push({
+        ...sourceOfRound(final),
+        readyAtMs: readyMs,
+        readyUnknown: !Number.isFinite(readyMs),
+        firstFinalAtMs: finalAt,
+        deliveryMinutes: Number.isFinite(readyMs) && Number.isFinite(finalAt) ? (finalAt - readyMs) / 60000 : null,
+        envWaitMinutes: envMinutes,
+        envWaitRounds: envBefore.map((round) => sourceOfRound(round)),
+      });
     }
 
-    reworkDenom.push(sourceOfRound(final));
-    const laterFix = ordered.some((round) => round.round > final.round && round.status === '要修');
-    const reopened = events.some(
-      (event) => event.issueRef === ref && event.event === 'reopened' && event.atMs > (finalAt || 0),
-    );
-    if (laterFix || reopened) {
-      reworkSources.push({ ...sourceOfRound(final), laterFix, reopened });
+    if (final && Number.isFinite(finalAt) && finalAt < window.endUtcMs) {
+      reworkDenom.push(sourceOfRound(final));
+      const laterFix = ordered.some(
+        (round) =>
+          round.round > final.round &&
+          round.status === '要修' &&
+          inWindow(round.finishedAtMs ?? round.startedAtMs, window),
+      );
+      const reopened = events.some(
+        (event) =>
+          event.issueRef === ref &&
+          event.event === 'reopened' &&
+          inWindow(event.atMs, window) &&
+          event.atMs > (finalAt || 0),
+      );
+      if (laterFix || reopened) {
+        reworkSources.push({ ...sourceOfRound(final), laterFix, reopened });
+      }
     }
 
+    const passRounds = ordered.filter((round) => round.status === '通过');
     const close = events
       .filter((event) => event.issueRef === ref && event.event === 'closed')
       .sort((a, b) => (a.atMs || 0) - (b.atMs || 0))
       .at(-1);
     const closer = close?.actor || issue.closedBy;
     const closeMs = close?.atMs ?? issue.closedAtMs;
-    if (final.status === '通过' && closer?.type === 'Bot' && inWindow(closeMs, window)) {
+    if (passRounds.length && closer?.type === 'Bot' && inWindow(closeMs, window)) {
+      const manualPass =
+        [...passRounds].reverse().find((round) => round.items.some((item) => item.result === '人工手测')) || null;
+      const sourceRound = manualPass || passRounds.at(-1);
       falseCloseDenom.push({
-        ...sourceOfRound(final),
+        ...sourceOfRound(sourceRound),
         eventId: close?.eventId ?? null,
         closer: closer.login,
         closedAt: close?.at || issue.closedAt,
       });
-      const manuals = final.items.filter((item) => item.result === '人工手测');
-      if (manuals.length) {
+      if (manualPass) {
         humanClose.push({
-          ...sourceOfRound(final),
+          ...sourceOfRound(manualPass),
           eventId: close?.eventId ?? null,
           closer: closer.login,
-          items: manuals.map((item) => `${item.ref} SC${item.sc}`),
+          items: manualPass.items.filter((item) => item.result === '人工手测').map((item) => `${item.ref} SC${item.sc}`),
         });
       }
     }
-
-    const readyMs = readyMsOf(issue);
-    const envBefore = ordered.filter((round) => round.envWait && (round.finishedAtMs || 0) <= (finalAt || 0));
-    const envMinutes = envBefore.reduce((sum, round) => {
-      if (!Number.isFinite(round.finishedAtMs) || !Number.isFinite(round.startedAtMs)) return sum;
-      return sum + (round.finishedAtMs - round.startedAtMs) / 60000;
-    }, 0);
-    delivery.push({
-      ...sourceOfRound(final),
-      readyAtMs: readyMs,
-      readyUnknown: !Number.isFinite(readyMs),
-      firstFinalAtMs: finalAt,
-      deliveryMinutes: Number.isFinite(readyMs) && Number.isFinite(finalAt) ? (finalAt - readyMs) / 60000 : null,
-      envWaitMinutes: envMinutes,
-      envWaitRounds: envBefore.map((round) => sourceOfRound(round)),
-    });
   }
+
+  const unattachedEvents = events
+    .filter((event) => !event.issueRef)
+    .map((event) => ({
+      eventId: event.eventId,
+      event: event.event,
+      url: event.url || null,
+      at: event.at,
+    }));
+  const unattachedClosed = unattachedEvents.filter((event) => event.event === 'closed');
+  const unattachedReopened = unattachedEvents.filter((event) => event.event === 'reopened');
+  const parseErrors = snapshot.parseErrors || [];
+  const alertParseErrors = parseErrors.filter((row) => row.file === 'alerts.jsonl');
+  const deployParseErrors = parseErrors.filter((row) => row.file === 'deploy-log.jsonl');
 
   const qualityAlertRows = alerts.filter((row) => !row.keepalive && Number.isFinite(row.tsMs));
   const keepaliveAlertRows = alerts.filter((row) => row.keepalive && Number.isFinite(row.tsMs));
   let repeatAlerts = hasAlerts ? emptyMeasured() : unknownMetric('alerts.jsonl 未提供');
-  if (hasAlerts) {
+  if (alertParseErrors.length) {
+    repeatAlerts = unknownMetric(`alerts.jsonl 坏行：第 ${alertParseErrors.map((row) => row.line).join(',')} 行无法解析`, {
+      parseErrors: alertParseErrors,
+    });
+  } else if (hasAlerts) {
     const inWin = qualityAlertRows.filter((row) => inWindow(row.tsMs, window));
     const extras = [];
     const lastByKey = new Map();
@@ -709,38 +890,36 @@ export function computeMetrics(snapshot, window, opts = {}) {
   }
 
   let deployAuth = unknownMetric('无追加部署日志；legacy 授权未知');
-  if (deployCoverage === 'legacy-state') {
+  if (deployParseErrors.length) {
+    deployAuth = unknownMetric(`deploy-log.jsonl 坏行：第 ${deployParseErrors.map((row) => row.line).join(',')} 行无法解析`, {
+      format: 'b-log',
+      parseErrors: deployParseErrors,
+    });
+  } else if (deployCoverage === 'legacy-state') {
     deployAuth = unknownMetric('legacy deploy-ff.json 无授权来源评论', { format: 'legacy-state' });
   } else if (deployCoverage === 'b-log') {
     const deployed = deployments.filter((row) => row.format === 'b-log' && row.result === 'deployed' && inWindow(row.tsMs, window));
-    if (deployed.some((row) => row.sensitive && row.unknownAuth)) {
-      // 有 deployed 行但授权字段缺失：这些行本身 unknown，不把全体记 0。
-    }
-    const judged = deployed.filter((row) => row.sensitive);
-    const unknownRows = judged.filter((row) => row.unknownAuth);
-    const known = judged.filter((row) => !row.unknownAuth);
-    const unverifiable = known.filter((row) => !validUserAuth(row));
-    const verifiable = known.filter((row) => validUserAuth(row));
-    if (!deployed.length && unknownRows.length === 0) {
-      deployAuth = measured(0, 0, []);
-      deployAuth.format = 'b-log';
-    } else if (unknownRows.length && !known.length) {
-      deployAuth = unknownMetric('B 日志有部署行但无 authorization 字段', {
-        format: 'b-log',
-        sources: unknownRows.map((row) => ({ sourceId: row.sourceId, toSha: row.toSha, ts: row.ts })),
-      });
-    } else {
-      deployAuth = measured(unverifiable.length, known.length, unverifiable.map((row) => ({
+    const unverifiable = deployed.filter((row) => row.sensitive && !validUserAuth(row));
+    const verifiable = deployed.filter((row) => validUserAuth(row));
+    deployAuth = measured(
+      unverifiable.length,
+      deployed.length,
+      unverifiable.map((row) => ({
         sourceId: row.sourceId,
         toSha: row.toSha,
         ts: row.ts,
         authorType: row.authorization?.authorType || row.authorization?.type || null,
         commentUrl: row.authorization?.commentUrl || null,
-      })));
-      deployAuth.format = 'b-log';
-      deployAuth.verifiable = verifiable.map((row) => ({ sourceId: row.sourceId, toSha: row.toSha, commentUrl: row.authorization.commentUrl }));
-      if (unknownRows.length) deployAuth.unknownRows = unknownRows.length;
-    }
+      })),
+    );
+    deployAuth.format = 'b-log';
+    deployAuth.verifiable = verifiable.map((row) => ({
+      sourceId: row.sourceId,
+      toSha: row.toSha,
+      commentUrl: row.authorization?.commentUrl || null,
+    }));
+    deployAuth.definition =
+      '分子：已部署且敏感，且授权不是 User 评论里的目标完整 SHA。分母：窗口内已部署次数。legacy 无字段仍 unknown。';
   }
 
   const fullSigUnknown = (snapshot.rounds || []).every((round) => !round.mainSha);
@@ -768,6 +947,8 @@ export function computeMetrics(snapshot, window, opts = {}) {
       deploy: deployCoverage,
       heartbeat: hasHeartbeat,
       productionSevenDayFleet: false,
+      unattachedEvents,
+      parseErrors,
       note: '不能声称已算全舰队七天；见 missingProductionData',
     },
     metrics: {
@@ -778,10 +959,15 @@ export function computeMetrics(snapshot, window, opts = {}) {
         definition: '分子：第一次终局是通过，且逐条都是带证据的通过（无人工手测/空证据/待核实临时补测试）。分母：窗口内第一次终局可判定的单。去重：一单一条。纯中断不进分母。',
       },
       rework: {
-        ...(hasComments
-          ? measured(reworkSources.length, reworkDenom.length, reworkSources)
-          : unknownMetric('未提供轮次评论')),
-        definition: '分子：终局之后又出现要修，或通过之后被重开。分母：有终局的单。去重：一单最多一次。',
+        ...(!hasComments
+          ? unknownMetric('未提供轮次评论')
+          : unattachedReopened.length
+            ? unknownMetric('存在无法挂到 issue 的 reopened 事件，返工不能记成已测量的 0', {
+                unattachedEvents: unattachedReopened,
+              })
+            : measured(reworkSources.length, reworkDenom.length, reworkSources)),
+        definition:
+          '分子：窗口内发生的终局之后要修，或通过之后被重开。分母：到窗口结束为止已有终局的单（首次终局可在窗口外）。去重：一单最多一次。',
       },
       emptyEvidencePass: {
         ...(hasComments
@@ -789,12 +975,17 @@ export function computeMetrics(snapshot, window, opts = {}) {
           : unknownMetric('未提供轮次评论')),
         definition: '分子：通过终局里存在空证据的通过项。分母：可判定终局单。不是 0 填充。',
       },
-      humanUnverifiedClose: hasEvents
-        ? {
-            ...measured(humanClose.length, falseCloseDenom.length, humanClose),
-            definition: '分子：bot 关单且通过评论含人工手测。分母：窗口内 bot 关闭的通过单。去重：一单一条。',
-          }
-        : unknownMetric('未提供 issue closed 事件，人工未验关单无法核实 closer'),
+      humanUnverifiedClose: !hasEvents
+        ? unknownMetric('未提供 issue closed 事件，人工未验关单无法核实 closer')
+        : unattachedClosed.length
+          ? unknownMetric('存在无法挂到 issue 的 closed 事件，不能把人工未验关单记成已测量的 0', {
+              unattachedEvents: unattachedClosed,
+              definition: '分子：bot 关单且通过评论含人工手测。分母：窗口内 bot 关闭的通过单。去重：一单一条。',
+            })
+          : {
+              ...measured(humanClose.length, falseCloseDenom.length, humanClose),
+              definition: '分子：bot 关单且通过评论含人工手测。分母：窗口内 bot 关闭的通过单。去重：一单一条。',
+            },
       tempCopyUnverified: {
         ...(hasComments
           ? measured(tempCopy.length, firstPassDenom.length, tempCopy)
@@ -818,7 +1009,7 @@ export function computeMetrics(snapshot, window, opts = {}) {
         })),
         unknownIssues: delivery.filter((row) => row.readyUnknown).map((row) => sourceOfRound({ ...row, issueRef: row.issue, round: row.round, commentId: row.commentId, commentUrl: row.commentUrl, startedAt: row.originalStartedAt, finishedAt: row.originalFinishedAt, startedZoneHint: row.startedZoneHint, finishedZoneHint: row.finishedZoneHint, bodyVersion: row.bodyVersion })),
         envWaitSeparate: envSeries,
-        definition: '交付时延：子 PR 全合入（readyAt）到第一次终局的分钟数。环境等待另列，不从时延里偷偷扣掉。缺 mergedAt 为 unknown。',
+        definition: '交付时延：子 PR 全合入（readyAt / timeline CrossReferencedEvent / PR 列表的 mergedAt）到第一次终局的分钟数。环境等待另列。缺 mergedAt 为 unknown。',
       },
       repeatClaimSameBody: {
         ...(hasComments
@@ -900,15 +1091,44 @@ export function readJsonlFile(file) {
     if (!line.trim()) return;
     try {
       rows.push({ line: index + 1, value: JSON.parse(line) });
-    } catch {
-      rows.push({ line: index + 1, value: null, parseError: true });
+    } catch (error) {
+      rows.push({
+        line: index + 1,
+        value: null,
+        parseError: true,
+        message: error.message,
+        snippet: line.slice(0, 160),
+      });
     }
   });
   return rows;
 }
 
 function existingFile(file) {
-  return typeof file === 'string' && file.length && fs.existsSync(file);
+  return typeof file === 'string' && file.length && fs.existsSync(file) && fs.statSync(file).isFile();
+}
+
+export function assertExistingFile(file, label) {
+  if (typeof file !== 'string' || !file.length) {
+    throw new Error(`${label} 缺少路径：期望传入文件路径，实际为空`);
+  }
+  if (!fs.existsSync(file)) {
+    throw new Error(`${label} 不存在：期望文件 ${file}，实际路径不存在`);
+  }
+  const st = fs.statSync(file);
+  if (!st.isFile()) {
+    throw new Error(`${label} 不是文件：期望文件 ${file}，实际是${st.isDirectory() ? '目录' : '其他类型'}`);
+  }
+  return file;
+}
+
+function resolveInputFile(explicit, baseDir, dirName, label) {
+  if (explicit) return assertExistingFile(explicit, label);
+  if (baseDir) {
+    const candidate = path.join(baseDir, dirName);
+    return existingFile(candidate) ? candidate : null;
+  }
+  return null;
 }
 
 export function loadSnapshot({
@@ -916,10 +1136,15 @@ export function loadSnapshot({
   comments,
   issues,
   events,
+  eventsInputs,
   alerts,
   deployLog,
   deployState,
   heartbeat,
+  timeline,
+  timelineInputs,
+  pullRequests,
+  pullRequestsInputs,
   issueRef,
   allowLogins,
   labeledSample,
@@ -927,28 +1152,33 @@ export function loadSnapshot({
   let bundle = {};
   let baseDir = null;
   if (snapshot) {
+    if (!fs.existsSync(snapshot)) {
+      throw new Error(`--snapshot 不存在：期望文件或目录 ${snapshot}，实际路径不存在`);
+    }
     const stat = fs.statSync(snapshot);
     if (stat.isDirectory()) {
       baseDir = snapshot;
       bundle = {};
+    } else if (!stat.isFile()) {
+      throw new Error(`--snapshot 不是文件或目录：期望 ${snapshot}，实际是其他类型`);
     } else {
       bundle = readJsonFile(snapshot);
     }
   }
 
-  const fileFrom = (explicit, name) => explicit || (baseDir ? path.join(baseDir, name) : null);
+  const commentsFile = resolveInputFile(comments, baseDir, 'comments.json', '--comments');
+  const issuesFile = resolveInputFile(issues, baseDir, 'issues.json', '--issues');
+  const alertsFile = resolveInputFile(alerts, baseDir, 'alerts.jsonl', '--alerts');
+  const deployLogFile = resolveInputFile(deployLog, baseDir, 'deploy-log.jsonl', '--deploy-log');
+  const deployStateFile = resolveInputFile(deployState, baseDir, 'deploy-ff.json', '--deploy-state');
+  const heartbeatFile = resolveInputFile(heartbeat, baseDir, 'heartbeat.json', '--heartbeat');
+  const timelineFile = resolveInputFile(timeline, baseDir, 'timeline.json', '--timeline');
+  const pullRequestsFile = resolveInputFile(pullRequests, baseDir, 'pull-requests.json', '--pull-requests');
 
-  const commentsFile = fileFrom(comments, 'comments.json');
-  const issuesFile = fileFrom(issues, 'issues.json');
-  const eventsFile = fileFrom(events, 'events.json');
-  const alertsFile = fileFrom(alerts, 'alerts.jsonl');
-  const deployLogFile = fileFrom(deployLog, 'deploy-log.jsonl');
-  const deployStateFile = fileFrom(deployState, 'deploy-ff.json');
-  const heartbeatFile = fileFrom(heartbeat, 'heartbeat.json');
-
+  const parseErrors = [];
   let commentRaw = null;
   let commentsProvided = false;
-  if (existingFile(commentsFile)) {
+  if (commentsFile) {
     commentRaw = readJsonFile(commentsFile);
     commentsProvided = true;
   } else if (bundle.comments != null) {
@@ -961,37 +1191,44 @@ export function loadSnapshot({
     commentRaw = bundle;
     commentsProvided = true;
   }
-  const issueRaw = existingFile(issuesFile) ? readJsonFile(issuesFile) : bundle.issues;
-  const eventRaw = existingFile(eventsFile) ? readJsonFile(eventsFile) : bundle.events;
+  const issueRaw = issuesFile ? readJsonFile(issuesFile) : bundle.issues;
   let alertRows = [];
   let alertsProvided = false;
-  if (existingFile(alertsFile)) {
+  if (alertsFile) {
     alertsProvided = true;
     alertRows = readJsonlFile(alertsFile);
   } else if (Array.isArray(bundle.alerts)) {
     alertsProvided = true;
     alertRows = bundle.alerts.map((value, i) => ({ line: i + 1, value }));
   }
+  for (const row of alertRows) {
+    if (row.parseError) {
+      parseErrors.push({ file: 'alerts.jsonl', line: row.line, message: row.message, snippet: row.snippet });
+    }
+  }
 
   let deployRows = [];
   let deployCoverage = 'missing';
-  if (existingFile(deployLogFile)) {
+  if (deployLogFile) {
     deployCoverage = 'b-log';
     deployRows = readJsonlFile(deployLogFile);
   } else if (Array.isArray(bundle.deployments) || Array.isArray(bundle.deployLog)) {
     deployCoverage = 'b-log';
     deployRows = (bundle.deployments || bundle.deployLog).map((value, i) => ({ line: i + 1, value }));
-  } else if (existingFile(deployStateFile)) {
+  } else if (deployStateFile) {
     deployCoverage = 'legacy-state';
     deployRows = [{ line: 1, value: readJsonFile(deployStateFile) }];
   } else if (bundle.deployState) {
     deployCoverage = 'legacy-state';
     deployRows = [{ line: 1, value: bundle.deployState }];
   }
+  for (const row of deployRows) {
+    if (row.parseError) {
+      parseErrors.push({ file: 'deploy-log.jsonl', line: row.line, message: row.message, snippet: row.snippet });
+    }
+  }
 
-  const heartbeatObj = existingFile(heartbeatFile)
-    ? readJsonFile(heartbeatFile)
-    : bundle.heartbeat || null;
+  const heartbeatObj = heartbeatFile ? readJsonFile(heartbeatFile) : bundle.heartbeat || null;
 
   const allow = allowLogins?.length ? new Set(allowLogins.map((n) => String(n).toLowerCase())) : null;
   const rawComments = commentRaw ? unwrapComments(commentRaw, issueRef) : [];
@@ -1007,12 +1244,45 @@ export function loadSnapshot({
   }
 
   const eventList = [];
-  const rawEvents = eventRaw ? unwrapList(eventRaw, ['events']) : [];
-  for (const raw of rawEvents) {
-    const event = normalizeEvent(raw, { issueRef: raw.issueRef || issueRef });
-    if (event) eventList.push(event);
+  let eventRawPresent = false;
+  const ingestEventRaw = (raw, boundRef) => {
+    if (raw == null) return;
+    eventRawPresent = true;
+    if (isObject(raw) && !Array.isArray(raw)) {
+      const mapKeys = Object.keys(raw).filter((key) => ISSUE_REF_TOKEN.test(key) && Array.isArray(raw[key]));
+      if (mapKeys.length) {
+        for (const key of mapKeys) ingestEventRaw(raw[key], key);
+        return;
+      }
+    }
+    const wrappedRef = isObject(raw) && !Array.isArray(raw) ? raw.issueRef || boundRef : boundRef;
+    for (const item of unwrapList(raw, ['events'])) {
+      const event = normalizeEvent(item, { issueRef: item.issueRef || wrappedRef });
+      if (event) eventList.push(event);
+    }
+  };
+
+  const eventSpecs = Array.isArray(eventsInputs) && eventsInputs.length
+    ? eventsInputs
+    : events
+      ? [typeof events === 'string' ? parsePathWithIssueRef(events) : { path: events, issueRef: null }]
+      : [];
+  if (eventSpecs.length) {
+    for (const spec of eventSpecs) {
+      const file = assertExistingFile(spec.path, '--events');
+      const fallback = eventSpecs.length === 1 ? spec.issueRef || issueRef : spec.issueRef;
+      ingestEventRaw(readJsonFile(file), fallback);
+    }
+  } else {
+    const eventsFile = resolveInputFile(null, baseDir, 'events.json', '--events');
+    if (eventsFile) ingestEventRaw(readJsonFile(eventsFile), issueRef);
+    else if (bundle.events != null) ingestEventRaw(bundle.events, issueRef);
   }
-  if (!eventList.length && normalizedIssues.some((issue) => issue.closedAt)) {
+  if (bundle.eventsByIssue && isObject(bundle.eventsByIssue)) {
+    ingestEventRaw(bundle.eventsByIssue, null);
+  }
+
+  if (!eventRawPresent && !eventList.length && normalizedIssues.some((issue) => issue.closedAt)) {
     for (const issue of normalizedIssues) {
       if (!issue.closedAt) continue;
       eventList.push({
@@ -1027,6 +1297,50 @@ export function loadSnapshot({
     }
   }
 
+  const ingestPrSource = (raw, boundRef) => {
+    if (raw == null) return;
+    const ref = boundRef || graphqlIssueRef(raw) || (normalizedIssues.length === 1 ? normalizedIssues[0].ref : null);
+    const fromTimeline = pullRequestsFromTimeline(raw);
+    const fromList = Array.isArray(raw) ? raw.map(normalizePullRequest).filter(Boolean) : [];
+    const prs = fromTimeline.length ? fromTimeline : fromList;
+    if (!ref || !prs.length) return;
+    let issue = normalizedIssues.find((item) => item.ref === ref);
+    if (!issue) {
+      issue = { ref, pullRequests: [] };
+      normalizedIssues.push(issue);
+    }
+    mergePullRequests(issue, prs);
+  };
+
+  const timelineSpecs = Array.isArray(timelineInputs) && timelineInputs.length
+    ? timelineInputs
+    : timelineFile
+      ? [{ path: timelineFile, issueRef: parsePathWithIssueRef(timeline || '').issueRef }]
+      : [];
+  if (timelineSpecs.length) {
+    for (const spec of timelineSpecs) {
+      ingestPrSource(readJsonFile(spec.path), spec.issueRef || (timelineSpecs.length === 1 ? issueRef : null));
+    }
+  } else if (bundle.timeline != null) {
+    ingestPrSource(bundle.timeline, issueRef);
+  }
+  if (bundle.timelineByIssue && isObject(bundle.timelineByIssue)) {
+    for (const [ref, raw] of Object.entries(bundle.timelineByIssue)) ingestPrSource(raw, ref);
+  }
+
+  const prSpecs = Array.isArray(pullRequestsInputs) && pullRequestsInputs.length
+    ? pullRequestsInputs
+    : pullRequestsFile
+      ? [{ path: pullRequestsFile, issueRef: parsePathWithIssueRef(pullRequests || '').issueRef }]
+      : [];
+  if (prSpecs.length) {
+    for (const spec of prSpecs) {
+      ingestPrSource(readJsonFile(spec.path), spec.issueRef || (prSpecs.length === 1 ? issueRef : null));
+    }
+  } else if (bundle.pullRequests != null && !Array.isArray(bundle.issues)) {
+    ingestPrSource(bundle.pullRequests, issueRef);
+  }
+
   const normalizedAlerts = alertRows
     .filter((row) => !row.parseError)
     .map((row) => normalizeAlert(row.value, row.line))
@@ -1034,10 +1348,11 @@ export function loadSnapshot({
 
   const deployments = [];
   for (const row of deployRows) {
+    if (row.parseError) continue;
     const rec = normalizeDeployRecord(row.value, row.line);
     if (rec) deployments.push(rec);
   }
-  if (deployCoverage === 'b-log' && deployments.every((row) => row.format === 'legacy-state')) {
+  if (deployCoverage === 'b-log' && deployments.length && deployments.every((row) => row.format === 'legacy-state')) {
     deployCoverage = 'legacy-state';
   }
 
@@ -1047,12 +1362,13 @@ export function loadSnapshot({
     commentsProvided,
     issues: normalizedIssues,
     events: eventList,
-    eventsProvided: eventRaw != null || eventList.some((event) => event.eventId != null),
+    eventsProvided: eventRawPresent || eventList.some((event) => event.eventId != null),
     alerts: normalizedAlerts,
     alertsProvided,
     deployments,
     deployCoverage,
     heartbeat: heartbeatObj,
+    parseErrors,
     labeledSample: Boolean(labeledSample || bundle.labeledSample || bundle.meta?.sample),
   };
 }
@@ -1063,10 +1379,15 @@ export function parseArgs(argv) {
     comments: null,
     issues: null,
     events: null,
+    eventsInputs: [],
     alerts: null,
     deployLog: null,
     deployState: null,
     heartbeat: null,
+    timeline: null,
+    timelineInputs: [],
+    pullRequests: null,
+    pullRequestsInputs: [],
     timeZone: DEFAULT_TIMEZONE,
     from: null,
     to: null,
@@ -1098,9 +1419,24 @@ export function parseArgs(argv) {
       case '--issues':
         out.issues = take();
         break;
-      case '--events':
-        out.events = take();
+      case '--events': {
+        const spec = parsePathWithIssueRef(take());
+        out.eventsInputs.push(spec);
+        out.events = spec.path;
         break;
+      }
+      case '--timeline': {
+        const spec = parsePathWithIssueRef(take());
+        out.timelineInputs.push(spec);
+        out.timeline = spec.path;
+        break;
+      }
+      case '--pull-requests': {
+        const spec = parsePathWithIssueRef(take());
+        out.pullRequestsInputs.push(spec);
+        out.pullRequests = spec.path;
+        break;
+      }
       case '--alerts':
         out.alerts = take();
         break;
@@ -1152,6 +1488,9 @@ export const USAGE = `用法：node watchers/acceptance/bin/fleet-quality-stats.
 
 选项：
   --comments --issues --events --alerts --deploy-log --deploy-state --heartbeat
+  --events <file>[:owner/repo#n]  可重复；单 issue 导出按文件绑定，不能只靠一个全局 --issue-ref
+  --timeline <file>[:owner/repo#n]  GraphQL/REST timeline（CrossReferencedEvent）
+  --pull-requests <file>[:owner/repo#n]  PR 列表（number + mergedAt）
   --timezone America/Los_Angeles   默认
   --from YYYY-MM-DD --to YYYY-MM-DD
   --window-days 7
@@ -1204,6 +1543,12 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
   }
   const report = computeMetrics(snapshot, window, { nowMs, labeledSample: snapshot.labeledSample || args.labeledSample });
   stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  if (snapshot.parseErrors?.length) {
+    stderr.write(
+      `JSONL 坏行：${snapshot.parseErrors.map((row) => `${row.file} 第 ${row.line} 行`).join('；')}\n`,
+    );
+    return 1;
+  }
   return 0;
 }
 

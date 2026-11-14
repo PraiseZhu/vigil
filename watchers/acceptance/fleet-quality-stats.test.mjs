@@ -21,6 +21,11 @@ import {
   legacyDeployState,
   restComment,
   restEvent,
+  ISSUE62_DELIVERY_MINUTES,
+  REAL_ISSUE_62_CLOSED_EVENT,
+  realIssue62ReopenedCounterexample,
+  realIssue62TimelineCrossReferencedPrs,
+  repoLevelClosedEventFor62,
   sample62Comments,
   sample62Events,
   sampleSnapshot,
@@ -517,4 +522,277 @@ test('parseVerdictItems 读真实逐条行形', () => {
   assert.equal(items.filter((item) => item.result === '人工手测').length, 3);
   assert.equal(items.filter((item) => item.evidenceClass.kind === 'writable-copy').length, 1);
   assert.equal(items.filter((item) => item.evidenceClass.kind === 'temp-copy-extra-tests').length, 1);
+});
+
+function writeJson(dir, name, value) {
+  const file = path.join(dir, name);
+  fs.writeFileSync(file, JSON.stringify(value));
+  return file;
+}
+
+test('P1 真实 /issues/events/{id} 无 issue 号：未挂接不得把人工未验关单写成 0', () => {
+  assert.equal(REAL_ISSUE_62_CLOSED_EVENT.event, 'closed');
+  assert.equal(REAL_ISSUE_62_CLOSED_EVENT.id, 36126959257);
+  assert.match(REAL_ISSUE_62_CLOSED_EVENT.url, /\/issues\/events\/36126959257$/);
+  assert.equal(/\/issues\/\d+/.test(REAL_ISSUE_62_CLOSED_EVENT.url.replace(/\/issues\/events\/\d+$/, '')), false);
+  const unbound = normalizeEvent(REAL_ISSUE_62_CLOSED_EVENT);
+  assert.equal(unbound.event, 'closed');
+  assert.equal(unbound.eventId, 36126959257);
+  assert.equal(unbound.issueRef, null);
+
+  const snap = snapshotFrom({
+    comments: sample62Comments(),
+    issues: [{ number: 62, html_url: `https://github.com/${REPO}/issues/62`, labeledSample: true }],
+    events: [REAL_ISSUE_62_CLOSED_EVENT],
+  });
+  const report = computeMetrics(snap, windowFor(NOW_NOV15_LA), { nowMs: NOW_NOV15_LA });
+  assert.equal(report.metrics.humanUnverifiedClose.unknown, true, '挂不上时是 unknown，不是已测量的 0');
+  assert.equal(report.metrics.humanUnverifiedClose.numerator, null);
+  const listed = JSON.stringify(report.metrics.humanUnverifiedClose);
+  assert.match(listed, /36126959257/);
+  const coverageListed = JSON.stringify(report.coverage.unattachedEvents || report.metrics.humanUnverifiedClose.unattachedEvents);
+  assert.match(coverageListed + listed, /36126959257/);
+});
+
+test('P1 仓库级嵌套 issue.number/html_url 能挂上；只改 event=reopened 的原文不当关单', () => {
+  const nested = normalizeEvent(repoLevelClosedEventFor62());
+  assert.equal(nested.issueRef, `${REPO}#62`);
+  assert.equal(nested.eventId, 36126959257);
+  assert.equal(nested.event, 'closed');
+
+  const reopenedRaw = realIssue62ReopenedCounterexample();
+  assert.equal(reopenedRaw.id, REAL_ISSUE_62_CLOSED_EVENT.id);
+  assert.equal(reopenedRaw.url, REAL_ISSUE_62_CLOSED_EVENT.url);
+  assert.equal(reopenedRaw.created_at, REAL_ISSUE_62_CLOSED_EVENT.created_at);
+  assert.equal(reopenedRaw.event, 'reopened');
+  const reopened = normalizeEvent({
+    ...reopenedRaw,
+    issue: { number: 62, html_url: `https://github.com/${REPO}/issues/62` },
+  });
+  assert.equal(reopened.event, 'reopened');
+  assert.equal(reopened.issueRef, `${REPO}#62`);
+
+  const closedSnap = snapshotFrom({
+    comments: sample62Comments(),
+    issues: [{ number: 62, html_url: `https://github.com/${REPO}/issues/62` }],
+    events: [repoLevelClosedEventFor62()],
+  });
+  const closedReport = computeMetrics(closedSnap, windowFor(NOW_NOV15_LA), { nowMs: NOW_NOV15_LA });
+  assert.equal(closedReport.metrics.humanUnverifiedClose.unknown, false);
+  assert.equal(closedReport.metrics.humanUnverifiedClose.numerator, 1);
+  assert.equal(closedReport.metrics.humanUnverifiedClose.sources[0].eventId, 36126959257);
+
+  const reopenSnap = snapshotFrom({
+    comments: sample62Comments(),
+    issues: [{ number: 62, html_url: `https://github.com/${REPO}/issues/62` }],
+    events: [{ ...reopenedRaw, issue: { number: 62, html_url: `https://github.com/${REPO}/issues/62` } }],
+  });
+  const reopenReport = computeMetrics(reopenSnap, windowFor(NOW_NOV15_LA), { nowMs: NOW_NOV15_LA });
+  assert.equal(reopenReport.metrics.humanUnverifiedClose.unknown, false);
+  assert.equal(reopenReport.metrics.humanUnverifiedClose.numerator, 0, '只改 event=reopened 不得当成关单');
+  assert.equal(reopenReport.metrics.humanUnverifiedClose.sources.length, 0);
+  assert.equal(
+    reopenSnap.events.some((event) => event.event === 'closed' && event.eventId === 36126959257),
+    false,
+  );
+});
+
+test('P1 单 issue 导出可按文件/参数绑定多个 issue，不能只靠一个全局 --issue-ref', () => {
+  const dir = tmpDir('fleet-quality-bind-');
+  const comments = [
+    ...sample62Comments(),
+    restComment({
+      id: 2080,
+      number: 80,
+      round: 1,
+      status: '通过',
+      startedAt: '2026-11-14T10:00:00+08:00',
+      finishedAt: '2026-11-14T10:05:00+08:00',
+      items: cleanPassItems(),
+      created_at: '2026-11-14T02:00:00Z',
+    }),
+  ];
+  const commentsFile = writeJson(dir, 'comments.json', comments);
+  const events62 = writeJson(dir, 'events-62.json', [REAL_ISSUE_62_CLOSED_EVENT]);
+  const events80 = writeJson(dir, 'events-80.json', [realIssue62ReopenedCounterexample()]);
+  const args = parseArgs([
+    '--comments',
+    commentsFile,
+    '--events',
+    `${events62}:${REPO}#62`,
+    '--events',
+    `${events80}:${REPO}#80`,
+  ]);
+  assert.equal(args.eventsInputs.length, 2);
+  assert.equal(args.eventsInputs[0].issueRef, `${REPO}#62`);
+  assert.equal(args.eventsInputs[1].issueRef, `${REPO}#80`);
+  const snap = loadSnapshot(args);
+  const byRef = new Map(snap.events.map((event) => [event.issueRef, event]));
+  assert.equal(byRef.get(`${REPO}#62`)?.event, 'closed');
+  assert.equal(byRef.get(`${REPO}#62`)?.eventId, 36126959257);
+  assert.equal(byRef.get(`${REPO}#80`)?.event, 'reopened');
+  assert.equal(byRef.get(`${REPO}#80`)?.eventId, 36126959257);
+  const report = computeMetrics(snap, windowFor(NOW_NOV15_LA), { nowMs: NOW_NOV15_LA });
+  assert.equal(report.metrics.humanUnverifiedClose.unknown, false);
+  assert.equal(report.metrics.humanUnverifiedClose.numerator, 1);
+  assert.equal(report.metrics.rework.sources.some((row) => row.issue === `${REPO}#80` && row.reopened), true);
+});
+
+test('P2-1 首次终局不是通过时，后续「通过且含人工手测」并被 bot 关单仍计入', () => {
+  const comments = [
+    restComment({
+      id: 301,
+      number: 86,
+      round: 1,
+      status: '要修',
+      startedAt: '2026-11-13T10:00:00+08:00',
+      finishedAt: '2026-11-13T10:05:00+08:00',
+      items: `- 要修：${REPO}#86 SC1`,
+    }),
+    restComment({
+      id: 302,
+      number: 86,
+      round: 2,
+      status: '通过',
+      startedAt: '2026-11-14T10:00:00+08:00',
+      finishedAt: '2026-11-14T10:05:00+08:00',
+      items: PASS_ITEMS,
+    }),
+  ];
+  const snap = snapshotFrom({
+    comments,
+    issues: [{ number: 86, html_url: `https://github.com/${REPO}/issues/86` }],
+    events: [restEvent({ id: 8601, number: 86, event: 'closed', created_at: '2026-11-14T02:10:00Z', login: BOT, type: 'Bot' })],
+  });
+  const report = computeMetrics(snap, windowFor(NOW_NOV15_LA), { nowMs: NOW_NOV15_LA });
+  assert.equal(report.metrics.humanUnverifiedClose.unknown, false);
+  assert.equal(report.metrics.humanUnverifiedClose.numerator, 1);
+  assert.equal(report.metrics.humanUnverifiedClose.denominator, 1);
+  assert.equal(report.metrics.humanUnverifiedClose.sources[0].commentId, 302);
+  assert.equal(report.metrics.humanUnverifiedClose.sources[0].eventId, 8601);
+});
+
+test('P2-2 首次终局在窗口外时，窗口内后续要修仍计入返工', () => {
+  const comments = [
+    restComment({
+      id: 401,
+      number: 87,
+      round: 1,
+      status: '通过',
+      startedAt: '2026-11-06T10:00:00+08:00',
+      finishedAt: '2026-11-06T10:05:00+08:00',
+      items: cleanPassItems(),
+      created_at: '2026-11-06T02:00:00Z',
+    }),
+    restComment({
+      id: 402,
+      number: 87,
+      round: 2,
+      status: '要修',
+      startedAt: '2026-11-12T10:00:00+08:00',
+      finishedAt: '2026-11-12T10:05:00+08:00',
+      items: `- 要修：${REPO}#87 SC1`,
+      created_at: '2026-11-12T02:00:00Z',
+    }),
+  ];
+  const snap = snapshotFrom({ comments, issues: [{ number: 87, html_url: `https://github.com/${REPO}/issues/87` }], events: [] });
+  const report = computeMetrics(snap, windowFor(NOW_NOV15_LA), { nowMs: NOW_NOV15_LA });
+  assert.equal(report.metrics.firstPassOriginal.denominator, 0, '首次终局不在窗口，一次通过仍不计入');
+  assert.equal(report.metrics.rework.unknown, false);
+  assert.equal(report.metrics.rework.numerator, 1);
+  assert.equal(report.metrics.rework.denominator, 1);
+  assert.equal(report.metrics.rework.sources[0].laterFix, true);
+});
+
+test('P2-3 JSONL 坏行必须报告行号，受影响指标 unknown，CLI 非 0', async () => {
+  const dir = tmpDir('fleet-quality-jsonl-');
+  const commentsFile = writeJson(dir, 'comments.json', []);
+  const alertsFile = path.join(dir, 'alerts.jsonl');
+  fs.writeFileSync(
+    alertsFile,
+    `${JSON.stringify(alertLine({ ts: '2026-11-14T02:00:00.000Z', kind: 'prefetch-failed' }))}\n{not json\n${JSON.stringify(alertLine({ ts: '2026-11-14T03:00:00.000Z', kind: 'prefetch-failed' }))}\n`,
+  );
+  const snap = loadSnapshot({ comments: commentsFile, alerts: alertsFile });
+  const badLines = (snap.parseErrors || snap.alertParseErrors || []).map((row) => row.line);
+  assert.ok(badLines.includes(2), `坏行号应包含 2，实际 ${JSON.stringify(snap.parseErrors || snap.alertParseErrors)}`);
+  const report = computeMetrics(snap, windowFor(NOW_NOV15_LA), { nowMs: NOW_NOV15_LA });
+  assert.equal(report.metrics.repeatAlerts.unknown, true, '坏行时不得用剩余行给出已测量数字');
+  assert.equal(report.metrics.repeatAlerts.numerator, null);
+  assert.match(JSON.stringify(report.metrics.repeatAlerts), /:2|行 2|第 2/);
+
+  const stdout = [];
+  const stderr = [];
+  const code = await main(['--comments', commentsFile, '--alerts', alertsFile, '--now', '2026-11-15T18:00:00Z'], {
+    stdout: { write: (chunk) => stdout.push(chunk) },
+    stderr: { write: (chunk) => stderr.push(chunk) },
+  });
+  assert.notEqual(code, 0);
+  assert.match(stderr.join('') + stdout.join(''), /2/);
+});
+
+test('P2-4 显式路径不存在必须非 0，并说明期望与实际', async () => {
+  const dir = tmpDir('fleet-quality-missing-');
+  const commentsFile = writeJson(dir, 'comments.json', []);
+  const missing = path.join(dir, 'no-such-alerts.jsonl');
+  const stdout = [];
+  const stderr = [];
+  const code = await main(['--comments', commentsFile, '--alerts', missing, '--now', '2026-11-15T18:00:00Z'], {
+    stdout: { write: (chunk) => stdout.push(chunk) },
+    stderr: { write: (chunk) => stderr.push(chunk) },
+  });
+  assert.notEqual(code, 0);
+  const err = stderr.join('');
+  assert.match(err, /期望/);
+  assert.match(err, /实际/);
+  assert.ok(err.includes(missing), err);
+});
+
+test('P2-5 #62 真实 timeline PR mergedAt 可算出交付时延；无数据仍 unknown', () => {
+  const withTimeline = snapshotFrom({
+    comments: sample62Comments(),
+    issues: [
+      {
+        number: 62,
+        html_url: `https://github.com/${REPO}/issues/62`,
+        labeledSample: true,
+        closedByPullRequestsReferences: { nodes: [] },
+        timelineItems: { nodes: realIssue62TimelineCrossReferencedPrs() },
+      },
+    ],
+    events: [repoLevelClosedEventFor62()],
+  });
+  const report = computeMetrics(withTimeline, windowFor(NOW_NOV15_LA), { nowMs: NOW_NOV15_LA });
+  assert.equal(report.metrics.deliveryLatency.unknown, false);
+  assert.equal(report.metrics.deliveryLatency.values.length, 1);
+  assert.equal(report.metrics.deliveryLatency.values[0].minutes, ISSUE62_DELIVERY_MINUTES);
+  assert.ok(Math.abs(ISSUE62_DELIVERY_MINUTES - 1193.2166) < 0.001);
+
+  const noReady = snapshotFrom({
+    comments: sample62Comments(),
+    issues: [{ number: 62, html_url: `https://github.com/${REPO}/issues/62`, closedByPullRequestsReferences: { nodes: [] } }],
+    events: [],
+  });
+  const unknown = computeMetrics(noReady, windowFor(NOW_NOV15_LA), { nowMs: NOW_NOV15_LA });
+  assert.equal(unknown.metrics.deliveryLatency.unknown, true);
+  assert.equal(unknown.metrics.deliveryLatency.values.length, 0);
+  assert.equal(unknown.metrics.deliveryLatency.unknownIssues.length, 1);
+});
+
+test('P2-6 部署授权分母是窗口内已部署次数，不是只留敏感且带 authorization 的行', () => {
+  const sha = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const snap = snapshotFrom({
+    comments: [],
+    issues: [],
+    events: [],
+    deployments: [
+      bDeployRow({ ts: '2026-11-14T01:00:00Z', toSha: sha, authorization: userAuth(sha) }),
+      bDeployRow({ ts: '2026-11-14T01:10:00Z', toSha: sha, authorization: botAuth(sha) }),
+      bDeployRow({ ts: '2026-11-14T01:20:00Z', toSha: sha, sensitiveFiles: [], authorization: userAuth(sha) }),
+      bDeployRow({ ts: '2026-11-14T01:30:00Z', toSha: sha, authorization: null }),
+    ],
+  });
+  const report = computeMetrics(snap, windowFor(NOW_NOV15_LA), { nowMs: NOW_NOV15_LA });
+  assert.equal(report.metrics.deployAuth.unknown, false);
+  assert.equal(report.metrics.deployAuth.denominator, 4, '四个 deployed 都应进分母');
+  assert.equal(report.metrics.deployAuth.numerator, 2, 'bot 授权与缺 authorization 的敏感行不可核实');
 });

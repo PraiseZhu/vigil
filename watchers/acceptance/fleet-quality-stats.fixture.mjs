@@ -178,6 +178,93 @@ export function sample62Events() {
   ];
 }
 
+/**
+ * 公开 GET /repos/PraiseZhu/vigil/issues/62/events 的 closed 事件原文。
+ * url 是 /issues/events/{id}，没有 issue 号。测试里不得改这些字段；
+ * 反例只改 event=reopened。
+ */
+export const REAL_ISSUE_62_CLOSED_EVENT = {
+  actor: {
+    avatar_url: 'https://avatars.githubusercontent.com/in/5405636?v=4',
+    events_url: 'https://api.github.com/users/praiseautomation%5Bbot%5D/events{/privacy}',
+    followers_url: 'https://api.github.com/users/praiseautomation%5Bbot%5D/followers',
+    following_url: 'https://api.github.com/users/praiseautomation%5Bbot%5D/following{/other_user}',
+    gists_url: 'https://api.github.com/users/praiseautomation%5Bbot%5D/gists{/gist_id}',
+    gravatar_id: '',
+    html_url: 'https://github.com/apps/praiseautomation',
+    id: 345634207,
+    login: 'praiseautomation[bot]',
+    node_id: 'BOT_kgDOFJn1nw',
+    organizations_url: 'https://api.github.com/users/praiseautomation%5Bbot%5D/orgs',
+    received_events_url: 'https://api.github.com/users/praiseautomation%5Bbot%5D/received_events',
+    repos_url: 'https://api.github.com/users/praiseautomation%5Bbot%5D/repos',
+    site_admin: false,
+    starred_url: 'https://api.github.com/users/praiseautomation%5Bbot%5D/starred{/owner}{/repo}',
+    subscriptions_url: 'https://api.github.com/users/praiseautomation%5Bbot%5D/subscriptions',
+    type: 'Bot',
+    url: 'https://api.github.com/users/praiseautomation%5Bbot%5D',
+    user_view_type: 'public',
+  },
+  commit_id: null,
+  commit_url: null,
+  created_at: '2026-11-14T13:55:07Z',
+  event: 'closed',
+  id: 36126959257,
+  intent: null,
+  node_id: 'CE_lADOU38phs8AAAABZrUzX88AAAAIaVWmmQ',
+  performed_via_github_app: null,
+  state_reason: null,
+  url: 'https://api.github.com/repos/PraiseZhu/vigil/issues/events/36126959257',
+};
+
+export function realIssue62ReopenedCounterexample() {
+  return { ...REAL_ISSUE_62_CLOSED_EVENT, event: 'reopened' };
+}
+
+/** 仓库级 /issues/events 带嵌套 issue；html_url 用占位仓库以对接夹具评论。 */
+export function repoLevelClosedEventFor62() {
+  return {
+    ...REAL_ISSUE_62_CLOSED_EVENT,
+    issue: {
+      number: 62,
+      html_url: issueUrl(62),
+      url: `https://api.github.com/repos/${REPO}/issues/62`,
+    },
+  };
+}
+
+/** #62 真实 timeline：closedByPullRequestsReferences 为空，CrossReferencedEvent 有 PR446/447 mergedAt。 */
+export function realIssue62TimelineCrossReferencedPrs() {
+  return [
+    {
+      __typename: 'CrossReferencedEvent',
+      createdAt: '2026-11-13T01:31:08Z',
+      source: {
+        __typename: 'PullRequest',
+        number: 446,
+        url: `https://github.com/${REPO}/pull/446`,
+        mergedAt: '2026-11-13T18:00:49Z',
+        repository: { nameWithOwner: REPO },
+      },
+    },
+    {
+      __typename: 'CrossReferencedEvent',
+      createdAt: '2026-11-13T01:31:10Z',
+      source: {
+        __typename: 'PullRequest',
+        number: 447,
+        url: `https://github.com/${REPO}/pull/447`,
+        mergedAt: '2026-11-13T18:02:01Z',
+        repository: { nameWithOwner: REPO },
+      },
+    },
+  ];
+}
+
+export const ISSUE62_READY_AT_MS = Date.parse('2026-11-13T18:02:01Z');
+export const ISSUE62_FIRST_FINAL_AT_MS = Date.parse('2026-11-14T21:55:14+08:00');
+export const ISSUE62_DELIVERY_MINUTES = (ISSUE62_FIRST_FINAL_AT_MS - ISSUE62_READY_AT_MS) / 60000;
+
 export function sampleSnapshot(extra = {}) {
   return {
     labeledSample: true,
