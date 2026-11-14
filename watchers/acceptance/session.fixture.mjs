@@ -519,6 +519,11 @@ export const ALL_RAN_CHECKS_FILE = (() => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-checks-'));
   return writeJsonFile(dir, 'checks.json', { checks: ALL_RAN });
 })();
+/** 全机器树看板通过：必需检查 + 覆盖 MACHINE_SCS 的非空逐条证据。 */
+export const MACHINE_PASS_CHECKS_FILE = (() => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-checks-'));
+  return writeJsonFile(dir, 'machine-pass-checks.json', { checks: ALL_RAN, items: machineConclusions() });
+})();
 /** close 的 --verdict（close 先查「通过」条目的证据再写）：一条证据正常的「通过」。 */
 export const PASS_VERDICT_FILE = (() => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-checks-'));

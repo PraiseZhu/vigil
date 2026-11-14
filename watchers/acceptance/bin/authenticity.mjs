@@ -57,6 +57,9 @@ export function materialVersions(dir = materialDir()) {
   return out;
 }
 
+/** 认领快照相对 watcher home 的路径。沙箱只通过只读叠挂看到这一层，看不到整个 host 状态。 */
+export const CLAIM_SNAPSHOT_REL = path.join('state', 'host', 'snapshots');
+
 function watcherHomeFromProfile(profile) {
   if (typeof profile?.profilePath === 'string' && profile.profilePath) {
     return path.dirname(path.dirname(profile.profilePath));
@@ -64,9 +67,19 @@ function watcherHomeFromProfile(profile) {
   throw new Error('认领快照需要 profile.profilePath，才能写到沙箱不可写的宿主目录');
 }
 
-/** 认领快照目录：`<watcher home>/state/host/snapshots`，沙箱看不见、写不了。 */
+/** 认领快照目录：`<watcher home>/state/host/snapshots`。沙箱经只读视图读同一份，不能改。 */
 export function snapshotDir(profile) {
-  return path.join(watcherHomeFromProfile(profile), 'state', 'host', 'snapshots');
+  return path.join(watcherHomeFromProfile(profile), CLAIM_SNAPSHOT_REL);
+}
+
+export function isClaimSnapshotDir(dir) {
+  if (typeof dir !== 'string' || !dir) return false;
+  const resolved = path.resolve(dir);
+  return (
+    path.basename(resolved) === 'snapshots' &&
+    path.basename(path.dirname(resolved)) === 'host' &&
+    path.basename(path.dirname(path.dirname(resolved))) === 'state'
+  );
 }
 
 export function snapshotPath(profile, ref, n) {
@@ -93,6 +106,9 @@ function atomicWrite(file, data) {
 }
 
 export function writeClaimSnapshot(profile, ref, n, patch) {
+  if (process.env.ACCEPTANCE_GATE_SOCKET) {
+    throw new Error('沙箱不能改认领快照');
+  }
   const file = snapshotPath(profile, ref, n);
   const prev = readJson(file) || {};
   const next = {
@@ -342,6 +358,62 @@ export function pendingCloseBlocked(tree) {
   if (tree?.collectionComplete === false || (tree?.skippedQueries || []).length) {
     return '收集不完整，不能关总单、不能写看板通过';
   }
+  return null;
+}
+
+/** 任务树里每条 SC 都要有一条结论。 */
+export function missingConclusions(tree, items = []) {
+  const have = new Set((Array.isArray(items) ? items : []).map((item) => conclusionKey(item.ref, item.sc)));
+  const missing = [];
+  const seen = new Set();
+  for (const issue of tree?.issues || []) {
+    for (const item of issue.items || []) {
+      const key = conclusionKey(item.source || issue.ref, item.sc);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!have.has(key)) missing.push(`${item.source || issue.ref} SC${item.sc}`);
+    }
+  }
+  return missing;
+}
+
+/**
+ * 通过类副作用（关总单/关子单、看板验收=通过）共用的宿主门禁。
+ * 不信快照齐全、调用方声称已验、打勾或 frozen 标签：必须有覆盖整棵树的非空逐条证据。
+ */
+export function passSideEffectBlocked(tree, snapshot, items, extra = {}) {
+  const pending = pendingCloseBlocked(tree);
+  if (pending) return pending;
+  const snapBlock = snapshotPassBlocked(snapshot, tree);
+  if (snapBlock) return snapBlock;
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return '通过类副作用需要完整逐条非空证据';
+  const missing = missingConclusions(tree, list);
+  if (missing.length) return `通过类副作用缺逐条结论：${missing.join('、')}`;
+  try {
+    guardOriginalPass(list, {
+      snapshot,
+      checkoutDir: extra.checkoutDir || snapshot?.checkoutDir,
+      moduleUrl: extra.moduleUrl,
+      materials: extra.materials,
+      materialDir: extra.materialDir,
+      compareMaterials: extra.compareMaterials,
+    });
+  } catch (error) {
+    return String(error.message || error);
+  }
+  let status;
+  try {
+    status = deriveStatus(list, extra.needsHuman || extra.corrections || [], {
+      tree,
+      skippedQueries: extra.skippedQueries ?? tree?.skippedQueries,
+      collectionComplete: extra.collectionComplete ?? tree?.collectionComplete,
+      extracted: extra.extracted,
+    });
+  } catch (error) {
+    return String(error.message || error);
+  }
+  if (status !== '通过') return `通过类副作用要求总评通过，当前是${status}`;
   return null;
 }
 

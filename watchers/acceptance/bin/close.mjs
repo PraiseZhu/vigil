@@ -10,11 +10,11 @@ import { collectTree, fetchIssueBody } from './collect.mjs';
 import { createRounds, parseRef } from './rounds.mjs';
 import { guardPass, readVerdictItems } from './checks.mjs';
 import { assertNotVerdictOnly } from './profile.mjs';
-import { missingConclusions } from './verdict.mjs';
 import {
   OVERALL_PENDING,
   deriveStatus,
   guardOriginalPass,
+  missingConclusions,
   pendingCloseBlocked,
   readClaimSnapshot,
   snapshotUnusableReason,
@@ -171,6 +171,7 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
         verdictUrl: current.url,
         round: n,
         ref: target,
+        items: verdictItems,
       });
     }
 
@@ -181,6 +182,7 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
       repo: root.repo,
       issue: root.number,
       reason: 'completed',
+      items: verdictItems,
     });
   }
 

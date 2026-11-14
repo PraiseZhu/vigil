@@ -35,7 +35,7 @@ import {
   selectModelId,
 } from './llm-proxy-preflight.mjs';
 import { redact } from '../bin/redact.mjs';
-import { attachCodeSha } from '../bin/authenticity.mjs';
+import { attachCodeSha, snapshotDir } from '../bin/authenticity.mjs';
 import { activityChange, probeSandboxActivity } from './activity.mjs';
 
 /** 内存门：MemAvailable 低于 3 GiB 就不认领、不跑模型。常量，不可配。 */
@@ -817,10 +817,12 @@ export async function runHostRound({
     let sandboxReady = false;
     try {
       const rawProfile = JSON.parse(fs.readFileSync(profile.profilePath, 'utf8'));
-      prepareSandboxProfile({ profile, roundDir, repoRoot: root, socketPath });
+      const prepared = prepareSandboxProfile({ profile, roundDir, repoRoot: root, socketPath });
       for (const dir of [profile.stateDir, profile.worktreeDir]) {
         fs.mkdirSync(dir, { recursive: true });
       }
+      const hostSnapshots = snapshotDir(profile);
+      fs.mkdirSync(hostSnapshots, { recursive: true, mode: 0o700 });
       const masks = maskList({
         rawProfile,
         profile,
@@ -840,6 +842,7 @@ export async function runHostRound({
         readOnlyBinds: [...codeDirs, ...(deps?.readOnlyBinds || [])],
         readOnlyMounts: deps?.mounts || [],
         tmpfsDirs: deps?.tmpfs || [],
+        readOnlyOverlays: [{ src: hostSnapshots, dest: prepared.snapshotView }],
         hostHome: env.HOME || process.env.HOME,
         homeAllow: defaultHomeAllow({ repoRoot: root, hostConfig: settings }),
       });

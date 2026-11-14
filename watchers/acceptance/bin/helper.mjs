@@ -12,14 +12,13 @@ import { collectTree } from './collect.mjs';
 import { runClose } from './close.mjs';
 import { runCorrect } from './correct.mjs';
 import { runPush, secretFiles, sessionPath, writeNeedsHuman } from './push.mjs';
-import { EnvUnverifiedError, guardPass, readChecksRaw } from './checks.mjs';
+import { EnvUnverifiedError, guardPass, readChecksRaw, readPassItems } from './checks.mjs';
 import { runVerdict } from './verdict.mjs';
 import {
   OVERALL_PENDING,
   assertNotTempModule,
-  pendingCloseBlocked,
+  passSideEffectBlocked,
   readClaimSnapshot,
-  snapshotPassBlocked,
 } from './authenticity.mjs';
 
 export const EXIT = Object.freeze({ OK: 0, FAIL: 1, CLAIM: 3, REJECTED: 4, SECRET: 5, ENV: 6 });
@@ -234,9 +233,10 @@ async function cmdBoard({ github, profile, ref, n, flags, now, stdout }) {
     if (!inTree.has(one.toLowerCase())) throw new Error(`${one} 不在本轮任务树里，不能写看板`);
     targets = [one];
   }
+  const passItems = acceptance === '通过' ? readPassItems(flags.get('checks')) : undefined;
   if (acceptance === '通过') {
     const loaded = await loadTree();
-    const blocked = pendingCloseBlocked(loaded) || snapshotPassBlocked(readClaimSnapshot(profile, ref, n), loaded);
+    const blocked = passSideEffectBlocked(loaded, readClaimSnapshot(profile, ref, n), passItems);
     if (blocked) throw new Error(blocked);
   }
 
@@ -249,6 +249,7 @@ async function cmdBoard({ github, profile, ref, n, flags, now, stdout }) {
       verdictUrl,
       round: n,
       ref: one,
+      ...(passItems ? { items: passItems } : {}),
     });
   }
   stdout.write(`${JSON.stringify({ target: target || 'root', acceptance, verdictUrl, issues: targets })}\n`);

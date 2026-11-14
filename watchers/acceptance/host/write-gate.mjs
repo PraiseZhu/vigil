@@ -39,9 +39,9 @@ import {
 } from './prbot-gate-check.mjs';
 import {
   illegalPassFromVerdictText,
+  passSideEffectBlocked,
   pendingCloseBlocked,
   readClaimSnapshot,
-  snapshotPassBlocked,
 } from '../bin/authenticity.mjs';
 
 export { MAIN_CHECKS_QUERY, PR_BY_BRANCH_QUERY, PR_HEAD_QUERY, PR_STATUS_QUERY, READY_ACTIVITY_QUERY };
@@ -584,21 +584,11 @@ export function createGate({
             return reject('edit-not-allowed', 'issue.edit 只能勾选或取消验收项、给验收项补「人工手测」，不能改正文其它内容');
           }
         }
-        if (action.type === 'issue.close') {
-          const pending = pendingCloseBlocked(currentTree);
-          if (pending) return reject('pending-human', pending);
+        if (action.type === 'issue.close' || (action.type === 'project.field.set' && action.fields?.['验收'] === '通过')) {
           const snapshot = readClaimSnapshot(profile, binding.root, binding.round);
-          const snapBlock = snapshotPassBlocked(snapshot, currentTree);
-          if (snapBlock) return reject('illegal-pass', snapBlock);
-        }
-        if (action.type === 'project.field.set') {
-          const fields = action.fields && typeof action.fields === 'object' && !Array.isArray(action.fields) ? action.fields : {};
-          if (fields['验收'] === '通过') {
-            const pending = pendingCloseBlocked(currentTree);
-            if (pending) return reject('pending-human', pending);
-            const snapshot = readClaimSnapshot(profile, binding.root, binding.round);
-            const snapBlock = snapshotPassBlocked(snapshot, currentTree);
-            if (snapBlock) return reject('illegal-pass', snapBlock);
+          const blocked = passSideEffectBlocked(currentTree, snapshot, action.items);
+          if (blocked) {
+            return reject(pendingCloseBlocked(currentTree) ? 'pending-human' : 'illegal-pass', blocked);
           }
         }
         return null;

@@ -37,6 +37,7 @@ import {
   writeJsonFile,
   ALL_RAN,
   ALL_RAN_CHECKS_FILE,
+  MACHINE_PASS_CHECKS_FILE,
   PASS_VERDICT_FILE,
   claimWorld,
 } from './session.fixture.mjs';
@@ -265,7 +266,14 @@ test('verdict-only 写闸：绑定到名单里的根，关单 / 勾选 / 开修�
   claimWorld(other.profile, otherWorld, ROOT_REF, 1);
   const normal = openGate({ home: other.home, profile: other.profile, world: otherWorld, binding: bindingFor(otherWorld) });
   await normal.start();
-  const closed = await normal.handle({ type: 'issue.close', repo: REPO, issue: 1, reason: 'completed', dedupeKey: 'normal-close' });
+  const closed = await normal.handle({
+    type: 'issue.close',
+    repo: REPO,
+    issue: 1,
+    reason: 'completed',
+    items: machineConclusions(),
+    dedupeKey: 'normal-close',
+  });
   assert.equal(closed.code, 0, JSON.stringify(closed));
 });
 
@@ -312,7 +320,7 @@ test('helper：写闸回 4 verdict-only（绕过 helper 的情形）→ 退出�
       },
     }),
     profile,
-    ['board', '--issue', ROOT_REF, '--round', '1', '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE],
+    ['board', '--issue', ROOT_REF, '--round', '1', '--acceptance', '通过', '--checks', MACHINE_PASS_CHECKS_FILE],
   );
   assert.equal(result.code, 4);
   assert.match(rootComment(world).body, /第 1 轮：验收中/);
@@ -1028,7 +1036,7 @@ test('helper：写闸退出码 1 → helper 退出码 1（不是 4），这一�
       },
     }),
     profile,
-    ['board', '--issue', ROOT_REF, '--round', '1', '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE],
+    ['board', '--issue', ROOT_REF, '--round', '1', '--acceptance', '通过', '--checks', MACHINE_PASS_CHECKS_FILE],
   );
   assert.equal(result.code, 1);
   const body = rootComment(world).body;

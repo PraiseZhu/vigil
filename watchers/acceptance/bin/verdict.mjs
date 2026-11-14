@@ -15,9 +15,12 @@ import {
   formatMaterialLine,
   guardOriginalPass,
   materialVersions,
+  missingConclusions,
   readClaimSnapshot,
   snapshotUnusableReason,
 } from './authenticity.mjs';
+
+export { missingConclusions };
 
 export const RESULTS = Object.freeze(['通过', '要修', '人工手测', '待验', '有争议']);
 
@@ -151,25 +154,6 @@ export const VERDICT_ONLY_LINE = '本 issue 由人工复核后关闭。';
 
 function conclusionKey(ref, sc) {
   return `${String(ref).toLowerCase()} SC${Number(sc)}`;
-}
-
-/**
- * 任务树里每条 SC 都要有一条结论（通过 / 要修 / 人工手测 / 有争议）：返回缺结论的条目（`owner/repo#n SC<k>`）。
- * 树是 collect 收到的那棵（总 issue、子 issue、挂着的修正子 issue）。
- */
-export function missingConclusions(tree, items = []) {
-  const have = new Set(items.map((item) => conclusionKey(item.ref, item.sc)));
-  const missing = [];
-  const seen = new Set();
-  for (const issue of tree?.issues || []) {
-    for (const item of issue.items || []) {
-      const key = conclusionKey(item.source || issue.ref, item.sc);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      if (!have.has(key)) missing.push(`${item.source || issue.ref} SC${item.sc}`);
-    }
-  }
-  return missing;
 }
 
 export function deriveStatus(items = [], needsHuman = [], extras = {}) {

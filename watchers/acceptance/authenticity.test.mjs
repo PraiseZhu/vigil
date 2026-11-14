@@ -205,6 +205,22 @@ test('SC2 标准变化除 SC 行勾选和人工手测后缀外作废；快照可
   );
 });
 
+test('P1 沙箱 GATE_SOCKET 下不能写/改认领快照', () => {
+  const { profile } = setup();
+  const prev = process.env.ACCEPTANCE_GATE_SOCKET;
+  process.env.ACCEPTANCE_GATE_SOCKET = '/tmp/acceptance-gate-test.sock';
+  try {
+    assert.throws(
+      () => writeClaimSnapshot(profile, ROOT, 1, { bodyVersion: 'sha256:x', bodies: { [ROOT]: 'x' } }),
+      /不能改认领快照|沙箱不能/,
+    );
+    assert.equal(readClaimSnapshot(profile, ROOT, 1), null);
+  } finally {
+    if (prev === undefined) delete process.env.ACCEPTANCE_GATE_SOCKET;
+    else process.env.ACCEPTANCE_GATE_SOCKET = prev;
+  }
+});
+
 test('SC2 材料版本与运行 SHA 写进快照；临时目录启动拒绝', () => {
   const versions = materialVersions();
   assert.ok(versions['authenticity.mjs'].startsWith('sha256:'));
@@ -557,9 +573,58 @@ test('P1-1 写闸：收集完整时无证据关总单 / 写看板通过 / 两行
   assert.equal(world.writes.length, 0);
 });
 
-test('P1-1/SC6 写闸：完整认领快照后机器层关单仍放行', async () => {
+test('P1 写闸：快照齐全且收集完整时无逐条证据，关总单/关子单/看板通过均拒绝', async () => {
   const { home, profile } = setup();
   const world = machineOnlyTree();
+  claimWorld(profile, world, ROOT, 1);
+  const gate = openGate(home, profile, world);
+  await gate.start();
+  const rootClose = await gate.handle({
+    type: 'issue.close',
+    repo: REPO,
+    issue: 1,
+    reason: 'completed',
+    dedupeKey: 'p1-no-ev-root',
+  });
+  assert.equal(rootClose.code, 4, JSON.stringify(rootClose));
+  assert.equal(rootClose.body.reason, 'illegal-pass');
+  assert.match(rootClose.body.detail || '', /逐条|证据|裁决/);
+  assert.equal(world.get(ROOT).state, 'open');
+
+  const childClose = await gate.handle({
+    type: 'issue.close',
+    repo: REPO,
+    issue: 2,
+    reason: 'completed',
+    dedupeKey: 'p1-no-ev-child',
+  });
+  assert.equal(childClose.code, 4, JSON.stringify(childClose));
+  assert.equal(childClose.body.reason, 'illegal-pass');
+  assert.equal(world.get(`${REPO}#2`).state, 'open');
+
+  const board = await gate.handle({
+    type: 'project.field.set',
+    repo: REPO,
+    issue: 1,
+    ownerLogin: OWNER,
+    projectNumber: 7,
+    fields: { 验收: '通过' },
+    dedupeKey: 'p1-no-ev-board',
+  });
+  assert.equal(board.code, 4, JSON.stringify(board));
+  assert.equal(board.body.reason, 'illegal-pass');
+  assert.equal(world.get(ROOT).project['验收'], undefined);
+  assert.equal(world.writes.length, 0);
+});
+
+test('P1 写闸：快照齐全时打勾、frozen 标签、声称已验仍不能代替逐条证据', async () => {
+  const { home, profile } = setup();
+  const world = machineOnlyTree();
+  for (const ref of [ROOT, `${REPO}#2`, `${OTHER_REPO}#7`]) {
+    const issue = world.get(ref);
+    issue.body = String(issue.body || '').replaceAll('- [ ]', '- [x]');
+    issue.labels = ['frozen'];
+  }
   claimWorld(profile, world, ROOT, 1);
   const gate = openGate(home, profile, world);
   await gate.start();
@@ -568,6 +633,80 @@ test('P1-1/SC6 写闸：完整认领快照后机器层关单仍放行', async ()
     repo: REPO,
     issue: 1,
     reason: 'completed',
+    verified: true,
+    claimedVerified: true,
+    frozen: true,
+    labels: ['frozen'],
+    dedupeKey: 'p1-tick-frozen',
+  });
+  assert.equal(closed.code, 4, JSON.stringify(closed));
+  assert.equal(closed.body.reason, 'illegal-pass');
+  assert.match(closed.body.detail || '', /逐条|证据|裁决/);
+  assert.equal(world.get(ROOT).state, 'open');
+  assert.equal(world.writes.length, 0);
+});
+
+test('P1 写闸：快照齐全但逐条通过证据为空，关单/看板通过仍拒绝且零写入', async () => {
+  const { home, profile } = setup();
+  const world = machineOnlyTree();
+  claimWorld(profile, world, ROOT, 1);
+  const gate = openGate(home, profile, world);
+  await gate.start();
+  const items = machineConclusions();
+  for (const item of items) item.evidence = '—';
+  const board = await gate.handle({
+    type: 'project.field.set',
+    repo: REPO,
+    issue: 1,
+    ownerLogin: OWNER,
+    projectNumber: 7,
+    fields: { 验收: '通过' },
+    items,
+    dedupeKey: 'p1-empty-ev-board',
+  });
+  assert.equal(board.code, 4, JSON.stringify(board));
+  assert.equal(board.body.reason, 'illegal-pass');
+  assert.match(board.body.detail || '', /空证据|证据为空/);
+  assert.equal(world.get(ROOT).project['验收'], undefined);
+  const closed = await gate.handle({
+    type: 'issue.close',
+    repo: REPO,
+    issue: 1,
+    reason: 'completed',
+    items,
+    dedupeKey: 'p1-empty-ev-close',
+  });
+  assert.equal(closed.code, 4, JSON.stringify(closed));
+  assert.equal(closed.body.reason, 'illegal-pass');
+  assert.equal(world.get(ROOT).state, 'open');
+  assert.equal(world.writes.length, 0);
+});
+
+test('P1-1/SC6 写闸：完整认领快照且逐条非空证据后机器层关单/看板通过仍放行', async () => {
+  const { home, profile } = setup();
+  const world = machineOnlyTree();
+  claimWorld(profile, world, ROOT, 1);
+  const gate = openGate(home, profile, world);
+  await gate.start();
+  const items = machineConclusions();
+  const board = await gate.handle({
+    type: 'project.field.set',
+    repo: REPO,
+    issue: 1,
+    ownerLogin: OWNER,
+    projectNumber: 7,
+    fields: { 验收: '通过' },
+    items,
+    dedupeKey: 'p1-1-ok-board',
+  });
+  assert.equal(board.code, 0, JSON.stringify(board));
+  assert.equal(world.get(ROOT).project['验收'], '通过');
+  const closed = await gate.handle({
+    type: 'issue.close',
+    repo: REPO,
+    issue: 1,
+    reason: 'completed',
+    items,
     dedupeKey: 'p1-1-ok-close',
   });
   assert.equal(closed.code, 0, JSON.stringify(closed));

@@ -22,6 +22,7 @@ import {
   writeJsonFile,
   ALL_RAN,
   ALL_RAN_CHECKS_FILE,
+  MACHINE_PASS_CHECKS_FILE,
   PASS_VERDICT_FILE,
   claimWorld,
 } from './session.fixture.mjs';
@@ -339,7 +340,7 @@ test('SC9 写闸拒绝（非 secret-found）→ 退出码 4 且这一轮标中�
     '--acceptance',
     '通过',
     '--checks',
-    ALL_RAN_CHECKS_FILE,
+    MACHINE_PASS_CHECKS_FILE,
   ], {
     onWrite: (action) => {
       if (action.type === 'project.field.set') {
@@ -359,7 +360,7 @@ test('SC9 写闸忙 → 退出码 1 且这一轮标中断写「写闸忙」', as
   const { profile } = loadProfile();
   const world = machineOnlyTree();
   claimWorld(profile, world, `${REPO}#1`, 1);
-  const result = await run(world, profile, ['board', '--issue', `${REPO}#1`, '--round', '1', '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE], {
+  const result = await run(world, profile, ['board', '--issue', `${REPO}#1`, '--round', '1', '--acceptance', '通过', '--checks', MACHINE_PASS_CHECKS_FILE], {
     onWrite: (action) => {
       if (action.type === 'project.field.set') throw new WriteBusyError('外发忙');
       return undefined;
