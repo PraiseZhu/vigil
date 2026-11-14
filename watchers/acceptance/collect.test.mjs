@@ -56,6 +56,17 @@ test('App-only 模式跳过无 owner 的全局修正搜索，保留逐仓搜索'
   ]);
 });
 
+test('沙箱副本删掉 appOnly（读也经写闸）时也不发无 owner 的全局修正搜索', () => {
+  const sandbox = {
+    forkRepos: ['example-org/fork-repo'],
+    writeCommand: ['node', 'host/gate-client.mjs', '--socket', '/tmp/gate.sock'],
+  };
+  assert.equal(Object.hasOwn(sandbox, 'appOnly'), false);
+  assert.deepEqual(searchQueries(`${REPO}#1`, sandbox), [
+    `"[验收机] 修正 · 总 ${REPO}#1" in:body is:issue repo:example-org/fork-repo`,
+  ]);
+});
+
 test('SC1 collect 输出任务树：总 issue、跨仓子 issue、修正子 issue、验收项、已合并 PR', async () => {
   const profile = loadProfile();
   const world = defaultTree();
