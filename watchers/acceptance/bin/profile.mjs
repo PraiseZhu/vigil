@@ -417,6 +417,14 @@ export function loadAcceptanceProfile(env = process.env) {
   if (appOnly && !apps) throw invalid('appOnly', file, '打开只用 App 模式时必须同时配 apps');
   if (appOnly && appConfigPath) throw invalid('appOnly', file, '只用 App 模式不能和 appConfigPath 一起用（appConfigPath 不按 owner 分流）');
 
+  // 沙箱副本删掉 appOnly 之后，仍要知道宿主是不是只用 App，才能决定是否发无 owner 全局搜索。
+  // 这不是令牌路由开关（github.mjs 只看 appOnly），默认 false，不要求配 apps。
+  let hostAppOnly = false;
+  if (Object.hasOwn(raw, 'hostAppOnly') && raw.hostAppOnly !== undefined && raw.hostAppOnly !== null) {
+    if (typeof raw.hostAppOnly !== 'boolean') throw invalid('hostAppOnly', file, '应为 true 或 false');
+    hostAppOnly = raw.hostAppOnly;
+  }
+
   // 身份白名单只多认配置里的 App bot：没配时是 []，判断逻辑和「只认 ownerLogin」完全一致。
   const trustedBotLogins = optionalBotLogins(raw, file);
 
@@ -447,6 +455,7 @@ export function loadAcceptanceProfile(env = process.env) {
     appPrivateKeyFile,
     apps,
     appOnly,
+    hostAppOnly,
     appTokenCommand: appTokenCommand ? Object.freeze(appTokenCommand) : undefined,
     appOwners: Object.freeze(appOwners),
     trustedBotLogins: Object.freeze(trustedBotLogins),

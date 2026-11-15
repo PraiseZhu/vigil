@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion } from './bin/rounds.mjs';
 import { runHelper } from './bin/helper.mjs';
 import { parseItems, parseMarker, parseLayer, parseTestPoint, searchQueries, skippedSearchQueries } from './bin/collect.mjs';
+import { prepareSandboxProfile } from './host/sandbox.mjs';
 import { tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import {
   OWNER,
@@ -59,15 +62,133 @@ test('App-only 模式跳过无 owner 的全局修正搜索，保留逐仓搜索'
   ]);
 });
 
-test('沙箱副本删掉 appOnly（读也经写闸）时也不发无 owner 的全局修正搜索', () => {
-  const sandbox = {
-    forkRepos: ['example-org/fork-repo'],
-    writeCommand: ['node', 'host/gate-client.mjs', '--socket', '/tmp/gate.sock'],
-  };
-  assert.equal(Object.hasOwn(sandbox, 'appOnly'), false);
-  assert.deepEqual(searchQueries(`${REPO}#1`, sandbox), [
-    `"[验收机] 修正 · 总 ${REPO}#1" in:body is:issue repo:example-org/fork-repo`,
+const FORK = 'example-org/fork-repo';
+const ROOT_REF = `${REPO}#1`;
+const GLOBAL_QUERY = `"[验收机] 修正 · 总 ${ROOT_REF}" in:body is:issue`;
+const FORK_QUERY = `${GLOBAL_QUERY} repo:${FORK}`;
+const WRITE_COMMAND = ['node', 'host/gate-client.mjs', '--socket', '/tmp/gate.sock'];
+
+function searchOf(profile) {
+  return searchQueries(ROOT_REF, { forkRepos: [FORK], ...profile });
+}
+
+test('searchQueries 只认显式 App-only 能力，writeCommand 四组合不改变过滤', () => {
+  assert.deepEqual(searchOf({}), [GLOBAL_QUERY, FORK_QUERY]);
+  assert.deepEqual(searchOf({ writeCommand: WRITE_COMMAND }), [GLOBAL_QUERY, FORK_QUERY]);
+  assert.deepEqual(searchOf({ appOnly: true }), [FORK_QUERY]);
+  assert.deepEqual(searchOf({ appOnly: true, writeCommand: WRITE_COMMAND }), [FORK_QUERY]);
+  assert.deepEqual(searchOf({ hostAppOnly: true }), [FORK_QUERY]);
+  assert.deepEqual(searchOf({ hostAppOnly: true, writeCommand: WRITE_COMMAND }), [FORK_QUERY]);
+  assert.deepEqual(searchOf({ hostAppOnly: false, writeCommand: WRITE_COMMAND }), [GLOBAL_QUERY, FORK_QUERY]);
+  assert.deepEqual(skippedSearchQueries(ROOT_REF, { hostAppOnly: true, forkRepos: [FORK] }), [
+    { query: GLOBAL_QUERY, reason: 'appOnly-global-search' },
   ]);
+  assert.deepEqual(skippedSearchQueries(ROOT_REF, { writeCommand: WRITE_COMMAND, forkRepos: [FORK] }), []);
+});
+
+function hostProfile({ appOnly = false, forkRepos = [], extra = {} } = {}) {
+  const home = tmpDir();
+  const profileExtra = {
+    forkRepos,
+    autoRepos: [`${OWNER}/*`, REPO],
+    ...extra,
+  };
+  if (appOnly) {
+    const key = path.join(home, 'secrets', 'read.key');
+    fs.mkdirSync(path.dirname(key), { recursive: true });
+    fs.writeFileSync(key, 'not-a-real-app-key', { mode: 0o600 });
+    profileExtra.appOnly = true;
+    profileExtra.apps = { read: { appId: 101, privateKeyFile: key, owners: [OWNER] } };
+  }
+  writeProfile(home, { profile: profileExtra });
+  return loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+}
+
+function sandboxCopyOf(host) {
+  const roundDir = tmpDir();
+  const { sandboxHome, profileFile } = prepareSandboxProfile({
+    profile: host,
+    roundDir,
+    repoRoot: '/repo',
+    socketPath: path.join(roundDir, 'gate.sock'),
+  });
+  const raw = JSON.parse(fs.readFileSync(profileFile, 'utf8'));
+  const loaded = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: sandboxHome });
+  return { raw, loaded };
+}
+
+function unattachedCorrectionWorld() {
+  const world = defaultTree();
+  const correction = world.addIssue({
+    repo: REPO,
+    number: 99,
+    title: '修正：挂接失败的同仓修正单',
+    body: [`[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#2 SC3 · 第 1 轮`].join('\n'),
+  });
+  world.addComment(correction.ref, {
+    body: [
+      '[修正机] 第 1 轮：要修',
+      `- 有争议：${REPO}#2 SC3 · 验收方：没挂上 · 修正方：创建成功`,
+    ].join('\n'),
+  });
+  return world;
+}
+
+test('真实沙箱 profile：非 App-only 宿主有 writeCommand 仍发全局搜索，挂接失败的 autoRepos 修正单和争议收得到', async () => {
+  const host = hostProfile({ appOnly: false, forkRepos: [] });
+  assert.equal(host.appOnly, false);
+  const { raw, loaded } = sandboxCopyOf(host);
+  assert.equal(Object.hasOwn(raw, 'appOnly'), false);
+  assert.ok(raw.writeCommand);
+  assert.equal(raw.hostAppOnly, false);
+  assert.equal(loaded.appOnly, false);
+  assert.equal(loaded.hostAppOnly, false);
+  assert.ok(loaded.writeCommand);
+  assert.deepEqual(loaded.forkRepos, []);
+  assert.ok(loaded.autoRepos.includes(REPO));
+  const queries = searchQueries(ROOT_REF, loaded);
+  assert.deepEqual(queries, [GLOBAL_QUERY]);
+  assert.equal(queries.some((query) => /(?:^|\s)repo:/.test(query)), false, '不得用逐仓扫描代替全局发现');
+
+  const world = unattachedCorrectionWorld();
+  const { code, out, err } = await runCollect(world, loaded);
+  assert.equal(code, 0, err);
+  const tree = JSON.parse(out);
+  assert.equal(tree.collectionComplete, true);
+  assert.deepEqual(tree.skippedQueries, []);
+  assert.equal(tree.corrections.some((entry) => entry.ref === `${REPO}#99`), true);
+  assert.equal(
+    tree.disputed.some((entry) => entry.source === 'correction' && entry.item === `${REPO}#2 SC3`),
+    true,
+  );
+});
+
+test('真实沙箱 profile：App-only 宿主显式传递能力，forkRepos=[] 时不发无 owner 查询且不假通过', async () => {
+  const host = hostProfile({ appOnly: true, forkRepos: [] });
+  assert.equal(host.appOnly, true);
+  const { raw, loaded } = sandboxCopyOf(host);
+  assert.equal(Object.hasOwn(raw, 'appOnly'), false);
+  assert.equal(raw.hostAppOnly, true);
+  assert.ok(raw.writeCommand);
+  assert.equal(loaded.appOnly, false);
+  assert.equal(loaded.hostAppOnly, true);
+  assert.deepEqual(searchQueries(ROOT_REF, loaded), []);
+  assert.equal(
+    searchQueries(ROOT_REF, loaded).some((query) => query.includes(`repo:${REPO}`)),
+    false,
+    'App-only 不得改成按 autoRepos 逐仓扫描',
+  );
+  assert.deepEqual(skippedSearchQueries(ROOT_REF, loaded), [
+    { query: GLOBAL_QUERY, reason: 'appOnly-global-search' },
+  ]);
+
+  const world = unattachedCorrectionWorld();
+  const { code, out, err } = await runCollect(world, loaded);
+  assert.equal(code, 0, err);
+  const tree = JSON.parse(out);
+  assert.equal(tree.collectionComplete, false);
+  assert.ok(tree.skippedQueries.some((entry) => entry.reason === 'appOnly-global-search'));
+  assert.equal(tree.corrections.some((entry) => entry.ref === `${REPO}#99`), false);
 });
 
 test('SC1 collect 输出任务树：总 issue、跨仓子 issue、修正子 issue、验收项、已合并 PR', async () => {
