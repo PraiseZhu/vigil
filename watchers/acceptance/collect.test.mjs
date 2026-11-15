@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import { loadAcceptanceProfile } from './bin/profile.mjs';
 import { bodyVersion } from './bin/rounds.mjs';
 import { runHelper } from './bin/helper.mjs';
 import { parseItems, parseMarker, parseLayer, parseTestPoint, searchQueries, skippedSearchQueries } from './bin/collect.mjs';
+import { prepareSandboxProfile } from './host/sandbox.mjs';
 import { tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import {
   OWNER,
@@ -41,6 +44,73 @@ async function runCollect(world, profile, ref = `${REPO}#1`) {
 }
 
 const CORRECTION_MARKER = `[验收机] 修正 · 总 ${REPO}#1 · 项 ${REPO}#2 SC3 · 第 1 轮`;
+const FORK_REPO = 'example-org/fork-repo';
+const GLOBAL_QUERY = `"[验收机] 修正 · 总 ${REPO}#1" in:body is:issue`;
+const FORK_QUERY = `${GLOBAL_QUERY} repo:${FORK_REPO}`;
+const GATE_WRITE_COMMAND = ['node', 'host/gate-client.mjs', '--socket', '/tmp/gate.sock'];
+
+test('searchQueries 只认显式 App-only 能力，writeCommand 不改变过滤', () => {
+  const searchOf = (extra) => searchQueries(`${REPO}#1`, { forkRepos: [FORK_REPO], ...extra });
+  assert.deepEqual(searchOf({}), [GLOBAL_QUERY, FORK_QUERY]);
+  assert.deepEqual(searchOf({ writeCommand: GATE_WRITE_COMMAND }), [GLOBAL_QUERY, FORK_QUERY]);
+  assert.deepEqual(searchOf({ hostAppOnly: true }), [FORK_QUERY]);
+  assert.deepEqual(searchOf({ hostAppOnly: true, writeCommand: GATE_WRITE_COMMAND }), [FORK_QUERY]);
+  assert.deepEqual(searchOf({ hostAppOnly: false, writeCommand: GATE_WRITE_COMMAND }), [GLOBAL_QUERY, FORK_QUERY]);
+  assert.deepEqual(skippedSearchQueries(`${REPO}#1`, { hostAppOnly: true, forkRepos: [FORK_REPO] }), [
+    { query: GLOBAL_QUERY, reason: 'appOnly-global-search' },
+  ]);
+});
+
+function sandboxProfileOf({ appOnly, forkRepos }) {
+  const home = tmpDir();
+  const profile = { appOnly, forkRepos };
+  if (appOnly) {
+    const key = path.join(home, 'secrets', 'read.key');
+    fs.mkdirSync(path.dirname(key), { recursive: true });
+    fs.writeFileSync(key, 'not-a-real-app-key', { mode: 0o600 });
+    profile.apps = { read: { appId: 101, privateKeyFile: key, owners: [OWNER] } };
+  }
+  writeProfile(home, { profile });
+  const host = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home });
+  const roundDir = tmpDir();
+  const { sandboxHome, profileFile } = prepareSandboxProfile({
+    profile: host,
+    roundDir,
+    repoRoot: '/repo',
+    socketPath: path.join(roundDir, 'gate.sock'),
+  });
+  const raw = JSON.parse(fs.readFileSync(profileFile, 'utf8'));
+  const loaded = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: sandboxHome });
+  return { host, raw, loaded };
+}
+
+test('沙箱副本带上宿主 App-only：不发无 owner 的全局修正搜索，逐仓搜索还在', () => {
+  const appOnly = sandboxProfileOf({ appOnly: true, forkRepos: [FORK_REPO] });
+  assert.equal(appOnly.host.appOnly, true);
+  assert.equal(Object.hasOwn(appOnly.raw, 'appOnly'), false);
+  assert.equal(appOnly.raw.hostAppOnly, true);
+  assert.ok(appOnly.raw.writeCommand);
+  assert.equal(appOnly.loaded.appOnly, false);
+  assert.equal(appOnly.loaded.hostAppOnly, true);
+  assert.deepEqual(searchQueries(`${REPO}#1`, appOnly.loaded), [FORK_QUERY]);
+  assert.deepEqual(skippedSearchQueries(`${REPO}#1`, appOnly.loaded), [
+    { query: GLOBAL_QUERY, reason: 'appOnly-global-search' },
+  ]);
+
+  // 非 App-only 宿主的沙箱也有写闸（writeCommand），但全局搜索必须照发，才能收到 forkRepos 外的修正单。
+  const normal = sandboxProfileOf({ appOnly: false, forkRepos: [FORK_REPO] });
+  assert.equal(normal.raw.hostAppOnly, false);
+  assert.ok(normal.raw.writeCommand);
+  assert.equal(normal.loaded.hostAppOnly, false);
+  assert.deepEqual(searchQueries(`${REPO}#1`, normal.loaded), [GLOBAL_QUERY, FORK_QUERY]);
+  assert.deepEqual(skippedSearchQueries(`${REPO}#1`, normal.loaded), []);
+});
+
+test('hostAppOnly 只认布尔，缺省 false', () => {
+  const home = tmpDir();
+  writeProfile(home, { profile: { hostAppOnly: 'yes' } });
+  assert.throws(() => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }), /hostAppOnly/);
+});
 
 test('App-only 模式跳过无 owner 的全局修正搜索，保留逐仓搜索', () => {
   const normal = searchQueries(`${REPO}#1`, { forkRepos: ['example-org/fork-repo'] });
