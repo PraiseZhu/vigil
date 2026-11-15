@@ -12,7 +12,7 @@ import { runTick } from './host/tick.mjs';
 import { run as procRun } from './host/proc.mjs';
 import { runHelper } from './bin/helper.mjs';
 import { runRound as runRoundStatus } from './bin/round.mjs';
-import { CLOCK, createFakeGithub, defaultTree, fullConclusions, writeJsonFile } from './session.fixture.mjs';
+import { CLOCK, claimWorld, createFakeGithub, defaultTree, fullConclusions, writeJsonFile } from './session.fixture.mjs';
 import { OWNER, REPO, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
 import { ENV_PROBLEM_PREFIX, ENV_BACKOFF_MINUTES, backoffUntil } from './bin/trigger.mjs';
 import {
@@ -817,6 +817,7 @@ test('裁决防线#358：真没跑（0 passed）→ helper 退出码 6、轮次�
   const fixture = roundFixture();
   const profile = loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: fixture.home });
   const world = defaultTree();
+  claimWorld(profile, world, ROOT_REF, 1);
   world.get(ROOT_REF).state = 'closed';
   const verdictFile = writeJsonFile(fixture.home, 'verdict-358-notrun.json', {
     checks: { build: 'ran', typecheck: 'ran', test: { status: 'env-skipped', note: '依赖装不上，一个用例都没起来（0 passed）' } },

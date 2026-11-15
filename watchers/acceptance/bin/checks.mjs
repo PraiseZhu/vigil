@@ -117,6 +117,17 @@ export function envUnverifiedReason({ skipped = [], hints = [] } = {}) {
   return `${ENV_PROBLEM_PREFIX}${parts.join('；')}。这一轮未验证，不判「通过」`;
 }
 
+/** 读 board/close 的逐条裁决（verdict.json 或带 items 的 --checks）。缺文件或缺数组当空。 */
+export function readPassItems(file) {
+  if (typeof file !== 'string' || !file) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return Array.isArray(parsed?.items) ? parsed.items : [];
+  } catch {
+    return [];
+  }
+}
+
 /** 读 board 的 --checks 文件（可以直接用 verdict.json：只取里面的 checks，由 guardPass 校验）。 */
 export function readChecksRaw(file) {
   if (typeof file !== 'string' || !file) return undefined;

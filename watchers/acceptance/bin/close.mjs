@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// 通过（#46 SC4）：在子 issue 里勾掉验证过的验收项、黑盒项标「人工手测」，
-// 再把看板「验收」写「通过」、「裁决」写本轮评论链接，最后才关总 issue。
+// 通过（#46 SC4）：在子 issue 里勾掉验证过的验收项、黑盒项标「人工手测」。
+// 总评「通过」时再把看板「验收」写「通过」、「裁决」写本轮评论链接，最后才关总 issue。
 // 顺序是 勾选 → 看板 → 关单：看板写失败就停在关单之前，issue 还开着、下一轮能接着验，不会「关了但看板没写」。
+// 总评「待人工」时只勾选已验机器项、给人工项补行尾，不关总单、不写看板通过。
 // 写任何东西之前先过裁决防线（checks + --verdict 里「通过」条目的证据），判不了通过就什么都不写。
 import fs from 'node:fs';
 import { setAcceptanceFields } from './board.mjs';
@@ -9,6 +10,15 @@ import { collectTree, fetchIssueBody } from './collect.mjs';
 import { createRounds, parseRef } from './rounds.mjs';
 import { guardPass, readVerdictItems } from './checks.mjs';
 import { assertNotVerdictOnly } from './profile.mjs';
+import {
+  OVERALL_PENDING,
+  deriveStatus,
+  guardOriginalPass,
+  missingConclusions,
+  pendingCloseBlocked,
+  readClaimSnapshot,
+  snapshotUnusableReason,
+} from './authenticity.mjs';
 
 const SC_LINE = /^\s*[-*]\s*(?:\[\s*([xX ])\s*\])?\s*(?:\*\*)?SC(\d+)\b/;
 const MANUAL_SUFFIX = '人工手测';
@@ -36,6 +46,17 @@ export function applyTicks(body, { verified = [], manual = [] } = {}) {
       return out;
     });
   return { body: lines.join('\n'), changed };
+}
+
+function readCloseVerdict(file) {
+  const items = readVerdictItems(file);
+  let extracted = false;
+  try {
+    extracted = Boolean(JSON.parse(fs.readFileSync(file, 'utf8'))?.extracted);
+  } catch {
+    extracted = false;
+  }
+  return { items, extracted };
 }
 
 function readVerified(file) {
@@ -68,7 +89,7 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
   assertNotVerdictOnly(profile, tree.root.ref, 'close');
 
   const verified = readVerified(flags.get('verified'));
-  const verdictItems = readVerdictItems(flags.get('verdict'));
+  const { items: verdictItems, extracted } = readCloseVerdict(flags.get('verdict'));
   const grouped = new Map();
   for (const entry of verified.items) {
     if (!grouped.has(entry.ref)) grouped.set(entry.ref, { verified: [], manual: [] });
@@ -85,10 +106,44 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
     if (!inTree.has(issueRef.toLowerCase())) throw new Error(`${issueRef} 不在本轮任务树里，不能勾选`);
   }
 
-  // 裁决防线：必需检查（build / typecheck / 测试）有一项因环境没跑，就不勾、不写看板、不关单，本轮标「中断」（环境问题）。
-  // 「通过」条目的证据也在这里查（--verdict 给的 verdict.json）：以前只在 verdict 才查，那时已经勾选、写看板、关单了。
-  await guardPass({ rounds, ref, n, checks: verified.checks, items: verdictItems, where: 'close 的 verified.json' });
+  if (verdictItems.some((item) => item.result === '通过')) {
+    await guardPass({ rounds, ref, n, checks: verified.checks, items: verdictItems, where: 'close 的 verified.json' });
+  }
+  if (extracted) {
+    throw new Error('提炼标准（extracted）不能关单或写看板通过，应写待人工裁决');
+  }
+  const missing = missingConclusions(tree, verdictItems);
+  if (missing.length) {
+    throw new Error(`裁决缺结论（通过 / 要修 / 人工手测 / 待验 / 有争议），没写：${missing.join('、')}`);
+  }
 
+  const snapshot = readClaimSnapshot(profile, ref, n);
+  const unusable = snapshotUnusableReason(snapshot, tree);
+  if (unusable) {
+    await rounds.finish(ref, n, '中断', { reason: unusable });
+    throw new Error(`${unusable}。旧轮次评论未改`);
+  }
+
+  const overall = deriveStatus(verdictItems, [], {
+    tree,
+    extracted,
+    skippedQueries: tree.skippedQueries || [],
+    collectionComplete: tree.collectionComplete,
+  });
+  if (overall === '要修') {
+    throw new Error('close 只处理通过或待人工：本轮有要修/有争议，不要关单');
+  }
+
+  // 裁决防线：有「通过」条目时先查证据。空证据 / 不可追溯补充在写之前拒绝，什么都不写。
+  if (verdictItems.some((item) => item.result === '通过') || overall === '通过') {
+    guardOriginalPass(verdictItems, {
+      snapshot,
+      checkoutDir: snapshot.checkoutDir,
+      moduleUrl: import.meta.url,
+    });
+  }
+
+  const canClose = overall === '通过' && !pendingCloseBlocked(tree);
   const edited = [];
   for (const [issueRef, changes] of grouped) {
     const fresh = await fetchIssueBody(github, issueRef);
@@ -106,27 +161,40 @@ export async function runClose({ github, profile, ref, n, flags, now = () => Dat
   }
 
   const targets = [tree.root.ref, ...tree.issues.filter((entry) => entry.role !== 'root').map((entry) => entry.ref)];
-  for (const target of targets) {
-    const { repo, number } = parseRef(target);
-    await setAcceptanceFields(github, profile, {
-      repo,
-      issue: number,
-      acceptance: '通过',
-      verdictUrl: current.url,
-      round: n,
-      ref: target,
+  if (canClose) {
+    for (const target of targets) {
+      const { repo, number } = parseRef(target);
+      await setAcceptanceFields(github, profile, {
+        repo,
+        issue: number,
+        acceptance: '通过',
+        verdictUrl: current.url,
+        round: n,
+        ref: target,
+        items: verdictItems,
+      });
+    }
+
+    const root = parseRef(tree.root.ref);
+    await github.write({
+      type: 'issue.close',
+      dedupeKey: `close:${tree.root.ref}:${n}`,
+      repo: root.repo,
+      issue: root.number,
+      reason: 'completed',
+      items: verdictItems,
     });
   }
 
-  const root = parseRef(tree.root.ref);
-  await github.write({
-    type: 'issue.close',
-    dedupeKey: `close:${tree.root.ref}:${n}`,
-    repo: root.repo,
-    issue: root.number,
-    reason: 'completed',
-  });
-
-  stdout.write(`${JSON.stringify({ ref: tree.root.ref, round: n, closed: tree.root.ref, edited, board: targets })}\n`);
+  stdout.write(
+    `${JSON.stringify({
+      ref: tree.root.ref,
+      round: n,
+      closed: canClose ? tree.root.ref : null,
+      pendingHuman: overall === OVERALL_PENDING,
+      edited,
+      board: canClose ? targets : [],
+    })}\n`,
+  );
   return 0;
 }

@@ -17,10 +17,14 @@ import {
   createWorld,
   defaultTree,
   fullConclusions,
+  machineConclusions,
+  machineOnlyTree,
   writeJsonFile,
   ALL_RAN,
   ALL_RAN_CHECKS_FILE,
+  MACHINE_PASS_CHECKS_FILE,
   PASS_VERDICT_FILE,
+  claimWorld,
 } from './session.fixture.mjs';
 
 function loadProfile() {
@@ -75,9 +79,10 @@ test('helper 未知命令 / 缺参数 → 退出码 1 并打印用法', async ()
   assert.equal(world.writes.length, 0);
 });
 
-test('SC4 close 勾掉已验证的项、人工手测标行尾、关总 issue、看板全部写通过', async () => {
+test('SC4 close 有人工层时勾已验项、标人工手测，但不关总单、不写看板通过', async () => {
   const { profile, home } = loadProfile();
   const world = defaultTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN,
     items: [
       { ref: `${REPO}#2`, sc: 3 },
@@ -86,10 +91,22 @@ test('SC4 close 勾掉已验证的项、人工手测标行尾、关总 issue、�
     manual: [{ ref: `${REPO}#2`, sc: 5 }],
   });
 
-  const result = await run(world, profile, ['close', '--issue', `${REPO}#1`, '--round', '1', '--verified', verified, '--verdict', PASS_VERDICT_FILE]);
+  const result = await run(world, profile, [
+    'close',
+    '--issue',
+    `${REPO}#1`,
+    '--round',
+    '1',
+    '--verified',
+    verified,
+    '--verdict',
+    writeJsonFile(home, 'pending-verdict.json', { checks: ALL_RAN, items: fullConclusions() }),
+  ]);
   assert.equal(result.code, 0, result.err);
   const printed = JSON.parse(result.out);
-  assert.equal(printed.closed, `${REPO}#1`);
+  assert.equal(printed.closed, null);
+  assert.equal(printed.pendingHuman, true);
+  assert.deepEqual(printed.board, []);
   assert.equal(printed.edited.length, 2);
 
   const childBody = world.get(`${REPO}#2`).body;
@@ -101,10 +118,49 @@ test('SC4 close 勾掉已验证的项、人工手测标行尾、关总 issue、�
   assert.ok(otherBody.includes('- [ ] SC8 真仓里跑一次 验证：github-live'), '没验的项不勾');
 
   const root = world.get(`${REPO}#1`);
+  assert.equal(root.state, 'open');
+  assert.equal(world.writes.some((action) => action.type === 'issue.close'), false);
+  assert.equal(world.writes.some((action) => action.type === 'project.field.set'), false);
+  assert.equal(world.writes.find((action) => action.type === 'issue.edit').dedupeKey, `close-edit:${REPO}#2:1`);
+  assert.deepEqual(typesOf(world), ['issue.edit', 'issue.edit']);
+});
+
+test('SC6 close 全机器层且证据非空：勾选 → 看板通过 → 关总单', async () => {
+  const { profile, home } = loadProfile();
+  const world = machineOnlyTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
+  const verified = writeJsonFile(home, 'verified.json', { checks: ALL_RAN,
+    items: [
+      { ref: `${REPO}#2`, sc: 3 },
+      { ref: `${OTHER_REPO}#7`, sc: 7 },
+    ],
+    manual: [],
+  });
+
+  const result = await run(world, profile, [
+    'close',
+    '--issue',
+    `${REPO}#1`,
+    '--round',
+    '1',
+    '--verified',
+    verified,
+    '--verdict',
+    writeJsonFile(home, 'machine-pass.json', { checks: ALL_RAN, items: machineConclusions() }),
+  ]);
+  assert.equal(result.code, 0, result.err);
+  const printed = JSON.parse(result.out);
+  assert.equal(printed.closed, `${REPO}#1`);
+  assert.equal(printed.pendingHuman, false);
+
+  const childBody = world.get(`${REPO}#2`).body;
+  assert.ok(childBody.includes('- [x] SC3 把结果写进轮次评论 验证：unit（测试点：假 gh）'), childBody);
+  assert.ok(world.get(`${OTHER_REPO}#7`).body.includes('- [x] SC7 跨仓也要收'));
+
+  const root = world.get(`${REPO}#1`);
   assert.equal(root.state, 'closed');
   assert.equal(world.writes.find((action) => action.type === 'issue.close').reason, 'completed');
   assert.equal(world.writes.find((action) => action.type === 'issue.close').dedupeKey, `close:${REPO}#1:1`);
-  assert.equal(world.writes.find((action) => action.type === 'issue.edit').dedupeKey, `close-edit:${REPO}#2:1`);
 
   const roundUrl = root.comments[0].url;
   for (const ref of [`${REPO}#1`, `${REPO}#2`, `${OTHER_REPO}#7`]) {
@@ -112,9 +168,7 @@ test('SC4 close 勾掉已验证的项、人工手测标行尾、关总 issue、�
     assert.equal(world.get(ref).project['裁决'], roundUrl, ref);
   }
 
-  // 顺序：先勾选（issue.edit × 2），再写看板（× 3），最后才关 issue（看板写失败就停在关单之前）。
-  const types = typesOf(world);
-  assert.deepEqual(types, [
+  assert.deepEqual(typesOf(world), [
     'issue.edit',
     'issue.edit',
     'project.field.set',
@@ -181,7 +235,7 @@ test('SC10 progress 写最近进度时间，done 要求先有裁决', async () =
   const early = await run(world, profile, ['done', '--issue', `${REPO}#1`, '--round', '1']);
   assert.equal(early.code, 3);
   assert.match(early.err, /第 1 轮还没写裁决/);
-  assert.match(early.err, /期望第 1 轮（通过或要修）/);
+  assert.match(early.err, /期望第 1 轮（通过、要修或待人工）/);
   assert.match(early.err, /实际第 1 轮（验收中）/);
   assert.equal(fs.existsSync(sessionPath(profile, `${REPO}#1`)), false);
 
@@ -198,13 +252,15 @@ test('SC10 progress 写最近进度时间，done 要求先有裁决', async () =
   assert.match(wrong.err, /期望第 4 轮/);
 
   // 写裁决之后才能 done。「通过」之前总 issue 要已关（helper close 做的事），这里直接置为已关。
-  world.get(`${REPO}#1`).state = 'closed';
-  const verdict = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items: fullConclusions() });
-  const judged = await run(world, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', verdict]);
+  const passWorld = machineOnlyTree();
+  claimWorld(profile, passWorld, `${REPO}#1`, 1);
+  passWorld.get(`${REPO}#1`).state = 'closed';
+  const verdict = writeJsonFile(home, 'verdict.json', { checks: ALL_RAN, items: machineConclusions() });
+  const judged = await run(passWorld, profile, ['verdict', '--issue', `${REPO}#1`, '--round', '1', '--file', verdict]);
   assert.equal(judged.code, 0, judged.err);
   assert.equal(JSON.parse(judged.out).status, '通过');
 
-  const done = await run(world, profile, ['done', '--issue', `${REPO}#1`, '--round', '1']);
+  const done = await run(passWorld, profile, ['done', '--issue', `${REPO}#1`, '--round', '1']);
   assert.equal(done.code, 0, done.err);
   assert.match(done.out, /第 1 轮结束/);
   const session = JSON.parse(fs.readFileSync(sessionPath(profile, `${REPO}#1`), 'utf8'));
@@ -273,7 +329,8 @@ test('SC10 done 只认我自己的轮次评论：别人伪造的「第 n 轮：�
 
 test('SC9 写闸拒绝（非 secret-found）→ 退出码 4 且这一轮标中断写明原因', async () => {
   const { profile } = loadProfile();
-  const world = defaultTree();
+  const world = machineOnlyTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   const result = await run(world, profile, [
     'board',
     '--issue',
@@ -283,7 +340,7 @@ test('SC9 写闸拒绝（非 secret-found）→ 退出码 4 且这一轮标中�
     '--acceptance',
     '通过',
     '--checks',
-    ALL_RAN_CHECKS_FILE,
+    MACHINE_PASS_CHECKS_FILE,
   ], {
     onWrite: (action) => {
       if (action.type === 'project.field.set') {
@@ -301,8 +358,9 @@ test('SC9 写闸拒绝（非 secret-found）→ 退出码 4 且这一轮标中�
 
 test('SC9 写闸忙 → 退出码 1 且这一轮标中断写「写闸忙」', async () => {
   const { profile } = loadProfile();
-  const world = defaultTree();
-  const result = await run(world, profile, ['board', '--issue', `${REPO}#1`, '--round', '1', '--acceptance', '通过', '--checks', ALL_RAN_CHECKS_FILE], {
+  const world = machineOnlyTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
+  const result = await run(world, profile, ['board', '--issue', `${REPO}#1`, '--round', '1', '--acceptance', '通过', '--checks', MACHINE_PASS_CHECKS_FILE], {
     onWrite: (action) => {
       if (action.type === 'project.field.set') throw new WriteBusyError('外发忙');
       return undefined;
