@@ -5,13 +5,13 @@ import { sessionPath } from './push.mjs';
 import { readIssueCache } from './rounds.mjs';
 import { readLedgerLines } from '../host/gate-audit.mjs';
 
-export const FINAL_STATUSES = Object.freeze(['通过', '要修', '中断']);
+export const FINAL_STATUSES = Object.freeze(['通过', '要修', '待人工', '中断']);
 
 const ISSUE_REF = '([^/]+/[^#]+#\\d+)';
-const FINISH_KEY = new RegExp(`^round-finish:${ISSUE_REF}:(\\d+):(\\d+):(通过|要修|中断)$`);
+const FINISH_KEY = new RegExp(`^round-finish:${ISSUE_REF}:(\\d+):(\\d+):(通过|要修|待人工|中断)$`);
 const CLOSE_KEY = new RegExp(`^close:${ISSUE_REF}:(\\d+)$`);
 const START_KEY = new RegExp(`^round-start:${ISSUE_REF}:(\\d+):`);
-const ABORT_FINAL = /实际第 \d+ 轮（(通过|要修|中断)）/;
+const ABORT_FINAL = /实际第 \d+ 轮（(通过|要修|待人工|中断)）/;
 
 function stampMs(value) {
   const ms = Date.parse(value || '');

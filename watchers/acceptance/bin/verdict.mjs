@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 裁决（#46 SC3）：把本轮的轮次评论就地改成「通过」或「要修」。
+// 裁决（#46 SC3）：把本轮的轮次评论就地改成「通过」「要修」或「待人工」。
 // 只在最后一步写：写完这一轮就结束了，后面的写命令都会被认领检查拒绝。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -9,8 +9,20 @@ import { isVerdictOnly } from './profile.mjs';
 import { redact } from './redact.mjs';
 import { readNeedsHuman } from './push.mjs';
 import { guardPass } from './checks.mjs';
+import {
+  OVERALL_PENDING,
+  deriveStatus as deriveOverall,
+  formatMaterialLine,
+  guardOriginalPass,
+  materialVersions,
+  missingConclusions,
+  readClaimSnapshot,
+  snapshotUnusableReason,
+} from './authenticity.mjs';
 
-export const RESULTS = Object.freeze(['通过', '要修', '人工手测', '有争议']);
+export { missingConclusions };
+
+export const RESULTS = Object.freeze(['通过', '要修', '人工手测', '待验', '有争议']);
 
 function atomicWrite(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -36,9 +48,11 @@ function formatItem(item, profile) {
     if (evidence) parts.push(`证据：${evidence}`);
     return parts.join(' · ');
   }
-  if (item.result === '人工手测') {
+  if (item.result === '人工手测' || item.result === '待验') {
     const layer = item.layer ? `（${redact(item.layer, profile)}）` : '';
-    return `- 人工手测：${ref}${layer}`;
+    const why = item.why ? ` · 原因：${redact(item.why, profile)}` : '';
+    const label = item.result === '待验' ? '待验' : '人工手测';
+    return `- ${label}：${ref}${layer}${why}`;
   }
   const sides = item.sides || {};
   return [
@@ -84,6 +98,7 @@ export function formatVerdictBody({
   round,
   status,
   bodyVersion: version,
+  startBodyVersion,
   startedAt,
   finishedAt,
   items = [],
@@ -93,19 +108,32 @@ export function formatVerdictBody({
   approveExec = false,
   handoff = null,
   handoffChecks = [],
+  codeSha,
+  materials,
+  skippedQueries = [],
+  collectionComplete,
   profile,
 } = {}) {
   const lines = [
     `[验收机] 第 ${round} 轮：${status}`,
     `正文版本：${version}`,
-    `开始：${startedAt}`,
-    `完成：${finishedAt}`,
-    '',
-    '## 逐条结果',
   ];
+  if (startBodyVersion) lines.push(`起始正文版本：${startBodyVersion}`);
+  lines.push(`开始：${startedAt}`, `完成：${finishedAt}`);
+  lines.push(`代码 SHA：${codeSha || '未知'}`);
+  if (materials) lines.push(`材料版本：${formatMaterialLine(materials)}`);
+  lines.push('', '## 逐条结果');
   for (const item of items) lines.push(formatItem(item, profile));
   if (extracted) {
-    lines.push('本任务没写验收标准，以上标准由验收机从正文和关联 PR 提炼。');
+    lines.push('本任务没写验收标准，以上标准由验收机从正文和关联 PR 提炼。总评不得是通过。');
+  }
+  if (skippedQueries.length || collectionComplete === false) {
+    lines.push('', '## 未执行的查询');
+    lines.push('收集不完整，不能按原标准通过。');
+    for (const skipped of skippedQueries) {
+      const reason = skipped.reason ? `（${redact(skipped.reason, profile)}）` : '';
+      lines.push(`- 未执行：${redact(skipped.query || '', profile)}${reason}`);
+    }
   }
   if (approveExec && !handoff) lines.push(NO_HANDOFF_LINE);
   lines.push(...formatHandoffChecks(handoff, handoffChecks, profile));
@@ -128,31 +156,8 @@ function conclusionKey(ref, sc) {
   return `${String(ref).toLowerCase()} SC${Number(sc)}`;
 }
 
-/**
- * 任务树里每条 SC 都要有一条结论（通过 / 要修 / 人工手测 / 有争议）：返回缺结论的条目（`owner/repo#n SC<k>`）。
- * 树是 collect 收到的那棵（总 issue、子 issue、挂着的修正子 issue）。
- */
-export function missingConclusions(tree, items = []) {
-  const have = new Set(items.map((item) => conclusionKey(item.ref, item.sc)));
-  const missing = [];
-  const seen = new Set();
-  for (const issue of tree?.issues || []) {
-    for (const item of issue.items || []) {
-      const key = conclusionKey(item.source || issue.ref, item.sc);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      if (!have.has(key)) missing.push(`${item.source || issue.ref} SC${item.sc}`);
-    }
-  }
-  return missing;
-}
-
-export function deriveStatus(items = [], needsHuman = []) {
-  // 一条结论都没有就不能判通过（以前空 items 会落到「通过」）。
-  if (!items.length) throw new Error('裁决没有任何逐条结论，不能判通过：items 至少要有一条');
-  if (needsHuman.length) return '要修';
-  if (items.some((item) => item.result === '要修' || item.result === '有争议')) return '要修';
-  return '通过';
+export function deriveStatus(items = [], needsHuman = [], extras = {}) {
+  return deriveOverall(items, needsHuman, extras);
 }
 
 function readVerdictFile(file) {
@@ -197,40 +202,61 @@ export async function runVerdict({ github, profile, ref, n, file, statusFlag, no
   const tree = await collectTree({ github, profile, ref });
   const missing = missingConclusions(tree, items);
   if (missing.length) {
-    throw new Error(`裁决缺结论（通过 / 要修 / 人工手测 / 有争议），没写：${missing.join('、')}`);
+    throw new Error(`裁决缺结论（通过 / 要修 / 人工手测 / 待验 / 有争议），没写：${missing.join('、')}`);
   }
   // 批准执行 lead 交接里的「请重点查」每条都要有结论（#140），缺了同样整条拒绝、什么都不写。
   const missingFocus = missingHandoffChecks(tree.handoff, payload.handoffChecks);
   if (missingFocus.length) {
     throw new Error(`交接重点核对缺结论：lead 交接第 ${tree.handoff.n} 次「请重点查」第 ${missingFocus.join('、')} 条没写（verdict.json 的 handoffChecks）`);
   }
+  const snapshot = readClaimSnapshot(profile, ref, n);
+  const unusable = snapshotUnusableReason(snapshot, tree);
+  if (unusable) {
+    await rounds.finish(ref, n, '中断', { reason: unusable });
+    throw new Error(`${unusable}。旧轮次评论未改`);
+  }
   const needsHuman = readNeedsHuman(profile, ref, n);
-  const derived = deriveStatus(items, needsHuman);
+  const extras = {
+    tree,
+    extracted: Boolean(payload.extracted),
+    skippedQueries: tree.skippedQueries || [],
+    collectionComplete: tree.collectionComplete,
+  };
+  const derived = deriveStatus(items, needsHuman, extras);
   if (statusFlag !== undefined && statusFlag !== derived) {
     throw new Error(`--status 与逐条结果不一致：--status 是 ${statusFlag}，逐条结果是 ${derived}`);
   }
-  if (statusFlag !== undefined && !['通过', '要修'].includes(statusFlag)) {
-    throw new Error(`--status 只能是 通过 或 要修：${statusFlag}`);
+  if (statusFlag !== undefined && !['通过', '要修', OVERALL_PENDING].includes(statusFlag)) {
+    throw new Error(`--status 只能是 通过、要修 或 待人工：${statusFlag}`);
   }
   const status = derived;
-  // 裁决防线：判「通过」要写明必需检查；有一项因环境没跑（或「通过」条目的证据写着因环境没跑）就不判通过，
-  // 本轮标「中断」（环境问题 / 未验证），退出码 6。「要修」不受影响：真的没过就是没过。
-  if (status === '通过') {
+  // 裁决防线：判「通过」或带「通过」条目时要写明必需检查；空证据 / 不可追溯补充在写之前拒绝。
+  // 「要修」不受空证据影响：真的没过就是没过。标准变化已在 derive 之前作废。
+  if (status !== '要修' && items.some((item) => item.result === '通过')) {
     await guardPass({ rounds, ref, n, checks: payload.checks, items, where: 'verdict.json' });
+    guardOriginalPass(items, {
+      snapshot,
+      checkoutDir: snapshot.checkoutDir,
+      moduleUrl: import.meta.url,
+    });
   }
 
-  // 正文版本按「现在」的正文算：验收机自己改了正文（勾选、关 issue），就用改后的版本。
+  // 正文版本按「现在」的正文算：验收机自己改了正文（勾选），就用改后的版本；起始版本留在评论里。
   const fresh = await fetchIssueBody(github, ref);
   const verdictOnly = Boolean(tree.root.verdictOnly) || isVerdictOnly(profile, ref);
   // 「通过」必须先 close（SESSION.md §4）：总 issue 还开着就不写裁决（退出码 1），免得留下「通过但没关」、以后也不再验。
+  // 「待人工」不关单，允许在 issue 仍开着时写裁决。
   if (status === '通过' && !verdictOnly && tree.root.tier !== 'watch' && fresh.state === 'open') {
     throw new Error(`判「通过」之前要先 close：${ref} 还开着，裁决不写（先跑 helper close，再写 verdict）`);
   }
   const version = bodyVersion(fresh.body);
+  const startVersion = snapshot.bodyVersion || current.bodyVersion;
+  const materials = snapshot.materials || materialVersions();
   const body = formatVerdictBody({
     round: n,
     status,
     bodyVersion: version,
+    startBodyVersion: startVersion,
     startedAt: current.startedAt || beijingIso(now()),
     finishedAt: beijingIso(now()),
     items,
@@ -240,6 +266,10 @@ export async function runVerdict({ github, profile, ref, n, file, statusFlag, no
     approveExec: Boolean(tree.root.approveExec),
     handoff: tree.handoff || null,
     handoffChecks: payload.handoffChecks || [],
+    codeSha: snapshot.codeSha,
+    materials,
+    skippedQueries: tree.skippedQueries || [],
+    collectionComplete: tree.collectionComplete,
     profile,
   });
 

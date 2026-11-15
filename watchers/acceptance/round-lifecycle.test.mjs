@@ -14,7 +14,7 @@ import { runHelper } from './bin/helper.mjs';
 import { bodyVersion, cachePath } from './bin/rounds.mjs';
 import { ROOT_REF, createRoundWorld, roundComments, writeMeminfo } from './round-world.fixture.mjs';
 import { OTHER_REPO, REPO, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
-import { ALL_RAN, CLOCK, createFakeGithub, createWorld, writeJsonFile } from './session.fixture.mjs';
+import { ALL_RAN, CLOCK, claimWorld, createFakeGithub, createWorld, writeJsonFile } from './session.fixture.mjs';
 
 const bwrapAvailable = await probeBwrap(procRun);
 const skip = bwrapAvailable ? false : 'bwrap 不可用（探针起不来），跳过真沙箱测试';
@@ -265,6 +265,7 @@ test('#228 SC10 已关闭且 PR 已合并的 child 走完 collect → close → 
   });
   world.addChild(parent.ref, child.ref);
   world.addComment(child.ref, roundComment({ round: 1, status: '验收中', bodyVersion: bodyVersion(childBody) }));
+  claimWorld(profile, world, childRef, 1);
 
   const out = { text: '' };
   const err = { text: '' };

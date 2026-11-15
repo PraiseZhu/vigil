@@ -35,6 +35,12 @@ test('parseFinishKey / parseCloseKey 只认完整去重键', () => {
     commentId: 1002,
     status: '通过',
   });
+  assert.deepEqual(parseFinishKey(`round-finish:${ISSUE}:3:1003:待人工`), {
+    issue: ISSUE,
+    round: 3,
+    commentId: 1003,
+    status: '待人工',
+  });
   assert.deepEqual(parseCloseKey(`close:${ISSUE}:2`), { issue: ISSUE, round: 2 });
   assert.equal(parseFinishKey(`round-start:${ISSUE}:2:2026-10-24T01:00:00.000Z`), null);
   assert.equal(parseCloseKey(`round-finish:${ISSUE}:2:1002:通过`), null);
@@ -140,6 +146,10 @@ test('staleAbortReason / abortFoundFinalVerdict 区分重启中断和已出结�
   assert.equal(
     abortFoundFinalVerdict('认领检查失败：期望第 1 轮（验收中），实际第 1 轮（通过）。'),
     '通过',
+  );
+  assert.equal(
+    abortFoundFinalVerdict('认领检查失败：期望第 1 轮（验收中），实际第 1 轮（待人工）。'),
+    '待人工',
   );
   assert.equal(abortFoundFinalVerdict('认领检查失败：期望第 1 轮（验收中），实际没有轮次'), null);
   void OWNER;

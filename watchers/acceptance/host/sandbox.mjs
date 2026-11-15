@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { TOKEN_FILE_KEY } from '../bin/profile.mjs';
+import { CLAIM_SNAPSHOT_REL, isClaimSnapshotDir, isClaimSnapshotFile } from '../bin/authenticity.mjs';
 
 /** 传进沙箱的环境变量白名单；别的（含任何令牌）一律不传。 */
 export const ENV_ALLOWLIST = Object.freeze([
@@ -143,6 +144,32 @@ function isInside(child, parent) {
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
+/** 沿路径逐级 mkdir；中间任一层是符号链接就停，不跟随、不截断目标。 */
+function mkdirRealDir(dir) {
+  if (typeof dir !== 'string' || !path.isAbsolute(dir)) {
+    throw new Error('认领快照视图必须是绝对路径');
+  }
+  const resolved = path.resolve(dir);
+  const parts = resolved.split(path.sep).filter(Boolean);
+  let cur = path.parse(resolved).root || path.sep;
+  for (const part of parts) {
+    cur = path.join(cur, part);
+    let st = null;
+    try {
+      st = fs.lstatSync(cur);
+    } catch {
+      fs.mkdirSync(cur, { mode: 0o700 });
+      continue;
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error('认领快照路径不能是符号链接');
+    }
+    if (!st.isDirectory()) {
+      throw new Error('认领快照路径必须是目录');
+    }
+  }
+}
+
 /**
  * 宿主 HOME 默认整个看不见：先在 HOME 上盖一层空 tmpfs，再把白名单里的目录只读挂回来。
  * 白名单 = 调用方传的 homeAllow（代码仓、host.json 的 homeAllowDirs 等）；可写绑定（roundDir、
@@ -183,7 +210,7 @@ function resolveHomeAllow(hostHomeReal, homeAllow, maskDirs) {
  * hostHome 必填：没有它就没法默认遮掉 HOME，直接抛错，不退回只遮名单的老做法。
  */
 export function buildBwrapArgs(options = {}) {
-  const { home, profile, roundDir, masks, binds, hostHome, homeAllow, readOnlyBinds, readOnlyMounts, tmpfsDirs } = options;
+  const { home, profile, roundDir, masks, binds, hostHome, homeAllow, readOnlyBinds, readOnlyMounts, tmpfsDirs, readOnlyOverlays } = options;
   // 环境变量不再进 bwrap 的参数（--setenv 的值会出现在 /proc/<pid>/cmdline，ps 看得见 LLM key）：
   // 调用方把 sandboxEnv() 的结果作为 spawn 的 env 交给 bwrap 进程本身，bwrap 不加 --clearenv，子进程原样继承。
   if (Object.prototype.hasOwnProperty.call(options, 'env')) {
@@ -290,6 +317,119 @@ export function buildBwrapArgs(options = {}) {
     }
     mountList.push({ src: srcReal, dest: destReal, destLexical: path.resolve(dest) });
   }
+
+  // 认领快照只读视图：可写 roundDir 里派生的目录 dest→dest 重挂不可信（已有内容、
+  // 符号链接会跟着进来，open('w') 还会截断权威文件）。改为：lstat 确认视图是真目录后
+  // 盖空 tmpfs，再把本轮宿主快照文件叠到 tmpfs 里的同名路径，最后 remount-ro。
+  // snapshots 叶子做成挂载点只能挡住 rename 叶子；host/state/home-acc 仍在可写 bind 上、
+  // 不是挂载点，rename 后换成伪造链接就能让 readClaimSnapshot 读到假正文。因此在
+  // tmpfs 之前把 sandbox watcher home dest→dest 只读重挂成挂载点，整条可信读取路径
+  // 都不可替换。不跟随符号链接，不在未验证路径上 open('w')，不清理/删除已有文件。
+  const overlayTmpfs = [];
+  const overlayFiles = [];
+  const sandboxHome = path.resolve(roundDir, 'home-acc');
+  for (const overlay of readOnlyOverlays || []) {
+    if (overlay && typeof overlay.tmpfs === 'string') {
+      const dest = overlay.tmpfs;
+      if (!path.isAbsolute(dest)) throw new Error('认领快照只读叠挂必须都是绝对路径');
+      const destLex = path.resolve(dest);
+      let destStat = null;
+      try {
+        destStat = fs.lstatSync(destLex);
+      } catch {
+        throw new Error(`认领快照视图不存在：${dest}`);
+      }
+      if (destStat.isSymbolicLink() || !destStat.isDirectory()) {
+        throw new Error('认领快照视图不能是符号链接');
+      }
+      if (!isClaimSnapshotDir(destLex)) {
+        throw new Error('只许把认领快照叠到沙箱派生的 state/host/snapshots，不能挂整个 host 状态');
+      }
+      if (!isInside(destLex, sandboxHome)) {
+        throw new Error('认领快照视图必须是沙箱 watcher home 下的派生路径');
+      }
+      for (const maskDir of maskDirs) {
+        if (isInside(destLex, maskDir)) {
+          throw new Error(`沙箱拒绝：认领快照视图 ${dest} 落在遮罩目录里`);
+        }
+      }
+      overlayTmpfs.push(destLex);
+      continue;
+    }
+    const src = overlay?.src;
+    const dest = overlay?.dest;
+    if (typeof src !== 'string' || !path.isAbsolute(src) || typeof dest !== 'string' || !path.isAbsolute(dest)) {
+      throw new Error('认领快照只读叠挂必须都是绝对路径');
+    }
+    const srcLex = path.resolve(src);
+    const destLex = path.resolve(dest);
+    let srcStat = null;
+    try {
+      srcStat = fs.lstatSync(srcLex);
+    } catch {
+      throw new Error(`认领快照源不存在：${src}`);
+    }
+    if (srcStat.isSymbolicLink()) {
+      throw new Error('认领快照源不能是符号链接');
+    }
+    if (srcStat.isDirectory()) {
+      if (isClaimSnapshotDir(srcLex) && srcLex !== destLex) {
+        throw new Error('不能把整个 snapshots 目录叠进沙箱，只许本轮快照文件');
+      }
+      throw new Error('不能把可写 roundDir 里的派生目录 dest→dest 重挂当成可信视图');
+    }
+    if (!srcStat.isFile()) {
+      throw new Error('只许叠本轮认领快照文件');
+    }
+    if (!isClaimSnapshotFile(srcLex) || !isClaimSnapshotFile(destLex)) {
+      throw new Error('只许叠本轮认领快照文件');
+    }
+    if (path.basename(srcLex) !== path.basename(destLex)) {
+      throw new Error('认领快照视图文件名必须与本轮快照一致');
+    }
+    const destParent = path.dirname(destLex);
+    if (!isClaimSnapshotDir(destParent) || !isInside(destParent, sandboxHome)) {
+      throw new Error('认领快照视图必须是沙箱 watcher home 下的派生路径');
+    }
+    let destParentStat = null;
+    try {
+      destParentStat = fs.lstatSync(destParent);
+    } catch {
+      destParentStat = null;
+    }
+    if (!destParentStat || destParentStat.isSymbolicLink() || !destParentStat.isDirectory()) {
+      throw new Error('认领快照视图不能是符号链接');
+    }
+    for (const maskDir of maskDirs) {
+      if (isInside(destParent, maskDir)) {
+        throw new Error(`沙箱拒绝：认领快照视图 ${dest} 落在遮罩目录里`);
+      }
+    }
+    overlayFiles.push({ src: srcLex, dest: destLex });
+  }
+  if (overlayFiles.length > 1) {
+    throw new Error('只许叠本轮一份认领快照');
+  }
+  for (const file of overlayFiles) {
+    const parent = path.dirname(file.dest);
+    if (!overlayTmpfs.includes(parent)) {
+      throw new Error('叠本轮快照文件前必须把快照视图目录盖成空 tmpfs');
+    }
+  }
+  const pathLock = [];
+  if (overlayTmpfs.length) {
+    let homeStat = null;
+    try {
+      homeStat = fs.lstatSync(sandboxHome);
+    } catch {
+      homeStat = null;
+    }
+    if (!homeStat || homeStat.isSymbolicLink() || !homeStat.isDirectory()) {
+      throw new Error('沙箱 watcher home 不能是符号链接');
+    }
+    pathLock.push(sandboxHome);
+  }
+
   // 只读挂载里的空 tmpfs（给工具写缓存）：只许落在上面那些只读挂载的目标里；
   // 挂载点在挂载的源里要已经存在（只读挂载里建不出挂载点）。
   const tmpfsList = [];
@@ -339,6 +479,12 @@ export function buildBwrapArgs(options = {}) {
   for (const bind of bindList) args.push('--bind', bind, bind);
   for (const dir of readOnlyList) args.push('--ro-bind', dir, dir);
   for (const mount of mountList) args.push('--ro-bind', mount.src, mount.dest);
+  // 先把 watcher home 收成只读挂载点（父路径不可 rename），再盖空快照视图 tmpfs。
+  // 若先 tmpfs 再 dest→dest 重挂 home-acc，非递归 bind 会吃掉子挂载，本轮文件消失。
+  for (const dir of pathLock) args.push('--ro-bind', dir, dir);
+  for (const dir of overlayTmpfs) args.push('--tmpfs', dir);
+  for (const overlay of overlayFiles) args.push('--ro-bind', overlay.src, overlay.dest);
+  for (const dir of overlayTmpfs) args.push('--remount-ro', dir);
   for (const dir of tmpfsList) args.push('--tmpfs', dir);
   // HOME 里没挂回来的遮罩目标本来就在空 tmpfs 下面、读不到；再挂一次反而要在 tmpfs 里造挂载点，跳过。
   // /run 下面同理（整个已是空 tmpfs）。
@@ -435,6 +581,45 @@ export function sandboxEnv({
  * 沙箱里的 watcher home：真 profile 的副本，但写操作只经 gate-client 走 socket，
  * 令牌文件换成一个占位文件（内容不是令牌），所有 …TokenFile / App 私钥配置一律删掉。
  */
+/**
+ * 本轮认领快照的只读叠挂：确认视图目录是真目录（不是符号链接）后盖空 tmpfs，
+ * 再叠本轮宿主快照文件。不在视图里 open('w')、不复制内容、不清理已有文件。
+ */
+export function claimSnapshotOverlays({ snapshotView, srcFile } = {}) {
+  if (typeof snapshotView !== 'string' || !path.isAbsolute(snapshotView)) {
+    throw new Error('认领快照视图必须是绝对路径');
+  }
+  if (!isClaimSnapshotDir(snapshotView)) {
+    throw new Error('认领快照视图必须是沙箱派生的 state/host/snapshots');
+  }
+  mkdirRealDir(snapshotView);
+  const viewStat = fs.lstatSync(snapshotView);
+  if (viewStat.isSymbolicLink() || !viewStat.isDirectory()) {
+    throw new Error('认领快照视图不能是符号链接');
+  }
+  const overlays = [{ tmpfs: snapshotView }];
+  if (srcFile == null || srcFile === '') return overlays;
+  if (typeof srcFile !== 'string' || !path.isAbsolute(srcFile)) {
+    throw new Error('本轮认领快照必须是绝对路径');
+  }
+  if (!isClaimSnapshotFile(srcFile)) {
+    throw new Error('只许叠本轮认领快照文件');
+  }
+  let srcStat = null;
+  try {
+    srcStat = fs.lstatSync(srcFile);
+  } catch {
+    return overlays;
+  }
+  if (srcStat.isSymbolicLink()) {
+    throw new Error('本轮认领快照不能是符号链接');
+  }
+  if (!srcStat.isFile()) return overlays;
+  const destFile = path.join(snapshotView, path.basename(srcFile));
+  overlays.push({ src: srcFile, dest: destFile });
+  return overlays;
+}
+
 export function prepareSandboxProfile({ profile, roundDir, repoRoot, socketPath } = {}) {
   if (!profile?.profilePath) throw new Error('prepareSandboxProfile 需要带 profilePath 的 profile');
   const sandboxHome = path.join(roundDir, 'home-acc');
@@ -462,7 +647,9 @@ export function prepareSandboxProfile({ profile, roundDir, repoRoot, socketPath 
   // 占位文件只是为了让沙箱里的 profile 校验（600、非空）能过，内容不是任何令牌。
   fs.writeFileSync(placeholderToken, 'sandbox-placeholder-not-a-token', { mode: 0o600 });
   fs.chmodSync(placeholderToken, 0o600);
-  return { sandboxHome, profileFile, placeholderToken };
+  const snapshotView = path.join(sandboxHome, CLAIM_SNAPSHOT_REL);
+  mkdirRealDir(snapshotView);
+  return { sandboxHome, profileFile, placeholderToken, snapshotView };
 }
 
 /** 小写别名，和 #47 的接口名对齐。 */

@@ -10,7 +10,7 @@ import { readNeedsHuman, scanForSecrets } from './bin/push.mjs';
 import { scanIntroducedObjects } from './bin/secretscan.mjs';
 import { WriteRejectedError } from './bin/github.mjs';
 import { HANDOFF_REPO, roundComment, tmpDir, writeProfile } from './fake-gh.fixture.mjs';
-import { REPO, createFakeGithub, createWorld, defaultTree, fullConclusions } from './session.fixture.mjs';
+import { REPO, claimWorld, createFakeGithub, createWorld, defaultTree, fullConclusions } from './session.fixture.mjs';
 import { BYPASS_KINDS, BYPASS_LABELS, buildBypassRepo } from './secret-bypass.fixture.mjs';
 
 // 假私钥头按行拼，源码里不会出现完整的私钥头。
@@ -202,6 +202,7 @@ test('SC7 gitleaks 自己出错（退出码不是 0/1）：不当成干净，不
 test('SC7 写闸返回 secret-found：退出码 4、不标中断，裁决里写需人工处理', async () => {
   const profile = loadProfile();
   const world = defaultTree();
+  claimWorld(profile, world, `${REPO}#1`, 1);
   const repo = await makeRepo({ file: 'src/app.mjs', content: 'export const ok = 1;\n' });
 
   const rejected = await run(world, profile, pushArgs(repo.dir, repo.branch), {
