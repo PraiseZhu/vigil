@@ -1290,7 +1290,6 @@ test('appOnly 只在宿主生效：沙箱 profile 副本删掉 appOnly（沙箱�
   const { profileFile } = prepareSandboxProfile({ profile, roundDir, repoRoot: '/repo', socketPath: path.join(roundDir, 'gate.sock') });
   const copy = JSON.parse(fs.readFileSync(profileFile, 'utf8'));
   assert.equal(Object.hasOwn(copy, 'appOnly'), false);
-  assert.equal(copy.hostAppOnly, true);
 });
 
 test('appOnly：宿主拉代码（fetchBranch）用 ①读 App 的令牌；名单外的 owner 直接拒绝、不跑 git', async () => {

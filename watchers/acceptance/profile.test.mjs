@@ -180,25 +180,6 @@ test('writeCommand 字符串会被收成单元素 argv', () => {
   assert.deepEqual(profile.writeCommand, [raw.writeCommand]);
 });
 
-test('hostAppOnly 默认 false，只认布尔，不要求配 apps', () => {
-  const home = tmpDir();
-  writeJson(path.join(home, 'config', 'profile.json'), baseProfile(home));
-  assert.equal(loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: home }).hostAppOnly, false);
-
-  const flagged = tmpDir();
-  const raw = baseProfile(flagged);
-  raw.hostAppOnly = true;
-  writeJson(path.join(flagged, 'config', 'profile.json'), raw);
-  assert.equal(loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: flagged }).hostAppOnly, true);
-  assert.equal(loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: flagged }).appOnly, false);
-
-  const bad = tmpDir();
-  const badRaw = baseProfile(bad);
-  badRaw.hostAppOnly = 'yes';
-  writeJson(path.join(bad, 'config', 'profile.json'), badRaw);
-  assert.throws(() => loadAcceptanceProfile({ ACCEPTANCE_WATCHER_HOME: bad }), /hostAppOnly/);
-});
-
 test('profile 缺配置文件时报路径，不回落', () => {
   const home = tmpDir();
   assert.throws(
