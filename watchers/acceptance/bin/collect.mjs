@@ -178,12 +178,20 @@ function plannedSearchQueries(rootRef, profile) {
   return queries;
 }
 
+function appOnlyQueryGate(profile) {
+  // 沙箱副本会删掉 appOnly（github.mjs 不能拿 /dev/null 私钥走 App 路由）。
+  // 查询门禁必须用宿主显式传来的能力，不能从 writeCommand 推断：所有沙箱都有写闸。
+  return profile.appOnly === true || profile.hostAppOnly === true;
+}
+
 function searchQueries(rootRef, profile) {
   const queries = plannedSearchQueries(rootRef, profile);
   // App-only 路由必须能从查询本身确定 owner。全局搜索没有 owner，
   // 会被 github.mjs 以 no-app-route 拦截；逐仓搜索仍可按 repo: owner 分流。
   // 过滤逻辑本身不改：丢掉的查询由 skippedSearchQueries 记成未执行，不能据此判原标准通过。
-  if (profile.appOnly === true) return queries.filter((query) => /(?:^|\s)repo:[^\s]+/.test(query));
+  if (appOnlyQueryGate(profile)) {
+    return queries.filter((query) => /(?:^|\s)repo:[^\s]+/.test(query));
+  }
   return queries;
 }
 
