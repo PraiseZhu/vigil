@@ -316,4 +316,8 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 
 确认成立且该段在已带入和最新 main 上原样存在的问题，从最新 main 的另一个独立工作树开修复 PR，指向 main；原同步 PR 不追加这个修复。解冲突改到该段的问题仍原地修。位置失效、左侧旧代码、查询或 Git 证据不全时不猜来源；代码相同但错误由集成分支调用方引入的，也需核实调用上下文。
 
-新修复 PR 验证完成、CI 绿并转 Ready 后，原反馈以 `no-change` 和 `main-transfer: <新PR号> <完整HEAD>` 留证。finalize / recheck 会核对来源、新 PR 身份、main 目标、Ready、HEAD、CI 和最新 main 祖先关系；通过后由 watcher 回复「这是 main 上已有的问题，已转 #xxx 修复」并 resolve。开 PR 或验证失败时不会把讨论串关掉。转修不表示反馈不成立。
+新修复 PR 验证完成、CI 绿并转 Ready 后，原反馈以 `no-change` 和 `main-transfer: <新PR号> <完整HEAD>` 留证。finalize / recheck 会核对来源（recheck 使用本轮已推送的 HEAD）、新 PR 身份、main 目标、Ready、HEAD、CI 和最新 main 祖先关系；通过后由 watcher 回复「这是 main 上已有的问题，已转 #xxx 修复」并 resolve。开 PR 或验证失败时不会把讨论串关掉。转修不表示反馈不成立。
+
+回帖前和 resolve 前还会分别查询转修 PR 当前状态及最新 main，重验上述目标条件；目标改 head、回 Draft、关闭、CI 红、落后最新 main 或 diff 为空时保留原讨论串，并记录 `main-transfer-close-held` 事件。标题/正文接受明确的「把最新 main 同步进阶段分支」「同步 main 到…」「sync main into …」等正向同步声明；只提到 main、反向合入 main 或否定同步的句子不触发。
+
+独立检出中可运行 `node watchers/mivo/sync-origin-mutation.mjs` 重现撤修验证：脚本在 `_tmp/` 的独立副本中撤掉转修处理、撤掉 recheck 当前 HEAD 参数，分别确认回归失败，再确认恢复后通过，不修改原检出。

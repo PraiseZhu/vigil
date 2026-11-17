@@ -41,8 +41,18 @@ function world(fixture) {
 test('sync detection accepts branch pair and explicit Chinese/English main sync intent', () => {
   for (const fixture of fixtures) assert.equal(isSyncPr(fixture.pr), true);
   assert.equal(isSyncPr({ title: 'chore: merge main into stage' }), true);
-  assert.equal(isSyncPr({ body: '把最新 `main` 同步进阶段分支' }), false);
+  assert.equal(isSyncPr({ body: '把最新 `main` 同步进阶段分支' }), true);
   assert.equal(isSyncPr({ body: '同步 main 到阶段分支' }), true);
+  for (const text of ['将 main 同步到阶段分支', '把最新的 main 合并进 integration/example',
+    'chore: sync main into integration/example', '同步 main 至阶段分支']) {
+    assert.equal(isSyncPr({ title: text }), true, text);
+    assert.equal(isSyncPr({ body: text }), true, text);
+  }
+  for (const text of ['修复 main 上的旧问题', '将分支合并进 main', 'sync feature into main',
+    '不要同步 main 进阶段分支', '本 PR 不是同步 main 进阶段分支', 'do not sync main into stage',
+    '同步 main 的状态显示', '更新同步 main 按钮文案']) {
+    assert.equal(isSyncPr({ title: text, body: text }), false, text);
+  }
   assert.equal(isSyncPr({ baseRefName: 'integration/stage', headRefName: 'feat/new-feature' }), false);
   assert.equal(isSyncPr({ baseRefName: 'main', headRefName: 'fix/feature', title: 'fix: video references' }), false);
 });

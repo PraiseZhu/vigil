@@ -1978,7 +1978,7 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
   const ownership = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead: head, allowValidatedHead: true });
   const { scs, feedbackCoverage } = validateScs(previous.scs, task);
   const worktree = taskWorktree(task);
-  verifySyncTransfers({ task: isSyncPr(ownership.pr) ? { ...task, syncPr: ownership.pr } : task, scs, worktree, allowedKeys: taskRepairPolicy(task).allowedFeedbackKeys,
+  verifySyncTransfers({ currentHead: head, task: isSyncPr(ownership.pr) ? { ...task, syncPr: ownership.pr } : task, scs, worktree, allowedKeys: taskRepairPolicy(task).allowedFeedbackKeys,
     git: args => gitOutput(args, gitFn), gh: args => ghFn(GH, args) });
   const emptyRetrigger = Boolean(previous.ciRetrigger) && isEmptyCiRetrigger(worktree, task.headRefOid, head, gitFn);
   assertTaskRepairScope(task, head, { emptyRetrigger });

@@ -2978,6 +2978,7 @@ export function* processPr({
         items: closable, dispatchId: previous.activeTask?.dispatchId ?? closable[0].dispatchId, previous, ghFn, now, head: resultHead,
         repo: REPO, pr: pr.number,
       });
+      for (const hold of outcome.held ?? []) events.push({ kind: 'main-transfer-close-held', number: pr.number, ...hold });
       const closedIds = new Set(outcome.closed.map((item) => item.threadId));
       previous = {
         ...outcome.previous,

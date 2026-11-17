@@ -1,7 +1,8 @@
 // Sync routing is independent of the feedback's severity. Bodies never grant authority.
 const SHA = /^[a-f0-9]{40}$/i;
 export function isSyncPr(pr = {}) {
-  const explicit = /(?:同步\s*`?main`?\s*(?:进|到|至|入)|(?:merge|sync)\s+`?main`?\s+(?:into|to)\b)/i;
+  // Positive main -> branch statements only; mentioning main or a negated sync is not enough.
+  const explicit = /^(?!.*(?:不(?:要|是|做|会|再)?同步|无需同步|无需合并|不合并|(?:do not|don't|not a|without)\s+(?:sync|merge)))(?:.*?)(?:同步\s*`?main`?\s*(?:进|到|至|入)|(?:把|将)\s*(?:最新(?:的)?\s*)?`?main`?\s*(?:同步|合并)(?:进|到|至|入)|(?:merge|sync)\s+`?main`?\s+(?:into|to)\s+\S+)/im;
   return (/^integration\//.test(pr.baseRefName ?? '') && /^sync\//.test(pr.headRefName ?? ''))
     || explicit.test(`${pr.title ?? ''}\n${pr.body ?? ''}`);
 }
@@ -52,17 +53,17 @@ export function codeOrigin({ worktree, head, file, start, end = start, git }) {
   } catch { return unknown('git-evidence-unavailable'); }
 }
 
-export function syncFeedbackOrigin({ task, feedback, worktree, git, gh, refresh = true }) {
+export function syncFeedbackOrigin({ task, feedback, worktree, git, gh, refresh = true, currentHead = task.headRefOid }) {
   if (!isSyncPr(task.syncPr ?? {})) return { route: 'in-place', reason: 'ordinary-pr' };
   if (!feedback?.threadId || !feedback.path) return { route: 'unknown', reason: 'missing-inline-location' };
   try {
     const query = 'query($id:ID!){node(id:$id){... on PullRequestReviewThread{path line startLine diffSide isOutdated pullRequest{number headRefOid repository{nameWithOwner}}}}}';
     const thread = JSON.parse(gh(['api', 'graphql', '-f', `query=${query}`, '-F', `id=${feedback.threadId}`])).data?.node;
     if (!thread || thread.path !== feedback.path || thread.isOutdated || thread.diffSide !== 'RIGHT'
-      || thread.pullRequest?.number !== task.number || thread.pullRequest?.headRefOid !== task.headRefOid
+      || thread.pullRequest?.number !== task.number || thread.pullRequest?.headRefOid !== currentHead
       || thread.pullRequest?.repository?.nameWithOwner !== task.repo) return { route: 'unknown', reason: 'stale-or-unbound-location' };
     if (refresh) git(['-C', worktree, 'fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
-    const origin = codeOrigin({ worktree, head: task.headRefOid, file: thread.path, start: thread.startLine ?? thread.line, end: thread.line, git });
+    const origin = codeOrigin({ worktree, head: currentHead, file: thread.path, start: thread.startLine ?? thread.line, end: thread.line, git });
     return { ...origin, ...(origin.route === 'main' ? { transferMarker: transferMarker(task, feedback.key) } : {}) };
   } catch { return { route: 'unknown', reason: 'origin-evidence-unavailable' }; }
 }
@@ -78,9 +79,38 @@ export function transferMarker(task, key) {
   return `<!-- vigil-main-transfer origin=${task.number} key=${encodeURIComponent(key)} head=${task.headRefOid} -->`;
 }
 
+// Both helper and watcher use this target gate. Yielded reads support synchronous
+// finalize and the watcher's async transport without dropping any checks.
+export function* verifyMainTransferTarget({ task, key, marker, gh, main = null }) {
+  if (!marker || Number(marker[1]) === task.number) throw Error('invalid main-transfer PR');
+  const replacement = JSON.parse(yield () => gh(['pr', 'view', marker[1], '--repo', task.repo, '--json', 'number,url,body,state,isDraft,isCrossRepository,baseRefName,headRefOid,statusCheckRollup']));
+  if (replacement.number !== Number(marker[1]) || replacement.state !== 'OPEN' || replacement.isDraft !== false
+    || replacement.isCrossRepository !== false || replacement.baseRefName !== 'main' || replacement.headRefOid !== marker[2]
+    || replacement.url !== `https://github.com/${task.repo}/pull/${marker[1]}`) throw Error('main-transfer PR identity, target, Ready status or head changed');
+  if (!String(replacement.body ?? '').split('\n').includes(transferMarker(task, key))) throw Error('main-transfer PR is not bound to this finding');
+  const checks = replacement.statusCheckRollup;
+  if (!Array.isArray(checks) || !checks.length || checks.some(check => check.__typename === 'StatusContext'
+    ? check.state !== 'SUCCESS' : check.status !== 'COMPLETED' || !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(check.conclusion))) throw Error('main-transfer PR CI is not green');
+  // finalize checks ancestry and diff using its freshly fetched local main. The
+  // closure path has no product worktree dependency and checks the same facts via API.
+  if (main === null) {
+    main = String(yield () => gh(['api', `repos/${task.repo}/commits/main`, '--jq', '.sha'])).trim();
+    if (!SHA.test(main)) throw Error('main-transfer latest main is unavailable');
+    const comparison = JSON.parse(yield () => gh(['api', `repos/${task.repo}/compare/${main}...${marker[2]}?per_page=1`]));
+    if (comparison.merge_base_commit?.sha !== main || comparison.behind_by !== 0) throw Error('main-transfer PR does not include latest main');
+    if (!Array.isArray(comparison.files) || !comparison.files.length) throw Error('main-transfer PR has no changes against main');
+  }
+  return replacement;
+}
+function driveSync(iterator) {
+  let step = iterator.next();
+  while (!step.done) step = iterator.next(step.value());
+  return step.value;
+}
+
 // Verification runs before the ordinary no-change/adjudication checks. A valid transfer
 // acknowledges a defect, so it must not be mistaken for a disputed finding.
-export function verifySyncTransfers({ task, scs, worktree, git, gh, allowedKeys }) {
+export function verifySyncTransfers({ task, scs, worktree, git, gh, allowedKeys, currentHead = task.headRefOid }) {
   const transferred = new Set();
   if (!isSyncPr(task.syncPr ?? {})) {
     if (scs.some(sc => sc.evidence.some(line => line.startsWith('main-transfer:')))) throw Error('main-transfer requires a sync PR');
@@ -95,7 +125,7 @@ export function verifySyncTransfers({ task, scs, worktree, git, gh, allowedKeys 
       if (markers.length) throw Error('main-transfer requires an inline location');
       continue;
     }
-    const origin = syncFeedbackOrigin({ task, feedback, worktree, git, gh, refresh: !refreshed });
+    const origin = syncFeedbackOrigin({ task, feedback, worktree, git, gh, currentHead, refresh: !refreshed });
     refreshed = true;
     if (origin.route !== 'main' && !markers.length) {
       if (origin.route === 'unknown' && bound.some(sc => sc.status === 'pass')) throw Error('sync origin is unknown; obtain current code evidence before fixing');
@@ -106,14 +136,7 @@ export function verifySyncTransfers({ task, scs, worktree, git, gh, allowedKeys 
     if (markers.length !== 1 || bound.some(sc => sc.status !== 'no-change')) throw Error('main inherited feedback requires one verified main-transfer and no-change');
     const marker = /^main-transfer: ([1-9]\d*) ([a-f0-9]{40})$/.exec(markers[0]);
     if (!marker || Number(marker[1]) === task.number) throw Error('invalid main-transfer PR');
-    const replacement = JSON.parse(gh(['pr', 'view', marker[1], '--repo', task.repo, '--json', 'number,url,body,state,isDraft,isCrossRepository,baseRefName,headRefOid,statusCheckRollup']));
-    if (replacement.number !== Number(marker[1]) || replacement.state !== 'OPEN' || replacement.isDraft !== false
-      || replacement.isCrossRepository !== false || replacement.baseRefName !== 'main' || replacement.headRefOid !== marker[2]
-      || replacement.url !== `https://github.com/${task.repo}/pull/${marker[1]}`) throw Error('main-transfer PR identity, target, Ready status or head changed');
-    if (!String(replacement.body ?? '').split('\n').includes(transferMarker(task, feedback.key))) throw Error('main-transfer PR is not bound to this finding');
-    const checks = replacement.statusCheckRollup;
-    if (!Array.isArray(checks) || !checks.length || checks.some(check => check.__typename === 'StatusContext'
-      ? check.state !== 'SUCCESS' : check.status !== 'COMPLETED' || !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(check.conclusion))) throw Error('main-transfer PR CI is not green');
+    const replacement = driveSync(verifyMainTransferTarget({ task, key: feedback.key, marker, gh, main: origin.main }));
     git(['-C', worktree, 'fetch', 'origin', marker[2]]);
     git(['-C', worktree, 'merge-base', '--is-ancestor', origin.main, marker[2]]);
     if (!String(git(['-C', worktree, 'diff', '--name-only', origin.main, marker[2]])).trim()) throw Error('main-transfer PR has no changes against main');

@@ -442,22 +442,110 @@ test('R-4 closing the threads posts the record only on the ruled reviewer thread
   assert.match(bodies[1], /结论是它在当前 head 上不成立/);
 });
 
-test('verified main transfer replies in plain language and resolves, without calling it invalid', () => {
+function mainTransferClosure() {
   const key = 'greptile:PRRT_g1:PRRC_b';
   const result = refutedResult();
+  const task = { ...refutedTask, repo: 'example-org/plugin', number: 7, headRefOid: 'b'.repeat(40) };
   result.scs[1] = { id: 'transfer', status: 'no-change', feedbackKeys: [key], evidence: [
     '这是 main 上已有的问题，已转 #42 修复（https://github.com/example-org/plugin/pull/42）。',
     `main-transfer: 42 ${'a'.repeat(40)}`,
   ] };
-  const item = refutedThreads(result, refutedTask).find(item => item.key === key);
-  assert.equal(item.kind, 'main-transfer');
+  const item = refutedThreads(result, task).find(item => item.key === key);
+  const target = { number: 42, url: 'https://github.com/example-org/plugin/pull/42', state: 'OPEN', isDraft: false,
+    isCrossRepository: false, baseRefName: 'main', headRefOid: 'a'.repeat(40),
+    body: `<!-- vigil-main-transfer origin=7 key=${encodeURIComponent(key)} head=${task.headRefOid} -->`,
+    statusCheckRollup: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+  const comparison = { merge_base_commit: { sha: 'c'.repeat(40) }, behind_by: 0, files: [{ filename: 'example.txt' }] };
   const calls = [];
-  const run = closeRefutedThreads({ items: [item], dispatchId: result.dispatchId, previous: {},
-    ghFn: args => { calls.push(args); return '{}'; }, now: '2026-11-17T00:00:00Z' });
-  let step = run.next(); while (!step.done) step = run.next(step.value());
-  assert.equal(calls.length, 2);
-  const body = calls[0].find(arg => arg.startsWith('body='));
+  let reads = 0;
+  const state = { onRead: () => {}, afterReply: () => {} };
+  const ghFn = args => {
+    calls.push(args);
+    if (args[0] === 'pr') { state.onRead(++reads); return JSON.stringify(target); }
+    if (args[1].endsWith('/commits/main')) return 'c'.repeat(40);
+    if (args[1].includes('/compare/')) return JSON.stringify(comparison);
+    if (args.some(arg => arg.startsWith('body='))) state.afterReply();
+    return '{}';
+  };
+  const run = () => {
+    const iterator = closeRefutedThreads({ items: [item], dispatchId: result.dispatchId, previous: {}, ghFn,
+      repo: task.repo, pr: task.number, now: '2026-11-17T00:00:00Z' });
+    let step = iterator.next();
+    while (!step.done) {
+      let value;
+      try { value = step.value(); } catch (error) { step = iterator.throw(error); continue; }
+      step = iterator.next(value);
+    }
+    return step.value;
+  };
+  const writes = () => calls.filter(args => args.some(arg => /query=mutation/.test(arg)));
+  return { item, target, comparison, calls, state, run, writes };
+}
+
+test('verified main transfer replies in plain language and resolves after fresh target checks', () => {
+  const f = mainTransferClosure();
+  assert.equal(f.item.kind, 'main-transfer');
+  const outcome = f.run();
+  assert.equal(outcome.closed.length, 1);
+  const writes = f.writes();
+  assert.equal(writes.length, 2);
+  const body = writes[0].find(arg => arg.startsWith('body='));
   assert.match(body, /这是 main 上已有的问题，已转 #42 修复/);
   assert.doesNotMatch(body, /不成立|P3|不需要改代码/);
-  assert.ok(calls[1].some(arg => arg.includes('resolveReviewThread')));
+  assert.ok(writes[1].some(arg => arg.includes('resolveReviewThread')));
+  assert.equal(f.calls.filter(args => args[0] === 'pr').length, 2);
+  assert.equal(f.calls.filter(args => args[1].includes('/compare/')).length, 2);
+});
+
+for (const [name, change] of [
+  ['head moved', f => { f.target.headRefOid = 'd'.repeat(40); }],
+  ['Draft', f => { f.target.isDraft = true; }],
+  ['closed', f => { f.target.state = 'CLOSED'; }],
+  ['red CI', f => { f.target.statusCheckRollup[0].conclusion = 'FAILURE'; }],
+  ['wrong base', f => { f.target.baseRefName = 'integration/example'; }],
+  ['main advanced', f => { f.comparison.merge_base_commit.sha = 'e'.repeat(40); f.comparison.behind_by = 1; }],
+  ['empty diff', f => { f.comparison.files = []; }],
+  ['missing binding', f => { delete f.item.transferTask; }],
+  ['API failure', f => { f.state.onRead = () => { throw Error('API unavailable'); }; }],
+]) {
+  test(`main transfer closure: ${name} before reply leaves the thread open without a reply`, () => {
+    const f = mainTransferClosure(); change(f);
+    const outcome = f.run();
+    assert.deepEqual(outcome.closed, []);
+    assert.equal(f.writes().length, 0);
+    assert.equal(outcome.held[0].phase, 'before-reply');
+    assert.equal(outcome.previous.autoClosedThreads[f.item.threadId], undefined);
+  });
+  test(`main transfer closure: ${name} after reply prevents resolve`, () => {
+    const f = mainTransferClosure(); f.state.afterReply = () => change(f);
+    const outcome = f.run();
+    assert.deepEqual(outcome.closed, []);
+    assert.equal(f.writes().length, 1);
+    assert.equal(outcome.held[0].phase, 'before-resolve');
+    assert.ok(f.writes()[0].some(arg => arg.startsWith('body=')));
+    assert.equal(outcome.previous.autoClosedThreads[f.item.threadId], undefined);
+  });
+}
+
+
+test('main transfer closure retains its binding when queued and supports asynchronous reads', async () => {
+  const f = mainTransferClosure();
+  const item = JSON.parse(JSON.stringify(f.item));
+  const replies = [];
+  const ghFn = async args => {
+    if (args[0] === 'pr') return JSON.stringify(f.target);
+    if (args[1].endsWith('/commits/main')) return 'c'.repeat(40);
+    if (args[1].includes('/compare/')) return JSON.stringify(f.comparison);
+    replies.push(args); return '{}';
+  };
+  const iterator = closeRefutedThreads({ items: [item], dispatchId: 'queued-transfer', previous: {}, ghFn,
+    repo: 'example-org/plugin', pr: 7, now: '2026-11-17T00:00:00Z' });
+  let step = iterator.next();
+  while (!step.done) {
+    let value;
+    try { value = await step.value(); } catch (error) { step = iterator.throw(error); continue; }
+    step = iterator.next(value);
+  }
+  assert.equal(step.value.closed.length, 1);
+  assert.equal(replies.length, 2);
 });
