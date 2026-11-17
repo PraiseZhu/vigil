@@ -309,3 +309,11 @@ node --env-file=watchers/mivo/test.env --test watchers/mivo/*.test.mjs
 
 测试里用到的仓库名、路径、session id 均为占位数据(`example-org/example-plugin`、
 `/tmp/...` 等),不对应任何真实仓库。
+
+## 同步 PR 的既有问题
+
+目标为 `integration/*` 且来源为 `sync/*`，或标题、正文明确写明同步 main 进分支时，修复轮先运行 `mivo-repair.mjs sync-origin --key <反馈key>`。helper 核对当前 Ready PR 的反馈行段（含附近 3 行）、HEAD 与 main 的 merge-base，以及最新 main；其它行的改动或行号移动不会直接判成新问题。
+
+确认成立且该段在已带入和最新 main 上原样存在的问题，从最新 main 的另一个独立工作树开修复 PR，指向 main；原同步 PR 不追加这个修复。解冲突改到该段的问题仍原地修。位置失效、左侧旧代码、查询或 Git 证据不全时不猜来源；代码相同但错误由集成分支调用方引入的，也需核实调用上下文。
+
+新修复 PR 验证完成、CI 绿并转 Ready 后，原反馈以 `no-change` 和 `main-transfer: <新PR号> <完整HEAD>` 留证。finalize / recheck 会核对来源、新 PR 身份、main 目标、Ready、HEAD、CI 和最新 main 祖先关系；通过后由 watcher 回复「这是 main 上已有的问题，已转 #xxx 修复」并 resolve。开 PR 或验证失败时不会把讨论串关掉。转修不表示反馈不成立。

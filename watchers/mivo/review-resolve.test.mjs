@@ -441,3 +441,23 @@ test('R-4 closing the threads posts the record only on the ruled reviewer thread
   assert.equal([...bodies[1].matchAll(REVIEWER_RULING_RE)].length, 0);
   assert.match(bodies[1], /结论是它在当前 head 上不成立/);
 });
+
+test('verified main transfer replies in plain language and resolves, without calling it invalid', () => {
+  const key = 'greptile:PRRT_g1:PRRC_b';
+  const result = refutedResult();
+  result.scs[1] = { id: 'transfer', status: 'no-change', feedbackKeys: [key], evidence: [
+    '这是 main 上已有的问题，已转 #42 修复（https://github.com/example-org/plugin/pull/42）。',
+    `main-transfer: 42 ${'a'.repeat(40)}`,
+  ] };
+  const item = refutedThreads(result, refutedTask).find(item => item.key === key);
+  assert.equal(item.kind, 'main-transfer');
+  const calls = [];
+  const run = closeRefutedThreads({ items: [item], dispatchId: result.dispatchId, previous: {},
+    ghFn: args => { calls.push(args); return '{}'; }, now: '2026-11-17T00:00:00Z' });
+  let step = run.next(); while (!step.done) step = run.next(step.value());
+  assert.equal(calls.length, 2);
+  const body = calls[0].find(arg => arg.startsWith('body='));
+  assert.match(body, /这是 main 上已有的问题，已转 #42 修复/);
+  assert.doesNotMatch(body, /不成立|P3|不需要改代码/);
+  assert.ok(calls[1].some(arg => arg.includes('resolveReviewThread')));
+});

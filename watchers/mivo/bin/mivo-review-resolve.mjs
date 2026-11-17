@@ -220,6 +220,7 @@ function completeCodeFixThreads(result, task, { disposition, scStatus, kind }) {
 export function refutedThreads(result, task) {
   return completeCodeFixThreads(result, task, { disposition: 'no-change', scStatus: 'no-change', kind: 'refuted' })
     .map((item) => {
+      if (item.evidence.some(line => /^main-transfer: [1-9]\d* [a-f0-9]{40}$/.test(line))) return { ...item, kind: 'main-transfer', triage: false };
       const ruling = rulingRecordFor(result, task, item.key);
       if (ruling) return { ...item, ruling };
       const deferral = deferralFor(task, item.key, item.evidence);
@@ -400,6 +401,11 @@ function sanitizeEvidence(evidence) {
 }
 const RULING_VERDICT_TEXT = { invalid: '不成立', p3: '属实但按统一分级只到 P3，不必修' };
 export function refutedReplyText(evidence, dispatchId, ruling = null) {
+  if (evidence.some(line => /^main-transfer: [1-9]\d* [a-f0-9]{40}$/.test(line))) return [
+    sanitizeLine(evidence[0]),
+    '同步 PR 保持同步范围；修复在指向 main 的独立 PR 跟进。',
+    `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
+  ].join('\n');
   return [
     ruling
       ? '**发生了什么**：盯梢修复轮核实后对这条意见有异议，交给只读裁决席按统一分级判定，结论是不需要改代码。'
@@ -482,7 +488,7 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
       : item.triage ? triagedReplyText(item.evidence, itemDispatchId)
         : deferral ? deferredReplyText(item.evidence, itemDispatchId, deferral, issue)
           : refutedReplyText(item.evidence, itemDispatchId, item.ruling ?? null);
-    const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : deferral ? 'deferred-to-issue' : 'refuted-p0-p1';
+    const reason = item.kind === 'main-transfer' ? 'transferred-to-main' : item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : deferral ? 'deferred-to-issue' : 'refuted-p0-p1';
     yield () => ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${body}`]);
     yield () => ghFn(['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${item.threadId}`]);
     closedThreads[item.threadId] = { at: now, key: item.key, reason, dispatchId: itemDispatchId, ...(issue ? { issue } : {}) };

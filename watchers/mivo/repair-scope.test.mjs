@@ -1725,3 +1725,40 @@ test('#397 a dispatch recorded before the fingerprint existed is left as it was'
   assert.equal((await f.validate()).status, 'pass');
 });
 
+
+test('sync main transfer finalizes no-change without a dispute, leaves original branch untouched, and rechecks', t => {
+  const f = fixture(t, { changed: false });
+  const feedback = { ...finding('P1', 'greptile:PRRT_sync:PRRC_example'), source: 'greptile', threadId: 'PRRT_sync', path: 'example.txt' };
+  f.task.syncPr = { baseRefName: 'integration/example', headRefName: 'sync/main-into-example' };
+  f.saveTask([feedback]);
+  f.git('-C', f.worktree, 'push', 'origin', `${f.sourceHead}:refs/heads/main`);
+  f.git('-C', f.worktree, 'checkout', '-b', 'fix/main-example');
+  fs.writeFileSync(path.join(f.worktree, 'example.txt'), 'fixed on main\n');
+  f.git('-C', f.worktree, 'commit', '-am', 'example replacement fix');
+  const replacementHead = f.git('-C', f.worktree, 'rev-parse', 'HEAD');
+  f.git('-C', f.worktree, 'checkout', 'watch/pr-790');
+  f.git('-C', f.worktree, 'push', 'origin', `${replacementHead}:refs/heads/fix/main-example`);
+  const originalGh = f.options.ghFn;
+  f.options.ghFn = (binary, args) => {
+    if (args[0] === 'api' && args[1] === 'graphql' && args.some(arg => arg.includes('PullRequestReviewThread'))) return JSON.stringify({ data: { node: {
+      path: 'example.txt', line: 1, startLine: null, diffSide: 'RIGHT', isOutdated: false,
+      pullRequest: { number: 790, headRefOid: f.sourceHead, repository: { nameWithOwner: REPO } },
+    } } });
+    if (args[0] === 'pr' && args[2] === '801') return JSON.stringify({ number: 801, url: `https://github.com/${REPO}/pull/801`,
+      state: 'OPEN', isDraft: false, isCrossRepository: false, baseRefName: 'main', headRefOid: replacementHead,
+      body: `<!-- vigil-main-transfer origin=790 key=${encodeURIComponent(feedback.key)} head=${f.sourceHead} -->`,
+      statusCheckRollup: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS' }] });
+    return originalGh(binary, args);
+  };
+  const sc = f.sc('no-change', [feedback.key]); sc.evidence = ['pending transfer', `main-transfer: 801 ${replacementHead}`];
+  f.report([sc], []);
+  const result = f.finalize();
+  assert.equal(result.status, 'complete');
+  assert.equal(result.pushed, false);
+  assert.match(result.scs[0].evidence[0], /这是 main 上已有的问题，已转 #801 修复/);
+  assert.equal(f.remoteHead(), f.sourceHead);
+  assert.equal(recheck(f.options).status, 'complete');
+  f.report([{ ...sc, evidence: ['fixed in original PR'], status: 'pass' }], []);
+  assert.throws(f.finalize, /main inherited feedback requires/);
+  assert.equal(f.pushCalls.length, 0);
+});

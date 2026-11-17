@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isSyncPr, SYNC_PR_RULE } from './mivo-sync-origin.mjs';
 // Mini Cindy 只读巡检：扫本人在目标仓（见 config/profile.json 的 targetRepo）的 open PR，
 // 采集 CI / reviews / threads / comments / labels，按 PR nodeid 维护唯一 session 映射。
 // 默认 dry-run：不 dispatch、不写 branch、不创建 Cindy session。
@@ -1053,10 +1054,12 @@ export function dispatchParams({ pr, mapping, fresh, now, taskPath, home, messag
       `Mivo PR repair for ${REPO}#${pr.number}.`,
       `nodeid=${pr.id}`,
       `head=${pr.headRefOid}`,
+      `syncPr=${JSON.stringify({ isSync: isSyncPr(pr), baseRefName: pr.baseRefName ?? null, headRefName: pr.headRefName ?? null })}`,
       `fresh=${fresh.length}`,
       `feedback=${JSON.stringify(promptFeedbackRows(fresh))}`,
       `prIntent=${JSON.stringify(prIntent ?? { source: 'unavailable', text: '' })}`,
       INTENT_RULE,
+      SYNC_PR_RULE,
       AUTO_ADVANCE_RULE,
       severityRule(),
       SIBLING_FIX_RULE,
@@ -1408,12 +1411,13 @@ function dispatchIntent({ pr, mapping, fresh, now, paths, dryRun, messagePrefix 
   const dispatchId = `${dryRun ? 'dry' : 'live'}-${pr.number}-${now.replace(/[:.]/g, '-')}`;
   const taskPath = path.join(paths.stateDir, 'tasks', `${dispatchId}.json`);
   const prSnapshot = compactPrSnapshot(collected, now);
+  const repairPr = { ...pr, ...(collected?.pr ?? {}) };
   // The session is told to write the drafts only when it may change code, and the task records that it was told.
   const handoffAsked = childPrHandoff?.enabled === true && taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }).canChangeCode;
-  const pending = { dispatchId, params: dispatchParams({ pr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, prIntent: prSnapshot?.prIntent, handledFindings: collected?.handledFindings ?? [], repeatFindings, childPrHandoff }), at: now, taskPath, feedbackDigest: taskFeedbackDigest(fresh) };
+  const pending = { dispatchId, params: dispatchParams({ pr: repairPr, mapping, fresh, now, taskPath, home: paths.home, messagePrefix, prIntent: prSnapshot?.prIntent, handledFindings: collected?.handledFindings ?? [], repeatFindings, childPrHandoff }), at: now, taskPath, feedbackDigest: taskFeedbackDigest(fresh) };
   if (!dryRun) {
     fs.mkdirSync(path.dirname(taskPath), { recursive: true });
-    atomic(taskPath, JSON.stringify({ dispatchId, ...(selfReviewRequired({ headRefOid: pr.headRefOid, fresh }) ? { selfReviewRequired: true } : {}), repeatFindings, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: pr.id, number: pr.number, repo: REPO, headRefOid: pr.headRefOid, headRefName: pr.headRefName, prAuthor: collected?.pr?.author?.login ?? pr.author?.login ?? null, handoff: collected?.handoff, releaseEpoch: collected?.pr?.releaseEpoch, feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }), prSnapshot, severityStandard: taskSeverityStandard(), adjudicationRecord: ADJUDICATION_RECORD_VERSION, ...(handoffAsked ? { childPrHandoff: childPrHandoffSpec(taskPath) } : {}), params: pending.params, createdAt: now }));
+    atomic(taskPath, JSON.stringify({ dispatchId, ...(selfReviewRequired({ headRefOid: pr.headRefOid, fresh }) ? { selfReviewRequired: true } : {}), repeatFindings, keelFlow: true, keelFlowVersion: KEEL_FLOW_VERSION, keelRunId: keelRunIdFor(dispatchId), nodeId: pr.id, number: pr.number, repo: REPO, ...(isSyncPr(repairPr) ? { syncPr: { baseRefName: repairPr.baseRefName, headRefName: repairPr.headRefName, title: repairPr.title, body: repairPr.body ?? '' } } : {}), headRefOid: pr.headRefOid, headRefName: pr.headRefName, prAuthor: collected?.pr?.author?.login ?? pr.author?.login ?? null, handoff: collected?.handoff, releaseEpoch: collected?.pr?.releaseEpoch, feedback: fresh, repairPolicy: taskRepairPolicy({ headRefOid: pr.headRefOid, feedback: fresh }), prSnapshot, severityStandard: taskSeverityStandard(), adjudicationRecord: ADJUDICATION_RECORD_VERSION, ...(handoffAsked ? { childPrHandoff: childPrHandoffSpec(taskPath) } : {}), params: pending.params, createdAt: now }));
   }
   return pending;
 }

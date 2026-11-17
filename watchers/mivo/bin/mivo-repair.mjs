@@ -2,6 +2,7 @@
 // Mini PR repair contract. This helper owns one task file and one PR worktree.
 // It deliberately has no session-runtime integration: the watcher is the
 // source of the session binding and Cindy is responsible for the session.
+import { syncFeedbackOrigin, verifySyncTransfers } from './mivo-sync-origin.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -717,9 +718,18 @@ export function prepare({ home, taskPath, ghFn = command, ownershipFn = collectP
   const repairPolicy = assertTaskRepairScope(task, pr.headRefOid);
   const needsSync = task.headRefOid !== pr.headRefOid;
   const commitIdentity = ensureCommitIdentity({ worktree: aligned.worktree, gitFn });
-  return { ...identity(task, sessionId), repairPolicy, status: needsSync ? 'needs-sync' : 'prepared', needsSync, commitIdentity,
+  return { ...identity(task, sessionId), syncPr: task.syncPr ?? null, repairPolicy, status: needsSync ? 'needs-sync' : 'prepared', needsSync, commitIdentity,
     worktree: aligned.worktree, head: pr.headRefOid, remoteHead: pr.headRefOid, sourceHead: task.headRefOid, created: checkout.created,
     preservation: aligned.preservation ?? null, realigned: aligned.realigned ?? null, ciErrors: ciErrorExcerpts(task, ghFn) };
+}
+
+export function syncOrigin({ home, taskPath, key, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command } = {}) {
+  const { task } = taskFrom(home, taskPath);
+  assertOwner({ home, taskPath, ghFn, ownershipFn });
+  const feedback = task.feedback.find(item => item.key === key);
+  if (!feedback) fail('sync-origin key is not task feedback');
+  return syncFeedbackOrigin({ task, feedback, worktree: taskWorktree(task),
+    git: args => gitOutput(args, gitFn), gh: args => ghFn(GH, args) });
 }
 
 // Workers a repair round opened, as reported by the session. Consult workers are capped per head
@@ -1880,9 +1890,14 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
   const { scs, feedbackCoverage, workers, selfReviewRecord } = loadScs(scReport, task);
-  assertDisputesAdjudicated({ scs, workers, task, fixedAfterReview: alreadyFixedProof({ worktree, validatedHead, gitFn }) });
-  assertRepeatInventory({ scs, task });
-  assertStandardAllowsDisputes({ scs, task });
+  const transferred = verifySyncTransfers({ task, scs, worktree,
+    allowedKeys: taskRepairPolicy(task).allowedFeedbackKeys,
+    git: args => gitOutput(args, gitFn), gh: args => ghFn(GH, args) });
+  const localScs = scs.map(sc => ({ ...sc, feedbackKeys: sc.feedbackKeys.filter(key => !transferred.has(key)) }))
+    .filter(sc => sc.feedbackKeys.length);
+  assertDisputesAdjudicated({ scs: localScs, workers, task, fixedAfterReview: alreadyFixedProof({ worktree, validatedHead, gitFn }) });
+  assertRepeatInventory({ scs: localScs, task });
+  assertStandardAllowsDisputes({ scs: localScs, task });
   const emptyRetrigger = allNoChange(scs) && isEmptyCiRetrigger(worktree, task.headRefOid, validatedHead, gitFn);
   // An empty commit that only re-triggers CI has no diff to review.
   const selfReview = validateSelfReview(selfReviewRecord, { required: task.selfReviewRequired === true, changed: validatedHead !== task.headRefOid && !emptyRetrigger });
@@ -1963,6 +1978,8 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
   const ownership = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead: head, allowValidatedHead: true });
   const { scs, feedbackCoverage } = validateScs(previous.scs, task);
   const worktree = taskWorktree(task);
+  verifySyncTransfers({ task, scs, worktree, allowedKeys: taskRepairPolicy(task).allowedFeedbackKeys,
+    git: args => gitOutput(args, gitFn), gh: args => ghFn(GH, args) });
   const emptyRetrigger = Boolean(previous.ciRetrigger) && isEmptyCiRetrigger(worktree, task.headRefOid, head, gitFn);
   assertTaskRepairScope(task, head, { emptyRetrigger });
   const checkout = assertWorktree(worktree, task, gitFn, originUrl);
@@ -2215,7 +2232,7 @@ export function autoCleanupWatch({
 
 async function cli(argv) {
   const args = [...argv];
-  const modes = new Set(['assert-owner', 'prepare', 'validate', 'finalize', 'recheck', 'blocked', 'adjudication-brief', 'cleanup', 'clear-owner-unknown']);
+  const modes = new Set(['assert-owner', 'prepare', 'validate', 'finalize', 'recheck', 'blocked', 'adjudication-brief', 'sync-origin', 'cleanup', 'clear-owner-unknown']);
   const modeIndex = args.findIndex((item) => modes.has(item));
   const mode = modeIndex >= 0 ? args.splice(modeIndex, 1)[0] : undefined;
   const value = (name, required = true) => {
@@ -2232,6 +2249,7 @@ async function cli(argv) {
   else {
     const task = value('--task');
     if (mode === 'assert-owner') result = assertOwner({ home, taskPath: task });
+    else if (mode === 'sync-origin') result = syncOrigin({ home, taskPath: task, key: value('--key') });
     else if (mode === 'prepare') result = prepare({ home, taskPath: task });
     else if (mode === 'validate') result = await validate({ home, taskPath: task, validatedHead: value('--validated-head') });
     else if (mode === 'finalize') result = finalize({ home, taskPath: task, scReport: value('--sc-report'), validatedHead: value('--validated-head'), validationReceipt: value('--validation-receipt', false), keelRun: value('--keel-run', false) });
