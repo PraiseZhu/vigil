@@ -5,7 +5,7 @@ export function isSyncPr(pr = {}) {
   const text = `${pr.title ?? ''}\n${pr.body ?? ''}`;
   // Text is weaker evidence than the branch pair. Reject negation or uncertainty
   // anywhere in it, including words between a negation and the sync verb.
-  if (/(?:不|无[需须]|禁止|避免|[勿别]|是否|能否|可能|如果|假如|[?？]|\b(?:not|don't|never|without|avoid|if|maybe)\b)/i.test(text)) return false;
+  if (/(?:[不没未]|无[需须]|禁止|避免|[勿别]|是否|能否|可能|如果|假如|[?？]|\b(?:no|not|cannot|(?:don|can|won|shouldn)['’]t|never|without|avoid|if|unless|whether|maybe)\b)/i.test(text)) return false;
   return /(?:同步\s*`?main`?\s*(?:进|到|至|入)|(?:把|将)\s*(?:最新(?:的)?\s*)?`?main`?\s*(?:同步|合并)(?:进|到|至|入)|(?:merge|sync)\s+`?main`?\s+(?:into|to)\s+\S+)/i.test(text);
 }
 
