@@ -2,7 +2,7 @@
 // Mini PR repair contract. This helper owns one task file and one PR worktree.
 // It deliberately has no session-runtime integration: the watcher is the
 // source of the session binding and Cindy is responsible for the session.
-import { syncFeedbackOrigin, verifySyncTransfers } from './mivo-sync-origin.mjs';
+import { isSyncPr, syncFeedbackOrigin, verifySyncTransfers } from './mivo-sync-origin.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -718,17 +718,17 @@ export function prepare({ home, taskPath, ghFn = command, ownershipFn = collectP
   const repairPolicy = assertTaskRepairScope(task, pr.headRefOid);
   const needsSync = task.headRefOid !== pr.headRefOid;
   const commitIdentity = ensureCommitIdentity({ worktree: aligned.worktree, gitFn });
-  return { ...identity(task, sessionId), syncPr: task.syncPr ?? null, repairPolicy, status: needsSync ? 'needs-sync' : 'prepared', needsSync, commitIdentity,
+  return { ...identity(task, sessionId), syncPr: isSyncPr(pr) ? { baseRefName: pr.baseRefName, headRefName: pr.headRefName, title: pr.title, body: pr.body } : task.syncPr ?? null, repairPolicy, status: needsSync ? 'needs-sync' : 'prepared', needsSync, commitIdentity,
     worktree: aligned.worktree, head: pr.headRefOid, remoteHead: pr.headRefOid, sourceHead: task.headRefOid, created: checkout.created,
     preservation: aligned.preservation ?? null, realigned: aligned.realigned ?? null, ciErrors: ciErrorExcerpts(task, ghFn) };
 }
 
 export function syncOrigin({ home, taskPath, key, ghFn = command, ownershipFn = collectPrOwnershipSync, gitFn = command } = {}) {
   const { task } = taskFrom(home, taskPath);
-  assertOwner({ home, taskPath, ghFn, ownershipFn });
+  const { pr } = assertOwner({ home, taskPath, ghFn, ownershipFn });
   const feedback = task.feedback.find(item => item.key === key);
   if (!feedback) fail('sync-origin key is not task feedback');
-  return syncFeedbackOrigin({ task, feedback, worktree: taskWorktree(task),
+  return syncFeedbackOrigin({ task: isSyncPr(pr) ? { ...task, syncPr: pr } : task, feedback, worktree: taskWorktree(task),
     git: args => gitOutput(args, gitFn), gh: args => ghFn(GH, args) });
 }
 
@@ -1890,7 +1890,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
   const { scs, feedbackCoverage, workers, selfReviewRecord } = loadScs(scReport, task);
-  const transferred = verifySyncTransfers({ task, scs, worktree,
+  const transferred = verifySyncTransfers({ task: isSyncPr(pr) ? { ...task, syncPr: pr } : task, scs, worktree,
     allowedKeys: taskRepairPolicy(task).allowedFeedbackKeys,
     git: args => gitOutput(args, gitFn), gh: args => ghFn(GH, args) });
   const localScs = scs.map(sc => ({ ...sc, feedbackKeys: sc.feedbackKeys.filter(key => !transferred.has(key)) }))
@@ -1978,7 +1978,7 @@ export function recheck({ home, taskPath, validatedHead, ghFn = command, ownersh
   const ownership = assertOwner({ home, taskPath, ghFn, ownershipFn, validatedHead: head, allowValidatedHead: true });
   const { scs, feedbackCoverage } = validateScs(previous.scs, task);
   const worktree = taskWorktree(task);
-  verifySyncTransfers({ task, scs, worktree, allowedKeys: taskRepairPolicy(task).allowedFeedbackKeys,
+  verifySyncTransfers({ task: isSyncPr(ownership.pr) ? { ...task, syncPr: ownership.pr } : task, scs, worktree, allowedKeys: taskRepairPolicy(task).allowedFeedbackKeys,
     git: args => gitOutput(args, gitFn), gh: args => ghFn(GH, args) });
   const emptyRetrigger = Boolean(previous.ciRetrigger) && isEmptyCiRetrigger(worktree, task.headRefOid, head, gitFn);
   assertTaskRepairScope(task, head, { emptyRetrigger });

@@ -117,7 +117,10 @@ export function verifySyncTransfers({ task, scs, worktree, git, gh, allowedKeys 
     git(['-C', worktree, 'fetch', 'origin', marker[2]]);
     git(['-C', worktree, 'merge-base', '--is-ancestor', origin.main, marker[2]]);
     if (!String(git(['-C', worktree, 'diff', '--name-only', origin.main, marker[2]])).trim()) throw Error('main-transfer PR has no changes against main');
-    for (const sc of bound) sc.evidence[0] = `这是 main 上已有的问题，已转 #${marker[1]} 修复（${replacement.url}）。`;
+    for (const sc of bound) {
+      sc.evidence[0] = `这是 main 上已有的问题，已转 #${marker[1]} 修复（${replacement.url}）。`;
+      if (!sc.evidence.includes(markers[0])) sc.evidence.push(markers[0]);
+    }
     transferred.add(feedback.key);
   }
   return transferred;

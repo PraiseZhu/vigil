@@ -125,3 +125,11 @@ test('real git: imported main region is routed out, conflict edits are routed in
   run(['commit', '-qam', 'conflict resolution']);
   assert.equal(codeOrigin({ ...args, head: run(['rev-parse', 'HEAD']) }).route, 'in-place');
 });
+
+test('a transfer marker supplied as the only evidence survives verification and watcher formatting', () => {
+  const w = world(fixtures[0]);
+  w.scs[0].evidence = [`main-transfer: 42 ${NEW}`];
+  assert.deepEqual([...verifySyncTransfers(w)], ['finding']);
+  assert.equal(w.scs[0].evidence[1], `main-transfer: 42 ${NEW}`);
+  assert.deepEqual([...verifySyncTransfers(w)], ['finding']);
+});

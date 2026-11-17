@@ -1758,6 +1758,15 @@ test('sync main transfer finalizes no-change without a dispute, leaves original 
   assert.match(result.scs[0].evidence[0], /这是 main 上已有的问题，已转 #801 修复/);
   assert.equal(f.remoteHead(), f.sourceHead);
   assert.equal(recheck(f.options).status, 'complete');
+  // Old tasks had no sync metadata: classify again from the live PR before finalizing.
+  const transferGh = f.options.ghFn;
+  f.options.ghFn = (binary, args) => {
+    const raw = transferGh(binary, args);
+    if (args[0] === 'pr' && args[1] === 'view' && args[2] === '790') return JSON.stringify({ ...JSON.parse(raw), title: 'chore: sync main into stage' });
+    return raw;
+  };
+  delete f.task.syncPr; f.saveTask([feedback]);
+  assert.equal(f.finalize().status, 'complete');
   f.report([{ ...sc, evidence: ['fixed in original PR'], status: 'pass' }], []);
   assert.throws(f.finalize, /main inherited feedback requires/);
   assert.equal(f.pushCalls.length, 0);
