@@ -1773,7 +1773,9 @@ test('sync main transfer finalizes no-change without a dispute, leaves original 
 });
 
 
-test('sync main transfer mixed with another fix rechecks the pushed head while CI is pending', async t => {
+for (const retry of [recheck, finalize]) {
+const name = retry === recheck ? 'mixed with another fix rechecks the pushed head' : 'retries finalize after a controlled push';
+test(`sync main transfer ${name} while CI is pending`, async t => {
   const f = fixture(t, { changed: false });
   const feedback = { ...finding('P1', 'greptile:PRRT_sync:PRRC_example'), source: 'greptile', threadId: 'PRRT_sync', path: 'example.txt' };
   f.task.syncPr = { baseRefName: 'integration/example', headRefName: 'sync/main-into-example' };
@@ -1814,13 +1816,14 @@ test('sync main transfer mixed with another fix rechecks the pushed head while C
   assert.equal(first.status, 'waiting-ci');
   assert.equal(first.pushed, true);
   assert.equal(f.remoteHead(), pushedHead);
-  const waiting = recheck(options);
+  const waiting = retry(options);
   assert.equal(waiting.status, 'waiting-ci');
   assert.equal(waiting.head, pushedHead);
   f.setCiConclusion('success');
-  const completed = recheck(options);
+  const completed = retry(options);
   assert.equal(completed.status, 'complete');
   assert.match(completed.scs[0].evidence[0], /已转 #801 修复/);
   assert.deepEqual(originReads, [f.sourceHead, pushedHead, pushedHead]);
   assert.equal(f.pushCalls.length, 1);
 });
+}

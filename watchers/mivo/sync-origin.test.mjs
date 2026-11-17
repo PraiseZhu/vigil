@@ -56,6 +56,25 @@ test('sync detection accepts branch pair and explicit Chinese/English main sync 
   assert.equal(isSyncPr({ baseRefName: 'integration/stage', headRefName: 'feat/new-feature' }), false);
   assert.equal(isSyncPr({ baseRefName: 'main', headRefName: 'fix/feature', title: 'fix: video references' }), false);
 });
+test('negated or uncertain sync intent stays ordinary without GitHub/git reads', () => {
+  for (const text of ['不要把 main 同步进阶段分支', '不要将最新 main 合并进 integration/stage',
+    '无需把最新的 `main` 同步到阶段分支', '禁止将 main 合并入 integration/stage',
+    '本 PR 不会把 main 同步至阶段分支', '请勿再将最新 main 合并进 integration/stage',
+    'do not automatically sync main into stage', 'never merge main into stage',
+    '是否把 main 同步进阶段分支', '如果要将 main 同步到阶段分支，请另开 PR',
+    '把 main 同步进阶段分支？', '本轮暂不同步 main 到阶段分支']) {
+    for (const field of ['title', 'body']) {
+      const w = world(fixtures[0]);
+      w.task.syncPr = { [field]: text };
+      w.scs[0].status = 'pass'; w.scs[0].evidence = ['fixed normal PR'];
+      assert.equal(isSyncPr(w.task.syncPr), false, text);
+      assert.deepEqual(syncFeedbackOrigin({ ...w, feedback: w.task.feedback[0] }), { route: 'in-place', reason: 'ordinary-pr' });
+      assert.equal(verifySyncTransfers(w).size, 0);
+      assert.deepEqual(w.calls, [], text);
+    }
+  }
+  assert.equal(isSyncPr({ title: 'sync main into stage', body: '不要把 main 同步进阶段分支' }), false);
+});
 for (const fixture of fixtures) {
   test(`${fixture.case}: inherited main finding goes to a verified main PR, with human reply`, () => {
     assert.equal(fixture.mainRegionSha256, fixture.headRegionSha256);

@@ -1,10 +1,12 @@
 // Sync routing is independent of the feedback's severity. Bodies never grant authority.
 const SHA = /^[a-f0-9]{40}$/i;
 export function isSyncPr(pr = {}) {
-  // Positive main -> branch statements only; mentioning main or a negated sync is not enough.
-  const explicit = /^(?!.*(?:不(?:要|是|做|会|再)?同步|无需同步|无需合并|不合并|(?:do not|don't|not a|without)\s+(?:sync|merge)))(?:.*?)(?:同步\s*`?main`?\s*(?:进|到|至|入)|(?:把|将)\s*(?:最新(?:的)?\s*)?`?main`?\s*(?:同步|合并)(?:进|到|至|入)|(?:merge|sync)\s+`?main`?\s+(?:into|to)\s+\S+)/im;
-  return (/^integration\//.test(pr.baseRefName ?? '') && /^sync\//.test(pr.headRefName ?? ''))
-    || explicit.test(`${pr.title ?? ''}\n${pr.body ?? ''}`);
+  if (/^integration\//.test(pr.baseRefName ?? '') && /^sync\//.test(pr.headRefName ?? '')) return true;
+  const text = `${pr.title ?? ''}\n${pr.body ?? ''}`;
+  // Text is weaker evidence than the branch pair. Reject negation or uncertainty
+  // anywhere in it, including words between a negation and the sync verb.
+  if (/(?:不|无[需须]|禁止|避免|[勿别]|是否|能否|可能|如果|假如|[?？]|\b(?:not|don't|never|without|avoid|if|maybe)\b)/i.test(text)) return false;
+  return /(?:同步\s*`?main`?\s*(?:进|到|至|入)|(?:把|将)\s*(?:最新(?:的)?\s*)?`?main`?\s*(?:同步|合并)(?:进|到|至|入)|(?:merge|sync)\s+`?main`?\s+(?:into|to)\s+\S+)/i.test(text);
 }
 
 // Map an unchanged HEAD interval back to main. Changed lines and deletions inside the

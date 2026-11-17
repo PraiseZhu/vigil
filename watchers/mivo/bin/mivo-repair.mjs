@@ -1890,7 +1890,7 @@ export function finalize({ home, taskPath, scReport, validatedHead, validationRe
   if (!isSha(branchHead)) fail('remote branch head is unavailable');
   if (branchHead !== pr.headRefOid) fail(`remote branch and PR head disagree: ${branchHead} != ${pr.headRefOid}`);
   const { scs, feedbackCoverage, workers, selfReviewRecord } = loadScs(scReport, task);
-  const transferred = verifySyncTransfers({ task: isSyncPr(pr) ? { ...task, syncPr: pr } : task, scs, worktree,
+  const transferred = verifySyncTransfers({ currentHead: pr.headRefOid, task: isSyncPr(pr) ? { ...task, syncPr: pr } : task, scs, worktree,
     allowedKeys: taskRepairPolicy(task).allowedFeedbackKeys,
     git: args => gitOutput(args, gitFn), gh: args => ghFn(GH, args) });
   const localScs = scs.map(sc => ({ ...sc, feedbackKeys: sc.feedbackKeys.filter(key => !transferred.has(key)) }))

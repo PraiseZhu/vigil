@@ -40,9 +40,13 @@ try {
   if (!source.includes(needle)) throw Error('current-head recheck gate not found');
   fs.writeFileSync(target, source.replace(needle, 'verifySyncTransfers({ task:'));
   run('sync main transfer mixed with another fix', 'main-transfer source is not proven unchanged on main');
+  const finalizeNeedle = 'verifySyncTransfers({ currentHead: pr.headRefOid, task:';
+  if (!source.includes(finalizeNeedle)) throw Error('current-head finalize gate not found');
+  fs.writeFileSync(target, source.replace(finalizeNeedle, 'verifySyncTransfers({ task:'));
+  run('sync main transfer retries finalize', 'main-transfer source is not proven unchanged on main');
   fs.writeFileSync(target, source);
   run('sync main transfer');
-  process.stdout.write('PASS: both mutations fail their regressions; restored source passes. Original checkout unchanged.\n');
+  process.stdout.write('PASS: all three mutations fail their regressions; restored source passes. Original checkout unchanged.\n');
 } finally {
   fs.rmSync(copy, { recursive: true, force: true });
 }
