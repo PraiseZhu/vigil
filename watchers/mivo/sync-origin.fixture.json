@@ -1,0 +1,36 @@
+[
+  {
+    "case": "sync-2410",
+    "sourcePr": 2410,
+    "provenance": "gh api PR metadata, review comment location and contents at reviewed HEAD and imported main; identifiers and code omitted; zero-context hunk coordinates retained",
+    "pr": {
+      "baseRefName": "integration/example-stage",
+      "headRefName": "sync/main-into-example-2410",
+      "title": "chore(integration): 同步 main 进阶段分支"
+    },
+    "file": "src/example.mjs",
+    "start": 139,
+    "end": 146,
+    "lineCount": 312,
+    "diff": "",
+    "mainRegionSha256": "8d7b15e417f5d046bef29892bc5bb0eead36cfcb39f450bfed4b0db843eac264",
+    "headRegionSha256": "8d7b15e417f5d046bef29892bc5bb0eead36cfcb39f450bfed4b0db843eac264"
+  },
+  {
+    "case": "sync-2432",
+    "sourcePr": 2432,
+    "provenance": "gh api PR metadata, review comment location and contents at reviewed HEAD and imported main; identifiers and code omitted; zero-context hunk coordinates retained",
+    "pr": {
+      "baseRefName": "integration/example-stage",
+      "headRefName": "sync/main-into-example-2432",
+      "title": "chore(integration): 同步 main 进阶段分支"
+    },
+    "file": "src/example.mjs",
+    "start": 251,
+    "end": 251,
+    "lineCount": 632,
+    "diff": "@@ -14 +14 @@\n@@ -331,0 +332,3 @@\n@@ -336,0 +340 @@\n@@ -557 +561,9 @@",
+    "mainRegionSha256": "58cc99a5dad3bce75c0876643ff56c793aca47bf985477fa5d5ad50d91c7640b",
+    "headRegionSha256": "58cc99a5dad3bce75c0876643ff56c793aca47bf985477fa5d5ad50d91c7640b"
+  }
+]

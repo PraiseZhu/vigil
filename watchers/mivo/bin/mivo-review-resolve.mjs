@@ -1,3 +1,4 @@
+import { verifyMainTransferTarget } from './mivo-sync-origin.mjs';
 import { createHash } from 'node:crypto';
 import { TRIAGE_REASONS, taskRepairPolicy, FEEDBACK_POLICY_VERSION } from './mivo-feedback-policy.mjs';
 import { isReviewerAuthor } from './public-review.mjs';
@@ -220,6 +221,7 @@ function completeCodeFixThreads(result, task, { disposition, scStatus, kind }) {
 export function refutedThreads(result, task) {
   return completeCodeFixThreads(result, task, { disposition: 'no-change', scStatus: 'no-change', kind: 'refuted' })
     .map((item) => {
+      if (item.evidence.some(line => /^main-transfer: [1-9]\d* [a-f0-9]{40}$/.test(line))) return { ...item, kind: 'main-transfer', triage: false, transferTask: { repo: task.repo, number: task.number, headRefOid: task.headRefOid } };
       const ruling = rulingRecordFor(result, task, item.key);
       if (ruling) return { ...item, ruling };
       const deferral = deferralFor(task, item.key, item.evidence);
@@ -400,6 +402,11 @@ function sanitizeEvidence(evidence) {
 }
 const RULING_VERDICT_TEXT = { invalid: '不成立', p3: '属实但按统一分级只到 P3，不必修' };
 export function refutedReplyText(evidence, dispatchId, ruling = null) {
+  if (evidence.some(line => /^main-transfer: [1-9]\d* [a-f0-9]{40}$/.test(line))) return [
+    sanitizeLine(evidence[0]),
+    '同步 PR 保持同步范围；修复在指向 main 的独立 PR 跟进。',
+    `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
+  ].join('\n');
   return [
     ruling
       ? '**发生了什么**：盯梢修复轮核实后对这条意见有异议，交给只读裁决席按统一分级判定，结论是不需要改代码。'
@@ -457,11 +464,21 @@ export function fixedReplyText(evidence, head, dispatchId) {
     `<!-- mivo-watcher-receipt task=${dispatchId} -->`,
   ].join('\n');
 }
+function* verifyTransferBeforeClose(item, repo, pr, gh) {
+  const task = item.transferTask;
+  if (!task || task.repo !== repo || task.number !== pr || !/^[a-f0-9]{40}$/.test(task.headRefOid ?? '')) throw Error('main-transfer closure missing task binding');
+  const markers = item.evidence.filter(line => line.startsWith('main-transfer:'));
+  if (markers.length !== 1) throw Error('main-transfer closure requires one marker');
+  const marker = /^main-transfer: ([1-9]\d*) ([a-f0-9]{40})$/.exec(markers[0]);
+  return yield* verifyMainTransferTarget({ task, key: item.key, marker, gh });
+}
+
 // Same durable receipt as the P3 closure: `previous.autoClosedThreads[threadId]`.
 export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, ghFn, now, head, repo = null, pr = null }) {
   const closedThreads = { ...(previous.autoClosedThreads ?? {}) };
   const deferralIssues = { ...(previous.deferralIssues ?? {}) };
   const results = [];
+  const held = [];
   for (const item of items) {
     // The receipt covers one disposition. A thread reopened and handled again by a later task
     // carries that task's dispatchId and is answered again; the same task never posts twice.
@@ -478,17 +495,26 @@ export function* closeRefutedThreads({ items = [], dispatchId, previous = {}, gh
       deferralIssues[item.threadId] = { issue, key: deferral.key, at: now };
       yield* registerDeferral({ repo, pr, issue, text: deferral.title, ghFn });
     }
+    const transfer = item.kind === 'main-transfer' || item.evidence.some(line => line.startsWith('main-transfer:'));
+    if (transfer) {
+      try { yield* verifyTransferBeforeClose(item, repo, pr, ghFn); }
+      catch (error) { held.push({ threadId: item.threadId, phase: 'before-reply', reason: String(error.message) }); continue; }
+    }
     const body = item.kind === 'fixed' ? fixedReplyText(item.evidence, head, itemDispatchId)
       : item.triage ? triagedReplyText(item.evidence, itemDispatchId)
         : deferral ? deferredReplyText(item.evidence, itemDispatchId, deferral, issue)
           : refutedReplyText(item.evidence, itemDispatchId, item.ruling ?? null);
-    const reason = item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : deferral ? 'deferred-to-issue' : 'refuted-p0-p1';
+    const reason = item.kind === 'main-transfer' ? 'transferred-to-main' : item.kind === 'fixed' ? 'fixed-p0-p1' : item.triage ? 'member-thread-no-change' : deferral ? 'deferred-to-issue' : 'refuted-p0-p1';
     yield () => ghFn(['api', 'graphql', '-f', `query=${replyMutation}`, '-f', `tid=${item.threadId}`, '-f', `body=${body}`]);
+    if (transfer) {
+      try { yield* verifyTransferBeforeClose(item, repo, pr, ghFn); }
+      catch (error) { held.push({ threadId: item.threadId, phase: 'before-resolve', reason: String(error.message) }); continue; }
+    }
     yield () => ghFn(['api', 'graphql', '-f', `query=${resolveMutation}`, '-f', `tid=${item.threadId}`]);
     closedThreads[item.threadId] = { at: now, key: item.key, reason, dispatchId: itemDispatchId, ...(issue ? { issue } : {}) };
     results.push({ threadId: item.threadId, key: item.key, ...(issue ? { issue } : {}) });
   }
-  return { previous: { ...previous, autoClosedThreads: closedThreads, ...(Object.keys(deferralIssues).length ? { deferralIssues } : {}) }, closed: results };
+  return { previous: { ...previous, autoClosedThreads: closedThreads, ...(Object.keys(deferralIssues).length ? { deferralIssues } : {}) }, closed: results, held };
 }
 const MEMBER_ITEM_KEY = /^(?:review|comment):/;
 export function completedMemberFeedback(result, task) {
