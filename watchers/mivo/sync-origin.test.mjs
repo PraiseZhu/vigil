@@ -64,7 +64,10 @@ test('negated or uncertain sync intent stays ordinary without GitHub/git reads',
     '是否把 main 同步进阶段分支', '如果要将 main 同步到阶段分支，请另开 PR',
     '把 main 同步进阶段分支？', '本轮暂不同步 main 到阶段分支', '尚未将 main 同步进阶段分支',
     '没有把 main 合并进 integration/stage', 'no need to sync main into stage',
-    "we can't sync main into stage", 'don’t automatically sync main into stage']) {
+    "we can't sync main into stage", 'don’t automatically sync main into stage',
+    "didn't sync main into stage", 'couldn’t sync main into stage',
+    "wouldn't merge main into stage", "mustn't sync main into stage",
+    'mightn’t sync main into stage', "DIDN'T merge main into stage"]) {
     for (const field of ['title', 'body']) {
       const w = world(fixtures[0]);
       w.task.syncPr = { [field]: text };
