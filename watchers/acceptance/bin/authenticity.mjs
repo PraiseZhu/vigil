@@ -279,19 +279,156 @@ export function guardOriginalPass(items = [], extras = {}) {
   }
 }
 
+// 手测结论标记（与 Review-PR 同一格式）：评论里一行
+// `<!-- manual-test-result:v1 issue=<N> pr=<M> head=<完整提交号> result=pass|fail -->`，
+// 正文逐行写 `- SC<k> pass|fail|未测`。只认授权人工验收者（默认 ownerLogin，bot 一律不认），
+// head 必须等于本轮被测提交的完整 SHA。
+export const MANUAL_TEST_MARKER = /<!--\s*manual-test-result:v1\s+issue=(\d+)\s+pr=(\d+)\s+head=([0-9a-f]{40})\s+result=(pass|fail)\s*-->/;
+const MANUAL_SC_LINE = /^\s*(?:[-*]\s+)?(?:\[[ xX]\]\s*)?(?:\*\*)?SC(\d+)(?:\*\*)?\s*[:：\-—]?\s*(不通过|未测|失败|通过|pass|fail)(?=$|[^A-Za-z0-9])/i;
+const FULL_SHA = /^[0-9a-f]{40}$/;
+
+function toManualItemResult(word) {
+  const lower = word.toLowerCase();
+  if (lower === 'pass' || word === '通过') return 'pass';
+  if (lower === 'fail' || word === '不通过' || word === '失败') return 'fail';
+  return 'untested';
+}
+
+/** 解析一条评论正文里的 manual-test-result:v1 标记和逐条 SC 结论；没有标记返回 null。同一 SC 写了多次，有 fail 就按 fail。 */
+export function parseManualTestResult(body) {
+  const text = String(body ?? '');
+  const marker = MANUAL_TEST_MARKER.exec(text);
+  if (!marker) return null;
+  const bySc = new Map();
+  for (const line of text.split('\n')) {
+    const match = MANUAL_SC_LINE.exec(line);
+    if (!match) continue;
+    const sc = Number(match[1]);
+    const result = toManualItemResult(match[2]);
+    const prev = bySc.get(sc);
+    if (prev === 'fail') continue;
+    if (prev === 'pass' && result === 'untested') continue;
+    bySc.set(sc, result);
+  }
+  return {
+    issue: Number(marker[1]),
+    pr: Number(marker[2]),
+    head: marker[3],
+    result: marker[4],
+    items: [...bySc].map(([sc, result]) => ({ sc, result })),
+  };
+}
+
+function manualAcceptorsOf({ profile, acceptors } = {}) {
+  const list = Array.isArray(acceptors) ? acceptors : [profile?.ownerLogin];
+  return list.filter((login) => typeof login === 'string' && login.trim()).map((login) => login.trim().toLowerCase());
+}
+
+/** 手测结论的作者是不是授权人工验收者：bot（类型是 Bot 或登录名带 [bot]）一律不是。 */
+export function manualTestAuthorized(author, options = {}) {
+  const login = typeof author === 'string' ? author : author?.login;
+  const type = typeof author === 'object' && author ? author.__typename ?? author.type : undefined;
+  if (typeof login !== 'string' || !login.trim()) return false;
+  if (type === 'Bot' || /\[bot\]$/i.test(login.trim())) return false;
+  return manualAcceptorsOf(options).includes(login.trim().toLowerCase());
+}
+
+/**
+ * 核验一条手测结论候选（tasks.mjs 采集的 `{ commentId, updatedAt, author, body, repo }`）。
+ * 通过返回 `{ ok: true, ref, ... }`，否则 `{ ok: false, reason }`。headSha 缺失或不是完整 SHA 时一律拒收。
+ */
+export function verifyManualTestResult(record, { profile, acceptors, headSha, repo } = {}) {
+  const parsed = parseManualTestResult(record?.body);
+  if (!parsed) return { ok: false, reason: 'not-manual-test-result' };
+  if (!manualTestAuthorized(record?.author, { profile, acceptors })) {
+    return { ok: false, reason: 'unauthorized-author' };
+  }
+  const current = typeof headSha === 'string' ? headSha.trim().toLowerCase() : '';
+  if (!FULL_SHA.test(current)) return { ok: false, reason: 'no-head-sha' };
+  if (parsed.head !== current) return { ok: false, reason: 'head-mismatch', expected: current, actual: parsed.head };
+  const issueRepo = record?.repo || repo;
+  if (typeof issueRepo !== 'string' || !issueRepo) return { ok: false, reason: 'no-repo' };
+  return {
+    ok: true,
+    ref: `${issueRepo}#${parsed.issue}`,
+    commentId: record.commentId ?? null,
+    updatedAt: record.updatedAt ?? null,
+    ...parsed,
+  };
+}
+
+/**
+ * 一组候选手测结论 → 已核验的覆盖情况：`passed` 是获 pass 的 `ref SC<k>` 集合；任一已核验记录整体 fail
+ * 或任一 SC 标 fail，`failed` 为 true。只认 `refs`（任务树里的 issue）里的 issue；没给 refs 不限。
+ */
+export function manualTestCoverage(records = [], options = {}) {
+  const refs = options.refs ? new Set([...options.refs].map((ref) => String(ref).toLowerCase())) : null;
+  const passed = new Set();
+  const accepted = [];
+  const rejected = [];
+  let failed = false;
+  for (const record of Array.isArray(records) ? records : []) {
+    const verified = verifyManualTestResult(record, options);
+    if (verified.ok && refs && !refs.has(verified.ref.toLowerCase())) {
+      rejected.push({ commentId: record?.commentId ?? null, reason: 'issue-not-in-tree' });
+      continue;
+    }
+    if (!verified.ok) {
+      rejected.push({ commentId: record?.commentId ?? null, reason: verified.reason });
+      continue;
+    }
+    accepted.push(verified);
+    if (verified.result === 'fail') failed = true;
+    for (const item of verified.items) {
+      if (item.result === 'fail') failed = true;
+      if (item.result === 'pass') passed.add(conclusionKey(verified.ref, item.sc));
+    }
+  }
+  return { passed, failed, accepted, rejected };
+}
+
+function treeRefsOf(tree, items) {
+  const refs = new Set();
+  for (const issue of tree?.issues || []) {
+    if (issue.ref) refs.add(issue.ref);
+    for (const item of issue.items || []) if (item.source) refs.add(item.source);
+  }
+  for (const item of items) if (item.ref) refs.add(item.ref);
+  return refs;
+}
+
+/**
+ * 总评。`extras.manualTestRecords` 给了手测结论候选时，按 `extras.headSha`（本轮被测提交完整 SHA）和
+ * 授权验收者（`extras.acceptors`，默认 `extras.profile.ownerLogin`）现场核验：任一 fail → 要修；
+ * 人工项获 pass 的只消除对应 SC 的等待，全部人工项都获 pass 且机器项全过才是通过。
+ */
 export function deriveStatus(items = [], needsHuman = [], extras = {}) {
   if (!items.length) throw new Error('裁决没有任何逐条结论，不能判通过：items 至少要有一条');
   if (needsHuman.length) return '要修';
   if (items.some((item) => item.result === '要修' || item.result === '有争议')) return '要修';
+  const tree = extras.tree;
+  const manualTest = extras.manualTestRecords
+    ? manualTestCoverage(extras.manualTestRecords, {
+        profile: extras.profile,
+        acceptors: extras.acceptors,
+        headSha: extras.headSha,
+        refs: treeRefsOf(tree, items),
+      })
+    : null;
+  if (manualTest?.failed) return '要修';
   if (extras.extracted) return OVERALL_PENDING;
   if ((extras.skippedQueries || []).length || extras.collectionComplete === false) return OVERALL_PENDING;
-  if (items.some((item) => PENDING_ITEM_RESULTS.includes(item.result))) return OVERALL_PENDING;
-  const tree = extras.tree;
-  if (tree?.manual?.length) return OVERALL_PENDING;
+  const covered = (ref, sc) => Boolean(manualTest?.passed.has(conclusionKey(ref, sc)));
+  for (const item of items) {
+    if (!PENDING_ITEM_RESULTS.includes(item.result)) continue;
+    const manual = item.result === '人工手测' || treeItemOf(tree, item.ref, item.sc)?.manual || MANUAL_LAYERS.includes(item.layer);
+    if (!manual || !covered(item.ref, item.sc)) return OVERALL_PENDING;
+  }
+  if ((tree?.manual || []).some((item) => !covered(item.source, item.sc))) return OVERALL_PENDING;
   for (const item of items) {
     if (item.result !== '通过') continue;
     const sc = treeItemOf(tree, item.ref, item.sc);
-    if (sc?.manual || MANUAL_LAYERS.includes(item.layer)) return OVERALL_PENDING;
+    if ((sc?.manual || MANUAL_LAYERS.includes(item.layer)) && !covered(item.ref, item.sc)) return OVERALL_PENDING;
   }
   return '通过';
 }
@@ -415,6 +552,10 @@ export function passSideEffectBlocked(tree, snapshot, items, extra = {}) {
       skippedQueries: extra.skippedQueries ?? tree?.skippedQueries,
       collectionComplete: extra.collectionComplete ?? tree?.collectionComplete,
       extracted: extra.extracted,
+      manualTestRecords: extra.manualTestRecords,
+      headSha: extra.headSha,
+      profile: extra.profile,
+      acceptors: extra.acceptors,
     });
   } catch (error) {
     return String(error.message || error);

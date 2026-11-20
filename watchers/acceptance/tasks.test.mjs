@@ -190,7 +190,7 @@ test('#140 反例（review-pr141）：交接早于最后一条登记（之后又
 
 const ROOT_TASK_KEYS = [
   'ref', 'repo', 'number', 'kind', 'tier', 'fork', 'state', 'closedAt', 'createdAt', 'url', 'nodeId',
-  'body', 'bodyVersion', 'defaultBranch', 'children', 'linkedPrs', 'rounds', 'outOfScope', 'leadHandoff', 'dispute',
+  'body', 'bodyVersion', 'defaultBranch', 'children', 'linkedPrs', 'rounds', 'outOfScope', 'leadHandoff', 'dispute', 'manualTestResults',
 ];
 
 function prNode(number, mergedAt, baseRefName = 'main') {
@@ -666,4 +666,44 @@ test('#363 SC9 重验任务自己的 PR 合入非默认分支时不开轮（base
   const decision = shouldTrigger(found, { now: NOW, profile });
   assert.equal(decision.trigger, false);
   assert.equal(decision.reason, 'base-not-default');
+});
+
+test('#486 任务对象采集 manual-test-result:v1 候选：带 commentId、updatedAt、author、body；普通评论不收', async () => {
+  const head = 'd'.repeat(40);
+  const marker = `<!-- manual-test-result:v1 issue=8 pr=12 head=${head} result=pass -->\n- SC1 通过`;
+  const comments = [
+    { id: 'IC_plain', databaseId: 1, body: '普通评论', createdAt: '2026-10-21T00:00:00.000Z', updatedAt: '2026-10-21T00:00:00.000Z', url: 'u1', author: { login: OWNER, __typename: 'User' } },
+    { id: 'IC_manual', databaseId: 2, body: marker, createdAt: '2026-10-22T00:00:00.000Z', updatedAt: '2026-10-22T03:00:00.000Z', url: 'u2', author: { login: OWNER, __typename: 'User' } },
+    { id: 'IC_bot', databaseId: 3, body: marker, createdAt: '2026-10-22T01:00:00.000Z', updatedAt: '2026-10-22T01:00:00.000Z', url: 'u3', author: { login: 'example-bot', __typename: 'Bot' } },
+  ];
+  const standalone = issueNode({ number: 8, body: 'alone', comments });
+  const parent = issueNode({ number: 1, body: 'parent', comments: [comments[1]], subIssues: [childNode({ number: 2, state: 'OPEN' })] });
+  const child = issueNode({ number: 2, state: 'OPEN', parent: ownerParent(1), comments: [comments[1]] });
+  const { tasks } = await tasksFrom([standalone, parent, child]);
+  const byRef = Object.fromEntries(tasks.map((task) => [task.ref, task]));
+  assert.deepEqual(byRef[`${REPO}#8`].manualTestResults, [
+    {
+      commentId: 'IC_manual',
+      databaseId: 2,
+      url: 'u2',
+      createdAt: '2026-10-22T00:00:00.000Z',
+      updatedAt: '2026-10-22T03:00:00.000Z',
+      author: { login: OWNER, type: 'User' },
+      body: marker,
+      repo: REPO,
+    },
+    {
+      commentId: 'IC_bot',
+      databaseId: 3,
+      url: 'u3',
+      createdAt: '2026-10-22T01:00:00.000Z',
+      updatedAt: '2026-10-22T01:00:00.000Z',
+      author: { login: 'example-bot', type: 'Bot' },
+      body: marker,
+      repo: REPO,
+    },
+  ]);
+  assert.equal(byRef[`${REPO}#1`].manualTestResults.length, 1);
+  const noMarker = await tasksFrom([issueNode({ number: 9, body: 'alone' })]);
+  assert.deepEqual(noMarker.tasks[0].manualTestResults, []);
 });

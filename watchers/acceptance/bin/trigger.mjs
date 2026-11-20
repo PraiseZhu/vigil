@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // 触发与退避：纯函数，now 由调用方注入。
+import { manualTestAuthorized, OVERALL_PENDING, parseManualTestResult } from './authenticity.mjs';
 import { parseMarker } from './collect.mjs';
 import { isVerdictOnly } from './profile.mjs';
 import { latestRound } from './rounds.mjs';
@@ -39,12 +40,36 @@ export function backoffUntil(rounds) {
   return new Date(Date.parse(from) + minutes * 60 * 1000).toISOString();
 }
 
-/** 编号最高的通过/要修轮次。 */
+export const FINAL_VERDICTS = Object.freeze(['通过', '要修', OVERALL_PENDING]);
+
+/** 编号最高的通过/要修/待人工轮次。 */
 export function lastFinal(rounds) {
   return [...(rounds || [])]
-    .filter((round) => round.status === '通过' || round.status === '要修')
+    .filter((round) => FINAL_VERDICTS.includes(round.status))
     .sort((a, b) => a.round - b.round)
     .at(-1) || null;
+}
+
+/**
+ * 最近裁决是「待人工」时，有没有还没被验过的手测结论：授权人工验收者发的 manual-test-result:v1 评论，
+ * GitHub updatedAt 严格晚于那条裁决轮次评论的 createdAt。之后再开的一轮（createdAt 更晚）就算处理过了，
+ * 同一 (commentId, updatedAt) 不会再触发；评论被编辑（updatedAt 变了）才算新证据。
+ */
+function newManualEvidence(task, f, profile) {
+  const verdictMs = Date.parse(f?.createdAt || '');
+  if (!Number.isFinite(verdictMs)) return false;
+  return (task.manualTestResults || []).some((record) => {
+    if (!parseManualTestResult(record?.body)) return false;
+    if (!manualTestAuthorized(record.author, { profile })) return false;
+    return Date.parse(record.updatedAt || '') > verdictMs;
+  });
+}
+
+/** 最近裁决「待人工」且没有新变化：有新的手测结论就开一轮，否则静默等人工证据。不是待人工返回 null。 */
+function pendingHumanDecision(task, f, profile) {
+  if (f?.status !== OVERALL_PENDING) return null;
+  if (newManualEvidence(task, f, profile)) return { trigger: true, reason: 'manual-test-result' };
+  return { trigger: false, reason: 'awaiting-human-evidence' };
 }
 
 function childOpen(child) {
@@ -223,7 +248,7 @@ function childDecision(task, { now, profile, f, dispute }) {
   const openRetry = passedButOpenRetry(task, f, profile);
   if (openRetry) return openRetry;
   if (mergedVersusVerdict === 'unknown') return { trigger: false, reason: 'merged-after-verdict-unknown' };
-  return { trigger: false, reason: 'up-to-date' };
+  return pendingHumanDecision(task, f, profile) || { trigger: false, reason: 'up-to-date' };
 }
 
 export function shouldTrigger(task, { now, profile }) {
@@ -269,7 +294,7 @@ export function shouldTrigger(task, { now, profile }) {
     if ([...(task.children || []), ...unmounted].some(closedAfterVerdict)) {
       return { trigger: true, reason: 'children-closed-after-verdict' };
     }
-    return passedButOpenRetry(task, f, profile) || { trigger: false, reason: 'up-to-date' };
+    return passedButOpenRetry(task, f, profile) || pendingHumanDecision(task, f, profile) || { trigger: false, reason: 'up-to-date' };
   }
 
   const merged = (task.linkedPrs || []).filter((pr) => pr.mergedAt);
@@ -288,7 +313,7 @@ export function shouldTrigger(task, { now, profile }) {
   const openRetry = passedButOpenRetry(task, f, profile);
   if (openRetry) return openRetry;
   if (mergedVersusVerdict === 'unknown') return { trigger: false, reason: 'merged-after-verdict-unknown' };
-  return { trigger: false, reason: 'up-to-date' };
+  return pendingHumanDecision(task, f, profile) || { trigger: false, reason: 'up-to-date' };
 }
 
 /**

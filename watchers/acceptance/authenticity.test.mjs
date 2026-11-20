@@ -41,14 +41,18 @@ import {
   formatMaterialLine,
   guardOriginalPass,
   illegalPassFromVerdictText,
+  manualTestAuthorized,
+  manualTestCoverage,
   materialVersions,
   originalPassBlocked,
+  parseManualTestResult,
   pendingCloseBlocked,
   readClaimSnapshot,
   requireClaimSnapshot,
   snapshotPassBlocked,
   snapshotPath,
   standardShifted,
+  verifyManualTestResult,
   writeClaimSnapshot,
 } from './bin/authenticity.mjs';
 
@@ -952,3 +956,133 @@ test('P2-5 写闸把 AppOnly/no-owner 搜索以未执行查询返回，collectTr
   assert.ok(tree.skippedQueries.some((entry) => entry.reason === 'no-owner'));
 });
 
+
+// #486：manual-test-result:v1 手测结论标记的真实性核验和完成语义。
+const MANUAL_REF = `${REPO}#2`;
+const HEAD = 'b'.repeat(40);
+const OLD_HEAD = 'c'.repeat(40);
+const MANUAL_OPTS = { profile: { ownerLogin: OWNER } };
+
+function manualTree() {
+  const items = [
+    { source: MANUAL_REF, sc: 3, manual: false },
+    { source: MANUAL_REF, sc: 4, manual: true, layer: 'cindy-mac' },
+    { source: MANUAL_REF, sc: 5, manual: true, layer: 'cindy-windows' },
+  ];
+  return { issues: [{ ref: MANUAL_REF, items }], manual: items.filter((item) => item.manual) };
+}
+
+function manualItems() {
+  return [
+    passItem(),
+    passItem({ sc: 4, result: '人工手测', layer: 'cindy-mac' }),
+    passItem({ sc: 5, result: '人工手测', layer: 'cindy-windows' }),
+  ];
+}
+
+function markerComment({ head = HEAD, result = 'pass', lines = ['- SC4 通过', '- SC5 通过'], ...extra } = {}) {
+  return {
+    commentId: 'IC_manual_1',
+    updatedAt: '2026-10-23T00:00:00.000Z',
+    author: { login: OWNER, type: 'User' },
+    body: [`<!-- manual-test-result:v1 issue=2 pr=9 head=${head} result=${result} -->`, ...lines].join('\n'),
+    repo: REPO,
+    ...extra,
+  };
+}
+
+function manualStatus(records, extra = {}) {
+  return deriveStatus(manualItems(), [], { tree: manualTree(), manualTestRecords: records, headSha: HEAD, ...MANUAL_OPTS, ...extra });
+}
+
+test('#486 parseManualTestResult：读出标记字段和逐条 SC 结果，未测项记 untested；没有标记返回 null', () => {
+  const parsed = parseManualTestResult(markerComment({ lines: ['- SC4 通过', '- SC5 未测'] }).body);
+  assert.deepEqual(parsed, {
+    issue: 2,
+    pr: 9,
+    head: HEAD,
+    result: 'pass',
+    items: [
+      { sc: 4, result: 'pass' },
+      { sc: 5, result: 'untested' },
+    ],
+  });
+  assert.equal(parseManualTestResult('- SC4 通过'), null);
+  assert.equal(parseManualTestResult(`<!-- manual-test-result:v1 issue=2 pr=9 head=${HEAD.slice(0, 12)} result=pass -->`), null);
+});
+
+test('#486 SC2 作者校验：bot 和非授权账号的标记拒收，人工项保持待人工', () => {
+  assert.equal(manualTestAuthorized({ login: OWNER, type: 'User' }, MANUAL_OPTS), true);
+  assert.equal(manualTestAuthorized({ login: 'example-bot[bot]', type: 'Bot' }, MANUAL_OPTS), false);
+  assert.equal(manualTestAuthorized({ login: OWNER, type: 'Bot' }, MANUAL_OPTS), false);
+  assert.equal(manualTestAuthorized({ login: `${OWNER}[bot]` }, MANUAL_OPTS), false);
+  assert.equal(manualTestAuthorized({ login: 'SomeoneElse', type: 'User' }, MANUAL_OPTS), false);
+  assert.equal(manualTestAuthorized({ login: 'SomeoneElse', type: 'User' }, { ...MANUAL_OPTS, acceptors: ['SomeoneElse'] }), true);
+  for (const author of [{ login: 'example-bot[bot]', type: 'Bot' }, { login: 'SomeoneElse', type: 'User' }]) {
+    assert.deepEqual(verifyManualTestResult(markerComment({ author }), { ...MANUAL_OPTS, headSha: HEAD }), {
+      ok: false,
+      reason: 'unauthorized-author',
+    });
+    assert.equal(manualStatus([markerComment({ author })]), OVERALL_PENDING);
+    // 未授权的 fail 也不能把总评改成要修。
+    assert.equal(manualStatus([markerComment({ author, result: 'fail', lines: ['- SC4 不通过'] })]), OVERALL_PENDING);
+  }
+});
+
+test('#486 SC2 head 必须等于当前被测提交完整 SHA：旧 SHA、缺 head 都拒收', () => {
+  assert.deepEqual(verifyManualTestResult(markerComment({ head: OLD_HEAD }), { ...MANUAL_OPTS, headSha: HEAD }), {
+    ok: false,
+    reason: 'head-mismatch',
+    expected: HEAD,
+    actual: OLD_HEAD,
+  });
+  assert.deepEqual(verifyManualTestResult(markerComment(), { ...MANUAL_OPTS }), { ok: false, reason: 'no-head-sha' });
+  assert.deepEqual(verifyManualTestResult(markerComment(), { ...MANUAL_OPTS, headSha: HEAD.slice(0, 12) }), {
+    ok: false,
+    reason: 'no-head-sha',
+  });
+  assert.equal(manualStatus([markerComment({ head: OLD_HEAD })]), OVERALL_PENDING);
+  assert.equal(manualStatus([markerComment()], { headSha: undefined }), OVERALL_PENDING);
+});
+
+test('#486 SC2 两条人工 SC 只通过一条：总评仍待人工，只消除已测那条', () => {
+  const partial = [markerComment({ lines: ['- SC4 通过', '- SC5 未测'] })];
+  assert.equal(manualStatus(partial), OVERALL_PENDING);
+  const coverage = manualTestCoverage(partial, { ...MANUAL_OPTS, headSha: HEAD });
+  assert.deepEqual([...coverage.passed], [`${MANUAL_REF} SC4`]);
+  assert.equal(coverage.failed, false);
+  // 另一条在第二条评论里补上 pass，两条一起才算全覆盖。
+  const second = markerComment({ commentId: 'IC_manual_2', lines: ['- SC5 通过'] });
+  assert.equal(manualStatus([...partial, second]), '通过');
+});
+
+test('#486 SC2 全部人工 SC 都有匹配 SHA 的授权 pass 且机器项全过：允许通过；机器项没过不行', () => {
+  assert.equal(manualStatus([markerComment()]), '通过');
+  // 不在本任务树里的 issue 的标记不算数。
+  assert.equal(manualStatus([markerComment({ body: markerComment().body.replace('issue=2', 'issue=77') })]), OVERALL_PENDING);
+  // 机器项仍是待验：不能靠手测标记转通过。
+  const items = [passItem({ result: ITEM_PENDING }), ...manualItems().slice(1)];
+  assert.equal(
+    deriveStatus(items, [], { tree: manualTree(), manualTestRecords: [markerComment()], headSha: HEAD, ...MANUAL_OPTS }),
+    OVERALL_PENDING,
+  );
+  // 没有给手测记录时行为不变。
+  assert.equal(deriveStatus(manualItems(), [], { tree: manualTree() }), OVERALL_PENDING);
+});
+
+test('#486 SC2 任一 fail 转要修：整体 result=fail 或逐条不通过都算', () => {
+  assert.equal(manualStatus([markerComment({ result: 'fail', lines: ['- SC4 通过', '- SC5 不通过'] })]), '要修');
+  assert.equal(manualStatus([markerComment({ lines: ['- SC4 通过', '- SC5 fail'] })]), '要修');
+  assert.equal(manualStatus([markerComment(), markerComment({ commentId: 'IC_manual_2', result: 'fail', lines: [] })]), '要修');
+  // 旧 SHA 上的 fail 不算数。
+  assert.equal(manualStatus([markerComment({ head: OLD_HEAD, result: 'fail', lines: ['- SC4 不通过'] })]), OVERALL_PENDING);
+});
+
+test('#486 SC2 人工项待人工与机器要修并存：总评仍是要修', () => {
+  const items = [passItem({ result: '要修', why: '断言失败' }), ...manualItems().slice(1)];
+  assert.equal(deriveStatus(items, [], { tree: manualTree() }), '要修');
+  assert.equal(
+    deriveStatus(items, [], { tree: manualTree(), manualTestRecords: [markerComment()], headSha: HEAD, ...MANUAL_OPTS }),
+    '要修',
+  );
+});
