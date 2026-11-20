@@ -294,6 +294,12 @@ export function shouldTrigger(task, { now, profile }) {
     if ([...(task.children || []), ...unmounted].some(closedAfterVerdict)) {
       return { trigger: true, reason: 'children-closed-after-verdict' };
     }
+    // 待人工后总单自己挂的 PR 又合进来：代码变了要重验，不能一直等人工证据（#486）。
+    if (f.status === OVERALL_PENDING && ownMerged.length) {
+      const ownVersusVerdict = prMergedVersusVerdict(ownMerged, f.createdAt);
+      if (ownVersusVerdict === 'after') return { trigger: true, reason: 'pr-merged-after-verdict' };
+      if (ownVersusVerdict === 'unknown') return { trigger: false, reason: 'merged-after-verdict-unknown' };
+    }
     return passedButOpenRetry(task, f, profile) || pendingHumanDecision(task, f, profile) || { trigger: false, reason: 'up-to-date' };
   }
 

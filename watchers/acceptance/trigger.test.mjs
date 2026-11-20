@@ -762,3 +762,19 @@ test('#486 手测结论只在待人工时起作用：最近结论是通过/要�
     assert.deepEqual(shouldTrigger(task, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), { trigger: false, reason: 'up-to-date' });
   }
 });
+
+test('#486 总单待人工后自己挂的 PR 又合并：重开；合并早于裁决仍等人工证据', () => {
+  const later = parentTask({
+    linkedPrs: [{ ref: `${REPO}#30`, mergedAt: '2026-10-23T00:00:00.000Z', base: 'main' }],
+    rounds: [pendingRound('parent body')],
+  });
+  assert.deepEqual(shouldTrigger(later, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), { trigger: true, reason: 'pr-merged-after-verdict' });
+  const earlier = parentTask({
+    linkedPrs: [{ ref: `${REPO}#30`, mergedAt: '2026-10-21T00:00:00.000Z', base: 'main' }],
+    rounds: [pendingRound('parent body')],
+  });
+  assert.deepEqual(shouldTrigger(earlier, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), {
+    trigger: false,
+    reason: 'awaiting-human-evidence',
+  });
+});
