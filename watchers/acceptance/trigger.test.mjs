@@ -617,3 +617,164 @@ test('#224 SC15 带修正标记不触发；同样条件不带标记照常触发'
     reason: 'child-merged',
   });
 });
+
+// #486：待人工 进入 lastFinal；无新变化静默等人工证据；无代码子单不卡总单；手测结论标记按版本触发一次。
+const PENDING_VERDICT_AT = '2026-10-22T00:00:00.000Z';
+const MANUAL_HEAD = 'a'.repeat(40);
+
+function pendingRound(body, extra = {}) {
+  return {
+    round: 1,
+    status: '待人工',
+    bodyVersion: bodyVersion(body),
+    createdAt: PENDING_VERDICT_AT,
+    finishedAt: '2026-10-22T01:00:00.000Z',
+    ...extra,
+  };
+}
+
+function manualRecord(extra = {}) {
+  return {
+    commentId: 'IC_manual_1',
+    updatedAt: '2026-10-23T00:00:00.000Z',
+    author: { login: OWNER, type: 'User' },
+    body: `<!-- manual-test-result:v1 issue=3 pr=9 head=${MANUAL_HEAD} result=pass -->\n- SC2 pass`,
+    repo: REPO,
+    ...extra,
+  };
+}
+
+const MANUAL_PROFILE = { startAt: START_AT, ownerLogin: OWNER };
+const MANUAL_NOW = nowAt('2026-10-24T00:00:00.000Z');
+
+test('#486 lastFinal 把待人工当终态；中断不算', () => {
+  const rounds = [
+    { round: 1, status: '要修' },
+    { round: 2, status: '待人工' },
+    { round: 3, status: '中断' },
+  ];
+  assert.equal(lastFinal(rounds).round, 2);
+});
+
+test('#486 SC1 独立单已判待人工、正文与 PR 都没变：awaiting-human-evidence', () => {
+  const task = standaloneTask({ rounds: [pendingRound('standalone')] });
+  assert.deepEqual(shouldTrigger(task, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), {
+    trigger: false,
+    reason: 'awaiting-human-evidence',
+  });
+  // 连续多拍都不重开。
+  assert.deepEqual(shouldTrigger(task, { now: nowAt('2026-10-30T00:00:00.000Z'), profile: MANUAL_PROFILE }), {
+    trigger: false,
+    reason: 'awaiting-human-evidence',
+  });
+});
+
+test('#486 SC1 总单已判待人工、正文与子单都没变：awaiting-human-evidence', () => {
+  const task = parentTask({ rounds: [pendingRound('parent body')] });
+  assert.deepEqual(shouldTrigger(task, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), {
+    trigger: false,
+    reason: 'awaiting-human-evidence',
+  });
+});
+
+test('#486 SC1 子单已判待人工、没有新合并：awaiting-human-evidence', () => {
+  const task = childTask({ rounds: [pendingRound('child body')] });
+  assert.deepEqual(shouldTrigger(task, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), {
+    trigger: false,
+    reason: 'awaiting-human-evidence',
+  });
+});
+
+test('#486 SC1 待人工后正文变了、PR 又合并了、子单又关了：照常重开', () => {
+  const bodyChanged = standaloneTask({ body: 'new standalone', rounds: [pendingRound('standalone')] });
+  assert.deepEqual(shouldTrigger(bodyChanged, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), { trigger: true, reason: 'body-changed' });
+  const merged = standaloneTask({
+    linkedPrs: [{ ref: `${REPO}#9`, mergedAt: '2026-10-23T00:00:00.000Z', base: 'main' }],
+    rounds: [pendingRound('standalone')],
+  });
+  assert.deepEqual(shouldTrigger(merged, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), { trigger: true, reason: 'pr-merged-after-verdict' });
+  const childClosed = parentTask({
+    children: [{ ref: `${REPO}#2`, state: 'closed', closedAt: '2026-10-23T00:00:00.000Z' }],
+    rounds: [pendingRound('parent body')],
+  });
+  assert.deepEqual(shouldTrigger(childClosed, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), {
+    trigger: true,
+    reason: 'children-closed-after-verdict',
+  });
+});
+
+test('#486 SC1 总单下已关闭且没有关联 PR 的无代码子单不卡总单开验', () => {
+  const noCode = { ref: `${REPO}#2`, state: 'closed', closedAt: '2026-10-20T00:00:00.000Z', prBase: { defaultBranch: 'main', mergedPrs: [] } };
+  const unknownChild = { ref: `${REPO}#5`, state: 'closed', closedAt: '2026-10-20T00:00:00.000Z', prBase: null };
+  for (const children of [[noCode], [noCode, unknownChild]]) {
+    const task = parentTask({ children });
+    assert.deepEqual(shouldTrigger(task, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), { trigger: true, reason: 'no-verdict' });
+  }
+});
+
+test('#486 SC2 新的授权手测结论触发一轮；同一 (commentId, updatedAt) 被下一轮覆盖后不再触发', () => {
+  const body = 'standalone';
+  const record = manualRecord();
+  const fresh = standaloneTask({ rounds: [pendingRound(body)] });
+  fresh.manualTestResults = [record];
+  assert.deepEqual(shouldTrigger(fresh, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), { trigger: true, reason: 'manual-test-result' });
+
+  // 第 2 轮在评论之后开（createdAt 更晚）仍判待人工：同一评论版本已处理过，不再重开。
+  const processed = standaloneTask({
+    rounds: [pendingRound(body), pendingRound(body, { round: 2, createdAt: '2026-10-23T00:05:00.000Z', finishedAt: '2026-10-23T00:30:00.000Z' })],
+  });
+  processed.manualTestResults = [record];
+  assert.deepEqual(shouldTrigger(processed, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), {
+    trigger: false,
+    reason: 'awaiting-human-evidence',
+  });
+
+  // 同一条评论被编辑（updatedAt 变晚）算新证据，再触发一次。
+  processed.manualTestResults = [{ ...record, updatedAt: '2026-10-23T06:00:00.000Z' }];
+  assert.deepEqual(shouldTrigger(processed, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), { trigger: true, reason: 'manual-test-result' });
+});
+
+test('#486 SC2 bot、非授权账号、没有标记的评论不触发；总单同样按手测结论触发', () => {
+  const base = () => standaloneTask({ rounds: [pendingRound('standalone')] });
+  for (const record of [
+    manualRecord({ author: { login: 'example-bot[bot]', type: 'Bot' } }),
+    manualRecord({ author: { login: OWNER, type: 'Bot' } }),
+    manualRecord({ author: { login: 'SomeoneElse', type: 'User' } }),
+    manualRecord({ body: '- SC2 pass（没有标记）' }),
+    manualRecord({ updatedAt: '2026-10-21T00:00:00.000Z' }),
+  ]) {
+    const task = base();
+    task.manualTestResults = [record];
+    assert.deepEqual(shouldTrigger(task, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), {
+      trigger: false,
+      reason: 'awaiting-human-evidence',
+    });
+  }
+  const parent = parentTask({ rounds: [pendingRound('parent body')] });
+  parent.manualTestResults = [manualRecord()];
+  assert.deepEqual(shouldTrigger(parent, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), { trigger: true, reason: 'manual-test-result' });
+});
+
+test('#486 手测结论只在待人工时起作用：最近结论是通过/要修时不因它重开', () => {
+  for (const status of ['要修']) {
+    const task = standaloneTask({ rounds: [pendingRound('standalone', { status })] });
+    task.manualTestResults = [manualRecord()];
+    assert.deepEqual(shouldTrigger(task, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), { trigger: false, reason: 'up-to-date' });
+  }
+});
+
+test('#486 总单待人工后自己挂的 PR 又合并：重开；合并早于裁决仍等人工证据', () => {
+  const later = parentTask({
+    linkedPrs: [{ ref: `${REPO}#30`, mergedAt: '2026-10-23T00:00:00.000Z', base: 'main' }],
+    rounds: [pendingRound('parent body')],
+  });
+  assert.deepEqual(shouldTrigger(later, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), { trigger: true, reason: 'pr-merged-after-verdict' });
+  const earlier = parentTask({
+    linkedPrs: [{ ref: `${REPO}#30`, mergedAt: '2026-10-21T00:00:00.000Z', base: 'main' }],
+    rounds: [pendingRound('parent body')],
+  });
+  assert.deepEqual(shouldTrigger(earlier, { now: MANUAL_NOW, profile: MANUAL_PROFILE }), {
+    trigger: false,
+    reason: 'awaiting-human-evidence',
+  });
+});

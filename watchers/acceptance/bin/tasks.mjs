@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // 盘点：一次 GraphQL 拉开放/关闭 issue，组成我建的任务树，并按名单分档。
+import { MANUAL_TEST_MARKER } from './authenticity.mjs';
 import { parseMarker } from './collect.mjs';
 import { bodyVersion, latestRound, parseRounds } from './rounds.mjs';
 import { lastFinal } from './trigger.mjs';
@@ -189,6 +190,33 @@ export function leadHandoffOf(comments, profile) {
   };
 }
 
+/**
+ * issue 评论里的 manual-test-result:v1 手测结论候选（不在这里认作者或 head：trigger 和 authenticity 各自核验）。
+ * 作者类型一并带出，核验时据此排除 bot。
+ */
+export function manualTestResultsOf(comments, repo) {
+  return (comments || [])
+    .filter((comment) => MANUAL_TEST_MARKER.test(String(comment?.body || '')))
+    .map((comment) => ({
+      commentId: comment.id ?? (comment.databaseId == null ? null : String(comment.databaseId)),
+      databaseId: comment.databaseId ?? null,
+      url: comment.url || null,
+      createdAt: comment.createdAt || null,
+      updatedAt: comment.updatedAt || comment.createdAt || null,
+      author: { login: comment.author?.login || '', type: comment.author?.__typename ?? comment.author?.type },
+      body: String(comment.body),
+      repo,
+    }));
+}
+
+/**
+ * 编号最高的通过/要修轮次（不含待人工）。父单「已覆盖子单」和 #363 重验资格只认已下定论的轮次：
+ * 父单待人工时子单自己的手测结论仍要能触发子单（#486）。
+ */
+function lastDecided(rounds) {
+  return lastFinal((rounds || []).filter((round) => round.status === '通过' || round.status === '要修'));
+}
+
 function asIssueList(connection) {
   return connection?.nodes || [];
 }
@@ -232,7 +260,7 @@ function toChildTask(issue, profile, ranked, repo, byKey) {
   const parentIssue = parentRef && byKey ? byKey.get(parentRef) : null;
   const parentRounds = parentIssue ? parseRounds(parentIssue.comments?.nodes || [], profile) : [];
   const parentLatest = latestRound(parentRounds);
-  const parentFinal = lastFinal(parentRounds);
+  const parentFinal = lastDecided(parentRounds);
   return {
     ref,
     repo,
@@ -264,6 +292,7 @@ function toChildTask(issue, profile, ranked, repo, byKey) {
     outOfScope,
     leadHandoff: { registeredAt: lead.registeredAt, handoffAt: lead.handoff?.createdAt || null },
     dispute: taskDispute({ comments: issue.comments?.nodes, rounds, profile, ref }),
+    manualTestResults: manualTestResultsOf(issue.comments?.nodes, repo),
     parentRef,
     parentLatestStatus: parentLatest?.status || null,
     parentFinalFinishedAt: parentFinal?.finishedAt || null,
@@ -294,7 +323,7 @@ function toTask(issue, profile, byKey) {
     const parentRounds = parentIssue ? parseRounds(parentIssue.comments?.nodes || [], profile) : [];
     reaccept.parentRef = parentRef;
     reaccept.parentLatestStatus = latestRound(parentRounds)?.status || null;
-    reaccept.parentFinalFinishedAt = lastFinal(parentRounds)?.finishedAt || null;
+    reaccept.parentFinalFinishedAt = lastDecided(parentRounds)?.finishedAt || null;
     return openChildReaccepts(reaccept) ? reaccept : null;
   }
   if (issue.state === 'CLOSED' && issue.closedAt && Date.parse(issue.closedAt) < Date.parse(profile.startAt)) {
@@ -308,7 +337,7 @@ function toTask(issue, profile, byKey) {
  * 开不开轮不在这里判：poll/start 仍走 shouldTrigger，修正轮发现要靠任务还在清单里。
  */
 function openChildReaccepts(task) {
-  return lastFinal(task.rounds)?.status === '要修';
+  return lastDecided(task.rounds)?.status === '要修';
 }
 
 /** 根任务形状（standalone / parent）：收哪些字段、怎么算轮次都在这里，open 子 issue 放行后复用同一份。 */
@@ -361,6 +390,8 @@ function toRootTask(issue, profile, ranked, repo, byKey) {
     leadHandoff: { registeredAt: lead.registeredAt, handoffAt: lead.handoff?.createdAt || null },
     // 最近一次裁决里的「有争议」条目和宿主的裁决结果（#46 SC8）：trigger 据此等裁决、裁决出来后触发下一轮。
     dispute: taskDispute({ comments: issue.comments?.nodes, rounds, profile, ref }),
+    // 手测结论候选（manual-test-result:v1）：trigger 据此在「待人工」后收到新手测结论时开轮，authenticity 核验作者与 head。
+    manualTestResults: manualTestResultsOf(issue.comments?.nodes, repo),
   };
 }
 
