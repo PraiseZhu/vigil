@@ -3,6 +3,7 @@ const DEFAULTS = Object.freeze({
   offlineTakeoverMinutes: 15,
   nudgeMinutes: 30,
   notifyMinutes: 60,
+  timeoutMinutes: 30,
   retryMinutes: 10,
   maxAttempts: 3,
 });
@@ -33,8 +34,8 @@ function orderKey(order) {
   return order?.payload?.dedupeKey ?? null;
 }
 
-function hasOrder(orders, { type, head, dedupeKey }) {
-  return orders.some((order) => order.type === type && order.head === head
+function hasOrder(orders, { pr, type, head, dedupeKey }) {
+  return orders.some((order) => order.pr === pr && order.type === type && order.head === head
     && (dedupeKey === undefined || orderKey(order) === dedupeKey));
 }
 
@@ -66,11 +67,13 @@ function sequence(order) {
   return Number.isSafeInteger(attempt) && attempt > 0 ? attempt : order?.attempts ?? 0;
 }
 
-function retryActions({ orders, receipts, head, now, settings }) {
+function retryActions({ orders, receipts, pr, head, now, settings }) {
   const groups = new Map();
+  const settled = new Set();
   for (const order of orders) {
-    if (order.head !== head || !RETRYABLE.has(order.type) || receipts.has(order.id)) continue;
+    if (order.pr !== pr || order.head !== head || !RETRYABLE.has(order.type)) continue;
     const root = order.payload?.retryRoot ?? order.id;
+    if (receipts.has(order.id)) settled.add(root);
     const current = groups.get(root);
     if (!current || sequence(order) > sequence(current) || Date.parse(order.created_at) > Date.parse(current.created_at)) {
       groups.set(root, order);
@@ -78,13 +81,22 @@ function retryActions({ orders, receipts, head, now, settings }) {
   }
   const actions = [];
   for (const [root, order] of groups) {
-    if (!order.delivered) continue;
+    if (settled.has(root)) continue;
     const elapsed = minutesSince(order.payload?.retryStartedAt ?? order.created_at, now);
-    const attempt = sequence(order);
-    if (attempt < settings.maxAttempts && elapsed >= attempt * settings.retryMinutes) {
+    const attempt = Math.max(1, sequence(order));
+    if (elapsed >= settings.timeoutMinutes) {
+      const dedupeKey = `notify:timeout:${root}`;
+      if (!hasOrder(orders, { pr, type: 'notify_human', head, dedupeKey })) {
+        actions.push({
+          type: 'notify_human', dedupeKey,
+          reason: `${order.type} 已满 ${settings.timeoutMinutes} 分钟仍无回执`,
+          payload: { ...order.payload, retryRoot: root, attempt },
+        });
+      }
+    } else if (attempt < settings.maxAttempts && elapsed >= attempt * settings.retryMinutes) {
       const nextAttempt = attempt + 1;
       const dedupeKey = `retry:${root}:${nextAttempt}`;
-      if (!hasOrder(orders, { type: order.type, head, dedupeKey })) {
+      if (!hasOrder(orders, { pr, type: order.type, head, dedupeKey })) {
         actions.push({
           type: order.type,
           dedupeKey,
@@ -93,21 +105,12 @@ function retryActions({ orders, receipts, head, now, settings }) {
             retryStartedAt: order.payload?.retryStartedAt ?? order.created_at },
         });
       }
-    } else if (attempt >= settings.maxAttempts && elapsed >= settings.notifyMinutes) {
-      const dedupeKey = `notify:timeout:${root}`;
-      if (!hasOrder(orders, { type: 'notify_human', head, dedupeKey })) {
-        actions.push({
-          type: 'notify_human', dedupeKey,
-          reason: `${order.type} 已重试 ${settings.maxAttempts} 次仍无回执`,
-          payload: { ...order.payload, retryRoot: root, attempt },
-        });
-      }
     }
   }
   return actions;
 }
 
-function blockerActions(fact, head, orders, follower) {
+function blockerActions(fact, pr, head, orders, follower) {
   if (!follower) return [];
   const blockers = [];
   if (fact.falseGreen) blockers.push({
@@ -120,7 +123,7 @@ function blockerActions(fact, head, orders, follower) {
     reason: `代码扫描告警达到阈值：${alert.number}`,
     payload: { alert },
   });
-  return blockers.filter(({ key }) => !hasOrder(orders, { type: 'forward_blocker', head, dedupeKey: key }))
+  return blockers.filter(({ key }) => !hasOrder(orders, { pr, type: 'forward_blocker', head, dedupeKey: key }))
     .map(({ key, reason, payload }) => ({ type: 'forward_blocker', dedupeKey: key, reason, payload }));
 }
 
@@ -129,16 +132,18 @@ export function decideCoverage({
   settings: overrides = {}, presenceAvailable = false,
 } = {}) {
   const settings = { ...DEFAULTS, ...overrides };
+  const pr = fact?.pr;
   const head = (fact?.head ?? state?.head ?? '').toLowerCase();
   if (fact?.classification !== '要修' || state?.halted === true || !/^[a-f0-9]{40}$/.test(head)) return [];
 
-  const actions = retryActions({ orders, receipts, head, now, settings });
+  const actions = retryActions({ orders, receipts, pr, head, now, settings });
   const activityAt = latestFollowerActivity(fact, follower);
   const enteredAt = state?.coverage?.entered_at ?? fact?.observed_at ?? now;
 
   if (!follower) {
-    const dedupeKey = 'ensure';
-    if (!hasOrder(orders, { type: 'ensure_follower', head, dedupeKey })) {
+    const dedupeKey = state.coverage?.lost_follower_order
+      ? `ensure:after:${state.coverage.lost_follower_order}` : 'ensure';
+    if (!hasOrder(orders, { pr, type: 'ensure_follower', head, dedupeKey })) {
       actions.push({ type: 'ensure_follower', dedupeKey, reason: '要修 PR 没有跟进方',
         payload: { pr: fact.pr, repo: fact.repo, number: fact.number, reasons: fact.reasons ?? [] } });
     }
@@ -153,36 +158,38 @@ export function decideCoverage({
   if (status === 'offline') {
     const offlineAt = follower.offline_at ?? now;
     if (minutesSince(offlineAt, now) >= settings.offlineTakeoverMinutes
-      && !hasOrder(orders, { type: 'takeover', head, dedupeKey: 'takeover' })) {
+      && !hasOrder(orders, { pr, type: 'takeover', head, dedupeKey: 'takeover' })) {
       actions.push({ type: 'takeover', dedupeKey: 'takeover', reason: '原跟进方离线已满 15 分钟',
         payload: { ...followerPayload, original: follower } });
     }
   } else if (status === 'online') {
     const onlineAt = follower.online_at ?? follower.last_activity_at ?? enteredAt;
-    const hasNewActivity = activityAt !== null && timestamp(onlineAt) !== null && activityAt > timestamp(onlineAt);
+    const hasNewActivity = Math.max(activityAt ?? 0, timestamp(enteredAt) ?? 0) > (timestamp(onlineAt) ?? 0);
     if (!hasNewActivity && minutesSince(onlineAt, now) >= settings.notifyMinutes
-      && !hasOrder(orders, { type: 'notify_human', head, dedupeKey: 'online:notify' })) {
+      && !hasOrder(orders, { pr, type: 'notify_human', head })
+      && !actions.some(({ type }) => type === 'notify_human')) {
       actions.push({ type: 'notify_human', dedupeKey: 'online:notify', reason: '跟进方在线但 60 分钟没有动静',
         payload: { ...followerPayload } });
     } else if (!hasNewActivity && minutesSince(onlineAt, now) >= settings.nudgeMinutes
-      && !hasOrder(orders, { type: 'nudge', head, dedupeKey: 'online:nudge' })) {
+      && !hasOrder(orders, { pr, type: 'nudge', head })
+      && !actions.some(({ type }) => type === 'nudge')) {
       actions.push({ type: 'nudge', dedupeKey: 'online:nudge', reason: '跟进方在线但 30 分钟没有动静',
         payload: { ...followerPayload } });
     }
   } else if (minutesSince(enteredAt, now) >= settings.stallMinutes
     && (activityAt === null || activityAt <= timestamp(enteredAt))
-    && !hasOrder(orders, { type: 'check_follower', head, dedupeKey: 'stall' })) {
+    && !hasOrder(orders, { pr, type: 'check_follower', head, dedupeKey: 'stall' })) {
     actions.push({ type: 'check_follower', dedupeKey: 'stall', reason: '要修 PR 停滞已满 5 分钟',
       payload: { ...followerPayload } });
   }
 
   if (follower.takeover === true && follower.original && presenceAvailable
     && !follower.original_paused_at
-    && !hasOrder(orders, { type: 'pause_original', head, dedupeKey: 'pause:original' })) {
+    && !hasOrder(orders, { pr, type: 'pause_original', head, dedupeKey: 'pause:original' })) {
     actions.push({ type: 'pause_original', dedupeKey: 'pause:original', reason: '原电脑已恢复，暂停原跟进方',
       payload: { ...followerPayload, original: follower.original } });
   }
-  actions.push(...blockerActions(fact, head, orders, follower));
+  actions.push(...blockerActions(fact, pr, head, orders, follower));
   return actions;
 }
 

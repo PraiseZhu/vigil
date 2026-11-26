@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 import { loadProfile } from './profile.mjs';
 import { markDelivered, readOrder, readReceipt, writeReceipt } from './outbox.mjs';
 import { clearFollower, readFollower, writeFollower } from './followers.mjs';
-import { withPrLock } from './state.mjs';
+import { readPr, withPrLock, writePr } from './state.mjs';
 
 const REQUIRED_SESSION_RESULTS = new Set(['following', 'started', 'created']);
 const RESULTS = Object.freeze({
@@ -35,8 +35,9 @@ function receiptFollower(order, flags, at) {
   const previous = readFollower(order.stateDir, order.pr);
   if (order.type === 'ensure_follower' && REQUIRED_SESSION_RESULTS.has(flags.result)) {
     return writeFollower(order.stateDir, order.pr, {
-      ...(previous ?? {}), device: flags.device, session: flags.session, kind: 'original', takeover: false,
-      status: 'following', followed_at: at, last_activity_at: at,
+      ...(previous ?? {}), device: flags.device, session: flags.session,
+      kind: flags.result === 'created' ? 'dedicated' : 'original', takeover: false,
+      status: 'following', offline_at: null, followed_at: at, last_activity_at: at,
     });
   }
   if (order.type === 'ensure_follower' && flags.result === 'offline') {
@@ -53,7 +54,13 @@ function receiptFollower(order, flags, at) {
       last_activity_at: flags.result === 'online' ? at : previous.last_activity_at,
     });
   }
-  if (order.type === 'check_follower' && flags.result === 'gone') {
+  if (flags.result === 'gone') {
+    const current = readPr(order.stateDir, order.pr);
+    if (current) {
+      writePr(order.stateDir, order.pr, {
+        ...current, coverage: { ...current.coverage, lost_follower_order: order.id },
+      });
+    }
     clearFollower(order.stateDir, order.pr);
     return null;
   }
@@ -61,7 +68,7 @@ function receiptFollower(order, flags, at) {
     const original = previous?.original ?? previous;
     return writeFollower(order.stateDir, order.pr, {
       ...(previous ?? {}), device: flags.device, session: flags.session, kind: 'dedicated', takeover: true,
-      status: 'following', takeover_at: at, original: original ? {
+      status: 'following', offline_at: null, takeover_at: at, original: original ? {
         device: original.device ?? null, session: original.session ?? null,
       } : null,
       original_paused_at: null,
