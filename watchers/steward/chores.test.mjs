@@ -102,11 +102,12 @@ test('SC5: false green reruns the configured cancelled prerequisite and stays re
 });
 
 test('SC6: only the latest trusted reverified reply closes using App transport, without posting', async (t) => {
-  const item = reviewed('Optional follow-up', `Fixed and verified ${HEAD}`);
-  const stale = { ...reviewed('Optional follow-up', `Fixed and verified ${NEXT}`), id: 'PRRT_stale' };
-  const human = { ...reviewed('Optional follow-up', 'Fixed and verified', USER), id: 'PRRT_human' };
+  const item = reviewed('P3 optional follow-up', `Fixed and verified ${HEAD}`);
+  const stale = { ...reviewed('P3 optional follow-up', `Fixed and verified ${NEXT}`), id: 'PRRT_stale' };
+  const human = { ...reviewed('P3 optional follow-up', 'Fixed and verified', USER), id: 'PRRT_human' };
   const urgent = { ...reviewed('P1 fix', 'Fixed and verified'), id: 'PRRT_urgent' };
-  const ctx = setup(t, review, { threads: [item, stale, human, urgent] });
+  const ungraded = { ...reviewed('P2 unrecognized severity', 'Fixed and verified'), id: 'PRRT_ungraded' };
+  const ctx = setup(t, review, { threads: [item, stale, human, urgent, ungraded] });
   const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const privateKeyFile = path.join(ctx.root, 'fixture.pem');
   fs.writeFileSync(privateKeyFile, privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
@@ -145,9 +146,9 @@ test('SC7: disabled flags, absent policy, and non-App mode make no writes', asyn
 
 test('SC8: CLI tick --dry-run lists each planned action and writes nothing', async (t) => {
   const checks = [...greenChecks, actionsCheck('publish', 'FAILURE', 41, { run: 11, summary: 'runner lost' })];
-  const ctx = setup(t, { ...review, ...infra, ...falseGreen }, { checks, threads: [reviewed('Optional', 'Fixed and verified')] });
+  const ctx = setup(t, { ...review, ...infra, ...falseGreen }, { checks, threads: [reviewed('P3 optional', 'Fixed and verified')] });
   const profileFile = path.join(ctx.root, 'profile.json');
-  const policy = { ...ctx.profile.policies[REPO], infraPatterns: ['runner lost'], severityPatterns: {} };
+  const policy = { ...ctx.profile.policies[REPO], infraPatterns: ['runner lost'], severityPatterns: { P3: ['P3'] } };
   fs.writeFileSync(profileFile, JSON.stringify({ ...ctx.profile, policies: { [REPO]: policy },
     github: { mode: 'app', appId: 1, installationId: 2, privateKeyFile: 'unused.pem' } }));
   const output = [];

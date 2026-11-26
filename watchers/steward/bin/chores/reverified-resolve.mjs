@@ -2,7 +2,7 @@ import { actorKey } from '../discover.mjs';
 
 export function reverifiedCandidates(fact, state, patterns) {
   return (fact.threads ?? []).filter((thread) => {
-    if (thread.source !== 'trusted_bot' || ['P0', 'P1', 'P2'].includes(thread.severity)
+    if (thread.source !== 'trusted_bot' || thread.severity !== 'P3'
       || thread.comments.length < 2 || Object.hasOwn(state.p3Replies ?? {}, thread.id)
       || Object.hasOwn(state.p3ClosedThreads ?? {}, thread.id)) return false;
     const root = thread.comments[0];
