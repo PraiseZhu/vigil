@@ -12,8 +12,11 @@ function closed(fact) {
   return fact.classification === '不管' && fact.reasons?.some((reason) => reason.code === 'closed');
 }
 
-function removePending(directory, pr) {
-  for (const order of readOrders(directory).filter((item) => item.pr === pr && !readReceipt(directory, item.id))) {
+function removePending(directory, fact) {
+  const preserveGuard = MANAGED.has(fact.classification);
+  for (const order of readOrders(directory)) {
+    if (order.pr !== fact.pr || readReceipt(directory, order.id)) continue;
+    if (preserveGuard && ['checkpoint', 'swap', 'stop_and_notify'].includes(order.type)) continue;
     fs.rmSync(path.join(directory, 'outbox', 'orders', `${order.id}.json`), { force: true });
   }
 }
@@ -74,7 +77,7 @@ async function handleFact({ profile, fact, dryRun, now }) {
   const state = readPr(directory, fact.pr) ?? { pr: fact.pr, head: fact.head, halted: false };
   if (fact.classification !== '要修') {
     if (!dryRun) {
-      removePending(directory, fact.pr);
+      removePending(directory, fact);
       if (closed(fact)) clearFollower(directory, fact.pr);
       if (closed(fact) || state.coverage?.active) {
         writePr(directory, fact.pr, { ...state, classification: fact.classification,
