@@ -30,6 +30,18 @@ test('SC2: repeated thread swaps once; fresh recurrence after successful swap st
   assert.equal(action(rounds, swapped), 'stop_and_notify');
 });
 
+test('failed swap stops on the next recurrence without issuing another swap', () => {
+  const rounds = [1, 2, 3, 4].map((index) => push(index));
+  const observations = Object.fromEntries(rounds.map(({ id }) => [id, { threads: ['example-thread'] }]));
+  const attempted = {
+    observations, orders: [{ id: 'swap-example', type: 'swap', payload: { push_id: 'push:2' } }],
+    receipts: { 'swap-example': { result: 'failed' } },
+  };
+  assert.equal(action(rounds.slice(0, 2), attempted), null);
+  assert.equal(action(rounds.slice(0, 3), attempted), 'checkpoint');
+  assert.equal(action(rounds, attempted), 'stop_and_notify');
+});
+
 test('SC3: consecutive regressions swap; a clean push or infrastructure failure breaks the streak', () => {
   const first = push(1, [required('unit', 'passed')], [required('unit', 'failed')]);
   const second = push(2, [required('build', 'passed')], [required('build', 'failed')]);

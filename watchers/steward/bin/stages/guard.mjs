@@ -20,7 +20,7 @@ function observe(previous, fact, state, rounds, at) {
       threads: (fact.reasons ?? []).filter(({ code }) => code === 'review_thread').map(({ id }) => id),
       red: existing?.red === true,
     };
-    view.red = repairPushes([push], { [push.id]: view })[0].red;
+    view.red = repairPushes([push], { [push.id]: view })[0].red === true;
     observations[push.id] = view;
   }
   let enteredAt = null;

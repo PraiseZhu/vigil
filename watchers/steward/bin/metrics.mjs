@@ -75,6 +75,7 @@ export function calculateMetrics({ rounds, records = [], orders = [], receipts =
   let total = 0;
   let repeated = 0;
   let red = 0;
+  let unknownRed = 0;
   let recurrences = 0;
   for (const [pr, log] of logs) {
     const pushes = repairPushes(log, observed.get(pr)?.observations);
@@ -84,6 +85,7 @@ export function calculateMetrics({ rounds, records = [], orders = [], receipts =
     for (const [index, push] of pushes.entries()) {
       if (!inWindow(push.at)) continue;
       if (push.red) red += 1;
+      if (push.red === null) unknownRed += 1;
       if (recurred(pushes[index - 1], push)) recurrences += 1;
       const duration = minutesBetween(push.enteredAt, push.at);
       if (duration !== null) durations.push(duration);
@@ -108,7 +110,8 @@ export function calculateMetrics({ rounds, records = [], orders = [], receipts =
   return {
     M1: { ...distribution(durations, [50, 75, 90]), unknown: total - durations.length },
     M2: total ? repeated / total : null,
-    M3: total ? red / total : null,
+    M3: total > unknownRed ? red / (total - unknownRed) : null,
+    M3Unknown: unknownRed,
     M4: recurrences,
     M5: {
       chores: counts(rounds.filter(({ type, pr, at }) => type === 'chore' && matches(pr) && inWindow(at))

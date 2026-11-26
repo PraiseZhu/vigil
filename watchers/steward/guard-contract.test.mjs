@@ -51,6 +51,32 @@ test('SC4: tick stops at six pushes and resume clears halted and appends exactly
   assert.ok(logs.every((message) => !message.includes('处理失败')));
 });
 
+test('checkpoint remains queued while checks run; merge still removes all pending orders', async (t) => {
+  const { env, stateDir } = fixture(t);
+  const profile = loadProfile({ env });
+  const tick = (index, checks, state = 'OPEN') => runSteward({
+    command: 'tick', profile, now: () => new Date(at(index)), log: () => {},
+    client: fixtureClient({ get: () => pull(1, { head: head(index), checks, state }) }),
+  });
+  for (let index = 0; index <= 3; index += 1) await tick(index, [check(`job-${index}`, 'FAILURE')]);
+  const queued = readOrders(stateDir);
+  const checkpoint = queued.find(({ type }) => type === 'checkpoint');
+  assert.ok(checkpoint);
+  assert.ok(queued.some(({ type }) => type === 'ensure_follower'));
+
+  const waiting = await tick(3, [check('job-3', null, { status: 'IN_PROGRESS' })]);
+  assert.equal(waiting.prs[0].classification, '等待中');
+  assert.deepEqual(readOrders(stateDir), [checkpoint]);
+  assert.equal(checkpoint.delivered, false);
+  assert.equal(readReceipt(stateDir, checkpoint.id), null);
+
+  for (const type of ['ensure_follower', 'swap', 'stop_and_notify']) {
+    await writeOrder(stateDir, makeOrder({ type, pr: PR, head: head(3), reason: 'fixture' }));
+  }
+  await tick(3, [], 'MERGED');
+  assert.deepEqual(readOrders(stateDir), []);
+});
+
 test('tick observes delayed failures on a repair head and uses them for swap and metrics', async (t) => {
   const { env, stateDir } = fixture(t);
   const profile = loadProfile({ env });

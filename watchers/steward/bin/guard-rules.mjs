@@ -11,12 +11,16 @@ export function repairPushes(rounds, observations = {}) {
   return rounds.filter(({ type, before_classification }) => type === 'push' && before_classification === '要修')
     .map((push) => {
       const observation = observations[push.id];
-      const checks = observation?.checks ?? push.after_required_checks ?? [];
-      const previouslyPassing = new Set((push.before_required_checks ?? []).filter(passed).map(checkKey));
+      const before = push.before_required_checks;
+      const after = observation?.checks ?? push.after_required_checks;
+      const checks = after ?? [];
+      const previouslyPassing = new Set((before ?? []).filter(passed).map(checkKey));
+      const red = observation?.red === true || checks.some((check) => failed(check) && previouslyPassing.has(checkKey(check)));
+      const incomplete = !before || !after || checks.some((check) => check.required !== false && check.result === 'running');
       return {
         id: push.id, at: push.at, head: push.after_head,
         enteredAt: observation?.enteredAt ?? null,
-        red: observation?.red === true || checks.some((check) => failed(check) && previouslyPassing.has(checkKey(check))),
+        red: red || (incomplete ? null : false),
         failedChecks: checks.filter(failed).map(checkKey),
         threads: observation?.threads ?? [],
       };
@@ -50,13 +54,13 @@ export function decideGuard({ rounds, pushes, orders = [], receipts = {}, state,
   if (cycle.length >= stopAfter) return result('stop_and_notify', `已修复推送 ${cycle.length} 次，仍要修`);
 
   const swap = orders.find(({ type }) => type === 'swap');
-  const swapped = state.guard?.swapped === true || receipts[swap?.id]?.result === 'created';
+  const swapAttempted = state.guard?.swapped === true || ['created', 'failed'].includes(receipts[swap?.id]?.result);
   const boundary = cycle.findIndex(({ id }) => id === swap?.payload?.push_id);
   const candidates = cycle.slice(boundary + 1);
   const reds = candidates.slice(-swapAfterRedPushes);
   if (recurred(candidates.at(-2), candidates.at(-1) ?? latest)
     || (reds.length === swapAfterRedPushes && reds.every(({ red }) => red))) {
-    if (swapped) return result('stop_and_notify', '换人后仍复发或连续改红');
+    if (swapAttempted) return result('stop_and_notify', '尝试换人后仍复发或连续改红');
     if (!swap) return result('swap', '同一问题复发或连续改红');
   }
   if (cycle.length >= checkpointAfter && !orders.some(({ type }) => type === 'checkpoint')) {

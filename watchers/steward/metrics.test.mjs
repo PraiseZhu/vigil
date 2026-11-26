@@ -38,6 +38,21 @@ test('SC6: empty CLI window emits null rates and ranks with exit 0', (t) => {
   assert.deepEqual(M6, { samples: 0, p50: null, max: null, unknown: 0 });
 });
 
+test('M3 excludes unfinished required checks unless a regression is already known', () => {
+  const passes = [required('unit', 'passed')];
+  const pending = [required('unit', 'running')];
+  const unfinished = push(1, passes, pending);
+  const observed = push(2, passes, pending);
+  const red = push(3, passes, [required('unit', 'failed'), required('build', 'running')]);
+  const records = [{ pr: observed.pr, observations: { [observed.id]: { checks: passes } } }];
+  const metrics = calculateMetrics({ rounds: [unfinished, observed, red], records }, { since });
+  assert.equal(metrics.M3, 0.5);
+  assert.equal(metrics.M3Unknown, 1);
+  const noKnown = calculateMetrics({ rounds: [unfinished] }, { since });
+  assert.equal(noKnown.M3, null);
+  assert.equal(noKnown.M3Unknown, 1);
+});
+
 test('counts typed events and successful receipts; exposure excludes missing endpoints', () => {
   const pr = `${repo}#2`;
   const rounds = [
