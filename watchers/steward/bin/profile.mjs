@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const REPO = /^[a-z\d][a-z\d-]*\/[a-z\d_.-]+$/i;
+export const REPO = /^[a-z\d][a-z\d-]*\/(?!\.{1,2}$)[a-z\d_.-]+$/i;
 const AUTHOR = /^(?:app\/)?[a-z\d][a-z\d-]*$/i;
 const SEVERITIES = ['low', 'medium', 'high', 'critical'];
 
