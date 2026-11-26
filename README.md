@@ -19,6 +19,8 @@ Vigil 收录三个独立的自动化工具,从内部私有仓库里剥离出来�
   任务、逐条验收、出裁决;宿主循环、写闸和 bwrap 沙箱在 `watchers/acceptance/host/`,运维见
   [`docs/acceptance-operations.md`](docs/acceptance-operations.md)。
 
+另有 **[`watchers/steward`](watchers/steward/README.md)**（PR 总管）：按配置巡检多仓 PR，处理已授权的常规杂活，并由绑定的 Cindy 伙伴处理跟进指令。安装、体检和回滚见 [PR 总管运维指南](docs/steward-operations.md)。
+
 两者负责**发现**(轮询 PR、判断是否有新的待处理反馈)和**修复动作的具体执行**(clone/
 worktree/push/清理),但它们**不是可以配进任意 cron 的无状态脚本**——discover 模式是专门
 为 Cindy 桌面端的调度器("script 模式")设计的,只有在那套协议下才会真正唤醒修复 session。

@@ -1,6 +1,6 @@
-# PR 总管：只读巡检
+# PR 总管：巡检与跟进指令
 
-需要 Node.js 24+、GitHub CLI 和能读取目标仓的 GitHub 身份。本版本发现、读事实、分类、记本地轮次并产生本地覆盖指令；覆盖阶段不直接操作 PR 或跟进会话。
+需要 Node.js 24+、GitHub CLI 和能读取目标仓的 GitHub 身份。总管发现 PR、分类、记本地轮次并发出跟进指令；策略打开且身份获授权时会回复、关闭讨论串或重跑检查。覆盖阶段不直接控制跟进会话。
 
 ```sh
 STEWARD_PROFILE=path/to/local-profile.json node watchers/steward/bin/steward.mjs scan
