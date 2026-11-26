@@ -4,7 +4,9 @@ import { decideCoverage, latestFollowerActivity } from '../coverage-rules.mjs';
 import { clearFollower, readFollower, writeFollower } from '../followers.mjs';
 import { probePresence } from '../presence.mjs';
 import { makeOrder, readOrders, readReceipt, writeOrder } from '../outbox.mjs';
-import { readPr, withPrLock, writePr } from '../state.mjs';
+import { prKey, readJson, readPr, withPrLock, writePr } from '../state.mjs';
+
+const MANAGED = new Set(['要修', '等待中', '等人', '没事']);
 
 function closed(fact) {
   return fact.classification === '不管' && fact.reasons?.some((reason) => reason.code === 'closed');
@@ -19,17 +21,24 @@ function removePending(directory, pr) {
 function knownPrs(directory) {
   const known = new Set(readOrders(directory)
     .filter((order) => !readReceipt(directory, order.id)).map((order) => order.pr));
-  const directoryPath = path.join(directory, 'followers');
-  let files = [];
-  try { files = fs.readdirSync(directoryPath); } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-  for (const file of files.filter((name) => name.endsWith('.json'))) {
+  for (const subdirectory of ['prs', 'followers']) {
+    const directoryPath = path.join(directory, subdirectory);
+    let files;
     try {
-      const follower = JSON.parse(fs.readFileSync(path.join(directoryPath, file), 'utf8'));
-      if (typeof follower?.pr === 'string') known.add(follower.pr);
-    } catch {
-      continue;
+      files = fs.readdirSync(directoryPath);
+    } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+    for (const file of files.filter((name) => name.endsWith('.json'))) {
+      try {
+        const record = readJson(path.join(directoryPath, file));
+        if (record?.pr && (subdirectory === 'followers' || MANAGED.has(record.classification))) {
+          known.add(prKey(record.pr));
+        }
+      } catch {
+        continue;
+      }
     }
   }
   return [...known];
@@ -84,7 +93,7 @@ async function handleFact({ profile, fact, dryRun, now }) {
   } };
   let follower = readFollower(directory, fact.pr);
   const configuredLogin = profile.policies?.[fact.repo?.toLowerCase()]?.chores?.followerLogin;
-  if (follower && !follower.login && typeof configuredLogin === 'string' && configuredLogin) {
+  if (follower && typeof configuredLogin === 'string' && configuredLogin) {
     follower = { ...follower, login: configuredLogin };
   }
   const activityAt = latestFollowerActivity(fact, follower);

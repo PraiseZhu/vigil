@@ -39,6 +39,12 @@ function hasOrder(orders, { pr, type, head, dedupeKey }) {
     && (dedupeKey === undefined || orderKey(order) === dedupeKey));
 }
 
+function hasEpisodeOrder(orders, { pr, type, head }, key, start) {
+  return orders.some((order) => order.pr === pr && order.type === type && order.head === head
+    && (orderKey(order) === `${key}:${start}`
+      || (orderKey(order) === key && timestamp(order.created_at) >= start)));
+}
+
 function commentLogin(comment) {
   const login = comment?.author?.login ?? comment?.author?.user?.login ?? comment?.login;
   return typeof login === 'string' ? login.toLowerCase() : null;
@@ -138,7 +144,7 @@ export function decideCoverage({
 
   const actions = retryActions({ orders, receipts, pr, head, now, settings });
   const activityAt = latestFollowerActivity(fact, follower);
-  const enteredAt = state?.coverage?.entered_at ?? fact?.observed_at ?? now;
+  const enteredAt = timestamp(state?.coverage?.entered_at ?? fact?.observed_at ?? now);
 
   if (!follower) {
     const dedupeKey = state.coverage?.lost_follower_order
@@ -155,31 +161,31 @@ export function decideCoverage({
     kind: follower.kind, takeover: follower.takeover === true,
   } };
   const status = follower.status ?? 'following';
+  const followCycle = Math.max(enteredAt ?? 0, timestamp(follower.takeover_at ?? follower.followed_at) ?? 0);
+  const lastMovement = Math.max(followCycle, activityAt ?? 0);
   if (status === 'offline') {
-    const offlineAt = follower.offline_at ?? now;
+    const offlineAt = timestamp(follower.offline_at ?? now);
     if (minutesSince(offlineAt, now) >= settings.offlineTakeoverMinutes
-      && !hasOrder(orders, { pr, type: 'takeover', head, dedupeKey: 'takeover' })) {
-      actions.push({ type: 'takeover', dedupeKey: 'takeover', reason: '原跟进方离线已满 15 分钟',
+      && !hasEpisodeOrder(orders, { pr, type: 'takeover', head }, 'takeover', offlineAt)) {
+      actions.push({ type: 'takeover', dedupeKey: `takeover:${offlineAt}`, reason: '跟进方离线已满 15 分钟',
         payload: { ...followerPayload, original: follower } });
     }
   } else if (status === 'online') {
-    const onlineAt = follower.online_at ?? follower.last_activity_at ?? enteredAt;
-    const hasNewActivity = Math.max(activityAt ?? 0, timestamp(enteredAt) ?? 0) > (timestamp(onlineAt) ?? 0);
-    if (!hasNewActivity && minutesSince(onlineAt, now) >= settings.notifyMinutes
+    const idleSince = Math.max(lastMovement, timestamp(follower.online_at) ?? 0);
+    if (minutesSince(idleSince, now) >= settings.notifyMinutes
       && !hasOrder(orders, { pr, type: 'notify_human', head })
       && !actions.some(({ type }) => type === 'notify_human')) {
       actions.push({ type: 'notify_human', dedupeKey: 'online:notify', reason: '跟进方在线但 60 分钟没有动静',
         payload: { ...followerPayload } });
-    } else if (!hasNewActivity && minutesSince(onlineAt, now) >= settings.nudgeMinutes
+    } else if (minutesSince(idleSince, now) >= settings.nudgeMinutes
       && !hasOrder(orders, { pr, type: 'nudge', head })
       && !actions.some(({ type }) => type === 'nudge')) {
       actions.push({ type: 'nudge', dedupeKey: 'online:nudge', reason: '跟进方在线但 30 分钟没有动静',
         payload: { ...followerPayload } });
     }
-  } else if (minutesSince(enteredAt, now) >= settings.stallMinutes
-    && (activityAt === null || activityAt <= timestamp(enteredAt))
-    && !hasOrder(orders, { pr, type: 'check_follower', head, dedupeKey: 'stall' })) {
-    actions.push({ type: 'check_follower', dedupeKey: 'stall', reason: '要修 PR 停滞已满 5 分钟',
+  } else if (minutesSince(lastMovement, now) >= settings.stallMinutes
+    && !hasEpisodeOrder(orders, { pr, type: 'check_follower', head }, 'stall', followCycle)) {
+    actions.push({ type: 'check_follower', dedupeKey: `stall:${followCycle}`, reason: '要修 PR 停滞已满 5 分钟',
       payload: { ...followerPayload } });
   }
 

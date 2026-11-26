@@ -71,7 +71,7 @@ function receiptFollower(order, flags, at) {
       status: 'following', offline_at: null, takeover_at: at, original: original ? {
         device: original.device ?? null, session: original.session ?? null,
       } : null,
-      original_paused_at: null,
+      original_paused_at: previous?.original_paused_at ?? null,
     });
   }
   if (order.type === 'takeover' && flags.result === 'online' && previous) {
