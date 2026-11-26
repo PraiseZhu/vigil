@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": false,
   "type": "module",
-  "description": "Vigil: 三个独立的 watcher（mivo-watcher / cindy-watcher / acceptance-watcher）与只读 PR 总管（steward）的开源版本。",
+  "description": "Vigil: 三个独立的 watcher（mivo-watcher / cindy-watcher / acceptance-watcher）与 PR 总管（steward）的开源版本。总管发出跟进指令，并在策略开启时执行零消耗杂活。",
   "license": "MIT",
   "scripts": {
     "test": "node scripts/run-tests.mjs",

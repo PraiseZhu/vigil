@@ -13,6 +13,7 @@ const STEPS = [
   ['python3', ['-B', 'watchers/mivo/mivo-watch-script.test.py']],
   ['node', ['--env-file=watchers/acceptance/test.env', '--test', '--test-timeout=120000', 'watchers/acceptance/*.test.mjs']],
   ['node', ['--env-file=watchers/steward/test.env', '--test', 'watchers/steward/*.test.mjs']],
+  ['python3', ['-B', 'watchers/steward/steward-script.test.py']],
 ];
 
 // 测试里会在临时目录下建 unix socket（写闸、出网代理），路径上限 107 字节：TMPDIR 很长时（比如验收轮沙箱里
