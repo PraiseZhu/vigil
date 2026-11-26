@@ -31,6 +31,10 @@ function patterns(value, key) {
 
 function parsePolicy(value, key) {
   const policy = object(value, key);
+  const login = policy.chores?.followerLogin;
+  if (login !== undefined && (typeof login !== 'string' || !/^[a-z\d][a-z\d-]*$/i.test(login))) {
+    throw new Error(`无效的配置「${key}.chores.followerLogin」`);
+  }
   const trustedReviewers = strings(policy.trustedReviewers ?? [], `${key}.trustedReviewers`,
     (login) => AUTHOR.test(login) || /^[a-z\d-]+\[bot\]$/i.test(login));
   const severityPatterns = object(policy.severityPatterns ?? {}, `${key}.severityPatterns`);
@@ -52,6 +56,17 @@ function parsePolicy(value, key) {
     infraPatterns: patterns(policy.infraPatterns ?? [], `${key}.infraPatterns`),
     codeScanning: { enabled: codeScanning.enabled ?? false, threshold },
   };
+}
+
+function parsePresence(value) {
+  const presence = object(value ?? {}, 'presence');
+  const commands = object(presence.commands ?? presence, 'presence.commands');
+  for (const [device, command] of Object.entries(commands)) {
+    if (!device.trim() || typeof command !== 'string' || !command.trim()) {
+      throw new Error('配置「presence.commands」必须是设备到非空命令的映射');
+    }
+  }
+  return { commands };
 }
 
 export function loadProfile({ env = process.env, file = env.STEWARD_PROFILE } = {}) {
@@ -84,6 +99,7 @@ export function loadProfile({ env = process.env, file = env.STEWARD_PROFILE } = 
   }));
   return {
     authors, repos, excludeRepos, discoverByAuthor, policies,
+    presence: parsePresence(profile.presence),
     stateDir: path.resolve(directory, stateDir),
     github: mode === 'app' ? { ...github, mode, privateKeyFile: path.resolve(directory, github.privateKeyFile) } : { mode },
   };

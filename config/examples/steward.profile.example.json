@@ -5,6 +5,7 @@
   "discoverByAuthor": true,
   "stateDir": "steward-state",
   "github": { "mode": "gh" },
+  "presence": { "commands": { "ExampleDevice": "false" } },
   "policies": {
     "example-org/example-repo": {
       "trustedReviewers": ["app/example-reviewer"],
@@ -15,7 +16,8 @@
         "P3": ["\\bP3\\b"]
       },
       "infraPatterns": ["\\bHTTP 5[0-9]{2}\\b", "runner (?:lost|disconnected)"],
-      "codeScanning": { "enabled": false, "threshold": "high" }
+      "codeScanning": { "enabled": false, "threshold": "high" },
+      "chores": { "followerLogin": "ExampleFollower" }
     }
   }
 }
