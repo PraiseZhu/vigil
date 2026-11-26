@@ -6,7 +6,7 @@
 
 1. 按上线顺序等巡检、杂活、覆盖、守门及原会话跟进流程合入；选常驻机上一份固定检出，记录部署 SHA。不要把自动化指向临时开发工作树。任何换版本或生产切换须有对应授权，参见[部署授权边界](fleet-deploy-authorization.md)。
 2. 复制[`steward.profile.example.json`](../config/examples/steward.profile.example.json) 到仓库外，以本机权限保护该配置与状态目录。填入 `authors`、`repos`、`stateDir`，为每个要巡检的仓设置 `policies.<repo>.chores.followerLogin`，它是该仓跟进方的 GitHub 登录名字符串，要与常驻机的 `gh` 登录一致。配置 `presence.commands` 时只用本机信任的探测命令。第一阶段用明确仓库列表（`discoverByAuthor: false`），不加入仍有老盯梢运行的仓；启用按作者发现时，同样检查 `excludeRepos` 和新发现仓的策略，不可借自动发现提前纳管。
-3. 零消耗杂活默认关闭。打开写入策略须用 `github.mode: "app"` 和已授权的 App 安装配置；密钥只留本机，固定 P3 回复由匹配 `followerLogin` 的 `gh` 身份发。命令与配置见[总管 README](../watchers/steward/README.md)。
+3. 零消耗杂活默认关闭。四项开关放在 `policies.<repo>.chores`：`p3Close`、`resolveReverified`、`rerunInfra`、`rerunFalseGreen`。打开写入策略须用 `github.mode: "app"` 和已授权的 App 安装配置；密钥只留本机。P3 回复用 `p3Reply` 配置文案，由与 `followerLogin` 匹配的本机 `gh` 身份发送。用 `reverifiedPatterns` 配置已复核标记；`falseGreenNeeds` 必须把被跳过的检查名映射到前置 job 名列表，不能在同一轮 Actions 中定位唯一失败或取消项时不重跑。
 4. 在选定检出目录设置 `STEWARD_PROFILE` 为本机配置的绝对路径，运行：
 
    ```sh
@@ -28,7 +28,7 @@
 部署当天由 lead 在常驻机核对两项：
 
 1. 打开巡检定时任务的运行记录，最新一轮状态为成功。空指令箱不应唤醒伙伴；如有指令，宿主接受投递不等于伙伴已办完。
-2. 核对 `stateDir/last-scan.json` 的 `scanned_at` 属于该次运行，检查 `prs` 和分类。若 `discoveryErrors` 非空或有未知项，先查任务标准错误和 GitHub 权限，不把部分结果当完整结果。投递成功时间与批次键另存 `stateDir/outbox/deliveries/<ID>.json`；业务回执在 `outbox/receipts/<ID>.json`。
+2. 核对 `stateDir/last-scan.json` 的 `scanned_at` 属于该次运行，检查 `prs` 和分类。若 `discoveryErrors` 非空或有未知项，先查任务标准错误和 GitHub 权限，不把部分结果当完整结果。投递成功时间与批次键另存 `stateDir/outbox/deliveries/<ID>.json`；业务回执在 `outbox/receipts/<ID>.json`。已停手的 PR 只投递停手通知，旧指令不删、不标已投递。
 
 首轮不临时伪造线上故障或离线。先观察至少三天；需要切换仍有老盯梢的仓时，等用户当次点名，按上线清单暂停该仓旧发现器、合入并同步跟进流程，再把该仓纳入总管并按授权打开杂活。
 

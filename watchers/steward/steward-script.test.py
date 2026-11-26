@@ -41,7 +41,7 @@ class StewardScriptTest(unittest.TestCase):
             "CINDY_SCRIPT_PROTOCOL": "1",
         }
 
-    def seed(self, count=3):
+    def seed(self, count=3, types=None):
         directory = self.outbox / "orders"
         directory.mkdir(parents=True)
         ids = []
@@ -49,7 +49,7 @@ class StewardScriptTest(unittest.TestCase):
             order_id = hashlib.sha256(str(number).encode()).hexdigest()
             ids.append(order_id)
             (directory / f"{order_id}.json").write_text(json.dumps({
-                "id": order_id, "type": "ensure_follower",
+                "id": order_id, "type": types[number - 1] if types else "ensure_follower",
                 "pr": f"example-org/example-repo#{number}", "head": "a" * 40,
                 "reason": "需要跟进", "created_at": "2026-01-01T00:00:00Z",
                 "attempts": 0, "delivered": False, "payload": {},
@@ -129,6 +129,28 @@ class StewardScriptTest(unittest.TestCase):
         self.assertIn("未确认目标会话", result.stderr)
         self.assertEqual([item["type"] for item in frames], ["call"])
         self.assert_delivery(ids, False)
+
+    def test_halted_pr_dispatches_only_its_stop_order(self):
+        other, stop, old = self.seed(types=["nudge", "stop_and_notify", "ensure_follower"])
+        pr = "example-org/example-repo#1"
+        order_file = self.outbox / "orders" / f"{stop}.json"
+        stop_order = json.loads(order_file.read_text())
+        order_file.write_text(json.dumps({**stop_order, "pr": pr}), encoding="utf-8")
+        pr_dir = self.state / "prs"
+        pr_dir.mkdir()
+        pr_key = hashlib.sha256(pr.encode()).hexdigest()
+        (pr_dir / f"{pr_key}.json").write_text(json.dumps({
+            "pr": pr, "head": "a" * 40, "classification": "要修", "halted": True,
+        }), encoding="utf-8")
+        result, frames = self.run_host()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([item["type"] for item in frames], ["call", "complete"])
+        message = frames[0]["params"]["message"]
+        self.assertIn(stop, message)
+        self.assertIn(other, message)
+        self.assertNotIn(old, message)
+        self.assert_delivery([stop, other], True)
+        self.assert_delivery([old], False)
 
     def test_sc4_tick_failure_uses_stderr_only_and_never_dispatches(self):
         ids = self.seed()

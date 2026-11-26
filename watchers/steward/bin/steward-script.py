@@ -18,7 +18,7 @@ import path from 'node:path';
 import { loadProfile } from './profile.mjs';
 import { main } from './steward.mjs';
 import { markDelivered, readOrder, readOrders, readReceipt } from './outbox.mjs';
-import { atomicJson } from './state.mjs';
+import { atomicJson, readPr } from './state.mjs';
 
 if (process.argv[1] === 'tick') {
   let scan;
@@ -26,7 +26,8 @@ if (process.argv[1] === 'tick') {
   if (status !== 0) process.exit(status);
   const { stateDir } = loadProfile();
   const orders = readOrders(stateDir)
-    .filter((order) => !order.delivered && !readReceipt(stateDir, order.id));
+    .filter((order) => !order.delivered && !readReceipt(stateDir, order.id))
+    .filter((order) => order.type === 'stop_and_notify' || !readPr(stateDir, order.pr)?.halted);
   atomicJson(path.join(stateDir, 'last-scan.json'), {
     scanned_at: new Date().toISOString(), ...scan,
   });
