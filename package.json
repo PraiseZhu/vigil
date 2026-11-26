@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": false,
   "type": "module",
-  "description": "Vigil: 三个独立的自动化工具（mivo-watcher / cindy-watcher / acceptance-watcher）的开源版本。",
+  "description": "Vigil: 三个独立的 watcher（mivo-watcher / cindy-watcher / acceptance-watcher）与只读 PR 总管（steward）的开源版本。",
   "license": "MIT",
   "scripts": {
     "test": "node scripts/run-tests.mjs",
