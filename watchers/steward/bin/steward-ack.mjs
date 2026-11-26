@@ -13,6 +13,9 @@ const RESULTS = Object.freeze({
   pause_original: ['delivered', 'offline', 'failed'],
   nudge: ['delivered', 'gone', 'failed'],
   forward_blocker: ['delivered', 'gone', 'failed'],
+  checkpoint: ['delivered', 'gone', 'failed'],
+  swap: ['created', 'failed'],
+  stop_and_notify: ['delivered', 'failed'],
   notify_human: ['delivered', 'failed'],
 });
 
@@ -32,7 +35,17 @@ export function parseAckArgs(argv) {
 }
 
 function receiptFollower(order, flags, at) {
+  if (['checkpoint', 'stop_and_notify'].includes(order.type)) return null;
   const previous = readFollower(order.stateDir, order.pr);
+  if (order.type === 'swap' && flags.result === 'created') {
+    const state = readPr(order.stateDir, order.pr);
+    writeFollower(order.stateDir, order.pr, {
+      ...(previous ?? {}), device: flags.device, session: flags.session, kind: 'dedicated',
+      takeover: previous?.takeover === true, status: 'following', offline_at: null,
+      followed_at: at, last_activity_at: at,
+    });
+    return writePr(order.stateDir, order.pr, { ...state, guard: { ...state?.guard, swapped: true } });
+  }
   if (order.type === 'ensure_follower' && REQUIRED_SESSION_RESULTS.has(flags.result)) {
     return writeFollower(order.stateDir, order.pr, {
       ...(previous ?? {}), device: flags.device, session: flags.session,
@@ -99,9 +112,13 @@ export async function applyAck({ stateDir, orderId, result, device, session, sch
       result, device: device ?? null, session: session ?? null,
       schedule: schedule ?? null, note: note ?? null, at: now.toISOString(),
     });
+    if (current.type === 'swap' && receipt.result === 'created'
+      && readPr(stateDir, order.pr)?.guard?.swapped !== true) {
+      receiptFollower({ ...current, stateDir }, receipt, receipt.at);
+    }
     if (!existing) {
       if (!current.delivered) await markDelivered(stateDir, orderId);
-      receiptFollower({ ...current, stateDir }, flags, now.toISOString());
+      if (current.type !== 'swap') receiptFollower({ ...current, stateDir }, flags, now.toISOString());
     }
     return receipt;
   });
