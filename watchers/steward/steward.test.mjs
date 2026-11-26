@@ -234,7 +234,7 @@ test('SC7: dry-run CLI contract runs five stages without GitHub writes or local 
   const logs = [];
   const output = [];
   assert.equal(await main(['tick', '--dry-run'], { env, client, log: (line) => logs.push(line), output: (line) => output.push(line) }), 0);
-  assert.deepEqual(logs, ['发现', '事实', '杂活：未启用', '覆盖：未启用', '守门：未启用']);
+  assert.deepEqual(logs, ['发现', '事实', '杂活：未启用', '覆盖：预览', '守门：未启用']);
   assert.equal(JSON.parse(output[0]).prs[0].classification, '没事');
   assert.deepEqual(client.calls, ['listOpenPulls', 'searchOpenPulls', 'searchOpenPulls', 'getPull', 'listBranchRules']);
   assert.equal(fs.existsSync(stateDir), false);
