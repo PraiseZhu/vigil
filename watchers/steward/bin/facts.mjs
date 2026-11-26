@@ -113,7 +113,7 @@ async function currentAlerts(client, pr, head, threshold) {
   return result;
 }
 
-export function classify({ ignored = [], checks = [], threads = [], conflict, alerts = [], awaitingHuman, mergeState }) {
+export function classify({ ignored = [], checks = [], threads = [], conflict, alerts = [], awaitingHuman, mergeState, requiresConversationResolution }) {
   const requiredChecks = checks.filter((check) => check.required);
   const failedRequired = requiredChecks.filter((check) => check.result === 'failed');
   const skipped = requiredChecks.filter((check) => check.result === 'skipped');
@@ -137,7 +137,12 @@ export function classify({ ignored = [], checks = [], threads = [], conflict, al
   ];
   if (waiting.length) return { classification: '等待中', reasons: waiting, falseGreen, requiredChecks };
   if (awaitingHuman) return { classification: '等人', reasons: [{ code: 'manual_approval_or_merge' }], falseGreen, requiredChecks };
-  if (['BLOCKED', 'BEHIND', 'UNKNOWN'].includes(mergeState)) throw new Error(`merge status not explained: ${mergeState}`);
+  const onlyNonblockingThreads = mergeState === 'BLOCKED' && requiresConversationResolution
+    && threads.length > 0 && threads.every((thread) =>
+      thread.source === 'other_bot' || (thread.source === 'trusted_bot' && thread.severity === 'P3'));
+  if (!onlyNonblockingThreads && ['BLOCKED', 'BEHIND', 'UNKNOWN'].includes(mergeState)) {
+    throw new Error(`merge status not explained: ${mergeState}`);
+  }
   return { classification: '没事', reasons: [], falseGreen, requiredChecks };
 }
 
@@ -168,6 +173,8 @@ export async function readFacts(client, profile, pr, branchRules = new Map()) {
     if (!branchRules.has(branch)) branchRules.set(branch, client.listBranchRules(pr.repo, pull.baseRefName));
     const rules = await branchRules.get(branch);
     checks.push(...missingRequired(checks, classic, rules));
+    const requiresConversationResolution = pull.baseRef.refUpdateRule?.requiresConversationResolution === true
+      || rules.some((rule) => rule.type === 'pull_request' && rule.parameters?.required_review_thread_resolution === true);
     const threads = complete(pull.reviewThreads, 'review threads').filter((thread) => {
       requireFact(typeof thread.isResolved === 'boolean', 'review thread resolution unknown');
       return !thread.isResolved;
@@ -183,7 +190,7 @@ export async function readFacts(client, profile, pr, branchRules = new Map()) {
     return {
       ...identity, head, base: pull.baseRefOid, baseBranch: pull.baseRefName,
       checks, threads, conflict, alerts, mergeState, author: pull.author,
-      ...classify({ checks, threads, conflict, alerts, awaitingHuman,
+      ...classify({ checks, threads, conflict, alerts, awaitingHuman, requiresConversationResolution,
         mergeState: pull.mergeable === 'UNKNOWN' ? 'UNKNOWN' : mergeState }),
     };
   } catch (error) {

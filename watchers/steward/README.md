@@ -24,7 +24,7 @@ STEWARD_PROFILE=path/to/local-profile.json node watchers/steward/bin/steward.mjs
 | `policies.*.infraPatterns` | 在失败检查的标题、摘要、正文或状态描述中匹配的不区分大小写正则。没有明确匹配不当作基建错误。 |
 | `policies.*.codeScanning` | `enabled` 默认关；`threshold` 默认 `high`，可选 `low/medium/high/critical`。非安全告警的 `note/warning/error` 折算为前三档。只采纳当前 PR 开放实例，若扫描的是合并提交，验证其头部父提交。 |
 
-客户端方法名记在 `client.calls`，供测试核对。GitHub 规则或事实读取失败、连接截断、提交不一致或无法解释的合并状态不会判为没事。未出现的已声明必需检查视为等待；只将真正的 `SKIPPED` 计入假绿灯。代码扫描开启时需要告警读取权限。发现读取使用分页；超过 GitHub 搜索上限或搜索返回不完整时显示范围错误。单 PR 超过 GraphQL 读取上限时显式标未知。无界面改动。
+客户端方法名记在 `client.calls`，供测试核对。GitHub 规则或事实读取失败、连接截断、提交不一致或无法解释的合并状态不会判为没事。规则集或旧式分支保护要求解决讨论串、且已读事实只剩 P3 或其他机器人讨论串时，即使 GitHub 报 `BLOCKED`，也判「没事」并保留讨论串。未出现的已声明必需检查视为等待；只将真正的 `SKIPPED` 计入假绿灯。代码扫描开启时需要告警读取权限。发现读取使用分页；超过 GitHub 搜索上限或搜索返回不完整时显示范围错误。单 PR 超过 GraphQL 读取上限时显式标未知。无界面改动。
 
 ## 本地记录
 

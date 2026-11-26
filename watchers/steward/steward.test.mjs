@@ -101,6 +101,35 @@ for (const [label, fields, classification, reason] of [
   });
 }
 
+for (const [label, refUpdateRule, rules, reviewThread, expectedThread] of [
+  ['ruleset', null, [{ type: 'pull_request', parameters: { required_review_thread_resolution: true } }],
+    thread('P3: optional'), ['example-thread', 'trusted_bot', 'P3']],
+  ['classic protection', { requiredStatusCheckContexts: [], requiresConversationResolution: true }, [],
+    thread('other automation', { author: { login: 'other[bot]', __typename: 'Bot' } }), ['example-thread', 'other_bot', null]],
+]) {
+  test(`SC3: ${label} BLOCKED by only P3 or other bot threads remains healthy`, async () => {
+    const facts = await factsFor({
+      mergeStateStatus: 'BLOCKED', baseRef: { refUpdateRule },
+      checks: [check('test', 'SUCCESS')],
+      threads: [reviewThread],
+    }, { rules });
+    assert.equal(facts.classification, '没事');
+    assert.deepEqual(facts.reasons, []);
+    assert.deepEqual(facts.threads.map(({ id, source, severity }) => [id, source, severity]),
+      [expectedThread]);
+  });
+}
+
+test('SC3: BLOCKED with P3 but without required thread resolution remains unknown', async () => {
+  const facts = await factsFor({
+    mergeStateStatus: 'BLOCKED',
+    baseRef: { refUpdateRule: { requiredStatusCheckContexts: [], requiresConversationResolution: false } },
+    checks: [check('test', 'SUCCESS')], threads: [thread('P3: optional')],
+  }, { rules: [{ type: 'pull_request', parameters: { required_review_thread_resolution: false } }] });
+  assert.equal(facts.classification, '未知');
+  assert.deepEqual(facts.reasons, [{ code: 'read_failed', detail: 'merge status not explained: BLOCKED' }]);
+});
+
 test('required waiting is not masked by a manual review gate or a same-name check from a different app', async () => {
   const facts = await factsFor({
     mergeStateStatus: 'BLOCKED', reviewDecision: 'REVIEW_REQUIRED',

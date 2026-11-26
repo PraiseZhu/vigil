@@ -12,7 +12,7 @@ const PULL_QUERY = `query($owner:String!, $repo:String!, $number:Int!) {
       number state isDraft author { login __typename }
       headRefOid baseRefName baseRefOid mergeable mergeStateStatus reviewDecision
       autoMergeRequest { enabledAt } isInMergeQueue
-      baseRef { refUpdateRule { requiredStatusCheckContexts } }
+      baseRef { refUpdateRule { requiredStatusCheckContexts requiresConversationResolution } }
       commits(last:1) { nodes { commit { oid statusCheckRollup {
         contexts(first:100) { totalCount pageInfo { hasNextPage } nodes {
           __typename
