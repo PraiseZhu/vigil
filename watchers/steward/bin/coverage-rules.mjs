@@ -87,7 +87,7 @@ function retryActions({ orders, receipts, pr, head, now, settings }) {
   }
   const actions = [];
   for (const [root, order] of groups) {
-    if (settled.has(root)) continue;
+    if (settled.has(root) || order.delivered !== true) continue;
     const elapsed = minutesSince(order.payload?.retryStartedAt ?? order.created_at, now);
     const attempt = Math.max(1, sequence(order));
     if (elapsed >= settings.timeoutMinutes) {

@@ -134,7 +134,8 @@ test('SC6: orders retry at minutes 10 and 20 and notify exactly once at 30', () 
     assert.deepEqual(decideAt(minute - 1), []);
     const actions = decideAt(minute);
     assert.deepEqual(actions.map(({ type, payload }) => [type, payload.attempt]), [['check_follower', minute / 10 + 1]]);
-    orders.push(order({ ...actions[0], created_at: new Date(BASE.getTime() + minute * 60_000).toISOString() }));
+    orders.push(order({ ...actions[0], delivered: true,
+      created_at: new Date(BASE.getTime() + minute * 60_000).toISOString() }));
   }
   assert.deepEqual(decideAt(29), []);
   assert.deepEqual(decideAt(30, new Set([orders[1].id])), []);
@@ -144,9 +145,30 @@ test('SC6: orders retry at minutes 10 and 20 and notify exactly once at 30', () 
   assert.deepEqual(decideAt(40), []);
 });
 
+test('SC6: an undelivered takeover or queued retry does not retry or time out', () => {
+  const initial = order({ type: 'takeover', dedupeKey: 'takeover', created_at: BASE.toISOString() });
+  const offline = follower({ status: 'offline', offline_at: BASE.toISOString() });
+  const decideAt = (minute, orders) => decideCoverage({
+    fact: fact(), state: state(), follower: offline, orders,
+    now: new Date(BASE.getTime() + minute * 60_000),
+  });
+  for (const minute of [10, 20, 30, 60]) {
+    assert.deepEqual(decideAt(minute, [initial]), []);
+  }
+
+  const delivered = { ...initial, delivered: true, attempts: 1 };
+  const [retry] = decideAt(10, [delivered]);
+  assert.equal(retry.type, 'takeover');
+  const queued = order({ ...retry, created_at: new Date(BASE.getTime() + 10 * 60_000).toISOString() });
+  for (const minute of [20, 30, 60]) {
+    assert.deepEqual(decideAt(minute, [delivered, queued]), []);
+  }
+});
+
 test('dedupe and retries ignore orders for another PR sharing the same head', () => {
-  const other = makeOrder({ type: 'ensure_follower', pr: 'other-org/other-repo#7', head: HEAD,
-    dedupeKey: 'ensure', reason: 'other', payload: { dedupeKey: 'ensure' }, created_at: BASE.toISOString() });
+  const other = { ...makeOrder({ type: 'ensure_follower', pr: 'other-org/other-repo#7', head: HEAD,
+    dedupeKey: 'ensure', reason: 'other', payload: { dedupeKey: 'ensure' }, created_at: BASE.toISOString() }),
+  delivered: true, attempts: 1 };
   assert.deepEqual(decideCoverage({ fact: fact(), state: state(), orders: [other],
     now: new Date(BASE.getTime() + 30 * 60_000) })
     .map(({ type }) => type), ['ensure_follower']);
