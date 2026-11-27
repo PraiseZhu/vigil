@@ -4,7 +4,13 @@
   "excludeRepos": ["example-org/ignored-repo"],
   "discoverByAuthor": true,
   "stateDir": "steward-state",
-  "github": { "mode": "gh" },
+  "github": {
+    "mode": "by-owner",
+    "installations": {
+      "ExampleUser": { "appId": 1001, "installationId": 2001, "privateKeyFile": "keys/example-user.pem" },
+      "example-org": { "appId": 1002, "installationId": 2002, "privateKeyFile": "keys/example-org.pem" }
+    }
+  },
   "presence": { "commands": { "ExampleDevice": "false" } },
   "policies": {
     "example-org/example-repo": {
