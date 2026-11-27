@@ -11,8 +11,8 @@ export function addComment(thread, id, body, author = USER) {
   thread.comments = connection([...thread.comments.nodes, { id: `comment-${id}`, databaseId: id, body, author }]);
 }
 
-export function actionsCheck(name, conclusion, id, { run = 10, required = true, summary } = {}) {
-  return { ...check(name, conclusion, { required, summary, appId: 15368 }), databaseId: id + 10_000,
+export function actionsCheck(name, conclusion, id, { run = 10, required = true, summary, startedAt, annotations, status } = {}) {
+  return { ...check(name, conclusion, { required, summary, appId: 15368, startedAt, annotations, status }), databaseId: id + 10_000,
     detailsUrl: `https://github.com/${REPO}/actions/runs/${run}/job/${id}` };
 }
 
@@ -22,10 +22,16 @@ export function githubFixture(options = {}) {
   let nextId = 5;
   const app = {
     listOpenPulls: async () => [row(1)],
-    listBranchRules: async () => [],
+    listBranchRules: async (repo, branch) => options.branchRules?.[branch] ?? [],
     getPull: async () => structuredClone(pull(1, { ...options, threads })),
+    compareBase: async () => options.drift ?? { behindBy: 0, mergeBaseAt: '2026-01-01T00:00:00Z' },
     resolveThread: async (id) => { calls.push(['app.resolve', id]); },
     rerunJob: async (repo, id) => { calls.push(['app.rerun', repo, id]); },
+    updateBranch: async (repo, number, head) => {
+      calls.push(['app.updateBranch', repo, number, head]);
+      if (options.updateBranchError) throw options.updateBranchError;
+      return { message: 'Updating pull request branch.' };
+    },
   };
   const follower = {
     viewer: async () => USER,

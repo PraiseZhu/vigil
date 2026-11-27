@@ -1,4 +1,4 @@
-const ACTIONS_APP_ID = 15368;
+export const ACTIONS_APP_ID = 15368;
 
 function actionsJob(check, repo) {
   if (check.appId !== ACTIONS_APP_ID || typeof check.url !== 'string') return null;
