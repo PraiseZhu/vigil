@@ -4,6 +4,7 @@ import { closeReverifiedThread, reverifiedCandidates } from '../chores/reverifie
 import { rerunCandidates, rerunCheck } from '../chores/ci-rerun.mjs';
 import { actorKey } from '../discover.mjs';
 import { createGithubClient } from '../github.mjs';
+import { appForRepo } from '../profile.mjs';
 import { appendRound } from '../round-log.mjs';
 import { readPr, withPrLock, writePr } from '../state.mjs';
 
@@ -29,12 +30,12 @@ export async function chores({ profile, client, facts, dryRun, log, now = () => 
     .filter(([, settings]) => enabled.some((key) => settings[key] === true));
   log(work.length ? '杂活' : '杂活：未启用');
   if (!work.length) return;
-  if (profile.github?.mode !== 'app') {
-    log('杂活跳过：关闭讨论串和重跑检查要求 GitHub App 模式');
-    return;
-  }
   let viewer;
   for (const [fact, policy] of work) {
+    if (!appForRepo(profile.github, fact.repo)) {
+      log(`${fact.repo}：杂活跳过，未配置适用的 GitHub App 安装`);
+      continue;
+    }
     const execute = async () => {
       const previous = readPr(profile.stateDir, fact.pr);
       if (!dryRun && previous?.head !== fact.head) return;
@@ -55,7 +56,11 @@ export async function chores({ profile, client, facts, dryRun, log, now = () => 
         if (root?.id !== original.id || root.body !== original.body || actorKey(root.author) !== actorKey(original.author)) return null;
         return current.comments.nodes;
       }
-      const context = { fact, state, app: client, refresh, dryRun, log };
+      const app = {
+        resolveThread: (threadId) => client.resolveThread(threadId, fact.repo),
+        rerunJob: (repo, jobId) => client.rerunJob(repo, jobId),
+      };
+      const context = { fact, state, app, refresh, dryRun, log };
       const run = async (kind, target, action) => {
         const before = JSON.stringify(state);
         let result;

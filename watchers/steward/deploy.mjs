@@ -29,12 +29,14 @@ function checkProfile(errors) {
   } catch (error) {
     errors.push(`stateDir 不可写：${error.code ?? error.message}`);
   }
-  if (profile.github.mode === 'app') {
+  const installations = profile.github.mode === 'app' ? [['github', profile.github]]
+    : Object.entries(profile.github.installations ?? {}).map(([owner, app]) => [`github.installations.${owner}`, app]);
+  for (const [setting, app] of installations) {
     try {
-      if (!fs.statSync(profile.github.privateKeyFile).isFile()) throw new Error('not a file');
-      fs.accessSync(profile.github.privateKeyFile, fs.constants.R_OK);
+      if (!fs.statSync(app.privateKeyFile).isFile()) throw new Error('not a file');
+      fs.accessSync(app.privateKeyFile, fs.constants.R_OK);
     } catch {
-      errors.push('github.privateKeyFile 不可读或不是文件');
+      errors.push(`${setting}.privateKeyFile 不可读或不是文件`);
     }
   }
   return profile;
