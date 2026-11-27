@@ -207,6 +207,27 @@ test('SC4: a PR under repair or with a pending order is not updated; a registere
   assert.deepEqual(followed.calls, [['app.updateBranch', REPO, 1, HEAD]]);
 });
 
+test('SC4: checks still running keep the branch alone over rounds; a never-reported required check does not', async (t) => {
+  const drift = { behindBy: 20, mergeBaseAt: hoursAgo(1) };
+  // The follower pushed a fix: last round was a repair with an unanswered order, and CI runs on the new head.
+  const pushed = tickContext(t, { chores: SYNC }, { drift, checks: [actionsCheck('test', null, 20, { status: 'IN_PROGRESS' })] });
+  writePr(pushed.stateDir, PR, { head: HEAD, classification: '要修', coverage: { active: true, head: HEAD } });
+  await writeOrder(pushed.stateDir, makeOrder({ type: 'ensure_follower', pr: PR, head: HEAD, reason: 'example', created_at: hoursAgo(1) }));
+  assert.equal((await pushed.tick()).prs[0].classification, '等待中');
+  pushed.clock.at = new Date(NOW.getTime() + 3 * 60_000);
+  await pushed.tick();
+  assert.deepEqual(pushed.calls, []);
+  assert.deepEqual(pushed.logs.filter((line) => line.includes('不更新分支')),
+    [`${PR}：不更新分支（repair_in_progress）`, `${PR}：不更新分支（checks_running）`]);
+
+  const gate = [{ type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'review-gate' }] } }];
+  const stale = tickContext(t, { chores: SYNC }, { drift, branchRules: { main: gate },
+    checks: [actionsCheck('test', 'SUCCESS', 20), actionsCheck('lint', 'SUCCESS', 21, { required: false })] });
+  const result = await stale.tick();
+  assert.deepEqual([result.prs[0].classification, result.prs[0].reasons], ['等待中', [{ code: 'required_check_running', name: 'review-gate' }]]);
+  assert.deepEqual(stale.calls, [['app.updateBranch', REPO, 1, HEAD]]);
+});
+
 test('SC4: a refused update is asked once per head within the hour, then tried again', async (t) => {
   for (const [label, error] of [
     ['403', new Error('updateBranch: GitHub request failed (HTTP 403)')],

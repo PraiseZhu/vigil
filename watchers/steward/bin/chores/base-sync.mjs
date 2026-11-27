@@ -36,6 +36,9 @@ function hold(fact, state, settings, follow, now) {
   if (fact.classification === '要修') return 'needs_repair';
   if (follow.coverageActive) return 'repair_in_progress';
   if (follow.pendingOrders) return 'pending_dispatch';
+  // A repair is in progress while its CI runs, also after coverage was cleared. A required check that never
+  // reported (missing) is not running: a review gate that refuses old branches never starts its check.
+  if ((fact.checks ?? []).some((check) => check.result === 'running' && check.missing !== true)) return 'checks_running';
   const last = state.baseSync;
   if (last?.result === 'failed' && last.head === fact.head) {
     const since = now.getTime() - Date.parse(last.at);

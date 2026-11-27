@@ -84,7 +84,7 @@ function missingRequired(checks, classicContexts, rules) {
   return [...distinct.values()].filter(({ name, appId }) => !checks.some((check) => check.required
     && check.name === name && (appId === null || check.appId === appId))).map(({ name, appId }) => ({
     name, appId, result: 'running', conclusion: 'EXPECTED', required: true, infra: false, id: null, url: null,
-    description: '',
+    description: '', missing: true,
   }));
 }
 

@@ -11,8 +11,8 @@ export function addComment(thread, id, body, author = USER) {
   thread.comments = connection([...thread.comments.nodes, { id: `comment-${id}`, databaseId: id, body, author }]);
 }
 
-export function actionsCheck(name, conclusion, id, { run = 10, required = true, summary, startedAt, annotations } = {}) {
-  return { ...check(name, conclusion, { required, summary, appId: 15368, startedAt, annotations }), databaseId: id + 10_000,
+export function actionsCheck(name, conclusion, id, { run = 10, required = true, summary, startedAt, annotations, status } = {}) {
+  return { ...check(name, conclusion, { required, summary, appId: 15368, startedAt, annotations, status }), databaseId: id + 10_000,
     detailsUrl: `https://github.com/${REPO}/actions/runs/${run}/job/${id}` };
 }
 
