@@ -79,13 +79,13 @@
 
 ## stop_and_notify
 
-用 `send_to_session` 要求当前跟进方停止该 PR 的自动修复与跟进；用 `schedule_get` 核对已停止。用已配置飞书会话的 `send_text` 发一条通知：PR 链接、已达停止阈值、未解决的卡点、是否由用户接手或另作安排。停止及飞书均核实成功回 `delivered`；失败回 `failed` 并如实写明哪一步未成功。
+用 `send_to_session` 要求当前跟进方停止该 PR 的自动修复与跟进；用 `schedule_get` 核对已停止。用 `cindy_feishu_bot` 的 `send_message_to_user`（伙伴自己的飞书渠道）发一条通知：PR 链接、已达停止阈值、未解决的卡点、是否由用户接手或另作安排。停止及飞书均核实成功回 `delivered`；失败回 `failed` 并如实写明哪一步未成功。
 
 `node watchers/steward/bin/steward-ack.mjs --order <ID> --result delivered`
 
 ## notify_human
 
-用已配置飞书会话的 `send_text` 发一条通知：哪个 PR、指令无回执或停滞的已知事实、需要用户决定恢复跟进还是人工接手。飞书回执确认成功回 `delivered`；未确认或失败回 `failed`，不擅自改投其他群。
+用 `cindy_feishu_bot` 的 `send_message_to_user`（伙伴自己的飞书渠道）发一条通知：哪个 PR、指令无回执或停滞的已知事实、需要用户决定恢复跟进还是人工接手。飞书回执确认成功回 `delivered`；未确认或失败回 `failed`，不擅自改投其他群。
 
 `node watchers/steward/bin/steward-ack.mjs --order <ID> --result delivered`
 

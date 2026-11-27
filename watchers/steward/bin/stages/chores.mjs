@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { closeP3Thread, p3Candidates, replyAllowed } from '../chores/p3-close.mjs';
 import { closeReverifiedThread, reverifiedCandidates } from '../chores/reverified-resolve.mjs';
 import { rerunCandidates, rerunCheck } from '../chores/ci-rerun.mjs';
+import { planBaseSync, syncBase, syncSettings } from '../chores/base-sync.mjs';
 import { actorKey } from '../discover.mjs';
 import { createGithubClient } from '../github.mjs';
 import { appForRepo } from '../profile.mjs';
@@ -17,6 +18,11 @@ function patterns(sources) {
   try { return sources.map((source) => new RegExp(source, 'i')); } catch { return []; }
 }
 
+function keyPattern(source) {
+  if (typeof source !== 'string' || !source) return null;
+  try { return new RegExp(source); } catch { return null; }
+}
+
 function complete(connection) {
   return Array.isArray(connection?.nodes) && connection.pageInfo?.hasNextPage === false
     && connection.totalCount === connection.nodes.length && connection.nodes.every(Boolean);
@@ -27,7 +33,7 @@ export async function chores({ profile, client, facts, dryRun, log, now = () => 
   const enabled = ['p3Close', 'resolveReverified', 'rerunInfra', 'rerunFalseGreen'];
   const work = (facts ?? []).filter((fact) => fact.head && !['未知', '不管'].includes(fact.classification))
     .map((fact) => [fact, object(profile.policies?.[fact.repo.toLowerCase()]?.chores)])
-    .filter(([, settings]) => enabled.some((key) => settings[key] === true));
+    .filter(([, settings]) => enabled.some((key) => settings[key] === true) || settings.syncBase?.enabled === true);
   log(work.length ? '杂活' : '杂活：未启用');
   if (!work.length) return;
   let viewer;
@@ -59,6 +65,7 @@ export async function chores({ profile, client, facts, dryRun, log, now = () => 
       const app = {
         resolveThread: (threadId) => client.resolveThread(threadId, fact.repo),
         rerunJob: (repo, jobId) => client.rerunJob(repo, jobId),
+        updateBranch: (repo, number, head) => client.updateBranch(repo, number, head),
       };
       const context = { fact, state, app, refresh, dryRun, log };
       const run = async (kind, target, action) => {
@@ -75,7 +82,10 @@ export async function chores({ profile, client, facts, dryRun, log, now = () => 
           chore_type: kind, object: target, head: fact.head, result,
         });
       };
-      const reverified = policy.resolveReverified === true ? reverifiedCandidates(fact, state, patterns(policy.reverifiedPatterns)) : [];
+      const reverified = policy.resolveReverified === true ? reverifiedCandidates(fact, state, patterns(policy.reverifiedPatterns), {
+        severities: Array.isArray(policy.reverifiedSeverities) ? policy.reverifiedSeverities : ['P3'],
+        keyPattern: keyPattern(policy.reverifiedKeyPattern),
+      }) : [];
       for (const thread of reverified) {
         await run('reverified_close', thread.id, () => closeReverifiedThread({ ...context, thread }));
       }
@@ -104,6 +114,15 @@ export async function chores({ profile, client, facts, dryRun, log, now = () => 
         falseGreenNeeds: object(policy.falseGreenNeeds) };
       for (const item of rerunCandidates(fact, state, settings, log)) {
         await run(item.kind, item.job, () => rerunCheck({ ...context, item, currentPull }));
+      }
+      const sync = syncSettings(policy.syncBase);
+      if (sync) {
+        const plan = await planBaseSync({ fact, state, settings: sync, reader: client, now: now() });
+        if (plan.reason === 'eligible') {
+          await run('base_sync', fact.baseBranch, () => syncBase({ ...context, plan, currentPull }));
+        } else if (plan.reason !== 'up_to_date') {
+          log(`${fact.pr}：不更新分支（${plan.reason}）`);
+        }
       }
     };
     try {

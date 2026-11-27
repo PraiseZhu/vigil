@@ -17,7 +17,7 @@ test('SC5: every wire order has a section, a Cindy tool and an ack example', () 
   for (const type of ORDER_TYPES) {
     const body = sections.get(type);
     assert.ok(body, `missing section: ${type}`);
-    assert.match(body, /list_machines|send_to_session|send_text/);
+    assert.match(body, /list_machines|send_to_session|send_message_to_user/);
     assert.match(body, /node watchers\/steward\/bin\/steward-ack\.mjs --order <ID> --result \w+/);
   }
 });
@@ -35,7 +35,12 @@ test('companion instructions cover lookup, delivery, handoff and owner query', (
   assert.match(sections.get('swap'), /200 字以内[\s\S]*确认原跟进定时任务已停止[\s\S]*再走专属新建流程[\s\S]*首条消息带摘要/);
   assert.match(sections.get('pause_original'), /只在原电脑用 `schedule_pause` 暂停这一条，不删除[\s\S]*send_to_session/);
   for (const type of ['stop_and_notify', 'notify_human']) {
-    assert.match(sections.get(type), /飞书[\s\S]*send_text[\s\S]*发一条通知/);
+    assert.match(sections.get(type), /`cindy_feishu_bot` 的 `send_message_to_user`[\s\S]*飞书[\s\S]*发一条通知/);
   }
   assert.match(sections.get('归属查询'), /steward-owner\.mjs --pr/);
+});
+
+test('SC9: Feishu notices name the companion own Feishu tool, never send_text', () => {
+  assert.equal(prompt.includes('send_text'), false);
+  assert.equal([...prompt.matchAll(/`cindy_feishu_bot` 的 `send_message_to_user`/g)].length, 2);
 });

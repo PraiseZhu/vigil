@@ -21,7 +21,11 @@ STEWARD_PROFILE=path/to/local-profile.json node watchers/steward/bin/steward.mjs
 | `github` | 默认 `{"mode":"gh"}`，用本机 GitHub CLI 身份。旧的 `mode: "app"` 仍用单一安装做所有读取和 App 杂活。多账号用 `mode: "by-owner"`，在 `installations` 中按仓库所属账号或组织配置安装（不区分大小写）。每组安装必填 `appId`、`installationId` 和 `privateKeyFile`；密钥路径可相对配置文件，短期 installation token 不落盘。 |
 | `policies` | 以 `owner/repo` 为键。未配置的仓不信任任何机器人、不标基建、不读取代码扫描。 |
 | `policies.*.trustedReviewers`、`severityPatterns` | 可信机器人登录名或 `app/<slug>`；每级 `P0` 到 `P3` 是不区分大小写的正则数组，按严重等级从高到低命中，未命中为未分级。按讨论串首条评论判断，已过期但未解决的串仍纳入。 |
-| `policies.*.infraPatterns` | 在失败检查的标题、摘要、正文或状态描述中匹配的不区分大小写正则。没有明确匹配不当作基建错误。 |
+| `policies.*.infraPatterns` | 在失败检查的标题、摘要、正文、状态描述及失败级别注释中匹配的不区分大小写正则。没有明确匹配不当作基建错误。失败检查的注释超过读取上限时，该 PR 判「未知」，不当成没有注释。 |
+| `policies.*.infraRequiresAllAnnotations` | 布尔值，默认 `false`。为真且失败检查有失败级别注释时，每条注释都命中 `infraPatterns` 才算基建错误；没有失败注释时仍按标题、摘要等文字判断。 |
+| `policies.*.optionalChecks` | `block` 布尔值，默认 `false`。为真时，每个非必需 GitHub Actions 检查同名只看最新一次；结论为 `FAILURE`、`TIMED_OUT` 或 `STARTUP_FAILURE` 时记要修原因 `optional_check_failed` 并带检查名，命中 `infraPatterns` 的记为等待中的基建错误。`ignorePatterns` 是不区分大小写的正则数组，名称命中的检查不计。 |
+| `policies.*.chores.syncBase` | 分支同步，默认关。`enabled` 布尔值；`bases` 是 base 分支名的不区分大小写正则数组，启用时不能为空；`minBehind` 正整数，默认 10；`maxAgeHours` 正数，默认 48。正式、可合并无冲突、不是「要修」、base 命中名单的 PR，落后提交数达到 `minBehind`、merge base 早于 `maxAgeHours` 或 GitHub 报 `BEHIND` 时，用 App 调用 update-branch 并带当前 head；同一 head 和 base 末端只调用一次。head 分支规则要求走 PR、或规则读不到时不调用。GitHub 回报 head 已变时记 `held`，不重试。开启后 `BEHIND` 判「等待中」，未开启判「要修」，原因都是 `behind_base`。 |
+| `policies.*.chores.reverifiedSeverities`、`reverifiedKeyPattern` | 已复核关闭（`resolveReverified`）处理的等级，默认 `["P3"]`，可选 `P0` 到 `P3`。P0–P2 讨论串还需全部满足：最后回复与首条评论出自同一审查 App 且命中 `reverifiedPatterns`；回复至少写出一个提交号，且全部等于当前 head；用 `reverifiedKeyPattern`（恰好含一个捕获组的正则）从回复取出的全部 key 都等于首条评论里的最后一个 key。取不到 key 不关闭。 |
 | `policies.*.codeScanning` | `enabled` 默认关；`threshold` 默认 `high`，可选 `low/medium/high/critical`。非安全告警的 `note/warning/error` 折算为前三档。只采纳当前 PR 开放实例，若扫描的是合并提交，验证其头部父提交。 |
 | `policies.*.chores.followerLogin` | 可选，与杂活策略共用的 GitHub 登录名。该账号在 PR 讨论串里的新回复会重置停滞和在线催办计时；不配置就不按回复计时。 |
 | `presence.commands` | 可选，按原设备标识设置本机可信探测命令。退出 0 表示设备可能已恢复，覆盖阶段才发 `pause_original`；未配置、超时或非零退出均视为不可达。示例里的 `false` 不会触发暂停，请在仓外本机配置中替换成部署用探测命令。 |

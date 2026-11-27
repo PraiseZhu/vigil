@@ -18,8 +18,10 @@ export const discoveryRows = [
 ];
 export const searchRows = [row(1), row(3, { repo: OUTSIDE }), row(6, { repo: EXCLUDED })];
 
-export function check(name, conclusion, { required = true, summary, status = 'COMPLETED', appId = 1 } = {}) {
-  return { __typename: 'CheckRun', name, status, conclusion, summary, isRequired: required, checkSuite: { app: { databaseId: appId } } };
+export function check(name, conclusion, { required = true, summary, status = 'COMPLETED', appId = 1, startedAt, annotations } = {}) {
+  return { __typename: 'CheckRun', name, status, conclusion, summary, isRequired: required, checkSuite: { app: { databaseId: appId } },
+    ...(startedAt ? { startedAt } : {}),
+    ...(annotations ? { annotations: connection(annotations.map(([annotationLevel, message]) => ({ annotationLevel, message }))) } : {}) };
 }
 
 export function thread(body, { author = REVIEWER, outdated = true, resolved = false } = {}) {
@@ -30,7 +32,7 @@ export function thread(body, { author = REVIEWER, outdated = true, resolved = fa
 export function pull(number = 1, { head = HEAD, checks = [], threads = [], ...fields } = {}) {
   return {
     number, author: USER, state: 'OPEN', isDraft: false,
-    headRefOid: head, baseRefOid: BASE, baseRefName: 'main',
+    headRefOid: head, headRefName: 'feature/example', isCrossRepository: false, baseRefOid: BASE, baseRefName: 'main',
     baseRef: { refUpdateRule: null }, mergeable: 'MERGEABLE', mergeStateStatus: 'UNSTABLE', reviewDecision: null,
     commits: { nodes: [{ commit: { oid: head, statusCheckRollup: { contexts: connection(checks) } } }] },
     reviewThreads: connection(threads),

@@ -10,15 +10,16 @@ const PULL_QUERY = `query($owner:String!, $repo:String!, $number:Int!) {
   repository(owner:$owner, name:$repo) {
     pullRequest(number:$number) {
       number state isDraft author { login __typename }
-      headRefOid baseRefName baseRefOid mergeable mergeStateStatus reviewDecision
+      headRefOid headRefName isCrossRepository baseRefName baseRefOid mergeable mergeStateStatus reviewDecision
       autoMergeRequest { enabledAt } isInMergeQueue
       baseRef { refUpdateRule { requiredStatusCheckContexts requiresConversationResolution } }
       commits(last:1) { nodes { commit { oid statusCheckRollup {
         contexts(first:100) { totalCount pageInfo { hasNextPage } nodes {
           __typename
           ... on CheckRun {
-            databaseId name status conclusion detailsUrl title summary text isRequired(pullRequestNumber:$number)
+            databaseId name status conclusion startedAt detailsUrl title summary text isRequired(pullRequestNumber:$number)
             checkSuite { app { databaseId slug } }
+            annotations(first:50) { totalCount pageInfo { hasNextPage } nodes { annotationLevel message } }
           }
           ... on StatusContext { context state description targetUrl isRequired(pullRequestNumber:$number) }
         } }
@@ -110,9 +111,11 @@ export function createGithubClient(config, { env = process.env, run = spawnSync,
     });
     if (result.error || result.status !== 0) {
       const status = /\(HTTP (\d{3})\)/.exec(result.stderr ?? '')?.[1];
-      throw new Error(`${method}: GitHub request failed${status ? ` (HTTP ${status})` : result.error?.code ? ` (${result.error.code})` : ''}`);
+      const error = new Error(`${method}: GitHub request failed${status ? ` (HTTP ${status})` : result.error?.code ? ` (${result.error.code})` : ''}`);
+      if (status === '422' && /expected head sha/i.test(result.stderr ?? '')) error.code = 'HEAD_CHANGED';
+      throw error;
     }
-    if (!result.stdout?.trim() && ['POST', 'PATCH'].includes(verb) && endpoint !== 'graphql') return null;
+    if (!result.stdout?.trim() && ['POST', 'PATCH', 'PUT'].includes(verb) && endpoint !== 'graphql') return null;
     let data;
     try { data = JSON.parse(result.stdout); }
     catch { throw new Error(`${method}: invalid GitHub response`); }
@@ -180,6 +183,20 @@ export function createGithubClient(config, { env = process.env, run = spawnSync,
       } });
       if (data.resolveReviewThread?.thread?.isResolved !== true) throw new Error('resolveThread: resolution unconfirmed');
       return data.resolveReviewThread.thread;
+    },
+    async compareBase(repo, base, head) {
+      if (![base, head].every((sha) => /^[a-f0-9]{40}$/i.test(sha))) throw new Error('compareBase: invalid commit SHA');
+      const data = await api('compareBase', `${repoPath(repo)}/compare/${base}...${head}?per_page=1`, { repo });
+      const behindBy = data?.behind_by;
+      const mergeBaseAt = data?.merge_base_commit?.commit?.committer?.date;
+      if (!Number.isSafeInteger(behindBy) || behindBy < 0 || typeof mergeBaseAt !== 'string'
+        || !Number.isFinite(Date.parse(mergeBaseAt))) throw new Error('compareBase: behind count or merge base date unknown');
+      return { behindBy, mergeBaseAt };
+    },
+    updateBranch(repo, number, expectedHeadSha) {
+      if (!/^[a-f0-9]{40}$/i.test(expectedHeadSha)) throw new Error('updateBranch: invalid expected head SHA');
+      return api('updateBranch', `${repoPath(repo)}/pulls/${positive(number)}/update-branch`,
+        { repo, appOnly: true, verb: 'PUT', body: { expected_head_sha: expectedHeadSha } });
     },
     rerunJob(repo, jobId) {
       return api('rerunJob', `${repoPath(repo)}/actions/jobs/${positive(jobId)}/rerun`, { repo, appOnly: true, verb: 'POST' });

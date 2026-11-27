@@ -22,8 +22,15 @@
         "P3": ["\\bP3\\b"]
       },
       "infraPatterns": ["\\bHTTP 5[0-9]{2}\\b", "runner (?:lost|disconnected)"],
+      "infraRequiresAllAnnotations": false,
+      "optionalChecks": { "block": false, "ignorePatterns": ["^Analyze \\("] },
       "codeScanning": { "enabled": false, "threshold": "high" },
-      "chores": { "followerLogin": "ExampleFollower" }
+      "chores": {
+        "followerLogin": "ExampleFollower",
+        "syncBase": { "enabled": false, "bases": ["^main$"], "minBehind": 10, "maxAgeHours": 48 },
+        "reverifiedSeverities": ["P3"],
+        "reverifiedKeyPattern": "finding-key=([A-Za-z0-9_-]+)"
+      }
     }
   }
 }

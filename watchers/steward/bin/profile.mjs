@@ -30,8 +30,45 @@ function patterns(value, key) {
   });
 }
 
+function boolean(value, key) {
+  if (value !== undefined && typeof value !== 'boolean') throw new Error(`配置「${key}」必须是布尔值`);
+  return value ?? false;
+}
+
+function captureGroups(source) {
+  return new RegExp(`${source}|`).exec('').length - 1;
+}
+
+function parseChores(chores, key) {
+  const syncBase = chores.syncBase;
+  if (syncBase !== undefined) {
+    object(syncBase, `${key}.syncBase`);
+    const enabled = boolean(syncBase.enabled, `${key}.syncBase.enabled`);
+    const bases = patterns(syncBase.bases ?? [], `${key}.syncBase.bases`);
+    if (enabled && !bases.length) throw new Error(`配置「${key}.syncBase.bases」启用时不能为空`);
+    if (syncBase.minBehind !== undefined && !(Number.isSafeInteger(syncBase.minBehind) && syncBase.minBehind > 0)) {
+      throw new Error(`配置「${key}.syncBase.minBehind」必须是正整数`);
+    }
+    if (syncBase.maxAgeHours !== undefined && !(typeof syncBase.maxAgeHours === 'number'
+      && Number.isFinite(syncBase.maxAgeHours) && syncBase.maxAgeHours > 0)) {
+      throw new Error(`配置「${key}.syncBase.maxAgeHours」必须是正数`);
+    }
+  }
+  if (chores.reverifiedSeverities !== undefined) {
+    strings(chores.reverifiedSeverities, `${key}.reverifiedSeverities`, (level) => ['P0', 'P1', 'P2', 'P3'].includes(level));
+  }
+  const keyPattern = chores.reverifiedKeyPattern;
+  if (keyPattern !== undefined) {
+    let groups;
+    try { groups = typeof keyPattern === 'string' && keyPattern ? captureGroups(keyPattern) : -1; } catch { groups = -1; }
+    if (groups !== 1) throw new Error(`配置「${key}.reverifiedKeyPattern」必须是恰好含一个捕获组的正则`);
+  }
+}
+
 function parsePolicy(value, key) {
   const policy = object(value, key);
+  parseChores(object(policy.chores ?? {}, `${key}.chores`), `${key}.chores`);
+  const optionalChecks = object(policy.optionalChecks ?? {}, `${key}.optionalChecks`);
   const login = policy.chores?.followerLogin;
   if (login !== undefined && (typeof login !== 'string' || !/^[a-z\d][a-z\d-]*$/i.test(login))) {
     throw new Error(`无效的配置「${key}.chores.followerLogin」`);
@@ -55,6 +92,11 @@ function parsePolicy(value, key) {
       ([level, sources]) => [level, patterns(sources, `${key}.severityPatterns.${level}`)],
     )),
     infraPatterns: patterns(policy.infraPatterns ?? [], `${key}.infraPatterns`),
+    infraRequiresAllAnnotations: boolean(policy.infraRequiresAllAnnotations, `${key}.infraRequiresAllAnnotations`),
+    optionalChecks: {
+      block: boolean(optionalChecks.block, `${key}.optionalChecks.block`),
+      ignorePatterns: patterns(optionalChecks.ignorePatterns ?? [], `${key}.optionalChecks.ignorePatterns`),
+    },
     codeScanning: { enabled: codeScanning.enabled ?? false, threshold },
   };
 }
