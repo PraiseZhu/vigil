@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { sign } from 'node:crypto';
 import fs from 'node:fs';
-import { REPO } from './profile.mjs';
+import { appForRepo, REPO } from './profile.mjs';
 
 const HOST = 'github.com';
 const URL_ROOT = 'https://api.github.com';
@@ -64,33 +64,39 @@ function jwt(config) {
 
 export function createGithubClient(config, { env = process.env, run = spawnSync, fetchFn = fetch } = {}) {
   const calls = [];
-  let installation;
+  const tokens = new Map();
 
-  async function appToken() {
+  async function appToken(app) {
+    const installation = tokens.get(app);
     if (installation && Date.parse(installation.expires_at) > Date.now() + 60_000) return installation.token;
     calls.push('authenticateApp');
     try {
-      const response = await fetchFn(`${URL_ROOT}/app/installations/${config.installationId}/access_tokens`, {
+      const response = await fetchFn(`${URL_ROOT}/app/installations/${app.installationId}/access_tokens`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${jwt(config)}`, Accept: 'application/vnd.github+json' },
+        headers: { Authorization: `Bearer ${jwt(app)}`, Accept: 'application/vnd.github+json' },
         signal: AbortSignal.timeout(TIMEOUT),
         redirect: 'error',
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      installation = await response.json();
-      if (typeof installation.token !== 'string' || !installation.token
-        || !(Date.parse(installation.expires_at) > Date.now())) throw new Error('invalid installation response');
-      return installation.token;
+      const current = await response.json();
+      if (typeof current.token !== 'string' || !current.token
+        || !(Date.parse(current.expires_at) > Date.now())) throw new Error('invalid installation response');
+      tokens.set(app, current);
+      return current.token;
     } catch (error) {
       const status = /^HTTP \d{3}$/.test(error.message) ? ` (${error.message})` : '';
       throw new Error(`authenticateApp: installation authentication failed${status}`);
     }
   }
 
-  async function api(method, endpoint, { paginate = false, body, verb = 'GET' } = {}) {
+  async function api(method, endpoint, { repo, paginate = false, body, verb = 'GET', appOnly = false } = {}) {
     calls.push(method);
     const childEnv = { ...env, GH_PROMPT_DISABLED: '1' };
-    if (config.mode === 'app') childEnv.GH_TOKEN = await appToken();
+    const app = appForRepo(config, repo);
+    if (appOnly && config.mode === 'by-owner' && !app) {
+      throw new Error(`${method}: repository has no GitHub App installation`);
+    }
+    if (app) childEnv.GH_TOKEN = await appToken(app);
     const args = ['api', endpoint, '--hostname', HOST, '--method', verb];
     if (paginate) args.push('--paginate', '--slurp');
     if (body) args.push('--input', '-');
@@ -116,8 +122,8 @@ export function createGithubClient(config, { env = process.env, run = spawnSync,
     return endpoint === 'graphql' ? data.data : data;
   }
 
-  async function pages(method, endpoint) {
-    return asPages(await api(method, endpoint, { paginate: true }), method);
+  async function pages(method, repo, endpoint) {
+    return asPages(await api(method, endpoint, { repo, paginate: true }), method);
   }
 
   return {
@@ -126,7 +132,7 @@ export function createGithubClient(config, { env = process.env, run = spawnSync,
       return (await api('viewer', 'graphql', { verb: 'POST', body: { query: 'query { viewer { login } }' } })).viewer;
     },
     async listOpenPulls(repo) {
-      const rows = await pages('listOpenPulls', `${repoPath(repo)}/pulls?state=open&per_page=100`);
+      const rows = await pages('listOpenPulls', repo, `${repoPath(repo)}/pulls?state=open&per_page=100`);
       return rows.map((row) => pullRow(row, repo));
     },
     async searchOpenPulls(author) {
@@ -145,29 +151,30 @@ export function createGithubClient(config, { env = process.env, run = spawnSync,
     async getPull(repo, number) {
       const [, owner, name] = repoPath(repo).split('/');
       const data = await api('getPull', 'graphql', {
-        verb: 'POST', body: { query: PULL_QUERY, variables: { owner, repo: name, number: positive(number) } },
+        repo, verb: 'POST', body: { query: PULL_QUERY, variables: { owner, repo: name, number: positive(number) } },
       });
       return data.repository?.pullRequest;
     },
     listBranchRules(repo, branch) {
-      return pages('listBranchRules', `${repoPath(repo)}/rules/branches/${encodeURIComponent(branch)}?per_page=100`);
+      return pages('listBranchRules', repo, `${repoPath(repo)}/rules/branches/${encodeURIComponent(branch)}?per_page=100`);
     },
     listAlerts(repo, number) {
-      return pages('listAlerts', `${repoPath(repo)}/code-scanning/alerts?pr=${positive(number)}&state=open&per_page=100`);
+      return pages('listAlerts', repo, `${repoPath(repo)}/code-scanning/alerts?pr=${positive(number)}&state=open&per_page=100`);
     },
     listAlertInstances(repo, number, alert) {
-      return pages('listAlertInstances', `${repoPath(repo)}/code-scanning/alerts/${positive(alert)}/instances?pr=${positive(number)}&per_page=100`);
+      return pages('listAlertInstances', repo, `${repoPath(repo)}/code-scanning/alerts/${positive(alert)}/instances?pr=${positive(number)}&per_page=100`);
     },
     async alertCommitParents(repo, sha) {
       if (!/^[a-f0-9]{40}$/i.test(sha)) throw new Error('invalid alert commit SHA');
-      return (await api('alertCommitParents', `${repoPath(repo)}/commits/${sha}`)).parents;
+      return (await api('alertCommitParents', `${repoPath(repo)}/commits/${sha}`, { repo })).parents;
     },
     replyToThread(repo, number, commentId, body) {
       return api('replyToThread', `${repoPath(repo)}/pulls/${positive(number)}/comments/${positive(commentId)}/replies`,
-        { verb: 'POST', body: { body } });
+        { repo, verb: 'POST', body: { body } });
     },
-    async resolveThread(threadId) {
-      const data = await api('resolveThread', 'graphql', { verb: 'POST', body: {
+    async resolveThread(threadId, repo) {
+      if (repo !== undefined) repoPath(repo);
+      const data = await api('resolveThread', 'graphql', { repo, appOnly: true, verb: 'POST', body: {
         query: 'mutation($id:ID!) { resolveReviewThread(input:{threadId:$id}) { thread { id isResolved } } }',
         variables: { id: threadId },
       } });
@@ -175,7 +182,7 @@ export function createGithubClient(config, { env = process.env, run = spawnSync,
       return data.resolveReviewThread.thread;
     },
     rerunJob(repo, jobId) {
-      return api('rerunJob', `${repoPath(repo)}/actions/jobs/${positive(jobId)}/rerun`, { verb: 'POST' });
+      return api('rerunJob', `${repoPath(repo)}/actions/jobs/${positive(jobId)}/rerun`, { repo, appOnly: true, verb: 'POST' });
     },
   };
 }

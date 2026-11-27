@@ -6,7 +6,7 @@
 
 1. 按上线顺序等巡检、杂活、覆盖、守门及原会话跟进流程合入；选常驻机上一份固定检出，记录部署 SHA。不要把自动化指向临时开发工作树。任何换版本或生产切换须有对应授权，参见[部署授权边界](fleet-deploy-authorization.md)。
 2. 复制[`steward.profile.example.json`](../config/examples/steward.profile.example.json) 到仓库外，以本机权限保护该配置与状态目录。填入 `authors`、`repos`、`stateDir`，为每个要巡检的仓设置 `policies.<repo>.chores.followerLogin`，它是该仓跟进方的 GitHub 登录名字符串，要与常驻机的 `gh` 登录一致。配置 `presence.commands` 时只用本机信任的探测命令。第一阶段用明确仓库列表（`discoverByAuthor: false`），不加入仍有老盯梢运行的仓；启用按作者发现时，同样检查 `excludeRepos` 和新发现仓的策略，不可借自动发现提前纳管。
-3. 零消耗杂活默认关闭。四项开关放在 `policies.<repo>.chores`：`p3Close`、`resolveReverified`、`rerunInfra`、`rerunFalseGreen`。打开写入策略须用 `github.mode: "app"` 和已授权的 App 安装配置；密钥只留本机。P3 回复用 `p3Reply` 配置文案，由与 `followerLogin` 匹配的本机 `gh` 身份发送。用 `reverifiedPatterns` 配置已复核标记；`falseGreenNeeds` 必须把被跳过的检查名映射到前置 job 名列表，不能在同一轮 Actions 中定位唯一失败或取消项时不重跑。
+3. 零消耗杂活默认关闭。四项开关放在 `policies.<repo>.chores`：`p3Close`、`resolveReverified`、`rerunInfra`、`rerunFalseGreen`。单一安装可继续用 `github.mode: "app"`；多个账号或组织用 `github.mode: "by-owner"`，在 `github.installations` 中按仓库所属账号或组织填写已授权安装的 `appId`、`installationId`、`privateKeyFile`。没有安装的仓继续用本机 `gh` 读取但不跑杂活；纯读取也可保留 `github.mode: "gh"`。密钥只留本机，示例里的安装 ID 和路径要替换后才能使用。P3 回复用 `p3Reply` 配置文案，由与 `followerLogin` 匹配的本机 `gh` 身份发送。用 `reverifiedPatterns` 配置已复核标记；`falseGreenNeeds` 必须把被跳过的检查名映射到前置 job 名列表，不能在同一轮 Actions 中定位唯一失败或取消项时不重跑。
 4. 在选定检出目录设置 `STEWARD_PROFILE` 为本机配置的绝对路径，运行：
 
    ```sh
@@ -14,7 +14,7 @@
    node watchers/steward/deploy.mjs --print-schedule
    ```
 
-   体检会验证调度可用的 Node、Python、`gh`、配置、跟进账号和状态目录可写性。补齐每个报出的缺项再继续。体检不证明 GitHub App 已获每个仓的权限，也不证明调度能使用同一 `PATH`；这些需在常驻机首轮验证。打印命令只输出参数，不创建伙伴或定时任务。
+   体检会验证调度可用的 Node、Python、`gh`、配置、跟进账号和状态目录可写性，并逐项检查 App 密钥是否为可读文件。多账号配置中有密钥不可读时，错误会标出对应账号或组织。体检不证明 GitHub App 已获每个仓的权限，也不证明调度能使用同一 `PATH`；这些需在常驻机首轮验证。打印命令只输出参数，不创建伙伴或定时任务。
 
 ## 配置伙伴与调度
 

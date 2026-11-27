@@ -10,7 +10,7 @@ const DEPLOY = fileURLToPath(new URL('./deploy.mjs', import.meta.url));
 const FIXTURE = fileURLToPath(new URL('./fixtures/script/fake-gh.sh', import.meta.url));
 const REPO = 'example-org/example-repo';
 
-function setup(t, { login, followerLogin = 'ExampleUser', stateIsFile = false } = {}) {
+function setup(t, { login, followerLogin = 'ExampleUser', stateIsFile = false, github } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'vigil-steward-deploy-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const fakeGh = path.join(directory, 'gh');
@@ -20,7 +20,7 @@ function setup(t, { login, followerLogin = 'ExampleUser', stateIsFile = false } 
   const state = path.join(directory, 'state');
   if (stateIsFile) fs.writeFileSync(state, '');
   fs.writeFileSync(profile, JSON.stringify({
-    authors: ['ExampleUser'], repos: [REPO], stateDir: 'state',
+    authors: ['ExampleUser'], repos: [REPO], stateDir: 'state', github,
     policies: { [REPO]: { chores: { followerLogin } } },
   }));
   const env = {
@@ -59,6 +59,29 @@ test('SC6: valid account and writable state pass without leaving a probe', (t) =
   const result = run('--check');
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(fs.readdirSync(state), []);
+});
+
+test('SC4: deploy checks every installation and identifies missing or non-file keys by owner', (t) => {
+  const github = { mode: 'by-owner', installations: {
+    'example-org': { appId: 11, installationId: 101, privateKeyFile: 'org.pem' },
+    exampleuser: { appId: 22, installationId: 202, privateKeyFile: 'user.pem' },
+  } };
+  const { run, profile } = setup(t, { login: 'ExampleUser', github });
+  const directory = path.dirname(profile);
+  fs.mkdirSync(path.join(directory, 'org.pem'));
+  const missing = run('--check');
+  assert.equal(missing.status, 1, missing.stderr);
+  assert.match(missing.stderr, /github\.installations\.example-org\.privateKeyFile 不可读或不是文件/);
+  assert.match(missing.stderr, /github\.installations\.exampleuser\.privateKeyFile 不可读或不是文件/);
+  fs.rmdirSync(path.join(directory, 'org.pem'));
+  fs.writeFileSync(path.join(directory, 'org.pem'), 'placeholder');
+  const partial = run('--check');
+  assert.equal(partial.status, 1, partial.stderr);
+  assert.doesNotMatch(partial.stderr, /github\.installations\.example-org/);
+  assert.match(partial.stderr, /github\.installations\.exampleuser/);
+  fs.writeFileSync(path.join(directory, 'user.pem'), 'placeholder');
+  const ready = run('--check');
+  assert.equal(ready.status, 0, ready.stderr);
 });
 
 test('SC7: prints a bound script schedule and no extra capability', (t) => {

@@ -3,6 +3,7 @@ import path from 'node:path';
 
 export const REPO = /^[a-z\d][a-z\d-]*\/(?!\.{1,2}$)[a-z\d_.-]+$/i;
 const AUTHOR = /^(?:app\/)?[a-z\d][a-z\d-]*$/i;
+const OWNER = /^[a-z\d][a-z\d-]*$/i;
 const SEVERITIES = ['low', 'medium', 'high', 'critical'];
 
 function requireConfig(profile, key) {
@@ -69,6 +70,44 @@ function parsePresence(value) {
   return { commands };
 }
 
+function parseInstallation(value, key, directory) {
+  const installation = object(value, key);
+  for (const field of ['appId', 'installationId']) {
+    if (!/^[1-9]\d*$/.test(String(installation[field]))) {
+      throw new Error(`无效或缺少必需配置「${key}.${field}」`);
+    }
+  }
+  if (typeof installation.privateKeyFile !== 'string' || !installation.privateKeyFile.trim()) {
+    throw new Error(`缺少必需配置「${key}.privateKeyFile」`);
+  }
+  return { ...installation, mode: 'app', privateKeyFile: path.resolve(directory, installation.privateKeyFile) };
+}
+
+function parseGithub(value, directory) {
+  const github = object(value ?? {}, 'github');
+  const mode = github.mode ?? 'gh';
+  if (mode === 'gh') return { mode };
+  if (mode === 'app') return parseInstallation(github, 'github', directory);
+  if (mode !== 'by-owner') throw new Error('配置「github.mode」必须是 gh、app 或 by-owner');
+  const entries = object(github.installations, 'github.installations');
+  const installations = new Map();
+  for (const [owner, installation] of Object.entries(entries)) {
+    const key = `github.installations.${owner}`;
+    if (!OWNER.test(owner)) throw new Error(`配置「${key}」必须以 GitHub 账号或组织登录名为键`);
+    const normalized = owner.toLowerCase();
+    if (installations.has(normalized)) throw new Error(`配置「${key}」重复（不区分大小写）`);
+    installations.set(normalized, parseInstallation(installation, key, directory));
+  }
+  return { mode, installations: Object.fromEntries(installations) };
+}
+
+export function appForRepo(github, repo) {
+  if (github?.mode === 'app') return github;
+  if (github?.mode !== 'by-owner' || !repo) return undefined;
+  const owner = repo.split('/')[0].toLowerCase();
+  return Object.hasOwn(github.installations, owner) ? github.installations[owner] : undefined;
+}
+
 export function loadProfile({ env = process.env, file = env.STEWARD_PROFILE } = {}) {
   if (!file) throw new Error('缺少必需配置「STEWARD_PROFILE」：请指定本机配置文件');
   const profile = object(JSON.parse(fs.readFileSync(file, 'utf8')), 'profile');
@@ -81,18 +120,8 @@ export function loadProfile({ env = process.env, file = env.STEWARD_PROFILE } = 
   if (!repos.length && !discoverByAuthor) throw new Error('配置「repos」不能为空，除非启用 discoverByAuthor');
   const stateDir = requireConfig(profile, 'stateDir');
   if (typeof stateDir !== 'string' || !stateDir.trim()) throw new Error('配置「stateDir」必须是路径');
-  const github = object(profile.github ?? {}, 'github');
-  const mode = github.mode ?? 'gh';
-  if (!['gh', 'app'].includes(mode)) throw new Error('配置「github.mode」必须是 gh 或 app');
-  if (mode === 'app') {
-    for (const key of ['appId', 'installationId']) {
-      if (!/^[1-9]\d*$/.test(String(github[key]))) throw new Error(`无效或缺少必需配置「github.${key}」`);
-    }
-    if (typeof github.privateKeyFile !== 'string' || !github.privateKeyFile.trim()) {
-      throw new Error('缺少必需配置「github.privateKeyFile」');
-    }
-  }
   const directory = path.dirname(path.resolve(file));
+  const github = parseGithub(profile.github, directory);
   const policies = Object.fromEntries(Object.entries(object(profile.policies ?? {}, 'policies')).map(([repo, policy]) => {
     if (!REPO.test(repo)) throw new Error('配置「policies」必须以 owner/repo 为键');
     return [repo.toLowerCase(), parsePolicy(policy, `policies.${repo}`)];
@@ -101,6 +130,6 @@ export function loadProfile({ env = process.env, file = env.STEWARD_PROFILE } = 
     authors, repos, excludeRepos, discoverByAuthor, policies,
     presence: parsePresence(profile.presence),
     stateDir: path.resolve(directory, stateDir),
-    github: mode === 'app' ? { ...github, mode, privateKeyFile: path.resolve(directory, github.privateKeyFile) } : { mode },
+    github,
   };
 }
