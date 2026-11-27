@@ -7,8 +7,11 @@ import test from 'node:test';
 import { planBaseSync } from './bin/chores/base-sync.mjs';
 import { readFacts } from './bin/facts.mjs';
 import { createGithubClient } from './bin/github.mjs';
+import { writeFollower } from './bin/followers.mjs';
+import { makeOrder, writeOrder, writeReceipt } from './bin/outbox.mjs';
 import { loadProfile } from './bin/profile.mjs';
 import { readRounds } from './bin/round-log.mjs';
+import { writePr } from './bin/state.mjs';
 import { main, runSteward } from './bin/steward.mjs';
 import { HEAD, NEXT, REPO, REVIEWER, USER, check, fixtureClient, pull } from './fixtures/pulls.mjs';
 import { actionsCheck, addComment, discussion, githubFixture, PR } from './fixtures/chores/cases.mjs';
@@ -43,8 +46,9 @@ function tickContext(t, policy, options) {
   const fixture = githubFixture(options);
   const profile = profileFor(policy, stateDir);
   const logs = [];
-  const tick = (client = fixture.app) => runSteward({ command: 'tick', profile, client, log: (line) => logs.push(line), now: () => NOW });
-  return { ...fixture, logs, stateDir, tick };
+  const clock = { at: NOW };
+  const tick = (client = fixture.app) => runSteward({ command: 'tick', profile, client, log: (line) => logs.push(line), now: () => clock.at });
+  return { ...fixture, clock, logs, stateDir, tick };
 }
 
 function reply(item, body, author = REVIEWER, id = 2) {
@@ -170,6 +174,58 @@ test('SC4: a head that GitHub reports as changed is held and not retried', async
       [`repos/${REPO}/pulls/1/update-branch`, 'PUT', { expected_head_sha: HEAD }]);
     return { status: 1, stderr: 'expected head sha didn\'t match current head ref. (HTTP 422)' };
   } });
+  await assert.rejects(client.updateBranch(REPO, 1, HEAD), { code: 'HEAD_CHANGED' });
+});
+
+test('SC4: a PR under repair or with a pending order is not updated; a registered follower alone does not hold it', async (t) => {
+  const drift = { behindBy: 20, mergeBaseAt: hoursAgo(1) };
+  const order = () => makeOrder({ type: 'ensure_follower', pr: PR, head: HEAD, reason: 'example', created_at: hoursAgo(1) });
+  for (const [seed, reason] of [
+    // The follower pushed a fix, CI is running (waiting): coverage from the last round is still active.
+    [(stateDir) => writePr(stateDir, PR, { head: HEAD, classification: '要修', coverage: { active: true, head: HEAD } }),
+      'repair_in_progress'],
+    [(stateDir) => writeOrder(stateDir, order()), 'pending_dispatch'],
+  ]) {
+    const ctx = tickContext(t, { chores: SYNC }, { drift, checks: [check('build', null, { status: 'IN_PROGRESS' })] });
+    await seed(ctx.stateDir);
+    assert.equal((await ctx.tick()).prs[0].classification, '等待中');
+    assert.deepEqual(ctx.calls, [], reason);
+    assert.ok(ctx.logs.includes(`${PR}：不更新分支（${reason}）`), reason);
+  }
+  const answered = tickContext(t, { chores: SYNC }, { drift });
+  const done = await writeOrder(answered.stateDir, order());
+  await writeReceipt(answered.stateDir, done.id, { result: 'following' });
+  await answered.tick();
+  assert.deepEqual(answered.calls, [['app.updateBranch', REPO, 1, HEAD]]);
+  // Repaired before, now quiet: a follower is registered, coverage is inactive and every order is answered.
+  const followed = tickContext(t, { chores: SYNC }, { drift });
+  writeFollower(followed.stateDir, PR, { kind: 'original', takeover: false, device: 'example-device', session: 'example-session' });
+  writePr(followed.stateDir, PR, { head: HEAD, classification: '等待中', coverage: { active: false, head: HEAD } });
+  const answeredOrder = await writeOrder(followed.stateDir, order());
+  await writeReceipt(followed.stateDir, answeredOrder.id, { result: 'following' });
+  await followed.tick();
+  assert.deepEqual(followed.calls, [['app.updateBranch', REPO, 1, HEAD]]);
+});
+
+test('SC4: a refused update is asked once per head within the hour, then tried again', async (t) => {
+  for (const [label, error] of [
+    ['403', new Error('updateBranch: GitHub request failed (HTTP 403)')],
+    ['422', new Error('updateBranch: GitHub request failed (HTTP 422)')],
+  ]) {
+    const ctx = tickContext(t, { chores: SYNC }, { drift: { behindBy: 12, mergeBaseAt: hoursAgo(1) }, updateBranchError: error });
+    await ctx.tick();
+    ctx.clock.at = new Date(NOW.getTime() + 59 * 60_000);
+    await ctx.tick();
+    assert.deepEqual(ctx.calls, [['app.updateBranch', REPO, 1, HEAD]], label);
+    assert.ok(ctx.logs.includes(`${PR}：不更新分支（failed_cooldown）`), label);
+    assert.deepEqual(readRounds(ctx.stateDir, PR).map(({ chore_type, result }) => [chore_type, result]),
+      [['base_sync', 'failed']], label);
+    ctx.clock.at = new Date(NOW.getTime() + 60 * 60_000);
+    await ctx.tick();
+    assert.equal(ctx.calls.length, 2, label);
+  }
+  const client = createGithubClient({ mode: 'gh' }, { env: {}, run: () => ({ status: 1, stderr: 'gh: Validation Failed (HTTP 422)',
+    stdout: '{"message":"expected head sha didn\'t match current head ref."}' }) });
   await assert.rejects(client.updateBranch(REPO, 1, HEAD), { code: 'HEAD_CHANGED' });
 });
 

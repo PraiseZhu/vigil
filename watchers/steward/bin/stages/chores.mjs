@@ -5,9 +5,10 @@ import { rerunCandidates, rerunCheck } from '../chores/ci-rerun.mjs';
 import { planBaseSync, syncBase, syncSettings } from '../chores/base-sync.mjs';
 import { actorKey } from '../discover.mjs';
 import { createGithubClient } from '../github.mjs';
+import { readOrders, readReceipt } from '../outbox.mjs';
 import { appForRepo } from '../profile.mjs';
 import { appendRound } from '../round-log.mjs';
-import { readPr, withPrLock, writePr } from '../state.mjs';
+import { prKey, readPr, withPrLock, writePr } from '../state.mjs';
 
 function object(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
@@ -117,9 +118,15 @@ export async function chores({ profile, client, facts, dryRun, log, now = () => 
       }
       const sync = syncSettings(policy.syncBase);
       if (sync) {
-        const plan = await planBaseSync({ fact, state, settings: sync, reader: client, now: now() });
+        const follow = {
+          coverageActive: previous?.coverage?.active === true,
+          pendingOrders: readOrders(profile.stateDir).some((order) => order.pr === prKey(fact.pr)
+            && !readReceipt(profile.stateDir, order.id)),
+        };
+        const at = now();
+        const plan = await planBaseSync({ fact, state, settings: sync, reader: client, now: at, follow });
         if (plan.reason === 'eligible') {
-          await run('base_sync', fact.baseBranch, () => syncBase({ ...context, plan, currentPull }));
+          await run('base_sync', fact.baseBranch, () => syncBase({ ...context, plan, currentPull, now: at }));
         } else if (plan.reason !== 'up_to_date') {
           log(`${fact.pr}：不更新分支（${plan.reason}）`);
         }

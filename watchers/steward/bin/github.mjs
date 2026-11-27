@@ -112,7 +112,7 @@ export function createGithubClient(config, { env = process.env, run = spawnSync,
     if (result.error || result.status !== 0) {
       const status = /\(HTTP (\d{3})\)/.exec(result.stderr ?? '')?.[1];
       const error = new Error(`${method}: GitHub request failed${status ? ` (HTTP ${status})` : result.error?.code ? ` (${result.error.code})` : ''}`);
-      if (status === '422' && /expected head sha/i.test(result.stderr ?? '')) error.code = 'HEAD_CHANGED';
+      if (status === '422' && /expected head sha/i.test(`${result.stderr ?? ''}\n${result.stdout ?? ''}`)) error.code = 'HEAD_CHANGED';
       throw error;
     }
     if (!result.stdout?.trim() && ['POST', 'PATCH', 'PUT'].includes(verb) && endpoint !== 'graphql') return null;

@@ -2,6 +2,8 @@
 // and review, so it waits until the branch is this far behind, or its merge base this old, or GitHub reports BEHIND.
 export const BASE_SYNC_DEFAULTS = { minBehind: 10, maxAgeHours: 48 };
 const HOUR = 60 * 60 * 1000;
+// A refused update (missing permission, another 422) is not asked again for the same head before this.
+export const BASE_SYNC_FAILED_COOLDOWN_MS = HOUR;
 
 function compile(sources) {
   if (!Array.isArray(sources)) return [];
@@ -22,15 +24,25 @@ export function baseSyncKey(fact) {
   return `${fact.head}:${fact.base}`;
 }
 
-// Why the PR is not synced, judged from facts already read; null when GitHub has to be asked.
-function hold(fact, state, settings) {
+// Why the PR is not synced, judged from facts already read; null when GitHub has to be asked. `follow` is the local
+// coverage record: while a repair is in progress or an order is not answered, a merge commit pushed under the
+// follower would put its local branch behind. A follower that is only registered does not hold the sync.
+function hold(fact, state, settings, follow, now) {
   if (fact.draft === true) return 'draft';
   if (fact.crossRepository === true) return 'cross_repository';
   if (!settings.bases.some((pattern) => pattern.test(fact.baseBranch ?? ''))) return 'base_not_listed';
   if (fact.conflict) return 'conflict';
   if (fact.mergeable !== 'MERGEABLE') return 'not_mergeable';
   if (fact.classification === '要修') return 'needs_repair';
-  if (state.baseSync?.key === baseSyncKey(fact)) return `already_${state.baseSync.result}`;
+  if (follow.coverageActive) return 'repair_in_progress';
+  if (follow.pendingOrders) return 'pending_dispatch';
+  const last = state.baseSync;
+  if (last?.result === 'failed' && last.head === fact.head) {
+    const since = now.getTime() - Date.parse(last.at);
+    if (!(since >= BASE_SYNC_FAILED_COOLDOWN_MS)) return 'failed_cooldown';
+    return null;
+  }
+  if (last?.key === baseSyncKey(fact)) return `already_${last.result}`;
   return null;
 }
 
@@ -40,8 +52,8 @@ export function driftDue({ fact, drift, settings, now }) {
   return drift.behindBy >= settings.minBehind || now.getTime() - Date.parse(drift.mergeBaseAt) >= settings.maxAgeHours * HOUR;
 }
 
-export async function planBaseSync({ fact, state, settings, reader, now }) {
-  const held = hold(fact, state, settings);
+export async function planBaseSync({ fact, state, settings, reader, now, follow = {} }) {
+  const held = hold(fact, state, settings, follow, now);
   if (held) return { reason: held };
   let drift;
   try { drift = await reader.compareBase(fact.repo, fact.base, fact.head); } catch { return { reason: 'drift_unavailable' }; }
@@ -60,7 +72,7 @@ export async function planBaseSync({ fact, state, settings, reader, now }) {
   return { reason: 'eligible', drift };
 }
 
-export async function syncBase({ fact, plan, state, app, currentPull, dryRun, log }) {
+export async function syncBase({ fact, plan, state, app, currentPull, dryRun, log, now }) {
   const key = baseSyncKey(fact);
   if (dryRun) {
     log(`${fact.pr}：将更新分支，同步 ${fact.baseBranch}（落后 ${plan.drift.behindBy} 个提交）`);
@@ -73,11 +85,14 @@ export async function syncBase({ fact, plan, state, app, currentPull, dryRun, lo
   try {
     await app.updateBranch(fact.repo, fact.number, fact.head);
   } catch (error) {
-    if (error?.code !== 'HEAD_CHANGED') throw error;
-    state.baseSync = { key, result: 'held' };
+    if (error?.code !== 'HEAD_CHANGED') {
+      state.baseSync = { key, head: fact.head, result: 'failed', at: now.toISOString() };
+      throw error;
+    }
+    state.baseSync = { key, head: fact.head, result: 'held' };
     log(`${fact.pr}：GitHub 回报 head 已变化，不更新分支，也不重试`);
     return 'held';
   }
-  state.baseSync = { key, result: 'synced' };
+  state.baseSync = { key, head: fact.head, result: 'synced' };
   return 'synced';
 }
